@@ -329,6 +329,16 @@ def _add_task_impl(
         }
         if goal_id and not non_current_goal_id:
             result["serves_goal"] = goal_id
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
+            # Reset-on-incident (#1698 slice 3 §3): a NEW serves edge just
+            # landed against this goal — full strength again.
+            try:
+                core._reset_principle_enactments(goal_id)
+            except Exception:
+                pass  # best-effort; never fail task creation on this
         if non_current_goal_id:
             result["non_current_goal_id"] = non_current_goal_id
         if impl_ids:

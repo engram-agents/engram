@@ -499,7 +499,6 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
         if _want("memory"):
             result["memory"] = {
                 "current_turn": core._get_current_turn(),
-                "tier1_threshold": core._get_tier_threshold(conn, 1),
                 "tier2_threshold": core._get_tier_threshold(conn, 2),
             }
 
@@ -812,20 +811,13 @@ def _diagnose_impl() -> str:
         current_turn = core._get_current_turn()
         memory["current_turn"] = current_turn
 
-        t1 = core._get_tier_threshold(conn, 1)
         t2 = core._get_tier_threshold(conn, 2)
-        tier1_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
-            (t1,),
-        ).fetchone()["c"] if t1 > 0 else total_current
         tier2_count = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND COALESCE(importance_score, 0) >= ?",
             (t2,),
         ).fetchone()["c"] if t2 > 0 else total_current
         memory["tiers"] = {
-            "tier1_working": tier1_count,
-            "tier1_threshold": round(t1, 4),
-            "tier2_searchable": tier2_count,
+            "tier2_queryable": tier2_count,
             "tier2_threshold": round(t2, 4),
             "tier3_total": total_current,
         }
@@ -1277,6 +1269,94 @@ def _diagnose_impl() -> str:
         except Exception:
             metrics["cornerstone_coverage"] = {"error": "cornerstone coverage check failed"}
 
+        # ── Principle Coverage (#1698 slice 3) ────────────────────────────
+        # Broader than cornerstone_coverage above: all four principle-family
+        # kinds (lesson/cornerstone/axiom/goal), and a wider set of recall
+        # channels than just the two auto-load surfaces — a principle is
+        # "covered" if it's reachable via ANY of: the unified
+        # principle_triggers.json registry (registry_trigger — the #1698
+        # trigger mechanism itself), a situation_pattern on its own metadata
+        # (situation_pattern — the cognitive-tripwire keyword-match path),
+        # a warm-briefing.md mention (warm_briefing_anchor), or a CLAUDE.md
+        # mention (claude_md). Read-only, degrades gracefully (missing
+        # registry/files -> everything reports uncovered rather than
+        # raising — the honest answer when those files are genuinely
+        # absent), matching this function's documented side-effect-free
+        # contract.
+        try:
+            principle_rows = conn.execute(
+                """SELECT id, type, claim, metadata FROM nodes
+                   WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
+                     AND is_current = 1 AND memory_status = 'active'"""
+            ).fetchall()
+
+            try:
+                with open(core.PRINCIPLE_TRIGGERS_PATH, "r") as f:
+                    _pt_registry = json.load(f)
+                # #1731: registry values are LISTS of entries (a dual-role
+                # trigger node now gets one entry per principle it triggers,
+                # instead of the old single-dict-per-trigger last-spec-wins
+                # shape). Tolerate an old-shape single dict too (lazy-read
+                # shim, same as the surface hook's consumer).
+                covered_ids = set()
+                for _raw in _pt_registry.values():
+                    _entries = _raw if isinstance(_raw, list) else [_raw]
+                    for _e in _entries:
+                        _pid = _e.get("principle_id")
+                        if _pid:
+                            covered_ids.add(_pid)
+            except (FileNotFoundError, json.JSONDecodeError):
+                covered_ids = set()
+
+            # Independent read of the same two auto-load surfaces
+            # cornerstone_coverage above already reads (wb_path/claude_md_path) --
+            # deliberately NOT reusing that block's wb_text/claude_text locals:
+            # this try/except is meant to degrade on its own (missing files ->
+            # empty text -> everything reports uncovered) without an implicit
+            # dependency on cornerstone_coverage's try block having reached
+            # those assignments first.
+            _pc_wb_path = core.DATA_DIR / "warm-briefing.md"
+            _pc_claude_path = Path.home() / ".claude" / "CLAUDE.md"
+            _pc_wb_text = _pc_wb_path.read_text(errors="replace") if _pc_wb_path.exists() else ""
+            _pc_claude_text = (
+                _pc_claude_path.read_text(errors="replace") if _pc_claude_path.exists() else ""
+            )
+
+            uncovered: list[dict] = []
+            for row in principle_rows:
+                nid = row["id"]
+                channels: list[str] = []
+                if nid in covered_ids:
+                    channels.append("registry_trigger")
+                try:
+                    meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                except (TypeError, json.JSONDecodeError):
+                    meta = {}
+                if meta.get("situation_pattern"):
+                    channels.append("situation_pattern")
+                if nid in _pc_wb_text:
+                    channels.append("warm_briefing_anchor")
+                if nid in _pc_claude_text:
+                    channels.append("claude_md")
+                if not channels:
+                    uncovered.append({
+                        "id": nid,
+                        "type": row["type"],
+                        "claim": (row["claim"] or "")[:120],
+                        "cheapest_fix": (
+                            "register one exemplar (engram_register_exemplar / "
+                            "engram_lesson_register_incident)"
+                        ),
+                    })
+
+            metrics["principle_coverage"] = {
+                "total_principles": len(principle_rows),
+                "covered_count": len(principle_rows) - len(uncovered),
+                "uncovered": uncovered,
+            }
+        except Exception:
+            metrics["principle_coverage"] = {"error": "principle coverage check failed"}
+
         # ── Health Score (0-100) ─────────────────────────────────────────
         # Single source of truth: the shared helper (charter §6 fold). The
         # intermediates computed above remain for their own report sections;
@@ -1293,7 +1373,6 @@ def _diagnose_impl() -> str:
         ).fetchone()
 
         metrics["config_summary"] = {
-            "tier1_max_nodes": mem.get("tier1_max_nodes", 200),
             "tier2_max_nodes": mem.get("tier2_max_nodes", 1000),
             "decay_base": mem.get("decay_base", 1.014),
             "current_turn": mem.get("current_turn", 0),

@@ -43,6 +43,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# NOTE: `pwd` is no longer used directly in this file (its one use --
+# _get_agent_name's uid fallback -- now lives in _prompthooklib.py) but the
+# import is kept so `pwd` stays a patchable attribute on THIS module: tests
+# patch `hook.pwd.getpwuid` to exercise the uid-fallback path, and since
+# `import pwd` always binds the same singleton sys.modules['pwd'] object,
+# patching it here also patches what _prompthooklib.get_agent_name() sees.
+
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
@@ -58,25 +65,44 @@ LIST_CAP = 10
 # Pure-API (UCS invariant): this hook reads DM state ONLY via the forum HTTP
 # API — no local-filesystem fallback.  forum_api ships in tools/.
 #
-# Resolve tools/ in BOTH topologies (mirrors engram-baton-prompt-hook.py) — a
-# fixed parents[N] is WRONG because the build FLATTENS hooks/claude/ -> hooks/,
-# so the deployed hook sits one level shallower than the source.  Prefer
-# $CLAUDE_PLUGIN_ROOT/tools when set, else walk parents and take the first dir
-# that actually contains forum_api.py.  Import is best-effort: a failure sets
-# _FORUM_API_OK=False, degrading the hook to a silent no-op rather than
-# crashing the prompt.
+# Resolve tools/ in BOTH topologies via the shared _hooklib helper (gh#1657 —
+# this walk-parents logic was duplicated byte-for-byte across this hook and
+# engram-baton-prompt-hook.py, slice 1 of which extracted it; this is slice 2,
+# a byte-identical swap since this hook shares baton's marker file
+# (forum_api.py) and candidate ordering exactly). _hooklib.py lives alongside
+# this file in both topologies (source: hooks/claude/; deployed: hooks/), so
+# no walk-parents is needed to find it — but this repo's own test loaders
+# (importlib.util.spec_from_file_location) don't auto-add a script's own
+# directory to sys.path the way a real `python3 hooks/x.py` invocation does,
+# so this hook adds its own directory explicitly before importing _hooklib.
+# Import is best-effort throughout: any failure degrades the hook to a
+# silent no-op rather than crashing the prompt. (Behavior note, same as
+# slice 1: the pre-extraction inline walk-parents loop was NOT itself
+# wrapped in try/except -- wrapping it here is a deliberate tightening to
+# match this file's own "never crash the prompt" discipline, not an
+# accidental behavior change.)
+#
+# gh#1680 slice 1: the config/agent-name/emit-context/resolve-tools-dir
+# prologue previously inlined here now lives in the shared _prompthooklib
+# module (same directory, same sys.path bootstrap used for _hooklib above).
+# _PROMPTHOOKLIB_OK gates main() -- if the shared module somehow fails to
+# import, the hook degrades to a silent no-op rather than crashing, same
+# discipline as every other best-effort import in this prologue.
 # ---------------------------------------------------------------------------
-_tools_candidates = []
-_plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "").strip()
-if _plugin_root:
-    _tools_candidates.append(Path(_plugin_root) / "tools")
-for _parent in Path(__file__).resolve().parents:
-    _tools_candidates.append(_parent / "tools")
-_TOOLS_DIR = next(
-    (c for c in _tools_candidates if (c / "forum_api.py").exists()), None
-)
-if _TOOLS_DIR is not None and str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _prompthooklib import (
+        load_config as _load_config_impl,
+        get_agent_name as _get_agent_name_impl,
+        emit_context as _emit_context,
+        bootstrap_tools_dir as _bootstrap_tools_dir,
+    )
+    _PROMPTHOOKLIB_OK = True
+except Exception:
+    _PROMPTHOOKLIB_OK = False
+_TOOLS_DIR = _bootstrap_tools_dir("forum_api.py") if _PROMPTHOOKLIB_OK else None
 try:
     from forum_api import (
         ForumClient,
@@ -90,59 +116,22 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Config helpers
+# Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
+# per-hook wrappers, not bare aliases: they pin ENGRAM_HOME (this hook's own
+# module constant, captured once at import time above) as an explicit arg,
+# preserving both (a) the exact zero-arg call signature every existing call
+# site and test-monkeypatch already depends on, and (b) the "frozen at
+# import time" ENGRAM_HOME timing the pre-extraction inline code had.
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
-    config_path = Path(ENGRAM_HOME) / "config.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {}
+    return _load_config_impl(ENGRAM_HOME)
 
 
 def _get_agent_name(config: Optional[dict] = None) -> str:
-    """Resolve this agent's own name.
-
-    Priority:
-      1. config.json["agent_name"] field (explicit; wins if set).
-      2. $USER env var, agent- prefix stripped.
-      3. $LOGNAME env var, agent- prefix stripped (Claude Code hook context
-         populates $LOGNAME but not $USER).
-      4. pwd.getpwuid(os.getuid()).pw_name, agent- prefix stripped.
-      5. Empty string (hook will see no matching DMs — safe).
-
-    Username layers (USER, LOGNAME, pwd) return the raw username if it doesn't
-    start with `agent-` — caller (multi-agent mode) must validate via
-    counterparts list.
-    """
-    if config is None:
-        config = _load_config()
-    name = config.get("agent_name", "").strip()
-    if name:
-        return name
-
-    def _strip_agent_prefix(username: str) -> str:
-        if username.startswith("agent-"):
-            return username[len("agent-"):]
-        return username
-
-    for envvar in ("USER", "LOGNAME"):
-        username = os.environ.get(envvar, "").strip()
-        if username:
-            return _strip_agent_prefix(username)
-
-    try:
-        username = pwd.getpwuid(os.getuid()).pw_name
-        if username:
-            return _strip_agent_prefix(username)
-    except KeyError:
-        pass
-
-    return ""
+    """Resolve this agent's own name. See _prompthooklib.get_agent_name."""
+    return _get_agent_name_impl(config, ENGRAM_HOME)
 
 
 def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
@@ -274,18 +263,17 @@ def _fetch_dm_updates(config: dict, agent_name: str, since: int) -> dict:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
-def _emit_context(text: str) -> None:
-    """Emit an additionalContext block on stdout (the UserPromptSubmit channel)."""
-    print(json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": text,
-        }
-    }))
+# _emit_context now lives in _prompthooklib (gh#1680 slice 1); imported above.
 
 
 def main() -> None:
+    # ── Prologue-lib gate (gh#1680 slice 1) ───────────────────────────────────
+    # If _prompthooklib somehow failed to import, _load_config/_get_agent_name/
+    # _emit_context are unavailable -- degrade to a silent no-op, matching
+    # every other best-effort import in this hook's prologue.
+    if not _PROMPTHOOKLIB_OK:
+        sys.exit(0)
+
     # ── Read stdin payload (session_id for drift throttle) ────────────────────
     try:
         hook_input = json.load(sys.stdin)

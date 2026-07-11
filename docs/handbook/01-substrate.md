@@ -520,9 +520,9 @@ Seed nodes:
 
 ## **25. Selftest & CI Integration**
 
-**what** — `selftest.py` runs pytest against tests/ directory; wrapper script that checks for pytest availability and delegates. CI runs via .github/workflows/tests.yml (expensive full suite, MASTER-ONLY to save GitHub Actions quota on free tier; cheaper scrub gates run on every PR).
+**what** — `selftest.py` runs pytest against tests/ directory; wrapper script that checks for pytest availability and delegates. CI runs via .github/workflows/tests.yml (expensive full suite, MAIN-ONLY to save GitHub Actions quota on free tier; cheaper scrub gates run on every PR).
 
-**how** — `selftest.py` (lines 1–62): checks `importlib.util.find_spec("pytest")`, runs `pytest tests/ ...` with optional `-q` (quiet). CI workflow (tests.yml): on master PR/push, runs `pytest tests/ forum/tests/ -v --tb=short` in py3.11/3.12 matrix. Env var ENGRAM_NO_EMBEDDINGS=1 skips embedding model download (~500MB).
+**how** — `selftest.py` (lines 1–62): checks `importlib.util.find_spec("pytest")`, runs `pytest tests/ ...` with optional `-q` (quiet). CI workflow (tests.yml): on main PR/push, runs `pytest tests/ forum/tests/ -v --tb=short` in py3.11/3.12 matrix. Env var ENGRAM_NO_EMBEDDINGS=1 skips embedding model download (~500MB).
 
 **status-candidate** — **prod-presumed** (active test runner; infrastructure solid).
 

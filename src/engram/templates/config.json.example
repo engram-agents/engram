@@ -28,7 +28,6 @@
   "memory": {
     "decay_base": 1.014,
     "current_turn": 0,
-    "tier1_max_nodes": 200,
     "tier2_max_nodes": 1000
   },
 

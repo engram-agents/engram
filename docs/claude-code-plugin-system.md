@@ -17,16 +17,19 @@
 
 ## TL;DR — the one rule
 
-**For our install, the marketplace SOURCE tree IS the live code.** Edit a file in
-`~/.engram/marketplace/plugins/engram/` and it is what actually runs — there is no
-separate "installed copy" to push to. The cache directory is bookkeeping, not the
-live path. (The repo workflow deploys via `tools/install-local-marketplace.sh`,
-which rebuilds that tree from `src/` — see §9; direct edits to the marketplace tree
-also run, useful only for one-off testing.) Consequences (full table in §5):
+**For our install, the marketplace SOURCE tree is the live code — for hooks,
+skills, and tools.** Edit a file in `~/.engram/marketplace/plugins/engram/` and it
+is what actually runs for those; the cache directory is bookkeeping for them. **The
+one exception is AGENTS (sub-agents / fairies): they load from the cache snapshot,
+NOT source** (live-verified #1639) — an agent-spec edit is inert until a cache
+refresh. (The repo workflow deploys via `tools/install-local-marketplace.sh`, which
+rebuilds that tree from `src/` — see §9; direct edits to the marketplace tree also
+run, useful only for one-off testing.) Consequences (full table in §5):
 
 | You edit… | Goes live… |
 |---|---|
 | hook / tool / skill code | **immediately** (re-read per invocation; no `/plugin update`) |
+| **agent spec (`agents/*.md`)** | after **`/plugin marketplace update` + `/reload-plugins`** (agents load from the cache snapshot, not source — #1639) |
 | `server.py` (MCP) | after a `/mcp` reconnect or restart (process is from session start) |
 | `hooks.json` *registration* (add/remove a hook) | after a **full Claude Code restart** |
 
@@ -42,16 +45,20 @@ A Claude Code marketplace is registered with a `source` whose *type* decides how
 the plugin is loaded:
 
 - **`directory`** (what we use) — Claude Code sets the marketplace's
-  `installLocation` to **the source path itself** and loads the plugin **in
-  place**. No copy is made; the source tree is the runtime.
+  `installLocation` to **the source path itself** and loads *most* components in
+  place: no copy is made for hooks/skills/tools; the source tree is their runtime.
+  **Agents are the exception** — the plugin's separate `installPath`
+  (`installed_plugins.json`) still points at a **cache snapshot**, and agent specs
+  load from *there*, not source (§4/§6, live-verified #1639).
 - **`git` / `github`** — Claude Code **clones** the marketplace into
-  `~/.claude/plugins/marketplaces/<name>/` (a copy) and loads from *that* cache.
-  This is the cache-based model the public docs implicitly describe.
+  `~/.claude/plugins/marketplaces/<name>/` (a copy) and loads *everything* from
+  *that* cache. This is the cache-based model the public docs implicitly describe.
 
-So "is the cache live?" has no single answer — **it depends on the source type.**
-Official/distributed plugins (git) → cache is live. Ours (directory) → source is
-live, cache is bookkeeping. Conflating the two is the confusion that caused the
-v0.1.4 incident (§10).
+So "is the cache live?" has no single answer — **it depends on the source type
+AND the component.** Official/distributed plugins (git) → cache is live for all.
+Ours (directory) → source is live for hooks/skills/tools, but the **cache is still
+live for agents**. Conflating "directory = source-live for everything" is the
+confusion that caused the v0.1.4 incident (§10) *and* the #1639 agent-MCP outage.
 
 ## 2. Our configuration (the lever)
 
@@ -78,10 +85,13 @@ Claude Code sets the env var **`CLAUDE_PLUGIN_ROOT` to the plugin root**, which 
 a directory install **resolves to the source tree**
 (`~/.engram/marketplace/plugins/engram/`). All plugin components are found by
 convention *under that root* — `hooks/`, `skills/`, `agents/`, `tools/`,
-`output-styles/`, `templates/`, and the `.mcp.json` launcher. There is one root and
-everything hangs off it, which is why
-the source-is-live property is **uniform across component types**, not a
-per-component quirk.
+`output-styles/`, `templates/`, and the `.mcp.json` launcher. `CLAUDE_PLUGIN_ROOT`
+governs loading for hooks/skills/tools (source-live). **But `CLAUDE_PLUGIN_ROOT` is
+NOT the load path for agents** (§4): sub-agent definitions are registered from the
+plugin's `installPath` cache snapshot, so the source-is-live property is **NOT
+uniform across component types** — agents are a genuine per-component exception
+(live-verified #1639). Root-by-convention determines where a component *lives*, not
+whether Claude Code loads it from source vs. cache.
 
 `plugin.json` itself lists no component paths — name/version/description/author
 only — so resolution is purely convention-based under the root.
@@ -92,12 +102,17 @@ only — so resolution is purely convention-based under the root.
 |---|---|---|
 | **Hooks** | ✅ yes | **live-verified** — instrumented every copy, fired a real prompt; only the source-tree copy logged, with `CLAUDE_PLUGIN_ROOT` = source |
 | **Skills** | ✅ yes | **live-verified** — every Skill load prints "Base directory … `/…/marketplace/plugins/engram/skills/…`" |
-| **Agents / tools / output-styles / templates** | yes | **inferred** — same `CLAUDE_PLUGIN_ROOT`=source resolution; not independently fired |
+| **Agents (sub-agents / fairies)** | ❌ **NO — cache-loaded** | **live-verified (#1639, 2026-07-02)** — agent definitions are registered from the plugin **`installPath`** (a `~/.claude/plugins/cache/.../<version>/` snapshot), **NOT** from source. A source-only edit never activates: a fresh dream-fairy carried the stale-cache spec (pre-#1551, single-prefix) until `/plugin marketplace update` + `/reload-plugins`, after which a probe confirmed the new spec live. **This is the one component where `CLAUDE_PLUGIN_ROOT`=source does NOT govern loading.** |
+| **Tools / output-styles / templates** | yes | **inferred** — same `CLAUDE_PLUGIN_ROOT`=source resolution; not independently fired |
 | **MCP server** | path = source | **inferred** — `.mcp.json` launches via `${CLAUDE_PLUGIN_ROOT}/launch-engram-server.sh`; the running *process* is not introspectable from the agent |
 
-The two "inferred" rows follow from the *same* verified mechanism (one root, by
-convention) — but per §8 they are inference, not live proof. Close the gap by
-live-verifying if a deploy ever behaves unexpectedly.
+The remaining "inferred" rows (tools/output-styles/templates, MCP-server-path)
+follow from the *same* verified mechanism (one root, by convention) — but per §8
+they are inference, not live proof. Close the gap by live-verifying if a deploy
+ever behaves unexpectedly. **The Agents row was exactly such a case:** it was
+"inferred: yes-from-source" until #1639 live-verified it is actually
+cache-loaded — the opposite of the inference. Treat the remaining inferred rows
+with that cautionary precedent.
 
 (Note: Claude Code **slash commands** like `/reload-plugins` are CC built-ins, not
 file-based plugin components — our plugin ships no `commands/` directory, so they
@@ -108,26 +123,42 @@ are out of scope for the source-loading mechanism above.)
 | You change… | Detected at | Live after | Reload needed? |
 |---|---|---|---|
 | Hook code (`hooks/*.py`) | next prompt | next prompt | **No** — hot-reloads (re-read per invocation). **live-proven** |
-| Skill / agent code | next invocation | next invocation | Probably no (hot-reload); `/reload-plugins` forces it if a stale read appears |
+| Skill code | next invocation | next invocation | No — hot-reloads from source (re-read per invocation). **live-proven** |
+| **Agent code (`agents/*.md`)** | — | **after cache refresh + reload** | **Yes — `/plugin marketplace update` + `/reload-plugins`.** Agents are cache-loaded (§4), so a source edit is inert until the cache snapshot is refreshed; a full restart also works but is heavier. **live-proven (#1639)** |
 | Tool code (`tools/*.py`) | next call | next call | No |
 | `server.py` / MCP code | — | next `/mcp` reconnect or session | **Yes** — `/mcp` reconnect (lighter) or restart; the process is from session start, so its path is source but it doesn't hot-reload |
 | `.mcp.json` launcher | session start | next session | Yes — restart |
 | **`hooks.json` registration** (add/remove a hook) | **session start** | **next session** | **Yes — full Claude Code restart.** This is the v0.1.4 lever (§10) |
 | Shared-bin CLIs (`/home/agents-shared/bin/{baton,ia,forum}`) | — | on refresh | **Separate copies** — not the plugin tree; refresh independently |
 
-**`/reload-plugins`** (surfaced in the docs review) applies plugin changes without
-a full restart — useful as a forcing function if a skill/agent edit ever fails to
-hot-reload. It does **not** substitute for the MCP reconnect or the `hooks.json`
-restart.
+**`/reload-plugins`** applies plugin changes without a full restart. For **agents**
+it is **required** (paired with `/plugin marketplace update`, which refreshes the
+cache snapshot agents load from — §4/§6), not merely a forcing function. For
+skills/tools (source-live) it is only a forcing function if a hot-reload ever fails.
+It does **not** substitute for the MCP reconnect; for a `hooks.json` *registration*
+change it reloaded hooks in-session in the #1639 case, but a full restart remains
+the conservative fallback (that specific case is not independently re-verified).
 
-## 6. The cache & `installed_plugins.json` — bookkeeping, not the live path
+## 6. The cache & `installed_plugins.json` — bookkeeping for MOST, live for AGENTS
 
-`~/.claude/plugins/cache/.../<version>/` holds version snapshots, and
-`~/.claude/plugins/installed_plugins.json` pins an `installPath`. **For a directory
-source these are version bookkeeping, NOT what loads.** (`installPath` for a
-directory source points back at the source dir.) For a git source they *would* be
-the live path — which is exactly why the distinction matters: the same files mean
-different things depending on the source type.
+Two different fields, two different targets — do not conflate them (this conflation
+was the root of the #1639 mis-inference):
+
+- **Marketplace `installLocation`** (`known_marketplaces.json`) for a `directory`
+  source = **the source dir itself** (verified: `/home/<agent>/.engram/marketplace`).
+  This is what `CLAUDE_PLUGIN_ROOT` resolves to, and hooks/skills/tools load from it —
+  **source-live.**
+- **Plugin `installPath`** (`installed_plugins.json`) = a **cache snapshot dir**
+  (verified: `~/.claude/plugins/cache/engram-local/engram/<version>/`), **NOT** the
+  source dir. It advances only on `/plugin marketplace update`.
+
+For hooks/skills/tools the cache snapshot is **version bookkeeping, NOT what loads**
+(they load from `installLocation`=source). **But AGENTS load from the `installPath`
+cache snapshot** (§4, live-verified #1639) — so for agents the cache is the live path,
+exactly as it is for a *git*-source plugin. That is why a stale cache silently served
+a pre-fix agent spec until the snapshot was refreshed. The earlier claim here —
+"`installPath` for a directory source points back at the source dir" — was **wrong**:
+it points at a cache snapshot, and for agents that snapshot is authoritative.
 
 ## 7. The build restructures paths (don't assume `src/` layout)
 
@@ -166,6 +197,10 @@ forum thread #189.
 
 - **Shipped a hook/skill/tool fix?** → `tools/install-local-marketplace.sh` rebuilds
   the source tree (= live). Done; it's live next prompt. No `/plugin update`.
+- **Shipped an agent-spec fix (`agents/*.md`)?** → rebuild, then **`/plugin
+  marketplace update engram-local` + `/reload-plugins`** — agents load from the cache
+  snapshot, NOT source (§4/§6), so a rebuild alone is inert. Verify by dispatching the
+  agent and confirming its tools; a stale-cache agent fails *silently* (#1639).
 - **Shipped a `server.py` change?** → rebuild, then `/mcp` reconnect (or restart).
 - **Added/removed a hook (touched `hooks.json`)?** → rebuild, then **full restart**.
   `install-local-marketplace.sh` prints a `⚠️ HOOK REGISTRATION CHANGED` banner.

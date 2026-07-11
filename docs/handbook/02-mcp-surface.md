@@ -101,8 +101,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: test_axiom_definition_conjecture.py
 
 **6. engram_derive** — Multi-premise inference.
-- **contract**: `{claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids, use_stale]}`
-- **guards**: hard block BLOCKED_TAINTED on retracted premises; soft block BLOCKED_STALE on superseded premises (MECH-5 guard); `use_stale` parameter bypasses soft-block only (gated by bool type-check at line 4195 post-#872 to prevent "false" string bypass); taint-cascade on retract; stale-cascade on supersede; reasoning_type must be in REASONING_TYPES dict
+- **contract**: `{claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids, use_stale, use_contested]}`
+- **guards**: hard block BLOCKED_TAINTED on retracted premises (no override); soft block BLOCKED_STALE on superseded premises and soft block BLOCKED_CONTRADICTED on premises sitting on an open unresolved contradiction (MECH-5 guard, #1654); `use_stale` and `use_contested` each bypass their own soft-block only, independently (a premise that is both stale and contested requires both overrides — clearing one does not clear the other); both gated by bool type-check to prevent "false" string bypass; taint-cascade on retract; stale-cascade on supersede; `contradict` itself stays cascade-free (block-new-only, cascade rides resolution); `use_contested` auto-stamps `metadata.built_on_contested` (never author-supplied); reasoning_type must be in REASONING_TYPES dict
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (confidence-computation model per SKILL.md §2.3)
 - **tests**: test_derive_reasoning_types.py, test_cascade_semantics.py, test_stale_replacement_dict.py
@@ -384,7 +384,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ## Zombie Hunt Findings *(fairy claims — credibility-discounted per header; re-verify in accuracy pass)*
 
 - (b) unused payload fields: NONE claimed — all field validation via explicit `_<TOOL>_FIELDS` frozensets with unknown-field rejection (post-#872: distributed in server.py ~1305+, previously line 5405–5409 in the monolith).
-- (c) guard bypass params: ONE — `use_stale` in engram_derive; intentional, bool-type-gated (line 4195 post-#872), audit-marked `metadata.built_on_stale`.
+- (c) guard bypass params: TWO — `use_stale` and `use_contested` (#1654) in engram_derive; both intentional, bool-type-gated, audit-marked (`metadata.built_on_stale` / `metadata.built_on_contested` respectively; the latter auto-stamped by the override path only, never author-supplied).
 - (d) undiscoverable tools: NONE claimed (all 49 in SKILL.md).
 - (e) success-shaped error paths: NONE claimed (uniform `{"error": ...}` shape).
 - (f) multi-arg stragglers: NONE — 49/49 on payload_json (or no-arg). **Wave-3 migration complete** (mechanical, trustworthy).
@@ -406,4 +406,4 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 | destructiveHint True | 4 |
 | Test coverage claim | **VOID — fabricated filenames found; re-derive mechanically** |
 | Multi-arg regressed tools | 0 *(mechanical)* |
-| Guard-bypass params | 1 (use_stale, intentional + audited) |
+| Guard-bypass params | 2 (use_stale, use_contested — both intentional + audited) |

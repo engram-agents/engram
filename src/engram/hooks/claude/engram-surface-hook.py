@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -46,7 +47,15 @@ def _resolve_runtime_dir(engram_home: str) -> str:
       3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
          reached only when there is no plugin bundle; covers scatter installs
          that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
+      4. Walk parents from __file__ for the nearest ancestor whose own
+         src/engram/ actually contains engram_client.py, instead of guessing a
+         fixed absolute path (#1712: the fixed guess resolves to the WRONG
+         checkout when this process is running from a git worktree nested
+         under the guessed path, e.g. .claude/worktrees/<id>/ under
+         ~/engram-alpha -- silently shadowing the actually-running copy with
+         a sibling one).
+      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
+         unchanged).
     """
     explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
     if explicit:
@@ -58,7 +67,24 @@ def _resolve_runtime_dir(engram_home: str) -> str:
         return plugin_root
     if os.path.exists(os.path.join(engram_home, "engram_client.py")):
         return engram_home
-    return os.path.expanduser("~/engram-alpha")
+    # Reviewer-fairy blocker (PR #1727): this function is called at bare
+    # module-import time below (`PROJECT_DIR = _resolve_runtime_dir(...)`,
+    # unguarded), so the walk itself must never raise. Path.exists() --
+    # unlike os.path.exists() used at every other rung above -- raises
+    # PermissionError on an unreadable ancestor instead of returning False;
+    # an unhandled exception here would crash the whole hook process at
+    # import time. Same precedent as _hooklib.resolve_tools_dir's own
+    # docstring ("the caller's own import should be wrapped... and degrade
+    # to a silent no-op on failure") -- wrapped here instead of at the call
+    # site so this function keeps its existing never-raises contract.
+    try:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "src" / "engram"
+            if (candidate / "engram_client.py").exists():
+                return str(candidate)
+    except OSError:
+        pass
+    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
 
 
 ENGRAM_HOME = _resolve_engram_home()
@@ -133,7 +159,32 @@ FEELING_NUDGE_MARKER = os.path.join(ENGRAM_HOME, "feeling-nudge-active.json")
 WARM_BRIEFING_PATH = os.path.join(ENGRAM_HOME, "warm-briefing.md")
 ERROR_PATTERNS_PATH = os.path.join(ENGRAM_HOME, "error_patterns.json")
 ERROR_INCIDENTS_PATH = os.path.join(ENGRAM_HOME, "error_incidents.json")
+CORNERSTONE_ANCHORS_PATH = os.path.join(ENGRAM_HOME, "cornerstone_anchors.json")
+CORNERSTONE_ANCHOR_STATE_PATH = os.path.join(ENGRAM_HOME, "cornerstone-anchor-state.json")
 KNOWLEDGE_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
+
+# Cross-prompt cooldown for cornerstone anchors: once a cornerstone fires,
+# suppress it for this many prompts. Prevents the habituation failure — a
+# principle nudge that fires every prompt trains the agent to dismiss it
+# (#1691; same failure class the stop-hook #840/#845 gates solved).
+CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS = 10
+
+# Unified principle-trigger registry (#1698 slice 2) — one registry,
+# four kinds (lesson/cornerstone/axiom/goal), replacing the separate
+# error-incidents + cornerstone-anchors read paths below.
+PRINCIPLE_TRIGGERS_PATH = os.path.join(ENGRAM_HOME, "principle_triggers.json")
+PRINCIPLE_TRIGGER_STATE_PATH = os.path.join(ENGRAM_HOME, "principle-trigger-state.json")
+PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS = 10  # same value as today's CORNERSTONE_ANCHOR_COOLDOWN_PROMPTS
+PRINCIPLE_TRIGGER_CAP = 2  # design doc §3 point 3
+_PRINCIPLE_KIND_PRIORITY = {"lesson": 0, "axiom": 1, "cornerstone": 2, "goal": 3}  # lower = higher priority
+
+# #1698 slice 3 — decay/enactment state shape + effective cooldown (design
+# doc §4). RETIREMENT_CEILING_PROMPTS is the cap on how far a non-axiom
+# principle's effective cooldown can grow via repeated fires-without-
+# enactment; once reached the principle is, in practice, retired from
+# injection (its cooldown almost never clears) but stays in the registry
+# (still "covered" per engram_diagnose's principle_coverage, §4 below).
+RETIREMENT_CEILING_PROMPTS = 160  # design doc §4: "effectively retired"
 
 def get_user_name() -> str:
     """Read primary_user from $ENGRAM_HOME/config.json; fall back to 'the human'."""
@@ -226,6 +277,280 @@ def _get_auto_surface_config() -> dict:
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         return defaults
+
+
+# Surfaced-recency suppression defaults — recall-triggering blueprint §3-P1
+# (issue #1689). Overridden by config.json's `recall_suppression` section,
+# same read pattern as `_get_auto_surface_config`.
+DEFAULT_SUPPRESSION_K = 5   # trailing-prompt window
+DEFAULT_SUPPRESSION_M = 3   # repeat-count threshold before full suppression
+
+# Ledger retention (~/.engram/surface-ledger.json). Two independent bounds,
+# applied together (belt-and-suspenders — either alone would bound growth,
+# combining them tolerates occasional gaps without losing the trailing-k
+# signal): per-session entries older than DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS
+# are dropped, and each session's remaining entries are capped at
+# max(4*k, DEFAULT_LEDGER_RETENTION_ENTRIES) — a safety margin over the
+# configured k so the window read never runs dry on catch-up/out-of-order
+# writes. Sessions with no activity in DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS
+# are dropped entirely, so the ledger doesn't accumulate one entry-set per
+# session forever across the life of the install.
+DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS = 24
+DEFAULT_LEDGER_RETENTION_ENTRIES = 20
+DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS = 48
+
+
+def _get_suppression_config() -> dict:
+    """Read recall_suppression tunables from $ENGRAM_HOME/config.json.
+
+    Returns {k, m} with defaults if config absent / malformed / section
+    missing. Never raises. Same read pattern as _get_auto_surface_config.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_suppression", {})
+        return {
+            "k": int(section.get("k", defaults["k"])),
+            "m": int(section.get("m", defaults["m"])),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _surface_ledger_path() -> str:
+    """Path to the surfaced-recency ledger. Reads the module-level ENGRAM_HOME
+    name at call time (not a frozen module-load-time constant) so tests that
+    override `hook.ENGRAM_HOME` after import (the established pattern in this
+    file's test suite — see e.g. test_surface_hook_attached_packs.py) redirect
+    ledger I/O correctly, same as get_user_name()'s dynamic ENGRAM_HOME read.
+    """
+    return os.path.join(ENGRAM_HOME, "surface-ledger.json")
+
+
+def _read_surface_ledger() -> dict:
+    """Read the surfaced ledger. Any failure → {} (fail-open — the ledger is
+    an advisory cache for render-layer suppression, never a source of truth).
+    """
+    try:
+        with open(_surface_ledger_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def _write_surface_ledger(ledger: dict) -> None:
+    """Best-effort ledger write. Any failure is swallowed — fail-open."""
+    try:
+        path = _surface_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(ledger, f)
+    except Exception:
+        pass
+
+
+def _prune_surface_ledger(
+    ledger: dict, *, now_ts: float, retention_entries: int,
+    entry_max_age_hours: float, session_max_age_hours: float,
+) -> dict:
+    """Prune the ledger: drop inactive sessions, trim each session's entries.
+
+    A session is dropped entirely if its most-recent entry is older than
+    session_max_age_hours (checked against the RAW last entry, before
+    per-entry age filtering — this is what bounds the ledger's total size
+    across the life of the install). Surviving sessions have entries older
+    than entry_max_age_hours dropped, then are capped at the last
+    retention_entries entries.
+    """
+    entry_cutoff = now_ts - (entry_max_age_hours * 3600)
+    session_cutoff = now_ts - (session_max_age_hours * 3600)
+    pruned: dict = {}
+    for sid, entries in ledger.items():
+        if not isinstance(entries, list) or not entries:
+            continue
+        last = entries[-1]
+        last_ts = last.get("ts", 0) if isinstance(last, dict) else 0
+        if last_ts < session_cutoff:
+            continue  # session inactive too long — drop entirely
+        fresh = [e for e in entries if isinstance(e, dict) and e.get("ts", 0) >= entry_cutoff]
+        fresh = fresh[-retention_entries:]
+        if fresh:
+            pruned[sid] = fresh
+    return pruned
+
+
+def _append_surface_ledger_entry(session_id: str, rendered_ids, *, k: int) -> None:
+    """Append this prompt's actually-rendered node ids to the surfaced ledger
+    for session_id, then prune. Best-effort / fail-open throughout — the
+    ledger is an advisory cache; any I/O or parse failure here must never
+    break the hook. See docs/recall-triggering-blueprint.md §3-P1.
+    """
+    try:
+        now_ts = time.time()
+        ledger = _read_surface_ledger()
+        entries = ledger.get(session_id, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"ts": now_ts, "ids": sorted(set(rendered_ids))})
+        ledger[session_id] = entries
+        retention_entries = max(4 * max(int(k), 1), DEFAULT_LEDGER_RETENTION_ENTRIES)
+        ledger = _prune_surface_ledger(
+            ledger,
+            now_ts=now_ts,
+            retention_entries=retention_entries,
+            entry_max_age_hours=DEFAULT_LEDGER_ENTRY_MAX_AGE_HOURS,
+            session_max_age_hours=DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS,
+        )
+        _write_surface_ledger(ledger)
+    except Exception:
+        pass
+
+
+def _get_trailing_window_ids(session_id: str, k: int) -> list:
+    """Return the id-lists of the trailing k ledger entries for session_id.
+
+    [] on any failure or when the session has no history (fail-open — a
+    fresh/unknown session simply renders full-tier, as today).
+    """
+    try:
+        if k <= 0:
+            return []
+        ledger = _read_surface_ledger()
+        entries = ledger.get(session_id, [])
+        if not isinstance(entries, list):
+            return []
+        trailing = entries[-k:]
+        return [
+            e.get("ids", []) for e in trailing
+            if isinstance(e, dict) and isinstance(e.get("ids"), list)
+        ]
+    except Exception:
+        return []
+
+
+def _count_occurrences_in_window(node_id, window) -> int:
+    """Count how many of the trailing-k ledger entries contain node_id."""
+    if not node_id:
+        return 0
+    return sum(1 for ids in window if node_id in ids)
+
+
+def _classify_suppression(count: int, m: int) -> str:
+    """Classify a node's render tier from its prior-occurrence count within
+    the trailing k window (per issue #1689's demotion tiers):
+      0 or 1 prior occurrence  → "full"    (render as today)
+      2 .. m-1 prior occurrences → "others"  (demote to keyword-only)
+      >= m prior occurrences   → "suppress" (don't render at all)
+    """
+    if count <= 1:
+        return "full"
+    if count < m:
+        return "others"
+    return "suppress"
+
+
+def _others_candidate_from_full_entry(entry: dict) -> dict:
+    """Build a matched_meta-shaped candidate (id, recall_keywords, [tainted],
+    [stale]) from a full special/top_claim entry — used when a would-be
+    full-tier render is demoted to the Others (keyword-only) tier.
+    """
+    kw = entry.get("recall_keywords")
+    cand: dict = {
+        "id": entry.get("id"),
+        "recall_keywords": kw if isinstance(kw, list) else None,
+    }
+    w = entry.get("warnings")
+    if w:
+        if w.get("tainted_by"):
+            cand["tainted"] = True
+        if w.get("stale_by"):
+            cand["stale"] = True
+    return cand
+
+
+# Per-prompt injection budget — recall-triggering blueprint §3-P4 (issue
+# #1692). Overridden by config.json's `recall_budget` section, same read
+# pattern as `_get_auto_surface_config` / `_get_suppression_config`.
+#
+# Default is deliberately generous ("current typical render" per the
+# blueprint, with headroom): a dense render (3 specials + 3 top claims + 2
+# not-recalled reservations + 15 Others lines + a handful of attached-pack
+# lines) runs well under 4,000 chars in practice, so 6,000 chars gives
+# comfortable margin without being effectively unlimited. This is the number
+# that makes the backward-compat invariant (default config → byte-identical
+# output to pre-P4) hold structurally rather than by accident.
+DEFAULT_RECALL_BUDGET_TOTAL_CHARS = 6000
+DEFAULT_RECALL_BUDGET_ENABLED = True
+
+
+def _get_budget_config() -> dict:
+    """Read recall_budget tunables from $ENGRAM_HOME/config.json.
+
+    Returns {total_chars, enabled} with defaults if config absent / malformed
+    / section missing. Never raises. Same read pattern as
+    _get_auto_surface_config / _get_suppression_config.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {
+        "total_chars": DEFAULT_RECALL_BUDGET_TOTAL_CHARS,
+        "enabled": DEFAULT_RECALL_BUDGET_ENABLED,
+    }
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("recall_budget", {})
+        return {
+            "total_chars": int(section.get("total_chars", defaults["total_chars"])),
+            "enabled": bool(section.get("enabled", defaults["enabled"])),
+        }
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _budget_try_spend(line_text: str, budget_state: dict) -> bool:
+    """Attempt to spend a rendered line's cost against the remaining budget.
+
+    budget_state is a small mutable dict the caller owns across an entire
+    format_nudge() render:
+      {"remaining": int | None, "exhausted": bool,
+       "chars_rendered": int, "nodes_shown": int, "nodes_cut_budget": int}
+
+    remaining=None means the budget is disabled (unlimited) — every line
+    fits, and only chars_rendered/nodes_shown bookkeeping happens (no cuts
+    are ever recorded). This is the kill-switch path (recall_budget.enabled
+    = False) and is what keeps that path byte-identical to the pre-P4 fixed
+    3/3/15 caps.
+
+    Once exhausted (a line didn't fit), ALL subsequent calls return False —
+    the allocator is a one-way stop, not a skip-ahead-to-find-something-
+    smaller re-ranker (deliberate simplification, see PR body / issue #1692).
+    This is why every remaining tier's candidates still need to be walked by
+    the caller (not early-`break`ed out of): nodes_cut_budget must count every
+    candidate that was eligible to render but didn't fit, across all tiers.
+
+    Cost = len(line_text) + 1, the +1 accounting for the joining "\n" each
+    rendered line contributes when the caller later does "\n".join(lines).
+    """
+    if budget_state["exhausted"]:
+        budget_state["nodes_cut_budget"] += 1
+        return False
+    if budget_state["remaining"] is None:
+        budget_state["chars_rendered"] += len(line_text) + 1
+        budget_state["nodes_shown"] += 1
+        return True
+    cost = len(line_text) + 1
+    if cost > budget_state["remaining"]:
+        budget_state["exhausted"] = True
+        budget_state["nodes_cut_budget"] += 1
+        return False
+    budget_state["remaining"] -= cost
+    budget_state["chars_rendered"] += cost
+    budget_state["nodes_shown"] += 1
+    return True
 
 
 def _get_attached_packs() -> list[dict]:
@@ -544,6 +869,19 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     recall_summary = entry.get("recall_summary")
     recall_keywords = entry.get("recall_keywords")
 
+    # Taint/staleness marker — additive-only: entries with no "warnings" key
+    # (the common case) render byte-identical to prior output.
+    warnings = entry.get("warnings")
+    warn_marker = ""
+    if warnings:
+        tags = []
+        if warnings.get("tainted_by"):
+            tags.append("TAINTED")
+        if warnings.get("stale_by"):
+            tags.append("STALE")
+        if tags:
+            warn_marker = f"⚠ {'/'.join(tags)} "
+
     # Build prefix tokens (conf / type-tag)
     prefix_parts = []
     if type_tag:
@@ -570,19 +908,29 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     else:
         body = claim
 
-    return f"- [{nid}] {prefix}{age_tag}{kw_prefix}{body}"
+    return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}"
 
 
-def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
+def format_nudge(
+    result: dict,
+    pack_results: list[dict] | None = None,
+    session_id: str | None = None,
+    stats: dict | None = None,
+) -> str:
     """Format engram_surface result into a compact nudge string.
 
-    Layout (2026-05-19 redesign):
+    Layout (2026-05-19 redesign; suppression tiers added 2026-07-07, #1689;
+    injection budget added 2026-07-07, #1692):
       1. Header
-      2. Noteworthy: <type counts> (when specials present)
-      3. Specials section (rendered with full content, BEFORE top_claims)
-      4. Top claims section (with keyword+summary format)
-      5. Warnings / Memory / IDs / footer
-      6. Attached-library section (when pack_results is non-empty)
+      2. Suppressed-count line (when this render suppressed ≥1 node)
+      3. Noteworthy: <type counts> (when specials present)
+      4. Specials section (rendered with full content, BEFORE top_claims)
+      5. Top claims section (with keyword+summary format)
+      6. Worth revisiting: not-recalled-recently reservation (when a
+         special/top_claim slot was freed — by suppression or by fewer than
+         3 nodes qualifying naturally)
+      7. Warnings / Memory / Others / IDs / footer
+      8. Attached-library section (when pack_results is non-empty)
 
     Types: line dropped — Noteworthy already conveys the type breakdown for
     specials, and when no specials are present the Types line is stats-noise.
@@ -590,43 +938,263 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     pack_results: list of node dicts from _query_attached_packs(), each tagged
     with 'pack_id'. Omitted or empty → section not rendered (zero-packs invariant:
     byte-identical output to prior behavior when no packs are configured).
+    Pack lines are NOT counted against the injection budget below — same
+    "separate provenance" discipline #1689 already applied to suppression.
+
+    session_id: recall-triggering blueprint §3-P1 surfaced-ledger suppression
+    (issue #1689). When None (the legacy call shape — every pre-existing
+    caller/test in this repo omits it), suppression is disabled entirely: every
+    candidate classifies as "full" tier and the not-recalled reservation never
+    fires, so output is byte-identical to pre-suppression behavior (this is
+    the "zero-suppression invariant" this file's tests pin). When a session_id
+    is provided (main() always passes one), nodes surfaced ≥2 times in the
+    trailing k prompts for this session demote to Others-tier or suppress
+    entirely — render-layer only, matching/ranking are untouched. This
+    function owns the ledger read (to compute tiers) AND the ledger write (to
+    record what was actually rendered) — see docs/recall-triggering-blueprint.md
+    §3-P1 for the design.
+
+    Injection budget (recall-triggering blueprint §3-P4, issue #1692):
+    node-line candidates across ALL tiers (Specials → Top claims → not-
+    recalled reservation → Others, the existing fixed tier-priority order)
+    are rendered against a single global per-prompt character budget
+    (config.json `recall_budget.total_chars`; `recall_budget.enabled` is a
+    kill switch). The existing fixed per-tier caps (3 specials / 3 top
+    claims / ≤2 reservations / 15 Others) are UNCHANGED — the budget is an
+    additional gate applied within those caps, not a replacement for them,
+    and it never re-sorts: each tier's candidates are walked in their
+    existing (already relevance-sorted upstream) order, and the first
+    candidate that doesn't fit the remaining budget trips a one-way
+    "exhausted" flag — every later candidate, in this tier and every
+    subsequent tier, is cut too (never re-checked against a since-freed
+    budget, never skipped-past in search of a smaller one that would fit).
+    This is a deliberate simplification: engram_query.py does not surface a
+    per-candidate relevance score to this render layer, so this function
+    treats "existing arrival order" as the relevance signal instead of
+    inventing a synthetic composite score — see the PR body for the full
+    rationale. Structural header/footer lines (Noteworthy, section titles,
+    Warnings, Memory, the trailing "Use engram_inspect..." line, the
+    suppressed-count line) are NOT counted against the budget — only the
+    variable-length per-candidate node lines are, since those are what scale
+    with match volume. Budget-cut candidates are dropped entirely (never
+    demoted to Others — Others is itself budget-gated) and are NOT recorded
+    in the surfaced ledger (the agent never actually saw them).
+    Default config (recall_budget absent, or enabled=True with the generous
+    default total_chars) is byte-identical to pre-#1692 output for any
+    realistically-sized render — the default is sized well above what the
+    existing fixed caps can ever produce. `recall_budget.enabled=False` is
+    the explicit kill switch: every candidate is treated as unlimited-budget
+    (structurally identical to the pre-#1692 code path).
+
+    stats: optional caller-owned dict, mutated in place (out-parameter) with
+    render telemetry for the engram.surface.render_size event (issue #1692):
+    {budget_enabled, budget_total_chars, budget_exhausted, chars_rendered,
+    nodes_shown, nodes_suppressed, nodes_cut_budget}. Populated even on the
+    total==0 early-return (all zeroed / budget config echoed) so callers can
+    rely on the dict shape unconditionally. None (the default) skips
+    telemetry entirely — no behavior change, matches the pack_results /
+    session_id optional-param precedent above.
     """
+    budget_cfg = _get_budget_config()
+    if stats is not None:
+        stats.clear()
+        stats.update({
+            "budget_enabled": budget_cfg["enabled"],
+            "budget_total_chars": budget_cfg["total_chars"] if budget_cfg["enabled"] else None,
+            "budget_exhausted": False,
+            "chars_rendered": 0,
+            "nodes_shown": 0,
+            "nodes_suppressed": 0,
+            "nodes_cut_budget": 0,
+        })
+
     total = result.get("match_count", 0)
     if total == 0:
         return ""
 
+    # --- Suppression setup ---------------------------------------------
+    suppression_active = session_id is not None
+    sup_cfg = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    window: list = []
+    if suppression_active:
+        sup_cfg = _get_suppression_config()
+        window = _get_trailing_window_ids(session_id, sup_cfg["k"])
+
+    def _tier_for(nid) -> str:
+        if not suppression_active or not nid:
+            return "full"
+        count = _count_occurrences_in_window(nid, window)
+        return _classify_suppression(count, sup_cfg["m"])
+
+    # --- Budget setup -------------------------------------------------
+    # remaining=None when recall_budget.enabled=False (the kill switch) —
+    # unlimited: every candidate fits, matching the pre-#1692 fixed-cap
+    # behavior exactly.
+    budget_state = {
+        "remaining": budget_cfg["total_chars"] if budget_cfg["enabled"] else None,
+        "exhausted": False,
+        "chars_rendered": 0,
+        "nodes_shown": 0,
+        "nodes_cut_budget": 0,
+    }
+
     lines = []
     lines.append(f"[ENGRAM Recall: {total} nodes match your query]")
 
+    rendered_ids_this_prompt: set = set()
+    suppressed_ids: set = set()
+    demoted_candidates: list[dict] = []
+    # Nodes that were eligible (full-tier or Others-tier) in one section but
+    # got cut by the budget rather than rendered. Kept SEPARATE from
+    # rendered_ids_this_prompt (which must stay ledger-accurate — a
+    # budget-cut node was never actually seen, so it must never be written
+    # to the surfaced ledger) but still needs to exclude the node from being
+    # re-evaluated (and re-counted as a SECOND cut) by a later section that
+    # also considers it — e.g. a budget-cut top claim that's also present in
+    # matched_meta would otherwise fall through to the Others pool and get
+    # counted twice. See PR #1701 round-1 review + its double-count follow-up.
+    budget_cut_ids: set = set()
+
     # Special nodes — rendered BEFORE top_claims
     special = result.get("special_nodes", [])
+    special_rendered_count = 0
     if special:
         from collections import Counter
+        # Noteworthy reflects the ORIGINAL matched special set (match
+        # composition), not the post-suppression render count — a demoted/
+        # suppressed special is still "noteworthy" in kind.
         type_counts_special = Counter(n.get("type", "unknown") for n in special)
         parts = [f"{c} {t}" for t, c in type_counts_special.items()]
         lines.append(f"  Noteworthy: {', '.join(parts)}")
-        lines.append("  Specials:")
+        special_lines = []
         # Defensive [:3] — engram_surface already caps specials at 3 (server.py:5269),
         # but the slice here protects against any future surface payload that returns more.
         for s in special[:3]:
-            line = render_one_node_line(s, conf_prefix=True, type_tag=True)
-            lines.append(f"    {line}")
+            nid = s.get("id")
+            tier = _tier_for(nid)
+            if tier == "full":
+                line = render_one_node_line(s, conf_prefix=True, type_tag=True)
+                rendered_line = f"    {line}"
+                if _budget_try_spend(rendered_line, budget_state):
+                    special_lines.append(rendered_line)
+                    rendered_ids_this_prompt.add(nid)
+                    special_rendered_count += 1
+                else:
+                    # eligible (full-tier) but budget-cut — dropped, not
+                    # demoted, not marked "seen" (agent never saw this
+                    # line), but still excluded from Others below so it's
+                    # not re-evaluated and double-counted as a second cut.
+                    budget_cut_ids.add(nid)
+            elif tier == "others":
+                demoted_candidates.append(_others_candidate_from_full_entry(s))
+            else:  # "suppress"
+                suppressed_ids.add(nid)
+        if special_lines:
+            lines.append("  Specials:")
+            lines.extend(special_lines)
 
     # Top claims (keyword+summary format)
     top_claims = result.get("top_claims", [])
+    top_claims_rendered_count = 0
     if top_claims:
-        lines.append("  Top claims:")
+        top_claim_lines = []
         # Defensive [:3] — engram_surface already caps top_claims at 3 (server.py:5296);
         # same future-proofing as above.
         for c in top_claims[:3]:
-            line = render_one_node_line(c, conf_prefix=True, type_tag=False)
-            lines.append(f"    {line}")
+            nid = c.get("id")
+            tier = _tier_for(nid)
+            if tier == "full":
+                line = render_one_node_line(c, conf_prefix=True, type_tag=False)
+                rendered_line = f"    {line}"
+                if _budget_try_spend(rendered_line, budget_state):
+                    top_claim_lines.append(rendered_line)
+                    rendered_ids_this_prompt.add(nid)
+                    top_claims_rendered_count += 1
+                else:
+                    # eligible (full-tier) but budget-cut — dropped, not
+                    # demoted, not marked "seen" (agent never saw this
+                    # line), but still excluded from Others below so it's
+                    # not re-evaluated and double-counted as a second cut.
+                    budget_cut_ids.add(nid)
+            elif tier == "others":
+                demoted_candidates.append(_others_candidate_from_full_entry(c))
+            else:  # "suppress"
+                suppressed_ids.add(nid)
+        if top_claim_lines:
+            lines.append("  Top claims:")
+            lines.extend(top_claim_lines)
+
+    matched_meta = result.get("matched_meta") or []
+
+    # --- Not-recalled slot reservation (recall-triggering blueprint §3-P1,
+    # second lever) — reserve up to 2 of the special/top_claim slots freed by
+    # suppression above, OR simply left empty because fewer than 3 nodes
+    # qualified naturally, for the top-ranked matches from
+    # age.not_recalled_recently. Full-tier quality needs confidence /
+    # recall_summary / created_ago, which matched_meta does not carry
+    # (id, type, recall_keywords[, tainted, stale] only) — so these render at
+    # Others (keyword-only) quality with a distinguishing section header
+    # instead of inventing fields that don't exist upstream.
+    reserved_lines: list[str] = []
+    if suppression_active:
+        freed_slots = max(0, 3 - special_rendered_count) + max(0, 3 - top_claims_rendered_count)
+        reserve_n = min(2, freed_slots)
+        if reserve_n > 0:
+            not_recalled_ids = result.get("age", {}).get("not_recalled_recently", [])
+            if isinstance(not_recalled_ids, list):
+                meta_by_id = {m.get("id"): m for m in matched_meta}
+                already_placed = (
+                    rendered_ids_this_prompt | suppressed_ids
+                    | {d.get("id") for d in demoted_candidates}
+                )
+                for nid in not_recalled_ids:
+                    if len(reserved_lines) >= reserve_n:
+                        break
+                    # No early exit on budget_state["exhausted"] here (unlike
+                    # the reserve_n cap above): _budget_try_spend's own
+                    # contract (see its docstring) is that nodes_cut_budget
+                    # counts every candidate that reaches it post-exhaustion,
+                    # not just the first. Breaking early here would silently
+                    # undercount cuts for every remaining eligible candidate
+                    # (PR #1701 round-1 review finding — reproduced empirically:
+                    # 15 eligible Others candidates, budget for 3, undercounted
+                    # 12 cuts as 1). Eligibility filtering below is cheap
+                    # (dict lookups, no I/O) so walking the full list even
+                    # once budget is spent is not a real cost concern.
+                    if not nid or nid in already_placed:
+                        continue
+                    if _tier_for(nid) == "suppress":
+                        continue
+                    meta = meta_by_id.get(nid)
+                    if not meta:
+                        continue  # no metadata available upstream — skip, don't invent fields
+                    kw = meta.get("recall_keywords")
+                    if not (isinstance(kw, list) and len(kw) >= 1):
+                        continue  # no keywords — no recognition value, matches Others discipline
+                    kw_str = " · ".join(f"`{k}`" for k in kw)
+                    tags = []
+                    if meta.get("tainted"):
+                        tags.append("TAINTED")
+                    if meta.get("stale"):
+                        tags.append("STALE")
+                    marker = f"⚠ {'/'.join(tags)} " if tags else ""
+                    reserved_line = f"    - {marker}[{nid}] {kw_str}"
+                    if not _budget_try_spend(reserved_line, budget_state):
+                        already_placed.add(nid)
+                        budget_cut_ids.add(nid)
+                        continue
+                    reserved_lines.append(reserved_line)
+                    rendered_ids_this_prompt.add(nid)
+                    already_placed.add(nid)
+        if reserved_lines:
+            lines.append("  Worth revisiting (not recalled recently):")
+            lines.extend(reserved_lines)
 
     # Age / issues
     age = result.get("age", {})
     issues = result.get("issues", {})
-    stale = issues.get("stale_count", 0) if isinstance(issues, dict) else 0
-    tainted = issues.get("tainted_count", 0) if isinstance(issues, dict) else 0
+    stale = issues.get("stale_nodes", 0) if isinstance(issues, dict) else 0
+    tainted = issues.get("tainted_nodes", 0) if isinstance(issues, dict) else 0
     if stale or tainted:
         parts = []
         if stale:
@@ -645,24 +1213,71 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
     # (no-keywords nodes provide no recognition value in skim, just noise).
     # Keywords-only (no summary) gives the agent a faceted index for "which of
     # these should I inspect" while preserving the lossy-by-design noetic-register.
-    rendered_ids = {s.get("id") for s in special[:3]} | {c.get("id") for c in top_claims[:3]}
-    matched_meta = result.get("matched_meta") or []
-    others = [m for m in matched_meta if m.get("id") not in rendered_ids]
+    #
+    # Suppression tiers apply here too (issue #1689 §3-P1: "Specials follow
+    # the same rule" — so do Others candidates): a node hitting the suppress
+    # threshold is dropped even from keyword-only tier; demoted specials/
+    # top_claims are merged into this same pool, at the same keyword-required
+    # discipline as natural Others candidates.
+    excluded_from_others = (
+        rendered_ids_this_prompt | suppressed_ids
+        | {d.get("id") for d in demoted_candidates}
+        | budget_cut_ids
+    )
+    others_candidates: list[dict] = []
+    for m in matched_meta:
+        mid = m.get("id")
+        if mid in excluded_from_others:
+            continue
+        if _tier_for(mid) == "suppress":
+            suppressed_ids.add(mid)
+            continue
+        others_candidates.append(m)
+    others_candidates.extend(demoted_candidates)
     # Filter to nodes with at least 1 keyword; drop bare-ID entries entirely
     # (per the maintainer issue #234 Findings 1+2): no-keywords nodes provide
     # no recognition value in skim, just noise.
     others_with_kw = [
-        m for m in others
+        m for m in others_candidates
         if isinstance(m.get("recall_keywords"), list)
         and len(m.get("recall_keywords") or []) >= 1
     ]
-    if others_with_kw:
+    # Budget-gated render pass. Built into a separate list first (rather than
+    # appending straight to `lines`) so the "  Others:" header — like
+    # "  Specials:" / "  Top claims:" above — is only emitted when at least
+    # one Others candidate actually survived the budget, never as an empty
+    # header (which the pre-budget code could never produce, since
+    # others_with_kw truthiness and "will anything render" were the same
+    # question before #1692).
+    others_rendered_lines: list[str] = []
+    others_rendered_ids: set = set()
+    for m in others_with_kw[:15]:
+        # No early exit on budget_state["exhausted"]: this slice is already
+        # bounded at 15 AND already fully eligibility-filtered (keyword +
+        # non-suppressed), so every remaining item genuinely would render if
+        # budget allowed — _budget_try_spend's nodes_cut_budget count relies
+        # on being called for each of them post-exhaustion, not just the
+        # first (PR #1701 round-1 review finding — see the reservation loop
+        # above for the same fix + fuller rationale).
+        mid = m.get("id", "?")
+        kw = m.get("recall_keywords") or []
+        kw_str = " · ".join(f"`{k}`" for k in kw)
+        # Taint/staleness marker — same compact style as render_one_node_line
+        # (§2); additive-only, omitted for clean entries.
+        tags = []
+        if m.get("tainted"):
+            tags.append("TAINTED")
+        if m.get("stale"):
+            tags.append("STALE")
+        others_marker = f"⚠ {'/'.join(tags)} " if tags else ""
+        others_line = f"    - {others_marker}[{mid}] {kw_str}"
+        if not _budget_try_spend(others_line, budget_state):
+            continue
+        others_rendered_lines.append(others_line)
+        others_rendered_ids.add(mid)
+    if others_rendered_lines:
         lines.append("  Others:")
-        for m in others_with_kw[:15]:
-            mid = m.get("id", "?")
-            kw = m.get("recall_keywords") or []
-            kw_str = " · ".join(f"`{k}`" for k in kw)
-            lines.append(f"    - [{mid}] {kw_str}")
+        lines.extend(others_rendered_lines)
     elif not (special or top_claims or others_with_kw):
         # No content rendered yet — fall back to the legacy flat IDs line so
         # the digest is never silently empty when matches exist.
@@ -672,7 +1287,8 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
 
     # Attached-library section — appended AFTER all own-graph content.
     # Only rendered when pack results exist; zero packs → section omitted
-    # entirely, preserving byte-identical output to current behavior.
+    # entirely, preserving byte-identical output to current behavior. Pack
+    # content is out of scope for suppression (#1689) — separate provenance.
     if pack_results:
         lines.append("  From attached libraries (read-only — cite, never import):")
         for pr in pack_results:
@@ -685,6 +1301,45 @@ def format_nudge(result: dict, pack_results: list[dict] | None = None) -> str:
         lines.append("    (pack nodes: deep-read via engram-pkg --pkg <path> inspect <id> — engram_inspect reads own-graph only)")
 
     lines.append("  Use engram_inspect(node_id) for details, engram_get_subgraph for full chains.")
+
+    # Suppressed-count line — inserted right after the header (index 1) so
+    # it's the first thing noticed, honesty-about-lossiness per §3-P1. Only
+    # rendered when this render actually suppressed ≥1 node (zero-suppression
+    # invariant: absent whenever nothing was suppressed, same discipline as
+    # this file's zero-packs invariant).
+    if suppression_active and suppressed_ids:
+        lines.insert(1, f"  (+{len(suppressed_ids)} recently shown — engram_surface for full list)")
+
+    # --- Ledger write: record what was ACTUALLY rendered this prompt -----
+    # (specials/top_claims full-tier + not-recalled reservation + Others,
+    # at whatever tier each landed — suppressed ids are intentionally
+    # excluded, so a suppressed node's occurrence count naturally decays out
+    # of future trailing-k windows once its last real rendering ages out).
+    if suppression_active:
+        # Must match the render set above, not the pre-budget candidate set
+        # (others_with_kw[:15]) — recording ids the budget cut would mark
+        # them "seen" when the agent never actually saw them, silently
+        # inflating their occurrence count toward demotion/suppression
+        # before a single real rendering. Same discipline as the pre-#1692
+        # slice-must-match-render-slice fix (Kepler's #1697 colleague-review
+        # catch), now extended to the budget cut too (#1692).
+        all_rendered_ids = rendered_ids_this_prompt | others_rendered_ids
+        all_rendered_ids.discard(None)
+        _append_surface_ledger_entry(session_id, all_rendered_ids, k=sup_cfg["k"])
+
+    # --- Stats out-parameter: final telemetry for engram.surface.render_size
+    # (issue #1692). chars_rendered/nodes_shown/nodes_cut_budget come from
+    # budget_state (populated as lines were gated above); nodes_suppressed
+    # is the #1689 suppression count (independent of the budget).
+    if stats is not None:
+        stats.update({
+            "budget_exhausted": budget_state["exhausted"],
+            "chars_rendered": budget_state["chars_rendered"],
+            "nodes_shown": budget_state["nodes_shown"],
+            "nodes_suppressed": len(suppressed_ids),
+            "nodes_cut_budget": budget_state["nodes_cut_budget"],
+        })
+
     return "\n".join(lines)
 
 
@@ -844,48 +1499,398 @@ def check_error_patterns(prompt: str) -> str:
     return "\n".join(warnings)
 
 
-def check_incident_tripwire(matched_ids: list) -> str:
-    """Check if any engram_surface matched IDs are error incident observations.
+def check_principle_triggers(matched_ids: list, prompt_count: int) -> str:
+    """Unified principle-trigger check (#1698 slice 2) — one registry, four
+    kinds (lesson/cornerstone/axiom/goal), replacing the separate
+    check_incident_tripwire + check_cornerstone_anchor.
 
-    Reads $ENGRAM_HOME/error_incidents.json (maps incident obs IDs → lesson info).
-    When a matched node is an incident, surfaces the lesson's scaffolding_nudge.
+    Byte-compatibility requirement: lesson and cornerstone renderings must
+    stay IDENTICAL to their pre-unification format — both are load-bearing
+    in existing transcripts/tests. Axiom and goal are new kinds with no
+    prior rendering to preserve; they use the design doc's generic
+    "[Principle trigger (...)]" register-tagged form.
 
-    This is the primary tripwire mechanism (incident-based architecture):
-    - Incidents are written in task-level language → semantically matchable
-    - Lessons are abstract patterns → surfaced via graph edge, not direct match
-    - More incidents linked to a lesson = more matching surface area
+    #1698 slice 3 note: this remains a thin string-only wrapper around
+    `check_principle_triggers_full` on PURPOSE — slice 2's own test suite
+    (test_principle_triggers_registry.py §5) locks down `result == expected`
+    / `result.split(...)` / `"x" in result` against a plain string return.
+    The slice-3 design doc §3 suggestion to have this function itself return
+    `(text, rendered)` would have broken all 7 of those byte-compat tests;
+    `check_principle_triggers_full` (below) carries the richer pair for the
+    one caller (this file's `main()`) that needs `rendered` for
+    `engram.trigger.fire` telemetry.
+    """
+    text, _rendered = check_principle_triggers_full(matched_ids, prompt_count)
+    return text
+
+
+def check_principle_triggers_full(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+    """Same check as `check_principle_triggers`, but also returns the
+    `rendered` list (`[(kind, principle_id, entry, matched_trigger_id), ...]`)
+    of everything that actually fired this call -- the #1698 slice-3 caller
+    (`main()`) uses this to emit one `engram.trigger.fire` telemetry event
+    per rendered firing without re-deriving the cap/cooldown decision.
     """
     if not matched_ids:
-        return ""
+        return "", []
+    try:
+        return _check_principle_triggers_inner(matched_ids, prompt_count)
+    except Exception:
+        # Runs on every prompt — a malformed cache must degrade to
+        # silence, never break the hook (same contract as the function
+        # this replaces).
+        return "", []
+
+
+def _effective_cooldown(kind: str, state_entry: dict) -> int:
+    """#1698 slice 3, design doc §4 decay math.
+
+    Fork-2 (forum #229/#230/#231, Kepler-confirmed): `kind == "axiom"` is
+    exempt from decay -- it KEEPS the flat base cooldown forever (never
+    grows, never retires) but is still cooldown-suppressed between fires.
+    The other three kinds (lesson/cornerstone/goal) grow their effective
+    cooldown exponentially per UN-PROMPTED ENACTMENT (`enactments` on the
+    principle's own state entry, incremented by `_check_enactments` in
+    engram-utility-credit-mention-stop.py when the practice recurs without a
+    recent trigger fire) -- i.e. internalization drives decay, not the other
+    way around. (Colleague-review catch, Ariadne, PR #1717: the previous
+    wording "per firing-without-enactment" named the opposite driver -- a
+    future "fix" toward that wrong docstring would have decayed the
+    principle you keep ignoring instead of the one you've internalized.)
+    Capped at RETIREMENT_CEILING_PROMPTS.
+    """
+    base = PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS
+    if kind == "axiom":
+        return base
+    enactments = state_entry.get("enactments", 0) if isinstance(state_entry, dict) else 0
+    try:
+        enactments = int(enactments)
+    except (TypeError, ValueError):
+        enactments = 0
+    # Reviewer-fairy flag (PR #1717): clamp BEFORE exponentiating, not just
+    # after via min(). A corrupted/huge `enactments` value (e.g. hand-edited
+    # state file) would otherwise force Python to build an enormous integer
+    # before the min() ever applies -- a hang/memory spike in a hook whose
+    # contract is "never crash, never block a prompt." 8 is already past the
+    # point (2**5 * base=10 -> 320 > RETIREMENT_CEILING_PROMPTS=160) where a
+    # larger exponent changes nothing, so this clamp never affects legitimate
+    # values.
+    enactments = min(max(enactments, 0), 8)
+    return min(base * (2 ** enactments), RETIREMENT_CEILING_PROMPTS)
+
+
+def _migrate_bare_int_entries(state: dict) -> None:
+    """In-place upconvert any bare-int entry (slice-2 shape: last_fired_prompt
+    only) to the rich slice-3 dict shape. Reviewer-fairy flag (PR #1725):
+    factored out of two identical inline loops (the outer snapshot read and
+    the write-back's fresh re-read under the lock) -- both live in this same
+    module/scope, so unlike the cross-process `_with_state_lock` duplication
+    there's no import-surface constraint justifying two live copies of the
+    same logic here."""
+    for pid, entry in list(state.items()):
+        if isinstance(entry, int):
+            state[pid] = {
+                "last_fired_prompt": entry,
+                "strength": 1.0,
+                "enactments": 0,
+                "fires": 0,
+            }
+
+
+def _with_state_lock(lock_path, fn):
+    """Run fn() (a read-modify-write closure) while holding an exclusive,
+    BLOCKING flock on lock_path. Unlike #1709's non-blocking pattern, this
+    one blocks -- the critical section is a fast local file read+write (no
+    daemon round-trip), so a brief wait is cheap and correctness (no lost
+    update) matters more than never-block here. Degrades to running fn()
+    unlocked if fcntl/lockfile-open fails (non-POSIX, permissions) -- same
+    never-crash contract as #1709's degrade path, just without the
+    non-blocking contention branch (there's nothing to suppress; fn() still
+    runs, just unprotected).
+
+    #1720: this exact ~15-line helper is duplicated in engram_core.py
+    (the MCP server process) rather than shared -- this hook script (a
+    separate subprocess invoked by Claude Code) and engram_core.py have no
+    shared import surface today, and a new shared module for ~15 lines isn't
+    worth the engineering (see spec
+    docs/specs/1720-principle-state-write-race.md). If either copy changes,
+    check the other.
+    """
+    try:
+        import fcntl
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception as exc:
+        # #1743: this degrade was silent -- nothing distinguished "locked and
+        # protected" from "running unlocked," the same diagnosis-costing gap
+        # #1737/#1742 fixed for the non-blocking cooldown lock. Emit one
+        # never-block/never-raise stderr tell (hook/server stderr goes to logs,
+        # not the model, so it is safe on every call) so a fallback-to-unlocked
+        # -- which leaves fn()'s read-modify-write unprotected against a lost
+        # update -- leaves a trace instead of being invisible. (#1742's
+        # state-file-flag half does not map onto this generic helper, which has
+        # no access to fn()'s state dict; the stderr line is the proportionate
+        # tell here.) Kept byte-identical with the sibling copy (surface-hook /
+        # engram_core) per the #1720 sync note above -- if one changes, change
+        # the other.
+        try:
+            import sys
+            print(
+                f"[engram _with_state_lock] flock degraded to UNLOCKED "
+                f"({lock_path}): {type(exc).__name__}: {exc} -- read-modify-write "
+                f"is unprotected; a concurrent write may be lost",
+                file=sys.stderr,
+            )
+        except Exception:
+            pass
+        return fn()  # degrade: run unlocked rather than crash or skip
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)  # blocking -- no LOCK_NB
+        return fn()
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tuple[str, list]:
+    try:
+        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+            registry = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Deviation from design doc §2's literal "fallback to legacy":
+        # slice 1's rebuild is additive and runs at the same 3 sites the
+        # legacy caches already rebuild from, so this file is realistically
+        # only absent in the brief window right after an upgrade before any
+        # lesson/cornerstone/axiom/goal edge write has happened -- and in
+        # that window the legacy caches would also be empty of anything
+        # meaningful. Returning "" here (rather than re-implementing a
+        # parallel legacy read path) is a simplification; flagging this
+        # explicitly for reviewer/Kepler to confirm or override, since the
+        # design doc's literal words say "fallback to legacy."
+        return "", []
+    if not registry or not isinstance(registry, dict):
+        return "", []
+
+    # Reverse view: a matched ID that IS a principle's own node ID (not a
+    # trigger) also fires -- mirrors today's by_cornerstone reverse lookup,
+    # generalized across all four kinds. Reviewer-fairy flag (PR #1713):
+    # pre-unification, only cornerstones had this reverse lookup
+    # (check_incident_tripwire had no equivalent for lessons); unification
+    # widens direct-ID firing to lesson/axiom/goal too. This is intentional
+    # (the registry doesn't distinguish "reached via trigger" from "reached
+    # via own ID" per kind) but wasn't called out as a flagged deviation at
+    # write time -- documented here as the third one alongside sec2.2/sec2.3
+    # in the spec, with `test_fires_on_direct_lesson_id` covering the
+    # previously-untested lesson-kind path (test_fires_on_direct_cornerstone_id
+    # already covered cornerstone).
+    # #1731: registry values are now LISTS of entries (a dual-role trigger
+    # node has one entry per principle it triggers, no longer collapsed to
+    # one via last-spec-wins). Tolerate an old-shape single-dict entry too
+    # (lazy-read shim) — a registry file written before this fix deploys and
+    # not yet rebuilt looks like {trigger_id: {...}} rather than
+    # {trigger_id: [{...}]}.
+    def _entry_list(raw):
+        if raw is None:
+            return []
+        return raw if isinstance(raw, list) else [raw]
+
+    by_principle = {}
+    for raw_entries in registry.values():
+        for entry in _entry_list(raw_entries):
+            pid = entry.get("principle_id", "")
+            if pid:
+                by_principle.setdefault(pid, entry)
 
     try:
-        with open(ERROR_INCIDENTS_PATH, "r") as f:
-            index = json.load(f)
+        with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            state = {}
     except (FileNotFoundError, json.JSONDecodeError):
-        return ""
+        state = {}
 
-    if not index:
-        return ""
+    # #1698 slice 3 §1.1 — migration on read: a bare int entry is the
+    # slice-2 shape (last_fired_prompt only). Upconvert in memory here;
+    # the rich dict shape gets written back naturally the next time this
+    # function actually stamps state below (lazy, idempotent upgrade-on-
+    # touch, same spirit as slice 1's cache migration shim). Every state
+    # entry present in the file is normalized here, not just ones that fire
+    # this call, so a state write later in this same call persists the
+    # upgraded shape for the whole file, not just the touched principles.
+    _migrate_bare_int_entries(state)
 
-    warnings = []
-    seen_lessons = set()
+    # Gather all candidates that matched AND are past their EFFECTIVE
+    # cooldown (#1698 slice 3 §1.2 — decay math replaces the flat
+    # PRINCIPLE_TRIGGER_COOLDOWN_PROMPTS comparison), deduped per
+    # principle_id (one firing per principle per prompt -- same semantics
+    # as today's `fired`/`seen_lessons` sets, now shared across all four
+    # kinds since it's one registry).
+    candidates = []  # list of (kind, principle_id, entry, matched_via)
+    seen_principles = set()
     for mid in matched_ids:
-        if mid in index:
-            entry = index[mid]
-            lesson_id = entry.get("lesson_id", "")
-            if lesson_id in seen_lessons:
-                continue  # Don't repeat the same lesson
-            seen_lessons.add(lesson_id)
-            nudge = entry.get("scaffolding_nudge", "")
-            lesson_claim = entry.get("lesson_claim", "")
-            if nudge:
-                warnings.append(
-                    f"[ENGRAM Tripwire ({lesson_id}): {lesson_claim}]\n"
-                    f"  Action: {nudge}\n"
-                    f"  (Triggered by incident match: {mid})"
-                )
+        # #1731: a dual-role trigger now yields MULTIPLE entries (e.g. one
+        # exemplifies-lesson entry AND one instantiates-axiom entry for the
+        # same node) — iterate all of them per matched trigger instead of
+        # picking just one, so a dual-role node's lesson tripwire can no
+        # longer be silently shadowed by its axiom role. The existing
+        # priority sort + cap below (unchanged) arbitrates exactly as it
+        # already does across different triggers matched in one prompt.
+        raw = registry.get(mid)
+        entries = _entry_list(raw) if raw is not None else (
+            [by_principle[mid]] if mid in by_principle else []
+        )
+        for entry in entries:
+            pid = entry.get("principle_id", "")
+            if not pid or pid in seen_principles:
+                continue
+            kind = entry.get("kind", "")
+            state_entry = state.get(pid)
+            if not isinstance(state_entry, dict):
+                state_entry = {}
+            last = state_entry.get("last_fired_prompt")
+            effective_cooldown = _effective_cooldown(kind, state_entry)
+            if (
+                isinstance(last, (int, float))
+                and last <= prompt_count
+                and (prompt_count - last) < effective_cooldown
+            ):
+                continue
+            seen_principles.add(pid)
+            candidates.append((kind, pid, entry, mid))
 
-    return "\n".join(warnings)
+    if not candidates:
+        return "", []
+
+    # Priority sort (lesson > axiom > cornerstone > goal), cap total to 2.
+    # NOTE this is a real behavior change for lessons, which previously had
+    # NO cross-prompt cooldown (only per-fire dedup) -- unification means
+    # lessons now share the same fixed cooldown as cornerstones did. This
+    # is what design doc §6 means by "v1 fixed cooldown carried over" --
+    # carried over to ALL kinds, not just cornerstone. Flagging explicitly
+    # since it changes observed lesson-tripwire cadence.
+    #
+    # Filter to known kinds BEFORE the cap slice (Ariadne's colleague-review
+    # catch on PR #1713, corroborating the reviewer-fairy's own flag): the
+    # render loop's `else: continue` only skips producing a line for an
+    # unrecognized kind -- it doesn't stop that candidate from consuming a
+    # cap slot or getting cooldown-stamped, since both happen against
+    # `rendered` unconditionally. Filtering here fixes it properly instead of
+    # relying on the render-loop guard alone. Latent today (registry only
+    # ever writes the 4 known kinds); matters if a 5th kind is ever added.
+    candidates = [c for c in candidates if c[0] in _PRINCIPLE_KIND_PRIORITY]
+    if not candidates:
+        return "", []
+    candidates.sort(key=lambda c: _PRINCIPLE_KIND_PRIORITY[c[0]])
+    rendered = candidates[:PRINCIPLE_TRIGGER_CAP]
+
+    lines = []
+    for kind, pid, entry, mid in rendered:
+        claim = entry.get("claim", "")
+        nudge = entry.get("nudge", "") or claim
+        if kind == "lesson":
+            # BYTE-COMPATIBLE with pre-unification check_incident_tripwire.
+            # mid here is the incident/trigger ID (was `mid` in old code).
+            lines.append(
+                f"[ENGRAM Tripwire ({pid}): {claim}]\n"
+                f"  Action: {nudge}\n"
+                f"  (Triggered by incident match: {mid})"
+            )
+        elif kind == "cornerstone":
+            # BYTE-COMPATIBLE with pre-unification check_cornerstone_anchor.
+            lines.append(f"[Cornerstone anchor ({pid})]: {nudge}")
+        elif kind == "axiom":
+            lines.append(f"[Principle trigger ({pid}, constraining)]: {claim} → Constraint: {nudge}")
+        elif kind == "goal":
+            lines.append(f"[Principle trigger ({pid}, directional)]: {claim} → Serves: {nudge}")
+        else:
+            # Unreachable in practice: `candidates` is now pre-filtered to
+            # known kinds above, before the cap slice. Kept as a
+            # belt-and-suspenders backstop (an unrecognized kind must not
+            # produce a garbage line even if the upstream filter is ever
+            # bypassed) -- the real fix for cap-slot/cooldown consumption is
+            # the pre-filter, per Ariadne's colleague-review catch on #1713.
+            continue
+
+    # Stamp cooldown ONLY for what actually rendered (top 2 after the cap) --
+    # a cap-bumped candidate stays eligible next prompt rather than being
+    # suppressed for a firing it never got to make. Matches old code's
+    # semantics (`for cid in fired: state[cid] = prompt_count` where `fired`
+    # was exactly the rendered set).
+    #
+    # #1698 slice 3 §1.1/§1.3: stamp the RICH shape (last_fired_prompt +
+    # fires incremented; strength/enactments carried over or defaulted).
+    # `engram.trigger.fire` telemetry (one emission per rendered principle)
+    # is intentionally NOT emitted here -- design doc §1.3 / spec §1.3
+    # prefers the call-site placement in main() (hook_input/the existing
+    # `_emitter` singleton are already in scope there; this function stays a
+    # pure `(matched_ids, prompt_count) -> (text, rendered)` function with no
+    # session_id/transcript_path threading). The caller emits from `rendered`.
+    #
+    # #1720: the write-back runs under a blocking `_with_state_lock`, and
+    # re-reads the state file FRESH from disk inside the lock rather than
+    # reusing the `state` snapshot read at the top of this function -- a
+    # concurrent server-side `_reset_principle_enactments` call (engram_core.py,
+    # MCP server process) could have landed between that snapshot read and
+    # now; merging this call's updates onto the stale snapshot would silently
+    # clobber that reset (the lost-update race this spec fixes). The
+    # cooldown/decay DECISION above (which principles matched, `rendered`)
+    # still comes from the snapshot read -- only the write-back needs
+    # exclusivity with the other writer (see spec's "Why NOT #1709's
+    # non-blocking-suppress pattern").
+    def _write_back():
+        try:
+            with open(PRINCIPLE_TRIGGER_STATE_PATH, "r") as f:
+                fresh_state = json.load(f)
+            if not isinstance(fresh_state, dict):
+                fresh_state = {}
+        except (FileNotFoundError, json.JSONDecodeError):
+            fresh_state = {}
+
+        # Re-apply the same bare-int-entry upconversion (§1.1) done on the
+        # snapshot read above -- that migrated copy isn't reused here (it may
+        # be stale relative to a concurrent writer), so this freshly-read
+        # copy needs its own migration pass to preserve the existing
+        # opportunistic whole-file-migrates-on-any-write behavior.
+        _migrate_bare_int_entries(fresh_state)
+
+        for _kind, pid, _entry, _mid in rendered:
+            existing = fresh_state.get(pid)
+            if not isinstance(existing, dict):
+                existing = {"strength": 1.0, "enactments": 0, "fires": 0}
+            existing["last_fired_prompt"] = prompt_count
+            existing["fires"] = existing.get("fires", 0) + 1
+            existing.setdefault("strength", 1.0)
+            existing.setdefault("enactments", 0)
+            fresh_state[pid] = existing
+
+        try:
+            # Additional #1720 hardening, found during self-review: this
+            # write was a direct `open(...,'w')` even pre-#1720 (unlike
+            # _reset_principle_enactments's tmp+os.replace) -- fine before,
+            # because the lock now held here means no COOPERATING writer can
+            # interleave, but a concurrent snapshot READ (the one at the top
+            # of this function, which deliberately stays outside the lock)
+            # could still observe a torn/truncated file mid-write and
+            # degrade to an empty state, risking a spurious re-fire. Switch
+            # to tmp+os.replace so a reader never sees a partial write,
+            # matching the convention already used by _reset_principle_
+            # enactments and by _write_state in the sibling in_turn_recall
+            # state file.
+            tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(fresh_state, f)
+            os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
+        except OSError:
+            pass  # state write failure -> worst case an early re-fire; never block
+
+    _with_state_lock(str(PRINCIPLE_TRIGGER_STATE_PATH) + ".lock", _write_back)
+
+    return "\n".join(lines), rendered
 
 
 def format_nap_warning(count: int) -> str:
@@ -1007,14 +2012,52 @@ def main():
     # Build context parts
     parts = []
 
-    # Cognitive tripwire — incident-based matching (primary) or keyword fallback
+    # Unified principle-trigger check (#1698 slice 2) — one registry, four
+    # kinds (lesson/cornerstone/axiom/goal), replacing the separate
+    # check_incident_tripwire + check_cornerstone_anchor calls.
     matched_ids = result.get("matched_ids", []) if result else []
-    tripwire = check_incident_tripwire(matched_ids)
-    if not tripwire:
-        # Fallback to keyword matching when no incident matches found
-        tripwire = check_error_patterns(prompt)
-    if tripwire:
-        parts.append(tripwire)
+    principle_triggers, _principle_rendered = check_principle_triggers_full(
+        matched_ids, counter["prompts_since_compaction"]
+    )
+    if not principle_triggers:
+        # Preserve the semantic-keyword fallback for lessons specifically --
+        # this is independent of the incident-index match and must survive
+        # unification unchanged (design doc doesn't mention it; it's Locus-3
+        # semantic-content matching, orthogonal to the trigger registry).
+        principle_triggers = check_error_patterns(prompt)
+        _principle_rendered = []  # keyword fallback has no registry firing to emit telemetry for
+    if principle_triggers:
+        parts.append(principle_triggers)
+
+    # #1698 slice 3 §1.3 — engram.trigger.fire telemetry, one emission per
+    # rendered principle firing. Call-site placement (spec's preferred
+    # option): reuses the `_emitter` singleton already initialized above
+    # (Emitter.init is documented idempotent, but reusing avoids a second
+    # construction) and keeps check_principle_triggers_full a pure
+    # (matched_ids, prompt_count) -> (text, rendered) function with no
+    # hook_input/session_id threading of its own.
+    if _principle_rendered:
+        try:
+            sys.path.insert(0, ENGRAM_HOME)
+            from engram_log_emitter import Emitter
+            _emitter3 = Emitter.init(
+                session_id=hook_input.get("session_id", "unknown"),
+                transcript_path=hook_input.get("transcript_path", ""),
+            )
+            for _kind, _pid, _entry, _mid in _principle_rendered:
+                _emitter3.emit(
+                    event_type="engram.trigger.fire",
+                    level=1,
+                    data={
+                        "principle_id": _pid,
+                        "kind": _kind,
+                        "trigger_id": _mid,
+                        "prompt_seq": counter["prompts_since_compaction"],
+                    },
+                )
+        except Exception:
+            # Emitter failures must not break the hook — drop silently.
+            pass
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a
@@ -1116,8 +2159,17 @@ def main():
         pack_results = []
 
     # ENGRAM recall nudge
+    # _render_stats stays {} unless format_nudge actually runs (result is
+    # not None) — see the engram.surface.render_size emission below, which
+    # gates on this dict being non-empty.
+    _render_stats: dict = {}
     if result is not None:
-        nudge = format_nudge(result, pack_results=pack_results)
+        nudge = format_nudge(
+            result,
+            pack_results=pack_results,
+            session_id=hook_input.get("session_id", "unknown"),
+            stats=_render_stats,
+        )
         if nudge:
             parts.append(nudge)
         elif pack_results:
@@ -1151,6 +2203,29 @@ def main():
             "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
         )
         parts.append("\n".join(pack_lines))
+
+    # Emit engram.surface.render_size event for the structured event log
+    # (recall-triggering blueprint §3-P4, issue #1692). Mirrors the
+    # engram.surface.fire emission above: same Emitter singleton (idempotent
+    # re-init), same best-effort/never-raise failure-mode contract. Only
+    # fires when format_nudge actually ran (_render_stats non-empty) — see
+    # its out-parameter docstring for why an untouched {} means "skipped".
+    if _render_stats:
+        try:
+            sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
+            from engram_log_emitter import Emitter
+            _emitter2 = Emitter.init(
+                session_id=hook_input.get("session_id", "unknown"),
+                transcript_path=hook_input.get("transcript_path", ""),
+            )
+            _emitter2.emit(
+                event_type="engram.surface.render_size",
+                level=1,
+                data=dict(_render_stats),
+            )
+        except Exception:
+            # Emitter failures must not break the hook — drop silently.
+            pass
 
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()

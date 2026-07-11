@@ -108,6 +108,25 @@ LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")
 # Must match USE_ALPHA["mention"] in server.py. Action: "mention". Tier 2 — moderate engagement.
 ALPHA_MENTION = 0.10
 
+# #1698 slice 3 §2 — enactment detection (mention-proxy). Paths mirror the
+# unified principle-trigger registry/state that engram-surface-hook.py owns
+# (same $ENGRAM_HOME, same filenames — this Stop hook reads them, never
+# rebuilds them).
+PRINCIPLE_TRIGGERS_PATH = os.path.join(ENGRAM_HOME, "principle_triggers.json")
+PRINCIPLE_TRIGGER_STATE_PATH = os.path.join(ENGRAM_HOME, "principle-trigger-state.json")
+
+# Open question resolved (spec §2, option (a)): this Stop hook is a
+# different process/event (Stop) from the surface hook (UserPromptSubmit)
+# and has no shared in-memory counter. The surface hook already persists
+# prompts_since_compaction to this exact file on every prompt
+# (read_prompt_counter/write_prompt_counter in engram-surface-hook.py) so it
+# survives the per-prompt subprocess boundary — reuse it here (read-only)
+# rather than inventing a second counter that could drift from the surface
+# hook's.
+PROMPT_COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")
+
+_ENACTMENT_WINDOW_PROMPTS = 10  # "no trigger fire... within the last k prompts" (design doc §4)
+
 
 def bump_utility(
     node_ids,
@@ -236,11 +255,127 @@ def collect_turn_text(transcript_path: str, last_assistant_message: str) -> str:
     return "\n".join(parts)
 
 
+def _read_prompt_count(path: str = PROMPT_COUNTER_PATH) -> int:
+    """Read the CURRENT prompts_since_compaction counter (#1698 slice 3 §2).
+
+    Reads $ENGRAM_HOME/prompt-counter.json — the same file
+    engram-surface-hook.py's read_prompt_counter()/write_prompt_counter()
+    already maintain across every UserPromptSubmit fire. This Stop hook runs
+    as a separate process on a separate hook event and has no in-memory
+    access to the surface hook's counter; reusing its persisted file (read-
+    only) is the resolved answer to the spec's open question — never invent
+    a second counter that could drift from the surface hook's.
+
+    Returns 0 on any missing/malformed file (fail-open — worst case an
+    enactment is judged eligible/ineligible against a stale-zero counter,
+    never a crash).
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return int(data.get("prompts_since_compaction", 0))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return 0
+
+
+def _write_state_atomic(path: str, state: dict) -> None:
+    """tmp + os.replace write, matching the hooks' own atomic-write pattern
+    (#1698 slice 3 §2/§3) so a concurrent reader never sees a partial write.
+    Raises on failure — callers (here, `_check_enactments`'s own caller in
+    `credit_mentions`) wrap this in a best-effort try/except, per this file's
+    house rule that behavioral hooks must never block the session.
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def _emit_enactment(
+    principle_id: str,
+    prompt_count: int,
+    *,
+    session_id: str = "unknown",
+    transcript_path: str = "",
+) -> None:
+    """Emit engram.trigger.enactment telemetry (#1698 slice 3 §4) — same
+    Emitter pattern/failure-mode contract as engram-surface-hook.py's
+    engram.trigger.fire (§1.3): best-effort, drop silently on any failure.
+    """
+    try:
+        from engram_log_emitter import Emitter
+        emitter = Emitter.init(session_id=session_id, transcript_path=transcript_path)
+        emitter.emit(
+            event_type="engram.trigger.enactment",
+            level=1,
+            data={"principle_id": principle_id, "prompt_seq": prompt_count},
+        )
+    except Exception:
+        pass
+
+
+def _check_enactments(
+    mentioned_ids,
+    state_path: str = PRINCIPLE_TRIGGER_STATE_PATH,
+    prompt_count_path: str = PROMPT_COUNTER_PATH,
+    *,
+    session_id: str = "unknown",
+    transcript_path: str = "",
+) -> None:
+    """Mention-proxy enactment detection (design doc §4, v1-implementable
+    proxy). A mentioned node ID that IS a principle_id in the registry, with
+    no trigger fire for that principle in the trailing window, counts as an
+    unprompted enactment: the practice happened without the nudge firing.
+    """
+    try:
+        with open(PRINCIPLE_TRIGGERS_PATH, "r") as f:
+            registry = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+    # #1731: registry values are LISTS of entries (a dual-role trigger node
+    # now gets one entry per principle it triggers). Tolerate an old-shape
+    # single dict too (lazy-read shim, same as the surface hook's consumer).
+    principle_ids = set()
+    for _raw in registry.values():
+        for _e in (_raw if isinstance(_raw, list) else [_raw]):
+            _pid = _e.get("principle_id")
+            if _pid:
+                principle_ids.add(_pid)
+    hits = principle_ids & set(mentioned_ids)
+    if not hits:
+        return
+
+    prompt_count = _read_prompt_count(prompt_count_path)
+    try:
+        with open(state_path, "r") as f:
+            state = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        state = {}
+
+    changed = False
+    for pid in hits:
+        entry = state.get(pid)
+        if isinstance(entry, int):
+            entry = {"last_fired_prompt": entry, "strength": 1.0, "enactments": 0, "fires": 0}
+        if not isinstance(entry, dict):
+            entry = {"last_fired_prompt": 0, "strength": 1.0, "enactments": 0, "fires": 0}
+        last_fired = entry.get("last_fired_prompt", 0)
+        if (prompt_count - last_fired) >= _ENACTMENT_WINDOW_PROMPTS:
+            entry["enactments"] = entry.get("enactments", 0) + 1
+            state[pid] = entry
+            changed = True
+            _emit_enactment(pid, prompt_count, session_id=session_id, transcript_path=transcript_path)
+    if changed:
+        _write_state_atomic(state_path, state)
+
+
 def credit_mentions(
     last_message: str,
     *,
     db_path: str = KNOWLEDGE_DB,
     alpha: float = ALPHA_MENTION,
+    session_id: str = "unknown",
+    transcript_path: str = "",
 ) -> dict:
     """Run the credit-assignment pipeline against `last_message`.
 
@@ -252,6 +387,11 @@ def credit_mentions(
 
     Pure function (no I/O beyond the configured paths) — testable
     independently of stdin parsing.
+
+    session_id/transcript_path (#1698 slice 3): threaded through purely for
+    `engram.trigger.enactment` telemetry attribution (_check_enactments →
+    _emit_enactment). Optional/defaulted so every pre-existing caller in
+    this repo (which omits them) is unaffected.
     """
     stats = {
         "mentioned_count": 0,
@@ -269,6 +409,16 @@ def credit_mentions(
     stats["mentioned_count"] = len(mentioned)
     if not mentioned:
         return stats
+
+    # #1698 slice 3 §2 — enactment detection piggybacked on this existing
+    # mention-parsing pass. Independent of the utility-bump path below (a
+    # bump_utility failure must not skip enactment detection, and vice
+    # versa) — its own try/except, matching this file's per-concern
+    # failure-isolation style.
+    try:
+        _check_enactments(mentioned, session_id=session_id, transcript_path=transcript_path)
+    except Exception as e:
+        _log(f"enactment check failed: {type(e).__name__}: {e}")
 
     try:
         # `mentioned` is already deduplicated in first-occurrence order by
@@ -309,7 +459,7 @@ def main() -> None:
     # with the just-emitted last_assistant_message from stdin.
     turn_text = collect_turn_text(transcript_path, last_message)
 
-    stats = credit_mentions(turn_text)
+    stats = credit_mentions(turn_text, session_id=session_id, transcript_path=transcript_path)
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
     if stats["mentioned_count"] > 0:

@@ -79,13 +79,13 @@ TOOL_SCHEMAS = {
     "engram_add_observation": {
         "description": "Extract and record a claim from a source document with full provenance. Single-payload signature — pass all fields as one JSON object string in payload_json. Required fields inside payload_json: quoted_text, interpretation, claim, quote_type. Source identification: include url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) containing observation fields. Required: quoted_text, interpretation, claim, quote_type (one of hard_data/official_statement/attributed_analysis/counterfactual_inference/unnamed_source/personal_communication/editorial). Optional: url, title, domain, source_date, evidence_id, is_predictive, predicted_event, resolution_timeframe, source_class (external/introspective/user_stated), content_hash, git_sha, standpoint_author_id, standpoint_collection_id, standpoint_override_tag, standpoint_lineage (provider:family, e.g. anthropic:opus — the training-lineage provenance axis), fs_class (re-executable/frozen — falsification-sensitivity; omit to use the quote_type proxy).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) containing observation fields. Required: quoted_text, interpretation, claim, quote_type (one of hard_data/official_statement/attributed_analysis/counterfactual_inference/unnamed_source/personal_communication/editorial). Optional: url, title, domain, source_date, evidence_id, is_predictive, predicted_event, resolution_timeframe, source_class (external/introspective/user_stated), content_hash, git_sha, standpoint_author_id, standpoint_collection_id, standpoint_override_tag, standpoint_lineage (provider:family, e.g. anthropic:opus — the training-lineage provenance axis; marks the EVIDENCE SOURCE that produced the claim, not who authored this node), fs_class (re-executable/frozen — falsification-sensitivity; omit to use the quote_type proxy).", "required": True},
         },
     },
     "engram_add_observation_batch": {
         "description": "Extract multiple observations from a single source in one call. Single-payload signature — pass all fields as one JSON object string in payload_json. Required inside payload_json: observations_json (itself a stringified JSON array of observation objects). Source identification: include url+title to auto-create the evidence node, OR evidence_id to cite an existing one.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with batch fields. Required: observations_json (stringified JSON array; each observation needs quoted_text, interpretation, claim, quote_type — optional: is_predictive, predicted_event, resolution_timeframe, source_class, standpoint_author_id, standpoint_collection_id, standpoint_override_tag, standpoint_lineage (provider:family), fs_class (re-executable/frozen)). Source: url+title OR evidence_id. Optional: domain, source_date, content_hash, git_sha.", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with batch fields. Required: observations_json (stringified JSON array; each observation needs quoted_text, interpretation, claim, quote_type — optional: is_predictive, predicted_event, resolution_timeframe, source_class, standpoint_author_id, standpoint_collection_id, standpoint_override_tag, standpoint_lineage (provider:family; marks the EVIDENCE SOURCE that produced the claim, not who authored this node), fs_class (re-executable/frozen)). Source: url+title OR evidence_id. Optional: domain, source_date, content_hash, git_sha.", "required": True},
         },
     },
     "engram_surface": {
@@ -128,7 +128,7 @@ TOOL_SCHEMAS = {
     "engram_derive": {
         "description": "Create a derived claim by combining evidence from existing nodes. You MUST specify reasoning_type to classify the argument. Types: deductive_modus_ponens (0.98), deductive_modus_tollens (0.98), deductive_hypothetical_syllogism (0.98), deductive_disjunctive (0.98), deductive_reductio (0.98), inductive_generalization (0.95, corroborative), inductive_enumeration (0.93, corroborative), inductive_statistical (0.90), inductive_causal (0.85), inductive_analogy (0.70), abductive_best_explanation (cap 0.80), abductive_elimination (cap 0.90), authority_expert (0.95), authority_consensus (0.98, corroborative). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, supporting_ids, logical_chain.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated 'cites' edges for definitions etc., not derives_from), use_stale (bool — opt-in MECH-5 stale-premise override).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated 'cites' edges for definitions etc., not derives_from), use_stale (bool — opt-in MECH-5 stale-premise override), use_contested (bool — opt-in MECH-5 contradicted-premise override, #1654; set True only when deliberately building on a premise under an open unresolved contradiction, e.g. the derivation that will resolve it; auto-stamps metadata.built_on_contested, never author-supplied), warrant (str — optional Toulmin bridging principle; the general principle that licenses this inference — why do these premises support this claim? Leave blank if logical_chain fully captures it).", "required": True},
         },
     },
     "engram_add_axiom": {
@@ -349,14 +349,46 @@ class EngramClient:
             os.environ["ENGRAM_HOME"] = resolved_dir
 
         # Import fresh — needed if we're running multiple clients
-        # with different db_dirs in the same process. Purge server AND
-        # engram_core as a PAIR (#872 wave 1): the path globals live on
-        # engram_core, and a fresh server importing the CACHED core would
-        # share path state with every prior client — client #2's
-        # _configure_paths would silently redirect client #1's live paths.
-        # Each client gets its own version-coherent server+core module pair.
-        for _mod in ("server", "engram_core"):
-            sys.modules.pop(_mod, None)
+        # with different db_dirs in the same process. Purge server,
+        # engram_core, AND every "family" module (#872 waves 2-9) as one unit
+        # (#1679): the path globals live on engram_core, and each family
+        # module binds its own module-level `core` reference via
+        # `import engram_core as core` (the project's canonical
+        # shared-state-access convention). If a family module is left in
+        # sys.modules while server+engram_core are purged and re-imported,
+        # server.py's re-execution finds the family module ALREADY cached
+        # and reuses it as-is — so that family module's `core` still points
+        # at the FIRST client's now-stale engram_core object, not the fresh
+        # one. Calls that route through a family module (e.g. engram_stats,
+        # engram_observation) would then silently read/write against the
+        # first client's DATA_DIR/DB_PATH instead of this client's.
+        #
+        # Purge by PREFIX ("server" exactly, or any "engram_*" module other
+        # than this module itself) rather than an enumerated list of family
+        # module names. An enumerated list is exactly the shape that caused
+        # #1679: the original purge tuple (server, engram_core) silently fell
+        # out of sync as family modules were added across #872 waves 2-9, and
+        # a hardcoded 14-name list here would fall out of sync again the next
+        # time a 13th family module is added — nothing would catch it, since
+        # nothing derives the list from the modules that actually exist.
+        # Matching by prefix is self-updating: any current or future
+        # engram_* module gets purged and forced to re-bind a fresh `core`
+        # on each new EngramClient instantiation, with no list to maintain.
+        #
+        # Self-exclusion: this __init__ method is executing as code that
+        # lives INSIDE the "engram_client" module. Purging "engram_client"
+        # from sys.modules here would not affect the currently-executing
+        # frame (the function object keeps running), but it would orphan the
+        # cached module — a subsequent `import engram_client` anywhere else
+        # in the process would re-execute the module body and mint a NEW
+        # EngramClient class object, breaking isinstance checks and any
+        # module-level state associated with the original import. The
+        # established prefix-purge pattern elsewhere in this codebase (see
+        # tests/test_scope_export.py's _fresh_server_at helper) carries this
+        # same self-exclusion for the same reason.
+        for _mod in list(sys.modules):
+            if _mod == "server" or (_mod.startswith("engram_") and _mod != "engram_client"):
+                sys.modules.pop(_mod, None)
         import server as _server
 
         # Redirect ALL module-level paths via the centralized function.

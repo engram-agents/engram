@@ -16,7 +16,7 @@ Spot-checked every operational reference against current behavior:
 | Nudges | engram_query, engram_nap, sleep | ✓ current |
 | End of day / Auto sleep | engram-sleep, `cadence.auto_sleep_*`, 3 AM default, window math | ✓ current |
 | Compaction & drowsiness | 4 tiers (refreshed/energetic/a-little-drowsy/needs-a-nap), 4 scaffolds, warm-briefing "Notes from the user" | ✓ current |
-| Upgrading | engram-upgrade, `FORCE=1` refuses non-empty, master/dev tracks | ✓ current |
+| Upgrading | engram-upgrade, `FORCE=1` refuses non-empty, main/dev tracks | ✓ current |
 | Config | viz config tab, `drowsiness_ceiling_tokens`, fairy policies | ✓ current |
 | Cheatsheet (tool list) | engram_inspect/get_subgraph/stats/diagnose/query/nap | ✓ current |
 | Multi-agent appendix | agentctl spawn/finalize-name/session/bash/health/share | ✓ current |

@@ -400,7 +400,7 @@ def _link_about_impl(
             person_id = self_row["id"]
 
         person = conn.execute(
-            "SELECT id, type, is_current FROM nodes WHERE id = ?", (person_id,)
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?", (person_id,)
         ).fetchone()
         if not person:
             return json.dumps({"error": f"Person '{person_id}' not found."})
@@ -427,11 +427,36 @@ def _link_about_impl(
         except sqlite3.IntegrityError:
             created = False  # Edge already exists
 
-        return json.dumps({
+        # --- Stage 2 auto-suggest: special-moment candidate (§4 of person typed schema) ---
+        # After wiring an about-edge, suggest the caller consider adding this node
+        # to the person's special_moments highlights list. Light + rare; decline is
+        # the common case — most about-edges are ordinary. The nudge ensures a real
+        # moment is never missed because the agent forgot the field exists.
+        result: dict = {
             "status": "linked" if created else "already_linked",
             "node_id": node_id,
             "person_id": person_id,
             "relation": "about",
+        }
+
+        # Stage 2 auto-suggest: only for newly-created edges (not redundant re-links).
+        if created and person:
+            person_meta = json.loads(person["metadata"] or "{}")
+            person_name = person_meta.get("name", person_id)
+            result["special_moment_suggestion"] = {
+                "person_id": person_id,
+                "person_name": person_name,
+                "source_node_id": node_id,
+                "message": f"add to {person_name}'s special_moments?",
+                "how": (
+                    "call engram_add_special_moment with {person_id, "
+                    "node_id (use this source_node_id), description "
+                    "(your read of the moment)}"
+                ),
+            }
+
+        return json.dumps({
+            **result,
         })
     finally:
         conn.close()
@@ -502,12 +527,33 @@ def _remove_edge_impl(
         # Best-effort cache rebuild for the exemplifies side-effect surface.
         # Outside the transaction so a JSON-write failure can't roll back the
         # edge delete. Mirrors engram_lesson_register_incident's pattern.
+        # Both hot-path caches (lesson incidents + cornerstone anchors,
+        # #1691) resync so the generic edge tools can't strand either.
         cache_rebuild = None
         if relation == "exemplifies":
             try:
                 cache_rebuild = core._rebuild_incidents_cache()
             except Exception as exc:
                 cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal
+        if relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
+        # NOTE (#1698 slice 3 §3, flagged for reviewer): NOT calling
+        # core._reset_principle_enactments() here on purpose — this is
+        # _remove_edge_impl, so this rebuild fires on an edge REMOVAL, not a
+        # new exemplar/incident registration. Resetting enactments to 0
+        # ("full strength") on a removal would contradict the reset-on-
+        # incident design intent (§3: reset happens when NEW evidence is
+        # recorded, not when an edge is undone). The reset call is wired
+        # only at the ADD-side call sites: engram_epistemic.py's
+        # _register_exemplar_impl, this file's _add_edge_impl below, and
+        # engram_tasks.py's serves-edge site.
 
         result = {
             "status": "removed",
@@ -676,6 +722,22 @@ def _add_edge_impl(
                 cache_rebuild = core._rebuild_incidents_cache()
             except Exception as exc:
                 cache_rebuild = {"status": "error", "detail": str(exc)}
+            try:
+                core._rebuild_cornerstone_anchors_cache()
+            except Exception:
+                pass  # best-effort; anchor staleness is non-fatal (#1691)
+        if relation in ("exemplifies", "instantiates", "serves", "tensions"):
+            try:
+                core._rebuild_principle_triggers()  # unified registry (#1698)
+            except Exception:
+                pass  # best-effort
+            # Reset-on-incident (#1698 slice 3 §3): this generic edge-add is
+            # itself the "new trigger edge just written" event for whichever
+            # of the four kinds `target_id` is — full strength again.
+            try:
+                core._reset_principle_enactments(target_id)
+            except Exception:
+                pass  # best-effort; never fail edge creation on this
 
         result = {
             "status": "created",

@@ -219,7 +219,7 @@ def main():
                         help="Path to .scan-leaks-local.json for personal-pattern gate. "
                              "Default: <source>/.scan-leaks-local.json if present.")
     parser.add_argument("--author", default=None,
-                        help='Author for the release commit, e.g. "Lei Shi <lei@example.com>". '
+                        help='Author for the release commit, e.g. "Jane Doe <jane@example.com>". '
                              "Default: parsed from LICENSE copyright line.")
     parser.add_argument("--push", action="store_true",
                         help="Push the branch + tag to target's origin after commit. Default: off.")

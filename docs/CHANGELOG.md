@@ -9,9 +9,74 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-_Nothing yet — changes land here after the v0.2.0-rc2 cut._
+_Nothing yet — changes land here after the v0.3.0-rc1 cut._
 
-## [v0.2.0-rc2] - 2026-07-02
+## [v0.3.0] - 2026-07-11
+
+The headline of v0.3.0 is the **recall-triggering overhaul**: memory that
+surfaces while the agent's hands are moving — action-moment ambient recall,
+a cornerstone anchor channel, render-layer repetition suppression, and a
+unified principle-trigger registry — plus a substantial performance and
+reliability wave.
+
+### Added
+
+- **In-turn ambient recall, ON by default with zero channel cooldown**
+  (#1690/#1696, default flip #1746) — action-moment recall on PreToolUse
+  behind a cheapest-first IDF novelty gate; graph-size-relative min_idf
+  (#1734); atomic cooldown claim (#1714); observable lock-degrade tell
+  (#1737/#1743); **per-fire JSONL ledger** (#1749) for junk-rate and
+  usefulness measurement. The zero-cooldown default is validated by a live
+  n=252 ledger experiment (junk fires render nothing; ~0.7s daemon time/hr);
+  `auto_surface.in_turn_recall.enabled=false` is the per-install kill-switch.
+- **Cornerstone anchor channel** (#1695) — exemplar cache + cooldown-gated
+  surface injection; cornerstones gain a trigger channel.
+- **Surfaced-ledger repetition suppression** (#1689) — render-layer recency
+  penalty (K=5/M=3) + not-recalled slot reservation, attacking the measured
+  68%-median-repeat baseline.
+- **Unified principle-trigger registry** (#1698 slices 1–3, #1731, #1740) —
+  list-valued triggers, decay-on-enactment, habituation cooldown-doubling,
+  principle_coverage diagnose, startup rebuild.
+- **Per-prompt injection budget + render-size telemetry** (#1692).
+- **Async snapshot** (#1673) — iterdump + git-commit moved off the turn path.
+- **Focus list renders at every SessionStart** (#1732) and PostCompact (#1655).
+- **BLOCKED_CONTRADICTED premise guard** + built_on_contested override (#1654).
+- **Typed-schema person nodes** + engram_update_person (#1587) + the
+  engram_add_special_moment tool (#1705).
+- **Toulmin warrant field** on engram_derive (#1464); lineage-collinearity
+  independence advisory (#1313); standpoint_author_id tiered-ID convention (#1348).
+- **Recall-Set Continuity** per-nap diagnose metric (#1630).
+- Replay-bench harness + trace generator + concurrency mode (#1668 family);
+  bench_in_turn_recall with instrument-honesty daemon_queries counter (#1709/#1733).
+- Nightly scheduled full-suite CI on dev (#1656).
+
+### Changed
+
+- **Performance wave (faster-never-looser)**: one-shot DB setup guard,
+  lightweight timing conn, embedder lock (#1669+); hot-path PRAGMA tuning
+  (#1672); schema-bootstrap/timing-conn decouple; MMR-rerank embedding-decode
+  cache; shared `_parse_payload` across all payload_json tools (#1683);
+  offline-first embedder loads killing the 84s HF-etag stall in both the
+  surface daemon (#1682) and the forum app (#1762).
+- Tri-state MCP health at SessionStart — pgrep timeout is indeterminate,
+  not OFFLINE (#1754).
+- `_hooklib`/`_prompthooklib` SSoT extraction for hook path resolution
+  (#1657, #1680 slice 1); walk-parents runtime-dir fallback (#1712).
+- Tier-1 working-memory tier retired — §5–§8 gate on tier-2 (#1220).
+- PR merge-authority SSoT doc + standing when-away substrate grant
+  (docs/PR-MERGE-POLICY.md); RELEASING.md rewritten from the first
+  end-to-end cut; engram-letter skill rewritten for the forum-DM ia CLI.
+
+### Fixed
+
+- Atomic writes for principle-trigger state (#1720/#1725); repo-qualified
+  PR-baton anchors (#1715); registry
+  rebuild at startup (#1740); dual-role trigger collision (#1731);
+  macOS /tmp-symlink path mismatch in the hot-path DB guard test (#1686);
+  stale-module purge on EngramClient re-instantiation; per-node
+  tainted/stale surface markers.
+
+## [v0.2.0] - 2026-07-02
 
 The headline of v0.2.0 is the **Unified Coordination Surface (UCS)**: inter-agent
 letters, baton turn-state, and the project board all migrated from local-filesystem

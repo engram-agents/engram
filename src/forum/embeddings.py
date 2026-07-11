@@ -52,6 +52,17 @@ import struct
 import sys
 from typing import Any
 
+# #1762: belt-and-suspenders against HuggingFace Hub's online etag-check
+# retry ladder (6 x 10s + backoff ~= 83s stall on a slow/unreachable HF
+# Hub -- the same defect fixed for the ENGRAM daemon side in #1682). The
+# module singleton loaded by _get_model() below now tries a fully offline
+# load first (local_files_only=True), which already avoids any HF Hub
+# network call -- this env var is a second line of defense so that even a
+# residual online etag-check (e.g. a first-time download) times out in ~1s
+# instead of ~83s. Set before the `from sentence_transformers import ...`
+# below. setdefault() so an operator override in the environment wins.
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "1")
+
 # ---------------------------------------------------------------------------
 # Loud degradation checks -- mirrors server.py:47-62
 # ---------------------------------------------------------------------------
@@ -105,6 +116,11 @@ def _get_model() -> Any:
     (RAM fine per design-settlement -- see issue #807). This function is the
     loading entry point; create_app() calls warm_model() at startup so the
     first post write never bears the model load latency.
+
+    Offline-first (#1762, mirrors #1682 on the ENGRAM daemon side): tries
+    local_files_only=True so a cached model never triggers HF Hub's online
+    etag-check (source of an ~83s stall when HF Hub is slow/unreachable).
+    Falls back to a one-time online download on a genuine cache-miss.
     """
     global _model
     if os.environ.get("FORUM_NO_EMBEDDINGS"):
@@ -113,7 +129,28 @@ def _get_model() -> Any:
         return None
     if _model is None:
         try:
-            _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL)
+            try:
+                # #1762: offline-first load. A cached model loads with ZERO
+                # HuggingFace Hub network traffic -- no online etag-check,
+                # so the ~83s stall (HF Hub slow/unreachable) cannot happen
+                # on the common warm-cache path (every forum app startup
+                # after the first successful load).
+                _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL, local_files_only=True)
+            except Exception:
+                # Cache-miss: this install does NOT pre-download the
+                # embedder model as a discrete install step (verified --
+                # no forum install/deploy script calls SentenceTransformer(...)).
+                # The genuine first-time download happens here, lazily, on
+                # first real use. Fall back to a one-time online download
+                # so a fresh install keeps working; every subsequent load
+                # hits the local_files_only path above.
+                print(
+                    f"[forum] Embedding model '{FORUM_EMBEDDING_MODEL}' not in "
+                    f"local HF cache -- downloading once (online); subsequent "
+                    f"loads are offline.",
+                    file=sys.stderr,
+                )
+                _model = _SentenceTransformer(FORUM_EMBEDDING_MODEL)
         except Exception as exc:
             print(
                 f"[forum] Failed to load embedding model '{FORUM_EMBEDDING_MODEL}': {exc}",
