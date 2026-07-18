@@ -193,3 +193,121 @@ def test_surface_latency_warning_fires_when_slow():
     assert "#819" in r["_surface_warning"], (
         f"Warning must reference issue #819: {r['_surface_warning']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. include_query_embedding (#257 rec 1, extends #1700 — issue #1778):
+#    opt-in machinery flag for the surface daemon's prompt-similarity decay.
+# ---------------------------------------------------------------------------
+
+def test_query_embedding_absent_by_default():
+    """Ordinary engram_surface calls (the flag omitted) never get a
+    query_embedding key — it's daemon-only machinery, not agent-facing."""
+    server = fresh_server()
+    r = json.loads(server.engram_surface(payload_json=json.dumps({"query": "some query"})))
+    assert "error" not in r, f"Unexpected error: {r}"
+    assert "query_embedding" not in r, (
+        f"query_embedding must be absent when include_query_embedding is omitted, got keys: {list(r.keys())}"
+    )
+
+
+def test_query_embedding_field_accepted_not_unknown():
+    """include_query_embedding is a recognised field, not rejected as unknown."""
+    server = fresh_server()
+    r = json.loads(server.engram_surface(payload_json=json.dumps({
+        "query": "some query", "include_query_embedding": True,
+    })))
+    assert "error" not in r, f"include_query_embedding should be accepted, got: {r}"
+
+
+def _seed_one_observation(server, url_suffix: str):
+    """Add one observation so a subsequent surface query has a match — the
+    query_embedding tests below need match_count > 0 (the no_match early
+    return never carries query_embedding: with nothing to render, the hook
+    never reaches the ledger write that would need it)."""
+    r_add = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "url": f"https://example.com/{url_suffix}",
+        "title": "Test Source",
+        "quoted_text": "Query embedding test claim verbatim.",
+        "interpretation": "Test interpretation for query_embedding check.",
+        "claim": "Query embedding test claim.",
+        "quote_type": "hard_data",
+    })))
+    assert "observation_id" in r_add, f"add_observation failed: {r_add}"
+
+
+def test_query_embedding_none_when_embedder_unavailable():
+    """With the flag set but embeddings disabled (this file's fixture sets
+    ENGRAM_NO_EMBEDDINGS=1), the key is present but explicitly None — the
+    opt-in adds the key regardless of whether a real vector was computed,
+    so the daemon can distinguish 'no vector' from 'didn't ask'."""
+    server = fresh_server()
+    _seed_one_observation(server, "query-embedding-none-test")
+    r = json.loads(server.engram_surface(payload_json=json.dumps({
+        "query": "query embedding test claim", "include_query_embedding": True,
+    })))
+    assert "error" not in r, f"Unexpected error: {r}"
+    assert r.get("match_count", 0) > 0, f"Expected a match, got: {r}"
+    assert "query_embedding" in r, f"Expected query_embedding key, got keys: {list(r.keys())}"
+    assert r["query_embedding"] is None
+
+
+def test_query_embedding_returns_computed_vector_when_available():
+    """When the embedder IS available, include_query_embedding=True returns
+    the actual vector computed for this query (mock-patched, mirroring the
+    latency test's monkeypatch style above)."""
+    import unittest.mock as mock
+    server = fresh_server()
+    _seed_one_observation(server, "query-embedding-vector-test")
+    fake_vector = [0.1, 0.2, 0.3]
+    with mock.patch("engram_query.core._embedder.is_available", return_value=True), \
+         mock.patch("engram_query.core._get_embedding_config", return_value={"model": "fake-model", "enabled": True}), \
+         mock.patch("engram_query.core._embedder.embed", return_value=fake_vector):
+        result_str = server._surface_impl(
+            query="query embedding test claim", semantic=False, include_query_embedding=True,
+        )
+    r = json.loads(result_str)
+    assert "error" not in r, f"Unexpected error: {r}"
+    assert r.get("match_count", 0) > 0, f"Expected a match, got: {r}"
+    assert r.get("query_embedding") == fake_vector, (
+        f"Expected the mocked vector to pass through unchanged, got: {r.get('query_embedding')}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. _created_minutes_ago (engram_core) — companion to _humanized_ago, feeds
+#    the same-session-echo guard's numeric N-minutes threshold check.
+# ---------------------------------------------------------------------------
+
+def test_created_minutes_ago_basic():
+    from datetime import datetime, timedelta, timezone
+    server = fresh_server()
+    now = datetime.now(timezone.utc)
+    then_iso = (now - timedelta(minutes=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    mins = server.core._created_minutes_ago(then_iso, now=now)
+    assert mins is not None
+    # Tolerance covers the up-to-1s quantization from then_iso's whole-second
+    # ISO format (no fractional seconds) against a microsecond-precision `now`.
+    assert abs(mins - 7.0) < 0.02
+
+
+def test_created_minutes_ago_missing_input_is_none():
+    server = fresh_server()
+    assert server.core._created_minutes_ago(None) is None
+    assert server.core._created_minutes_ago("") is None
+
+
+def test_created_minutes_ago_malformed_is_none():
+    server = fresh_server()
+    assert server.core._created_minutes_ago("not-a-timestamp") is None
+
+
+def test_created_minutes_ago_future_timestamp_is_none():
+    """A timestamp ahead of `now` (clock skew / bad data) returns None rather
+    than a negative number — callers gate on `< N minutes`, and a negative
+    value would incorrectly satisfy that check."""
+    from datetime import datetime, timedelta, timezone
+    server = fresh_server()
+    now = datetime.now(timezone.utc)
+    future_iso = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert server.core._created_minutes_ago(future_iso, now=now) is None
