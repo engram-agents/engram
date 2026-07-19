@@ -47,6 +47,13 @@ SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(SRC_ENGRAM))
 
+# Capture the REAL canonical junk list at collection time (before any test
+# installs a fake engram_idf), so the stubs below can expose the same list the
+# live filter uses (#1784: single source of truth). The hook imports
+# JUNK_STOPLIST alongside extract_keywords/STOPWORDS, so every fake must carry
+# it or the hook's import fails and filtering silently no-ops.
+from engram_idf import JUNK_STOPLIST as _REAL_JUNK_STOPLIST  # noqa: E402
+
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 
 import pytest
@@ -88,13 +95,15 @@ def _stub_idf(terms_by_call: list[list[str]]):
     """
     calls = {"n": 0}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
         i = min(calls["n"], len(terms_by_call) - 1)
         calls["n"] += 1
         return [(t, 7.5) for t in terms_by_call[i]]
 
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = extract_keywords
+    fake.STOPWORDS = frozenset()  # hook imports STOPWORDS alongside extract_keywords
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST  # #1784: hook imports this too
     sys.modules["engram_idf"] = fake
     return fake
 
@@ -130,12 +139,15 @@ def _stub_idf_capture(terms):
     it was called with, into the returned dict (key 'min_idf')."""
     captured = {}
 
-    def extract_keywords(conn, text, min_idf=4.0, top_k=5):
+    def extract_keywords(conn, text, min_idf=4.0, top_k=5, stopwords=None):
         captured["min_idf"] = min_idf
+        captured["stopwords"] = stopwords
         return [(t, 7.5) for t in terms]
 
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = extract_keywords
+    fake.STOPWORDS = frozenset({"builtin_sw"})
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST  # #1784: hook imports this too
     sys.modules["engram_idf"] = fake
     return captured
 
@@ -582,6 +594,11 @@ def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
 
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = failing_extract_keywords
+    # #1784: carry STOPWORDS + JUNK_STOPLIST so the hook's import SUCCEEDS and
+    # the test exercises the real n_docs==0 short-circuit (returns before
+    # extract_keywords is reached), rather than passing via an import failure.
+    fake.STOPWORDS = frozenset()
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST
     sys.modules["engram_idf"] = fake
 
     daemon_calls = {"n": 0}
@@ -699,3 +716,89 @@ def test_ledger_entry_construction_failure_does_not_break_recall(tmp_path, monke
     assert "ENGRAM in-turn recall" in out
     assert "ob_1" in out
     assert _read_ledger(hook) == []
+
+
+# --- rec-3 (#266): junk-token stoplist for the novel-terms gate ------------
+
+def test_apply_junk_stoplist_default_filters_shell_tokens(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    got = hook._apply_junk_stoplist(
+        ["echo", "portfolio", "sed", "hbm4"], _REAL_JUNK_STOPLIST)
+    assert got == ["portfolio", "hbm4"]  # order preserved, junk dropped
+
+
+def test_apply_junk_stoplist_empty_disables(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    terms = ["echo", "sed", "portfolio"]
+    assert hook._apply_junk_stoplist(terms, frozenset()) == terms
+
+
+def test_apply_junk_stoplist_case_insensitive(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    assert hook._apply_junk_stoplist(
+        ["ECHO", "Sed", "nvda"], _REAL_JUNK_STOPLIST) == ["nvda"]
+
+
+def test_junk_stoplist_config_default_is_sentinel(tmp_path):
+    # #1784: with no config override, _in_turn_config() returns the None
+    # sentinel meaning "use the canonical engram_idf.JUNK_STOPLIST", resolved
+    # at point-of-use after the lazy import. Kept distinct from a config []
+    # (which is a real empty frozenset that disables filtering, tested below).
+    # End-to-end resolution of the sentinel to the canonical list is covered by
+    # test_all_junk_terms_produce_no_fire.
+    hook = _load_hook(str(tmp_path))
+    assert hook._in_turn_config()["junk_stoplist"] is None
+
+
+def test_junk_stoplist_config_override_lowercases(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), junk_stoplist=["FOO", "Bar"])
+    assert hook._in_turn_config()["junk_stoplist"] == frozenset({"foo", "bar"})
+
+
+def test_junk_stoplist_config_empty_disables(tmp_path):
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), junk_stoplist=[])
+    assert hook._in_turn_config()["junk_stoplist"] == frozenset()
+
+
+def test_all_junk_terms_produce_no_fire(tmp_path, monkeypatch):
+    """rec-3: a fire whose novel terms are ALL junk drops to no-fire (the
+    all-junk fires eliminated), and writes no ledger line."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["echo", "sed"]])  # both in the default stoplist
+    monkeypatch.setattr(hook, "_query_recall_daemon",
+                        lambda q, top_k=5: _daemon_result(["ob_1"]))
+    assert hook.check_in_turn_recall("Bash echo something | sed") == ""
+    assert _read_ledger(hook) == []
+
+
+def test_mixed_terms_drop_junk_from_fire_and_ledger(tmp_path, monkeypatch):
+    """rec-3: junk is stripped but the real term still fires; the ledger's
+    novel_terms/terms carry only the real token (cleaner term-set)."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path))
+    _stub_idf([["echo", "portfolio"]])  # echo junk, portfolio real
+    monkeypatch.setattr(hook, "_query_recall_daemon",
+                        lambda q, top_k=5: _daemon_result(["ob_1"]))
+    out = hook.check_in_turn_recall("Bash echo portfolio")
+    assert "ENGRAM in-turn recall" in out
+    ledger = _read_ledger(hook)
+    assert len(ledger) == 1
+    assert ledger[0]["novel_terms"] == ["portfolio"]
+    assert "echo" not in ledger[0]["terms"]
+
+
+def test_junk_stoplist_merged_with_builtin_stopwords_before_ranking(tmp_path, monkeypatch):
+    """rec-3 round 2 (colleague suggestion): junk is excluded BEFORE the top_k
+    cut via extract_keywords' stopwords=, MERGED with the built-in STOPWORDS
+    (never replacing it, which would drop English-stopword filtering). Verifies
+    the hook passes STOPWORDS | junk_stoplist to extract_keywords."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), junk_stoplist=["zzjunk"])
+    captured = _stub_idf_capture(["portfolio"])
+    monkeypatch.setattr(hook, "_query_recall_daemon",
+                        lambda q, top_k=5: _daemon_result(["ob_1"]))
+    hook.check_in_turn_recall("Bash zzjunk portfolio")
+    assert captured["stopwords"] == frozenset({"builtin_sw", "zzjunk"})

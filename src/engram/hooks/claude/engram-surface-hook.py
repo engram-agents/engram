@@ -18,6 +18,7 @@ import socket
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -285,6 +286,19 @@ def _get_auto_surface_config() -> dict:
 DEFAULT_SUPPRESSION_K = 5   # trailing-prompt window
 DEFAULT_SUPPRESSION_M = 3   # repeat-count threshold before full suppression
 
+# Prompt-embedding-proximity decay (#257 rec 1, extends #1700 — thread #266).
+# Once a node's trailing-window count reaches the point _classify_suppression
+# would demote/suppress it, the decay path compares THIS prompt's embedding
+# against the embedding stored at that node's most recent render (not just
+# the raw repeat count). High similarity (>= threshold) means the same
+# context keeps re-triggering it — decay applies, but floors at "others"
+# (never "suppress" — Ariadne's 6th-fire slip is the standing counter-
+# evidence for why a hard cutoff is unsafe). Low similarity means the prompt
+# has moved on and the match is freshly relevant despite the count — render
+# full. Missing embeddings (model down, or a ledger entry written before
+# this field existed) fall back exactly to the count-only classification.
+DEFAULT_PROMPT_SIMILARITY_THRESHOLD = 0.75
+
 # Ledger retention (~/.engram/surface-ledger.json). Two independent bounds,
 # applied together (belt-and-suspenders — either alone would bound growth,
 # combining them tolerates occasional gaps without losing the trailing-k
@@ -303,11 +317,16 @@ DEFAULT_LEDGER_SESSION_MAX_AGE_HOURS = 48
 def _get_suppression_config() -> dict:
     """Read recall_suppression tunables from $ENGRAM_HOME/config.json.
 
-    Returns {k, m} with defaults if config absent / malformed / section
-    missing. Never raises. Same read pattern as _get_auto_surface_config.
+    Returns {k, m, prompt_similarity_threshold} with defaults if config
+    absent / malformed / section missing. Never raises. Same read pattern
+    as _get_auto_surface_config.
     """
     config_path = os.path.join(ENGRAM_HOME, "config.json")
-    defaults = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    defaults = {
+        "k": DEFAULT_SUPPRESSION_K,
+        "m": DEFAULT_SUPPRESSION_M,
+        "prompt_similarity_threshold": DEFAULT_PROMPT_SIMILARITY_THRESHOLD,
+    }
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -315,9 +334,92 @@ def _get_suppression_config() -> dict:
         return {
             "k": int(section.get("k", defaults["k"])),
             "m": int(section.get("m", defaults["m"])),
+            "prompt_similarity_threshold": float(
+                section.get("prompt_similarity_threshold", defaults["prompt_similarity_threshold"])
+            ),
         }
     except (OSError, ValueError, json.JSONDecodeError, TypeError):
         return defaults
+
+
+# Same-session-echo guard (#257 rec 2 — thread #266): never re-render a node
+# created in THIS session within N minutes of its creation. Re-surfacing
+# something the agent just wrote is pure echo, zero information — this is a
+# hard drop, not a decay (there's no "less of a duplicate" version of a
+# claim you just made).
+DEFAULT_ECHO_GUARD_MINUTES = 10
+
+
+def _get_echo_guard_config() -> dict:
+    """Read same_session_echo tunables from $ENGRAM_HOME/config.json.
+
+    Returns {minutes} with the default if config absent / malformed /
+    section missing. Never raises. Same read pattern as
+    _get_suppression_config.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {"minutes": DEFAULT_ECHO_GUARD_MINUTES}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("same_session_echo", {})
+        return {"minutes": float(section.get("minutes", defaults["minutes"]))}
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _get_session_started_at(session_id: str | None) -> "datetime | None":
+    """Read this session's started_at from its per-session marker file
+    (~/.engram/sessions/<session_id>.json, written by the SessionStart hook).
+
+    None on any failure (missing session_id, missing/malformed marker file,
+    missing/malformed started_at) — the echo guard treats None as "can't
+    verify the session boundary" and stays inactive (fail-open toward
+    rendering, never toward silently dropping a legitimate render).
+    """
+    if not session_id:
+        return None
+    try:
+        path = os.path.join(ENGRAM_HOME, "sessions", f"{session_id}.json")
+        with open(path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        started_at = marker.get("started_at")
+        if not started_at:
+            return None
+        dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _is_same_session_echo(entry: dict, session_started_at, n_minutes: float) -> bool:
+    """True if `entry` (a special/top_claim dict carrying created_at +
+    created_minutes_ago) is a same-session echo per the rec-2 guard: created
+    less than n_minutes ago AND on/after this session's start.
+
+    False (never treat as an echo) on any missing signal — session boundary
+    unknown, timestamp missing/malformed, or the age check alone doesn't
+    clear the bar. Fail-open toward rendering: a false negative here just
+    means one echo gets rendered (mildly wasteful); a false positive would
+    silently drop a legitimate render, which is the worse failure direction.
+    """
+    if session_started_at is None:
+        return False
+    mins_ago = entry.get("created_minutes_ago")
+    if mins_ago is None or mins_ago >= n_minutes:
+        return False
+    created_at = entry.get("created_at")
+    if not created_at:
+        return False
+    try:
+        created_dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return False
+    return created_dt >= session_started_at
 
 
 def _surface_ledger_path() -> str:
@@ -383,11 +485,26 @@ def _prune_surface_ledger(
     return pruned
 
 
-def _append_surface_ledger_entry(session_id: str, rendered_ids, *, k: int) -> None:
+def _append_surface_ledger_entry(
+    session_id: str, rendered_ids, *, k: int,
+    prompt_embedding: list | None = None,
+    suppressed_echo_ids=None,
+    decay_events: list | None = None,
+) -> None:
     """Append this prompt's actually-rendered node ids to the surfaced ledger
     for session_id, then prune. Best-effort / fail-open throughout — the
     ledger is an advisory cache; any I/O or parse failure here must never
     break the hook. See docs/recall-triggering-blueprint.md §3-P1.
+
+    prompt_embedding, suppressed_echo_ids, decay_events (#257 recs 1+2,
+    thread #266): all optional and omitted from the entry entirely when
+    falsy, so a ledger with the decay features inactive (embed model down,
+    no echoes this prompt) stays byte-identical in shape to the pre-#266
+    entry — same "additive, never bloats the common case" discipline as
+    the rest of this file. Per Kepler's #266 review: these are logged as
+    distinct events rather than silently dropped/applied, so the
+    measurement harness can attribute before/after changes to the fix
+    rather than just observing a rate shift with no causal trace.
     """
     try:
         now_ts = time.time()
@@ -395,7 +512,14 @@ def _append_surface_ledger_entry(session_id: str, rendered_ids, *, k: int) -> No
         entries = ledger.get(session_id, [])
         if not isinstance(entries, list):
             entries = []
-        entries.append({"ts": now_ts, "ids": sorted(set(rendered_ids))})
+        entry = {"ts": now_ts, "ids": sorted(set(rendered_ids))}
+        if prompt_embedding:
+            entry["prompt_embedding"] = prompt_embedding
+        if suppressed_echo_ids:
+            entry["suppressed_echo_ids"] = sorted(set(suppressed_echo_ids))
+        if decay_events:
+            entry["decay_events"] = decay_events
+        entries.append(entry)
         ledger[session_id] = entries
         retention_entries = max(4 * max(int(k), 1), DEFAULT_LEDGER_RETENTION_ENTRIES)
         ledger = _prune_surface_ledger(
@@ -408,6 +532,69 @@ def _append_surface_ledger_entry(session_id: str, rendered_ids, *, k: int) -> No
         _write_surface_ledger(ledger)
     except Exception:
         pass
+
+
+def _get_trailing_window_entries(session_id: str, k: int) -> list:
+    """Return the trailing k ledger entries (full dicts — ts, ids, and,
+    when present, prompt_embedding) for session_id, oldest-first.
+
+    The richer form of _get_trailing_window_ids: rec 1's decay logic needs
+    each entry's stored prompt_embedding, not just its id list. [] on any
+    failure or when the session has no history — same fail-open contract.
+    """
+    try:
+        if k <= 0:
+            return []
+        ledger = _read_surface_ledger()
+        entries = ledger.get(session_id, [])
+        if not isinstance(entries, list):
+            return []
+        trailing = entries[-k:]
+        return [e for e in trailing if isinstance(e, dict)]
+    except Exception:
+        return []
+
+
+def _get_embedding_for_node_in_window(node_id, window_entries: list) -> "list | None":
+    """Most recent stored prompt_embedding among window_entries that
+    rendered node_id. window_entries is oldest-first (as ledger entries are
+    appended and sliced), so scan from the end.
+
+    None if the node never appears with a stored embedding in the window —
+    e.g. older entries written before this field existed, or the embed
+    model was unavailable at that render. Callers must treat None as
+    "no comparison possible," not "similarity is zero."
+    """
+    for entry in reversed(window_entries):
+        if not isinstance(entry, dict):
+            continue
+        ids = entry.get("ids")
+        if isinstance(ids, list) and node_id in ids:
+            emb = entry.get("prompt_embedding")
+            if isinstance(emb, list) and emb:
+                return emb
+    return None
+
+
+def _cosine_similarity(a: list, b: list) -> float:
+    """Pure-python cosine similarity between two equal-length vectors.
+
+    Mirrors engram_core's EmbeddingManager.cosine_similarity exactly,
+    duplicated here (rather than imported) so this lightweight hook process
+    never needs to import the heavier core module or load a model of its
+    own — it only ever compares vectors the daemon already computed.
+    0.0 on any shape mismatch or zero-vector (fail-open toward "not
+    similar," which routes to the safer "full" tier rather than a wrongly-
+    confident decay).
+    """
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 def _get_trailing_window_ids(session_id: str, k: int) -> list:
@@ -451,6 +638,65 @@ def _classify_suppression(count: int, m: int) -> str:
     if count < m:
         return "others"
     return "suppress"
+
+
+def _decay_tier_for(
+    nid, count: int, m: int,
+    query_embedding: list | None,
+    window_entries: list,
+    similarity_threshold: float,
+) -> tuple:
+    """Classify a node's render tier using prompt-embedding proximity to its
+    last render when available (#257 rec 1, extends #1700 — thread #266),
+    falling back to the count-only classification (_classify_suppression)
+    when it isn't.
+
+    The count-only path (count <= 1, i.e. today's "full" tier) never engages
+    decay logic at all — nothing to compare yet, nothing to record.
+
+    Once count reaches the point _classify_suppression would demote/suppress
+    (count >= 2), decay logic evaluates: compare THIS prompt's embedding to
+    the one stored at the node's most recent render in the window.
+      - similarity >= threshold: same context still re-triggering it — decay
+        applies, but floors at "others", NEVER "suppress" (Ariadne's 6th-fire
+        slip is the standing counter-evidence for why a hard cutoff on a
+        node that's still actually relevant is unsafe).
+      - similarity < threshold: the prompt has genuinely moved on — the raw
+        count doesn't mean stale here, render full despite it.
+      - embeddings unavailable (model down, or this node's last render
+        predates the prompt_embedding field), OR present but shape-mismatched
+        (a corrupted/truncated vector — the two embeddings should always be
+        the same model's dimension, so a mismatch means the data is bad, not
+        that a real comparison happened): fall back exactly to the
+        count-only tier — a degraded recall hook must degrade to the known
+        baseline, not to silence (Kepler, #266 review). Routing shape-
+        mismatched vectors through this same branch (rather than letting
+        them reach _cosine_similarity, whose 0.0-on-mismatch guard would
+        otherwise read as "genuinely orthogonal") keeps the ledger's cosine
+        field meaningful: None always means "no real comparison," never a
+        disguised data problem (colleague-review catch, PR #1779 round 1).
+
+    Returns (tier, decay_event). decay_event is None only for the count<=1
+    fast path; otherwise a dict {"id", "tier", "cosine"} for the measurement
+    harness — cosine is None when the decay path was reached but couldn't
+    actually compare (so the harness can distinguish "decayed on data" from
+    "fell back blind" rather than reading both as the same outcome).
+    """
+    if count <= 1:
+        return "full", None
+
+    baseline_tier = _classify_suppression(count, m)
+
+    if not query_embedding:
+        return baseline_tier, {"id": nid, "tier": baseline_tier, "cosine": None}
+
+    last_embedding = _get_embedding_for_node_in_window(nid, window_entries)
+    if last_embedding is None or len(last_embedding) != len(query_embedding):
+        return baseline_tier, {"id": nid, "tier": baseline_tier, "cosine": None}
+
+    cosine = _cosine_similarity(query_embedding, last_embedding)
+    tier = "others" if cosine >= similarity_threshold else "full"
+    return tier, {"id": nid, "tier": tier, "cosine": cosine}
 
 
 def _others_candidate_from_full_entry(entry: dict) -> dict:
@@ -1006,6 +1252,7 @@ def format_nudge(
             "nodes_shown": 0,
             "nodes_suppressed": 0,
             "nodes_cut_budget": 0,
+            "nodes_suppressed_echo": 0,
         })
 
     total = result.get("match_count", 0)
@@ -1014,17 +1261,72 @@ def format_nudge(
 
     # --- Suppression setup ---------------------------------------------
     suppression_active = session_id is not None
-    sup_cfg = {"k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M}
+    sup_cfg = {
+        "k": DEFAULT_SUPPRESSION_K, "m": DEFAULT_SUPPRESSION_M,
+        "prompt_similarity_threshold": DEFAULT_PROMPT_SIMILARITY_THRESHOLD,
+    }
     window: list = []
+    window_entries: list = []
+    echo_cfg = {"minutes": DEFAULT_ECHO_GUARD_MINUTES}
+    session_started_at = None
     if suppression_active:
         sup_cfg = _get_suppression_config()
         window = _get_trailing_window_ids(session_id, sup_cfg["k"])
+        window_entries = _get_trailing_window_entries(session_id, sup_cfg["k"])
+        echo_cfg = _get_echo_guard_config()
+        session_started_at = _get_session_started_at(session_id)
 
-    def _tier_for(nid) -> str:
+    # This prompt's own embedding (#257 rec 1, extends #1700 — thread #266) —
+    # None whenever the daemon path wasn't used, the embed model is
+    # unavailable, or include_query_embedding wasn't requested (agent-facing
+    # engram_surface calls never set it). Threaded through to the decay
+    # classifier below and into the ledger write at the end of this function.
+    query_embedding = result.get("query_embedding")
+
+    # Same-session-echo drops (rec 2) and decay-tier firings (rec 1),
+    # recorded as distinct ledger events per Kepler's #266 review — a
+    # measurement harness needs to see these to attribute before/after
+    # changes to the fix, not just observe a rate shift with no causal trace.
+    suppressed_echo_ids: set = set()
+    decay_events: list = []
+    # A node can legitimately be classified more than once in a single
+    # render pass (e.g. the not-recalled reservation loop and the Others
+    # loop both walk overlapping id pools) — _decay_tier_for's inputs don't
+    # change within one pass, so a repeat classification always recomputes
+    # the SAME tier/cosine. Track which ids already had a decay_event
+    # recorded so a repeat classification doesn't double-write the same
+    # firing to the ledger (colleague-review catch, PR #1779 round 1 —
+    # would have silently double-counted a firing for Aleph's harness).
+    _decay_recorded_ids: set = set()
+
+    def _tier_for(entry) -> str:
+        # entry is either a full candidate dict (special/top_claim, or now
+        # a matched_meta entry — all three carry created_at/
+        # created_minutes_ago, so the echo guard can evaluate any of them)
+        # or a bare node-id string (legacy call shape, kept for safety —
+        # the echo guard no-ops via the empty-dict fallback since there's
+        # no creation-time metadata to check).
+        if isinstance(entry, dict):
+            nid = entry.get("id")
+        else:
+            nid = entry
+            entry = {}
         if not suppression_active or not nid:
             return "full"
+        if session_started_at is not None and _is_same_session_echo(
+            entry, session_started_at, echo_cfg["minutes"]
+        ):
+            suppressed_echo_ids.add(nid)
+            return "echo"
         count = _count_occurrences_in_window(nid, window)
-        return _classify_suppression(count, sup_cfg["m"])
+        tier, decay_event = _decay_tier_for(
+            nid, count, sup_cfg["m"], query_embedding, window_entries,
+            sup_cfg["prompt_similarity_threshold"],
+        )
+        if decay_event is not None and nid not in _decay_recorded_ids:
+            decay_events.append(decay_event)
+            _decay_recorded_ids.add(nid)
+        return tier
 
     # --- Budget setup -------------------------------------------------
     # remaining=None when recall_budget.enabled=False (the kill switch) —
@@ -1071,8 +1373,15 @@ def format_nudge(
         # but the slice here protects against any future surface payload that returns more.
         for s in special[:3]:
             nid = s.get("id")
-            tier = _tier_for(nid)
-            if tier == "full":
+            tier = _tier_for(s)
+            if tier == "echo":
+                # Same-session-echo drop (rec 2) — pure echo, zero
+                # information; not rendered, not demoted, not counted
+                # against "recently shown" (suppressed_ids is a distinct
+                # kind of drop). Already recorded in suppressed_echo_ids by
+                # _tier_for.
+                pass
+            elif tier == "full":
                 line = render_one_node_line(s, conf_prefix=True, type_tag=True)
                 rendered_line = f"    {line}"
                 if _budget_try_spend(rendered_line, budget_state):
@@ -1102,8 +1411,13 @@ def format_nudge(
         # same future-proofing as above.
         for c in top_claims[:3]:
             nid = c.get("id")
-            tier = _tier_for(nid)
-            if tier == "full":
+            tier = _tier_for(c)
+            if tier == "echo":
+                # Same-session-echo drop (rec 2) — see the specials loop
+                # above for the full rationale; already recorded in
+                # suppressed_echo_ids by _tier_for.
+                pass
+            elif tier == "full":
                 line = render_one_node_line(c, conf_prefix=True, type_tag=False)
                 rendered_line = f"    {line}"
                 if _budget_try_spend(rendered_line, budget_state):
@@ -1146,6 +1460,7 @@ def format_nudge(
                 already_placed = (
                     rendered_ids_this_prompt | suppressed_ids
                     | {d.get("id") for d in demoted_candidates}
+                    | suppressed_echo_ids
                 )
                 for nid in not_recalled_ids:
                     if len(reserved_lines) >= reserve_n:
@@ -1163,11 +1478,23 @@ def format_nudge(
                     # once budget is spent is not a real cost concern.
                     if not nid or nid in already_placed:
                         continue
-                    if _tier_for(nid) == "suppress":
-                        continue
                     meta = meta_by_id.get(nid)
                     if not meta:
                         continue  # no metadata available upstream — skip, don't invent fields
+                    # Pass the full meta dict (carries created_at /
+                    # created_minutes_ago, per the matched_meta extension
+                    # above) rather than the bare id, so the same-session-
+                    # echo guard can actually evaluate this candidate —
+                    # colleague-review catch, PR #1779 round 1: a bare-id
+                    # call can never trigger the echo guard (no creation-
+                    # time metadata to check), which meant reservation
+                    # candidates were structurally un-guardable before.
+                    tier = _tier_for(meta)
+                    if tier == "echo":
+                        continue
+                    if tier == "suppress":
+                        suppressed_ids.add(nid)
+                        continue
                     kw = meta.get("recall_keywords")
                     if not (isinstance(kw, list) and len(kw) >= 1):
                         continue  # no keywords — no recognition value, matches Others discipline
@@ -1223,13 +1550,20 @@ def format_nudge(
         rendered_ids_this_prompt | suppressed_ids
         | {d.get("id") for d in demoted_candidates}
         | budget_cut_ids
+        | suppressed_echo_ids
     )
     others_candidates: list[dict] = []
     for m in matched_meta:
         mid = m.get("id")
         if mid in excluded_from_others:
             continue
-        if _tier_for(mid) == "suppress":
+        # Pass the full meta dict, not the bare id — see the reservation
+        # loop above for why (echo guard needs created_at/
+        # created_minutes_ago, which only the dict form carries).
+        tier = _tier_for(m)
+        if tier == "echo":
+            continue
+        if tier == "suppress":
             suppressed_ids.add(mid)
             continue
         others_candidates.append(m)
@@ -1280,8 +1614,28 @@ def format_nudge(
         lines.extend(others_rendered_lines)
     elif not (special or top_claims or others_with_kw):
         # No content rendered yet — fall back to the legacy flat IDs line so
-        # the digest is never silently empty when matches exist.
-        matched_ids = result.get("matched_ids", [])
+        # the digest is never silently empty when matches exist. Filtered
+        # against suppressed/echoed ids so a lone suppressed or echoed match
+        # doesn't leak its raw id here — this fallback predates #1689/#266,
+        # and without the filter it silently un-suppresses/un-echoes the
+        # exact class of node both mechanisms exist to withhold, whenever
+        # it's the only match this prompt (colleague-review catch, PR #1779
+        # round 1 — found via the echo guard, but the same gap existed for
+        # plain suppression too).
+        #
+        # NOTE: re-union suppressed_ids | suppressed_echo_ids fresh HERE
+        # rather than reusing excluded_from_others (built earlier, before
+        # the Others loop ran) — a node whose ONLY appearance is in
+        # matched_meta gets its echo/suppress classification DURING that
+        # loop, which mutates suppressed_ids/suppressed_echo_ids AFTER
+        # excluded_from_others was already snapshotted. Reusing the stale
+        # snapshot here would silently readmit exactly the single-match
+        # case this fix targets.
+        _fallback_excluded = suppressed_ids | suppressed_echo_ids
+        matched_ids = [
+            mid for mid in result.get("matched_ids", [])
+            if mid not in _fallback_excluded
+        ]
         if matched_ids:
             lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
 
@@ -1325,7 +1679,12 @@ def format_nudge(
         # catch), now extended to the budget cut too (#1692).
         all_rendered_ids = rendered_ids_this_prompt | others_rendered_ids
         all_rendered_ids.discard(None)
-        _append_surface_ledger_entry(session_id, all_rendered_ids, k=sup_cfg["k"])
+        _append_surface_ledger_entry(
+            session_id, all_rendered_ids, k=sup_cfg["k"],
+            prompt_embedding=query_embedding,
+            suppressed_echo_ids=suppressed_echo_ids,
+            decay_events=decay_events,
+        )
 
     # --- Stats out-parameter: final telemetry for engram.surface.render_size
     # (issue #1692). chars_rendered/nodes_shown/nodes_cut_budget come from
@@ -1338,6 +1697,7 @@ def format_nudge(
             "nodes_shown": budget_state["nodes_shown"],
             "nodes_suppressed": len(suppressed_ids),
             "nodes_cut_budget": budget_state["nodes_cut_budget"],
+            "nodes_suppressed_echo": len(suppressed_echo_ids),
         })
 
     return "\n".join(lines)

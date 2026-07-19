@@ -202,6 +202,12 @@ def handle_client(conn, client):
             args = {"query": query, "top_k": top_k, "semantic": True}
             if embed_query is not None:
                 args["embed_query"] = embed_query
+            # Render-layer habituation decay (#257 rec 1 / extends #1700)
+            # needs this prompt's own embedding to compare against the one
+            # stored at a node's last render — opt-in flag so ordinary
+            # engram_surface calls (from an agent, not this daemon) don't pay
+            # for or receive the raw vector.
+            args["include_query_embedding"] = True
             result = _client.call("engram_surface", args)
             response = {"status": "ok", "result": result}
 

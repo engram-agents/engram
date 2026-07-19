@@ -155,6 +155,29 @@ def _append_ledger(build_entry) -> None:
         pass
 
 
+# rec-3 (#266): junk-token stoplist for the novel-terms gate. Shell/code
+# execution tokens carry zero recall signal but pollute the high-IDF
+# novel-term set (a seat-level ledger measured ~30% of novel tokens as
+# junk-class). The canonical list now lives as `JUNK_STOPLIST` in engram_idf
+# (#1784: single source of truth shared with the rec-4 measurement harness so
+# the filter and the measurement can't drift). It is imported lazily at
+# point-of-use — NOT at module top-level — because this hook must never crash
+# at import when engram_idf isn't yet on sys.path (the whole recall path is
+# guarded and returns "" if the import fails). `_in_turn_config()` therefore
+# carries a None sentinel for "use the canonical default", kept distinct from
+# a config-supplied `[]` which DISABLES filtering; the sentinel is resolved to
+# JUNK_STOPLIST only after the import succeeds.
+
+
+def _apply_junk_stoplist(terms: list, stoplist: frozenset) -> list:
+    """Drop junk-class tokens (case-insensitive) from an ordered term list,
+    preserving order. rec-3 (#266) -- keeps shell/code execution noise out of
+    the novel-term set that drives in-turn recall + the ledger."""
+    if not stoplist:
+        return terms
+    return [t for t in terms if t.lower() not in stoplist]
+
+
 def _in_turn_config() -> dict:
     """Read auto_surface.in_turn_recall from config.json; safe defaults.
 
@@ -177,6 +200,10 @@ def _in_turn_config() -> dict:
         "max_lines": 3,
         "min_idf": None,
         "min_idf_ratio": 0.7,
+        # None sentinel = "not overridden, use the canonical engram_idf.JUNK_STOPLIST
+        # (resolved at point-of-use after the lazy import)". A config-supplied []
+        # is a real empty frozenset that DISABLES filtering — kept distinct below.
+        "junk_stoplist": None,
     }
     try:
         with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
@@ -189,6 +216,11 @@ def _in_turn_config() -> dict:
             "max_lines": int(section.get("max_lines", defaults["max_lines"])),
             "min_idf": float(raw_min_idf) if raw_min_idf is not None else None,
             "min_idf_ratio": float(section.get("min_idf_ratio", defaults["min_idf_ratio"])),
+            "junk_stoplist": (
+                frozenset(str(t).lower() for t in section["junk_stoplist"])
+                if isinstance(section.get("junk_stoplist"), list)
+                else defaults["junk_stoplist"]
+            ),
         }
     except Exception:
         return defaults
@@ -378,7 +410,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         if runtime_dir not in sys.path:
             sys.path.insert(0, runtime_dir)
         try:
-            from engram_idf import extract_keywords
+            from engram_idf import extract_keywords, STOPWORDS, JUNK_STOPLIST
+            # Resolve the None sentinel from _in_turn_config() to the canonical
+            # shared list now that the import has succeeded (#1784). A
+            # config-supplied frozenset — including an empty one (filtering
+            # disabled) — passes through unchanged.
+            junk = cfg["junk_stoplist"] if cfg["junk_stoplist"] is not None else JUNK_STOPLIST
             conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
             try:
                 if cfg["min_idf"] is not None:
@@ -390,10 +427,22 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                     if n_docs == 0:
                         return ""
                     effective_min_idf = cfg["min_idf_ratio"] * math.log(n_docs)
-                pairs = extract_keywords(conn, match_target, min_idf=effective_min_idf, top_k=5)
+                # rec-3 (#266) round 2 (colleague-review suggestion): exclude
+                # junk tokens BEFORE the top_k cut, so >=5 high-IDF junk tokens
+                # can't crowd a real lower-ranked term out of `pairs` entirely.
+                # MERGE with the built-in STOPWORDS -- never replace, which
+                # would drop common-English stopword filtering. The post-filter
+                # below stays as a backstop.
+                pairs = extract_keywords(
+                    conn, match_target, min_idf=effective_min_idf, top_k=5,
+                    stopwords=STOPWORDS | junk)
             finally:
                 conn.close()
             terms = [tok for tok, _score in pairs]
+            # rec-3 (#266): drop junk-class shell/code tokens BEFORE the
+            # novelty check + fire, so execution noise neither triggers recall
+            # nor pollutes the term-memory/ledger. Targeted, not a min_idf bump.
+            terms = _apply_junk_stoplist(terms, junk)
         except Exception:
             return ""
         if not terms:
