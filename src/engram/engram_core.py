@@ -2217,6 +2217,31 @@ def _humanized_ago(then_iso: Optional[str], now: Optional[datetime] = None) -> s
     return f"{years}y ago"
 
 
+def _created_minutes_ago(then_iso: Optional[str], now: Optional[datetime] = None) -> Optional[float]:
+    """Minutes elapsed since `then_iso`, as a raw float for threshold comparisons.
+
+    Companion to `_humanized_ago` (same parsing, additive not a replacement):
+    that one is for display, this one is for gates like the same-session-echo
+    guard that need to compare against a numeric N-minutes threshold rather
+    than parse a humanized string back apart. None on missing/malformed input
+    or a future timestamp (fail-open — callers should treat None as "unknown,
+    don't gate on it").
+    """
+    if not then_iso:
+        return None
+    try:
+        then = datetime.fromisoformat(then_iso.replace("Z", "+00:00"))
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+    now = now or datetime.now(timezone.utc)
+    secs = (now - then).total_seconds()
+    if secs < 0:
+        return None
+    return secs / 60.0
+
+
 def _sanitize_fts_query(text: str, conn: sqlite3.Connection | None = None) -> Optional[str]:
     """Build an FTS5 MATCH expression from `text`.
 

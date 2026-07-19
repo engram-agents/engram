@@ -206,3 +206,49 @@ Umbrella: #1688.
 Reciprocal review per repo convention (reviewer-fairy → counterpart colleague
 → maintainer). Ship P1 first: it is the cheapest, the most user-visible, and
 funds the context budget the other streams spend.
+
+## §6 P1 addendum — prompt-similarity decay + same-session-echo guard (2026-07-18)
+
+The v0.3.0 surfacing review (forum #257, four seats' data) found P1's
+count-only classification insufficient on two counts, assigned as thread #266:
+
+- **Habituation should key on prompt-embedding proximity to a node's last
+  render, not raw occurrence count.** Four independent sessions (Ariadne ×2,
+  Borges rc1 + today) bracket one axis: varied-topic dense sessions produce
+  ~0 repeats, single-topic dense sessions produce heavy repeats — the driver
+  is how similar the current prompt is to the one that last triggered the
+  render, not how many prompts have elapsed or how tool-dense the session is.
+  `_decay_tier_for` compares this prompt's embedding (daemon-computed,
+  threaded through via `engram_surface`'s opt-in `include_query_embedding`
+  flag so ordinary agent calls never pay for or receive the raw vector) to
+  the embedding stored at the node's most recent render in the trailing-k
+  ledger window. High similarity (`recall_suppression.prompt_similarity_threshold`,
+  default 0.75) still demotes — but **floors at "others", never "suppress"**:
+  Ariadne's 6th-fire slip (a tripwire rendered 5× before the exact fire that
+  would have prevented a real error) is the standing counter-evidence against
+  a hard cutoff on a candidate whose actual relevance a raw count can't see.
+  Missing embeddings (model down, or a ledger entry predating this field)
+  fall back exactly to the original count-only tiers — a degraded recall
+  hook degrades to the known baseline, never to silence.
+- **Same-session-echo guard** (`same_session_echo.minutes`, default 10):
+  never re-render a node created in the current session within N minutes of
+  its creation — re-surfacing something the agent just wrote is pure echo,
+  zero information. This is a hard drop, not a decay (there is no
+  "less-duplicate" version of a claim made moments ago), gated on both
+  recency and the session boundary (`~/.engram/sessions/<session_id>.json`'s
+  `started_at`) so a node genuinely created by a *previous* session moments
+  before this one started is never misclassified as same-session.
+
+Both drops/decays are recorded as distinct surface-ledger events
+(`suppressed_echo_ids`, `decay_events: [{id, tier, cosine}]`) rather than
+applied silently — the before/after measurement harness (thread #266,
+Aleph) needs the causal trace, not just an observed rate shift.
+
+**Chosen, not a regression of the cap** (Aleph, PR #1779 colleague review):
+in steady state — once the trailing window is fully embedded (every prior
+render stored a `prompt_embedding`) — the decay path only ever returns
+`"others"` or `"full"`, so hard `"suppress"` becomes structurally
+unreachable. `"suppress"` survives only on the embedding-missing fallback
+(model down, or a node whose in-window render predates this field). This is
+the intended end-state of "floor at others, never suppress" — suppression
+stops being a hard monotonic cap once embeddings are healthy, by design.

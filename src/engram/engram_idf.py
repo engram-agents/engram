@@ -95,6 +95,27 @@ DISCOURSE_MARKERS: frozenset[str] = frozenset([
 # Union of both layers — the default filter applied by extract_keywords.
 STOPWORDS: frozenset[str] = STANDARD_STOPWORDS | DISCOURSE_MARKERS
 
+# Canonical junk-token stoplist (rec-3, #266 / #1784) — the SINGLE source of
+# truth shared by the in-turn-recall hook (the live filter) and the rec-4
+# measurement harness (the measurement). Both import this constant so they can
+# never drift about "what counts as junk" on the same ledger.
+#
+# Deliberately CONSERVATIVE: drop only tokens that are unambiguously
+# shell/code execution-noise, never topical. A zero-cooldown ledger analysis
+# showed a stricter cut (e.g. a min_idf bump, or adding ambiguous tokens like
+# json/os/re/cat/print/def) kills ~24% of REAL renders — so the filter is the
+# floor and the measurement conforms DOWN to it, never the reverse (#1784
+# decision: the filter's conservative list is canonical). Extend/tune only from
+# rec-4 harness evidence. Config `auto_surface.in_turn_recall.junk_stoplist`
+# overrides the whole list; `[]` disables filtering.
+JUNK_STOPLIST: frozenset[str] = frozenset({
+    "str", "rn", "echo", "wc", "sed", "eof",       # Kepler's named class (all-seats-confirmed)
+    "sys", "stdin", "stdout", "stderr",            # python IO
+    "nohup", "pkill", "sigterm", "pgrep", "grep",  # process/shell
+    "awk", "xargs", "chmod", "mkdir", "rmdir", "printf",
+    "sh", "bash", "zsh",
+})
+
 # Pre-compiled tokenize pattern: two-or-more letters to start, then alphanumeric +
 # underscore.  The spec's stated pattern is [a-z][a-z0-9_]*, but the spec test
 # assertions imply single-letter tokens (e.g. bare "s" from apostrophe-s) and

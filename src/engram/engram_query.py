@@ -1784,8 +1784,20 @@ def _surface_impl(
     top_k: int = 10,
     semantic: bool = True,
     embed_query: str | None = None,
+    include_query_embedding: bool = False,
 ) -> str:
-    """Impl for engram_surface — callable with named kwargs for in-server callers."""
+    """Impl for engram_surface — callable with named kwargs for in-server callers.
+
+    include_query_embedding: opt-in, default False. When True, adds a
+    `query_embedding` field (this call's raw embedding vector) to the
+    returned summary — used internally by the surface daemon (see
+    engram-surface-daemon.py) to feed the render-hook's prompt-similarity
+    habituation decay (#257 rec 1 / extends #1700). False by default because
+    the vector is machinery, not agent-facing content — a normal
+    engram_surface call (from an agent, not the daemon) has no use for a
+    384-float array in its own context, so it's opt-in rather than always
+    computed+stripped (mirrors the `return_debug` idiom on _search_nodes).
+    """
     conn = core._get_db()
     try:
         t0 = time.perf_counter()
@@ -1808,6 +1820,28 @@ def _surface_impl(
                     "Issue #819: p95=4.3s tail is under investigation."
                 )
             return json.dumps(no_match)
+
+        # Query embedding for the render-layer's prompt-similarity decay
+        # (#257 rec 1 / extends #1700) — computed only when the daemon asks
+        # for it (include_query_embedding=True), not on every ordinary
+        # engram_surface call, and only past the zero-match early return
+        # above (nothing to compare against on a truly empty result, so
+        # there's no reason to pay for an embed call that gets discarded).
+        # Re-embedding here (rather than threading a vector out of
+        # _search_nodes, which many other callers share) keeps this
+        # surface-only — no shared-function signature change. Redundant
+        # with the embed _search_nodes already did internally, but cheap:
+        # the daemon preloads the model specifically so this stays fast.
+        # None (not computed / model unavailable) is a valid, expected value
+        # — the hook falls back to today's count-only classification on it.
+        query_embedding = None
+        if include_query_embedding and core._embedder.is_available() and core._get_embedding_config().get("enabled", True):
+            try:
+                model_name = core._get_embedding_config().get("model", core.DEFAULT_EMBEDDING_MODEL)
+                effective_embed_query = embed_query if embed_query is not None else query
+                query_embedding = core._embedder.embed(effective_embed_query, model_name)
+            except Exception:
+                query_embedding = None
 
         # Snapshot wall-clock now once so every humanized timestamp in this
         # surface response is rendered against the same reading (MECH-2 of
@@ -1835,7 +1869,9 @@ def _surface_impl(
                 entry: dict = {
                     "id": n["id"], "type": ntype,
                     "claim": n.get("claim", ""),
+                    "created_at": n.get("created_at"),
                     "created_ago": core._humanized_ago(n.get("created_at"), now=now_utc),
+                    "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                     "recall_summary": n.get("recall_summary"),
                     "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
                 }
@@ -1870,7 +1906,9 @@ def _surface_impl(
                 "id": n["id"], "type": n["type"],
                 "claim": n.get("claim", ""),
                 "confidence": n.get("confidence"),
+                "created_at": n.get("created_at"),
                 "created_ago": core._humanized_ago(n.get("created_at"), now=now_utc),
+                "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
                 "recall_summary": n.get("recall_summary"),
                 "recall_keywords": json.loads(n.get("recall_keywords") or "null"),
             }
@@ -1952,6 +1990,17 @@ def _surface_impl(
                 "id": n["id"],
                 "type": n.get("type"),
                 "recall_keywords": kw,
+                # Additive, same computation as special_nodes/top_claims
+                # above — needed so the same-session-echo guard (#257 rec 2)
+                # can evaluate Others/matched_meta-only candidates too, not
+                # just the top-3 specials/top_claims. Without this, a node
+                # that never ranks into the top 3 of its category (or an
+                # `evidence`-type node, which never appears in either
+                # section at all) could never be echo-guarded regardless of
+                # how recently it was created (colleague-review catch, PR
+                # #1779 round 1).
+                "created_at": n.get("created_at"),
+                "created_minutes_ago": core._created_minutes_ago(n.get("created_at"), now=now_utc),
             }
             # Lightweight boolean taint/staleness signal (MECH-5 follow-up) —
             # reuse the warned_nodes map already built above rather than
@@ -2076,7 +2125,16 @@ def _surface_impl(
                 "Issue #819: p95=4.3s tail is under investigation."
             )
 
-        return json.dumps(core._strip_agent_facing(summary))
+        # Added after _strip_agent_facing rather than exempted within it: the
+        # strip list is a static denylist applied to every summary regardless
+        # of caller, and this field's presence is itself opt-in
+        # (include_query_embedding) — adding the key post-strip keeps the
+        # strip semantics simple (it still strips this field from anything
+        # that reaches it via a path OTHER than this explicit opt-in).
+        result_json = core._strip_agent_facing(summary)
+        if include_query_embedding:
+            result_json["query_embedding"] = query_embedding
+        return json.dumps(result_json)
     finally:
         conn.close()
 

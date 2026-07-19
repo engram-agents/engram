@@ -1831,7 +1831,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
 # semantic=False is the fast keyword-only path — useful in latency-sensitive
 # hooks. Default semantic=True for full recall quality.
 _SURFACE_FIELDS = frozenset({
-    "query", "top_k", "semantic", "embed_query",
+    "query", "top_k", "semantic", "embed_query", "include_query_embedding",
 })
 
 
@@ -1866,6 +1866,10 @@ def engram_surface(payload_json: str) -> str:
                 FTS still uses query. Designed for the auto-surface hook to
                 prepend prev-response-tail for short prompts without polluting
                 FTS keyword matching. See alpha #177 area 1.
+            include_query_embedding (bool, optional): Internal machinery flag
+                for the surface daemon (prompt-similarity habituation decay,
+                #257 rec 1) — default False. Adds a raw `query_embedding`
+                vector to the response. Not useful for ordinary agent calls.
 
     Returns:
         JSON with compact summary: type counts, special nodes, top claims,

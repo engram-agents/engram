@@ -338,6 +338,12 @@
       "note": "recall-repetition acceptance-metric measurement tool (recall-triggering blueprint #1688 P1/#1689) -- a measurement/benchmarking harness for ENGRAM-development use, same class as tools/perf's replay-bench harness. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/recall_repetition_analysis.py) would wrongly flag this as dangling."
     },
     {
+      "path": "tools/recall_measurement_harness.py",
+      "tier": "dev",
+      "source": "tools/recall_measurement_harness.py",
+      "note": "rec-4 unified before/after in-turn-recall measurement harness (#266 / #1780) -- measurement/benchmarking tool for ENGRAM-development use, same class as (and reuses) tools/recall_repetition_analysis.py. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly to avoid a false dangling-source flag."
+    },
+    {
       "path": "tools/deference_baseline.py",
       "tier": "dev"
     },
