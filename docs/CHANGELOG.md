@@ -9,7 +9,76 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-_Nothing yet — changes land here after the v0.3.0-rc1 cut._
+_Nothing yet — changes land here after the v0.3.1-rc1 cut._
+
+## [v0.3.1] - 2026-07-19
+
+A focused refinement wave on top of v0.3.0's recall-triggering overhaul —
+tuning the render layer against a day of real dogfood signal, plus a
+measurement instrument to keep tuning honest going forward.
+
+### Added
+
+- **Prompt-embedding-proximity habituation decay** (#1779, closes #1778) —
+  extends the render-layer repetition suppression from count-only
+  classification to a comparison against the embedding at a node's last
+  render: high prompt-similarity still decays a repeated render, but floors
+  at "others" rather than fully suppressing it; low similarity renders in
+  full regardless of prior count, because the conversation has genuinely
+  moved on. `query_embedding` threads through as an opt-in
+  `engram_surface` field so ordinary calls never pay for it.
+- **Same-session-echo guard** (#1779) — a node created in the current
+  session is never re-rendered within N minutes of its own creation (pure
+  echo, zero information), gated on the session-start boundary so a node
+  from a just-ended *previous* session isn't misclassified as an echo of
+  this one.
+- **Before/after in-turn-recall measurement harness** (#1781) — a
+  standalone tool (`tools/recall_measurement_harness.py`) that computes
+  junk-token rate, repetition rate, and engagement-floor metrics from the
+  per-fire surface ledger. Before/after comparison is done by running it on
+  each slice of the ledger; a first-class `--split-at <timestamp>` flag to
+  do the slicing in-tool is planned (#1787). Built to give the team a
+  shared, reusable instrument for validating future render-layer changes
+  against real session data rather than one-off manual reads.
+- **Canonical junk-token stoplist** (#1783, #1785) — a single
+  `JUNK_STOPLIST` in `engram_idf.py`, imported by both the in-turn-recall
+  hook (the live filter) and the measurement harness (the measurement), so
+  the two can no longer disagree about what counts as junk on the same
+  ledger. The list is deliberately conservative: a wider cut (dropping
+  ambiguous tokens like `json`/`os`/`re`/`cat`/`print`/`def`) was found to
+  over-suppress ~24% of real renders, so the filter's conservative 24-token
+  list is canonical and the measurement conforms down to it, never the
+  reverse.
+
+### Fixed
+
+- **Junk-token stoplist divergence** (#1785, closes #1784) — the hook's
+  and the harness's independently-maintained stoplists had already drifted
+  (18 tokens shared, 22 harness-only, 6 hook-only) before either shipped
+  externally, which would have quietly skewed before/after comparisons.
+  Caught in colleague review before it reached a release.
+
+### Measurement note (read before interpreting recall metrics across this release)
+
+Engagement-floor numbers measured **after** this release are **not directly
+comparable** to floors measured before v0.3.0's echo-guard/#1779 landed.
+Pre-#1779, a node cited once but rendered N times (before the guard
+suppressed the redundant renders) scored as **N separate engaged-fires** —
+so the historical floor was inflated by repeated renders of the same
+eventually-cited node, not a true measure of distinct recall. The
+echo-guard removes that padding: a lower floor after this release at
+equal-or-better real recall is the **expected signature** of the fix
+working, not a regression. Corroborating signal from the v0.3.1 gate run:
+junk-token rate at literal zero across all seats measured, decay events
+firing at cosine 0.95–0.99 (near-duplicates only, not distinct content),
+and no seat reporting missing-recall symptoms.
+
+Separately: the "~30% junk" figure quoted during v0.3.0's development was
+measured under a since-retired 42-token stoplist. The shipped, conservative
+24-token `JUNK_STOPLIST` (this release) measures real junk-fire rate at
+~3.5%, which rec-3's filter now zeroes — most of the old 30% was ambiguous
+tokens (`json`, `os`, `re`, `curl`, …) that the team deliberately chose not
+to filter, not genuine execution noise.
 
 ## [v0.3.0] - 2026-07-11
 
