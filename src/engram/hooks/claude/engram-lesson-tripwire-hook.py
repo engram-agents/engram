@@ -158,20 +158,15 @@ def _append_ledger(build_entry) -> None:
 # rec-3 (#266): junk-token stoplist for the novel-terms gate. Shell/code
 # execution tokens carry zero recall signal but pollute the high-IDF
 # novel-term set (a seat-level ledger measured ~30% of novel tokens as
-# junk-class). TARGETED stoplist, deliberately NOT a min_idf bump: a
-# zero-cooldown ledger analysis showed a stricter threshold kills ~24% of
-# REAL renders, so we drop only tokens that are unambiguously execution-
-# noise, never topical. Conservative seed; extend/tune from the rec-4
-# measurement harness (#1780). Config
-# `auto_surface.in_turn_recall.junk_stoplist` overrides the whole list;
-# `[]` disables filtering.
-_DEFAULT_JUNK_STOPLIST = frozenset({
-    "str", "rn", "echo", "wc", "sed", "eof",       # Kepler's named class (all-seats-confirmed)
-    "sys", "stdin", "stdout", "stderr",            # python IO
-    "nohup", "pkill", "sigterm", "pgrep", "grep",  # process/shell
-    "awk", "xargs", "chmod", "mkdir", "rmdir", "printf",
-    "sh", "bash", "zsh",
-})
+# junk-class). The canonical list now lives as `JUNK_STOPLIST` in engram_idf
+# (#1784: single source of truth shared with the rec-4 measurement harness so
+# the filter and the measurement can't drift). It is imported lazily at
+# point-of-use — NOT at module top-level — because this hook must never crash
+# at import when engram_idf isn't yet on sys.path (the whole recall path is
+# guarded and returns "" if the import fails). `_in_turn_config()` therefore
+# carries a None sentinel for "use the canonical default", kept distinct from
+# a config-supplied `[]` which DISABLES filtering; the sentinel is resolved to
+# JUNK_STOPLIST only after the import succeeds.
 
 
 def _apply_junk_stoplist(terms: list, stoplist: frozenset) -> list:
@@ -205,7 +200,10 @@ def _in_turn_config() -> dict:
         "max_lines": 3,
         "min_idf": None,
         "min_idf_ratio": 0.7,
-        "junk_stoplist": _DEFAULT_JUNK_STOPLIST,
+        # None sentinel = "not overridden, use the canonical engram_idf.JUNK_STOPLIST
+        # (resolved at point-of-use after the lazy import)". A config-supplied []
+        # is a real empty frozenset that DISABLES filtering — kept distinct below.
+        "junk_stoplist": None,
     }
     try:
         with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
@@ -412,7 +410,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
         if runtime_dir not in sys.path:
             sys.path.insert(0, runtime_dir)
         try:
-            from engram_idf import extract_keywords, STOPWORDS
+            from engram_idf import extract_keywords, STOPWORDS, JUNK_STOPLIST
+            # Resolve the None sentinel from _in_turn_config() to the canonical
+            # shared list now that the import has succeeded (#1784). A
+            # config-supplied frozenset — including an empty one (filtering
+            # disabled) — passes through unchanged.
+            junk = cfg["junk_stoplist"] if cfg["junk_stoplist"] is not None else JUNK_STOPLIST
             conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=1.0)
             try:
                 if cfg["min_idf"] is not None:
@@ -432,14 +435,14 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
                 # below stays as a backstop.
                 pairs = extract_keywords(
                     conn, match_target, min_idf=effective_min_idf, top_k=5,
-                    stopwords=STOPWORDS | cfg["junk_stoplist"])
+                    stopwords=STOPWORDS | junk)
             finally:
                 conn.close()
             terms = [tok for tok, _score in pairs]
             # rec-3 (#266): drop junk-class shell/code tokens BEFORE the
             # novelty check + fire, so execution noise neither triggers recall
             # nor pollutes the term-memory/ledger. Targeted, not a min_idf bump.
-            terms = _apply_junk_stoplist(terms, cfg["junk_stoplist"])
+            terms = _apply_junk_stoplist(terms, junk)
         except Exception:
             return ""
         if not terms:

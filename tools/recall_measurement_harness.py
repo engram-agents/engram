@@ -63,6 +63,28 @@ if _TOOLS_DIR not in sys.path:
 
 import recall_repetition_analysis as rra  # noqa: E402  (reuse, do not reimplement)
 
+
+def _add_engram_idf_to_path() -> None:
+    """Put engram_idf.py on sys.path so the harness shares the canonical
+    JUNK_STOPLIST (#1784) instead of keeping its own copy. Dev tree:
+    <repo>/src/engram/. Deployed plugin: the plugin root (flat layout).
+    Env override: $ENGRAM_RUNTIME_DIR."""
+    repo_root = os.path.dirname(_TOOLS_DIR)
+    candidates = [
+        os.environ.get("ENGRAM_RUNTIME_DIR"),
+        os.path.join(repo_root, "src", "engram"),
+        repo_root,  # deployed flat layout
+    ]
+    for cand in candidates:
+        if cand and os.path.exists(os.path.join(cand, "engram_idf.py")):
+            if cand not in sys.path:
+                sys.path.insert(0, cand)
+            return
+
+
+_add_engram_idf_to_path()
+from engram_idf import JUNK_STOPLIST  # noqa: E402  (#1784 single source of truth)
+
 # ---------------------------------------------------------------------------
 # Node-ID regex -- per the #1780 harness spec (bullet 4). Note this is
 # intentionally `\d{4,}` (four-or-more digits), which is the exact pattern
@@ -78,16 +100,16 @@ import recall_repetition_analysis as rra  # noqa: E402  (reuse, do not reimpleme
 NODE_ID_RE = re.compile(
     r"\b(?:ob|dv|cs|ls|qu|cj|ev|fl|tk|pn|gl|ax|df|pr|th|ct|gt|ts)_\d{4,}\b")
 
-# Seed junk-token stoplist (rec-3). Module constant, overridable via
-# --stoplist-file (one token per line, '#'-prefixed lines and blanks
-# ignored).
-DEFAULT_STOPLIST = frozenset(
-    """
-    str rn echo wc sed eof sys print python3 nohup pipe uid def ps cat grep
-    awk json stdin stdout stderr null true false none lambda import os re
-    sh bash zsh curl pkill sigterm checkout rev parse stash pytest
-    """.split()
-)
+# Junk-token stoplist (rec-3, #266). Aliased to the canonical
+# engram_idf.JUNK_STOPLIST (#1784): the measurement uses the EXACT list the
+# live filter (the recall hook) uses, so the two can never disagree about
+# "what counts as junk" on the same ledger. The filter's conservative list is
+# authoritative; this alias reconciles the measurement DOWN to it (dropping
+# this module's former ambiguous extras like json/os/re/cat/print/def, which
+# are over-suppression risks the filter deliberately does not carry).
+# Overridable via --stoplist-file (one token per line, '#'-prefixed lines and
+# blanks ignored).
+DEFAULT_STOPLIST = JUNK_STOPLIST
 
 
 # ---------------------------------------------------------------------------

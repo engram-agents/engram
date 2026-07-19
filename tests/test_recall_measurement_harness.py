@@ -370,11 +370,15 @@ class TestJunkFire(unittest.TestCase):
                 "novel_terms": ["str", "sed"],
                 "rendered_ids": ["ob_1"],
             },
-            # any-junk (but not all-junk) fire: one junk, one real term
+            # any-junk (but not all-junk) fire: one junk, one real term.
+            # NB (#1784): uses "grep" (in the canonical engram_idf.JUNK_STOPLIST
+            # that DEFAULT_STOPLIST now aliases), not the former "curl" — curl
+            # was one of the harness's ambiguous extras dropped when the
+            # measurement reconciled DOWN to the conservative filter list.
             {
                 "ts": 2.0,
                 "outcome": "rendered",
-                "novel_terms": ["curl", "portfolio"],
+                "novel_terms": ["grep", "portfolio"],
                 "rendered_ids": ["ob_2"],
             },
             # no-junk fire
@@ -388,7 +392,7 @@ class TestJunkFire(unittest.TestCase):
             {
                 "ts": 4.0,
                 "outcome": "no_matches",
-                "novel_terms": ["str", "sed", "curl"],
+                "novel_terms": ["str", "sed", "grep"],
                 "rendered_ids": [],
             },
         ]
@@ -397,7 +401,7 @@ class TestJunkFire(unittest.TestCase):
         result = rmh.compute_junk_fire(ledger_path, rmh.DEFAULT_STOPLIST)
         self.assertEqual(result["n_rendered_fires"], 3)
         self.assertEqual(result["n_novel_tokens"], 6)  # 2 + 2 + 2, excludes non-rendered
-        self.assertEqual(result["n_junk_tokens"], 3)  # str,sed (fire1) + curl (fire2)
+        self.assertEqual(result["n_junk_tokens"], 3)  # str,sed (fire1) + grep (fire2)
         self.assertAlmostEqual(result["token_fraction"], 3 / 6)
         self.assertAlmostEqual(result["any_junk_fraction"], 2 / 3)  # fires 1,2
         self.assertAlmostEqual(result["all_junk_fraction"], 1 / 3)  # fire 1 only

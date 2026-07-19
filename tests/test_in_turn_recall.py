@@ -47,6 +47,13 @@ SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(SRC_ENGRAM))
 
+# Capture the REAL canonical junk list at collection time (before any test
+# installs a fake engram_idf), so the stubs below can expose the same list the
+# live filter uses (#1784: single source of truth). The hook imports
+# JUNK_STOPLIST alongside extract_keywords/STOPWORDS, so every fake must carry
+# it or the hook's import fails and filtering silently no-ops.
+from engram_idf import JUNK_STOPLIST as _REAL_JUNK_STOPLIST  # noqa: E402
+
 HOOK_PATH = SRC_ENGRAM / "hooks" / "claude" / "engram-lesson-tripwire-hook.py"
 
 import pytest
@@ -96,6 +103,7 @@ def _stub_idf(terms_by_call: list[list[str]]):
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = extract_keywords
     fake.STOPWORDS = frozenset()  # hook imports STOPWORDS alongside extract_keywords
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST  # #1784: hook imports this too
     sys.modules["engram_idf"] = fake
     return fake
 
@@ -139,6 +147,7 @@ def _stub_idf_capture(terms):
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = extract_keywords
     fake.STOPWORDS = frozenset({"builtin_sw"})
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST  # #1784: hook imports this too
     sys.modules["engram_idf"] = fake
     return captured
 
@@ -585,6 +594,11 @@ def test_zero_docs_is_silent_no_daemon_call(tmp_path, monkeypatch):
 
     fake = types.ModuleType("engram_idf")
     fake.extract_keywords = failing_extract_keywords
+    # #1784: carry STOPWORDS + JUNK_STOPLIST so the hook's import SUCCEEDS and
+    # the test exercises the real n_docs==0 short-circuit (returns before
+    # extract_keywords is reached), rather than passing via an import failure.
+    fake.STOPWORDS = frozenset()
+    fake.JUNK_STOPLIST = _REAL_JUNK_STOPLIST
     sys.modules["engram_idf"] = fake
 
     daemon_calls = {"n": 0}
@@ -709,7 +723,7 @@ def test_ledger_entry_construction_failure_does_not_break_recall(tmp_path, monke
 def test_apply_junk_stoplist_default_filters_shell_tokens(tmp_path):
     hook = _load_hook(str(tmp_path))
     got = hook._apply_junk_stoplist(
-        ["echo", "portfolio", "sed", "hbm4"], hook._DEFAULT_JUNK_STOPLIST)
+        ["echo", "portfolio", "sed", "hbm4"], _REAL_JUNK_STOPLIST)
     assert got == ["portfolio", "hbm4"]  # order preserved, junk dropped
 
 
@@ -722,12 +736,18 @@ def test_apply_junk_stoplist_empty_disables(tmp_path):
 def test_apply_junk_stoplist_case_insensitive(tmp_path):
     hook = _load_hook(str(tmp_path))
     assert hook._apply_junk_stoplist(
-        ["ECHO", "Sed", "nvda"], hook._DEFAULT_JUNK_STOPLIST) == ["nvda"]
+        ["ECHO", "Sed", "nvda"], _REAL_JUNK_STOPLIST) == ["nvda"]
 
 
-def test_junk_stoplist_config_default_is_seed(tmp_path):
+def test_junk_stoplist_config_default_is_sentinel(tmp_path):
+    # #1784: with no config override, _in_turn_config() returns the None
+    # sentinel meaning "use the canonical engram_idf.JUNK_STOPLIST", resolved
+    # at point-of-use after the lazy import. Kept distinct from a config []
+    # (which is a real empty frozenset that disables filtering, tested below).
+    # End-to-end resolution of the sentinel to the canonical list is covered by
+    # test_all_junk_terms_produce_no_fire.
     hook = _load_hook(str(tmp_path))
-    assert hook._in_turn_config()["junk_stoplist"] == hook._DEFAULT_JUNK_STOPLIST
+    assert hook._in_turn_config()["junk_stoplist"] is None
 
 
 def test_junk_stoplist_config_override_lowercases(tmp_path):
