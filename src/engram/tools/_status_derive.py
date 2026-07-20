@@ -40,6 +40,7 @@ LAST_USER_ACTIVITY_PATH
 
 import json
 import os
+import socket
 import time
 import urllib.request
 from pathlib import Path
@@ -189,8 +190,24 @@ def _fetch_held_batons(agent_name: str) -> list:
         base_url = _resolve_forum_url()
         url = f"{base_url}/api/projects?active_only=true"
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=_FORUM_REQUEST_TIMEOUT_SECONDS) as resp:
-            raw = resp.read()
+        # Force IPv4-only resolution: the forum host's mDNS record advertises
+        # unreachable IPv6 candidates ahead of the working IPv4 address, and
+        # stdlib create_connection tries each serially at full timeout cost
+        # before falling through — enough to blow the hook's outer budget
+        # (see forum_api.ForumClient._execute for the full writeup; this
+        # function can't import forum_api per the module's import-back-free
+        # design, so the same fix is duplicated here).
+        real_getaddrinfo = socket.getaddrinfo
+
+        def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+        socket.getaddrinfo = _ipv4_only_getaddrinfo
+        try:
+            with urllib.request.urlopen(req, timeout=_FORUM_REQUEST_TIMEOUT_SECONDS) as resp:
+                raw = resp.read()
+        finally:
+            socket.getaddrinfo = real_getaddrinfo
         data = json.loads(raw)
         if not isinstance(data, dict):
             return []
