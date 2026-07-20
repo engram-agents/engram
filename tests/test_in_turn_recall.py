@@ -774,6 +774,19 @@ def test_all_junk_terms_produce_no_fire(tmp_path, monkeypatch):
     assert _read_ledger(hook) == []
 
 
+def test_empty_junk_stoplist_disables_filtering_e2e(tmp_path, monkeypatch):
+    """rec-3 / #1784: junk_stoplist=[] resolves to a real empty frozenset
+    (never the None-sentinel default), so all-junk novel terms still fire."""
+    hook = _load_hook(str(tmp_path))
+    _enable(hook, str(tmp_path), junk_stoplist=[])
+    _stub_idf([["echo", "sed"]])  # both in the default stoplist
+    monkeypatch.setattr(hook, "_query_recall_daemon",
+                        lambda q, top_k=5: _daemon_result(["ob_1"]))
+    out = hook.check_in_turn_recall("Bash echo something | sed")
+    assert "ENGRAM in-turn recall" in out
+    assert len(_read_ledger(hook)) == 1
+
+
 def test_mixed_terms_drop_junk_from_fire_and_ledger(tmp_path, monkeypatch):
     """rec-3: junk is stripped but the real term still fires; the ledger's
     novel_terms/terms carry only the real token (cleaner term-set)."""
