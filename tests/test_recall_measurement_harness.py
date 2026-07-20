@@ -350,6 +350,93 @@ class TestEngagementFloorPositiveCases(TranscriptFixtureMixin, unittest.TestCase
         self.assertEqual(result["engagement_floor"], 0.0)
 
 
+class TestEngagementFloorDistinctNode(TranscriptFixtureMixin, unittest.TestCase):
+    """#1787 part 2: the distinct-cited-node floor must be invariant to
+    render multiplicity -- a node rendered N times in one session should
+    only ever count once toward the distinct-node denominator/numerator,
+    unlike the per-fire floor, which counts each render separately."""
+
+    def test_distinct_node_floor_invariant_to_render_multiplicity(self):
+        transcript_path = os.path.join(self.tmpdir, "session.jsonl")
+        # ob_9401 is cited exactly once, well after all three of its renders.
+        records = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Citing ob_9401 for this decision."}
+                    ],
+                },
+                "timestamp": _iso(self._after(100)),
+            },
+        ]
+        _write_jsonl(transcript_path, records)
+
+        ledger_path = os.path.join(self.tmpdir, "in-turn-recall-ledger.jsonl")
+        _write_jsonl(
+            ledger_path,
+            [
+                # ob_9401 rendered three separate times in the SAME session, at
+                # increasing timestamps -- render-multiplicity to be
+                # invariant against.
+                {
+                    "ts": self.fire_ts,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                {
+                    "ts": self.fire_ts + 10,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                {
+                    "ts": self.fire_ts + 20,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                # ob_9402: a second distinct node, rendered once, never cited.
+                {
+                    "ts": self.fire_ts + 30,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9402"],
+                    "novel_terms": ["bar"],
+                },
+            ],
+        )
+        surface_ledger_path = os.path.join(self.tmpdir, "surface-ledger.json")
+        with open(surface_ledger_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        result = rmh.compute_engagement_floor(
+            ledger_path, surface_ledger_path, [], None
+        )
+
+        self.assertEqual(result["n_distinct_nodes"], 2)
+        self.assertEqual(result["n_distinct_engaged"], 1)
+        self.assertEqual(result["engagement_floor_distinct"], 0.5)
+
+        # Per-fire floor inflates: all 3 ob_9401 fires are individually
+        # "engaged" (the citation is after every one of their fire.ts), so
+        # the per-fire numerator/denominator differ from the distinct-node
+        # variant -- this locks in that the two metrics genuinely diverge
+        # under render multiplicity.
+        self.assertNotEqual(
+            result["engagement_floor"], result["engagement_floor_distinct"]
+        )
+
+
 class TestJunkFire(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="rmh-junk-test-")

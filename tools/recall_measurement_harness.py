@@ -594,6 +594,12 @@ def compute_engagement_floor(
     # (A) as the required metric; B is marked "companion" in the design
     # comment, not a build must-have. See handoff ambiguous-decisions log.
 
+    # #1787 part 2: distinct-cited-node floor, render-multiplicity-invariant.
+    # Unit of counting is the (transcript_path, node_id) pair -- i.e. distinct
+    # rendered nodes per session -- rather than the per-fire unit above, which
+    # over-counts a node rendered N times in a session as up to N engaged-fires.
+    distinct_earliest: Dict[Tuple[str, str], float] = {}
+
     for fire in fires:
         if not fire.transcript_path or not os.path.exists(fire.transcript_path):
             continue
@@ -611,8 +617,25 @@ def compute_engagement_floor(
         if engaged:
             n_engaged += 1
 
+        for nid in fire.ids:
+            key = (fire.transcript_path, nid)
+            prev = distinct_earliest.get(key)
+            if prev is None or fire.ts < prev:
+                distinct_earliest[key] = fire.ts
+
     engagement_floor = (n_engaged / n_fires_with_transcript) if n_fires_with_transcript else 0.0
     coverage = (n_fires_with_transcript / n_fires_total) if n_fires_total else 0.0
+
+    n_distinct_nodes = len(distinct_earliest)
+    n_distinct_engaged = 0
+    for (tpath, nid), earliest_ts in distinct_earliest.items():
+        authored = authored_cache.get(tpath) or {}
+        cited_ts = authored.get(nid)
+        if cited_ts is not None and cited_ts > earliest_ts:
+            n_distinct_engaged += 1
+    engagement_floor_distinct = (
+        (n_distinct_engaged / n_distinct_nodes) if n_distinct_nodes else 0.0
+    )
 
     return {
         "available": n_fires_total > 0,
@@ -621,6 +644,9 @@ def compute_engagement_floor(
         "transcript_coverage_fraction": coverage,
         "n_engaged": n_engaged,
         "engagement_floor": engagement_floor,
+        "n_distinct_nodes": n_distinct_nodes,
+        "n_distinct_engaged": n_distinct_engaged,
+        "engagement_floor_distinct": engagement_floor_distinct,
         "known_error_direction": (
             "This is a FLOOR, not a ceiling: an agent that uses a rendered "
             "node's content via paraphrase, without writing its literal ID, "
@@ -629,7 +655,14 @@ def compute_engagement_floor(
             "are excluded from the denominator (see "
             "transcript_coverage_fraction) -- if unresolved sessions "
             "systematically differ from resolved ones, this is a further "
-            "source of bias in an unknown direction."
+            "source of bias in an unknown direction. The distinct-node "
+            "floor (engagement_floor_distinct) counts each rendered "
+            "(transcript, node_id) pair once regardless of how many times "
+            "it was re-rendered in the session, so it is invariant to "
+            "render multiplicity and is the valid basis for cross-#1779 "
+            "comparison -- the per-fire floor above is not, because "
+            "#1779's echo-guard change alters how many times the same "
+            "node is re-rendered within a session."
         ),
     }
 
@@ -768,6 +801,14 @@ def render_md(report: dict) -> str:
             f"coverage) | engaged: {ef['n_engaged']}\n"
         )
         lines.append(f"**Engagement floor: {_fmt_pct(ef['engagement_floor'])}**\n")
+        lines.append(
+            f"Distinct rendered nodes (per session, with transcript): {ef['n_distinct_nodes']} | "
+            f"distinct engaged: {ef['n_distinct_engaged']}\n"
+        )
+        lines.append(
+            f"**Engagement floor (distinct-node, render-multiplicity-invariant): "
+            f"{_fmt_pct(ef['engagement_floor_distinct'])}**\n"
+        )
         lines.append(f"_Known error direction: {ef['known_error_direction']}_\n")
 
     return "\n".join(lines) + "\n"
