@@ -71,16 +71,16 @@ import unittest.mock  # noqa: E402 — needed for _run_hook above
 class TestPipeExitWarn(unittest.TestCase):
 
     def test_warns_on_pytest_pipe_then_commit(self):
-        """pytest | tail && git commit — warns and allows (never blocks)."""
+        """pytest | tail && git commit — warns via context-only PreToolUse output."""
         out = _run_hook("pytest tests/ | tail -20 && git commit -m 'wip'")
         self.assertTrue(out.strip(), "Expected JSON output but got empty stdout")
         response = json.loads(out.strip())
         ctx = response["hookSpecificOutput"]["additionalContext"]
         self.assertIn("pipe-exit-warn", ctx)
-        self.assertEqual(
-            response["hookSpecificOutput"]["permissionDecision"],
-            "allow",
-            "Hook must never block — permissionDecision must be 'allow'",
+        self.assertNotIn(
+            "permissionDecision",
+            response["hookSpecificOutput"],
+            "Context-only PreToolUse output must omit permissionDecision",
         )
 
     def test_warns_on_gh_pipe_then_push(self):

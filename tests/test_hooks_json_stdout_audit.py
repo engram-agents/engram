@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -61,8 +62,46 @@ SHELL_HOOK_REFS = [
     if script_name.endswith(".sh")
 ]
 
+PRETOOL_ACTIVE_FIXTURES = {
+    "engram-bash-pipe-exit-warn.py",
+    "engram-lesson-tripwire-hook.py",
+    "engram-toolcall-repair.py",
+}
 
-def _payload_for(event_name: str, transcript_path: Path) -> dict:
+
+def _seed_lesson_tripwire_db(engram_home: Path) -> None:
+    """Create the minimal active-lesson DB state needed to exercise the hook."""
+    db = engram_home / "knowledge.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS nodes (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 1,
+            memory_status TEXT NOT NULL DEFAULT 'active',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            claim TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
+        "VALUES (?, 'lesson', 1, 'active', ?, ?)",
+        (
+            "ls_0001",
+            json.dumps({
+                "situation_pattern": r"forum reply",
+                "scaffolding_nudge": "Read body from stdin.",
+            }),
+            "forum reply lesson",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _payload_for(event_name: str, script_name: str, transcript_path: Path) -> dict:
     base = {
         "session_id": "codex-json-sweep-test",
         "transcript_path": str(transcript_path),
@@ -70,6 +109,32 @@ def _payload_for(event_name: str, transcript_path: Path) -> dict:
     if event_name == "UserPromptSubmit":
         return {**base, "prompt": "hello world"}
     if event_name == "PreToolUse":
+        if script_name == "engram-bash-pipe-exit-warn.py":
+            return {
+                **base,
+                "tool_name": "Bash",
+                "tool_input": {"command": "pytest tests/ | tail -20 && git commit -m 'wip'"},
+                "input": {"command": "pytest tests/ | tail -20 && git commit -m 'wip'"},
+            }
+        if script_name == "engram-lesson-tripwire-hook.py":
+            return {
+                **base,
+                "tool_name": "Bash",
+                "tool_input": {"command": "forum reply 42"},
+                "input": {"command": "forum reply 42"},
+            }
+        if script_name == "engram-toolcall-repair.py":
+            return {
+                **base,
+                "tool_name": "mcp__engram__engram_add_observation",
+                "tool_input": {
+                    "quoted_text": "Q",
+                    "interpretation": 'I</interpretation><parameter name="claim">C</parameter>',
+                    "quote_type": "personal_communication",
+                    "url": "https://example.com",
+                    "title": "repair test",
+                },
+            }
         return {
             **base,
             "tool_name": "mcp__engram__engram_query",
@@ -118,9 +183,12 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
             "ENGRAM_RUNTIME_DIR": str(REPO_ROOT),
         }
     )
+    if script_name == "engram-lesson-tripwire-hook.py":
+        _seed_lesson_tripwire_db(engram_home)
+
     result = subprocess.run(
         [sys.executable, str(hook_path)],
-        input=json.dumps(_payload_for(event_name, transcript_path)),
+        input=json.dumps(_payload_for(event_name, script_name, transcript_path)),
         capture_output=True,
         text=True,
         env=env,
@@ -135,6 +203,10 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
 
     stdout = result.stdout.strip()
     if not stdout:
+        assert script_name not in PRETOOL_ACTIVE_FIXTURES, (
+            f"{script_name} fixture must exercise its non-empty PreToolUse "
+            "output path"
+        )
         return
 
     try:
@@ -189,6 +261,23 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
         assert isinstance(hook_specific["additionalContext"], str), (
             f"{script_name} ({event_name}) additionalContext must be a string"
         )
+
+    if event_name == "PreToolUse":
+        permission = hook_specific.get("permissionDecision")
+        has_updated_input = "updatedInput" in hook_specific
+        assert not (permission == "allow" and not has_updated_input), (
+            f"{script_name} ({event_name}) emitted permissionDecision='allow' "
+            "without updatedInput; context-only PreToolUse output must omit "
+            "permissionDecision"
+        )
+        assert not (has_updated_input and permission != "allow"), (
+            f"{script_name} ({event_name}) emitted updatedInput without "
+            "permissionDecision='allow'"
+        )
+        if script_name == "engram-toolcall-repair.py":
+            assert hook_specific["updatedInput"].get("claim") == "C", (
+                "toolcall-repair fixture must prove the rewrite path restored claim"
+            )
 
 
 def test_referenced_shell_hooks_do_not_write_plaintext_stdout():
