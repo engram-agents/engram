@@ -4,7 +4,7 @@ PR #824 fixed the known laggards (time-bar, stop, user-identity).  This
 regression test keeps the rest of the shipped hook set from drifting back to
 plain-text or bare-Codex-incompatible stdout: if a referenced hook writes
 anything to stdout, that stdout must be a JSON object.  Event hooks that surface
-model context must use hookSpecificOutput with the matching hookEventName.
+model context must use the event-specific envelope the hook protocol requires.
 """
 
 from __future__ import annotations
@@ -152,8 +152,22 @@ def test_referenced_python_hook_stdout_is_empty_or_json_object(
     )
     assert "additionalContext" not in payload, (
         f"{script_name} ({event_name}) emitted bare additionalContext; "
-        "Codex requires hookSpecificOutput.additionalContext"
+        "Codex requires event-specific envelopes, never bare additionalContext"
     )
+
+    if event_name == "Stop":
+        assert "hookSpecificOutput" not in payload, (
+            f"{script_name} ({event_name}) must not use hookSpecificOutput; "
+            "Stop hooks continue the turn with decision/reason"
+        )
+        assert payload.get("decision") == "block", (
+            f"{script_name} ({event_name}) decision must be 'block'; got {payload.get('decision')!r}"
+        )
+        reason = payload.get("reason")
+        assert isinstance(reason, str) and reason, (
+            f"{script_name} ({event_name}) reason must be a non-empty string"
+        )
+        return
 
     hook_specific = payload.get("hookSpecificOutput")
     if hook_specific is None:

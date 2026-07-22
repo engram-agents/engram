@@ -79,8 +79,8 @@ def _nudge_emitted(stdout: str) -> bool:
         return False
     try:
         parsed = json.loads(stdout)
-        ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
-        return "ENGRAM Write Check" in ctx
+        reason = parsed.get("reason", "")
+        return "ENGRAM Write Check" in reason
     except (json.JSONDecodeError, AttributeError):
         return False
 

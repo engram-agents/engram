@@ -15,7 +15,7 @@ will catch it. The envelope-shape assertions also catch the older bare
 
 Hooks covered:
   - engram-time-bar-hook.py  (UserPromptSubmit)
-  - engram-stop-hook.py      (Stop -> hookSpecificOutput.additionalContext)
+  - engram-stop-hook.py      (Stop -> decision/block + reason)
   - engram-user-identity-hook.py (UserPromptSubmit, context + no-op paths)
 """
 
@@ -140,53 +140,50 @@ class TestTimeBarHookEnvelope:
 # ---------------------------------------------------------------------------
 
 class TestStopHookEnvelope:
-    """engram-stop-hook.py must emit hookSpecificOutput/Stop/additionalContext.
+    """engram-stop-hook.py must emit the Stop-hook decision/reason envelope.
 
-    The Stop hook is a MODEL-directed write-check nudge, so it must use the
-    model-reaching form (hookSpecificOutput.additionalContext) — NOT the
-    user-facing systemMessage form, which would produce a visible warning
-    banner and never reach the model.
+    Codex Stop hooks accept only {"decision": "block", "reason": "..."} when
+    they continue the turn. Claude Code supports the same shape, so the Stop
+    hook should use that common contract rather than hookSpecificOutput.
     """
 
     def test_stdout_is_valid_json(self):
         payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
         assert isinstance(payload, dict)
 
-    def test_has_hook_specific_output_key(self):
+    def test_decision_is_block(self):
         payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
-        assert "hookSpecificOutput" in payload, (
-            "Missing 'hookSpecificOutput' key — Stop hook returned wrong envelope form"
+        assert payload.get("decision") == "block", (
+            f"decision is {payload.get('decision')!r}, expected 'block'"
         )
 
-    def test_hook_event_name_is_stop(self):
+    def test_reason_is_nonempty_string(self):
         payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
-        hso = payload["hookSpecificOutput"]
-        assert hso.get("hookEventName") == "Stop", (
-            f"hookEventName is {hso.get('hookEventName')!r}, expected 'Stop'"
+        reason = payload.get("reason")
+        assert isinstance(reason, str) and reason, (
+            "reason is absent or not a non-empty string"
         )
 
-    def test_additional_context_is_nonempty_string(self):
-        payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
-        hso = payload["hookSpecificOutput"]
-        ctx = hso.get("additionalContext")
-        assert isinstance(ctx, str) and ctx, (
-            "additionalContext is absent or not a non-empty string"
-        )
-
-    def test_additional_context_contains_write_check(self):
+    def test_reason_contains_write_check(self):
         """Model-visible content is unchanged: must contain the ENGRAM Write Check text."""
         payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
-        ctx = payload["hookSpecificOutput"]["additionalContext"]
-        assert "ENGRAM Write Check" in ctx, (
+        reason = payload["reason"]
+        assert "ENGRAM Write Check" in reason, (
             "Stop hook write-check text changed unexpectedly"
         )
 
+    def test_not_hook_specific_output(self):
+        """hookSpecificOutput is not a valid Stop-hook continuation contract."""
+        payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
+        assert "hookSpecificOutput" not in payload, (
+            "Stop hook is still using hookSpecificOutput; Stop must use decision/reason"
+        )
+
     def test_not_system_message(self):
-        """systemMessage is user-facing (banner), not model-reaching — must NOT be present."""
+        """systemMessage is user-facing (banner), not the Stop-hook continuation form."""
         payload = _run_hook("engram-stop-hook.py", _STOP_PAYLOAD)
         assert "systemMessage" not in payload, (
-            "Stop hook is using systemMessage (user-facing banner) — must use "
-            "hookSpecificOutput.additionalContext (model-reaching) instead"
+            "Stop hook is using systemMessage (user-facing banner) instead of decision/reason"
         )
 
     def test_not_plain_text(self):

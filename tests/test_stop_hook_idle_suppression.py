@@ -64,8 +64,8 @@ def _nudge_emitted(stdout: str) -> bool:
         return False
     try:
         parsed = json.loads(stdout)
-        ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
-        return "ENGRAM Write Check" in ctx
+        reason = parsed.get("reason", "")
+        return "ENGRAM Write Check" in reason
     except (json.JSONDecodeError, AttributeError):
         return False
 
@@ -325,15 +325,14 @@ def test_corrupt_state_file_emits_nudge(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 8: envelope regression — #824 contract must be preserved on emission
+# Test 8: envelope regression — Stop decision/reason contract must be preserved on emission
 # ---------------------------------------------------------------------------
 
-def test_emitted_nudge_preserves_824_envelope(tmp_path):
-    """When the nudge emits (tool_use delta), the output must be byte-compatible
-    with the #824 envelope: JSON object with hookSpecificOutput.hookEventName=Stop
-    and a non-empty additionalContext string.
+def test_emitted_nudge_preserves_stop_contract(tmp_path):
+    """When the nudge emits (tool_use delta), stdout must use the Stop decision/reason contract.
 
-    This is the regression guard so idle-suppression cannot break #824's fix.
+    This is the regression guard so idle-suppression cannot break the Stop-hook
+    continuation shape Codex and Claude both accept.
     """
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
@@ -354,18 +353,17 @@ def test_emitted_nudge_preserves_824_envelope(tmp_path):
     except json.JSONDecodeError as exc:
         pytest.fail(f"Emitted stdout is not valid JSON: {exc}\nstdout={stdout!r}")
 
-    assert "hookSpecificOutput" in parsed, (
-        "Missing hookSpecificOutput — #824 envelope broken"
+    assert parsed.get("decision") == "block", (
+        f"decision={parsed.get('decision')!r}, expected 'block'"
     )
-    hso = parsed["hookSpecificOutput"]
-    assert hso.get("hookEventName") == "Stop", (
-        f"hookEventName={hso.get('hookEventName')!r}, expected 'Stop'"
-    )
-    ctx = hso.get("additionalContext")
-    assert isinstance(ctx, str) and ctx, "additionalContext must be a non-empty string"
-    assert "ENGRAM Write Check" in ctx, "Write-check text missing from additionalContext"
+    reason = parsed.get("reason")
+    assert isinstance(reason, str) and reason, "reason must be a non-empty string"
+    assert "ENGRAM Write Check" in reason, "Write-check text missing from reason"
     assert "systemMessage" not in parsed, (
-        "systemMessage must NOT be present (user-facing banner, not model-reaching)"
+        "systemMessage must NOT be present (user-facing banner, not Stop continuation)"
+    )
+    assert "hookSpecificOutput" not in parsed, (
+        "hookSpecificOutput must NOT be present on Stop output"
     )
     assert "additionalContext" not in parsed, (
         "Bare additionalContext at top level — still using old form Codex rejects"

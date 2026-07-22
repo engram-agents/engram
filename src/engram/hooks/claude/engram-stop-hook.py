@@ -7,7 +7,7 @@ Idle-suppression (issue #840)
 -----------------------------
 Problem: before #824, this hook emitted plain text on stdout, which Claude Code
 discarded as invalid hook output — so it was silently mute. #824 wrapped the
-nudge in the strict-JSON envelope (hookSpecificOutput.additionalContext),
+nudge in the Stop-hook JSON envelope ({"decision":"block","reason":"..."}),
 delivering it to the model for the first time. That exposed a second problem:
 on contentless turns where the agent replies "nothing to record," the hook fires
 again (Stop fires after every assistant turn), creating a self-sustaining
@@ -584,7 +584,7 @@ def main() -> None:
         "If not, end the turn with NO output - do not reply to or acknowledge this check; "
         "a text-only acknowledgment wastes a turn.]"
     )
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": output}}))
+    print(json.dumps({"decision": "block", "reason": output}))
 
     # Update state after a real emit so the next fire scans only new bytes.
     _update_state(transcript_path)
