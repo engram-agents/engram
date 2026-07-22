@@ -154,13 +154,21 @@ def _to_epoch(ts) -> float:
     `events.ts` (as returned by `rra.load_events`) is an ISO-8601 string
     (e.g. ``2026-05-21T19:35:34.697Z``). This helper normalizes both so a
     single `--split-at` boundary can be compared uniformly across sources.
+
+    ISO-8601 string parsing is delegated to `_parse_iso_ts` (the two
+    helpers previously duplicated the same Z-strip + fromisoformat logic;
+    #1787 follow-up consolidates it there). Unlike `_parse_iso_ts`, this
+    function RAISES `ValueError` on a malformed string rather than
+    returning `None` -- callers (the --split-at window filter via
+    `_in_window`) rely on the raise to distinguish "unparseable" from
+    "valid timestamp", and `_in_window` catches it.
     """
     if isinstance(ts, (int, float)):
         return float(ts)
-    ts_str = str(ts)
-    if ts_str.endswith("Z"):
-        ts_str = ts_str[:-1] + "+00:00"
-    return datetime.fromisoformat(ts_str).timestamp()
+    result = _parse_iso_ts(str(ts))
+    if result is None:
+        raise ValueError(f"unparseable timestamp: {ts!r}")
+    return result
 
 
 def _in_window(
@@ -1069,6 +1077,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="ISO-8601 timestamp; run before/after slices + deltas.",
     )
     args = parser.parse_args(argv)
+
+    if args.split_at:
+        try:
+            _to_epoch(args.split_at)
+        except ValueError:
+            parser.error(f"--split-at: invalid ISO-8601 timestamp {args.split_at!r}")
 
     report = build_report(args)
     if args.format == "json":

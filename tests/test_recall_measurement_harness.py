@@ -753,6 +753,13 @@ class TestToEpoch(unittest.TestCase):
         ).timestamp()
         self.assertAlmostEqual(rmh._to_epoch(iso), expected, places=3)
 
+    def test_to_epoch_raises_valueerror_on_malformed_string(self):
+        # Contract preserved post-#1787-follow-up dedup via _parse_iso_ts:
+        # _to_epoch still RAISES (unlike _parse_iso_ts, which returns None)
+        # -- the --split-at window filter (_in_window) relies on the raise.
+        with self.assertRaises(ValueError):
+            rmh._to_epoch("garbage")
+
 
 class TestSplitAt(unittest.TestCase):
     """#1787: --split-at partitions fires/events/entries into a before-slice
@@ -799,6 +806,13 @@ class TestSplitAt(unittest.TestCase):
         self.assertTrue(rmh._in_window(self.split_epoch, (self.split_epoch, None)))
         # No window -> always in.
         self.assertTrue(rmh._in_window(self.split_epoch, None))
+
+    def test_in_window_malformed_ts_excluded_not_raised(self):
+        # A malformed ts under an ACTIVE window is excluded (False), not a
+        # crash -- _in_window catches _to_epoch's ValueError.
+        self.assertFalse(
+            rmh._in_window("not-a-timestamp", (0.0, 100.0))
+        )
 
     def test_build_report_split_partitions_fires_and_computes_deltas(self):
         before_ts = self.split_epoch - 3600  # 1h before split
@@ -902,6 +916,18 @@ class TestSplitAt(unittest.TestCase):
         report = rmh.build_report(args)
         self.assertNotIn("before", report)
         self.assertIn("metrics", report)
+
+
+class TestSplitAtCLIValidation(unittest.TestCase):
+    """#1787 follow-up: a malformed --split-at must degrade to a clean
+    argparse usage error (exit code 2), not an unhandled ValueError
+    traceback -- consistent with the module's degrade-not-crash
+    convention."""
+
+    def test_malformed_split_at_exits_cleanly_via_parser_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            rmh.main(["--split-at", "not-a-date"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 class TestNodeIdRegex(unittest.TestCase):
