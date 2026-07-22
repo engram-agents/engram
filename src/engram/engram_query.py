@@ -282,6 +282,139 @@ def _pattern_open_question_answerable(
     return candidates[:top_k]
 
 
+# Category-3 protection-channel floor (forum #275). recall_count / inflation_gap
+# is ONE observation port on an N-channel protection system: a node can be kept
+# live by a tripwire fire, an auto-load/external-doc citation, or edge-traversal
+# reads — none of which move importance_score, so the inflation gap grows
+# unbounded and the scan false-alarms forever on protected-but-not-deliberately-
+# recalled nodes (forum #275). The fix flags erosion only when a node has NO visible
+# protection channel. The edge-degree floor below is calibration-tunable (the
+# spec's open question q1); >=2 is the v1 proposal, raise per empirical signal.
+_PROTECTION_EDGE_DEGREE_FLOOR = 2
+
+
+def _load_protection_surfaces() -> tuple[str, set[str]]:
+    """Read the auto-load / external-doc protection surfaces ONCE per scan.
+
+    Returns (doc_text, registry_ids): the concatenated text of the read-time-load
+    surfaces a node id can be cited in (warm-briefing.md, CLAUDE.md, skill files
+    under the plugin bundle's skills/), and the set of principle ids registered in
+    principle_triggers.json. Degrades gracefully — a missing file/dir contributes
+    nothing rather than raising, matching principle_coverage's side-effect-free
+    contract. Same surfaces engram_stats.principle_coverage consults, kept as a
+    standalone read here so Category-3 does not depend on that block running.
+    """
+    doc_text_parts: list[str] = []
+    try:
+        wb = core.DATA_DIR / "warm-briefing.md"
+        if wb.exists():
+            doc_text_parts.append(wb.read_text(errors="replace"))
+    except Exception:
+        pass
+    try:
+        # Path is env-overridable (ENGRAM_CLAUDE_MD_PATH) so tests can point at a
+        # controlled surface instead of the host's real CLAUDE.md — the read is
+        # otherwise non-hermetic. Production default is the real path.
+        cm = Path(os.environ.get("ENGRAM_CLAUDE_MD_PATH") or (Path.home() / ".claude" / "CLAUDE.md"))
+        if cm.exists():
+            doc_text_parts.append(cm.read_text(errors="replace"))
+    except Exception:
+        pass
+    try:
+        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+        if plugin_root:
+            skills_root = Path(plugin_root) / "skills"
+            if skills_root.is_dir():
+                for md in skills_root.rglob("*.md"):
+                    try:
+                        doc_text_parts.append(md.read_text(errors="replace"))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    registry_ids: set[str] = set()
+    try:
+        with open(core.PRINCIPLE_TRIGGERS_PATH, "r") as f:
+            _reg = json.load(f)
+        # registry values are LISTS of entries (a dual-role trigger gets one
+        # entry per principle); tolerate an old-shape single dict too.
+        for _raw in _reg.values():
+            _entries = _raw if isinstance(_raw, list) else [_raw]
+            for _e in _entries:
+                _pid = _e.get("principle_id")
+                if _pid:
+                    registry_ids.add(_pid)
+    except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError):
+        pass
+
+    return "".join(doc_text_parts), registry_ids
+
+
+def _visible_protection_channels(
+    conn, node_id: str, meta: dict, doc_text: str, registry_ids: set[str]
+) -> list[str]:
+    """Which protection channels keep this node live, if any (forum #275).
+
+    A node is protected — and so NOT a genuine erosion candidate — if it is
+    reachable via any channel other than deliberate recall. Checks run
+    cheapest-first and short-circuit: the caller only needs "any channel
+    present", so the expensive edge queries are skipped once a cheap channel
+    hits. Returns the channels found (possibly one, since we short-circuit) —
+    an empty list means no visible protection.
+
+    Channels:
+      - situation_pattern: a cognitive-tripwire keyword-match on the node's own
+        metadata OR on a lesson it exemplifies. The node->owning-lesson traversal
+        is load-bearing: a lesson's tripwire lives on the *lesson*, while an
+        exemplar observation scanned separately would look unprotected without
+        it — the exact tripwire-protected-lesson miss forum #275 documents.
+      - doc_cited: the node id appears in an auto-load surface (warm-briefing,
+        CLAUDE.md, skill files) or the principle_triggers registry — read-time
+        load-protected.
+      - edge_degree: live in+out edge-degree (to/from non-retracted nodes) at or
+        above the floor — traversal-reachable via get_subgraph / derivation chains.
+    """
+    # Channel 1a — own situation_pattern (free).
+    if meta.get("situation_pattern"):
+        return ["situation_pattern"]
+
+    # Channel 2 — auto-load / external-doc citation (in-memory, cheap).
+    if node_id in registry_ids or (doc_text and node_id in doc_text):
+        return ["doc_cited"]
+
+    # Channel 1b — owning-lesson situation_pattern (node -> lesson via
+    # `exemplifies`; source=exemplar, target=lesson). One query, only reached
+    # when the cheap channels miss.
+    lesson_rows = conn.execute(
+        "SELECT n.metadata FROM edges e JOIN nodes n ON n.id = e.target_id "
+        "WHERE e.source_id = ? AND e.relation = 'exemplifies' "
+        "AND n.is_current = 1 AND n.status != 'retracted'",
+        (node_id,),
+    ).fetchall()
+    for (lmeta_json,) in lesson_rows:
+        try:
+            lmeta = json.loads(lmeta_json) if lmeta_json else {}
+        except (TypeError, json.JSONDecodeError):
+            lmeta = {}
+        if lmeta.get("situation_pattern"):
+            return ["situation_pattern"]
+
+    # Channel 3 — live edge-degree (traversal-reachable). Counts edges in either
+    # direction whose OTHER endpoint is a live (non-retracted, current) node.
+    degree = conn.execute(
+        "SELECT COUNT(*) FROM edges e JOIN nodes n "
+        "ON n.id = CASE WHEN e.source_id = ? THEN e.target_id ELSE e.source_id END "
+        "WHERE (e.source_id = ? OR e.target_id = ?) "
+        "AND n.is_current = 1 AND n.status != 'retracted'",
+        (node_id, node_id, node_id),
+    ).fetchone()[0]
+    if degree >= _PROTECTION_EDGE_DEGREE_FLOOR:
+        return ["edge_degree"]
+
+    return []
+
+
 def _pattern_stale_load_bearing(
     conn, preset_params: dict, **_filters
 ) -> list[dict]:
@@ -293,6 +426,15 @@ def _pattern_stale_load_bearing(
     once important (high base) and haven't been re-recalled in many turns.
     Cornerstones and feeling_reports are excluded.
 
+    Protection-channel floor (forum #275): a high-gap node is only a genuine
+    erosion candidate if it has NO visible protection channel
+    (_visible_protection_channels). A node kept live by a tripwire, a doc
+    citation, or edge-traversal has a large gap for a benign reason — its
+    importance_score never inflated because those channels don't count as
+    deliberate recall — so flagging it is a false alarm (forum #275). Protected
+    nodes are filtered out BEFORE the top_k cut so they don't crowd out real
+    candidates.
+
     Returns: list of {id, type, claim, score, importance_base, inflation_gap,
     recall_count, suggested_action}.
     """
@@ -303,13 +445,16 @@ def _pattern_stale_load_bearing(
     current_turn = mem.get("current_turn", 0)
     decay_base = mem.get("decay_base", 1.014)
 
+    # Read the protection surfaces once for the whole scan (not per candidate).
+    doc_text, registry_ids = _load_protection_surfaces()
+
     # Pre-sort heuristic: fetch top 200 by importance_base DESC, then re-sort
     # by inflation_gap. A node with lower base but very old recall_turn could
     # have a larger gap and be cut here — accepted as approximation cost since
     # the final ranking is by gap and the pool is wide enough (200) to catch
     # typical cases. If empirical signal shows misses, raise the limit.
     rows = conn.execute(
-        "SELECT id, type, claim, importance_base, importance_score, recall_count "
+        "SELECT id, type, claim, importance_base, importance_score, recall_count, metadata "
         "FROM nodes "
         "WHERE is_current=1 "
         "AND type NOT IN ('cornerstone', 'feeling_report') "
@@ -319,7 +464,16 @@ def _pattern_stale_load_bearing(
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, imp_base, imp_score, recalls in rows:
+    for nid, ntype, claim, imp_base, imp_score, recalls, meta_json in rows:
+        try:
+            meta = json.loads(meta_json) if meta_json else {}
+        except (TypeError, json.JSONDecodeError):
+            meta = {}
+        # Protection-channel floor: skip nodes kept live by any channel other
+        # than deliberate recall — their inflation gap is benign, not erosion.
+        if _visible_protection_channels(conn, nid, meta, doc_text, registry_ids):
+            continue
+
         recalls = recalls or 0
         imp_base = imp_base or 0.0
         imp_score = imp_score or imp_base  # if never recalled, score equals base

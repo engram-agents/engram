@@ -290,6 +290,221 @@ def test_cornerstone_candidate_gates_on_importance_base_floor():
     assert cand["importance_base"] == 1.5
 
 
+# ── stale_load_bearing protection-channel floor (forum #275) ──────────────────
+#
+# A high-inflation-gap node is only a genuine erosion candidate when it has NO
+# visible protection channel. recall_count / inflation_gap is one observation
+# port; a node kept live by a tripwire, a doc citation, or edge-traversal has a
+# benign gap (importance_score never inflated because those channels aren't
+# deliberate recall). Each test isolates ONE channel: the node is made a genuine
+# stale candidate, its baseline edges are cleared, and only the channel under
+# test is added — so the exclusion (or, for the control, the inclusion) is
+# attributable to exactly that channel.
+
+
+def _set_node_metadata(server, node_id: str, meta: dict):
+    """Overwrite a node's metadata JSON (for situation_pattern setup)."""
+    conn = server._get_db()
+    try:
+        conn.execute("UPDATE nodes SET metadata=? WHERE id=?", (json.dumps(meta), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _clear_edges(server, node_id: str):
+    """Remove all edges touching a node, so edge-degree starts at a known 0."""
+    conn = server._get_db()
+    try:
+        conn.execute("DELETE FROM edges WHERE source_id=? OR target_id=?", (node_id, node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _retract_node(server, node_id: str):
+    """Mark a node retracted so it should not count as a live edge endpoint."""
+    conn = server._get_db()
+    try:
+        conn.execute("UPDATE nodes SET status='retracted' WHERE id=?", (node_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _make_stale_candidate(server, claim: str) -> str:
+    """A high-importance, long-uncrecalled observation with edges cleared — a
+    genuine erosion candidate (large inflation gap at turn 100) absent any
+    protection channel. Callers advance the turn and add the channel under test."""
+    nid = _add_observation(server, claim)
+    _set_node_importance(server, nid, importance_base=2.0, importance_score=2.0,
+                         recall_count=0, recall_turn=0)
+    _clear_edges(server, nid)
+    return nid
+
+
+def _hermetic_claude_md(server):
+    """Point the CLAUDE.md protection surface at a nonexistent file under the
+    test dir, so the host's real CLAUDE.md never leaks a false doc_cited hit."""
+    os.environ["ENGRAM_CLAUDE_MD_PATH"] = os.path.join(TEST_DIR, "no-such-claude.md")
+
+
+def _run_stale_scan(server, top_k: int = 100):
+    conn = server._get_db()
+    try:
+        params = dict(server.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = top_k
+        return server._pattern_stale_load_bearing(conn, params)
+    finally:
+        conn.close()
+
+
+def test_protection_unprotected_node_still_flagged():
+    """CONTROL: a genuine stale candidate with NO protection channel (no
+    situation_pattern, not doc-cited, edge-degree 0) MUST still be flagged.
+    Guards against the fix over-suppressing real erosion candidates."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Genuinely eroding, unprotected node")
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid in ids, (
+        "An unprotected high-gap node must still be flagged as an erosion "
+        "candidate — the protection floor must not suppress real candidates."
+    )
+
+
+def test_protection_skips_own_situation_pattern():
+    """A node with situation_pattern on its OWN metadata is tripwire-protected
+    and must be excluded despite a large gap."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Tripwire-protected node")
+    _set_node_metadata(server, nid, {"situation_pattern": "about to assert.*first"})
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, (
+        "A node with its own situation_pattern tripwire must be excluded."
+    )
+
+
+def test_protection_skips_owning_lesson_situation_pattern():
+    """The ob_0668 case: the scanned node has NO own situation_pattern, but it
+    `exemplifies` a lesson whose metadata DOES — the node->owning-lesson
+    traversal must find that protection. Without the traversal the exemplar
+    observation looks unprotected and false-alarms forever."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Exemplar of a tripwire-protected lesson")
+    # The owning lesson (any node row will do for the traversal mechanism);
+    # give it the situation_pattern the scanned node lacks.
+    lesson_id = _add_observation(server, "Lesson: probe before asserting first-ness")
+    _set_node_metadata(server, lesson_id, {"situation_pattern": "first.*contact"})
+    # node --exemplifies--> lesson (source=exemplar, target=lesson).
+    _add_edge(server, nid, lesson_id, "exemplifies")
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, (
+        "A node exemplifying a lesson whose situation_pattern protects it must "
+        "be excluded via the node->owning-lesson traversal (the ob_0668 miss)."
+    )
+
+
+def test_protection_skips_doc_cited_warm_briefing():
+    """A node whose id appears in warm-briefing.md is read-time-load-protected
+    and must be excluded."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Node cited in warm-briefing")
+    with open(os.path.join(TEST_DIR, "warm-briefing.md"), "w") as f:
+        f.write(f"Currently focused:\n- [{nid}] some load-bearing claim\n")
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, "A node cited in warm-briefing.md must be excluded."
+
+
+def test_protection_skips_doc_cited_claude_md():
+    """A node whose id appears in the CLAUDE.md surface (via the env seam) is
+    read-time-load-protected and must be excluded."""
+    server = fresh_server()
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Node cited in CLAUDE.md")
+    claude_path = os.path.join(TEST_DIR, "test-claude.md")
+    with open(claude_path, "w") as f:
+        f.write(f"Operating principle ({nid}, focus-pinned): ...\n")
+    os.environ["ENGRAM_CLAUDE_MD_PATH"] = claude_path
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, "A node cited in the CLAUDE.md surface must be excluded."
+
+
+def test_protection_skips_high_edge_degree():
+    """A node with live edge-degree >= the floor (2) is traversal-reachable and
+    must be excluded."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Highly-connected node")
+    n1 = _add_observation(server, "Live neighbor 1")
+    n2 = _add_observation(server, "Live neighbor 2")
+    _add_edge(server, nid, n1, "derives_from")
+    _add_edge(server, n2, nid, "cites")  # in-edge counts too
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, (
+        "A node with live edge-degree >= 2 must be excluded (traversal-protected)."
+    )
+
+
+def test_protection_edge_degree_below_floor_still_flagged():
+    """A node with edge-degree 1 (below the floor of 2) is NOT edge-protected and
+    must still be flagged — verifies the floor boundary."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Weakly-connected node")
+    n1 = _add_observation(server, "Sole live neighbor")
+    _add_edge(server, nid, n1, "derives_from")  # degree 1 < floor
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid in ids, (
+        "A node with edge-degree 1 (below floor 2) must still be flagged."
+    )
+
+
+def test_protection_retracted_edges_do_not_count():
+    """Edges to retracted/non-current nodes must NOT count toward edge-degree —
+    a node connected only to dead nodes is not traversal-protected."""
+    server = fresh_server()
+    _hermetic_claude_md(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Connected only to retracted nodes")
+    d1 = _add_observation(server, "Dead neighbor 1")
+    d2 = _add_observation(server, "Dead neighbor 2")
+    _add_edge(server, nid, d1, "derives_from")
+    _add_edge(server, nid, d2, "cites")
+    _retract_node(server, d1)
+    _retract_node(server, d2)
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid in ids, (
+        "Edges to retracted nodes must not protect a node — it should still be "
+        "flagged when its only edges point to dead nodes."
+    )
+
+
 if __name__ == "__main__":
     import traceback
 
