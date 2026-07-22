@@ -343,10 +343,14 @@ def _make_stale_candidate(server, claim: str) -> str:
     return nid
 
 
-def _hermetic_claude_md(server):
-    """Point the CLAUDE.md protection surface at a nonexistent file under the
-    test dir, so the host's real CLAUDE.md never leaks a false doc_cited hit."""
+def _hermetic_surfaces(server):
+    """Point the host-derived protection surfaces (CLAUDE.md, plugin skills/) at
+    nonexistent paths under the test dir, so the host's real CLAUDE.md or an
+    exported CLAUDE_PLUGIN_ROOT never leaks a false doc_cited hit into tests not
+    exercising those channels. (warm-briefing.md + principle_triggers.json are
+    already DATA_DIR-isolated by fresh_server, so they need no neutralizing.)"""
     os.environ["ENGRAM_CLAUDE_MD_PATH"] = os.path.join(TEST_DIR, "no-such-claude.md")
+    os.environ["CLAUDE_PLUGIN_ROOT"] = os.path.join(TEST_DIR, "no-such-plugin-root")
 
 
 def _run_stale_scan(server, top_k: int = 100):
@@ -364,7 +368,7 @@ def test_protection_unprotected_node_still_flagged():
     situation_pattern, not doc-cited, edge-degree 0) MUST still be flagged.
     Guards against the fix over-suppressing real erosion candidates."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Genuinely eroding, unprotected node")
@@ -380,7 +384,7 @@ def test_protection_skips_own_situation_pattern():
     """A node with situation_pattern on its OWN metadata is tripwire-protected
     and must be excluded despite a large gap."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Tripwire-protected node")
@@ -398,7 +402,7 @@ def test_protection_skips_owning_lesson_situation_pattern():
     traversal must find that protection. Without the traversal the exemplar
     observation looks unprotected and false-alarms forever."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Exemplar of a tripwire-protected lesson")
@@ -420,7 +424,7 @@ def test_protection_skips_doc_cited_warm_briefing():
     """A node whose id appears in warm-briefing.md is read-time-load-protected
     and must be excluded."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Node cited in warm-briefing")
@@ -451,7 +455,7 @@ def test_protection_skips_high_edge_degree():
     """A node with live edge-degree >= the floor (2) is traversal-reachable and
     must be excluded."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Highly-connected node")
@@ -470,7 +474,7 @@ def test_protection_edge_degree_below_floor_still_flagged():
     """A node with edge-degree 1 (below the floor of 2) is NOT edge-protected and
     must still be flagged — verifies the floor boundary."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Weakly-connected node")
@@ -487,7 +491,7 @@ def test_protection_retracted_edges_do_not_count():
     """Edges to retracted/non-current nodes must NOT count toward edge-degree —
     a node connected only to dead nodes is not traversal-protected."""
     server = fresh_server()
-    _hermetic_claude_md(server)
+    _hermetic_surfaces(server)
     server._set_current_turn(100)
 
     nid = _make_stale_candidate(server, "Connected only to retracted nodes")
@@ -502,6 +506,53 @@ def test_protection_retracted_edges_do_not_count():
     assert nid in ids, (
         "Edges to retracted nodes must not protect a node — it should still be "
         "flagged when its only edges point to dead nodes."
+    )
+
+
+def test_protection_skips_doc_cited_registry():
+    """The registry_trigger branch of the doc_cited channel: a node whose id is
+    registered as a principle in principle_triggers.json is read-time-load
+    protected and must be excluded. (Complements the warm-briefing/CLAUDE.md
+    doc_cited tests, which don't exercise the registry branch.)"""
+    server = fresh_server()
+    _hermetic_surfaces(server)
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Node registered in principle_triggers.json")
+    # principle_triggers.json lives at DATA_DIR/principle_triggers.json (= TEST_DIR,
+    # test-isolated). Registry values are lists of entries keyed by principle_id.
+    with open(os.path.join(TEST_DIR, "principle_triggers.json"), "w") as f:
+        json.dump({"some_trigger_node": [{"principle_id": nid}]}, f)
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, (
+        "A node registered in principle_triggers.json must be excluded "
+        "(registry_trigger branch of doc_cited)."
+    )
+
+
+def test_protection_skips_doc_cited_skill_file():
+    """The skill-file branch of the doc_cited channel: a node whose id appears in
+    a *.md under $CLAUDE_PLUGIN_ROOT/skills/ is read-time-load protected and must
+    be excluded. (Not covered by the warm-briefing/CLAUDE.md doc_cited tests.)"""
+    server = fresh_server()
+    # Hermetic CLAUDE.md, but set CLAUDE_PLUGIN_ROOT explicitly to the temp skill
+    # tree under test (do NOT use _hermetic_surfaces, which blanks it).
+    os.environ["ENGRAM_CLAUDE_MD_PATH"] = os.path.join(TEST_DIR, "no-such-claude.md")
+    server._set_current_turn(100)
+
+    nid = _make_stale_candidate(server, "Node cited in a skill file")
+    plugin_root = os.path.join(TEST_DIR, "plugin")
+    skill_dir = os.path.join(plugin_root, "skills", "some-skill")
+    os.makedirs(skill_dir, exist_ok=True)
+    with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
+        f.write(f"# Some skill\n\nSee {nid} for the load-bearing rule.\n")
+    os.environ["CLAUDE_PLUGIN_ROOT"] = plugin_root
+
+    ids = [c["id"] for c in _run_stale_scan(server)]
+    assert nid not in ids, (
+        "A node cited in a skill file under CLAUDE_PLUGIN_ROOT/skills must be "
+        "excluded (skill-file branch of doc_cited)."
     )
 
 
