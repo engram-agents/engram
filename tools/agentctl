@@ -14,7 +14,8 @@
 #
 # Usage:
 #   agentctl health                      # health table for all agents
-#   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]
+#   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>]
+#                            [--as-self] [...]
 #                                        # interactive session as agent; executes
 #                                        # the platform binary (claude or codex)
 #                                        # directly. Platform auto-detected from
@@ -22,6 +23,16 @@
 #                                        # --local is deprecated (no-op with notice).
 #                                        # tmux and other multiplexers are the
 #                                        # operator's own affair.
+#                                        # --as-self: skip the sudo/user-switch
+#                                        #   entirely — for use INSIDE a systemd
+#                                        #   unit (or any shell) that is already
+#                                        #   running as the target agent's own
+#                                        #   Linux user (e.g. `User=agent-%i`,
+#                                        #   where sudo is neither available nor
+#                                        #   needed). Verifies `id -un` matches
+#                                        #   the target user; loud error + exit 7
+#                                        #   on mismatch. Forces --no-share (ACL
+#                                        #   auto-share needs sudo).
 #                                        # Single-dash flag grammar (alias namespace):
 #                                        #   -xyz  is a BUNDLE of single-char aliases,
 #                                        #         expanded in char order: -x -y -z.
@@ -160,10 +171,15 @@ except Exception as e:
 #   2. Baked profile at ~/.engram/marketplace/plugins/engram/platform.json
 #   3. Binary heuristic: codex present + claude absent → codex
 #   4. Default: claude
-# No sudo inside this function — caller passes $user for the sudo cmds.
+# No sudo inside this function when as_self=1 — caller passes $user for the
+# sudo cmds in the normal (sudo-switch) path; under --as-self the invoking
+# shell already IS $user (verified by _as_self_check before this is called),
+# so steps 2-3 run directly with no user-switch at all.
+# Signature: _session_platform <override> <user> [<as_self=0>]
 _session_platform() {
     local override="$1"
     local user="$2"
+    local as_self="${3:-0}"
 
     # 1. Explicit override
     if [[ -n "$override" ]]; then
@@ -175,8 +191,12 @@ _session_platform() {
 
     # 2. Baked profile (no jq dependency — grep+cut only)
     local raw
-    raw=$(sudo -u "$user" -i bash -c \
-        'cat ~/.engram/marketplace/plugins/engram/platform.json' 2>/dev/null) || true
+    if [[ "$as_self" -eq 1 ]]; then
+        raw=$(cat ~/.engram/marketplace/plugins/engram/platform.json 2>/dev/null) || true
+    else
+        raw=$(sudo -u "$user" -i bash -c \
+            'cat ~/.engram/marketplace/plugins/engram/platform.json' 2>/dev/null) || true
+    fi
     if [[ -n "$raw" ]] && echo "$raw" | grep -q '"platform"'; then
         local val
         val=$(echo "$raw" \
@@ -192,14 +212,93 @@ _session_platform() {
 
     # 3. Binary heuristic: codex present AND claude absent → codex
     local has_codex=0 has_claude=0
-    sudo -u "$user" -i bash -c 'command -v codex' >/dev/null 2>&1 && has_codex=1
-    sudo -u "$user" -i bash -c 'command -v claude' >/dev/null 2>&1 && has_claude=1
+    if [[ "$as_self" -eq 1 ]]; then
+        command -v codex >/dev/null 2>&1 && has_codex=1
+        command -v claude >/dev/null 2>&1 && has_claude=1
+    else
+        sudo -u "$user" -i bash -c 'command -v codex' >/dev/null 2>&1 && has_codex=1
+        sudo -u "$user" -i bash -c 'command -v claude' >/dev/null 2>&1 && has_claude=1
+    fi
     if [[ $has_codex -eq 1 && $has_claude -eq 0 ]]; then
         echo "codex"; return 0
     fi
 
     # 4. Default
     echo "claude"
+}
+
+# _as_self_check: verify the invoking OS user already IS the target agent's
+# Linux user. Used by cmd_session's --as-self flag, which skips the sudo/
+# user-switch entirely (for use inside a systemd unit with User=agent-<name>,
+# where sudo is neither available nor needed inside the unit).
+# On match: no output, return 0.
+# On mismatch: loud error to stderr naming both users, return 1 (cmd_session
+# maps this to exit 7 — a distinct code from the alias-grammar's 3/4/5/6).
+# Pure function: no sudo, no filesystem writes — safe to unit-test directly
+# via the internal __as-self-check verb (no real agent user required).
+_as_self_check() {
+    local target_user="$1"
+    local current_user; current_user="$(id -un)"
+    if [[ "$current_user" != "$target_user" ]]; then
+        echo "ERROR: --as-self requires the invoking user to already be '$target_user' (no sudo/user-switch is performed)." >&2
+        echo "       Current user: '$current_user'." >&2
+        echo "       (--as-self assumes the caller is already the target agent, e.g. a" >&2
+        echo "       systemd unit with User=agent-<name> where sudo is unavailable)" >&2
+        return 1
+    fi
+    return 0
+}
+
+# _parse_session_flags: pure function (no sudo, no resolve_user, no
+# filesystem) that parses cmd_session's OWN flags — --platform, --no-share,
+# --cd, --local, --as-self. This is a separate namespace from the platform-
+# alias grammar (-c/-d/-r — see _expand_session_args); anything not matched
+# here (including single-dash aliases and double-dash platform flags) is
+# collected verbatim into the extra/passthrough array, unexamined, so the
+# two layers compose without either duplicating the other's logic.
+#
+# Signature: _parse_session_flags <platform_var> <no_share_var> <as_self_var> <cd_var> <extra_var> -- <args...>
+#   Sets the caller's 5 variables via namerefs (bash 4.3+), mirroring the
+#   _normalize_chosen_name nameref-out pattern used elsewhere in this file.
+# Returns 2 (usage error) on a malformed --platform/--cd (missing argument),
+# matching cmd_session's pre-existing exit-2 convention for flag-arg errors.
+# cmd_session calls this instead of an inline while-loop so the parsing logic
+# has exactly one implementation, reused by both the production path and the
+# internal __parse-session-flags test verb.
+_parse_session_flags() {
+    local -n _psf_platform="$1"
+    local -n _psf_no_share="$2"
+    local -n _psf_as_self="$3"
+    local -n _psf_cd="$4"
+    local -n _psf_extra="$5"
+    shift 5
+    [[ "${1:-}" == "--" ]] && shift
+
+    _psf_platform=""
+    _psf_no_share=0
+    _psf_as_self=0
+    _psf_cd=""
+    _psf_extra=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --platform)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; return 2; }
+                _psf_platform="$2"; shift 2 ;;
+            --platform=*) _psf_platform="${1#--platform=}"; shift ;;
+            --local)
+                echo "(--local is deprecated: sessions are always direct now)" >&2
+                shift ;;
+            --no-share) _psf_no_share=1; shift ;;
+            --as-self) _psf_as_self=1; shift ;;
+            --cd)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; return 2; }
+                _psf_cd="$2"; shift 2 ;;
+            --cd=*) _psf_cd="${1#--cd=}"; shift ;;
+            *) _psf_extra+=("$1"); shift ;;
+        esac
+    done
+    return 0
 }
 
 # _expand_session_args: pure function (no sudo, no filesystem).
@@ -409,7 +508,7 @@ _expand_session_args() {
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
-        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [...]" >&2
+        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [--as-self] [...]" >&2
         echo >&2
         echo "  Executes the platform binary (claude or codex) directly as the agent." >&2
         echo "  Platform auto-detected from baked profile, then binary heuristic." >&2
@@ -419,6 +518,14 @@ cmd_session() {
         echo "  --no-share                 skip auto-share of cwd (agent runs from its own home)" >&2
         echo "  --cd <dir>                 use <dir> as project folder instead of caller's cwd" >&2
         echo "  --local                    (deprecated — no-op; sessions are always direct now)" >&2
+        echo "  --as-self                  skip the sudo/user-switch entirely; requires the" >&2
+        echo "                             invoking user to already be the target agent (e.g." >&2
+        echo "                             a systemd unit with User=agent-<name>, where sudo" >&2
+        echo "                             is neither available nor needed). Loud error + exit 7" >&2
+        echo "                             on user mismatch. Forces --no-share (ACL auto-share" >&2
+        echo "                             needs sudo, unavailable under --as-self). NOTE:" >&2
+        echo "                             --cd has no effect under --as-self (cwd propagation" >&2
+        echo "                             rides the share path); the session starts in \$HOME." >&2
         echo >&2
         echo "  Flag grammar:" >&2
         echo "    Single-dash: agentctl alias namespace.  -xyz is a bundle: -x -y -z" >&2
@@ -440,25 +547,10 @@ cmd_session() {
     local user; user=$(resolve_user "$name")
     local platform_override=""
     local no_share=0
+    local as_self=0
     local cd_override=""
     local extra=()
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --platform)
-                [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
-                platform_override="$2"; shift 2 ;;
-            --platform=*) platform_override="${1#--platform=}"; shift ;;
-            --local)
-                echo "(--local is deprecated: sessions are always direct now)" >&2
-                shift ;;
-            --no-share) no_share=1; shift ;;
-            --cd)
-                [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; exit 2; }
-                cd_override="$2"; shift 2 ;;
-            --cd=*)     cd_override="${1#--cd=}"; shift ;;
-            *)          extra+=("$1"); shift ;;
-        esac
-    done
+    _parse_session_flags platform_override no_share as_self cd_override extra -- "$@" || exit $?
 
     # Validate --platform early if provided (before any heavy lifting).
     if [[ -n "$platform_override" ]]; then
@@ -466,6 +558,19 @@ cmd_session() {
             claude|codex) ;;
             *) echo "ERROR: --platform must be claude or codex (got '$platform_override')" >&2; exit 2 ;;
         esac
+    fi
+
+    # --as-self: skip the sudo/user-switch entirely. Requires the invoking
+    # user to already BE the target agent (systemd unit with User=agent-<name>,
+    # where sudo is neither available nor needed inside the unit). Loud error
+    # + distinct exit code (7) on mismatch — never silently fall back to sudo.
+    if [[ "$as_self" -eq 1 ]]; then
+        _as_self_check "$user" || exit 7
+        # ACL auto-share (below) shells out to `sudo agentctl share ...`; under
+        # --as-self there is no sudo, so force the --no-share path rather than
+        # attempt (and fail) an auto-share. Judgment call: --as-self implies
+        # --no-share rather than requiring the caller to also pass --no-share.
+        no_share=1
     fi
 
     # Project-dir propagation + auto-share. Design rationale (2026-05-03): the directory
@@ -527,7 +632,7 @@ cmd_session() {
 
     # Detect platform and expand aliases.
     local platform
-    platform=$(_session_platform "$platform_override" "$user") || {
+    platform=$(_session_platform "$platform_override" "$user" "$as_self") || {
         echo "ERROR: platform detection failed" >&2; exit 2
     }
 
@@ -553,7 +658,26 @@ cmd_session() {
     local tail_args=("${expanded[@]:1}")
 
     # Launch: try direct binary exec first, then ~/.runtime/start.sh fallback.
-    if sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
+    # Under --as-self, the invoking shell already IS $user (verified above) —
+    # no sudo/user-switch, just `exec` the platform binary in place. Same
+    # argv construction (binary + tail_args) as the sudo path; only the
+    # exec mechanism differs.
+    if [[ "$as_self" -eq 1 ]]; then
+        if command -v "$binary" >/dev/null 2>&1; then
+            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                cd "${cwd_arg[0]}"
+            fi
+            exec "$binary" "${tail_args[@]}"
+        elif [[ -x "$HOME/.runtime/start.sh" ]]; then
+            if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+                cd "${cwd_arg[0]}"
+            fi
+            exec "$HOME/.runtime/start.sh" "${tail_args[@]}"
+        else
+            echo "ERROR: no $binary on PATH for $user (as-self) and no ~/.runtime/start.sh adapter" >&2
+            exit 1
+        fi
+    elif sudo -u "$user" -i bash -c "command -v \"$binary\"" >/dev/null 2>&1; then
         if [[ ${#cwd_arg[@]} -gt 0 ]]; then
             sudo -u "$user" -i bash -c \
                 "cd $(printf '%q' "${cwd_arg[0]}") && exec \"$binary\" \"\$@\"" \
@@ -1594,6 +1718,38 @@ cmd__validate_chosen_name() {
     echo "$chosen"
 }
 
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __as-self-check <target_user>
+# Exercises _as_self_check directly — no real agent user, no sudo, no
+# resolve_user. Exit 0 on match (current OS user == target_user), exit 1 +
+# stderr naming both users on mismatch. Used by the test suite to verify the
+# --as-self mismatch/match logic that cmd_session gates on before exiting 7.
+cmd__as_self_check() {
+    local target="${1:-}"
+    [[ -z "$target" ]] && { echo "Usage: agentctl __as-self-check <target_user>" >&2; exit 2; }
+    _as_self_check "$target"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __parse-session-flags [args...]
+# Exercises _parse_session_flags directly — no real agent user, no sudo, no
+# resolve_user. Prints the parsed fields as KEY=VALUE lines (PLATFORM,
+# NO_SHARE, AS_SELF, CD), followed by one EXTRA:<value> line per passthrough
+# arg in original order. Used by the test suite to verify --as-self composes
+# with --platform, -c/-d/-r aliases (which land untouched in EXTRA), --cd,
+# and --no-share without altering their parsed values.
+cmd__parse_session_flags() {
+    local platform="" no_share=0 as_self=0 cd="" extra=()
+    _parse_session_flags platform no_share as_self cd extra -- "$@" || exit $?
+    printf 'PLATFORM=%s\n' "$platform"
+    printf 'NO_SHARE=%s\n' "$no_share"
+    printf 'AS_SELF=%s\n' "$as_self"
+    printf 'CD=%s\n' "$cd"
+    for a in "${extra[@]}"; do
+        printf 'EXTRA:%s\n' "$a"
+    done
+}
+
 case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
@@ -1606,5 +1762,7 @@ case "$SUBCMD" in
     help|--help|-h) cmd_help ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
     __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
+    __as-self-check) cmd__as_self_check "$@" ;;
+    __parse-session-flags) cmd__parse_session_flags "$@" ;;
     *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac

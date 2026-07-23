@@ -1,0 +1,2 @@
+<boot-charge>
+Automatic morning boot (not a human message — Lei has not spoken yet). Read your warm briefing if this is a fresh context. Log into the world (login skill: orient + arm your bell). Check the charge board in Lei's Office for anything he left overnight. Then hold your quiet on-call posture (monitors armed; no autonomous work-loop) until a human speaks or a charge directs otherwise.

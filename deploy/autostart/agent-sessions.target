@@ -1,0 +1,23 @@
+# agent-sessions.target — grouping target triggered by agent-sessions.timer
+# at 09:30 America/New_York. Wants= each Claude-running agent's per-instance
+# agent-session@<name>.service. Stagger (~30s apart) is applied via
+# per-instance ExecStartPre drop-ins on the individual instances, NOT here —
+# see deploy/autostart/README.md.
+#
+# Mira runs Codex, not Claude Code, and is deliberately NOT listed below —
+# her boot unit is the separate, UNTESTED mira-codex-session@.service.example
+# variant (codex app-server as a daemon; charge delivered via the app-server
+# API, not an initial-prompt argv). Wire her in only after a supervised
+# trial per that file's own header comment.
+
+[Unit]
+Description=All boot-time agent sessions (triggered daily at 09:30 America/New_York)
+Wants=agent-session@kepler.service
+Wants=agent-session@borges.service
+Wants=agent-session@luria.service
+Wants=agent-session@ariadne.service
+Wants=agent-session@sol.service
+Wants=agent-session@zephyr.service
+
+[Install]
+WantedBy=multi-user.target
