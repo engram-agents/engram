@@ -143,10 +143,40 @@ def _event(ref: str, *, kind: str = "gong", place: str = "place_square"):
     return {
         "id": f"umwelt-crossing:{place}:{ref}",
         "kind": kind,
+        "source": "umwelt",
         "place_id": place,
         "sender": "sol",
         "crossing_ref": ref,
         "prompt_token": wake.stable_hash(f"{place}:{ref}", 12),
+    }
+
+
+def _collab_item_completed_notification(
+    *,
+    thread_id: str = "thread-1",
+    sender_thread_id: str = "thread-1",
+    item_status: str = "completed",
+    tool: str = "spawnAgent",
+    item_id: str = "collab-1",
+    agent_statuses: dict[str, str] | None = None,
+):
+    agent_statuses = agent_statuses or {"thread-child": "completed"}
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": thread_id,
+            "turnId": "turn-123",
+            "completedAtMs": 1234567890,
+            "item": {
+                "type": "collabAgentToolCall",
+                "id": item_id,
+                "senderThreadId": sender_thread_id,
+                "receiverThreadIds": list(agent_statuses),
+                "agentsStates": {thread_id: {"status": status} for thread_id, status in agent_statuses.items()},
+                "status": item_status,
+                "tool": tool,
+            },
+        },
     }
 
 
@@ -265,6 +295,74 @@ def test_relevant_crossing_distinguishes_gong_message_and_irrelevant():
     assert wake.relevant_crossing(gong, "mira") == "gong"
     assert wake.relevant_crossing(msg, "mira") == "message"
     assert wake.relevant_crossing(nope, "mira") is None
+
+
+def test_parse_collab_item_completed_event_matches_target_thread():
+    notification = _collab_item_completed_notification(agent_statuses={"thread-child": "completed", "thread-child-2": "errored"})
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+
+    assert event is not None
+    assert event["source"] == "codex"
+    assert event["kind"] == "child-completed"
+    assert event["target_thread_id"] == "thread-1"
+    assert event["terminal_agent_count"] == 2
+    assert event["status_summary"] == "completed=1,errored=1"
+
+
+def test_parse_collab_item_completed_event_rejects_irrelevant_sender():
+    notification = _collab_item_completed_notification(sender_thread_id="thread-else")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_parse_collab_item_completed_event_rejects_nonterminal_status():
+    notification = _collab_item_completed_notification(item_status="inProgress")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_parse_collab_item_completed_event_rejects_non_spawnagent_tool():
+    notification = _collab_item_completed_notification(tool="wait")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_duplicate_codex_completion_event_is_not_requeued(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    notification = _collab_item_completed_notification()
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert event is not None
+    assert wake.enqueue_event(state, event, logger) is True
+    assert wake.enqueue_event(state, event, logger) is False
+    assert [queued["id"] for queued in state["queue"]] == [event["id"]]
+
+
+def test_active_parent_defers_codex_completion_wake(tmp_path):
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(), "thread-1")
+    assert event is not None
+    state = wake.default_state()
+    state["queue"] = [event]
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    rpc = ScriptedRpc(method_responses={"thread/read": [_thread_read("active")]})
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=sessions_dir,
+        thread_override="thread-1",
+        logger=_logger(tmp_path),
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: rpc,
+    )
+
+    assert result.status == "waiting_for_idle"
+    assert result.thread_id == "thread-1"
+    assert state["queue"] == [event]
+    assert not [params for method, params in rpc.calls if method == "turn/start"]
 
 
 # ---------------------------------------------------------------------------
