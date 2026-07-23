@@ -181,6 +181,16 @@ class FileStore(CoordinationStore):
             turn_reason = fields.get("turn_reason", "").strip()
             if len(turn_reason) >= 2 and turn_reason[0] == '"' and turn_reason[-1] == '"':
                 turn_reason = turn_reason[1:-1]
+            # turn_by is written quoted (like turn_reason — see projects.flip's
+            # comment for why: an unquoted empty value corrupts the frontmatter
+            # parser). Unquote the same way; a MISSING field (legacy baton,
+            # pre-#1812) is bare "" and the quote-check is a no-op on it. An
+            # unquoted-but-present turn_by (e.g. a hand-authored file) also
+            # passes through unchanged, since the strip only fires on an
+            # actual leading+trailing quote pair.
+            turn_by = fields.get("turn_by", "").strip()
+            if len(turn_by) >= 2 and turn_by[0] == '"' and turn_by[-1] == '"':
+                turn_by = turn_by[1:-1]
             records.append(
                 ProjectRecord(
                     project_id=fields.get("project_id", md.stem).strip() or md.stem,
@@ -193,6 +203,9 @@ class FileStore(CoordinationStore):
                     seq=_coerce_seq(fields.get("seq", "")),
                     raw=raw,
                     github=fields.get("github", "").strip(),
+                    # Missing turn_by (pre-this-field batons) parses to "" — the
+                    # documented safe default, never a crash, never a migration.
+                    turn_by=turn_by.strip().lower(),
                 )
             )
         # ISO-8601 turn_since sorts lexicographically == chronologically; empty

@@ -106,6 +106,23 @@ def test_flip_seq_recoverable_after_restart(tmp_path):
     assert seq2 == 2  # recovered above the persisted seq 1
 
 
+def test_flip_persists_turn_by_round_trip(store, allocator):
+    # #1812: flip(by_agent=...) persists turn_by; re-reading the file (a fresh
+    # parse via read_projects, not the in-memory value) recovers it lowercased.
+    flip(store, allocator, "PR-1", to_agent="borges", reason="please review",
+         by_agent="ARIADNE", ts="2026-06-26T12:00:00Z")
+    rec = next(r for r in store.read_projects() if r.project_id == "PR-1")
+    assert rec.turn_by == "ariadne"
+
+
+def test_flip_by_agent_defaults_to_empty_when_omitted(store, allocator):
+    # Back-compat: existing callers that don't pass by_agent must not crash,
+    # and must persist the documented safe default ("" == actor unknown).
+    flip(store, allocator, "PR-1", to_agent="borges", reason="r")
+    rec = next(r for r in store.read_projects() if r.project_id == "PR-1")
+    assert rec.turn_by == ""
+
+
 def test_flip_does_not_double_append_turn_log_section(store, allocator):
     # two flips → still exactly one "## Turn log" header, two entries.
     flip(store, allocator, "PR-1", to_agent="borges", reason="one")
@@ -159,6 +176,14 @@ def test_claim_normalizes_claimer_case(store, allocator):
     )
     fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
     assert fields["turn"] == "luria"
+
+
+def test_claim_sets_turn_by_to_claimer(store, allocator):
+    # #1812: claim's actor IS the claimer — turn_by mirrors turn.
+    claim(store, allocator, "PR-1", claimer="luria", pool_sentinel="lei")
+    rec = next(r for r in store.read_projects() if r.project_id == "PR-1")
+    assert rec.turn_by == "luria"
+    assert rec.turn_by == rec.turn
 
 
 def test_claim_missing_project_raises(store, allocator):
@@ -247,6 +272,15 @@ def test_release_byte_exact_golden(store, allocator):
     raw = store.read_project("PR-1")
     assert 'turn_reason: "scope complete"' in raw
     assert "- 2026-06-26T12:00:00Z ariadne → lei: scope complete" in raw
+
+
+def test_release_sets_turn_by_to_holder(store, allocator):
+    # #1812: release's actor IS the releasing holder — turn_by is stamped even
+    # though turn itself becomes the pool sentinel (audit-trail consistency).
+    release(store, allocator, "PR-1", holder="ariadne", pool_sentinel="lei", reason="done")
+    rec = next(r for r in store.read_projects() if r.project_id == "PR-1")
+    assert rec.turn_by == "ariadne"
+    assert rec.turn == "lei"
 
 
 def test_release_missing_project_raises(store, allocator):
@@ -790,6 +824,36 @@ def test_init_without_github_anchor(tmp_path):
     assert "github" not in fields
 
 
+def test_init_sets_turn_by_to_initor(tmp_path):
+    # #1812: by_agent is the INITOR, not necessarily the same as turn — one
+    # agent may init a baton with the turn assigned to someone else.
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T", status="in-progress", turn="borges",
+        participants=["borges", "ariadne"], turn_reason="init",
+        by_agent="ARIADNE", ts="2026-06-26T12:00:00Z",
+    )
+    rec = next(r for r in s.read_projects() if r.project_id == "PR-42")
+    assert rec.turn_by == "ariadne"
+    assert rec.turn == "borges"
+
+
+def test_init_by_agent_defaults_to_empty_when_omitted(tmp_path):
+    # Back-compat: existing init() callers that don't pass by_agent must not
+    # crash, and must persist the documented safe default.
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T", status="in-progress", turn="borges",
+        participants=["borges"], turn_reason="init",
+    )
+    rec = next(r for r in s.read_projects() if r.project_id == "PR-42")
+    assert rec.turn_by == ""
+
+
 def test_init_raises_if_project_already_exists(store, allocator):
     """init() raises ProjectAlreadyExists if the project_id already has a baton file."""
     with pytest.raises(ProjectAlreadyExists):
@@ -937,3 +1001,36 @@ def test_read_projects_github_field_absent(tmp_path):
     records = s.read_projects()
     assert len(records) == 1
     assert records[0].github == ""
+
+
+def test_read_projects_turn_by_field_parsed(tmp_path):
+    """read_projects populates ProjectRecord.turn_by from the frontmatter turn_by: field."""
+    s = FileStore(tmp_path)
+    baton_with_turn_by = (
+        "---\n"
+        "project_id: PR-5\n"
+        "title: t\n"
+        "status: in-progress\n"
+        "turn: ariadne\n"
+        "turn_since: 2026-06-29T00:00:00Z\n"
+        'turn_reason: "start"\n'
+        "turn_by: borges\n"
+        "participants: [ariadne, borges]\n"
+        "---\n"
+        "# PR-5\n\nbody\n"
+    )
+    s.write_project("PR-5", baton_with_turn_by, seq=1)
+    records = s.read_projects()
+    assert len(records) == 1
+    assert records[0].turn_by == "borges"
+
+
+def test_read_projects_turn_by_field_absent_legacy_baton(tmp_path):
+    """read_projects defaults ProjectRecord.turn_by to "" for a legacy baton with
+    no turn_by: frontmatter line — the load-bearing back-compat case (#1812):
+    never a crash, never a migration, safe default that still notifies."""
+    s = FileStore(tmp_path)
+    s.write_project("PR-1", _baton(turn="ariadne"), seq=1)  # no turn_by field
+    records = s.read_projects()
+    assert len(records) == 1
+    assert records[0].turn_by == ""
