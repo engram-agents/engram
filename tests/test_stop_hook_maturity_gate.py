@@ -83,8 +83,8 @@ def _nudge_emitted(stdout: str) -> bool:
         return False
     try:
         parsed = json.loads(stdout)
-        ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
-        return "ENGRAM Write Check" in ctx
+        reason = parsed.get("reason", "")
+        return "ENGRAM Write Check" in reason
     except (json.JSONDecodeError, AttributeError):
         return False
 
@@ -449,8 +449,8 @@ def test_maturity_gate_does_not_touch_state_file(tmp_path):
 # Regression: #824 envelope intact on young-graph emit path
 # ---------------------------------------------------------------------------
 
-def test_young_graph_emitted_nudge_preserves_824_envelope(tmp_path):
-    """On a young graph, the emitted nudge must preserve the #824 JSON envelope."""
+def test_young_graph_emitted_nudge_preserves_stop_contract(tmp_path):
+    """On a young graph, the emitted nudge must preserve the Stop decision/reason contract."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     transcript = tmp_path / "transcript.jsonl"
@@ -472,20 +472,19 @@ def test_young_graph_emitted_nudge_preserves_824_envelope(tmp_path):
     except json.JSONDecodeError as exc:
         pytest.fail(f"Emitted stdout is not valid JSON: {exc}\nstdout={stdout!r}")
 
-    assert "hookSpecificOutput" in parsed, "Missing hookSpecificOutput — #824 envelope broken"
-    hso = parsed["hookSpecificOutput"]
-    assert hso.get("hookEventName") == "Stop"
-    ctx = hso.get("additionalContext")
-    assert isinstance(ctx, str) and ctx, "additionalContext must be a non-empty string"
-    assert "ENGRAM Write Check" in ctx, "Write-check text missing from additionalContext"
+    assert parsed.get("decision") == "block", "Missing decision=block — Stop contract broken"
+    reason = parsed.get("reason")
+    assert isinstance(reason, str) and reason, "reason must be a non-empty string"
+    assert "ENGRAM Write Check" in reason, "Write-check text missing from reason"
+    assert "hookSpecificOutput" not in parsed, "Stop contract must not use hookSpecificOutput"
 
 
 # ---------------------------------------------------------------------------
 # Regression: #841 nudge text — explicit NO-output instruction, no 'carry on'
 # ---------------------------------------------------------------------------
 
-def _get_nudge_ctx(tmp_path) -> str:
-    """Helper: run hook on a young graph and return the emitted additionalContext."""
+def _get_nudge_reason(tmp_path) -> str:
+    """Helper: run hook on a young graph and return the emitted reason string."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     transcript = tmp_path / "transcript.jsonl"
@@ -501,7 +500,7 @@ def _get_nudge_ctx(tmp_path) -> str:
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc == 0 and stdout, f"Expected nudge emit; stdout={stdout!r}"
     parsed = json.loads(stdout)
-    return parsed["hookSpecificOutput"]["additionalContext"]
+    return parsed["reason"]
 
 
 def test_nudge_contains_no_output_instruction(tmp_path):
@@ -511,7 +510,7 @@ def test_nudge_contains_no_output_instruction(tmp_path):
     assertion below fail immediately, catching any regression to the ambiguous
     wording this fix replaced.
     """
-    ctx = _get_nudge_ctx(tmp_path)
+    ctx = _get_nudge_reason(tmp_path)
     assert "NO output" in ctx, (
         f"Nudge must contain 'NO output' (explicit zero-output instruction); ctx={ctx!r}"
     )
@@ -526,7 +525,7 @@ def test_nudge_contains_space_after_insight_comma(tmp_path):
     The pre-fix string concatenation 'insight,' + 'or design' rendered as
     'insight,or design' (no space). This test pins the corrected form.
     """
-    ctx = _get_nudge_ctx(tmp_path)
+    ctx = _get_nudge_reason(tmp_path)
     assert "insight, or design" in ctx, (
         f"Nudge must contain 'insight, or design' (space after comma); ctx={ctx!r}"
     )

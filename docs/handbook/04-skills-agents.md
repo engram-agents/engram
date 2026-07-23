@@ -75,7 +75,7 @@ All five active specs pass the four sub-agent disciplines (NOT-parent disclaimer
 
 **engram-dream-fairy** — Read-only consolidation scanner (6 scan categories), returns dream-report; refuses edits. Tools: read-only file + read-only engram MCP set. Model: sonnet. Dispatched 6× in parallel by sleep Phase B. Status: PROD-VERIFIED.
 
-**engram-dream-master** — The consolidation owner: receives all 7 fairy reports, walks merged agenda, writes dream record, advances turn ONLY when maintenance complete. Tools: `*` (the one agent with write authority). Model: opus. Status: PROD-VERIFIED.
+**engram-dream-master** — The consolidation owner: receives all 7 fairy reports, walks merged agenda, writes dream record, advances turn ONLY when maintenance complete. Tools: `*` (the one agent with write authority). Model: inherited from its parent on Claude Code; omitted on Codex so the runtime applies its normal `[agents]`-default/parent-fallback precedence. Coder, reviewer, dream, and batch-summary fairies explicitly use sonnet (`gpt-5.6-terra` on Codex). Status: PROD-VERIFIED.
 
 **engram-batch-summary-fairy** — One-shot batch variant (≤15 nodes/chunk), file-in/file-out (Read, Write only), cohort_dispatch.py orchestrated. Status: PROD-VERIFIED.
 

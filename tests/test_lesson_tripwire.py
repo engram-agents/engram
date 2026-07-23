@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import atexit
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -27,6 +28,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +51,22 @@ _hook = _import_hook()
 load_tripwires = _hook.load_tripwires
 check_command = _hook.check_command
 build_match_target = _hook.build_match_target
+
+
+def _run_hook_main(hook_input: dict, *, tripwires=None, recall: str = "") -> str:
+    """Run the hook main() with controlled tripwires/recall; return stdout."""
+    output_buf = io.StringIO()
+    with (
+        unittest.mock.patch.object(_hook, "load_tripwires", return_value=tripwires or []),
+        unittest.mock.patch.object(_hook, "check_in_turn_recall", return_value=recall),
+        unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(hook_input))),
+        unittest.mock.patch("sys.stdout", output_buf),
+    ):
+        try:
+            _hook.main()
+        except SystemExit:
+            pass
+    return output_buf.getvalue()
 
 # ---------------------------------------------------------------------------
 # Helpers for tests 1–5: a minimal temp DB with just the nodes table
@@ -215,6 +233,26 @@ class TestBuildMatchTarget(unittest.TestCase):
         """Unknown tool_name (not Bash, not mcp__*) → returns empty string."""
         hook_input = {"tool_name": "SomeFutureTool", "tool_input": {}}
         self.assertEqual(build_match_target(hook_input), "")
+
+
+class TestPreToolUseEnvelope(unittest.TestCase):
+
+    def test_context_only_output_omits_permission_decision(self):
+        """Lesson-tripwire context-only output must omit permissionDecision."""
+        out = _run_hook_main(
+            {"tool_name": "Bash", "tool_input": {"command": "forum reply 42"}},
+            tripwires=[(r"forum reply", "Read body from stdin.")],
+        )
+        self.assertTrue(out.strip(), "Expected JSON output")
+        response = json.loads(out.strip())
+        hook_specific = response["hookSpecificOutput"]
+        self.assertEqual(hook_specific["hookEventName"], "PreToolUse")
+        self.assertIn("lesson-tripwire", hook_specific["additionalContext"])
+        self.assertNotIn(
+            "permissionDecision",
+            hook_specific,
+            "Context-only PreToolUse output must omit permissionDecision",
+        )
 
 
 # ---------------------------------------------------------------------------

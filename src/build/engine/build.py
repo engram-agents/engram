@@ -503,11 +503,20 @@ def _agent_tools_to_list(raw_tools: Any) -> list[str] | str:
 
 
 def _codex_model_config(profile: dict[str, Any], claude_tier: str | None) -> dict[str, str]:
-    """Map Claude-style model tiers (opus/sonnet/haiku) through codex.json."""
+    """Map an explicit Claude-style model tier through ``codex.json``.
+
+    An omitted model is semantically meaningful on both platforms: Codex
+    resolves the custom agent through its normal precedence rules (including
+    configured ``[agents]`` defaults before parent fallback).  Keep
+    ``default_agent_model_tier`` as the backward-compatible fallback for an
+    explicit tier unknown to an older/newer profile, but never use it to fill
+    an omitted canonical field.
+    """
+    if not claude_tier:
+        return {}
     tiers = profile.get("agent_model_tiers", {})
     default_tier = profile.get("default_agent_model_tier", "sonnet")
-    tier = claude_tier or default_tier
-    cfg = tiers.get(tier) or tiers.get(default_tier) or {}
+    cfg = tiers.get(claude_tier) or tiers.get(default_tier) or {}
     return {k: str(v) for k, v in cfg.items() if v is not None}
 
 
