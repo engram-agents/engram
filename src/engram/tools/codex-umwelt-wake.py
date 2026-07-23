@@ -57,8 +57,10 @@ DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 1
-STATE_VERSION = 3
+STATE_VERSION = 4
 MAX_RECENT_DELIVERED = 256
+MAX_MONITOR_RECOVERY_TURNS = 32
+MAX_MONITOR_RECOVERY_ITEMS = 256
 HTTP_READ_LIMIT = 64 * 1024
 HTTP_OPEN_TIMEOUT = 5
 WS_OPEN_TIMEOUT = 5
@@ -66,7 +68,7 @@ REPLY_TIMEOUT = 10
 WS_MESSAGE_LIMIT = 32 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CODEX_NOTIFICATION_DRAIN_TIMEOUT = 0.001
-TERMINAL_COLLAB_AGENT_STATUSES = {"completed", "errored", "interrupted"}
+TERMINAL_COLLAB_AGENT_STATUSES = {"completed", "errored", "interrupted", "shutdown", "notFound"}
 
 _STOP_REQUESTED = False
 
@@ -165,6 +167,38 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
         return dict(default)
 
 
+def default_monitor_recovery() -> dict[str, Any]:
+    return {
+        "thread_id": None,
+        "last_turn_id": None,
+        "last_item_index": -1,
+        "armed": False,
+    }
+
+
+def normalize_monitor_recovery(value: Any) -> dict[str, Any]:
+    normalized = default_monitor_recovery()
+    if not isinstance(value, dict):
+        return normalized
+    normalized.update(value)
+    thread_id = normalized.get("thread_id")
+    normalized["thread_id"] = thread_id if isinstance(thread_id, str) and thread_id else None
+    turn_id = normalized.get("last_turn_id")
+    normalized["last_turn_id"] = turn_id if isinstance(turn_id, str) and turn_id else None
+    try:
+        normalized["last_item_index"] = int(normalized.get("last_item_index", -1))
+    except (TypeError, ValueError):
+        normalized["last_item_index"] = -1
+    normalized["armed"] = bool(normalized.get("armed"))
+    return normalized
+
+
+def monitor_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
+    recovery = normalize_monitor_recovery(state.get("codex_monitor_recovery"))
+    state["codex_monitor_recovery"] = recovery
+    return recovery
+
+
 def default_state() -> dict[str, Any]:
     return {
         "state_version": STATE_VERSION,
@@ -174,6 +208,7 @@ def default_state() -> dict[str, Any]:
         "delivered_event_ids": [],
         "inflight_batch": None,
         "active_wake": None,
+        "codex_monitor_recovery": default_monitor_recovery(),
     }
 
 
@@ -194,6 +229,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     active_wake = normalized.get("active_wake")
     if active_wake is not None and not isinstance(active_wake, dict):
         normalized["active_wake"] = None
+    normalized["codex_monitor_recovery"] = normalize_monitor_recovery(normalized.get("codex_monitor_recovery"))
     normalized["state_version"] = STATE_VERSION
     return normalized
 
@@ -337,19 +373,8 @@ def _status_summary(terminal_agents: list[dict[str, str]]) -> str:
     return ",".join(f"{status}={counts[status]}" for status in sorted(counts))
 
 
-def parse_collab_item_completed_event(notification: dict[str, Any], target_thread_id: str) -> dict[str, Any] | None:
+def parse_collab_completion_item(item: dict[str, Any], target_thread_id: str) -> dict[str, Any] | None:
     if not target_thread_id:
-        return None
-    if notification.get("method") != "item/completed":
-        return None
-    params = notification.get("params")
-    if not isinstance(params, dict):
-        return None
-    thread_id = str(params.get("threadId") or "").strip()
-    if thread_id != target_thread_id:
-        return None
-    item = params.get("item")
-    if not isinstance(item, dict):
         return None
     if str(item.get("type") or "").strip() != "collabAgentToolCall":
         return None
@@ -366,7 +391,7 @@ def parse_collab_item_completed_event(notification: dict[str, Any], target_threa
     if not terminal_agents:
         return None
     event_key = {
-        "target_thread_id": thread_id,
+        "target_thread_id": target_thread_id,
         "item_id": item_id,
         "terminal_agents": terminal_agents,
     }
@@ -375,7 +400,7 @@ def parse_collab_item_completed_event(notification: dict[str, Any], target_threa
         "id": event_id,
         "kind": "child-completed",
         "source": "codex",
-        "target_thread_id": thread_id,
+        "target_thread_id": target_thread_id,
         "sender_thread_id": target_thread_id,
         "tool": bounded_meta(item.get("tool"), 24),
         "item_id": bounded_meta(item_id, 64),
@@ -383,6 +408,23 @@ def parse_collab_item_completed_event(notification: dict[str, Any], target_threa
         "status_summary": _status_summary(terminal_agents),
         "prompt_token": stable_hash(event_id, 12),
     }
+
+
+def parse_collab_item_completed_event(notification: dict[str, Any], target_thread_id: str) -> dict[str, Any] | None:
+    if not target_thread_id:
+        return None
+    if notification.get("method") != "item/completed":
+        return None
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return None
+    thread_id = str(params.get("threadId") or "").strip()
+    if thread_id != target_thread_id:
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return None
+    return parse_collab_completion_item(item, target_thread_id)
 
 
 def enqueue_event(state: dict[str, Any], event: dict[str, Any], logger: Logger | None = None) -> bool:
@@ -777,6 +819,110 @@ def thread_contains_client_message(thread_read_result: dict[str, Any], client_us
 
 def thread_turns(thread_read_result: dict[str, Any]) -> list[dict[str, Any]]:
     return [turn for turn in (((thread_read_result.get("thread") or {}).get("turns") or [])) if isinstance(turn, dict)]
+
+
+def _turn_items(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in (turn.get("items") or []) if isinstance(item, dict)]
+
+
+def _latest_turn_boundary(turns: list[dict[str, Any]]) -> tuple[str | None, int]:
+    for turn in reversed(turns):
+        turn_id = str(turn.get("id") or "").strip() or None
+        items = _turn_items(turn)
+        if turn_id is not None:
+            return turn_id, len(items) - 1
+    return None, -1
+
+
+def recover_collab_completion_events(
+    thread_read_result: dict[str, Any],
+    *,
+    target_thread_id: str,
+    state: dict[str, Any],
+    logger: Logger | None = None,
+) -> int:
+    recovery = monitor_recovery_state(state)
+    if recovery.get("thread_id") != target_thread_id:
+        recovery.clear()
+        recovery.update(default_monitor_recovery())
+        recovery["thread_id"] = target_thread_id
+
+    turns = thread_turns(thread_read_result)
+    recent_turns = turns[-MAX_MONITOR_RECOVERY_TURNS:]
+    latest_turn_id, latest_item_index = _latest_turn_boundary(recent_turns)
+    thread_status = _thread_status(thread_read_result)
+    if recent_turns and latest_turn_id is None:
+        raise RuntimeError("codex monitor recovery requires turn ids in thread/read includeTurns snapshots")
+
+    if not recent_turns:
+        recovery["armed"] = True
+        recovery["last_turn_id"] = latest_turn_id
+        recovery["last_item_index"] = latest_item_index
+        return 0
+
+    entries_by_turn: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    terminal_count = 0
+    for turn in recent_turns:
+        turn_id = str(turn.get("id") or "").strip()
+        if not turn_id:
+            continue
+        turn_entries: list[tuple[int, dict[str, Any]]] = []
+        for item_index, item in enumerate(_turn_items(turn)):
+            event = parse_collab_completion_item(item, target_thread_id)
+            if event is None:
+                continue
+            terminal_count += 1
+            turn_entries.append((item_index, event))
+        if turn_entries:
+            entries_by_turn[turn_id] = turn_entries
+
+    if terminal_count > MAX_MONITOR_RECOVERY_ITEMS:
+        raise RuntimeError(
+            "codex monitor recovery exceeded bounded terminal-item scan "
+            f"({terminal_count}>{MAX_MONITOR_RECOVERY_ITEMS})"
+        )
+
+    enqueued = 0
+    if not recovery.get("armed"):
+        # Brand-new watcher bootstrap: when the parent thread is already idle,
+        # replay only completions from the latest visible turn so we can wake for
+        # the outstanding idle child result without flooding older history.
+        if thread_status == "idle" and latest_turn_id is not None:
+            for _item_index, event in entries_by_turn.get(latest_turn_id, []):
+                if enqueue_event(state, event, logger=logger):
+                    enqueued += 1
+        recovery["armed"] = True
+        recovery["last_turn_id"] = latest_turn_id
+        recovery["last_item_index"] = latest_item_index
+        return enqueued
+
+    boundary_turn_id = recovery.get("last_turn_id")
+    boundary_item_index = int(recovery.get("last_item_index", -1))
+    boundary_found = boundary_turn_id is None
+    for turn in recent_turns:
+        turn_id = str(turn.get("id") or "").strip()
+        if not turn_id:
+            continue
+        if not boundary_found:
+            if turn_id != boundary_turn_id:
+                continue
+            boundary_found = True
+        start_index = boundary_item_index + 1 if turn_id == boundary_turn_id else 0
+        for item_index, event in entries_by_turn.get(turn_id, []):
+            if item_index < start_index:
+                continue
+            if enqueue_event(state, event, logger=logger):
+                enqueued += 1
+
+    if not boundary_found:
+        raise RuntimeError(
+            "codex monitor recovery baseline fell outside the bounded turn scan; "
+            "increase the scan window or restore monitor state"
+        )
+
+    recovery["last_turn_id"] = latest_turn_id
+    recovery["last_item_index"] = latest_item_index
+    return enqueued
 
 
 def turn_contains_client_message(turn: dict[str, Any], client_user_message_id: str) -> bool:
@@ -1362,16 +1508,19 @@ class CodexItemCompletedMonitor:
         self.rpc_opener = rpc_opener
         self._rpc_context = None
         self._rpc: BaseRpc | None = None
+        self._reconciled_thread_id: str | None = None
 
     def close(self) -> None:
         if self._rpc_context is None:
             self._rpc = None
+            self._reconciled_thread_id = None
             return
         try:
             self._rpc_context.__exit__(None, None, None)
         finally:
             self._rpc_context = None
             self._rpc = None
+            self._reconciled_thread_id = None
 
     def _ensure_connected(self) -> None:
         if self._rpc is not None:
@@ -1409,6 +1558,16 @@ class CodexItemCompletedMonitor:
             return 0
 
         enqueued = 0
+        if self._reconciled_thread_id != target_thread_id:
+            assert self._rpc is not None
+            thread_result = self._rpc.call("thread/read", {"threadId": target_thread_id, "includeTurns": True})
+            enqueued += recover_collab_completion_events(
+                thread_result,
+                target_thread_id=target_thread_id,
+                state=state,
+                logger=self.logger,
+            )
+            self._reconciled_thread_id = target_thread_id
         while True:
             assert self._rpc is not None
             try:
@@ -1814,15 +1973,13 @@ def run_cycle(
     )
 
     context = load_umwelt_context(umwelt_config)
-    if context is None:
-        base_status.update({"mode": "waiting_for_umwelt", "detail": f"missing or invalid {umwelt_config}"})
-        update_status(paths, base_status)
-        return base_status
+    umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
 
     try:
         if codex_monitor is not None:
             codex_monitor.drain(state=state, sessions_dir=sessions_dir, thread_override=thread_override)
-        poll_umwelt(WorldClient(context), state, logger)
+        if context is not None:
+            poll_umwelt(WorldClient(context), state, logger)
         atomic_write_json(paths.state_path, state)
         result = attempt_delivery(
             state,
@@ -1834,10 +1991,15 @@ def run_cycle(
             after_inflight_persist=lambda current_state, _inflight: atomic_write_json(paths.state_path, current_state),
         )
         atomic_write_json(paths.state_path, state)
+        status_mode = result.status
+        status_detail = result.detail
+        if umwelt_detail is not None and result.status == "idle":
+            status_mode = "waiting_for_umwelt"
+            status_detail = umwelt_detail
         base_status.update(
             {
-                "mode": result.status,
-                "detail": result.detail,
+                "mode": status_mode,
+                "detail": status_detail,
                 "thread_id": result.thread_id
                 or (state.get("active_wake") or {}).get("thread_id")
                 or (state.get("inflight_batch") or {}).get("thread_id")

@@ -58,8 +58,9 @@ class FakeWorld:
 
 
 class ScriptedRpc:
-    def __init__(self, *, method_responses=None):
+    def __init__(self, *, method_responses=None, notifications=None):
         self.method_responses = {k: list(v) for k, v in (method_responses or {}).items()}
+        self.notifications = list(notifications or [])
         self.calls = []
 
     def __enter__(self):
@@ -82,6 +83,15 @@ class ScriptedRpc:
         if method == "turn/start":
             return {"turn": {"id": "turn_123"}}
         raise AssertionError(f"unexpected method {method!r}")
+
+    def recv_notification(self, timeout):
+        self.calls.append(("recv_notification", timeout))
+        if not self.notifications:
+            raise TimeoutError("no notifications queued")
+        result = self.notifications.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class FakeIo(wake.StreamIo):
@@ -151,6 +161,26 @@ def _event(ref: str, *, kind: str = "gong", place: str = "place_square"):
     }
 
 
+def _collab_item(
+    *,
+    sender_thread_id: str = "thread-1",
+    item_status: str = "completed",
+    tool: str = "spawnAgent",
+    item_id: str = "collab-1",
+    agent_statuses: dict[str, str] | None = None,
+):
+    agent_statuses = agent_statuses or {"thread-child": "completed"}
+    return {
+        "type": "collabAgentToolCall",
+        "id": item_id,
+        "senderThreadId": sender_thread_id,
+        "receiverThreadIds": list(agent_statuses),
+        "agentsStates": {child_thread_id: {"status": status} for child_thread_id, status in agent_statuses.items()},
+        "status": item_status,
+        "tool": tool,
+    }
+
+
 def _collab_item_completed_notification(
     *,
     thread_id: str = "thread-1",
@@ -160,22 +190,19 @@ def _collab_item_completed_notification(
     item_id: str = "collab-1",
     agent_statuses: dict[str, str] | None = None,
 ):
-    agent_statuses = agent_statuses or {"thread-child": "completed"}
     return {
         "method": "item/completed",
         "params": {
             "threadId": thread_id,
             "turnId": "turn-123",
             "completedAtMs": 1234567890,
-            "item": {
-                "type": "collabAgentToolCall",
-                "id": item_id,
-                "senderThreadId": sender_thread_id,
-                "receiverThreadIds": list(agent_statuses),
-                "agentsStates": {thread_id: {"status": status} for thread_id, status in agent_statuses.items()},
-                "status": item_status,
-                "tool": tool,
-            },
+            "item": _collab_item(
+                sender_thread_id=sender_thread_id,
+                item_status=item_status,
+                tool=tool,
+                item_id=item_id,
+                agent_statuses=agent_statuses,
+            ),
         },
     }
 
@@ -186,7 +213,10 @@ def _thread_read(
     client_id: str | None = None,
     turn_id: str | None = None,
     turn_status: str | None = None,
+    turns: list[dict] | None = None,
 ):
+    if turns is not None:
+        return {"thread": {"status": {"type": status}, "turns": turns}}
     items = []
     if client_id is not None:
         items = [{"type": "userMessage", "clientId": client_id, "content": [{"type": "text", "text": "wake"}]}]
@@ -310,6 +340,24 @@ def test_parse_collab_item_completed_event_matches_target_thread():
     assert event["status_summary"] == "completed=1,errored=1"
 
 
+def test_parse_collab_item_completed_event_includes_schema_terminal_statuses_only():
+    notification = _collab_item_completed_notification(
+        agent_statuses={
+            "thread-child-a": "completed",
+            "thread-child-b": "shutdown",
+            "thread-child-c": "notFound",
+            "thread-child-d": "running",
+            "thread-child-e": "pendingInit",
+        }
+    )
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+
+    assert event is not None
+    assert event["terminal_agent_count"] == 3
+    assert event["status_summary"] == "completed=1,notFound=1,shutdown=1"
+
+
 def test_parse_collab_item_completed_event_rejects_irrelevant_sender():
     notification = _collab_item_completed_notification(sender_thread_id="thread-else")
 
@@ -363,6 +411,133 @@ def test_active_parent_defers_codex_completion_wake(tmp_path):
     assert result.thread_id == "thread-1"
     assert state["queue"] == [event]
     assert not [params for method, params in rpc.calls if method == "turn/start"]
+
+
+def test_monitor_drain_replays_latest_idle_completion_and_live_notification(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[_collab_item_completed_notification(item_id="live-1")],
+    )
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: rpc,
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    enqueued = monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1")
+
+    assert enqueued == 2
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1", "live-1"]
+    assert state["codex_monitor_recovery"]["armed"] is True
+    assert state["codex_monitor_recovery"]["last_turn_id"] == "turn-new"
+    monitor.close()
+
+
+def test_monitor_reconnect_recovers_completion_without_notification(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc_round_1 = ScriptedRpc(
+        method_responses={"thread/read": [_thread_read("idle", turns=[{"id": "turn-1", "status": "completed", "items": []}])]},
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [_collab_item(item_id="recover-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert state["queue"] == []
+
+    monitor.close()
+    recovered = monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1")
+
+    assert recovered == 1
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    monitor.close()
+
+
+def test_monitor_bootstrap_avoids_historical_flood_and_duplicate_replay(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc_round_1 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 1
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+    monitor.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1276,39 @@ def test_run_cycle_waits_gracefully_when_umwelt_is_missing(tmp_path):
     assert status["mode"] == "waiting_for_umwelt"
     on_disk = json.loads(paths.status_path.read_text())
     assert on_disk["mode"] == "waiting_for_umwelt"
+
+
+def test_run_cycle_missing_umwelt_still_delivers_codex_queue(tmp_path, monkeypatch):
+    paths = wake.build_paths(tmp_path / "codex-wake")
+    logger = _logger(tmp_path)
+    state = wake.default_state()
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(item_id="codex-1"), "thread-1")
+    assert event is not None
+    state["queue"] = [event]
+    wake.atomic_write_json(paths.state_path, state)
+
+    def fake_attempt_delivery(current_state, **kwargs):
+        assert current_state["queue"] == [event]
+        wake.ack_event_ids(current_state, [event["id"]])
+        return wake.DeliveryResult(status="delivered", detail=event["item_id"], thread_id="thread-1")
+
+    monkeypatch.setattr(wake, "attempt_delivery", fake_attempt_delivery)
+
+    status = wake.run_cycle(
+        paths=paths,
+        umwelt_config=tmp_path / "missing-umwelt.json",
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=logger,
+        started_at="2026-07-22T12:00:00+00:00",
+    )
+
+    assert status["mode"] == "delivered"
+    assert status["thread_id"] == "thread-1"
+    persisted = json.loads(paths.state_path.read_text())
+    assert persisted["queue"] == []
+    assert event["id"] in persisted["delivered_event_ids"]
 
 
 # ---------------------------------------------------------------------------
