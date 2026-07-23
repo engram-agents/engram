@@ -1403,6 +1403,63 @@ def test_run_cycle_missing_umwelt_still_delivers_codex_queue(tmp_path, monkeypat
     assert event["id"] in persisted["delivered_event_ids"]
 
 
+def test_run_cycle_poll_failure_still_delivers_codex_queue_and_upgrades_legacy_state(tmp_path, monkeypatch):
+    paths = wake.build_paths(tmp_path / "codex-wake")
+    logger = _logger(tmp_path)
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(item_id="codex-legacy"), "thread-1")
+    assert event is not None
+    legacy_state = {
+        "state_version": 3,
+        "seeded": True,
+        "cursors": {"place_square": 7},
+        "queue": [event],
+        "delivered_event_ids": [],
+        "inflight_batch": None,
+        "active_wake": None,
+    }
+    wake.atomic_write_json(paths.state_path, legacy_state)
+    umwelt_config = tmp_path / "umwelt.json"
+    umwelt_config.write_text(json.dumps({"agent": "mira", "world_url": "http://world.test"}))
+
+    def fake_poll(_world, current_state, _logger):
+        assert current_state["state_version"] == wake.STATE_VERSION
+        assert current_state["codex_monitor_recovery"] == wake.default_monitor_recovery()
+        raise RuntimeError("umwelt offline")
+
+    def fake_attempt_delivery(current_state, **kwargs):
+        assert current_state["queue"] == [event]
+        assert current_state["state_version"] == wake.STATE_VERSION
+        assert current_state["codex_monitor_recovery"] == wake.default_monitor_recovery()
+        wake.ack_event_ids(current_state, [event["id"]])
+        return wake.DeliveryResult(status="delivered", detail=event["item_id"], thread_id="thread-1")
+
+    monkeypatch.setattr(wake, "poll_umwelt", fake_poll)
+    monkeypatch.setattr(wake, "attempt_delivery", fake_attempt_delivery)
+
+    status = wake.run_cycle(
+        paths=paths,
+        umwelt_config=umwelt_config,
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=logger,
+        started_at="2026-07-22T12:00:00+00:00",
+    )
+
+    assert status["mode"] == "delivered"
+    assert status["detail"] == "codex-legacy; umwelt degraded: poll failed: umwelt offline"
+    assert status["thread_id"] == "thread-1"
+    persisted = json.loads(paths.state_path.read_text())
+    assert persisted["state_version"] == wake.STATE_VERSION
+    assert persisted["queue"] == []
+    assert event["id"] in persisted["delivered_event_ids"]
+    assert persisted["codex_monitor_recovery"] == wake.default_monitor_recovery()
+    on_disk_status = json.loads(paths.status_path.read_text())
+    assert on_disk_status["mode"] == "delivered"
+    assert on_disk_status["detail"] == "codex-legacy; umwelt degraded: poll failed: umwelt offline"
+    assert "umwelt poll failed: umwelt offline" in (tmp_path / "watcher.log").read_text()
+
+
 # ---------------------------------------------------------------------------
 # thread discovery + transport selection + framing + pid identity
 # ---------------------------------------------------------------------------

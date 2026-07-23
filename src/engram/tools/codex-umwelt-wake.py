@@ -1088,8 +1088,19 @@ class BaseRpc:
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
-    def recv_notification(self, timeout: float) -> dict[str, Any]:
+    def _recv_json(self, timeout: float) -> dict[str, Any]:
         raise NotImplementedError
+
+    def recv_notification(self, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timeout waiting for websocket notification")
+            msg = self._recv_json(remaining)
+            if "id" in msg:
+                continue
+            return msg
 
 
 class WebsocketRpc(BaseRpc):
@@ -1125,17 +1136,6 @@ class WebsocketRpc(BaseRpc):
         if not isinstance(msg, dict):
             raise RuntimeError("unexpected websocket JSON message shape")
         return msg
-
-    def recv_notification(self, timeout: float) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timeout waiting for websocket notification")
-            msg = self._recv_json(remaining)
-            if "id" in msg:
-                continue
-            return msg
 
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
@@ -1379,17 +1379,6 @@ class StreamWebSocketRpc(BaseRpc):
 
     def notify(self, method: str, params: dict[str, Any]) -> None:
         self._send_frame(0x1, json.dumps({"method": method, "params": params}, separators=(",", ":")).encode("utf-8"))
-
-    def recv_notification(self, timeout: float) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timeout waiting for websocket notification")
-            msg = self._recv_json(remaining)
-            if "id" in msg:
-                continue
-            return msg
 
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self.request_id += 1
@@ -1987,7 +1976,11 @@ def run_cycle(
         if codex_monitor is not None:
             codex_monitor.drain(state=state, sessions_dir=sessions_dir, thread_override=thread_override)
         if context is not None:
-            poll_umwelt(WorldClient(context), state, logger)
+            try:
+                poll_umwelt(WorldClient(context), state, logger)
+            except Exception as exc:
+                umwelt_detail = f"poll failed: {exc}"
+                logger.log(f"umwelt poll failed: {exc}")
         atomic_write_json(paths.state_path, state)
         result = attempt_delivery(
             state,
@@ -2001,9 +1994,13 @@ def run_cycle(
         atomic_write_json(paths.state_path, state)
         status_mode = result.status
         status_detail = result.detail
-        if umwelt_detail is not None and result.status == "idle":
-            status_mode = "waiting_for_umwelt"
-            status_detail = umwelt_detail
+        if umwelt_detail is not None:
+            if result.status == "idle":
+                status_mode = "waiting_for_umwelt"
+                status_detail = umwelt_detail
+            else:
+                degrade_note = f"umwelt degraded: {umwelt_detail}"
+                status_detail = f"{status_detail}; {degrade_note}" if status_detail else degrade_note
         base_status.update(
             {
                 "mode": status_mode,
