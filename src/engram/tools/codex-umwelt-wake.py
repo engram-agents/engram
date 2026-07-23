@@ -57,10 +57,11 @@ DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 1
-STATE_VERSION = 4
+STATE_VERSION = 5
 MAX_RECENT_DELIVERED = 256
 MAX_MONITOR_RECOVERY_TURNS = 32
 MAX_MONITOR_RECOVERY_ITEMS = 256
+MAX_MONITOR_SEEN_TERMINAL_EVENTS = 256
 HTTP_READ_LIMIT = 64 * 1024
 HTTP_OPEN_TIMEOUT = 5
 WS_OPEN_TIMEOUT = 5
@@ -170,9 +171,8 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
 def default_monitor_recovery() -> dict[str, Any]:
     return {
         "thread_id": None,
-        "last_turn_id": None,
-        "last_item_index": -1,
         "armed": False,
+        "seen_terminal_event_ids": [],
     }
 
 
@@ -183,13 +183,13 @@ def normalize_monitor_recovery(value: Any) -> dict[str, Any]:
     normalized.update(value)
     thread_id = normalized.get("thread_id")
     normalized["thread_id"] = thread_id if isinstance(thread_id, str) and thread_id else None
-    turn_id = normalized.get("last_turn_id")
-    normalized["last_turn_id"] = turn_id if isinstance(turn_id, str) and turn_id else None
-    try:
-        normalized["last_item_index"] = int(normalized.get("last_item_index", -1))
-    except (TypeError, ValueError):
-        normalized["last_item_index"] = -1
     normalized["armed"] = bool(normalized.get("armed"))
+    seen_ids: list[str] = []
+    for event_id in normalized.get("seen_terminal_event_ids", []):
+        if not isinstance(event_id, str) or not event_id or event_id in seen_ids:
+            continue
+        seen_ids.append(event_id)
+    normalized["seen_terminal_event_ids"] = seen_ids[-MAX_MONITOR_SEEN_TERMINAL_EVENTS:]
     return normalized
 
 
@@ -197,6 +197,18 @@ def monitor_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
     recovery = normalize_monitor_recovery(state.get("codex_monitor_recovery"))
     state["codex_monitor_recovery"] = recovery
     return recovery
+
+
+def seen_terminal_event_ids(recovery: dict[str, Any]) -> set[str]:
+    return {x for x in recovery.get("seen_terminal_event_ids", []) if isinstance(x, str)}
+
+
+def remember_seen_terminal_event_id(recovery: dict[str, Any], event_id: str) -> None:
+    seen = [x for x in recovery.get("seen_terminal_event_ids", []) if isinstance(x, str)]
+    if event_id in seen:
+        seen.remove(event_id)
+    seen.append(event_id)
+    recovery["seen_terminal_event_ids"] = seen[-MAX_MONITOR_SEEN_TERMINAL_EVENTS:]
 
 
 def default_state() -> dict[str, Any]:
@@ -849,30 +861,28 @@ def recover_collab_completion_events(
 
     turns = thread_turns(thread_read_result)
     recent_turns = turns[-MAX_MONITOR_RECOVERY_TURNS:]
-    latest_turn_id, latest_item_index = _latest_turn_boundary(recent_turns)
+    latest_turn_id, _latest_item_index = _latest_turn_boundary(recent_turns)
     thread_status = _thread_status(thread_read_result)
     if recent_turns and latest_turn_id is None:
         raise RuntimeError("codex monitor recovery requires turn ids in thread/read includeTurns snapshots")
 
     if not recent_turns:
         recovery["armed"] = True
-        recovery["last_turn_id"] = latest_turn_id
-        recovery["last_item_index"] = latest_item_index
         return 0
 
-    entries_by_turn: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    entries_by_turn: dict[str, list[dict[str, Any]]] = {}
     terminal_count = 0
     for turn in recent_turns:
         turn_id = str(turn.get("id") or "").strip()
         if not turn_id:
             continue
-        turn_entries: list[tuple[int, dict[str, Any]]] = []
-        for item_index, item in enumerate(_turn_items(turn)):
+        turn_entries: list[dict[str, Any]] = []
+        for item in _turn_items(turn):
             event = parse_collab_completion_item(item, target_thread_id)
             if event is None:
                 continue
             terminal_count += 1
-            turn_entries.append((item_index, event))
+            turn_entries.append(event)
         if turn_entries:
             entries_by_turn[turn_id] = turn_entries
 
@@ -882,46 +892,40 @@ def recover_collab_completion_events(
             f"({terminal_count}>{MAX_MONITOR_RECOVERY_ITEMS})"
         )
 
+    seen_ids = seen_terminal_event_ids(recovery)
     enqueued = 0
     if not recovery.get("armed"):
+        replay_ids: set[str] = set()
         # Brand-new watcher bootstrap: when the parent thread is already idle,
         # replay only completions from the latest visible turn so we can wake for
         # the outstanding idle child result without flooding older history.
         if thread_status == "idle" and latest_turn_id is not None:
-            for _item_index, event in entries_by_turn.get(latest_turn_id, []):
-                if enqueue_event(state, event, logger=logger):
+            replay_ids = {event["id"] for event in entries_by_turn.get(latest_turn_id, [])}
+        for turn_id, turn_events in entries_by_turn.items():
+            for event in turn_events:
+                event_id = event["id"]
+                if event_id in seen_ids:
+                    continue
+                remember_seen_terminal_event_id(recovery, event_id)
+                seen_ids.add(event_id)
+                if turn_id == latest_turn_id and event_id in replay_ids and enqueue_event(state, event, logger=logger):
                     enqueued += 1
         recovery["armed"] = True
-        recovery["last_turn_id"] = latest_turn_id
-        recovery["last_item_index"] = latest_item_index
         return enqueued
 
-    boundary_turn_id = recovery.get("last_turn_id")
-    boundary_item_index = int(recovery.get("last_item_index", -1))
-    boundary_found = boundary_turn_id is None
     for turn in recent_turns:
         turn_id = str(turn.get("id") or "").strip()
         if not turn_id:
             continue
-        if not boundary_found:
-            if turn_id != boundary_turn_id:
+        for event in entries_by_turn.get(turn_id, []):
+            event_id = event["id"]
+            if event_id in seen_ids:
                 continue
-            boundary_found = True
-        start_index = boundary_item_index + 1 if turn_id == boundary_turn_id else 0
-        for item_index, event in entries_by_turn.get(turn_id, []):
-            if item_index < start_index:
-                continue
+            remember_seen_terminal_event_id(recovery, event_id)
+            seen_ids.add(event_id)
             if enqueue_event(state, event, logger=logger):
                 enqueued += 1
 
-    if not boundary_found:
-        raise RuntimeError(
-            "codex monitor recovery baseline fell outside the bounded turn scan; "
-            "increase the scan window or restore monitor state"
-        )
-
-    recovery["last_turn_id"] = latest_turn_id
-    recovery["last_item_index"] = latest_item_index
     return enqueued
 
 
@@ -1579,8 +1583,12 @@ class CodexItemCompletedMonitor:
                 self.close()
                 break
             event = parse_collab_item_completed_event(notification, target_thread_id)
-            if event is not None and enqueue_event(state, event, logger=self.logger):
-                enqueued += 1
+            if event is not None:
+                recovery = monitor_recovery_state(state)
+                if recovery.get("thread_id") == target_thread_id:
+                    remember_seen_terminal_event_id(recovery, event["id"])
+                if enqueue_event(state, event, logger=self.logger):
+                    enqueued += 1
         return enqueued
 
 

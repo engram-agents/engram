@@ -444,7 +444,9 @@ def test_monitor_drain_replays_latest_idle_completion_and_live_notification(tmp_
     assert enqueued == 2
     assert [event["item_id"] for event in state["queue"]] == ["latest-1", "live-1"]
     assert state["codex_monitor_recovery"]["armed"] is True
-    assert state["codex_monitor_recovery"]["last_turn_id"] == "turn-new"
+    seen_ids = set(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+    assert len(seen_ids) == 3
+    assert {state["queue"][0]["id"], state["queue"][1]["id"]} <= seen_ids
     monitor.close()
 
 
@@ -487,6 +489,79 @@ def test_monitor_reconnect_recovers_completion_without_notification(tmp_path):
 
     assert recovered == 1
     assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    assert state["codex_monitor_recovery"]["seen_terminal_event_ids"] == [state["queue"][0]["id"]]
+    monitor.close()
+
+
+def test_monitor_reconnect_recovers_same_item_index_status_mutation_once(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    running_item = _collab_item(item_id="recover-1", item_status="inProgress", agent_statuses={"thread-child": "running"})
+    completed_item = _collab_item(item_id="recover-1")
+    rpc_round_1 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "active",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "inProgress", "items": [running_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [completed_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_3 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [completed_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2, rpc_round_3])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert state["queue"] == []
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 1
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    seen_after_recovery = list(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    assert state["codex_monitor_recovery"]["seen_terminal_event_ids"] == seen_after_recovery
     monitor.close()
 
 
@@ -533,11 +608,28 @@ def test_monitor_bootstrap_avoids_historical_flood_and_duplicate_replay(tmp_path
     sessions_dir.mkdir()
     assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 1
     assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+    seen_after_bootstrap = set(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+    assert len(seen_after_bootstrap) == 2
 
     monitor.close()
     assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
     assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+    assert set(state["codex_monitor_recovery"]["seen_terminal_event_ids"]) == seen_after_bootstrap
     monitor.close()
+
+
+def test_monitor_recovery_raises_when_terminal_scan_exceeds_cap(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    items = [_collab_item(item_id=f"item-{i}") for i in range(wake.MAX_MONITOR_RECOVERY_ITEMS + 1)]
+
+    with pytest.raises(RuntimeError, match="exceeded bounded terminal-item scan"):
+        wake.recover_collab_completion_events(
+            _thread_read("idle", turns=[{"id": "turn-1", "status": "completed", "items": items}]),
+            target_thread_id="thread-1",
+            state=state,
+            logger=logger,
+        )
 
 
 # ---------------------------------------------------------------------------
