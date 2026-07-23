@@ -14,6 +14,12 @@
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-session-start-hook.py\"",
             "timeout": 5,
             "statusMessage": "Resetting ENGRAM prompt counter..."
+          },
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-pull-hook.py\"",
+            "timeout": 20,
+            "statusMessage": "Checking watched repos for stale trees..."
           }
         ]
       }
@@ -114,6 +120,16 @@
           {
             "type": "command",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-warn-hook.py\"",
             "timeout": 3
           }
         ]

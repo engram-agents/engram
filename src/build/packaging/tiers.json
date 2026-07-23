@@ -406,6 +406,18 @@
       "tier": "essential"
     },
     {
+      "path": "hooks/claude/engram-stale-tree-pull-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/engram-stale-tree-warn-hook.py",
+      "tier": "essential"
+    },
+    {
+      "path": "hooks/claude/_stale_tree_hooklib.py",
+      "tier": "essential"
+    },
+    {
       "path": "hooks/claude/engram-postcompact-hook.py",
       "tier": "essential"
     },
