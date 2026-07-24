@@ -24,7 +24,7 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
-| `agent-session-launch.sh` | wrapper: reads the boot charge, starts detached tmux, execs `agentctl session ... --as-self <charge>` |
+| `agent-session-launch.sh` | wrapper: reads the boot charge, prepends `~/.local/bin` to PATH, starts detached tmux, execs `agentctl session ... -dr --as-self <charge>` |
 | `boot-charge-default.md` | default morning charge (orient, log in, check the charge board, hold quiet on-call) |
 | `boot-charge-quiet.md` | variant for zephyr/mira: same, plus skip heartbeat loops / minimize token spend / stand by |
 | `mira-codex-session@.service.example` | Codex `app-server` daemon VARIANT — **UNTESTED**, documented example only (see its own header) |
@@ -64,13 +64,15 @@ sessions.
    sudo systemctl daemon-reload
    ```
 
-3. **Enable the timer + the per-agent instances** (six Claude agents; Mira's
-   Codex variant is NOT enabled here — see the WARNING in
+3. **Enable the timer + the per-agent instances** (five Claude agents — only
+   agents with an `agent-<name>` Linux user on THIS host; Luria is off-host
+   (her instance fails with status=217/USER — found live 2026-07-24), and
+   Mira's Codex variant is NOT enabled here — see the WARNING in
    `mira-codex-session@.service.example`):
 
    ```bash
    sudo systemctl enable agent-sessions.timer
-   for name in kepler borges luria ariadne sol zephyr; do
+   for name in kepler borges ariadne sol zephyr; do
        sudo systemctl enable "agent-session@${name}.service"
    done
    ```
@@ -82,11 +84,11 @@ sessions.
    starts on its own schedule regardless of whether the target user is
    logged in. Linger is a `--user`-unit concern only.
 
-## Stagger the six agents ~30s apart
+## Stagger the five agents ~30s apart
 
-`agent-sessions.target`'s `Wants=` fires all six instances at once by
+`agent-sessions.target`'s `Wants=` fires all five instances at once by
 default. Stagger them with a per-instance drop-in (`ExecStartPre=/bin/sleep N`)
-so six simultaneous Claude Code cold-starts don't hit the world/API all at
+so five simultaneous Claude Code cold-starts don't hit the world/API all at
 the same second:
 
 ```bash
@@ -102,13 +104,7 @@ cat <<'EOF' | sudo tee /etc/systemd/system/agent-session@borges.service.d/stagge
 ExecStartPre=/bin/sleep 30
 EOF
 
-sudo mkdir -p /etc/systemd/system/agent-session@luria.service.d
-cat <<'EOF' | sudo tee /etc/systemd/system/agent-session@luria.service.d/stagger.conf
-[Service]
-ExecStartPre=/bin/sleep 60
-EOF
-
-# ... ariadne=90, sol=120, zephyr=150, following the same pattern.
+# ... ariadne=60, sol=90, zephyr=120, following the same pattern.
 
 sudo systemctl daemon-reload
 ```

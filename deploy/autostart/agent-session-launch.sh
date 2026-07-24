@@ -59,6 +59,23 @@ fi
 
 charge_content="$(cat "$charge_path")"
 
+# The systemd unit environment carries only the default system PATH
+# (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:...), but the platform
+# CLI is installed per-user at ~/.local/bin. Found live at the 2026-07-24
+# 08:15 rehearsal: every unit "Finished" green while the tmux-spawned
+# `agentctl session` died instantly on `env: 'claude': No such file or
+# directory`. tmux inherits this environment into the server it starts, so
+# one prepend here covers the whole chain.
+export PATH="$HOME/.local/bin:$PATH"
+
+# Fail LOUDLY at the unit level if no platform CLI is resolvable — without
+# this check the unit reports success and the failure is invisible until
+# someone notices the missing session (the 07-24 silent-failure mode).
+if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; then
+    echo "ERROR: neither 'claude' nor 'codex' found on PATH ($PATH) — cannot start a session." >&2
+    exit 1
+fi
+
 tmux_session="agent-${AGENT_NAME}"
 
 # Refuse to double-launch if a session with this name is already up (e.g. a
@@ -71,5 +88,11 @@ if tmux has-session -t "$tmux_session" 2>/dev/null; then
     exit 1
 fi
 
+# -dr: -d (claude: --dangerously-skip-permissions) so an unattended boot
+# session never blocks on its first permission prompt; -r (claude:
+# --remote-control <agent>) so the session registers with remote control and
+# is visible/steerable from the operator's phone — matching how the operator
+# launches sessions manually (`agentctl session <name> -dr`). Added per Lei's
+# 2026-07-24 post-rehearsal instruction.
 exec tmux new-session -d -s "$tmux_session" -- \
-    agentctl session "$AGENT_NAME" --as-self "$charge_content"
+    agentctl session "$AGENT_NAME" -dr --as-self "$charge_content"
