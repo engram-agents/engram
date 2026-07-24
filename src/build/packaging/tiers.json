@@ -260,6 +260,10 @@
       "multi_agent": true
     },
     {
+      "path": "tools/codex-umwelt-wake.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/ia.py",
       "tier": "convenience",
       "multi_agent": true

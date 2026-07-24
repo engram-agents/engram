@@ -410,6 +410,12 @@
       "note": "No test file found for forum-mention-monitor.sh"
     },
     {
+      "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
+      "test_globs": [
+        "tests/test_codex_umwelt_wake.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "skills/claude/",
       "test_globs": [
         "tests/test_skill_frontmatter_lint.py",
