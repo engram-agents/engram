@@ -41,6 +41,27 @@ AGENT_NAME="${1:?Usage: agent-session-launch.sh <agent-name>}"
 
 RUNNER="/usr/local/lib/agentctl/autostart/agent-session-run.sh"
 
+# Per-agent environment file (optional): ~/.engram/boot-env — sourced FIRST,
+# before the PATH prepend and the CLI pre-checks, so everything below (and the
+# whole tmux-inherited chain: agentctl → claude) sees the agent's own env.
+# Why: the systemd unit starts with a clean environment and nothing in this
+# chain reads ~/.bash_profile, so an agent whose platform CLI depends on
+# profile-set variables (found live at the 2026-07-25 rehearsal: zephyr's
+# claude runs against a non-Anthropic backend via profile-set ANTHROPIC_* /
+# Ollama variables, and booted into "not logged in" without them) needs a
+# boot-visible home for those exports. Same per-agent override seam as
+# boot-charge.md / boot-cwd: the agent (or the operator on their behalf)
+# drops plain `VAR=value` / `export VAR=value` lines in, no root needed.
+# `set -a` auto-exports plain assignments; a sourcing failure aborts the
+# unit LOUDLY (set -e) rather than launching a half-configured session.
+BOOT_ENV_FILE="$HOME/.engram/boot-env"
+if [[ -r "$BOOT_ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$BOOT_ENV_FILE"
+    set +a
+fi
+
 # Per-agent override, else the shared default template. Judgment call: the
 # default lives at a fixed system-wide install path (mirrors agentctl's own
 # /usr/local/sbin/agent-bootstrap convention) rather than inside whichever

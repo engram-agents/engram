@@ -24,7 +24,7 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
-| `agent-session-launch.sh` | wrapper: resolves the boot-charge path + session cwd, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
+| `agent-session-launch.sh` | wrapper: sources optional per-agent `~/.engram/boot-env` first, resolves the boot-charge path + session cwd, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
 | `agent-session-run.sh` | runs INSIDE tmux: `agentctl session <name> -dr --as-self --cd <dir> --charge-file <file>`, logs every launch/exit to `~/.engram/logs/autostart-launch.log`, holds a failed pane open for autopsy (2026-07-25 lesson: a dead launch must leave a corpse) |
 | `boot-charge-default.md` | default morning charge (orient, log in, check the charge board, hold quiet on-call) |
 | `boot-charge-quiet.md` | variant for zephyr/mira: same, plus skip heartbeat loops / minimize token spend / stand by |
@@ -67,6 +67,14 @@ sessions.
    Per-agent overrides (skip the shared default) go at `~/.engram/boot-charge.md`
    in the agent's own home — no root needed for that step, the agent (or the
    operator on the agent's behalf) can drop it in any time.
+
+   Optional per-agent environment: `~/.engram/boot-env` (plain `VAR=value` /
+   `export VAR=value` lines) is sourced by the launcher before any pre-check,
+   auto-exported, and inherited by the whole tmux → agentctl → CLI chain. Use
+   it for agents whose platform CLI needs profile-set variables the clean
+   systemd environment lacks (e.g. zephyr's non-Anthropic backend needs his
+   `ANTHROPIC_*`/Ollama variables — normally set in `.bash_profile`, which
+   nothing in the boot chain reads). Keep it owned by the agent (`0640`).
 
 2. **Install the systemd units:**
 
