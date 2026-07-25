@@ -561,3 +561,36 @@ def test_claude_r_r_dedup_emits_remote_control_once():
     assert lines.count("borges") == 1, (
         f"Expected exactly 1 agent name 'borges', got: {lines.count('borges')}"
     )
+
+
+def test_charge_file_flag_parses_and_composes():
+    """--charge-file must parse into CHARGE_FILE and compose with --as-self and
+    alias passthrough. This is the 2026-07-25 boot-charge fix: the charge rides
+    a dedicated flag (content appended to argv AFTER expansion) because the
+    one-word-per-line expansion transport cannot carry multi-line text.
+    """
+    rc, lines, stderr = _parse_session_flags(
+        "--as-self", "--charge-file", "/tmp/charge.md", "-dr"
+    )
+    assert rc == 0, f"expected rc=0, got {rc}, stderr={stderr!r}"
+    assert "CHARGE_FILE=/tmp/charge.md" in lines, f"got: {lines!r}"
+    assert "AS_SELF=1" in lines
+    assert "EXTRA:-dr" in lines, f"-dr must still pass through to expansion; got: {lines!r}"
+
+
+def test_charge_file_equals_form_parses():
+    rc, lines, _ = _parse_session_flags("--charge-file=/x/y.md")
+    assert rc == 0
+    assert "CHARGE_FILE=/x/y.md" in lines, f"got: {lines!r}"
+
+
+def test_charge_file_missing_argument_errors_loudly():
+    rc, _, stderr = _parse_session_flags("--charge-file")
+    assert rc == 2, f"missing arg must exit 2; got {rc}"
+    assert "--charge-file" in stderr, f"error must name the flag; got: {stderr!r}"
+
+
+def test_charge_file_default_is_empty():
+    rc, lines, _ = _parse_session_flags("--as-self")
+    assert rc == 0
+    assert "CHARGE_FILE=" in lines, f"expected empty CHARGE_FILE default; got: {lines!r}"

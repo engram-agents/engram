@@ -24,7 +24,8 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
-| `agent-session-launch.sh` | wrapper: reads the boot charge, prepends `~/.local/bin` to PATH, starts detached tmux, execs `agentctl session ... -dr --as-self <charge>` |
+| `agent-session-launch.sh` | wrapper: resolves the boot-charge path + session cwd, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
+| `agent-session-run.sh` | runs INSIDE tmux: `agentctl session <name> -dr --as-self --cd <dir> --charge-file <file>`, logs every launch/exit to `~/.engram/logs/autostart-launch.log`, holds a failed pane open for autopsy (2026-07-25 lesson: a dead launch must leave a corpse) |
 | `boot-charge-default.md` | default morning charge (orient, log in, check the charge board, hold quiet on-call) |
 | `boot-charge-quiet.md` | variant for zephyr/mira: same, plus skip heartbeat loops / minimize token spend / stand by |
 | `mira-codex-session@.service.example` | Codex `app-server` daemon VARIANT — **UNTESTED**, documented example only (see its own header) |
@@ -43,12 +44,25 @@ sessions.
    ```bash
    sudo mkdir -p /usr/local/lib/agentctl/autostart
    sudo cp deploy/autostart/agent-session-launch.sh \
+           deploy/autostart/agent-session-run.sh \
            deploy/autostart/boot-charge-default.md \
            deploy/autostart/boot-charge-quiet.md \
            /usr/local/lib/agentctl/autostart/
-   sudo chmod 0755 /usr/local/lib/agentctl/autostart/agent-session-launch.sh
+   sudo chmod 0755 /usr/local/lib/agentctl/autostart/agent-session-launch.sh \
+                   /usr/local/lib/agentctl/autostart/agent-session-run.sh
    sudo chmod 0644 /usr/local/lib/agentctl/autostart/boot-charge-*.md
    ```
+
+   The launch chain requires an `agentctl` with `--charge-file` support
+   (2026-07-25) on the system path — keep `/usr/local/bin/agentctl` in sync
+   with `tools/agentctl` when installing:
+
+   ```bash
+   sudo install -m 0755 tools/agentctl /usr/local/bin/agentctl
+   ```
+
+   Optional per-agent session cwd: drop an absolute path into
+   `~/.engram/boot-cwd` (one line) in the agent's home; default is `$HOME`.
 
    Per-agent overrides (skip the shared default) go at `~/.engram/boot-charge.md`
    in the agent's own home — no root needed for that step, the agent (or the

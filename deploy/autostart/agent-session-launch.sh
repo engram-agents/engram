@@ -4,39 +4,42 @@
 # Invoked by agent-session@.service's ExecStart. That unit runs with
 # `User=agent-%i` — so this script is ALREADY running as the target agent's
 # own Linux user, with no sudo available or needed. It:
-#   1. reads the boot-charge template (per-agent override, else the shared
-#      default),
+#   1. resolves the boot-charge template (per-agent override, else the shared
+#      default) and the session working directory,
 #   2. starts a detached tmux session named `agent-<name>`,
-#   3. inside it, execs `agentctl session <name> --as-self <charge>` — the
-#      charge text becomes the platform CLI's initial prompt.
+#   3. inside it, runs agent-session-run.sh, which launches
+#      `agentctl session <name> -dr --as-self --charge-file <charge>` and
+#      leaves a breadcrumb log + holds the pane if the launch dies.
 #
 # The operator can `ssh` in (including over tailscale) and
 # `tmux attach -t agent-<name>` later to observe/interact.
 #
 # Usage: agent-session-launch.sh <agent-name>
 #
-# Prompt-passing note (judgment call — see spec §Part B.1): the boot-charge
-# content is passed to `agentctl session ... --as-self` as a single PLAIN
-# (non-dash-leading) positional argument. agentctl's single-dash alias
-# grammar (tools/agentctl header + _expand_session_args) only inspects args
-# that themselves start with a single dash; the charge always starts with
-# the literal "<boot-charge>" marker line, so it is never mistaken for a
-# flag and passes through _expand_session_args verbatim and unexamined. No
-# "--" separator is used between --as-self and the charge — introducing one
-# would risk the platform CLI (claude/codex) treating "--" as an
-# end-of-options marker rather than as part of the initial-prompt argument,
-# which is exactly the ambiguity this note forecloses.
+# Charge-passing note (REVISED 2026-07-25 — the previous design note here was
+# falsified live): the charge is now passed BY PATH via agentctl's
+# --charge-file flag, never inline. The old inline-positional design assumed
+# the charge "passes through _expand_session_args verbatim and unexamined";
+# in practice that function's one-word-per-line transport rejects any
+# newline-containing arg ("session args may not be empty or contain
+# newlines", exit 2), so the multi-line boot charge killed every launch at
+# the 2026-07-25 08:15 rehearsal — inside tmux, invisibly, with all five
+# units green. --charge-file reads the content inside cmd_session AFTER
+# alias expansion and appends it directly to the platform argv, so the
+# transport never sees it and no quoting layer can corrupt it.
 #
-# tmux argv-passing note: the command + its arguments are passed to
-# `tmux new-session` as SEPARATE argv words after a literal `--`, not as one
-# joined string. tmux execs them directly with no shell re-parsing in this
-# form, so charge content containing quotes, `$`, backticks, etc. is passed
-# through byte-for-byte instead of being re-interpreted by an intermediate
-# shell — verified empirically (tmux 3.4) before relying on it here.
+# Observability note (same incident): the gap between "unit finished green"
+# and "claude is alive" is this chain's recurring silent-failure surface
+# (07-22 timer Unit=, 07-24 PATH, 07-25 newline guard — three rehearsals,
+# each dying one layer deeper, each invisibly). The in-tmux runner script
+# now writes ~/.engram/logs/autostart-launch.log and holds a failed pane
+# open, so the NEXT layer-N failure leaves a corpse we can autopsy.
 
 set -euo pipefail
 
 AGENT_NAME="${1:?Usage: agent-session-launch.sh <agent-name>}"
+
+RUNNER="/usr/local/lib/agentctl/autostart/agent-session-run.sh"
 
 # Per-agent override, else the shared default template. Judgment call: the
 # default lives at a fixed system-wide install path (mirrors agentctl's own
@@ -57,7 +60,39 @@ if [[ ! -r "$charge_path" ]]; then
     exit 1
 fi
 
-charge_content="$(cat "$charge_path")"
+if [[ ! -s "$charge_path" ]]; then
+    echo "ERROR: boot-charge template '$charge_path' is empty" >&2
+    exit 1
+fi
+
+if [[ ! -x "$RUNNER" ]]; then
+    echo "ERROR: in-tmux runner '$RUNNER' missing or not executable (install step skipped?)" >&2
+    exit 1
+fi
+
+# Session working directory: per-agent override at ~/.engram/boot-cwd (a file
+# containing one absolute path), else ~/umwelt when it exists (the operator
+# starts every agent's manual session there — `agentctl session <name> -dr
+# --cd /home/agent-<name>/umwelt/` — so it's the already-TRUSTED project dir;
+# an unfamiliar cwd makes the platform CLI block on its first-run
+# "trust this folder?" dialog before remote-control registration, found live
+# at the 2026-07-25 Sol test), else $HOME. Without an explicit --cd the
+# session would inherit the systemd unit's cwd — / — and the platform CLI
+# would file its transcript under a "/" project.
+BOOT_CWD_FILE="$HOME/.engram/boot-cwd"
+if [[ -d "$HOME/umwelt" ]]; then
+    cd_target="$HOME/umwelt"
+else
+    cd_target="$HOME"
+fi
+if [[ -r "$BOOT_CWD_FILE" ]]; then
+    cwd_candidate="$(head -n1 "$BOOT_CWD_FILE")"
+    if [[ -d "$cwd_candidate" ]]; then
+        cd_target="$cwd_candidate"
+    else
+        echo "WARNING: boot-cwd '$cwd_candidate' is not a directory; falling back to \$HOME" >&2
+    fi
+fi
 
 # The systemd unit environment carries only the default system PATH
 # (/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:...), but the platform
@@ -76,6 +111,18 @@ if ! command -v claude >/dev/null 2>&1 && ! command -v codex >/dev/null 2>&1; th
     exit 1
 fi
 
+# Pre-check the exact agentctl contract the runner will use, while we can
+# still fail at the UNIT level (visible in systemctl/journal). A stale
+# installed agentctl without --charge-file would otherwise die inside tmux
+# — the exact invisible failure mode this revision exists to kill.
+# (Capture-then-grep, not a pipeline: the usage text exits nonzero, and under
+# pipefail that would poison the pipeline even when grep matches.)
+agentctl_usage="$(agentctl session 2>&1 || true)"
+if ! grep -q -- '--charge-file' <<<"$agentctl_usage"; then
+    echo "ERROR: installed agentctl does not support --charge-file (stale install?) — refusing to launch into a known-dead path." >&2
+    exit 1
+fi
+
 tmux_session="agent-${AGENT_NAME}"
 
 # Refuse to double-launch if a session with this name is already up (e.g. a
@@ -88,11 +135,9 @@ if tmux has-session -t "$tmux_session" 2>/dev/null; then
     exit 1
 fi
 
-# -dr: -d (claude: --dangerously-skip-permissions) so an unattended boot
-# session never blocks on its first permission prompt; -r (claude:
-# --remote-control <agent>) so the session registers with remote control and
-# is visible/steerable from the operator's phone — matching how the operator
-# launches sessions manually (`agentctl session <name> -dr`). Added per Lei's
-# 2026-07-24 post-rehearsal instruction.
+# All arguments are simple paths/names now (the multi-line charge stays in
+# its file), so the tmux argv-passing subtleties of the previous revision no
+# longer apply — but we still pass argv words after a literal `--` so tmux
+# execs the runner directly with no intermediate shell re-parse.
 exec tmux new-session -d -s "$tmux_session" -- \
-    agentctl session "$AGENT_NAME" -dr --as-self "$charge_content"
+    "$RUNNER" "$AGENT_NAME" "$charge_path" "$cd_target"

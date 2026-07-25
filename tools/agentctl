@@ -46,6 +46,11 @@
 #                                        #   -r  claude:--remote-control <agent>
 #                                        #       codex: error (remote control unavailable)
 #                                        # Double-dash flags and non-flag args pass through verbatim.
+#   agentctl attach <agent> [-r]         # attach your terminal to the agent's tmux
+#                                        # session (agent-<name>, e.g. a boot-time
+#                                        # auto-start session) and interact with the
+#                                        # CLI normally. Detach: Ctrl-b d (session
+#                                        # keeps running). -r = read-only observe.
 #   agentctl bash <agent>                # plain bash shell as agent (no CLI)
 #   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
 #                                        # grant agent ACL access to operator-side path;
@@ -257,8 +262,8 @@ _as_self_check() {
 # collected verbatim into the extra/passthrough array, unexamined, so the
 # two layers compose without either duplicating the other's logic.
 #
-# Signature: _parse_session_flags <platform_var> <no_share_var> <as_self_var> <cd_var> <extra_var> -- <args...>
-#   Sets the caller's 5 variables via namerefs (bash 4.3+), mirroring the
+# Signature: _parse_session_flags <platform_var> <no_share_var> <as_self_var> <cd_var> <charge_file_var> <extra_var> -- <args...>
+#   Sets the caller's 6 variables via namerefs (bash 4.3+), mirroring the
 #   _normalize_chosen_name nameref-out pattern used elsewhere in this file.
 # Returns 2 (usage error) on a malformed --platform/--cd (missing argument),
 # matching cmd_session's pre-existing exit-2 convention for flag-arg errors.
@@ -270,14 +275,16 @@ _parse_session_flags() {
     local -n _psf_no_share="$2"
     local -n _psf_as_self="$3"
     local -n _psf_cd="$4"
-    local -n _psf_extra="$5"
-    shift 5
+    local -n _psf_charge_file="$5"
+    local -n _psf_extra="$6"
+    shift 6
     [[ "${1:-}" == "--" ]] && shift
 
     _psf_platform=""
     _psf_no_share=0
     _psf_as_self=0
     _psf_cd=""
+    _psf_charge_file=""
     _psf_extra=()
 
     while [[ $# -gt 0 ]]; do
@@ -295,6 +302,10 @@ _parse_session_flags() {
                 [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; return 2; }
                 _psf_cd="$2"; shift 2 ;;
             --cd=*) _psf_cd="${1#--cd=}"; shift ;;
+            --charge-file)
+                [[ -z "${2:-}" ]] && { echo "ERROR: --charge-file requires a file argument" >&2; return 2; }
+                _psf_charge_file="$2"; shift 2 ;;
+            --charge-file=*) _psf_charge_file="${1#--charge-file=}"; shift ;;
             *) _psf_extra+=("$1"); shift ;;
         esac
     done
@@ -508,7 +519,7 @@ _expand_session_args() {
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
-        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [--as-self] [...]" >&2
+        echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [--as-self] [--charge-file <file>] [...]" >&2
         echo >&2
         echo "  Executes the platform binary (claude or codex) directly as the agent." >&2
         echo "  Platform auto-detected from baked profile, then binary heuristic." >&2
@@ -523,9 +534,14 @@ cmd_session() {
         echo "                             a systemd unit with User=agent-<name>, where sudo" >&2
         echo "                             is neither available nor needed). Loud error + exit 7" >&2
         echo "                             on user mismatch. Forces --no-share (ACL auto-share" >&2
-        echo "                             needs sudo, unavailable under --as-self). NOTE:" >&2
-        echo "                             --cd has no effect under --as-self (cwd propagation" >&2
-        echo "                             rides the share path); the session starts in \$HOME." >&2
+        echo "                             needs sudo, unavailable under --as-self). An" >&2
+        echo "                             explicit --cd IS honored (cd needs no sudo); only" >&2
+        echo "                             the ACL auto-share is skipped." >&2
+        echo "  --charge-file <file>       read <file> and append its content as the final" >&2
+        echo "                             positional arg (the platform CLI's initial prompt)." >&2
+        echo "                             Bypasses the alias-expansion transport, which cannot" >&2
+        echo "                             carry multi-line text — THE way to pass a multi-line" >&2
+        echo "                             boot charge (inline multi-line args are rejected)." >&2
         echo >&2
         echo "  Flag grammar:" >&2
         echo "    Single-dash: agentctl alias namespace.  -xyz is a bundle: -x -y -z" >&2
@@ -549,8 +565,23 @@ cmd_session() {
     local no_share=0
     local as_self=0
     local cd_override=""
+    local charge_file=""
     local extra=()
-    _parse_session_flags platform_override no_share as_self cd_override extra -- "$@" || exit $?
+    _parse_session_flags platform_override no_share as_self cd_override charge_file extra -- "$@" || exit $?
+
+    # --charge-file: validate early (before any heavy lifting) so a bad path
+    # fails loudly at launch time, not after platform detection. The CONTENT
+    # is read late (just before exec) and appended directly to the platform
+    # argv — it deliberately NEVER passes through _expand_session_args, whose
+    # one-word-per-line transport cannot carry multi-line text (the guard
+    # there rejects newline args; found live at the 2026-07-25 08:15
+    # rehearsal, where the multi-line boot charge killed every agent launch).
+    if [[ -n "$charge_file" ]]; then
+        if [[ ! -r "$charge_file" ]]; then
+            echo "ERROR: --charge-file '$charge_file' is not readable" >&2
+            exit 1
+        fi
+    fi
 
     # Validate --platform early if provided (before any heavy lifting).
     if [[ -n "$platform_override" ]]; then
@@ -595,7 +626,16 @@ cmd_session() {
     fi
     local cwd_arg=()
     if [[ $no_share -eq 1 ]]; then
-        echo "(--no-share: agent runs from \$HOME; --continue/--resume may not see expected sessions)" >&2
+        # An EXPLICIT --cd is still honored under --no-share/--as-self: cd-ing
+        # needs no sudo and no ACL grant — only the auto-share is skipped.
+        # (Previously --cd was silently ignored here, so --as-self boot
+        # sessions always started in the systemd unit's cwd, i.e. /.)
+        if [[ -n "$cd_override" ]]; then
+            cwd_arg=("$orig_cwd")
+            echo "(--no-share: honoring explicit --cd $orig_cwd; no ACL auto-share)" >&2
+        else
+            echo "(--no-share: agent runs from \$HOME; --continue/--resume may not see expected sessions)" >&2
+        fi
     else
         case "$orig_cwd" in
             "/home/$user"|"/home/$user"/* )
@@ -657,6 +697,23 @@ cmd_session() {
     local binary="${expanded[0]:-$platform}"
     local tail_args=("${expanded[@]:1}")
 
+    # --charge-file content rides OUTSIDE the expansion transport (see the
+    # early validation above): read here, append as the final positional (the
+    # platform CLI's initial prompt), byte-for-byte except trailing newlines
+    # (stripped by command substitution — harmless for a prompt).
+    if [[ -n "$charge_file" ]]; then
+        local charge_content
+        charge_content="$(cat "$charge_file")" || {
+            echo "ERROR: failed to read --charge-file '$charge_file'" >&2
+            exit 1
+        }
+        if [[ -z "$charge_content" ]]; then
+            echo "ERROR: --charge-file '$charge_file' is empty" >&2
+            exit 1
+        fi
+        tail_args+=("$charge_content")
+    fi
+
     # Launch: try direct binary exec first, then ~/.runtime/start.sh fallback.
     # Under --as-self, the invoking shell already IS $user (verified above) —
     # no sudo/user-switch, just `exec` the platform binary in place. Same
@@ -706,6 +763,30 @@ cmd_bash() {
     [[ -z "$name" ]] && { echo "Usage: agentctl bash <agent>" >&2; exit 2; }
     local user; user=$(resolve_user "$name")
     sudo -u "$user" -i
+}
+
+# attach: connect the operator's terminal to the agent's tmux session
+# (boot-time auto-start sessions live in tmux named agent-<name>). The tmux
+# socket is per-user, so the client must run AS the agent user — hence sudo.
+# Detaching (Ctrl-b d, or closing the terminal) leaves the session running;
+# only exiting the CLI inside ends it.
+cmd_attach() {
+    local name="${1:-}"; shift || true
+    [[ -z "$name" ]] && { echo "Usage: agentctl attach <agent> [-r]" >&2; exit 2; }
+    local ro=()
+    if [[ "${1:-}" == "-r" ]]; then ro=(-r); shift; fi
+    [[ $# -gt 0 ]] && { echo "ERROR: unknown extra args: $*" >&2; exit 2; }
+    local user; user=$(resolve_user "$name")
+    local tmux_session="agent-${name}"
+    if ! sudo -u "$user" tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "ERROR: no tmux session '$tmux_session' for $user." >&2
+        echo "       Running sessions: " >&2
+        sudo -u "$user" tmux ls 2>&1 | sed 's/^/         /' >&2 || true
+        echo "       (Boot-time sessions appear after the agent-sessions timer fires," >&2
+        echo "        or start one: sudo systemctl restart agent-session@${name}.service)" >&2
+        exit 1
+    fi
+    exec sudo -u "$user" tmux attach -t "$tmux_session" "${ro[@]}"
 }
 
 
@@ -1688,7 +1769,10 @@ cmd_share_status() {
 }
 
 cmd_help() {
-    sed -n '3,61p' "$0"
+    # Print the usage header (everything between the shebang block and the
+    # ===== divider). Anchored on the divider, not a hardcoded line number —
+    # the old '3,61p' silently truncated the tail whenever the header grew.
+    sed -n '3,/^# =====/p' "$0" | sed '$d'
 }
 
 # ---------- internal verb: __expand-session-args ----------
@@ -1734,17 +1818,18 @@ cmd__as_self_check() {
 # Usage: agentctl __parse-session-flags [args...]
 # Exercises _parse_session_flags directly — no real agent user, no sudo, no
 # resolve_user. Prints the parsed fields as KEY=VALUE lines (PLATFORM,
-# NO_SHARE, AS_SELF, CD), followed by one EXTRA:<value> line per passthrough
-# arg in original order. Used by the test suite to verify --as-self composes
+# NO_SHARE, AS_SELF, CD, CHARGE_FILE), followed by one EXTRA:<value> line per
+# passthrough arg in original order. Used by the test suite to verify --as-self composes
 # with --platform, -c/-d/-r aliases (which land untouched in EXTRA), --cd,
 # and --no-share without altering their parsed values.
 cmd__parse_session_flags() {
-    local platform="" no_share=0 as_self=0 cd="" extra=()
-    _parse_session_flags platform no_share as_self cd extra -- "$@" || exit $?
+    local platform="" no_share=0 as_self=0 cd="" charge_file="" extra=()
+    _parse_session_flags platform no_share as_self cd charge_file extra -- "$@" || exit $?
     printf 'PLATFORM=%s\n' "$platform"
     printf 'NO_SHARE=%s\n' "$no_share"
     printf 'AS_SELF=%s\n' "$as_self"
     printf 'CD=%s\n' "$cd"
+    printf 'CHARGE_FILE=%s\n' "$charge_file"
     for a in "${extra[@]}"; do
         printf 'EXTRA:%s\n' "$a"
     done
@@ -1754,6 +1839,7 @@ case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
     bash)          cmd_bash          "$@" ;;
+    attach)        cmd_attach        "$@" ;;
     spawn)         cmd_spawn         "$@" ;;
     finalize-name) cmd_finalize_name "$@" ;;
     share)         cmd_share         "$@" ;;
