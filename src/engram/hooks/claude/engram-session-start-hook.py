@@ -1630,11 +1630,75 @@ def main() -> None:
             "stale-on-arrival; disregard it. You have a full window to work."
         )
 
-    # ── ENGRAM Calibration block ───────────────────────────────────────────
+    # ══ ORDERING INVARIANT (#1819) ═════════════════════════════════════════
+    # This hook runs under a 5s harness timeout. If it overruns, the process is
+    # KILLED and the ENTIRE additionalContext is lost — there is no partial
+    # delivery and no error surfaced to the agent. Emission order is therefore a
+    # PRIORITY decision, not a cosmetic one.
+    #
+    # Rule: cheap, purely-local, load-bearing blocks are appended FIRST; blocks
+    # that are expensive or depend on runtime state come LAST. A timeout then
+    # costs only the optional tail instead of everything.
+    #
+    # Measured on a real install (2026-07-25):
+    #     focus_block()              0.002s   (19,958 chars — free)
+    #     starred_block()            local DB read
+    #     calibration block          0.61s warm  (~79% of the hook's warm total
+    #                                of 0.81s; dominated by EngramClient()
+    #                                construction, which pulls in the server
+    #                                runtime — whose cold start pre-warms the
+    #                                embedding model and can block for seconds
+    #                                on a cold cache; see #1819)
+    #
+    # Before this change, calibration ran FIRST, so on a cold start it consumed
+    # the whole budget and the 2ms focus list — the "deterministic focus
+    # channel" the identity layer depends on across compaction — was never
+    # reached. Observed on two independent installs at 5018ms and 5016ms
+    # against the 5000ms budget.
+    #
+    # If you add a block here, put it on the correct side of the divider and ask:
+    # "if this hook is killed halfway, does the important part survive?"
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── Focus list surface (cheap: single local DB read) ───────────────────
+    # Render the live focus list verbatim at EVERY session start (startup,
+    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
+    # fresh new session, knowing what's focused is a good thing"), not just
+    # post-compaction. This is the deterministic focus channel's actual
+    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
+    # additionalContext at all (confirmed against CC docs, forum #241); moving
+    # it here is the fix. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _focus = focus_block(ENGRAM_HOME)
+        if _focus:
+            lines.append(_focus)
+    except Exception:
+        pass
+
+    # ── Starred letters surface (cheap: local read) ────────────────────────
+    # Inject starred-letter pointers at both fresh-session (startup) and
+    # post-compaction (compact/resume) so load-bearing cross-session agreements
+    # survive the experiential reset. Pointer-not-injection: one line each,
+    # NOT full content. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _starred = starred_block(ENGRAM_HOME)
+        if _starred:
+            lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── ENGRAM Calibration block (EXPENSIVE — must stay last, see #1819) ───
     # Inject per-type distribution anchors on every SessionStart so fresh-wake
     # context has actual quantile data present (not just semantic labels).
     # Closes the access≠presence gap. Silent skip on any failure —
     # hook must never block session start.
+    #
+    # Deliberately LAST: constructing EngramClient loads the server runtime and
+    # is the hook's dominant cost. Keeping it after the cheap blocks means a
+    # timeout here degrades only calibration, which is an anchor rather than a
+    # continuity guarantee, instead of taking the focus list down with it.
     try:
         _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
         os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
@@ -1658,35 +1722,6 @@ def main() -> None:
             lines.append(_cal_block)
     except Exception:
         # Hook discipline: never surface calibration errors to session start.
-        pass
-
-    # ── Focus list surface ─────────────────────────────────────────────────
-    # Render the live focus list verbatim at EVERY session start (startup,
-    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
-    # fresh new session, knowing what's focused is a good thing"), not just
-    # post-compaction. This is the deterministic focus channel's actual
-    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
-    # additionalContext at all (confirmed against CC docs, forum #241); moving
-    # it here is the fix. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _focus = focus_block(ENGRAM_HOME)
-        if _focus:
-            lines.append(_focus)
-    except Exception:
-        pass
-
-    # ── Starred letters surface ────────────────────────────────────────────
-    # Inject starred-letter pointers at both fresh-session (startup) and
-    # post-compaction (compact/resume) so load-bearing cross-session agreements
-    # survive the experiential reset. Pointer-not-injection: one line each,
-    # NOT full content. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _starred = starred_block(ENGRAM_HOME)
-        if _starred:
-            lines.append(_starred)
-    except Exception:
         pass
 
     # ── Deferred viz-ACL application ──────────────────────────────────────
