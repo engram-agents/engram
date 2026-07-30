@@ -15,10 +15,12 @@ discriminator, no `or True`, no asserts over self-constructed values.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
 AGENTCTL_MAC = Path(__file__).resolve().parent.parent / "tools" / "agentctl-mac"
+AGENTCTL_LINUX = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
 
 
 def _run(*args: str) -> tuple[int, str, str]:
@@ -148,6 +150,28 @@ def test_as_self_and_no_share_compose_with_real_flags():
     assert words == ["claude", "--dangerously-skip-permissions"]
 
 
+# ---------------------------------------------------------------------------
+# --local: third and last flag in tools/agentctl's _parse_session_flags set.
+# Same bug class as --as-self/--no-share (found by a second reviewer-fairy
+# pass, via this repo's sibling-completeness-check convention) -- but the
+# correct behavior here is NOT silent absorption, it's the same deprecated-
+# no-op stderr notice tools/agentctl itself prints (tools/agentctl:303-304).
+# ---------------------------------------------------------------------------
+
+def test_local_absorbed_with_deprecation_notice():
+    rc, out, err = _run("session", "luria", "--local", "--dry-run")
+    assert rc == 0
+    assert out.split() == ["claude"]
+    assert "deprecated" in err.lower()
+
+
+def test_local_composes_with_real_flags():
+    rc, out, err = _run("session", "luria", "--local", "-d", "--dry-run")
+    assert rc == 0
+    assert out.split() == ["claude", "--dangerously-skip-permissions"]
+    assert "deprecated" in err.lower()
+
+
 def test_unrecognized_alias_char_errors_loudly():
     rc, out, err = _run("session", "luria", "-x", "--dry-run")
     assert rc != 0
@@ -236,3 +260,71 @@ def test_dry_run_after_dashdash_is_passthrough_not_intercepted():
     assert "--dry-run" in words
     assert "--resume" in words
     assert "x" in words
+
+
+# ---------------------------------------------------------------------------
+# Completeness derivation: agentctl-mac must recognize every flag
+# tools/agentctl's _parse_session_flags does, not just the ones a fairy
+# happened to test. Three one-flag fixes in a row (#1834 -> #1836 --as-self/
+# --no-share -> #1837 --local) is a pattern, not a coincidence -- each was
+# found by a SEPARATE ad-hoc sweep. This test derives the required set from
+# tools/agentctl's own source instead of hardcoding it, so a 7th upstream
+# flag added later fails CI here rather than silently leaking to the
+# platform binary the way the first three did.
+#
+# Deliberately NOT "reject unknown flags" -- the permissive passthrough is
+# correct and load-bearing (claude/codex have their own flags this script
+# has never heard of, e.g. --resume). The guard is narrower: every flag
+# tools/agentctl's OWN flag namespace recognizes must also be recognized
+# here (in a case-label sense -- absorbed, rejected, or otherwise handled --
+# not necessarily identically), so that namespace can never silently drift
+# out of sync again.
+# ---------------------------------------------------------------------------
+
+_CASE_LABEL_RE = re.compile(r'^\s*((?:--[a-z][a-z-]*(?:=\*)?\|?)+)\)', re.MULTILINE)
+
+
+def _flags_from_case_labels(text: str) -> set[str]:
+    """Extract the base --flag names (no `=*` suffix, `|`-bundles split) from
+    every case-label line in `text`. Excludes the bare `--` separator and the
+    `*)` catch-all (neither is a real flag name)."""
+    flags: set[str] = set()
+    for match in _CASE_LABEL_RE.finditer(text):
+        for alt in match.group(1).split("|"):
+            alt = alt.rstrip("*").rstrip("=")
+            if alt and alt != "--":
+                flags.add(alt)
+    return flags
+
+
+def _parse_session_flags_body() -> str:
+    """Isolate just the _parse_session_flags function body from
+    tools/agentctl -- the ONLY function whose flag namespace agentctl-mac
+    needs to mirror (not the whole file's every case statement, which
+    includes unrelated subcommands like health/share/spawn)."""
+    text = AGENTCTL_LINUX.read_text()
+    start = text.index("_parse_session_flags() {")
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
+def test_agentctl_mac_covers_every_parse_session_flags_flag():
+    upstream_flags = _flags_from_case_labels(_parse_session_flags_body())
+    # Sanity: fail loudly if the extraction itself is broken (e.g. tools/
+    # agentctl's function signature changed shape) rather than silently
+    # passing on an empty set.
+    assert upstream_flags == {
+        "--platform", "--local", "--no-share", "--as-self", "--cd", "--charge-file",
+    }, f"extraction found an unexpected flag set: {upstream_flags!r}"
+
+    mac_text = AGENTCTL_MAC.read_text()
+    mac_flags = _flags_from_case_labels(mac_text)
+    missing = upstream_flags - mac_flags
+    assert not missing, (
+        f"tools/agentctl-mac does not recognize {missing!r} from tools/agentctl's "
+        "_parse_session_flags -- it will fall through to the passthrough default "
+        "and leak verbatim to the platform binary, the exact bug class fixed in "
+        "#1836/#1837. Add a case for it in tools/agentctl-mac (absorb, reject, or "
+        "otherwise handle -- doesn't have to match tools/agentctl's own behavior "
+        "exactly, just must not silently fall through)."
+    )

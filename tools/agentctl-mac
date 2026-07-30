@@ -67,12 +67,16 @@
 #                  binary verbatim
 #
 # NOT supported here (all Linux-multi-agent-host concepts with no Mac
-# equivalent in this script's scope): --as-self, --no-share are recognized
-# and silently absorbed (true no-ops — this script never does anything
-# they'd need to suppress, and never forwards them to the platform binary,
-# which would otherwise reject them as unknown flags). --charge-file errors
-# loudly instead — boot-charge is a systemd-unit concept; pass the content
-# via the platform binary's own flags after `--` if you need it.
+# equivalent in this script's scope): --as-self, --no-share, --local are all
+# recognized so none of them silently leak to the platform binary (which
+# would reject them as unknown flags) -- but they're handled two different
+# ways. --as-self/--no-share are true no-ops (this script never does
+# anything they'd need to suppress). --local prints the same deprecated-no-op
+# notice as tools/agentctl (sessions are always direct on both scripts now;
+# the flag is a historical carry-over, not silently swallowed). --charge-file
+# is the one exception that errors loudly instead of absorbing — boot-charge
+# is a systemd-unit concept; pass the content via the platform binary's own
+# flags after `--` if you need it.
 # =============================================================================
 
 set -eo pipefail
@@ -156,6 +160,16 @@ while [[ $# -gt 0 ]]; do
             # to the platform binary, which would reject them as unknown
             # flags -- the opposite of "harmless no-op" (found by reviewer-
             # fairy review on #1834, fixed here rather than left undocumented).
+            shift ;;
+        --local)
+            # Third and last flag in tools/agentctl's _parse_session_flags
+            # set (--platform/--local/--no-share/--as-self/--cd/--charge-file
+            # -- this script now handles all six). Same deprecated-no-op
+            # notice as the Linux tool, not silent absorption -- matches
+            # tools/agentctl:303-304 exactly. Found missing by a second
+            # reviewer-fairy pass (on the --as-self/--no-share fix itself),
+            # via this repo's own sibling-completeness-check convention.
+            echo "(--local is deprecated: sessions are always direct now)" >&2
             shift ;;
         --platform)
             [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
