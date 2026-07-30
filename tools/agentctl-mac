@@ -67,10 +67,12 @@
 #                  binary verbatim
 #
 # NOT supported here (all Linux-multi-agent-host concepts with no Mac
-# equivalent in this script's scope): --as-self, --no-share (harmless no-ops
-# — this script never does anything they'd need to suppress), --charge-file
-# (errors loudly — boot-charge is a systemd-unit concept; pass the content
-# via the platform binary's own flags after `--` if you need it).
+# equivalent in this script's scope): --as-self, --no-share are recognized
+# and silently absorbed (true no-ops — this script never does anything
+# they'd need to suppress, and never forwards them to the platform binary,
+# which would otherwise reject them as unknown flags). --charge-file errors
+# loudly instead — boot-charge is a systemd-unit concept; pass the content
+# via the platform binary's own flags after `--` if you need it.
 # =============================================================================
 
 set -eo pipefail
@@ -146,6 +148,14 @@ while [[ $# -gt 0 ]]; do
             shift ;;
         --dry-run)
             DRY_RUN=1
+            shift ;;
+        --as-self|--no-share)
+            # Recognized and silently absorbed -- true no-ops on a
+            # single-agent Mac (see header). Without this case they'd fall
+            # through to the default branch below and get forwarded verbatim
+            # to the platform binary, which would reject them as unknown
+            # flags -- the opposite of "harmless no-op" (found by reviewer-
+            # fairy review on #1834, fixed here rather than left undocumented).
             shift ;;
         --platform)
             [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }

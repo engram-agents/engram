@@ -121,6 +121,33 @@ def test_codex_r_errors_nonzero():
     assert "remote control" in err.lower()
 
 
+# ---------------------------------------------------------------------------
+# --as-self / --no-share: must be true no-ops, never forwarded to the
+# platform binary (regression test for a real bug found by reviewer-fairy
+# review on #1834 -- these previously fell through to the passthrough
+# default and ended up verbatim in the expanded command, which the real
+# claude/codex binary would then reject as an unknown flag).
+# ---------------------------------------------------------------------------
+
+def test_as_self_is_absorbed_not_forwarded():
+    rc, out, _ = _run("session", "luria", "--as-self", "--dry-run")
+    assert rc == 0
+    assert out.split() == ["claude"]
+
+
+def test_no_share_is_absorbed_not_forwarded():
+    rc, out, _ = _run("session", "luria", "--no-share", "--dry-run")
+    assert rc == 0
+    assert out.split() == ["claude"]
+
+
+def test_as_self_and_no_share_compose_with_real_flags():
+    rc, out, _ = _run("session", "luria", "--as-self", "-d", "--no-share", "--dry-run")
+    assert rc == 0
+    words = out.split()
+    assert words == ["claude", "--dangerously-skip-permissions"]
+
+
 def test_unrecognized_alias_char_errors_loudly():
     rc, out, err = _run("session", "luria", "-x", "--dry-run")
     assert rc != 0
