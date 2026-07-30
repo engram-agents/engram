@@ -11,13 +11,13 @@
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-session-start-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-session-start-hook.py\"",
             "timeout": 5,
             "statusMessage": "Resetting ENGRAM prompt counter..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-pull-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-pull-hook.py\"",
             "timeout": 20,
             "statusMessage": "Checking watched repos for stale trees..."
           }
@@ -29,49 +29,49 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-time-bar-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-time-bar-hook.py\"",
             "timeout": 3,
             "statusMessage": "Stamping ambient time..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-user-identity-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-user-identity-hook.py\"",
             "timeout": 3,
             "statusMessage": "Detecting user identity..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-surface-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-surface-hook.py\"",
             "timeout": 10,
             "statusMessage": "Searching ENGRAM..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-deference-detector-prompt.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-deference-detector-prompt.py\"",
             "timeout": 3,
             "statusMessage": "Surfacing deference markers..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-end-of-day-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-end-of-day-hook.py\"",
             "timeout": 3,
             "statusMessage": "Checking for end-of-day signals..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-inter-agent-prompt-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-inter-agent-prompt-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking for inter-agent letters..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-baton-prompt-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-baton-prompt-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking baton turn-state..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-forum-prompt-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-forum-prompt-hook.py\"",
             "timeout": 5,
             "statusMessage": "Checking forum..."
           }
@@ -84,7 +84,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
             "timeout": 5
           }
         ]
@@ -94,7 +94,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-toolcall-repair.py\"",
             "timeout": 5
           }
         ]
@@ -104,12 +104,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-bash-pipe-exit-warn.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-bash-pipe-exit-warn.py\"",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
             "timeout": 3
           }
         ]
@@ -119,7 +119,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-lesson-tripwire-hook.py\"",
             "timeout": 3
           }
         ]
@@ -129,7 +129,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-warn-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stale-tree-warn-hook.py\"",
             "timeout": 3
           }
         ]
@@ -140,7 +140,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-postcompact-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-postcompact-hook.py\"",
             "timeout": 5,
             "statusMessage": "Resetting ENGRAM prompt counter..."
           }
@@ -152,19 +152,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stop-hook.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-stop-hook.py\"",
             "timeout": 5,
             "statusMessage": "Flagging ENGRAM write check..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-deference-detector-stop.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-deference-detector-stop.py\"",
             "timeout": 5,
             "statusMessage": "Detecting deference patterns..."
           },
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-utility-credit-mention-stop.py\"",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-utility-credit-mention-stop.py\"",
             "timeout": 5,
             "statusMessage": "Crediting mentioned nodes..."
           }
