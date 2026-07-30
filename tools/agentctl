@@ -12,6 +12,13 @@
 # Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
 #   spawn    finalize-name
 #
+# macOS: this tool assumes a multi-agent Linux host (per-agent "agent-<name>"
+# users, sudo user-switch, ACL sharing) and does not run there. For a Mac
+# host running exactly one agent, see the sibling tools/agentctl-mac — a
+# lightweight `session`-only wrapper that reuses this script's tested
+# alias-expansion/platform-detection verbs (__expand-session-args,
+# __detect-platform-as-self) without any of the multi-user machinery.
+#
 # Usage:
 #   agentctl health                      # health table for all agents
 #   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>]
@@ -511,7 +518,15 @@ _expand_session_args() {
     else
         printf '%s\n' "$base_cmd"
     fi
-    for a in "${extra_args[@]}"; do
+    # ${arr[@]+"${arr[@]}"} rather than a bare "${extra_args[@]}": under
+    # `set -u`, bash versions before 4.4 treat an EMPTY array as an unset
+    # variable and raise "unbound variable" here (e.g. `session <agent>`
+    # with no -c/-d/-r aliases at all -- extra_args stays empty). This
+    # never surfaces on the bash 5.x this tool normally runs under, but does
+    # on macOS's frozen bash 3.2 (tools/agentctl-mac invokes this verb
+    # directly) -- the guarded form is a no-op on newer bash and portable
+    # everywhere.
+    for a in "${extra_args[@]+"${extra_args[@]}"}"; do
         printf '%s\n' "$a"
     done
 }
@@ -1835,6 +1850,19 @@ cmd__parse_session_flags() {
     done
 }
 
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __detect-platform-as-self [<override>]
+# Exercises _session_platform's no-sudo (as_self=1) branch directly, with no
+# user arg needed (unused on that branch — see _session_platform's own
+# comment). No real agent user, no sudo. This is the exact seam
+# tools/agentctl-mac (the macOS sibling — single-agent-per-machine, no Linux
+# user to switch to, so it always runs "as self") reuses instead of
+# duplicating the baked-profile/binary-heuristic ladder.
+cmd__detect_platform_as_self() {
+    local override="${1:-}"
+    _session_platform "$override" "" 1
+}
+
 case "$SUBCMD" in
     health)        cmd_health        "$@" ;;
     session)       cmd_session       "$@" ;;
@@ -1850,5 +1878,6 @@ case "$SUBCMD" in
     __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
     __as-self-check) cmd__as_self_check "$@" ;;
     __parse-session-flags) cmd__parse_session_flags "$@" ;;
+    __detect-platform-as-self) cmd__detect_platform_as_self "$@" ;;
     *) echo "Unknown subcommand: $SUBCMD"; cmd_help; exit 2 ;;
 esac

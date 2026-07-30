@@ -594,3 +594,47 @@ def test_charge_file_default_is_empty():
     rc, lines, _ = _parse_session_flags("--as-self")
     assert rc == 0
     assert "CHARGE_FILE=" in lines, f"expected empty CHARGE_FILE default; got: {lines!r}"
+
+
+# ---------------------------------------------------------------------------
+# __detect-platform-as-self: no-sudo platform-detection seam
+#
+# tools/agentctl-mac (the macOS sibling) reuses this verb instead of
+# duplicating the baked-profile/binary-heuristic ladder. It exercises
+# _session_platform's as_self=1 branch directly -- no sudo, no real agent
+# user (the `user` param is unused on that branch).
+# ---------------------------------------------------------------------------
+
+def _detect_platform_as_self(*args: str) -> tuple[int, list[str], str]:
+    proc = subprocess.run(
+        ["bash", str(AGENTCTL), "__detect-platform-as-self", *args],
+        capture_output=True,
+        text=True,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l]
+    return proc.returncode, lines, proc.stderr
+
+
+def test_detect_platform_explicit_override_wins():
+    rc, lines, _ = _detect_platform_as_self("codex")
+    assert rc == 0
+    assert lines == ["codex"]
+
+
+def test_detect_platform_invalid_override_errors():
+    rc, lines, stderr = _detect_platform_as_self("gemini")
+    assert rc != 0, f"expected nonzero exit for invalid override, got rc={rc}"
+    assert not lines, f"expected no stdout on error path, got: {lines}"
+    assert "claude or codex" in stderr.lower(), f"got stderr: {stderr!r}"
+
+
+def test_detect_platform_no_override_falls_back_to_default_or_heuristic():
+    """With no override and (in this test environment) no baked profile at a
+    bogus HOME, the ladder falls through to the binary heuristic / default.
+    We don't assert a specific value (depends on what's on PATH in CI vs a
+    real agent host) -- only that it's one of the two valid platforms and
+    the call succeeds without sudo.
+    """
+    rc, lines, _ = _detect_platform_as_self()
+    assert rc == 0
+    assert lines and lines[0] in ("claude", "codex"), f"got: {lines!r}"

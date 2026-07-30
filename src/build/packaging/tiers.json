@@ -699,6 +699,10 @@
       "reason": "an operator's day-to-day admin CLI for co-located AI agents; operator tool that lives at ~/.local/bin/agentctl, not part of ENGRAM plugin"
     },
     {
+      "path": "tools/agentctl-mac",
+      "reason": "lightweight macOS sibling of tools/agentctl's session subcommand for a single-agent Mac host; operator tool that lives at ~/.local/bin/agentctl-mac, not part of ENGRAM plugin"
+    },
+    {
       "path": "tools/borges_session_eval.py",
       "reason": "Borges-persona-specific session quality evaluator; references Borges-specific ENGRAM observation IDs and rubric scaffolding, not generic ENGRAM tooling"
     },
