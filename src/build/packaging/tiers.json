@@ -438,6 +438,10 @@
       "tier": "essential"
     },
     {
+      "path": "hooks/claude/_stophooklib.py",
+      "tier": "essential"
+    },
+    {
       "path": "hooks/claude/context_tracker.py",
       "tier": "essential"
     },

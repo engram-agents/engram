@@ -47,6 +47,21 @@
       "note": "#1203 round-2 SSoT extraction: stale_tree_watch config-read shared by engram-stale-tree-pull-hook.py (Layer 1) and engram-stale-tree-warn-hook.py (Layer 2), same _hooklib.py/_prompthooklib.py precedent above. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement at the file's own top level in a form the layer-1 AST graph can trace back to a test), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_stophooklib.py",
+      "test_globs": [
+        "tests/test_stophooklib.py",
+        "tests/test_stop_hook_maturity_gate.py",
+        "tests/test_stop_hook_idle_suppression.py",
+        "tests/test_stop_hook_prose_gate.py",
+        "tests/test_deference_detector_scope_gate.py",
+        "tests/test_deference_detector_prompt.py",
+        "tests/test_deference_detector_cooldown.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-A: SSoT for the transcript-delta idiom shared by engram-stop-hook.py and engram-deference-detector-stop.py (byte-offset state, delta read, per-line JSONL parse with any_record_parsed sentinel, message.content block walk, transcript-path session-marker fallback, plus new Stop-side emit_context). Each hook dynamically imports it via a runtime sys.path insert (not a static top-level `import` statement in a form the layer-1 AST graph can trace back to a test), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py/_prompthooklib.py/_stale_tree_hooklib.py precedent above."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",

@@ -40,6 +40,19 @@ can compute true per-fire rates rather than absolute counts.
 
 Best-effort: any failure swallows silently. Behavioral hooks must never
 block the session.
+
+_stophooklib extraction (PR-A, 2026-07-31-loop-arm-nudge-SPEC.md)
+-------------------------------------------------------------------
+`_last_assistant_structure`'s transcript-path resolution (candidate path,
+else session-marker fallback) and its list-branch block iteration now
+delegate to hooks/claude/_stophooklib.py -- shared with
+engram-stop-hook.py. Pure refactor: this hook's own string-branch dispatch
+(the isinstance(last_msg_content, str) case) is left untouched inline
+rather than routed through the shared walker, to avoid a subtle divergence
+on an empty-string content edge case (see the inline comment at that
+branch). If _stophooklib somehow fails to import, this hook degrades to a
+silent no-op (matches the established _prompthooklib precedent on the
+UserPromptSubmit side).
 """
 
 import json
@@ -55,6 +68,18 @@ ENGRAM_HOME = (
     or str(Path.home() / ".engram")
 )
 SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
+
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _stophooklib import (
+        resolve_transcript_path as _resolve_transcript_path,
+        walk_content_blocks as _walk_content_blocks,
+    )
+    _STOPHOOKLIB_OK = True
+except Exception:
+    _STOPHOOKLIB_OK = False
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "deference-detector.log")
@@ -151,17 +176,13 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
       2. Per-session marker `~/.engram/sessions/<session_id>.json` by
          session_id from stdin — same race-free guarantee.
     """
-    jsonl = jsonl_path if (jsonl_path and os.path.exists(jsonl_path)) else None
-    if jsonl is None and session_id:
-        marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
-        try:
-            with open(marker_path) as f:
-                marker = json.load(f)
-            jsonl = marker.get("transcript_path")
-            if not jsonl or not os.path.exists(jsonl):
-                return None
-        except (OSError, ValueError, json.JSONDecodeError):
-            return None
+    if not _STOPHOOKLIB_OK:
+        # Lib unavailable — this fallback path can't resolve a transcript;
+        # degrade to "no structure available" (matches every other
+        # unresolvable-jsonl branch below). The stdin-primary path in
+        # main() does not depend on this function at all.
+        return None
+    jsonl = _resolve_transcript_path(jsonl_path, session_id, SESSIONS_DIR)
     if jsonl is None:
         return None
 
@@ -188,6 +209,12 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
 
     # Normalize: a content payload is either a bare string or a list of
     # blocks (each block is a dict with `type`).
+    #
+    # The string branch is deliberately NOT routed through the shared
+    # _stophooklib.walk_content_blocks() — that generic walker yields
+    # nothing for a FALSY string (including ""), which would make
+    # final_text_block None here instead of "" for an empty-string content
+    # payload. Kept inline to preserve that edge case exactly.
     if isinstance(last_msg_content, str):
         joined = last_msg_content
         final_text_block = last_msg_content
@@ -197,9 +224,7 @@ def _last_assistant_structure(jsonl_path: str | None = None, session_id: str | N
         had_tool_use = False
         last_text_seen: str | None = None
         last_block_was_text = False
-        for block in last_msg_content:
-            if not isinstance(block, dict):
-                continue
+        for block in _walk_content_blocks(last_msg_content):
             btype = block.get("type")
             if btype == "text":
                 t = block.get("text") or ""
