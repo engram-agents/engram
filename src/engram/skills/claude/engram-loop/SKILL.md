@@ -150,7 +150,7 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 cat > ~/.engram/loop-mode.json <<JSON
 {
-  "FIRST_ACTION": "RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. (3) CronList again and confirm the armed prompt starts with a LITERAL <loop-wake>, not an escaped &lt;loop-wake&gt; — an escaped marker makes the wake self-stamp as user activity and the loop defers perpetually. Only then continue.",
+  "FIRST_ACTION": "RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. (3) CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue. Only then continue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kind": "work|research|autonomous",
   "topic": "<one-line loop topic>",
