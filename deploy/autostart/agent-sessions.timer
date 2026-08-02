@@ -1,28 +1,35 @@
-# agent-sessions.timer — daily 09:30 America/New_York trigger for boot-time
+# agent-sessions.timer — daily 08:15 America/New_York trigger for boot-time
 # agent sessions. Triggers agent-sessions.target, which in turn Wants= each
 # per-agent agent-session@<name>.service instance (staggered via per-instance
 # drop-ins — see deploy/autostart/README.md).
 #
 # The host itself auto-boots at 8:00 America/New_York (world/forum/gateway
 # servers come up then, out of scope here). Agent SESSIONS deliberately wait
-# for this separate 09:30 timer rather than starting at boot.
+# for this separate timer rather than starting at boot.
+#
+# 08:15, not 08:00 sharp (Lei's 2026-08-02 NYC-timezone request was "around
+# 8"): the host's own auto-boot is AT 8:00, and with Persistent=false a
+# wall-clock moment that passes while the host is still booting is simply
+# missed — no sessions all day. The 15-minute margin guarantees the timer
+# unit is active well before its moment fires, and the world/forum/gateway
+# servers are up before any agent session tries to log in.
 
 [Unit]
-Description=Daily 09:30 America/New_York trigger for boot-time agent sessions
+Description=Daily 08:15 America/New_York trigger for boot-time agent sessions
 
 [Timer]
 # Without an explicit Unit=, a timer triggers a SAME-NAMED .service (which
 # does not exist here) — found live at first start, 2026-07-22 rehearsal arming.
 Unit=agent-sessions.target
-OnCalendar=*-*-* 09:30:00 America/New_York
+OnCalendar=*-*-* 08:15:00 America/New_York
 
 # Persistent=false — DELIBERATE, not the safer-looking default. A
 # Persistent=true timer fires IMMEDIATELY on the next boot/timer-activation
 # if the previous scheduled run was missed (e.g. the host was down at
-# 09:30). That is exactly wrong here: if the host boots late — say 13:00 —
+# 08:15). That is exactly wrong here: if the host boots late — say 13:00 —
 # a Persistent=true timer would surprise-start every agent session hours
 # into the day, with no operator awareness that it's about to happen and no
-# relation to the 09:30 morning-start intent. Missing a day's auto-start
+# relation to the 08:15 morning-start intent. Missing a day's auto-start
 # entirely is the SAFE failure mode (the operator starts sessions manually
 # via `agentctl session <agent>` whenever they notice); a silent, hours-late
 # catch-up firing is not safe — it's a stagger-less mass-start at an
