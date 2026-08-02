@@ -492,6 +492,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-loop-arm-stop-hook.py",
+      "tier": "convenience"
+    },
+    {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
       "tier": "convenience"
     },

@@ -167,6 +167,12 @@
             "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-utility-credit-mention-stop.py\"",
             "timeout": 5,
             "statusMessage": "Crediting mentioned nodes..."
+          },
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-loop-arm-stop-hook.py\"",
+            "timeout": 5,
+            "statusMessage": "Checking loop-arm confirmation..."
           }
         ]
       }
