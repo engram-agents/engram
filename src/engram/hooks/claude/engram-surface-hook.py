@@ -94,6 +94,14 @@ PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
+if HOOK_DIR not in sys.path:
+    sys.path.insert(0, HOOK_DIR)
+try:
+    from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
+    _HOOKLIB_OK = True
+except Exception:
+    _HOOKLIB_OK = False
+
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
@@ -122,6 +130,25 @@ def _check_db_liveness(db_path: str) -> tuple[bool, str]:
                 pass
 
 
+def _is_any_server_py_running() -> bool:
+    """Return True if THIS agent's own server.py process is running (pgrep
+    secondary check) -- scoped, not a bare "server.py" substring match.
+
+    Used by _check_mcp_write_tool_marker to distinguish a truly dead server
+    from a post-restart race where the marker PID is stale but the server is
+    alive. Delegates to the shared, path-scoped _hooklib.is_own_server_py_running
+    (see its docstring for the unscoped-pgrep regression this replaced --
+    PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
+    matches every agent's own server process on a shared multi-agent host,
+    permanently reporting healthy. Best-effort: returns False on any error,
+    including a failed _hooklib import, so the caller degrades to the
+    conservative (unhealthy) path rather than a false positive.
+    """
+    if not _HOOKLIB_OK:
+        return False
+    return _is_own_server_py_running_impl(ENGRAM_HOME)
+
+
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     """Check whether the MCP server wrote its initialization-complete marker.
 
@@ -129,9 +156,29 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     race: the new server's PID hasn't replaced the old PID in the marker yet
     at SessionStart time. By the first user prompt the race window is long past.
 
+    Two-signal check on a dead marker PID: a dead PID alone does not mean the
+    server is down — a duplicate server launch (e.g. two sessions racing at
+    startup) can write a fresh marker with its own PID and then die shortly
+    after, leaving the marker pointing at a dead PID while an older server
+    instance keeps serving under a different PID the marker no longer names.
+    So a dead marker PID triggers a secondary pgrep-based check
+    (_is_any_server_py_running): if any server.py process is found, the
+    marker is treated as merely stale (not evidence of a dead server) and the
+    probe returns healthy. Only when both signals agree the server is gone
+    does the probe return the stale-marker failure.
+
+    Known ceiling: the marker attests "init complete + about to serve," not
+    "serving." A hang inside mcp.run()'s serve-setup would still false-confirm.
+
     Returns (True, None) if marker exists and its PID is still running, or on
     any unexpected error (advisory probe — never block).
-    Returns (False, reason) if marker absent or its PID is no longer running.
+    Returns (True, note) if a dead marker PID is offset by a live server.py
+    found via the secondary check -- healthy, but NOT silent: per
+    PR #1839's colleague review, a suppressed condition must still surface
+    somewhere or the next duplicate-launch incident goes unnoticed the way
+    #1772 almost did. The caller renders this as informational, not alarming.
+    Returns (False, reason) if marker absent, or its PID is no longer running
+    AND no other server.py process is found.
     """
     import errno as _errno
     try:
@@ -149,6 +196,17 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
         except OSError as e:
             if e.errno == _errno.EPERM:
                 return True, None  # process exists, no permission to signal — ok
+            # Marker PID is dead — server may have restarted and not yet refreshed
+            # the marker (race between restart and this hook). Secondary check: is
+            # any server.py actually running right now?
+            if _is_any_server_py_running():
+                # A live server.py found — stale marker, not a dead server.
+                # Return healthy WITH a note; server will refresh the marker
+                # on its next startup write (or already has — hook just
+                # caught the window). Non-silent so a genuine duplicate-launch
+                # incident (the reason this secondary check exists) still
+                # surfaces instead of being permanently absorbed.
+                return True, f"marker stale (PID {pid} no longer running); live server found"
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block
@@ -2496,6 +2554,15 @@ def main():
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
             f"  → ENGRAM write calls will fail silently. Recovery: restart the MCP server."
+        )
+    elif write_reason:
+        # Healthy, but not silent: the secondary pgrep check offset a dead
+        # marker PID (a genuine duplicate-launch signal, not noise) — per
+        # PR #1839's colleague review: a suppressed condition must
+        # still surface informationally or the next real incident goes
+        # unnoticed the way #1772 almost did.
+        parts.append(
+            f"ℹ️  ENGRAM substrate health: MCP write-tool liveness OK ({write_reason})."
         )
 
     # DB liveness check — detects when the surface daemon serves stale

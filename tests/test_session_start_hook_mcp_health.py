@@ -300,7 +300,10 @@ def test_marker_with_dead_pid_but_server_alive_returns_true(tmp_path, monkeypatc
 
     write_ok, write_reason = mod._check_mcp_write_tool_marker(str(engram_home))
     assert write_ok is True  # server alive, marker just stale from restart race
-    assert write_reason is None
+    # Not silent: informational note, per PR #1839's colleague
+    # review -- a suppressed condition must still surface somewhere.
+    assert write_reason is not None
+    assert "stale" in write_reason
 
 
 def test_codex_platform_defers_write_tool_marker_check(tmp_path, monkeypatch):

@@ -60,6 +60,12 @@ ENGRAM_HOME = (
     or os.path.expanduser("~/.engram")
 )
 
+try:
+    from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
+    _HOOKLIB_OK = True
+except Exception:
+    _HOOKLIB_OK = False
+
 
 def _resolve_runtime_dir(engram_home: str) -> str:
     """Locate directory containing engram_client.py for stats import.
@@ -216,19 +222,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
 
 def _is_any_server_py_running() -> bool:
-    """Return True if any server.py process is running (pgrep secondary check).
+    """Return True if THIS agent's own server.py process is running (pgrep
+    secondary check) -- scoped, not a bare "server.py" substring match.
 
     Used by _check_mcp_write_tool_marker to distinguish a truly dead server
     from a post-restart race where the marker PID is stale but the server is
-    alive.  Best-effort: returns False on any error so the caller degrades to
-    the conservative (unhealthy) path rather than a false positive.
+    alive. Delegates to the shared, path-scoped _hooklib.is_own_server_py_running
+    (see its docstring for the unscoped-pgrep regression this replaced --
+    PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
+    matches every agent's own server process on a shared multi-agent host,
+    permanently reporting healthy. Best-effort: returns False on any error,
+    including a failed _hooklib import, so the caller degrades to the
+    conservative (unhealthy) path rather than a false positive.
     """
-    import subprocess as _sp
-    try:
-        r = _sp.run(["pgrep", "-f", "server.py"], capture_output=True, timeout=2)
-        return r.returncode == 0
-    except Exception:
+    if not _HOOKLIB_OK:
         return False
+    return _is_own_server_py_running_impl(ENGRAM_HOME)
 
 
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
@@ -249,7 +258,13 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     Returns:
         (True, None) if marker exists and its PID is still running, or if
                      the probe is deferred on this platform, or on any error.
-        (False, reason) if marker is absent or its PID is no longer running.
+        (True, note) if a dead marker PID is offset by a live server.py found
+                     via the secondary check -- healthy, but not silent (see
+                     _check_mcp_write_tool_marker's sibling in
+                     engram-surface-hook.py, the version actually called at
+                     runtime, for why: PR #1839's colleague review).
+        (False, reason) if marker is absent or its PID is no longer running
+                     AND no other server.py process is found.
     """
     if not _startup_mcp_health_probe_allowed():
         return True, None
@@ -274,9 +289,8 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             # any server.py actually running right now?
             if _is_any_server_py_running():
                 # A live server.py found — stale marker, not a dead server.
-                # Return healthy; server will refresh the marker on its next
-                # startup write (or already has — hook just caught the window).
-                return True, None
+                # Return healthy WITH a note (not silent — see docstring).
+                return True, f"marker stale (PID {pid} no longer running); live server found"
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block session start
