@@ -152,7 +152,7 @@ cat > ~/.engram/loop-mode.json <<JSON
 {
   "FIRST_ACTION": "RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. (3) CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue. Only then continue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "kind": "work|research|autonomous",
+  "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
   "instructions": "<what to do each iteration — the loop's standing brief>",
   "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
@@ -173,6 +173,9 @@ JSON
   `state` first starts working, and the arm degrades into something to
   remember. The text is fixed; copy it verbatim.
 - `kind` — informational; the drowsiness hook only checks the marker's existence.
+  `"heartbeat"` is the standard token for the quiet on-call cache-warm loop the
+  boot charge enters (grep target for reachability audits — write exactly this
+  value for that case, per the 2026-08-02 fleet-silence follow-up).
 - `topic` / `instructions` — the standing brief, written once at start.
 - `state` — the live handoff, **rewritten each iteration** (Step 2.3) so the
   marker always reflects where the loop is. This is what a post-compaction self
