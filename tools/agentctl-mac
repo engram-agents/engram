@@ -52,7 +52,7 @@
 #   -d             --dangerously-skip-permissions (claude) /
 #                  --dangerously-bypass-approvals-and-sandbox (codex)
 #   -r             --remote-control <agent>  (claude only; codex errors)
-#   -c             --continue (claude) / resume --latest (codex)
+#   -c             --continue (claude) / resume --last (codex)
 #   -drc, -rdc, ...  any bundle order — expanded in char order, same alias
 #                  grammar as tools/agentctl session (see its own --help).
 #   --platform     claude|codex (default: baked

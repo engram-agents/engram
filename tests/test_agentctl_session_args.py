@@ -85,21 +85,21 @@ def test_codex_d_expands_to_bypass_approvals():
 
 
 def test_codex_c_subcommand_transform():
-    """codex -c must transform the base command to 'codex resume --latest'."""
+    """codex -c must transform the base command to 'codex resume --last'."""
     rc, lines, _ = _run("codex", "borges", "-c")
     assert rc == 0
     # First three words must be the subcommand transform.
     assert lines[0] == "codex"
     assert lines[1] == "resume"
-    assert lines[2] == "--latest"
+    assert lines[2] == "--last"
 
 
 def test_codex_c_d_combined_has_both_resume_and_bypass():
-    """codex -c -d must produce resume --latest AND the bypass flag."""
+    """codex -c -d must produce resume --last AND the bypass flag."""
     rc, lines, _ = _run("codex", "borges", "-c", "-d")
     assert rc == 0
     assert "resume" in lines
-    assert "--latest" in lines
+    assert "--last" in lines
     assert "--dangerously-bypass-approvals-and-sandbox" in lines
 
 
@@ -155,7 +155,7 @@ def test_codex_c_c_dedupe_single_resume_transform():
     rc, lines, _ = _run("codex", "borges", "-c", "-c")
     assert rc == 0
     assert lines.count("resume") == 1
-    assert lines.count("--latest") == 1
+    assert lines.count("--last") == 1
 
 
 # ---------------------------------------------------------------------------

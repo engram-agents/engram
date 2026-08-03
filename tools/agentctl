@@ -354,7 +354,7 @@ _parse_session_flags() {
 #
 # Expansion rules (single-char aliases):
 #   -c  claude → append --continue                         (deduped)
-#       codex  → base command becomes "codex resume --latest" (deduped)
+#       codex  → base command becomes "codex resume --last" (deduped)
 #   -d  claude → --dangerously-skip-permissions            (deduped)
 #       codex  → --dangerously-bypass-approvals-and-sandbox (deduped)
 #   -r  claude → --remote-control <agent_name>  (two words, deduped)
@@ -514,7 +514,7 @@ _expand_session_args() {
     if [[ "$platform" == "codex" && $use_resume -eq 1 ]]; then
         printf '%s\n' "codex"
         printf '%s\n' "resume"
-        printf '%s\n' "--latest"
+        printf '%s\n' "--last"
     else
         printf '%s\n' "$base_cmd"
     fi
@@ -568,7 +568,7 @@ cmd_session() {
         echo >&2
         echo "  Recognized single-char aliases:" >&2
         echo "    -c   claude: --continue" >&2
-        echo "         codex:  subcommand becomes 'codex resume --latest'" >&2
+        echo "         codex:  subcommand becomes 'codex resume --last'" >&2
         echo "    -d   claude: --dangerously-skip-permissions" >&2
         echo "         codex:  --dangerously-bypass-approvals-and-sandbox" >&2
         echo "    -r   claude: --remote-control <agent>" >&2
