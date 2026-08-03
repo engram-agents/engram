@@ -1,0 +1,145 @@
+name: anti-dup-retro-check
+
+# Issue #1439 — retroactive duplicate-PR gate, fires when a PR merges.
+# Problem: anti-dup-check.yml fires at open/push time and correctly warns
+# when two PRs race on the same issue. But if PR A merges (auto-closing #N),
+# PR B's gate result stays GREEN — no new push occurred, so the gate never
+# re-fires. PR B silently becomes a duplicate.
+#
+# This workflow closes that window: on every merge to dev/main it scans
+# all remaining open PRs for closing-keyword references to any issue that
+# the merged PR just closed, then posts a failing check-run and a comment
+# on each orphaned PR.
+#
+# Informational + retroactive — always exits 0 so it does not fail the
+# triggering (just-merged) PR.
+#
+# Companion to anti-dup-check.yml (v1 / open-time gate). Same body-grep
+# approach: GitHub's closingIssuesReferences GraphQL field is dormant on
+# stacked/non-default-base PRs, so body-text matching is the reliable signal.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [dev, main]
+
+jobs:
+  anti-dup-retro:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      pull-requests: write
+      checks: write
+    steps:
+      - name: Identify orphaned PRs and post failing gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGED_PR: ${{ github.event.pull_request.number }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Strip inline-code spans before grepping — GitHub's auto-close parser
+          # ignores keywords inside backticks (verified #1191), and CLAUDE.md
+          # recommends backticking close-keyword examples to avoid parser trips.
+          # Same stripping logic as anti-dup-check.yml (v1).
+          BODY_STRIPPED=$(printf '%s' "$PR_BODY" | sed 's/`[^`]*`//g')
+
+          # Extract issue numbers referenced with a closing keyword in the body.
+          CLOSING_NS=$(printf '%s' "$BODY_STRIPPED" \
+            | grep -ioE '(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | sort -u)
+
+          if [ -z "$CLOSING_NS" ]; then
+            echo "Merged PR #$MERGED_PR has no closing-keyword issue references. Nothing to do."
+            exit 0
+          fi
+
+          echo "Merged PR #$MERGED_PR closes issue(s): $(printf '#%s ' $CLOSING_NS)"
+
+          # Fetch all open PRs in one call to avoid repeated API round-trips.
+          # headRefOid is needed to target the check-run at the correct commit SHA.
+          OPEN_PRS_JSON=$(gh pr list --repo "$REPO" --state open \
+            --json number,headRefOid,title,body --limit 200 2>/dev/null)
+
+          if [ -z "$OPEN_PRS_JSON" ] || [ "$OPEN_PRS_JSON" = "[]" ]; then
+            echo "No open PRs to scan."
+            exit 0
+          fi
+
+          PR_COUNT=$(printf '%s' "$OPEN_PRS_JSON" | jq 'length')
+          echo "Scanning $PR_COUNT open PR(s)."
+          if [ "$PR_COUNT" -ge 200 ]; then
+            echo "WARNING: open-PR list is at the 200-PR fetch limit — orphaned PRs beyond position 200 may be missed."
+          fi
+
+          # Both $MERGED_PR and each $N are digit-only (extracted via grep [0-9]+),
+          # so direct interpolation into jq filters is safe (no injection risk).
+          for N in $CLOSING_NS; do
+            echo ""
+            echo "-- Scanning for orphaned PRs targeting #$N --"
+
+            # Filter: open PRs (excluding the merged PR) whose body contains a
+            # closing-keyword reference to #N. Output: "<number> <headRefOid>" per match.
+            # N is interpolated as a literal number in .number != N (numeric in JSON).
+            # Strip backtick spans (gsub) before testing — this codebase's CLAUDE.md
+            # recommends wrapping close-keyword examples in backticks to avoid parser
+            # trips; without stripping, a PR that cites the convention would get a
+            # false-positive failing gate here (unlike v1 where the result is only a
+            # warning). Mirrors the sed stripping applied to the merged PR body above.
+            ORPHANS=$(printf '%s' "$OPEN_PRS_JSON" | jq -r \
+              '.[] |
+               select(.number != '"$MERGED_PR"') |
+               select(.body != null) |
+               select((.body | gsub("`[^`]*`"; "")) | test("(close[sd]?|fix(es|ed)?|resolve[sd]?)[[:space:]]+#'"$N"'\\b"; "i")) |
+               "\(.number) \(.headRefOid)"')
+
+            if [ -z "$ORPHANS" ]; then
+              echo "No orphaned PRs found for #$N."
+              continue
+            fi
+
+            while IFS= read -r line; do
+              read -r ORPHAN_NUM ORPHAN_SHA <<< "$line"
+
+              echo "Orphaned PR found: #$ORPHAN_NUM (sha=$ORPHAN_SHA) -- targets #$N which is now closed."
+
+              # ── Post failing check-run on orphaned PR's head commit ─────────
+              # Use --field flags rather than --input to avoid heredoc YAML issues.
+              CHECK_RESULT=$(gh api --method POST "repos/$REPO/check-runs" \
+                --field name="anti-dup" \
+                --field head_sha="$ORPHAN_SHA" \
+                --field status="completed" \
+                --field conclusion="failure" \
+                --field output[title]="Duplicate PR -- target issue #$N now closed" \
+                --field output[summary]="PR #$MERGED_PR merged and closed issue #$N. This PR also targets #$N with a closing keyword and is now a duplicate. Options: (1) If this PR supersedes the merged fix, reopen issue #$N and explain the distinction in this PR description. (2) If this PR duplicates the merged fix, close it." \
+                2>&1)
+              if printf '%s' "$CHECK_RESULT" | grep -q '"id":[[:space:]]*[0-9]'; then
+                echo "  check-run posted on #$ORPHAN_NUM: OK"
+              else
+                echo "  check-run on #$ORPHAN_NUM: FAILED -- $CHECK_RESULT"
+              fi
+
+              # ── Post PR comment for visibility ──────────────────────────────
+              # Check-run annotations alone are easy to miss; a comment ensures
+              # the author gets a notification.
+              COMMENT=$(printf \
+                '**Duplicate PR detected (anti-dup-retro-check)**\n\nPR #%s merged and closed issue #%s. This PR also references #%s with a closing keyword and is now orphaned.\n\n**Options:**\n- If this PR supersedes or extends the merged fix, reopen issue #%s and update this PR description to explain the distinction.\n- If this PR duplicates the merged fix, close it.\n\n*(Posted by the anti-dup-retro-check workflow.)*' \
+                "$MERGED_PR" "$N" "$N" "$N")
+
+              COMMENT_RESULT=$(gh pr comment "$ORPHAN_NUM" --repo "$REPO" \
+                --body "$COMMENT" 2>&1)
+              if [ $? -eq 0 ]; then
+                echo "  comment posted on #$ORPHAN_NUM: OK"
+              else
+                echo "  comment on #$ORPHAN_NUM: FAILED -- $COMMENT_RESULT"
+              fi
+
+            done <<< "$ORPHANS"
+          done
+
+          # Always exit 0 — this workflow is informational + retroactive.
+          # It should not fail the triggering (already-merged) PR.
+          echo ""
+          echo "Retro-check complete."
+          exit 0

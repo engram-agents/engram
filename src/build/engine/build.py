@@ -28,6 +28,11 @@ REPLICATION NOTES (bash oddities / edge cases faithfully ported):
     sed 's|{{PYTHON}}|$HOME/.engram/venv/bin/python3|g'
     Note: the literal '$HOME' is preserved in the file (not expanded at build
     time), matching the legacy script comment and behavior.
+  - The same {{PYTHON}} substitution also applies to hooks.json's "command"
+    strings (added #hooks-bare-python3-crash) — every hook now invokes the
+    pinned venv python instead of bare `python3`, which on some hosts (e.g.
+    a stock macOS install, where /usr/bin/python3 is Apple's CLT-bundled
+    3.9.6) is too old for hooks using PEP 604 union-type annotations.
   - hooks.json is filtered BEFORE hook scripts are copied (same ordering as
     build-plugin.sh step 3).
   - The hooks.json filter uses PLUGIN_ROOT variable to write the filtered result
@@ -503,11 +508,20 @@ def _agent_tools_to_list(raw_tools: Any) -> list[str] | str:
 
 
 def _codex_model_config(profile: dict[str, Any], claude_tier: str | None) -> dict[str, str]:
-    """Map Claude-style model tiers (opus/sonnet/haiku) through codex.json."""
+    """Map an explicit Claude-style model tier through ``codex.json``.
+
+    An omitted model is semantically meaningful on both platforms: Codex
+    resolves the custom agent through its normal precedence rules (including
+    configured ``[agents]`` defaults before parent fallback).  Keep
+    ``default_agent_model_tier`` as the backward-compatible fallback for an
+    explicit tier unknown to an older/newer profile, but never use it to fill
+    an omitted canonical field.
+    """
+    if not claude_tier:
+        return {}
     tiers = profile.get("agent_model_tiers", {})
     default_tier = profile.get("default_agent_model_tier", "sonnet")
-    tier = claude_tier or default_tier
-    cfg = tiers.get(tier) or tiers.get(default_tier) or {}
+    cfg = tiers.get(claude_tier) or tiers.get(default_tier) or {}
     return {k: str(v) for k, v in cfg.items() if v is not None}
 
 
@@ -1080,11 +1094,19 @@ def build_plugin(
     # Count stats for logging (mirrors bash script output)
     kept, dropped = _count_filter_stats(hooks_data, filtered_hooks, ship_set)
 
-    # Write filtered hooks.json
+    # Write filtered hooks.json — substitute {{PYTHON}} -> the pinned venv
+    # python (same token/value as start-engram-daemon.sh below) so every
+    # hook invokes the interpreter the plugin is actually developed and
+    # tested against, not whatever bare `python3` happens to resolve to on
+    # the host (e.g. macOS's CLT-bundled 3.9.6, too old for hooks using
+    # PEP 604 union-type annotations — see #hooks-bare-python3-crash).
     dest_hooks_json = os.path.join(plugin_root, "hooks", "hooks.json")
+    hooks_json_text = json.dumps(filtered_hooks, indent=2) + "\n"
+    hooks_json_text = hooks_json_text.replace(
+        PYTHON_SUBSTITUTION_TARGET, PYTHON_SUBSTITUTION_VALUE
+    )
     with open(dest_hooks_json, "w", encoding="utf-8") as f:
-        json.dump(filtered_hooks, f, indent=2)
-        f.write("\n")
+        f.write(hooks_json_text)
 
     print(
         f"[build-plugin] hooks.json filtered: {kept} entries kept, "

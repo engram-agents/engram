@@ -85,21 +85,21 @@ def test_codex_d_expands_to_bypass_approvals():
 
 
 def test_codex_c_subcommand_transform():
-    """codex -c must transform the base command to 'codex resume --latest'."""
+    """codex -c must transform the base command to 'codex resume --last'."""
     rc, lines, _ = _run("codex", "borges", "-c")
     assert rc == 0
     # First three words must be the subcommand transform.
     assert lines[0] == "codex"
     assert lines[1] == "resume"
-    assert lines[2] == "--latest"
+    assert lines[2] == "--last"
 
 
 def test_codex_c_d_combined_has_both_resume_and_bypass():
-    """codex -c -d must produce resume --latest AND the bypass flag."""
+    """codex -c -d must produce resume --last AND the bypass flag."""
     rc, lines, _ = _run("codex", "borges", "-c", "-d")
     assert rc == 0
     assert "resume" in lines
-    assert "--latest" in lines
+    assert "--last" in lines
     assert "--dangerously-bypass-approvals-and-sandbox" in lines
 
 
@@ -155,7 +155,7 @@ def test_codex_c_c_dedupe_single_resume_transform():
     rc, lines, _ = _run("codex", "borges", "-c", "-c")
     assert rc == 0
     assert lines.count("resume") == 1
-    assert lines.count("--latest") == 1
+    assert lines.count("--last") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +422,131 @@ def test_exit_3_takes_precedence_over_exit_6_reversed():
     )
 
 
+# ---------------------------------------------------------------------------
+# --as-self: skip-sudo mode (systemd boot-time auto-start, no sudo available)
+#
+# cmd_session's --as-self flag skips the sudo/user-switch entirely, for use
+# inside a systemd unit already running as the target agent's own Linux user
+# (User=agent-<name>). resolve_user() requires a REAL Linux user to exist, so
+# we cannot exercise cmd_session end-to-end without one; instead we test the
+# extracted pure-function seams directly (same pattern as
+# __expand-session-args and __validate-chosen-name above):
+#   __as-self-check <target_user>   — the match/mismatch gate (_as_self_check)
+#   __parse-session-flags [args...] — cmd_session's own flag parser
+#                                      (_parse_session_flags), independent of
+#                                      resolve_user and of the platform-alias
+#                                      grammar tested above.
+# ---------------------------------------------------------------------------
+
+def _as_self_check(target: str) -> tuple[int, list[str], str]:
+    proc = subprocess.run(
+        ["bash", str(AGENTCTL), "__as-self-check", target],
+        capture_output=True,
+        text=True,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l]
+    return proc.returncode, lines, proc.stderr
+
+
+def _parse_session_flags(*args: str) -> tuple[int, list[str], str]:
+    proc = subprocess.run(
+        ["bash", str(AGENTCTL), "__parse-session-flags", *args],
+        capture_output=True,
+        text=True,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l]
+    return proc.returncode, lines, proc.stderr
+
+
+def test_as_self_check_matching_user_exits_zero_no_sudo_mentioned():
+    """--as-self with the CURRENT OS user as target must exit 0 with no error output.
+
+    This is the "matching user execs without sudo" case: _as_self_check finds
+    id -un already equals the target, so cmd_session would proceed straight to
+    `exec` — no `sudo -u ... ` invocation anywhere on this path. We assert
+    that on the match path, no sudo-related text appears anywhere in stdout
+    or stderr (there is nothing to report — a real discriminator, since a
+    mutation that made the check always print something would be caught).
+    """
+    current_user = subprocess.run(
+        ["id", "-un"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    rc, lines, stderr = _as_self_check(current_user)
+    assert rc == 0, f"matching user must exit 0; got rc={rc}, stderr={stderr!r}"
+    assert not lines, f"expected no stdout on the match path; got: {lines!r}"
+    assert not stderr, f"expected no stderr on the match path; got: {stderr!r}"
+    assert "sudo" not in (stderr + "".join(lines)).lower()
+
+
+def test_as_self_check_mismatch_errors_loudly_naming_both_users():
+    """--as-self with a mismatched target must error loudly, naming both users.
+
+    Exit code must be nonzero and distinct from the alias-grammar codes (3-6)
+    used by _expand_session_args — cmd_session maps this mismatch to exit 7.
+    """
+    current_user = subprocess.run(
+        ["id", "-un"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    bogus_target = "definitely-not-a-real-agent-user-zzz"
+    rc, lines, stderr = _as_self_check(bogus_target)
+    assert rc == 1, f"_as_self_check must return 1 on mismatch; got rc={rc}"
+    assert not lines, f"expected no stdout on the mismatch path; got: {lines!r}"
+    assert bogus_target in stderr, (
+        f"stderr must name the target user '{bogus_target}'; got: {stderr!r}"
+    )
+    assert current_user in stderr, (
+        f"stderr must name the current user '{current_user}'; got: {stderr!r}"
+    )
+
+
+def test_as_self_flag_parses_true_and_defaults_no_share_false():
+    """--as-self alone must set AS_SELF=1; _parse_session_flags itself does not
+    force NO_SHARE (that forcing happens in cmd_session, one layer up) — this
+    test pins the parser's own output so a mutation that silently drops or
+    flips --as-self parsing is caught independent of that higher-level policy.
+    """
+    rc, lines, stderr = _parse_session_flags("--as-self")
+    assert rc == 0, f"expected rc=0, got {rc}, stderr={stderr!r}"
+    assert "AS_SELF=1" in lines, f"expected AS_SELF=1 in output; got: {lines!r}"
+    assert "NO_SHARE=0" in lines, f"expected NO_SHARE=0 (parser-level default); got: {lines!r}"
+
+
+def test_as_self_composes_with_platform_flag():
+    """--as-self must compose with --platform without altering its parsed value."""
+    rc, lines, _ = _parse_session_flags("--as-self", "--platform", "codex")
+    assert rc == 0
+    assert "AS_SELF=1" in lines
+    assert "PLATFORM=codex" in lines
+
+
+def test_as_self_composes_with_c_alias_passthrough():
+    """--as-self must compose with the -c platform alias: -c is untouched by
+    cmd_session's own flag parser and lands verbatim in the passthrough/extra
+    array (to be expanded later by _expand_session_args), regardless of
+    --as-self's presence or position.
+    """
+    rc, lines, _ = _parse_session_flags("--as-self", "-c")
+    assert rc == 0
+    assert "AS_SELF=1" in lines
+    assert "EXTRA:-c" in lines, f"expected -c to pass through verbatim; got: {lines!r}"
+
+
+def test_as_self_composes_with_cd_and_no_share_and_extra_args():
+    """--as-self combined with --cd, --no-share, and a trailing passthrough arg
+    must parse all four independently — no flag's value leaks into another's.
+    """
+    rc, lines, _ = _parse_session_flags(
+        "--as-self", "--cd", "/tmp", "--no-share", "-d", "--resume", "abc123"
+    )
+    assert rc == 0
+    assert "AS_SELF=1" in lines
+    assert "CD=/tmp" in lines
+    assert "NO_SHARE=1" in lines
+    assert "EXTRA:-d" in lines
+    assert "EXTRA:--resume" in lines
+    assert "EXTRA:abc123" in lines
+
+
 def test_claude_r_r_dedup_emits_remote_control_once():
     """-r -r on claude must produce exactly one --remote-control <agent> pair.
 
@@ -436,3 +561,80 @@ def test_claude_r_r_dedup_emits_remote_control_once():
     assert lines.count("borges") == 1, (
         f"Expected exactly 1 agent name 'borges', got: {lines.count('borges')}"
     )
+
+
+def test_charge_file_flag_parses_and_composes():
+    """--charge-file must parse into CHARGE_FILE and compose with --as-self and
+    alias passthrough. This is the 2026-07-25 boot-charge fix: the charge rides
+    a dedicated flag (content appended to argv AFTER expansion) because the
+    one-word-per-line expansion transport cannot carry multi-line text.
+    """
+    rc, lines, stderr = _parse_session_flags(
+        "--as-self", "--charge-file", "/tmp/charge.md", "-dr"
+    )
+    assert rc == 0, f"expected rc=0, got {rc}, stderr={stderr!r}"
+    assert "CHARGE_FILE=/tmp/charge.md" in lines, f"got: {lines!r}"
+    assert "AS_SELF=1" in lines
+    assert "EXTRA:-dr" in lines, f"-dr must still pass through to expansion; got: {lines!r}"
+
+
+def test_charge_file_equals_form_parses():
+    rc, lines, _ = _parse_session_flags("--charge-file=/x/y.md")
+    assert rc == 0
+    assert "CHARGE_FILE=/x/y.md" in lines, f"got: {lines!r}"
+
+
+def test_charge_file_missing_argument_errors_loudly():
+    rc, _, stderr = _parse_session_flags("--charge-file")
+    assert rc == 2, f"missing arg must exit 2; got {rc}"
+    assert "--charge-file" in stderr, f"error must name the flag; got: {stderr!r}"
+
+
+def test_charge_file_default_is_empty():
+    rc, lines, _ = _parse_session_flags("--as-self")
+    assert rc == 0
+    assert "CHARGE_FILE=" in lines, f"expected empty CHARGE_FILE default; got: {lines!r}"
+
+
+# ---------------------------------------------------------------------------
+# __detect-platform-as-self: no-sudo platform-detection seam
+#
+# tools/agentctl-mac (the macOS sibling) reuses this verb instead of
+# duplicating the baked-profile/binary-heuristic ladder. It exercises
+# _session_platform's as_self=1 branch directly -- no sudo, no real agent
+# user (the `user` param is unused on that branch).
+# ---------------------------------------------------------------------------
+
+def _detect_platform_as_self(*args: str) -> tuple[int, list[str], str]:
+    proc = subprocess.run(
+        ["bash", str(AGENTCTL), "__detect-platform-as-self", *args],
+        capture_output=True,
+        text=True,
+    )
+    lines = [l for l in proc.stdout.splitlines() if l]
+    return proc.returncode, lines, proc.stderr
+
+
+def test_detect_platform_explicit_override_wins():
+    rc, lines, _ = _detect_platform_as_self("codex")
+    assert rc == 0
+    assert lines == ["codex"]
+
+
+def test_detect_platform_invalid_override_errors():
+    rc, lines, stderr = _detect_platform_as_self("gemini")
+    assert rc != 0, f"expected nonzero exit for invalid override, got rc={rc}"
+    assert not lines, f"expected no stdout on error path, got: {lines}"
+    assert "claude or codex" in stderr.lower(), f"got stderr: {stderr!r}"
+
+
+def test_detect_platform_no_override_falls_back_to_default_or_heuristic():
+    """With no override and (in this test environment) no baked profile at a
+    bogus HOME, the ladder falls through to the binary heuristic / default.
+    We don't assert a specific value (depends on what's on PATH in CI vs a
+    real agent host) -- only that it's one of the two valid platforms and
+    the call succeeds without sudo.
+    """
+    rc, lines, _ = _detect_platform_as_self()
+    assert rc == 0
+    assert lines and lines[0] in ("claude", "codex"), f"got: {lines!r}"

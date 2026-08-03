@@ -95,20 +95,27 @@ def flip(
     *,
     to_agent: str,
     reason: str,
+    by_agent: str = "",
     ts: Optional[str] = None,
 ) -> int:
     """Flip a baton's turn to ``to_agent``; return the module-assigned seq.
 
     The pure write body of ``baton cmd_flip``: reads the current ``turn`` (the
-    ``from``), updates ``turn`` / ``turn_since`` / ``turn_reason``, appends a
-    ``from → to`` turn-log line, and writes atomically under the allocator lock
-    (fork-4 — :meth:`SeqAllocator.allocate` holds the lock across the write, and
-    :meth:`CoordinationStore.write_project` embeds the passed-in ``seq``).
+    ``from``), updates ``turn`` / ``turn_since`` / ``turn_reason`` / ``turn_by``,
+    appends a ``from → to`` turn-log line, and writes atomically under the
+    allocator lock (fork-4 — :meth:`SeqAllocator.allocate` holds the lock across
+    the write, and :meth:`CoordinationStore.write_project` embeds the passed-in
+    ``seq``).
 
     Validation (is ``to_agent`` a participant, status/colleague gates) is the
     caller's job and is NOT performed here — this is the write body only.
 
     Args:
+        by_agent: the acting agent performing this flip (normalised to
+            lowercase; may differ from ``to_agent`` — a third party can flip a
+            baton onto someone else). Defaults to ``""`` (actor unknown) for
+            back-compat with pre-existing callers; an empty ``turn_by`` is the
+            safe default the updates feed never treats as a self-flip.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -129,10 +136,20 @@ def flip(
     # `or "unknown"` yields "unknown" for both, friendlier than cmd_flip's "".
     from_agent = (fields.get("turn") or "unknown").strip().lower()
     to = to_agent.strip().lower()
+    turn_by = (by_agent or "").strip().lower()
 
     updated = md.update_frontmatter(
         content,
-        {"turn": to, "turn_since": now, "turn_reason": f'"{reason}"'},
+        # turn_by is quoted like turn_reason (not bare like turn/turn_since):
+        # unlike turn, turn_by can legitimately be "" (actor unknown), and an
+        # UNQUOTED empty value written mid-block corrupts the frontmatter
+        # parser — its `\s*` separator is greedy across the newline and eats
+        # the NEXT field's entire line as this field's "value" (verified: an
+        # empty turn_by followed by, e.g., `participants:` silently absorbs
+        # it). Quoting keeps a non-whitespace char right after the separator,
+        # so the parser never crosses the line boundary. Unquoted on read by
+        # store_file.read_projects, mirroring its existing turn_reason unquote.
+        {"turn": to, "turn_since": now, "turn_reason": f'"{reason}"', "turn_by": f'"{turn_by}"'},
     )
     _, body = md.parse_frontmatter(updated)
     body = md.append_turn_log(body, f"- {now} {from_agent} → {to}: {reason}")
@@ -155,9 +172,13 @@ def claim(
     """Claim a project baton from the pool; return the assigned seq.
 
     The pure write body of ``baton cmd_claim``: sets ``turn`` to the claimer,
-    updates ``turn_since`` / ``turn_reason``, appends a pool-sentinel→claimer
-    log entry.  CLI-layer validation (pool-sentinel check, participant check,
-    closed-status check) is the caller's job — only the write body lives here.
+    updates ``turn_since`` / ``turn_reason`` / ``turn_by``, appends a
+    pool-sentinel→claimer log entry.  CLI-layer validation (pool-sentinel
+    check, participant check, closed-status check) is the caller's job — only
+    the write body lives here.
+
+    The actor IS the claimer (``turn_by`` is set to ``claimer``, the same
+    normalised name that becomes ``turn``) — a claim is always self-authored.
 
     Args:
         claimer: agent claiming the baton (normalised to lowercase).
@@ -181,7 +202,11 @@ def claim(
 
     updated = md.update_frontmatter(
         content,
-        {"turn": self_name, "turn_since": now, "turn_reason": '"claimed"'},
+        # turn_by quoted like turn_reason — see flip()'s comment for why (the
+        # empty-value parser-corruption case doesn't arise here since
+        # self_name is never empty, but quoting is applied uniformly across
+        # every turn_by write site so the on-disk format is consistent).
+        {"turn": self_name, "turn_since": now, "turn_reason": '"claimed"', "turn_by": f'"{self_name}"'},
     )
     _, body = md.parse_frontmatter(updated)
     body = md.append_turn_log(body, f"- {now} {sentinel} → {self_name}: claimed")
@@ -206,10 +231,15 @@ def release(
     """Release a project baton back to the pool; return the assigned seq.
 
     The pure write body of ``baton cmd_release``: sets ``turn`` to the pool
-    sentinel, updates ``turn_since`` / ``turn_reason``, appends a holder→sentinel
-    log entry.  With ``done=True`` appends ``" (done)"`` to the title (idempotent).
-    CLI-layer validation (holder-must-be-current-turn, closed-status check) is
-    the caller's job.
+    sentinel, updates ``turn_since`` / ``turn_reason`` / ``turn_by``, appends a
+    holder→sentinel log entry.  With ``done=True`` appends ``" (done)"`` to the
+    title (idempotent). CLI-layer validation (holder-must-be-current-turn,
+    closed-status check) is the caller's job.
+
+    The actor IS the holder releasing (``turn_by`` is set to ``holder``), even
+    though ``turn`` itself becomes the pool sentinel — the release won't
+    self-notify anyone (the sentinel is never a real agent's ``turn``), but the
+    actor is stamped for audit-trail consistency with the other write-fns.
 
     Args:
         holder: the current turn holder (the one releasing).
@@ -236,6 +266,8 @@ def release(
         "turn": sentinel,
         "turn_since": now,
         "turn_reason": f'"{reason}"',
+        # quoted like turn_reason — see flip()'s comment for why.
+        "turn_by": f'"{self_name}"',
     }
 
     title_renamed = False
@@ -643,6 +675,7 @@ def init(
     turn: str,
     participants: list,
     turn_reason: str,
+    by_agent: str = "",
     github: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
@@ -656,7 +689,7 @@ def init(
     title constraints) is the caller's job.
 
     Frontmatter field order mirrors ``baton cmd_init``:
-      project / title / status / turn / turn_since / turn_reason / participants / github (optional)
+      project / title / status / turn / turn_since / turn_reason / turn_by / participants / github (optional)
 
     Log format: ``- {ts} initialized → {turn}: {turn_reason}``
 
@@ -666,6 +699,10 @@ def init(
         turn: initial turn holder (lowercase, already validated by caller).
         participants: list of participant names (lowercase, already validated).
         turn_reason: human-readable reason for initial turn assignment.
+        by_agent: the agent performing the init (normalised to lowercase) —
+            the initor, NOT necessarily the same as ``turn`` (one agent may
+            init a baton with the turn assigned to someone else). Defaults to
+            ``""`` (actor unknown) for back-compat with pre-existing callers.
         github: optional GitHub anchor (e.g. ``"pr/490"`` or ``"project/4"``).
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
@@ -680,6 +717,7 @@ def init(
         raise ProjectAlreadyExists(project_id)
 
     now = ts or md.now_iso()
+    turn_by = (by_agent or "").strip().lower()
     participants_str = "[" + ", ".join(participants) + "]"
 
     fm_lines = [
@@ -690,6 +728,10 @@ def init(
         f"turn: {turn}",
         f"turn_since: {now}",
         f'turn_reason: "{turn_reason}"',
+        # quoted like turn_reason — see flip()'s comment for why (an unquoted
+        # empty value here, followed by the participants: line, corrupts the
+        # frontmatter parser).
+        f'turn_by: "{turn_by}"',
         f"participants: {participants_str}",
     ]
     if github:

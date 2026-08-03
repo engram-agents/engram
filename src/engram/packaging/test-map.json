@@ -36,6 +36,32 @@
       "note": "gh#1680 slice 1 SSoT for the config/agent-name/emit-context/resolve-tools-dir prologue shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement, same as _hooklib.py above), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_stale_tree_hooklib.py",
+      "test_globs": [
+        "tests/test_stale_tree_hooks.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_hooks_json_stdout_audit.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "#1203 round-2 SSoT extraction: stale_tree_watch config-read shared by engram-stale-tree-pull-hook.py (Layer 1) and engram-stale-tree-warn-hook.py (Layer 2), same _hooklib.py/_prompthooklib.py precedent above. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement at the file's own top level in a form the layer-1 AST graph can trace back to a test), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_stophooklib.py",
+      "test_globs": [
+        "tests/test_stophooklib.py",
+        "tests/test_stop_hook_maturity_gate.py",
+        "tests/test_stop_hook_idle_suppression.py",
+        "tests/test_stop_hook_prose_gate.py",
+        "tests/test_deference_detector_scope_gate.py",
+        "tests/test_deference_detector_prompt.py",
+        "tests/test_deference_detector_cooldown.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-A: SSoT for the transcript-delta idiom shared by engram-stop-hook.py and engram-deference-detector-stop.py (byte-offset state, delta read, per-line JSONL parse with any_record_parsed sentinel, message.content block walk, transcript-path session-marker fallback, plus new Stop-side emit_context). Each hook dynamically imports it via a runtime sys.path insert (not a static top-level `import` statement in a form the layer-1 AST graph can trace back to a test), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py/_prompthooklib.py/_stale_tree_hooklib.py precedent above."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-baton-prompt-hook.py",
       "test_globs": [
         "tests/test_baton_hook.py",
@@ -128,6 +154,24 @@
       "note": "focus_block() moved here from engram-postcompact-hook.py (#1732, 2026-07-09) -- test_focus_block.py and the new test_session_start_hook_focus_render.py added accordingly."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/engram-stale-tree-pull-hook.py",
+      "test_globs": [
+        "tests/test_stale_tree_hooks.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_hooks_json_stdout_audit.py"
+      ],
+      "note": "#1203 stale-tree tripwire, Layer 1 (SessionStart auto-pull, PREVENTION). Tests it dynamically via importlib.util (hyphenated filename, not a static import), so invisible to the layer-1 AST import graph -- needs this layer-2 mapping, same pattern as the other hyphenated hook files above."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-stale-tree-warn-hook.py",
+      "test_globs": [
+        "tests/test_stale_tree_hooks.py",
+        "tests/test_build_plugin_hooks_consistency.py",
+        "tests/test_hooks_json_stdout_audit.py"
+      ],
+      "note": "#1203 stale-tree tripwire, Layer 2 (PreToolUse behind-count, CATCH). Same import-graph-invisibility reasoning as engram-stale-tree-pull-hook.py above."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/engram-stop-hook.py",
       "test_globs": [
         "tests/test_stop_hook_idle_suppression.py",
@@ -186,6 +230,13 @@
         "tests/test_engram_utility_credit_mention_stop.py",
         "tests/test_utility_use_action.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/engram-loop-arm-stop-hook.py",
+      "test_globs": [
+        "tests/test_loop_arm_stop_hook.py"
+      ],
+      "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
     },
     {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
@@ -379,6 +430,12 @@
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "full_suite_fallback": true,
       "note": "No test file found for forum-mention-monitor.sh"
+    },
+    {
+      "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
+      "test_globs": [
+        "tests/test_codex_umwelt_wake.py"
+      ]
     },
     {
       "path_prefix_or_glob": "skills/claude/",

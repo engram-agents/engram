@@ -232,7 +232,7 @@ Skip unless you run from a developer source checkout with `tools/selftest.py` av
 
 ```bash
 cd <engram-alpha-repo>
-python3 tools/selftest.py --quick 2>&1 | tail -20
+python3 tools/selftest.py --smoke 2>&1 | tail -20
 ```
 
 **PASS:** all tests pass.

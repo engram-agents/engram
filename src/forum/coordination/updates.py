@@ -129,7 +129,19 @@ def build_updates(
 
     if "baton" in want:
         for p in store.read_projects(active_only=True):
-            if _norm(p.turn) == agent and since < p.seq <= as_of:
+            # Self-exclusion: a self-authored turn (I flipped/initted it to
+            # myself) is redundant to notify — I set it, I know my own turn.
+            # `turn_by` is "" for legacy batons written before this field
+            # existed (or any genuinely unattributed write); "" never equals a
+            # real agent name, so the clause is a safe default — it still
+            # notifies rather than silently suppressing an unknown actor. A
+            # peer flipping the baton INTO my court (turn=me, turn_by=peer)
+            # is unaffected — only self→self (turn=me, turn_by=me) is filtered.
+            if (
+                _norm(p.turn) == agent
+                and _norm(getattr(p, "turn_by", "") or "") != agent
+                and since < p.seq <= as_of
+            ):
                 updates.append({
                     "kind": "baton",
                     "seq": p.seq,
@@ -137,6 +149,7 @@ def build_updates(
                     "project_id": p.project_id,
                     "title": p.title,
                     "turn": p.turn,
+                    "turn_by": p.turn_by,
                     "turn_reason": p.turn_reason,
                     "status": p.status,
                     # event-time of this turn-flip (uniform with dm's event_ts).

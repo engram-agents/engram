@@ -1,0 +1,234 @@
+#!/bin/bash
+# =============================================================================
+# agentctl-mac — lightweight macOS sibling of tools/agentctl's `session`
+# subcommand only.
+#
+# tools/agentctl is an operator's admin tool for a multi-agent LINUX host:
+# per-agent "agent-<name>" Linux users, sudo user-switching, ACL sharing,
+# spawn/finalize-name lifecycle. None of that exists (or is needed) on a Mac
+# running exactly one agent — there is no separate Linux user to switch to,
+# you already ARE the agent. The one part of agentctl that's still genuinely
+# useful in that world is the -d/-r/-c alias-expansion grammar (so you don't
+# have to remember/type --dangerously-skip-permissions or
+# --remote-control <name> by hand, and don't hit claude's own -d/--debug
+# collision). This script reuses that logic — and the platform-detection
+# ladder — directly from tools/agentctl's tested internal verbs
+# (__expand-session-args, __detect-platform-as-self), so the two never drift
+# apart on the part they share.
+#
+# macOS bash-3.2 compatibility note (found while building this, not assumed):
+# Apple ships bash 3.2.57 as /bin/bash (frozen since ~2007, GPLv2-licensed —
+# no Homebrew bash on this host either) with NO Homebrew bash as a fallback
+# on a fresh install. Two consequences that shaped this script:
+#   1. tools/agentctl's __parse-session-flags verb uses `local -n` namerefs
+#      (bash 4.3+) and hard-crashes under bash 3.2 ("local: -n: invalid
+#      option"). __expand-session-args and __detect-platform-as-self do NOT
+#      use namerefs and DO work fine under 3.2 (verified directly) — so this
+#      script reuses those two only, and re-implements the much smaller
+#      --platform/--cd/--charge-file parsing itself, nameref-free, below.
+#   2. `mapfile`/`readarray` (bash 4.0+) doesn't exist in 3.2 either — a
+#      plain `while read` loop is used instead everywhere a verb's
+#      one-line-per-word output needs collecting into an array.
+#   3. `set -u` + an empty array (`"${arr[@]}"` when arr=()) raises "unbound
+#      variable" under 3.2 even though the array IS declared — a real
+#      behavior difference from bash 4.4+. This script does not set -u for
+#      that reason; array-length checks below are done explicitly instead.
+# Requiring Homebrew bash just to run a session launcher would defeat the
+# "lightweight, works out of the box" point of this script, so it targets
+# bash 3.2 directly rather than assuming a newer one is installed.
+#
+# Added 2026-07-30 (Lei's request) after the venv-python/hooks.json
+# Mac-install bugs (#1831) surfaced the broader "our tooling assumes Linux"
+# gap. Scope is deliberately narrow: `session` only. No health/share/spawn —
+# those are multi-agent-Linux-host concepts with no Mac equivalent yet.
+#
+# Usage:
+#   agentctl-mac session <agent> [-drc] [--platform <claude|codex>]
+#                        [--cd <dir>] [--dry-run] [-- <passthrough args>]
+#
+#   <agent>        identity name, used for --remote-control <agent> (-r) and
+#                  shown in --dry-run output. Not a Linux user — this Mac has
+#                  exactly one agent (you) — a required label, not a lookup.
+#   -d             --dangerously-skip-permissions (claude) /
+#                  --dangerously-bypass-approvals-and-sandbox (codex)
+#   -r             --remote-control <agent>  (claude only; codex errors)
+#   -c             --continue (claude) / resume --last (codex)
+#   -drc, -rdc, ...  any bundle order — expanded in char order, same alias
+#                  grammar as tools/agentctl session (see its own --help).
+#   --platform     claude|codex (default: baked
+#                  ~/.engram/marketplace/plugins/engram/platform.json, else
+#                  binary-presence heuristic, else claude)
+#   --cd <dir>     cd into <dir> before launching
+#   --dry-run      print the expanded command (shell-quoted) instead of
+#                  executing it. Must appear before a literal `--`, same as
+#                  every other agentctl-mac-owned flag — after `--` it's
+#                  passthrough, not intercepted.
+#   --             everything after this passes through to the platform
+#                  binary verbatim
+#
+# NOT supported here (all Linux-multi-agent-host concepts with no Mac
+# equivalent in this script's scope): --as-self, --no-share, --local are all
+# recognized so none of them silently leak to the platform binary (which
+# would reject them as unknown flags) -- but they're handled two different
+# ways. --as-self/--no-share are true no-ops (this script never does
+# anything they'd need to suppress). --local prints the same deprecated-no-op
+# notice as tools/agentctl (sessions are always direct on both scripts now;
+# the flag is a historical carry-over, not silently swallowed). --charge-file
+# is the one exception that errors loudly instead of absorbing — boot-charge
+# is a systemd-unit concept; pass the content via the platform binary's own
+# flags after `--` if you need it.
+# =============================================================================
+
+set -eo pipefail
+# No -u: see the bash-3.2 empty-array note in the header comment above.
+
+# Resolve the script's REAL location, following symlinks -- this script is
+# meant to be symlinked into ~/.local/bin (same convention as tools/agentctl
+# itself), and ${BASH_SOURCE[0]} gives the invoked path, not the real one, so
+# a naive dirname would look for the sibling agentctl next to the symlink
+# instead of next to the actual file. `readlink -f` would be the one-liner,
+# but it's GNU-only (not guaranteed on macOS's BSD readlink) -- this loop is
+# the portable equivalent, safe under bash 3.2 (see the compatibility note
+# above).
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+    _self_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    [[ "$_self" != /* ]] && _self="$_self_dir/$_self"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+AGENTCTL_LINUX="$SCRIPT_DIR/agentctl"
+
+if [[ ! -f "$AGENTCTL_LINUX" ]]; then
+    echo "ERROR: sibling tools/agentctl not found at $AGENTCTL_LINUX -- agentctl-mac reuses its alias-expansion and platform-detection verbs and cannot run without it." >&2
+    exit 1
+fi
+
+usage() {
+    sed -n '3,/^# =====/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+SUBCMD="${1:-}"; shift || true
+if [[ "$SUBCMD" != "session" ]]; then
+    usage >&2
+    exit 2
+fi
+
+AGENT="${1:-}"; shift || true
+if [[ -z "$AGENT" ]]; then
+    echo "ERROR: agentctl-mac session requires an agent name" >&2
+    usage >&2
+    exit 2
+fi
+
+# Own flag parser -- deliberately NOT tools/agentctl's __parse-session-flags,
+# which uses `local -n` namerefs and crashes under macOS's bash 3.2 (see
+# header note). This is a much smaller surface (--platform/--cd/--charge-file
+# only) than the full alias-expansion grammar, so duplicating it here is a
+# reasonable, low-drift trade-off; the two never-duplicated verbs
+# (__expand-session-args, __detect-platform-as-self) still ARE reused below.
+#
+# --dry-run is intercepted in the same pass; --charge-file is parsed only so
+# it can be rejected with a clear error (see header: not supported here).
+# Everything else -- including single-dash alias bundles like -drc -- lands
+# in EXTRA for the alias-expansion pass below. All of this stops being ours
+# to parse once a literal `--` is seen; everything after is passthrough.
+DRY_RUN=0
+PLATFORM=""
+CD=""
+CHARGE_FILE=""
+EXTRA=()
+seen_dashdash=0
+while [[ $# -gt 0 ]]; do
+    if [[ $seen_dashdash -eq 1 ]]; then
+        EXTRA+=("$1"); shift; continue
+    fi
+    case "$1" in
+        --)
+            # Consumed as a separator, not forwarded -- matches
+            # tools/agentctl's own _parse_session_flags, which does the same
+            # single-leading-`--`-shift rather than passing it through.
+            seen_dashdash=1
+            shift ;;
+        --dry-run)
+            DRY_RUN=1
+            shift ;;
+        --as-self|--no-share)
+            # Recognized and silently absorbed -- true no-ops on a
+            # single-agent Mac (see header). Without this case they'd fall
+            # through to the default branch below and get forwarded verbatim
+            # to the platform binary, which would reject them as unknown
+            # flags -- the opposite of "harmless no-op" (found by reviewer-
+            # fairy review on #1834, fixed here rather than left undocumented).
+            shift ;;
+        --local)
+            # Third and last flag in tools/agentctl's _parse_session_flags
+            # set (--platform/--local/--no-share/--as-self/--cd/--charge-file
+            # -- this script now handles all six). Same deprecated-no-op
+            # notice as the Linux tool, not silent absorption -- matches
+            # tools/agentctl:303-304 exactly. Found missing by a second
+            # reviewer-fairy pass (on the --as-self/--no-share fix itself),
+            # via this repo's own sibling-completeness-check convention.
+            echo "(--local is deprecated: sessions are always direct now)" >&2
+            shift ;;
+        --platform)
+            [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
+            PLATFORM="$2"; shift 2 ;;
+        --platform=*)
+            PLATFORM="${1#--platform=}"; shift ;;
+        --cd)
+            [[ -z "${2:-}" ]] && { echo "ERROR: --cd requires a directory argument" >&2; exit 2; }
+            CD="$2"; shift 2 ;;
+        --cd=*)
+            CD="${1#--cd=}"; shift ;;
+        --charge-file)
+            [[ -z "${2:-}" ]] && { echo "ERROR: --charge-file requires a file argument" >&2; exit 2; }
+            CHARGE_FILE="$2"; shift 2 ;;
+        --charge-file=*)
+            CHARGE_FILE="${1#--charge-file=}"; shift ;;
+        *)
+            EXTRA+=("$1"); shift ;;
+    esac
+done
+
+if [[ -n "$CHARGE_FILE" ]]; then
+    echo "ERROR: --charge-file is not supported by agentctl-mac (boot-charge is a Linux systemd-unit concept, not applicable to an interactive Mac session). Pass its content via the platform binary's own flags after --, if needed." >&2
+    exit 2
+fi
+
+# Platform-detection ladder, reused from tools/agentctl (no sudo, no
+# namerefs -- verified to run fine under bash 3.2; the as_self=1 branch is
+# exactly what a single-agent Mac always is).
+PLATFORM="$(bash "$AGENTCTL_LINUX" __detect-platform-as-self "$PLATFORM")"
+
+# Alias expansion, reused from tools/agentctl (also nameref-free, also
+# verified under bash 3.2). Command substitution (not process substitution)
+# so a nonzero exit here (e.g. codex -r, or an unrecognized alias char)
+# propagates under `set -e` instead of being swallowed -- the same blocker
+# class documented in tools/agentctl's own _expand_session_args comment.
+EXPANDED_RAW="$(bash "$AGENTCTL_LINUX" __expand-session-args "$PLATFORM" "$AGENT" "${EXTRA[@]}")"
+
+# No mapfile/readarray -- bash 4.0+ only, absent from macOS's 3.2 (see
+# header). A plain while-read loop is the portable equivalent.
+EXPANDED=()
+while IFS= read -r line; do
+    EXPANDED+=("$line")
+done <<< "$EXPANDED_RAW"
+
+BIN="${EXPANDED[0]}"
+ARGS=()
+if [[ ${#EXPANDED[@]} -gt 1 ]]; then
+    ARGS=("${EXPANDED[@]:1}")
+fi
+
+if [[ -n "$CD" ]]; then
+    cd "$CD" || { echo "ERROR: --cd target '$CD' does not exist or is not accessible" >&2; exit 1; }
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    printf '%q ' "$BIN" "${ARGS[@]}"
+    printf '\n'
+    exit 0
+fi
+
+exec "$BIN" "${ARGS[@]}"

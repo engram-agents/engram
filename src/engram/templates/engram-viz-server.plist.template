@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.engram.viz-server</string>
+    <key>ProcessType</key><string>Background</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>{{PLUGIN_ENGRAM_DIR}}/viz_server.py</string>
+        <string>--bind</string><string>127.0.0.1</string>
+        <string>--port</string><string>5001</string>
+        <string>--config</string><string>{{VIZ_CONFIG}}</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>WorkingDirectory</key><string>{{PLUGIN_ENGRAM_DIR}}</string>
+    <key>StandardOutPath</key><string>{{ENGRAM_HOME}}/viz-server.log</string>
+    <key>StandardErrorPath</key><string>{{ENGRAM_HOME}}/viz-server.err</string>
+</dict>
+</plist>

@@ -60,6 +60,12 @@ ENGRAM_HOME = (
     or os.path.expanduser("~/.engram")
 )
 
+try:
+    from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
+    _HOOKLIB_OK = True
+except Exception:
+    _HOOKLIB_OK = False
+
 
 def _resolve_runtime_dir(engram_home: str) -> str:
     """Locate directory containing engram_client.py for stats import.
@@ -216,19 +222,22 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
 
 def _is_any_server_py_running() -> bool:
-    """Return True if any server.py process is running (pgrep secondary check).
+    """Return True if THIS agent's own server.py process is running (pgrep
+    secondary check) -- scoped, not a bare "server.py" substring match.
 
     Used by _check_mcp_write_tool_marker to distinguish a truly dead server
     from a post-restart race where the marker PID is stale but the server is
-    alive.  Best-effort: returns False on any error so the caller degrades to
-    the conservative (unhealthy) path rather than a false positive.
+    alive. Delegates to the shared, path-scoped _hooklib.is_own_server_py_running
+    (see its docstring for the unscoped-pgrep regression this replaced --
+    PR #1839's colleague review) -- an unscoped `pgrep -f server.py`
+    matches every agent's own server process on a shared multi-agent host,
+    permanently reporting healthy. Best-effort: returns False on any error,
+    including a failed _hooklib import, so the caller degrades to the
+    conservative (unhealthy) path rather than a false positive.
     """
-    import subprocess as _sp
-    try:
-        r = _sp.run(["pgrep", "-f", "server.py"], capture_output=True, timeout=2)
-        return r.returncode == 0
-    except Exception:
+    if not _HOOKLIB_OK:
         return False
+    return _is_own_server_py_running_impl(ENGRAM_HOME)
 
 
 def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
@@ -249,7 +258,13 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
     Returns:
         (True, None) if marker exists and its PID is still running, or if
                      the probe is deferred on this platform, or on any error.
-        (False, reason) if marker is absent or its PID is no longer running.
+        (True, note) if a dead marker PID is offset by a live server.py found
+                     via the secondary check -- healthy, but not silent (see
+                     _check_mcp_write_tool_marker's sibling in
+                     engram-surface-hook.py, the version actually called at
+                     runtime, for why: PR #1839's colleague review).
+        (False, reason) if marker is absent or its PID is no longer running
+                     AND no other server.py process is found.
     """
     if not _startup_mcp_health_probe_allowed():
         return True, None
@@ -274,9 +289,8 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             # any server.py actually running right now?
             if _is_any_server_py_running():
                 # A live server.py found — stale marker, not a dead server.
-                # Return healthy; server will refresh the marker on its next
-                # startup write (or already has — hook just caught the window).
-                return True, None
+                # Return healthy WITH a note (not silent — see docstring).
+                return True, f"marker stale (PID {pid} no longer running); live server found"
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block session start
@@ -1630,11 +1644,75 @@ def main() -> None:
             "stale-on-arrival; disregard it. You have a full window to work."
         )
 
-    # ── ENGRAM Calibration block ───────────────────────────────────────────
+    # ══ ORDERING INVARIANT (#1819) ═════════════════════════════════════════
+    # This hook runs under a 5s harness timeout. If it overruns, the process is
+    # KILLED and the ENTIRE additionalContext is lost — there is no partial
+    # delivery and no error surfaced to the agent. Emission order is therefore a
+    # PRIORITY decision, not a cosmetic one.
+    #
+    # Rule: cheap, purely-local, load-bearing blocks are appended FIRST; blocks
+    # that are expensive or depend on runtime state come LAST. A timeout then
+    # costs only the optional tail instead of everything.
+    #
+    # Measured on a real install (2026-07-25):
+    #     focus_block()              0.002s   (19,958 chars — free)
+    #     starred_block()            local DB read
+    #     calibration block          0.61s warm  (~79% of the hook's warm total
+    #                                of 0.81s; dominated by EngramClient()
+    #                                construction, which pulls in the server
+    #                                runtime — whose cold start pre-warms the
+    #                                embedding model and can block for seconds
+    #                                on a cold cache; see #1819)
+    #
+    # Before this change, calibration ran FIRST, so on a cold start it consumed
+    # the whole budget and the 2ms focus list — the "deterministic focus
+    # channel" the identity layer depends on across compaction — was never
+    # reached. Observed on two independent installs at 5018ms and 5016ms
+    # against the 5000ms budget.
+    #
+    # If you add a block here, put it on the correct side of the divider and ask:
+    # "if this hook is killed halfway, does the important part survive?"
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── Focus list surface (cheap: single local DB read) ───────────────────
+    # Render the live focus list verbatim at EVERY session start (startup,
+    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
+    # fresh new session, knowing what's focused is a good thing"), not just
+    # post-compaction. This is the deterministic focus channel's actual
+    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
+    # additionalContext at all (confirmed against CC docs, forum #241); moving
+    # it here is the fix. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _focus = focus_block(ENGRAM_HOME)
+        if _focus:
+            lines.append(_focus)
+    except Exception:
+        pass
+
+    # ── Starred letters surface (cheap: local read) ────────────────────────
+    # Inject starred-letter pointers at both fresh-session (startup) and
+    # post-compaction (compact/resume) so load-bearing cross-session agreements
+    # survive the experiential reset. Pointer-not-injection: one line each,
+    # NOT full content. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _starred = starred_block(ENGRAM_HOME)
+        if _starred:
+            lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── ENGRAM Calibration block (EXPENSIVE — must stay last, see #1819) ───
     # Inject per-type distribution anchors on every SessionStart so fresh-wake
     # context has actual quantile data present (not just semantic labels).
     # Closes the access≠presence gap. Silent skip on any failure —
     # hook must never block session start.
+    #
+    # Deliberately LAST: constructing EngramClient loads the server runtime and
+    # is the hook's dominant cost. Keeping it after the cheap blocks means a
+    # timeout here degrades only calibration, which is an anchor rather than a
+    # continuity guarantee, instead of taking the focus list down with it.
     try:
         _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
         os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
@@ -1658,35 +1736,6 @@ def main() -> None:
             lines.append(_cal_block)
     except Exception:
         # Hook discipline: never surface calibration errors to session start.
-        pass
-
-    # ── Focus list surface ─────────────────────────────────────────────────
-    # Render the live focus list verbatim at EVERY session start (startup,
-    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
-    # fresh new session, knowing what's focused is a good thing"), not just
-    # post-compaction. This is the deterministic focus channel's actual
-    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
-    # additionalContext at all (confirmed against CC docs, forum #241); moving
-    # it here is the fix. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _focus = focus_block(ENGRAM_HOME)
-        if _focus:
-            lines.append(_focus)
-    except Exception:
-        pass
-
-    # ── Starred letters surface ────────────────────────────────────────────
-    # Inject starred-letter pointers at both fresh-session (startup) and
-    # post-compaction (compact/resume) so load-bearing cross-session agreements
-    # survive the experiential reset. Pointer-not-injection: one line each,
-    # NOT full content. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _starred = starred_block(ENGRAM_HOME)
-        if _starred:
-            lines.append(_starred)
-    except Exception:
         pass
 
     # ── Deferred viz-ACL application ──────────────────────────────────────

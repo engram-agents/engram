@@ -11,11 +11,11 @@
   "min_version": "0.136.0",
   "agent_model_tiers": {
     "opus": {
-      "model": "gpt-5.5",
+      "model": "gpt-5.6-sol",
       "model_reasoning_effort": "high"
     },
     "sonnet": {
-      "model": "gpt-5.4",
+      "model": "gpt-5.6-terra",
       "model_reasoning_effort": "high"
     },
     "haiku": {

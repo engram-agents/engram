@@ -347,3 +347,73 @@ class TestMultiAgentHooksShip:
             "--tier dev --multi-agent build: hooks.json references hook file(s) not present:\n"
             + "\n".join(f"  MISSING: hooks/{f}" for f in missing)
         )
+
+
+# ── test class 4: {{PYTHON}} substitution in built hooks.json ─────────────────
+
+
+class TestHooksJsonPythonSubstitution:
+    """Every hook command in the built hooks.json must invoke the pinned venv
+    python, not a bare/unsubstituted interpreter (#1831 — bare python3 on a
+    fresh macOS install resolves to Apple's CLT-bundled 3.9.6, too old for
+    hooks using PEP 604 union-type annotations).
+
+    Guards the exact regression this fixes and the one it could reintroduce:
+    a future hook added with a literal 'python3' typed out of habit, bypassing
+    the {{PYTHON}} -> pinned-venv substitution.
+    """
+
+    def setup_method(self):
+        result = _run_build([])
+        assert result.returncode == 0, (
+            f"build-plugin.sh (default) failed in setup:\n{result.stderr}"
+        )
+
+    def _all_commands(self) -> list[str]:
+        hooks_json_path = os.path.join(PLUGIN_ROOT, "hooks", "hooks.json")
+        with open(hooks_json_path, encoding="utf-8") as f:
+            data = json.load(f)
+        commands = []
+        for groups in data.get("hooks", {}).values():
+            for group in groups:
+                for entry in group.get("hooks", []):
+                    cmd = entry.get("command", "")
+                    if cmd:
+                        commands.append(cmd)
+        return commands
+
+    def test_no_literal_python_template_token_remains(self):
+        """No command string still contains the unsubstituted '{{PYTHON}}' token."""
+        commands = self._all_commands()
+        assert commands, "Built hooks.json has no command-type hook entries to check."
+        offenders = [c for c in commands if "{{PYTHON}}" in c]
+        assert not offenders, (
+            "Built hooks.json still contains a literal '{{PYTHON}}' token — the "
+            "build-time substitution did not run on every entry:\n"
+            + "\n".join(f"  {c}" for c in offenders)
+        )
+
+    def test_every_python_command_invokes_pinned_venv(self):
+        """Every hook command that runs python invokes the pinned venv, not bare python3.
+
+        Not every hook command is python (e.g. start-engram-daemon.sh runs via
+        `bash "..."`) — only commands that actually invoke a python interpreter
+        are in scope here.
+        """
+        commands = self._all_commands()
+        assert commands, "Built hooks.json has no command-type hook entries to check."
+        python_commands = [c for c in commands if "python3" in c]
+        assert python_commands, (
+            "No command in the built hooks.json invokes python3 at all — "
+            "expected at least the session-start/prompt-submit hooks to."
+        )
+        offenders = [
+            c for c in python_commands
+            if not c.startswith("$HOME/.engram/venv/bin/python3 ")
+        ]
+        assert not offenders, (
+            "Found hook command(s) invoking python3 without the pinned venv "
+            "($HOME/.engram/venv/bin/python3) — likely a new hook added with a "
+            "bare 'python3' typed out of habit instead of the {{PYTHON}} template:\n"
+            + "\n".join(f"  {c}" for c in offenders)
+        )

@@ -336,12 +336,41 @@ class TestCodexAgentEmission:
 
     def test_codex_agent_model_tier_mapping_comes_from_profile(self, codex_convenience_bundle):
         """Claude model tiers map through codex.json profile into Codex model fields."""
-        coder = self._read_agent(codex_convenience_bundle, "engram-coder-fairy")
+        sonnet_agents = (
+            "engram-coder-fairy",
+            "engram-pr-reviewer",
+            "engram-dream-fairy",
+            "engram-batch-summary-fairy",
+        )
+        for name in sonnet_agents:
+            agent = self._read_agent(codex_convenience_bundle, name)
+            assert agent["model"] == "gpt-5.6-terra"
+            assert agent["model_reasoning_effort"] == "high"
+
         master = self._read_agent(codex_convenience_bundle, "engram-dream-master")
-        assert coder["model"] == "gpt-5.4"
-        assert coder["model_reasoning_effort"] == "high"
-        assert master["model"] == "gpt-5.4"
-        assert master["model_reasoning_effort"] == "high"
+        assert "model" not in master
+        assert "model_reasoning_effort" not in master
+
+    def test_canonical_dream_master_omits_model_to_inherit_parent(self):
+        """Claude source omission is intentional and must survive Codex conversion."""
+        path = Path(REPO_ROOT) / "src/engram/agents/claude/engram-dream-master.md"
+        frontmatter = path.read_text(encoding="utf-8").split("---", 2)[1]
+        assert not re.search(r"^model\s*:", frontmatter, re.MULTILINE)
+
+    def test_codex_model_config_only_maps_explicit_tiers(self):
+        """Omission inherits the parent; explicit Opus/Sonnet use profile mappings."""
+        from tools.engine.build import _codex_model_config, load_platform_profile
+
+        profile = load_platform_profile(REPO_ROOT, "codex")
+        assert _codex_model_config(profile, None) == {}
+        assert _codex_model_config(profile, "opus") == {
+            "model": "gpt-5.6-sol",
+            "model_reasoning_effort": "high",
+        }
+        assert _codex_model_config(profile, "sonnet") == {
+            "model": "gpt-5.6-terra",
+            "model_reasoning_effort": "high",
+        }
 
     def test_codex_agent_no_claude_frontmatter_leaks(self, codex_convenience_bundle):
         """Generated TOML must not retain raw Claude YAML frontmatter syntax."""

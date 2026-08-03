@@ -28,6 +28,13 @@ tests/
 #     red CI on the public snapshot repo; a public CI can be added deliberately later. ---
 .github/
 
+# --- Host-specific deploy files (Lei's machine only: hardcoded agent-user
+#     names, host boot schedule, per-instance systemd wiring). Generic ENGRAM
+#     users don't get a boot-autostart from the release; this stays private
+#     dev/ops infra. (Requested by Lei 2026-07-24 — added in the same PR that
+#     touched these files, alpha#1815.) ---
+deploy/
+
 # --- Dev-process docs (the procedures for DEVELOPING and RELEASING ENGRAM, run
 #     from engram-alpha/dev; a public release USER never cuts a release or contributes
 #     from the snapshot, so these are dev-internal and stay in the private repo). ---

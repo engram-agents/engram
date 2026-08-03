@@ -27,6 +27,7 @@ real ~/.engram install.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
@@ -350,6 +351,93 @@ class TestEngagementFloorPositiveCases(TranscriptFixtureMixin, unittest.TestCase
         self.assertEqual(result["engagement_floor"], 0.0)
 
 
+class TestEngagementFloorDistinctNode(TranscriptFixtureMixin, unittest.TestCase):
+    """#1787 part 2: the distinct-cited-node floor must be invariant to
+    render multiplicity -- a node rendered N times in one session should
+    only ever count once toward the distinct-node denominator/numerator,
+    unlike the per-fire floor, which counts each render separately."""
+
+    def test_distinct_node_floor_invariant_to_render_multiplicity(self):
+        transcript_path = os.path.join(self.tmpdir, "session.jsonl")
+        # ob_9401 is cited exactly once, well after all three of its renders.
+        records = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Citing ob_9401 for this decision."}
+                    ],
+                },
+                "timestamp": _iso(self._after(100)),
+            },
+        ]
+        _write_jsonl(transcript_path, records)
+
+        ledger_path = os.path.join(self.tmpdir, "in-turn-recall-ledger.jsonl")
+        _write_jsonl(
+            ledger_path,
+            [
+                # ob_9401 rendered three separate times in the SAME session, at
+                # increasing timestamps -- render-multiplicity to be
+                # invariant against.
+                {
+                    "ts": self.fire_ts,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                {
+                    "ts": self.fire_ts + 10,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                {
+                    "ts": self.fire_ts + 20,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9401"],
+                    "novel_terms": ["foo"],
+                },
+                # ob_9402: a second distinct node, rendered once, never cited.
+                {
+                    "ts": self.fire_ts + 30,
+                    "session_id": "sess-distinct",
+                    "transcript_path": transcript_path,
+                    "outcome": "rendered",
+                    "rendered_ids": ["ob_9402"],
+                    "novel_terms": ["bar"],
+                },
+            ],
+        )
+        surface_ledger_path = os.path.join(self.tmpdir, "surface-ledger.json")
+        with open(surface_ledger_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        result = rmh.compute_engagement_floor(
+            ledger_path, surface_ledger_path, [], None
+        )
+
+        self.assertEqual(result["n_distinct_nodes"], 2)
+        self.assertEqual(result["n_distinct_engaged"], 1)
+        self.assertEqual(result["engagement_floor_distinct"], 0.5)
+
+        # Per-fire floor inflates: all 3 ob_9401 fires are individually
+        # "engaged" (the citation is after every one of their fire.ts), so
+        # the per-fire numerator/denominator differ from the distinct-node
+        # variant -- this locks in that the two metrics genuinely diverge
+        # under render multiplicity.
+        self.assertNotEqual(
+            result["engagement_floor"], result["engagement_floor_distinct"]
+        )
+
+
 class TestJunkFire(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="rmh-junk-test-")
@@ -639,6 +727,207 @@ class TestRobustness(unittest.TestCase):
         self.assertIn("junk_fire", m)
         self.assertTrue(m["junk_fire"].get("available", True))
         self.assertIn("engagement_floor", m)
+
+
+class TestToEpoch(unittest.TestCase):
+    """#1787: the three data sources store ts in mixed formats -- _to_epoch
+    normalizes all of them to epoch seconds for --split-at comparisons."""
+
+    def test_to_epoch_float_passes_through(self):
+        self.assertEqual(rmh._to_epoch(1784384729.229103), 1784384729.229103)
+
+    def test_to_epoch_int_passes_through_as_float(self):
+        self.assertEqual(rmh._to_epoch(1000), 1000.0)
+
+    def test_to_epoch_iso_string_with_trailing_z_parses_to_correct_epoch(self):
+        iso = "2026-05-21T19:35:34.697Z"
+        expected = datetime(
+            2026, 5, 21, 19, 35, 34, 697000, tzinfo=timezone.utc
+        ).timestamp()
+        self.assertAlmostEqual(rmh._to_epoch(iso), expected, places=3)
+
+    def test_to_epoch_iso_string_without_z_parses(self):
+        iso = "2026-05-21T19:35:34.697+00:00"
+        expected = datetime(
+            2026, 5, 21, 19, 35, 34, 697000, tzinfo=timezone.utc
+        ).timestamp()
+        self.assertAlmostEqual(rmh._to_epoch(iso), expected, places=3)
+
+    def test_to_epoch_raises_valueerror_on_malformed_string(self):
+        # Contract preserved post-#1787-follow-up dedup via _parse_iso_ts:
+        # _to_epoch still RAISES (unlike _parse_iso_ts, which returns None)
+        # -- the --split-at window filter (_in_window) relies on the raise.
+        with self.assertRaises(ValueError):
+            rmh._to_epoch("garbage")
+
+
+class TestSplitAt(unittest.TestCase):
+    """#1787: --split-at partitions fires/events/entries into a before-slice
+    (ts < split) and an after-slice (ts >= split), across all three mixed-ts
+    data sources, and computes per-metric deltas."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="rmh-split-test-")
+        self.addCleanup(self._cleanup)
+        # Split boundary.
+        self.split_dt = datetime(2026, 7, 18, 12, 0, 0, tzinfo=timezone.utc)
+        self.split_iso = self.split_dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        self.split_epoch = self.split_dt.timestamp()
+
+    def _cleanup(self):
+        import shutil
+
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _mk_transcript(self, node_id: str, fire_ts: float) -> str:
+        """A transcript with an assistant text block citing node_id shortly
+        after fire_ts, so the fire counts as engaged."""
+        path = os.path.join(self.tmpdir, f"session-{node_id}.jsonl")
+        cite_dt = datetime.fromtimestamp(fire_ts, tz=timezone.utc) + timedelta(seconds=5)
+        records = [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": f"Citing {node_id}."}],
+                },
+                "timestamp": _iso(cite_dt),
+            },
+        ]
+        _write_jsonl(path, records)
+        return path
+
+    def test_in_window_partitions_before_after_half_open(self):
+        # before: ts < split; after: ts >= split (half-open, boundary goes
+        # to "after").
+        self.assertTrue(rmh._in_window(self.split_epoch - 1, (None, self.split_epoch)))
+        self.assertFalse(rmh._in_window(self.split_epoch, (None, self.split_epoch)))
+        self.assertFalse(rmh._in_window(self.split_epoch - 1, (self.split_epoch, None)))
+        self.assertTrue(rmh._in_window(self.split_epoch, (self.split_epoch, None)))
+        # No window -> always in.
+        self.assertTrue(rmh._in_window(self.split_epoch, None))
+
+    def test_in_window_malformed_ts_excluded_not_raised(self):
+        # A malformed ts under an ACTIVE window is excluded (False), not a
+        # crash -- _in_window catches _to_epoch's ValueError.
+        self.assertFalse(
+            rmh._in_window("not-a-timestamp", (0.0, 100.0))
+        )
+
+    def test_build_report_split_partitions_fires_and_computes_deltas(self):
+        before_ts = self.split_epoch - 3600  # 1h before split
+        after_ts = self.split_epoch + 3600   # 1h after split
+
+        t1 = self._mk_transcript("ob_8001", before_ts)
+        t2 = self._mk_transcript("ob_8002", before_ts)
+        t3 = self._mk_transcript("ob_8003", after_ts)
+
+        ledger_path = os.path.join(self.tmpdir, "in-turn-recall-ledger.jsonl")
+        _write_jsonl(
+            ledger_path,
+            [
+                # 2 fires before the split
+                {
+                    "ts": before_ts, "session_id": "s1", "transcript_path": t1,
+                    "outcome": "rendered", "rendered_ids": ["ob_8001"],
+                    "novel_terms": ["portfolio"],
+                },
+                {
+                    "ts": before_ts, "session_id": "s2", "transcript_path": t2,
+                    "outcome": "rendered", "rendered_ids": ["ob_8002"],
+                    "novel_terms": ["str"],  # junk token
+                },
+                # 1 fire after the split
+                {
+                    "ts": after_ts, "session_id": "s3", "transcript_path": t3,
+                    "outcome": "rendered", "rendered_ids": ["ob_8003"],
+                    "novel_terms": ["rebalance"],
+                },
+            ],
+        )
+        surface_ledger_path = os.path.join(self.tmpdir, "surface-ledger.json")
+        with open(surface_ledger_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        args = argparse.Namespace(
+            engram_home=self.tmpdir, seat="split-seat",
+            ledger_path=ledger_path, surface_ledger_path=surface_ledger_path,
+            index_db_path=os.path.join(self.tmpdir, "absent.db"),
+            stoplist_file=None, transcript=[], transcript_dir=None,
+            split_at=self.split_iso,
+        )
+        report = rmh.build_report(args)
+
+        self.assertIn("before", report)
+        self.assertIn("after", report)
+        self.assertEqual(report["split_at"], self.split_iso)
+
+        before_ef = report["before"]["engagement_floor"]
+        after_ef = report["after"]["engagement_floor"]
+        self.assertEqual(before_ef["n_fires_total"], 2)  # N fires before
+        self.assertEqual(after_ef["n_fires_total"], 1)   # M fires after
+        self.assertEqual(before_ef["n_engaged"], 2)
+        self.assertEqual(after_ef["n_engaged"], 1)
+
+        before_jf = report["before"]["junk_fire"]
+        after_jf = report["after"]["junk_fire"]
+        self.assertEqual(before_jf["n_rendered_fires"], 2)
+        self.assertEqual(after_jf["n_rendered_fires"], 1)
+
+        # A delta must be computed for the metrics available in both slices.
+        self.assertIn("deltas", report)
+        self.assertIn("engagement_floor", report["deltas"])
+        self.assertIn("junk_fire", report["deltas"])
+        expected_ef_delta = (
+            after_ef["engagement_floor"] - before_ef["engagement_floor"]
+        )
+        self.assertAlmostEqual(
+            report["deltas"]["engagement_floor"]["engagement_floor"],
+            expected_ef_delta,
+        )
+
+        # render_md/render_json must not raise on the split shape.
+        md = rmh.render_md(report)
+        self.assertIn("Before", md)
+        self.assertIn("After", md)
+        self.assertIn("Deltas", md)
+        js = rmh.render_json(report)
+        parsed = json.loads(js)
+        self.assertEqual(parsed["split_at"], self.split_iso)
+
+    def test_non_split_path_unaffected_by_split_at_absent(self):
+        """args without a split_at attribute at all (mirrors
+        TestRobustness's hand-built Namespace) must still produce the
+        plain (non-split) report shape."""
+        ledger_path = os.path.join(self.tmpdir, "in-turn-recall-ledger.jsonl")
+        _write_jsonl(ledger_path, [
+            {"ts": 1.0, "outcome": "rendered", "novel_terms": ["portfolio"],
+             "rendered_ids": ["ob_0001"]},
+        ])
+        surface_ledger_path = os.path.join(self.tmpdir, "surface-ledger.json")
+        with open(surface_ledger_path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+        args = argparse.Namespace(
+            engram_home=self.tmpdir, seat="test-seat",
+            ledger_path=ledger_path, surface_ledger_path=surface_ledger_path,
+            index_db_path=os.path.join(self.tmpdir, "absent.db"),
+            stoplist_file=None, transcript=[], transcript_dir=None,
+        )
+        report = rmh.build_report(args)
+        self.assertNotIn("before", report)
+        self.assertIn("metrics", report)
+
+
+class TestSplitAtCLIValidation(unittest.TestCase):
+    """#1787 follow-up: a malformed --split-at must degrade to a clean
+    argparse usage error (exit code 2), not an unhandled ValueError
+    traceback -- consistent with the module's degrade-not-crash
+    convention."""
+
+    def test_malformed_split_at_exits_cleanly_via_parser_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            rmh.main(["--split-at", "not-a-date"])
+        self.assertEqual(cm.exception.code, 2)
 
 
 class TestNodeIdRegex(unittest.TestCase):

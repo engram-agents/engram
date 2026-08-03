@@ -1,0 +1,50 @@
+# agent-session@.service — per-agent boot-time session launcher (TEMPLATE unit)
+#
+# Instantiated per agent, e.g. `agent-session@kepler.service` — the `%i`
+# instance name is the agent's short name (matches agentctl's own
+# `agent-<name>` Linux-user convention: `User=agent-%i`).
+#
+# Design context (self-contained; see deploy/autostart/README.md for the
+# full install/rehearsal procedure):
+#   - The host auto-boots at 8:00 America/New_York; world/forum/gateway
+#     servers (umwelt-world.service et al — OUT OF SCOPE here, umwelt-side
+#     units, referenced by name only as an ordering dependency) come up at
+#     boot. Agent sessions must NOT — they wait for the 09:30 timer
+#     (agent-sessions.timer -> agent-sessions.target -> this unit).
+#   - `User=agent-%i`: this unit runs AS the agent's own Linux user from the
+#     start — no sudo is available or needed inside it. That's why
+#     ExecStart calls `agentctl session ... --as-self` (tools/agentctl),
+#     which skips agentctl's normal sudo/user-switch path entirely.
+#   - The wrapper script (agent-session-launch.sh) does the actual tmux +
+#     boot-charge work; kept out of this unit file so the launch logic has
+#     one implementation, testable independent of systemd.
+
+[Unit]
+Description=Agent Claude Code session (boot-time auto-start) - %i
+After=network-online.target umwelt-world.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# RemainAfterExit=yes: the actual long-running process is the detached tmux
+# session started by agent-session-launch.sh, not this unit's own ExecStart
+# (which exits quickly once tmux has forked the session off). Without this,
+# systemd would show the unit as "inactive (dead)" immediately after a
+# successful start, which is misleading — the session is very much alive,
+# just no longer a child of this unit.
+RemainAfterExit=yes
+User=agent-%i
+ExecStart=/usr/local/lib/agentctl/autostart/agent-session-launch.sh %i
+
+# Restart=no — DELIBERATE, not an oversight. A crashed or failed morning
+# session must be VISIBLE to the operator (systemctl status shows
+# "failed"; the journal has the error) rather than silently respawned into
+# a repeat failure. This is a "lease, not latch" posture: the 09:30 timer
+# grants ONE attempt at a normal morning start. If it fails, a human looks
+# at it and restarts manually (`systemctl start agent-session@<name>` or
+# `agentctl session <name>` interactively) — the unit does not keep
+# retrying unsupervised.
+Restart=no
+
+[Install]
+WantedBy=agent-sessions.target

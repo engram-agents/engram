@@ -146,6 +146,55 @@ def resolve_seat_label(engram_home: str, explicit: Optional[str]) -> str:
     return base or "unknown-seat"
 
 
+def _to_epoch(ts) -> float:
+    """Normalize a timestamp to epoch seconds (#1787 --split-at).
+
+    The three data sources store ts in DIFFERENT formats: the in-turn
+    ledger and surface-ledger both store epoch floats; index.db's
+    `events.ts` (as returned by `rra.load_events`) is an ISO-8601 string
+    (e.g. ``2026-05-21T19:35:34.697Z``). This helper normalizes both so a
+    single `--split-at` boundary can be compared uniformly across sources.
+
+    ISO-8601 string parsing is delegated to `_parse_iso_ts` (the two
+    helpers previously duplicated the same Z-strip + fromisoformat logic;
+    #1787 follow-up consolidates it there). Unlike `_parse_iso_ts`, this
+    function RAISES `ValueError` on a malformed string rather than
+    returning `None` -- callers (the --split-at window filter via
+    `_in_window`) rely on the raise to distinguish "unparseable" from
+    "valid timestamp", and `_in_window` catches it.
+    """
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    result = _parse_iso_ts(str(ts))
+    if result is None:
+        raise ValueError(f"unparseable timestamp: {ts!r}")
+    return result
+
+
+def _in_window(
+    ts, ts_window: Optional[Tuple[Optional[float], Optional[float]]]
+) -> bool:
+    """True iff `ts` (any of the mixed source formats) falls in the
+    half-open window [lo, hi) -- an open (None) bound means unbounded on
+    that side. `ts_window is None` means "no filtering" (always True),
+    which keeps every compute_*() byte-for-byte unchanged when --split-at
+    is not passed. A ts that fails to normalize is excluded (False) rather
+    than raising, matching this module's existing skip-malformed-ts
+    convention (see e.g. _load_in_turn_fires)."""
+    if ts_window is None:
+        return True
+    lo, hi = ts_window
+    try:
+        epoch = _to_epoch(ts)
+    except (ValueError, TypeError):
+        return False
+    if lo is not None and epoch < lo:
+        return False
+    if hi is not None and epoch >= hi:
+        return False
+    return True
+
+
 def load_stoplist(path: Optional[str]) -> frozenset:
     if not path:
         return DEFAULT_STOPLIST
@@ -163,7 +212,10 @@ def load_stoplist(path: Optional[str]) -> frozenset:
 # Metric 1: repeat-render fraction (REUSE recall_repetition_analysis.py)
 
 
-def compute_repeat_render(index_db_path: str) -> dict:
+def compute_repeat_render(
+    index_db_path: str,
+    ts_window: Optional[Tuple[Optional[float], Optional[float]]] = None,
+) -> dict:
     """Wrap/aggregate recall_repetition_analysis.py's own functions -- no
     reimplementation of the repeat-render logic."""
     if not os.path.exists(index_db_path):
@@ -172,6 +224,14 @@ def compute_repeat_render(index_db_path: str) -> dict:
             "reason": f"index.db not found at {index_db_path}",
         }
     by_session = rra.load_events(index_db_path)
+    if ts_window is not None:
+        # index.db's ts is an ISO-8601 string; _in_window normalizes it.
+        filtered_by_session = {}
+        for sid, prompts in by_session.items():
+            kept = [(ts, ids) for ts, ids in prompts if _in_window(ts, ts_window)]
+            if kept:
+                filtered_by_session[sid] = kept
+        by_session = filtered_by_session
     n_sessions = len(by_session)
     n_events = sum(len(v) for v in by_session.values())
     n_ids_total = sum(len(ids) for prompts in by_session.values() for _, ids in prompts)
@@ -212,7 +272,11 @@ def compute_repeat_render(index_db_path: str) -> dict:
 # Metric 2: junk-fire fraction
 
 
-def compute_junk_fire(ledger_path: str, stoplist: frozenset) -> dict:
+def compute_junk_fire(
+    ledger_path: str,
+    stoplist: frozenset,
+    ts_window: Optional[Tuple[Optional[float], Optional[float]]] = None,
+) -> dict:
     if not os.path.exists(ledger_path):
         return {"available": False, "reason": f"ledger not found at {ledger_path}"}
 
@@ -230,6 +294,8 @@ def compute_junk_fire(ledger_path: str, stoplist: frozenset) -> dict:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not _in_window(rec.get("ts"), ts_window):
                 continue
             if rec.get("outcome") != "rendered":
                 continue
@@ -272,7 +338,10 @@ def compute_junk_fire(ledger_path: str, stoplist: frozenset) -> dict:
 # Metric 3: same-session-echo count
 
 
-def compute_same_session_echo(surface_ledger_path: str) -> dict:
+def compute_same_session_echo(
+    surface_ledger_path: str,
+    ts_window: Optional[Tuple[Optional[float], Optional[float]]] = None,
+) -> dict:
     if not os.path.exists(surface_ledger_path):
         return {
             "available": False,
@@ -305,6 +374,8 @@ def compute_same_session_echo(surface_ledger_path: str) -> dict:
             continue
         for entry in entries:
             if not isinstance(entry, dict):
+                continue
+            if not _in_window(entry.get("ts"), ts_window):
                 continue
             n_entries += 1
             # Parse BOTH shapes identically: pre-#1779 {ts, ids} and
@@ -578,8 +649,11 @@ def compute_engagement_floor(
     surface_ledger_path: str,
     explicit_transcripts: Sequence[str],
     transcript_dir: Optional[str],
+    ts_window: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> dict:
     fires = _load_in_turn_fires(ledger_path) + _load_surface_fires(surface_ledger_path)
+    if ts_window is not None:
+        fires = [f for f in fires if _in_window(f.ts, ts_window)]
     _resolve_transcript_paths(fires, explicit_transcripts, transcript_dir)
 
     # Cache parsed authored-id maps per transcript path (a session's
@@ -593,6 +667,12 @@ def compute_engagement_floor(
     # for this build -- the #1780 harness build spec lists engagement floor
     # (A) as the required metric; B is marked "companion" in the design
     # comment, not a build must-have. See handoff ambiguous-decisions log.
+
+    # #1787 part 2: distinct-cited-node floor, render-multiplicity-invariant.
+    # Unit of counting is the (transcript_path, node_id) pair -- i.e. distinct
+    # rendered nodes per session -- rather than the per-fire unit above, which
+    # over-counts a node rendered N times in a session as up to N engaged-fires.
+    distinct_earliest: Dict[Tuple[str, str], float] = {}
 
     for fire in fires:
         if not fire.transcript_path or not os.path.exists(fire.transcript_path):
@@ -611,8 +691,25 @@ def compute_engagement_floor(
         if engaged:
             n_engaged += 1
 
+        for nid in fire.ids:
+            key = (fire.transcript_path, nid)
+            prev = distinct_earliest.get(key)
+            if prev is None or fire.ts < prev:
+                distinct_earliest[key] = fire.ts
+
     engagement_floor = (n_engaged / n_fires_with_transcript) if n_fires_with_transcript else 0.0
     coverage = (n_fires_with_transcript / n_fires_total) if n_fires_total else 0.0
+
+    n_distinct_nodes = len(distinct_earliest)
+    n_distinct_engaged = 0
+    for (tpath, nid), earliest_ts in distinct_earliest.items():
+        authored = authored_cache.get(tpath) or {}
+        cited_ts = authored.get(nid)
+        if cited_ts is not None and cited_ts > earliest_ts:
+            n_distinct_engaged += 1
+    engagement_floor_distinct = (
+        (n_distinct_engaged / n_distinct_nodes) if n_distinct_nodes else 0.0
+    )
 
     return {
         "available": n_fires_total > 0,
@@ -621,6 +718,9 @@ def compute_engagement_floor(
         "transcript_coverage_fraction": coverage,
         "n_engaged": n_engaged,
         "engagement_floor": engagement_floor,
+        "n_distinct_nodes": n_distinct_nodes,
+        "n_distinct_engaged": n_distinct_engaged,
+        "engagement_floor_distinct": engagement_floor_distinct,
         "known_error_direction": (
             "This is a FLOOR, not a ceiling: an agent that uses a rendered "
             "node's content via paraphrase, without writing its literal ID, "
@@ -629,13 +729,109 @@ def compute_engagement_floor(
             "are excluded from the denominator (see "
             "transcript_coverage_fraction) -- if unresolved sessions "
             "systematically differ from resolved ones, this is a further "
-            "source of bias in an unknown direction."
+            "source of bias in an unknown direction. The distinct-node "
+            "floor (engagement_floor_distinct) counts each rendered "
+            "(transcript, node_id) pair once regardless of how many times "
+            "it was re-rendered in the session, so it is invariant to "
+            "render multiplicity and is the valid basis for cross-#1779 "
+            "comparison -- the per-fire floor above is not, because "
+            "#1779's echo-guard change alters how many times the same "
+            "node is re-rendered within a session."
         ),
     }
 
 
 # ---------------------------------------------------------------------------
 # Report assembly + rendering
+
+
+def _safe(fn):
+    # A measurement tool must never let one metric's failure discard the
+    # others: an unforeseen crash in any single compute_*() degrades that
+    # metric to an error record while the rest still report.
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 -- deliberate broad backstop
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def _compute_all_metrics(
+    ledger_path: str,
+    surface_ledger_path: str,
+    index_db_path: str,
+    stoplist: frozenset,
+    args: argparse.Namespace,
+    ts_window: Optional[Tuple[Optional[float], Optional[float]]] = None,
+) -> dict:
+    """Compute all four metrics, optionally restricted to `ts_window`
+    (#1787 --split-at). `ts_window is None` reproduces today's unfiltered
+    behavior exactly."""
+    return {
+        "repeat_render": _safe(lambda: compute_repeat_render(index_db_path, ts_window)),
+        "junk_fire": _safe(lambda: compute_junk_fire(ledger_path, stoplist, ts_window)),
+        "same_session_echo": _safe(
+            lambda: compute_same_session_echo(surface_ledger_path, ts_window)),
+        "engagement_floor": _safe(lambda: compute_engagement_floor(
+            ledger_path,
+            surface_ledger_path,
+            args.transcript or [],
+            args.transcript_dir,
+            ts_window,
+        )),
+    }
+
+
+def _compute_deltas(before: dict, after: dict) -> dict:
+    """Headline-scalar deltas (after - before) per metric, per the #1787
+    spec: repeat_render pooled fraction at k=5; junk_fire all three
+    fractions; same_session_echo suppressed_echo_count; engagement_floor
+    both `engagement_floor` and `engagement_floor_distinct` (the latter
+    guarded -- it does not exist on this branch, since the distinct-node
+    floor is a separate, already-shipped change (#1792) not part of this
+    scope). Any metric unavailable in either slice is skipped entirely."""
+    deltas: Dict[str, dict] = {}
+
+    b_rr = before.get("repeat_render") or {}
+    a_rr = after.get("repeat_render") or {}
+    if b_rr.get("available") and a_rr.get("available"):
+        b_w5 = b_rr.get("windows", {}).get(5)
+        a_w5 = a_rr.get("windows", {}).get(5)
+        if b_w5 is not None and a_w5 is not None:
+            deltas["repeat_render"] = {
+                "pooled_fraction_k5": a_w5["pooled_fraction"] - b_w5["pooled_fraction"],
+            }
+
+    b_jf = before.get("junk_fire") or {}
+    a_jf = after.get("junk_fire") or {}
+    if b_jf.get("available") and a_jf.get("available"):
+        deltas["junk_fire"] = {
+            "token_fraction": a_jf["token_fraction"] - b_jf["token_fraction"],
+            "any_junk_fraction": a_jf["any_junk_fraction"] - b_jf["any_junk_fraction"],
+            "all_junk_fraction": a_jf["all_junk_fraction"] - b_jf["all_junk_fraction"],
+        }
+
+    b_se = before.get("same_session_echo") or {}
+    a_se = after.get("same_session_echo") or {}
+    if b_se.get("available") and a_se.get("available"):
+        deltas["same_session_echo"] = {
+            "suppressed_echo_count": (
+                a_se["suppressed_echo_count"] - b_se["suppressed_echo_count"]
+            ),
+        }
+
+    b_ef = before.get("engagement_floor") or {}
+    a_ef = after.get("engagement_floor") or {}
+    if b_ef.get("available") and a_ef.get("available"):
+        ef_delta = {
+            "engagement_floor": a_ef["engagement_floor"] - b_ef["engagement_floor"],
+        }
+        if "engagement_floor_distinct" in b_ef and "engagement_floor_distinct" in a_ef:
+            ef_delta["engagement_floor_distinct"] = (
+                a_ef["engagement_floor_distinct"] - b_ef["engagement_floor_distinct"]
+            )
+        deltas["engagement_floor"] = ef_delta
+
+    return deltas
 
 
 def build_report(args: argparse.Namespace) -> dict:
@@ -649,14 +845,36 @@ def build_report(args: argparse.Namespace) -> dict:
     index_db_path = args.index_db_path or os.path.join(engram_home, "logs", "index.db")
     stoplist = load_stoplist(args.stoplist_file)
 
-    def _safe(fn):
-        # A measurement tool must never let one metric's failure discard the
-        # others: an unforeseen crash in any single compute_*() degrades that
-        # metric to an error record while the rest still report.
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001 -- deliberate broad backstop
-            return {"available": False, "error": f"{type(e).__name__}: {e}"}
+    # getattr, not args.split_at: some callers (e.g. TestRobustness's
+    # hand-built argparse.Namespace) construct args without this attribute,
+    # and the non-split path must stay usable without it.
+    split_at = getattr(args, "split_at", None)
+
+    if not split_at:
+        report = {
+            "seat": seat,
+            "engram_home": engram_home,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "sources": {
+                "ledger_path": ledger_path,
+                "surface_ledger_path": surface_ledger_path,
+                "index_db_path": index_db_path,
+            },
+            "metrics": _compute_all_metrics(
+                ledger_path, surface_ledger_path, index_db_path, stoplist, args
+            ),
+        }
+        return report
+
+    split_epoch = _to_epoch(split_at)
+    before_metrics = _compute_all_metrics(
+        ledger_path, surface_ledger_path, index_db_path, stoplist, args,
+        ts_window=(None, split_epoch),
+    )
+    after_metrics = _compute_all_metrics(
+        ledger_path, surface_ledger_path, index_db_path, stoplist, args,
+        ts_window=(split_epoch, None),
+    )
 
     report = {
         "seat": seat,
@@ -667,18 +885,10 @@ def build_report(args: argparse.Namespace) -> dict:
             "surface_ledger_path": surface_ledger_path,
             "index_db_path": index_db_path,
         },
-        "metrics": {
-            "repeat_render": _safe(lambda: compute_repeat_render(index_db_path)),
-            "junk_fire": _safe(lambda: compute_junk_fire(ledger_path, stoplist)),
-            "same_session_echo": _safe(
-                lambda: compute_same_session_echo(surface_ledger_path)),
-            "engagement_floor": _safe(lambda: compute_engagement_floor(
-                ledger_path,
-                surface_ledger_path,
-                args.transcript or [],
-                args.transcript_dir,
-            )),
-        },
+        "split_at": split_at,
+        "before": before_metrics,
+        "after": after_metrics,
+        "deltas": _compute_deltas(before_metrics, after_metrics),
     }
     return report
 
@@ -689,13 +899,14 @@ def _fmt_pct(x: Optional[float]) -> str:
     return f"{x * 100:.1f}%"
 
 
-def render_md(report: dict) -> str:
-    lines = []
-    lines.append(f"# Rec-4 recall measurement -- seat: {report['seat']}\n")
-    lines.append(f"Generated: {report['generated_at']}")
-    lines.append(f"ENGRAM_HOME: {report['engram_home']}\n")
+def _render_metrics_md(metrics: dict) -> List[str]:
+    """Render the four-metric body (everything below the report header) for
+    one metrics dict. Factored out of render_md so the split (--split-at)
+    path can reuse it for both the before-slice and after-slice sections
+    without duplicating the per-metric formatting."""
+    lines: List[str] = []
 
-    rr = report["metrics"]["repeat_render"]
+    rr = metrics["repeat_render"]
     lines.append("## 1. Repeat-render fraction\n")
     if not rr.get("available"):
         lines.append(f"_Unavailable: {rr.get('reason')}_\n")
@@ -718,7 +929,7 @@ def render_md(report: dict) -> str:
         )
         lines.append(f"\n_Known error direction: {rr['known_error_direction']}_\n")
 
-    jf = report["metrics"]["junk_fire"]
+    jf = metrics["junk_fire"]
     lines.append("## 2. Junk-fire fraction\n")
     if not jf.get("available"):
         lines.append(f"_Unavailable: {jf.get('reason')}_\n")
@@ -734,7 +945,7 @@ def render_md(report: dict) -> str:
         lines.append(f"| all-junk-fire fraction | {_fmt_pct(jf['all_junk_fraction'])} |")
         lines.append(f"\n_Known error direction: {jf['known_error_direction']}_\n")
 
-    se = report["metrics"]["same_session_echo"]
+    se = metrics["same_session_echo"]
     lines.append("## 3. Same-session-echo count\n")
     if not se.get("available"):
         lines.append(f"_Unavailable: {se.get('reason')}_\n")
@@ -757,7 +968,7 @@ def render_md(report: dict) -> str:
             lines.append("\nNo decay_events present in this ledger.")
         lines.append(f"\n_Known error direction: {se['known_error_direction']}_\n")
 
-    ef = report["metrics"]["engagement_floor"]
+    ef = metrics["engagement_floor"]
     lines.append("## 4. Engagement floor\n")
     if not ef.get("available"):
         lines.append("_Unavailable: no rendered fires found._\n")
@@ -768,8 +979,61 @@ def render_md(report: dict) -> str:
             f"coverage) | engaged: {ef['n_engaged']}\n"
         )
         lines.append(f"**Engagement floor: {_fmt_pct(ef['engagement_floor'])}**\n")
+        lines.append(
+            f"Distinct rendered nodes (per session, with transcript): {ef['n_distinct_nodes']} | "
+            f"distinct engaged: {ef['n_distinct_engaged']}\n"
+        )
+        lines.append(
+            f"**Engagement floor (distinct-node, render-multiplicity-invariant): "
+            f"{_fmt_pct(ef['engagement_floor_distinct'])}**\n"
+        )
         lines.append(f"_Known error direction: {ef['known_error_direction']}_\n")
 
+    return lines
+
+
+def _render_deltas_md(deltas: dict) -> List[str]:
+    lines: List[str] = ["## Deltas (after - before)\n"]
+    if not deltas:
+        lines.append(
+            "_No deltas computed (one or more metrics unavailable in the "
+            "before- or after-slice)._\n"
+        )
+        return lines
+    lines.append("| metric | field | delta (after - before) |")
+    lines.append("|---|---|---|")
+    for metric_name, fields in deltas.items():
+        for field_name, value in fields.items():
+            lines.append(f"| {metric_name} | {field_name} | {value:+.4f} |")
+    lines.append("")
+    return lines
+
+
+def render_md(report: dict) -> str:
+    lines: List[str] = []
+
+    if "before" in report:
+        lines.append(
+            f"# Rec-4 recall measurement (before/after split) -- seat: {report['seat']}\n"
+        )
+        lines.append(f"Generated: {report['generated_at']}")
+        lines.append(f"ENGRAM_HOME: {report['engram_home']}")
+        lines.append(f"Split at: {report['split_at']}\n")
+
+        lines.append("# Before (ts < split_at)\n")
+        lines.extend(_render_metrics_md(report["before"]))
+
+        lines.append("# After (ts >= split_at)\n")
+        lines.extend(_render_metrics_md(report["after"]))
+
+        lines.extend(_render_deltas_md(report.get("deltas") or {}))
+
+        return "\n".join(lines) + "\n"
+
+    lines.append(f"# Rec-4 recall measurement -- seat: {report['seat']}\n")
+    lines.append(f"Generated: {report['generated_at']}")
+    lines.append(f"ENGRAM_HOME: {report['engram_home']}\n")
+    lines.extend(_render_metrics_md(report["metrics"]))
     return "\n".join(lines) + "\n"
 
 
@@ -807,7 +1071,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Override the junk-token stoplist (one token per line).",
     )
     parser.add_argument("--format", choices=["md", "json"], default="md")
+    parser.add_argument(
+        "--split-at",
+        default=None,
+        help="ISO-8601 timestamp; run before/after slices + deltas.",
+    )
     args = parser.parse_args(argv)
+
+    if args.split_at:
+        try:
+            _to_epoch(args.split_at)
+        except ValueError:
+            parser.error(f"--split-at: invalid ISO-8601 timestamp {args.split_at!r}")
 
     report = build_report(args)
     if args.format == "json":

@@ -661,6 +661,35 @@ class TestCursor:
 class TestMarkRead:
     """mark-read: advance cursor via /api/updates."""
 
+    def test_mr_alias_reaches_command_not_help(self, engram_home):
+        """`ia mr` (the registered alias) must dispatch, not fall through to help.
+
+        Regression: argparse sets `subcommand` to the string the USER TYPED, not
+        the canonical name, so `aliases=["mr"]` produced an args.subcommand of
+        "mr" that matched no dispatch branch. It fell to the else-branch, printed
+        top-level help, and exited EXIT_VALIDATION — while the help epilog says
+        DM commands require multi-agent mode. So a user in multi mode (as here)
+        was told the opposite, naming a false cause. The shipped inter-agent
+        prompt-hook advertises `ia mr`, so the documented path was the broken one.
+
+        Asserted on the user-visible symptom rather than the exit code: with no
+        forum reachable the command legitimately fails loud, and that is fine —
+        what must not happen is the top-level-help-plus-mode-epilog output.
+        """
+        _write_config(engram_home, "multi")
+        rc, stdout, stderr = _run_ia(engram_home, "mr")
+
+        combined = stdout + stderr
+        assert "All DM commands require multi-agent mode" not in combined, (
+            "`ia mr` printed the mode-gate epilog while config mode IS multi — "
+            "the alias fell through to top-level help instead of dispatching."
+        )
+        # The canonical spelling and the alias must behave the same way here.
+        rc_canon, out_canon, err_canon = _run_ia(engram_home, "mark-read")
+        assert ("All DM commands require multi-agent mode" in combined) == (
+            "All DM commands require multi-agent mode" in (out_canon + err_canon)
+        ), "alias and canonical spelling diverge"
+
     def test_mark_read_advances_cursor(self, engram_home, capsys):
         """mark-read writes returned as_of to cursor file."""
         _write_config(engram_home, "multi")
