@@ -821,7 +821,11 @@ def main() -> None:
         cmd_read(args, config, agent_name)
     elif args.subcommand == "write":
         cmd_write(args, config, agent_name)
-    elif args.subcommand == "mark-read":
+    # NOTE: match the alias too. argparse sets `subcommand` to the string the
+    # user typed, NOT the canonical name, so a registered alias falls through
+    # to the else-branch and prints top-level help — whose epilog says DM
+    # commands need multi-agent mode, naming a cause that is false.
+    elif args.subcommand in ("mark-read", "mr"):
         cmd_mark_read(args, config, agent_name)
     elif args.subcommand == "cursor":
         cmd_cursor(args, config, agent_name)
