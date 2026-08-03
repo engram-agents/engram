@@ -1,9 +1,18 @@
 """Tests for the MCP write-tool liveness check in engram-surface-hook.py.
 
-The check moved from SessionStart to UserPromptSubmit to eliminate the startup
+The check moved from SessionStart to UserPromptSubmit to reduce the startup
 timing race: the old server PID stays in mcp-tools-ready.json until the new
-server finishes initializing (~8s), so checking at SessionStart produces a
-false alarm on every restart. By first user prompt the race window is past.
+server finishes initializing, so checking at SessionStart produces a false
+alarm on every restart.
+
+Residual cold-start race (the case PR #1839 could not close): the FIRST
+UserPromptSubmit of a fresh session can still arrive before the new server has
+written its marker (heavy imports), so the marker still holds the previous
+session's dead PID and no live server.py is detectable yet. That state is
+indistinguishable from a real outage by the marker check alone. The warning
+wording therefore surfaces both possibilities and points at a reality-test
+(engram_stats) rather than alarming "writes will fail silently — restart"
+unconditionally. See test_main_emits_write_tool_warning_on_stale_marker.
 """
 
 import importlib.util
@@ -164,6 +173,14 @@ class TestMcpLivenessIntegration:
         ctx = output["hookSpecificOutput"]["additionalContext"]
         assert "MCP write-tool liveness: UNCONFIRMED" in ctx
         assert "stale" in ctx
+        # Fix B (cold-start-aware wording): the warning must not alarm
+        # unconditionally with "writes will fail silently — restart". It surfaces
+        # the cold-start-race possibility and points at a reality-test before
+        # recommending a restart, so the agent verifies instead of panicking
+        # at the first prompt of every session.
+        assert "cold-start" in ctx
+        assert "engram_stats" in ctx
+        assert "self-resolves" in ctx
 
     def test_main_emits_informational_note_on_stale_marker_offset_by_live_server(
         self, tmp_path, monkeypatch
