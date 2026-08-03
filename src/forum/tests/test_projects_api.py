@@ -271,6 +271,15 @@ class TestProjectFlip:
         rec = next(r for r in store.read_projects() if r.project_id == "PR-42")
         assert rec.turn_by == "ariadne"
 
+    def test_flip_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/flip", json={
+            "agent": "ariadne",
+            "to_agent": "luria",
+            "reason": "colleague please",
+        }).get_json()
+        assert data["turn"] == "luria"
+        assert data["status"] == "in-progress"
+
 
 # ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/claim
@@ -296,6 +305,14 @@ class TestProjectClaim:
             "pool_sentinel": "lei",
         })
         assert resp.status_code == 404
+
+    def test_claim_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/claim", json={
+            "agent": "luria",
+            "pool_sentinel": "lei",
+        }).get_json()
+        assert data["turn"] == "luria"
+        assert data["status"] == "in-progress"
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +356,15 @@ class TestProjectRelease:
             "reason": "r",
         })
         assert resp.status_code == 404
+
+    def test_release_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/release", json={
+            "agent": "ariadne",
+            "pool_sentinel": "lei",
+            "reason": "back to pool",
+        }).get_json()
+        assert data["turn"] == "lei"
+        assert data["status"] == "in-progress"
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +410,15 @@ class TestProjectStatus:
         })
         assert resp.status_code == 404
 
+    def test_status_returns_updated_status(self, client):
+        data = client.post("/api/projects/PR-42/status", json={
+            "agent": "ariadne",
+            "new_status": "cancelled",
+            "reason": "scope dropped",
+        }).get_json()
+        assert data["status"] == "cancelled"
+        assert "turn" in data
+
 
 # ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/rename
@@ -410,6 +445,14 @@ class TestProjectRename:
         })
         assert resp.status_code == 404
 
+    def test_rename_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/rename", json={
+            "agent": "ariadne",
+            "new_title": "Renamed",
+        }).get_json()
+        assert data["turn"] == "ariadne"
+        assert data["status"] == "in-progress"
+
 
 # ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/anchor
@@ -435,6 +478,14 @@ class TestProjectAnchor:
             "github": "pr/99",
         })
         assert resp.status_code == 404
+
+    def test_anchor_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/anchor", json={
+            "agent": "ariadne",
+            "github": "pr/42",
+        }).get_json()
+        assert data["turn"] == "ariadne"
+        assert data["status"] == "in-progress"
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +586,15 @@ class TestProjectGc:
         })
         assert resp.status_code == 404
 
+    def test_gc_returns_turn_and_status(self, client):
+        data = client.post("/api/projects/PR-42/gc", json={
+            "agent": "ariadne",
+            "new_status": "merged",
+            "reason": "pr merged on gh",
+        }).get_json()
+        assert data["status"] == "merged"
+        assert "turn" in data
+
 
 # ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/merge
@@ -549,6 +609,13 @@ class TestProjectMerge:
         data = resp.get_json()
         assert "seq" in data
         assert data["seq"] >= 1
+
+    def test_merge_returns_merged_status(self, client):
+        data = client.post("/api/projects/PR-42/merge", json={
+            "agent": "luria",
+        }).get_json()
+        assert data["status"] == "merged"
+        assert "turn" not in data
 
     def test_merge_archives_baton(self, client, app):
         client.post("/api/projects/PR-42/merge", json={"agent": "luria"})
