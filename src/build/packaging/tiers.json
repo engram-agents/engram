@@ -671,6 +671,10 @@
       "tier": "convenience"
     },
     {
+      "path": "templates/engram-viz-server.plist.template",
+      "tier": "convenience"
+    },
+    {
       "path": "templates/template.CLAUDE.multi-agent.md",
       "tier": "convenience",
       "multi_agent": true
