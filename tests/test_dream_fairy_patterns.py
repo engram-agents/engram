@@ -435,7 +435,7 @@ def test_protection_skips_doc_cited_warm_briefing():
     assert nid not in ids, "A node cited in warm-briefing.md must be excluded."
 
 
-def test_protection_skips_doc_cited_claude_md():
+def test_protection_skips_doc_cited_claude_md(monkeypatch):
     """A node whose id appears in the CLAUDE.md surface (via the env seam) is
     read-time-load-protected and must be excluded."""
     server = fresh_server()
@@ -445,7 +445,7 @@ def test_protection_skips_doc_cited_claude_md():
     claude_path = os.path.join(TEST_DIR, "test-claude.md")
     with open(claude_path, "w") as f:
         f.write(f"Operating principle ({nid}, focus-pinned): ...\n")
-    os.environ["ENGRAM_CLAUDE_MD_PATH"] = claude_path
+    monkeypatch.setenv("ENGRAM_CLAUDE_MD_PATH", claude_path)
 
     ids = [c["id"] for c in _run_stale_scan(server)]
     assert nid not in ids, "A node cited in the CLAUDE.md surface must be excluded."
@@ -531,7 +531,7 @@ def test_protection_skips_doc_cited_registry():
     )
 
 
-def test_protection_skips_doc_cited_skill_file():
+def test_protection_skips_doc_cited_skill_file(monkeypatch):
     """The skill-file branch of the doc_cited channel: a node whose id appears in
     a *.md under $CLAUDE_PLUGIN_ROOT/skills/ is read-time-load protected and must
     be excluded. (Not covered by the warm-briefing/CLAUDE.md doc_cited tests.)"""
@@ -547,7 +547,7 @@ def test_protection_skips_doc_cited_skill_file():
     os.makedirs(skill_dir, exist_ok=True)
     with open(os.path.join(skill_dir, "SKILL.md"), "w") as f:
         f.write(f"# Some skill\n\nSee {nid} for the load-bearing rule.\n")
-    os.environ["CLAUDE_PLUGIN_ROOT"] = plugin_root
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", plugin_root)
 
     ids = [c["id"] for c in _run_stale_scan(server)]
     assert nid not in ids, (
