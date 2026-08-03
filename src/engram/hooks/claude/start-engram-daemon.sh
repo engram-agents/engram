@@ -27,15 +27,47 @@ except:
             # Daemon is alive and socket works
             exit 0
         fi
-        # Socket not responsive, kill stale process
-        kill "$pid" 2>/dev/null
     fi
-    rm -f "$PID_PATH" "$SOCKET_PATH"
 fi
 
-# Start daemon in background
+# #1874: reap EVERY process matching this daemon's script name AND this
+# specific ENGRAM_HOME before starting a fresh one -- not just the single
+# PID recorded in PID_PATH. The prior kill-recorded-pid-only logic left
+# orphaned instances running indefinitely whenever: (a) the daemon forks
+# workers the pidfile never recorded (multiprocessing children outlive
+# their parent -- #1874's leaked-semaphore log evidence), or (b) the
+# pidfile was stale/absent (e.g. across a plugin upgrade) while an
+# old-version daemon, launched from a since-replaced script path, was
+# still alive and holding the socket.
+#
+# Scoping on basename ALONE is unsafe (colleague-review finding on this
+# PR, empirically reproduced): it also matches a completely unrelated,
+# legitimate daemon for a DIFFERENT ENGRAM_HOME under the same OS user --
+# a second checkout, a manual debug invocation, even this file's own test
+# suite running alongside a live session. ENGRAM_HOME is passed only via
+# env var today, which `pgrep -f` cannot see (it matches argv/cmdline,
+# not the environment) -- so the daemon is launched below with ENGRAM_HOME
+# ALSO as a trailing argv (the script itself ignores it; its only purpose
+# is making this scope possible). The reap pattern then matches basename
+# AND this specific ENGRAM_HOME, mirroring the full-path-scoping
+# discipline _hooklib.py's is_own_server_py_running already established
+# for the sibling server.py liveness check.
+#
+# End-anchored (colleague-review fold, Kepler): ENGRAM_HOME is the LAST
+# argv, so an unanchored pattern would also match a DIFFERENT, longer
+# ENGRAM_HOME that merely has this one as a string prefix (e.g. this
+# agent's real `~/.engram` vs. some other checkout's `~/.engram-backup`)
+# -- the shorter path is a substring of the longer one's command line.
+for stale_pid in $(pgrep -f "engram-surface-daemon\.py.*${ENGRAM_HOME}\$" 2>/dev/null); do
+    kill "$stale_pid" 2>/dev/null || true
+done
+rm -f "$PID_PATH" "$SOCKET_PATH"
+
+# Start daemon in background. The trailing $ENGRAM_HOME argv is unused by
+# the script (ENGRAM_HOME is still resolved from the env var as before) --
+# it exists solely so pgrep -f above can scope on it.
 mkdir -p "$ENGRAM_HOME"
-env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" >> "$LOG_PATH" 2>&1 < /dev/null &
+env ENGRAM_HOME="$ENGRAM_HOME" {{PYTHON}} "$DAEMON_SCRIPT" "$ENGRAM_HOME" >> "$LOG_PATH" 2>&1 < /dev/null &
 
 # Fire-and-forget: the daemon warms asynchronously (cold model-load
 # routinely exceeds any fixed wait); the per-turn UserPromptSubmit
