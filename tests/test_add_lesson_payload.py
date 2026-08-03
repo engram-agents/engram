@@ -6,6 +6,9 @@ Coverage:
   3. Required-field validation — missing claim / incident_ids / scaffolding_nudge / logical_chain rejected.
   4. Empty-string guards on required string fields.
   5. Internal helper — _add_lesson_impl works with named kwargs.
+  6. #1864 situation_pattern prose-shape gate — dead-prose patterns blocked by
+     default, bypassable with an audit stamp, real regexes unaffected,
+     malformed regexes always rejected regardless of bypass.
 """
 
 import atexit
@@ -170,3 +173,202 @@ def test_impl_callable_with_kwargs():
     ))
     assert "error" not in r, r
     assert "lesson_id" in r
+
+
+# ---------------------------------------------------------------------------
+# #1864 — situation_pattern prose-shape gate
+# ---------------------------------------------------------------------------
+
+_PROSE_PATTERN = "When about to run gh pr create, check the issue first"
+_REGEX_PATTERN = r"(?:gh\s+pr\s+create|ia\s+write)"
+_UNCOMPILABLE_PATTERN = "(unclosed"
+
+# Colleague-round false-block counter-examples (#1864, Ariadne + Borges):
+# real, live command-shape patterns that the first-draft discriminator
+# (literal-space + no \s/\b/(?: construct) wrongly blocked. A bare
+# subcommand has no reason to carry a \s/\b/(?: construct, and a
+# multi-command alternation naturally carries literal spaces -- "gh pr
+# diff" IS three space-separated words. The corrected threshold
+# (>8 literal spaces) passes both; each carries far fewer than 8.
+_SHORT_COMMAND_PATTERN = "gh issue close"
+_MULTI_COMMAND_ALTERNATION_PATTERN = r"(?:gh pr diff|git diff|gh pr view)"
+
+
+def _lesson_metadata(server, lesson_id: str) -> dict:
+    """Read back a lesson node's metadata dict directly from the DB."""
+    conn = server.core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM nodes WHERE id = ?", (lesson_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"lesson {lesson_id} not found"
+    return json.loads(row["metadata"])
+
+
+def _lesson_payload(inc_id: str, **overrides) -> dict:
+    payload = {
+        "claim": "When diagnosing errors, read the output before hypothesizing.",
+        "incident_ids": inc_id,
+        "scaffolding_nudge": "Stop. Read the error output verbatim before forming a hypothesis.",
+        "logical_chain": "Single incident → action-focused tripwire pattern.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_prose_situation_pattern_blocked_by_default():
+    """A prose situation_pattern with no bypass is refused; no lesson created."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, situation_pattern=_PROSE_PATTERN)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "prose" in r["error"], r
+    assert "lesson_id" not in r, r
+
+
+def test_prose_situation_pattern_bypass_creates_and_stamps():
+    """The SAME prose pattern with bypass_prose_check=True is created, and
+    its metadata carries bypass_prose_check: True (the audit stamp)."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(
+        inc_id, situation_pattern=_PROSE_PATTERN, bypass_prose_check=True,
+    )
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+    meta = _lesson_metadata(server, lesson_id)
+    assert meta.get("bypass_prose_check") is True, meta
+    assert meta.get("situation_pattern") == _PROSE_PATTERN, meta
+
+
+def test_command_shape_pattern_no_bypass_stamp():
+    """A real command-shape regex is created successfully; metadata does NOT
+    carry a bypass_prose_check key at all (not even False — absent)."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, situation_pattern=_REGEX_PATTERN)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+    meta = _lesson_metadata(server, lesson_id)
+    assert "bypass_prose_check" not in meta, meta
+    assert meta.get("situation_pattern") == _REGEX_PATTERN, meta
+
+
+def test_short_bare_command_pattern_not_blocked():
+    """Regression (#1864 colleague round): a bare command with no
+    alternation and no \\s/\\b/(?: construct (e.g. `gh issue close`, 2
+    literal spaces) is a real, live tripwire pattern -- the corrected
+    threshold must not false-block it just because it lacks a regex
+    construct the first-draft discriminator wrongly required."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, situation_pattern=_SHORT_COMMAND_PATTERN)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+    meta = _lesson_metadata(server, lesson_id)
+    assert "bypass_prose_check" not in meta, meta
+    assert meta.get("situation_pattern") == _SHORT_COMMAND_PATTERN, meta
+
+
+def test_multi_command_alternation_pattern_not_blocked():
+    """Regression (#1864 colleague round): a multi-command alternation
+    naturally carries literal spaces -- `(?:gh pr diff|git diff|gh pr view)`
+    IS three space-separated words, 5 literal spaces, and a real, live
+    tripwire pattern. Must not be false-blocked."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(
+        inc_id, situation_pattern=_MULTI_COMMAND_ALTERNATION_PATTERN,
+    )
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+    meta = _lesson_metadata(server, lesson_id)
+    assert "bypass_prose_check" not in meta, meta
+    assert meta.get("situation_pattern") == _MULTI_COMMAND_ALTERNATION_PATTERN, meta
+
+
+def test_uncompilable_pattern_rejected_no_bypass():
+    """An uncompilable pattern is rejected with a compile-error message."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, situation_pattern=_UNCOMPILABLE_PATTERN)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "regex" in r["error"], r
+    assert "lesson_id" not in r, r
+
+
+def test_uncompilable_pattern_rejected_even_with_bypass():
+    """bypass_prose_check=True must NEVER smuggle a malformed regex through —
+    the compile check runs before, and independently of, the prose gate."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(
+        inc_id, situation_pattern=_UNCOMPILABLE_PATTERN, bypass_prose_check=True,
+    )
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "regex" in r["error"], r
+    assert "lesson_id" not in r, r
+
+
+def test_empty_situation_pattern_unaffected():
+    """A lesson with no situation_pattern field still creates normally,
+    exactly as today — the new gate has no effect when the field is absent."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+    meta = _lesson_metadata(server, lesson_id)
+    assert "situation_pattern" not in meta, meta
+    assert "bypass_prose_check" not in meta, meta
+
+
+def test_mutation_check_prose_gate_actually_blocks():
+    """Mutation-verify the block gate (spec step 6): temporarily neutralize
+    the prose-shape check in engram_epistemic and confirm the SAME prose
+    pattern that test_prose_situation_pattern_blocked_by_default expects to
+    be blocked is instead created — proving that test exercises the real
+    gate rather than being a false-green.
+
+    Implemented via monkeypatch (in-process equivalent of commenting out the
+    `_looks_like_prose` call site) rather than editing the source file on
+    disk, so the mutation is scoped to this one test and self-reverting.
+    """
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    epistemic_mod = sys.modules["engram_epistemic"]
+
+    original = epistemic_mod._looks_like_prose
+    try:
+        # Mutation: hardcode the gate's discriminator to always report
+        # "not prose" — equivalent to commenting out the real prose check.
+        epistemic_mod._looks_like_prose = lambda pattern: False
+
+        payload = _lesson_payload(inc_id, situation_pattern=_PROSE_PATTERN)
+        r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+        # With the gate neutralized, the prose pattern is now let through —
+        # this is the mutation-check FAILING for the original test's
+        # assertion, proving the gate (not something else) was responsible.
+        assert "error" not in r, (
+            "mutation check did not reproduce expected bypass — "
+            f"gate may not be the actual blocker: {r}"
+        )
+        assert "lesson_id" in r, r
+    finally:
+        epistemic_mod._looks_like_prose = original
+
+    # Restore verified: same payload is blocked again with the real gate.
+    payload = _lesson_payload(inc_id, situation_pattern=_PROSE_PATTERN)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "lesson_id" not in r, r
