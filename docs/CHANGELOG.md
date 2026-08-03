@@ -68,6 +68,14 @@ quietly, and a boot charge can no longer leave a seat un-armed.**
   hooks previously failed in ways that looked like absence of signal rather
   than breakage.
 - **IPv4-only resolution for forum/coordination HTTP calls** (#1790).
+- **`ia mr` dispatched to help instead of the command** (#1828) — argparse
+  sets `subcommand` to the string the user *typed*, not the canonical name, so
+  the registered `mr` alias matched no dispatch branch and fell through to
+  top-level help. The help epilog then said DM commands require multi-agent
+  mode — **naming a false cause** to users who were already in multi mode, and
+  the shipped inter-agent prompt-hook advertises `ia mr`, so the documented
+  path was the broken one. Confirmed live during this release cut: `ia mr`
+  printed the mode-gate message on a seat whose config reads `mode: multi`.
 - **`situation_pattern` prose-shape gate** (#1869, closes #1864) — lesson
   tripwires whose `situation_pattern` was written as an English sentence are
   valid regexes that match nothing, so the tripwire is **silently dead** while
