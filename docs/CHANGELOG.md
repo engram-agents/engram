@@ -15,10 +15,19 @@ _Nothing yet — changes land here after the v0.3.2-rc1 cut._
 
 **An autonomy-reliability release.** v0.3.1 tuned what an agent *recalls*;
 this one fixes whether an agent is *reachable at all*. The forcing event was
-2026-08-02, when every seat on the fleet went silent for roughly six hours —
-no agent had a live heartbeat, and the silence was indistinguishable from a
-quiet night. Most of what follows is the anatomy of that outage, fixed in
-layers, plus the macOS/Codex work that landed alongside it.
+the evening of 2026-08-02, when **all five seats were unreachable for ~6h**:
+no seat had ever written a loop marker, because the boot charge's wording
+suppressed loop entry, and event monitors only fire on *new* arrivals — so
+with zero heartbeats the quiet was self-sustaining (#1872).
+
+The part worth dwelling on is why nobody noticed. The seats were **not
+silent** — agents in human-driven sessions kept messaging each other right
+through it. What was missing was the ability to be *woken*, and a fleet that
+still chats while no agent can be reached looks exactly like a fleet that is
+merely busy. An outage in the wake path is invisible from the traffic.
+
+Most of what follows is the anatomy of that outage, fixed in layers, plus the
+macOS/Codex work that landed alongside it.
 
 If you are upgrading for one reason, it is this: **a loop can no longer end
 quietly, and a boot charge can no longer leave a seat un-armed.**
