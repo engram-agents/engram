@@ -473,6 +473,9 @@ def _goal_tension_impl(*args, **kwargs):
 def _add_lesson_impl(*args, **kwargs):
     return _epistemic_mod._add_lesson_impl(*args, **kwargs)
 
+def _update_lesson_impl(*args, **kwargs):
+    return _epistemic_mod._update_lesson_impl(*args, **kwargs)
+
 def _register_exemplar_impl(*args, **kwargs):
     return _epistemic_mod._register_exemplar_impl(*args, **kwargs)
 
@@ -4535,6 +4538,126 @@ def engram_lesson_register_incident(payload_json: str) -> str:
     except (json.JSONDecodeError, TypeError):
         pass
     return raw
+
+
+_UPDATE_LESSON_FIELDS = frozenset({
+    "node_id", "updates", "reason", "bypass_prose_check",
+})
+
+
+# DESIGN INTENT — engram_update_lesson
+# -------------------------------------
+# #1826 gap-2 fix: engram_add_lesson only accepts situation_pattern at
+# creation time, and no tool existed to backfill/correct it on an existing
+# lesson (dream cycles repeatedly found real lessons with dead or absent
+# situation_pattern on more than one graph). Mirrors
+# engram_update_person's in-place-metadata-update pattern exactly: no
+# supersede, no new node, prior values recorded in metadata.field_traces
+# (append-only), every call logged to edit_history via
+# core._log_edit(action="lesson_field_updated") — same shape as
+# engram_update_person's "person_field_updated" entries, so an in-place
+# lesson edit still surfaces as a graph-mutation event, not silently.
+#
+# Mutable-field set (widened 2026-08-03 per Lei): situation_pattern +
+# scaffolding_nudge — both mechanical/actionability metadata refinable from
+# real firing experience, never the lesson's epistemic content (claim,
+# logical_chain, confidence, reasoning_type stay supersede-only; the last
+# one specifically feeds confidence computation, so in-place editing it
+# would silently drift a derived value). No trust/security weight on either
+# mutable field, so no approval gate.
+#
+# situation_pattern updates run the SAME #1864 prose-shape gate
+# _add_lesson_impl runs at creation: a non-empty value must compile as a
+# regex and must not read as prose (_looks_like_prose) unless
+# bypass_prose_check=true is passed. Clearing to "" is always ungated —
+# falling back to locus-3 semantic-only recall is a legitimate correction.
+# scaffolding_nudge is free text with no analogous failure mode, so it has
+# no gate at all.
+#
+# Single-payload signature, per this repo's MCP tool parameter-style
+# convention.
+@mcp.tool(
+    name="engram_update_lesson",
+    annotations={
+        "title": "Update Mutable Fields on a Lesson Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_update_lesson(payload_json: str) -> str:
+    """Update mutable fields on an existing lesson node in-place.
+
+    No supersede, no new node — modifies metadata directly. Records prior
+    values in metadata.field_traces (append-only), same structure as
+    engram_update_person. Also logged to the edit_history audit table
+    (action="lesson_field_updated") — an in-place update still shows up as
+    a graph-mutation event, distinct from creating a new node.
+
+    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
+    scaffolding_nudge — mechanical retrieval/actionability metadata you can
+    refine from real firing experience, never the lesson's epistemic content
+    (claim, logical_chain, confidence, reasoning_type stay supersede-only).
+
+    situation_pattern, set to a non-empty value, runs the SAME #1864
+    prose-shape gate engram_add_lesson runs at creation time — must compile
+    as a regex, and must not look like prose (over 8 literal spaces) unless
+    bypass_prose_check=true is passed. Clearing situation_pattern to "" is
+    always allowed, ungated — falling back to locus-3 semantic-only recall
+    is a legitimate correction, not a prose violation. scaffolding_nudge has
+    no such gate — it's free text, not a regex, so there's no prose-shape
+    failure mode to guard against. No approval gate on either field: neither
+    carries trust/security weight (#1826's own scoping call).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): Lesson node ID (ls_NNNN). Must be
+                type='lesson' and is_current=1.
+            updates (dict, required): Map of field → new_value. Mutable
+                fields: situation_pattern, scaffolding_nudge. Attempting to
+                update any other field returns an error.
+            reason (str, optional): Human-readable explanation for the change.
+            bypass_prose_check (bool, optional): Default False. Same
+                override semantics as engram_add_lesson's field of the same
+                name — only has an effect when the new situation_pattern
+                value looks like prose; the lesson's metadata is stamped
+                bypass_prose_check: true only when the gate actually fired
+                and was overridden, never merely because the flag was passed.
+                Has no effect on scaffolding_nudge.
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta. On
+        any validation failure (unknown field, node not found / wrong type /
+        not current, invalid regex, or prose-shaped pattern without
+        bypass_prose_check), returns {"error": "..."}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _UPDATE_LESSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UPDATE_LESSON_FIELDS)}"
+        })
+
+    # Ensure updates is a dict, not a string or list.
+    if "updates" in params and not isinstance(params["updates"], dict):
+        return json.dumps({
+            "error": (
+                f"'updates' must be a JSON object (dict of field → value), "
+                f"got {type(params['updates']).__name__}."
+            )
+        })
+
+    return _update_lesson_impl(
+        node_id=params.get("node_id", ""),
+        updates=params.get("updates", {}),
+        reason=params.get("reason", ""),
+        bypass_prose_check=params.get("bypass_prose_check", False),
+    )
 
 
 _REGISTER_EXEMPLAR_FIELDS = frozenset({
