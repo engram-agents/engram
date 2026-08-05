@@ -9,7 +9,20 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-_Nothing yet — changes land here after the v0.3.2-rc1 cut._
+### Added
+
+- **Weight-aging dream-fairy lottery** (#1901) — the sleep cycle's Phase B no
+  longer dispatches all 9 dream-fairy scan categories every night. A
+  weight-aging lottery (`tools/dream_lottery.py`) draws one category per
+  sleep by default (all-8-nightly was the heaviest recurring token spend for
+  a mostly-zero-findings scan at current graph sizes), with an urgency
+  interrupt that force-includes cascade-sensitive categories when the day's
+  retraction/supersede activity crosses a threshold. The always-on
+  batch-summary (`recall_summary`) step is untouched. Fixed the one genuine
+  runs-every-day assumption the audit found: Category 7 (missing
+  principle-edges) now scans from a per-type watermark instead of "since last
+  sleep", so a category that goes several nights between draws doesn't
+  silently narrow its window to nothing.
 
 ## [v0.3.2] - 2026-08-03
 

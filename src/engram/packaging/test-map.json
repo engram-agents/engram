@@ -270,6 +270,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/dream_lottery.py",
+      "test_globs": [
+        "tests/test_dream_lottery.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/config_schema.py",
       "test_globs": [
         "tests/test_config_schema.py"

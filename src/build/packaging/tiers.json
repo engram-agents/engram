@@ -148,6 +148,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/dream_lottery.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/recall_summary_payload.py",
       "tier": "essential"
     },

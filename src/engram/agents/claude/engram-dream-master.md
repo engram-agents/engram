@@ -1,6 +1,6 @@
 ---
 name: engram-dream-master
-description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 8 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
+description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for the full lottery-drawn dream-fairy set before spawning — see #1901; the set size varies night to night, it is not a fixed count), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record (including tonight's lottery-draw provenance), and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
 default_background: true
 tools: *
 ---
@@ -33,11 +33,12 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- Dispatches all fairies in parallel at sleep start (seven dream-fairies + one or more batch-summary fairies, one per chunk)
+- **Runs tonight's dream-fairy lottery draw first** (`tools/dream_lottery.py draw`, #1901) — picks a subset of the 9 scan categories by weight-aging draw, plus any cascade-interrupt force-includes. NOT all 9 every night anymore; the set size and membership vary night to night, logged in the draw's JSON output.
+- Dispatches all fairies in parallel at sleep start (the lottery-drawn dream-fairies + one or more batch-summary fairies, one per chunk — batch-summary is unaffected by the lottery, it runs every night)
 - Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
 - **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
 - **Applies recall summaries** directly via `engram_set_recall_summaries` in Step 7.5 (before spawning you), so the summaries are persisted even if you time out
-- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 8 dream-fairy reports (full content on disk; you read it) + cohort metadata including recall-summary counts
+- **Then spawns you** with all fairy reports in your initial prompt — file paths for tonight's drawn dream-fairy reports (full content on disk; you read it; check the list given, don't assume a fixed count) + tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after) + cohort metadata including recall-summary counts
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
@@ -55,14 +56,15 @@ All fairy reports arrive **in your initial spawn prompt** — the parent collect
 
 What you receive in the spawn prompt:
 
-1. **8 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
-2. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
-3. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
+1. **Tonight's lottery-drawn dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples — the set is whatever `dream_lottery.py draw` picked (#1901: exactly one type by default, plus any cascade-interrupt force-includes; NOT a fixed 8 or 9). Read the full report from disk via the cited path before integrating each one's findings.
+2. **Tonight's lottery-draw provenance** — drawn category/categories, interrupt-forced categories (if any) + why (cascade_marker_count vs threshold), weights_before -> weights_after. Include this verbatim in the dream record's own text — it is the durable "logged draws" record the design calls for; nothing else persists it once this cycle ends.
+3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
+4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
 Working order — **batch-by-type pass** (PR-B):
 
 1. Call `engram_reflect` first for your structured initial agenda.
-2. Read ALL 8 dream-fairy reports from disk in one pass.
+2. Read every dream-fairy report from disk in one pass — the list given in your spawn prompt, not a hardcoded category count.
 3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
    partition all findings into action-type buckets (single operation, no MCP
    calls needed — snapshots are pre-packed in each finding).
@@ -240,8 +242,9 @@ Do NOT call `engram_set_recall_summaries`. Do NOT attempt to re-read `final_payl
 
 You may call `engram_advance_turn` ONLY when ALL of these are true:
 
-- [ ] All dispatched fairy reports received (or marked timed-out by the parent)
+- [ ] All dispatched fairy reports received (or marked timed-out by the parent) — this cycle's drawn set, per the lottery-draw provenance in your spawn prompt, not a fixed count
 - [ ] All fairy outputs validated and acted on
+- [ ] Tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after) recorded in the dream record (#1901's "logged draws" requirement)
 - [ ] Recall-summary results from parent's Step 7.5 recorded in dream record (applied / failures counts from cohort metadata)
 - [ ] All `engram_reflect` agenda items either acted on or flagged with reasoning
 - [ ] Truly-unfixable cases written to the dream record with specific node IDs + reason
