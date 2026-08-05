@@ -44,6 +44,17 @@ now spread across a longer inter-draw gap. Flagged in the audit, not solved
 here; a timed-out lottery draw is a rare event, not a routine correctness
 gap.
 
+Re-entrancy (issue #1907): a real (non-dry-run) `draw` refuses to run a
+second time for the same ``--turn`` -- re-running would double-apply the
+aging step and silently corrupt the sequence. Override with ``--force``
+if you genuinely mean it (e.g. recovering from a bad prior run). Dry-runs
+are exempt since they never persist. The guard's signal is "did any
+category's ``last_run_turn`` get stamped this turn" -- which only happens
+for types in ``ran_keys`` (drawn ∪ interrupt-forced). A ``--count 0`` draw
+with no interrupt firing would leave ``ran_keys`` empty and silently
+defeat the guard (caught by reviewer-fairy on #1912's own review, verified
+live before shipping); ``--count`` is therefore rejected below 1.
+
 History file (issue #1909): ``~/.engram/dream-lottery-history.jsonl`` —
 derived from the state path (``dream-lottery.json`` ->
 ``dream-lottery-history.jsonl``, same directory), not a fixed path, so a
@@ -74,6 +85,7 @@ as of #1901's filing). Flagged for Kepler/Lei's read; override via
 
 Usage:
     python -m tools.dream_lottery draw --db ~/.engram/knowledge.db --turn 39
+    python -m tools.dream_lottery draw --turn 39 --force  # override the re-entrancy guard
     python -m tools.dream_lottery status
     python -m tools.dream_lottery history --limit 30
 """
@@ -127,7 +139,10 @@ CATEGORIES: dict[int, str] = {
 # Categories whose scan is genuinely window-scoped (per the #1901 audit --
 # see docs/ audit note / PR description). Everything else runs a full-graph
 # scan every time it's drawn, so a per-type watermark is informational only
-# for those, not load-bearing.
+# for those, not load-bearing. Category 6's watermark specifically backs
+# its INLINE FALLBACK path only -- the primary engram_query_pattern path is
+# self-relative and needs no watermark at all (Luria's #1903 review note);
+# category 7 is watermark-scoped throughout, no such split.
 WINDOW_SCOPED_CATEGORIES: frozenset[int] = frozenset({6, 7})
 
 # See module docstring -- this module's own reading of "cascade/contradiction
@@ -205,8 +220,13 @@ def append_history(result: dict, path: str = DEFAULT_HISTORY_PATH) -> None:
 def count_cascade_markers(db_path: str, since_iso: str | None) -> int:
     """Count edit_history rows for cascade-producing actions since `since_iso`.
 
-    `since_iso=None` counts across all of history (used only when the state
-    file has never recorded a check -- first-ever draw on a fresh install).
+    `since_iso=None` counts across all of history. NOT reached by
+    `run_draw`'s cold-start path -- that branch short-circuits to a
+    baseline of 0 rather than ever calling this function with `None` (see
+    the cold-start comment in `run_draw`; caught by Borges reviewing
+    #1910, #1907). This all-history mode is exercised only by a direct
+    call (e.g. tests) or a future explicit audit path, not by the normal
+    draw flow.
     """
     conn = sqlite3.connect(db_path)
     try:
@@ -341,8 +361,82 @@ def run_draw(
     return {"state": new_state, "result": result}
 
 
+def _already_drawn_this_turn(state: dict, turn: int) -> bool:
+    """True if some category's `last_run_turn` already equals `turn` --
+    i.e. a real (non-dry-run) draw has already run for this turn.
+
+    Re-running `draw` for the same turn would double-apply the aging step
+    (this turn's winners get re-reset to 0, this turn's losers age a
+    second time before the next real turn even happens), silently
+    corrupting the weight-aging sequence. See #1907.
+    """
+    return any(v.get("last_run_turn") == turn for v in state["types"].values())
+
+
+def _validate_draw_args(args: argparse.Namespace) -> str | None:
+    """Reject nonsensical integer CLI args before any work happens.
+
+    Returns an error message string if invalid, ``None`` if OK. This is a
+    class-level fix, not a one-off: this module has several unvalidated
+    integer CLI args (``--count``, ``--limit``, ``--interrupt-threshold``,
+    ``--turn``), and three independent failures were found in one review
+    pass on #1912 (Sol's reviewer-fairy: ``--count 0`` silently defeats the
+    re-entrancy guard; Borges: ``--interrupt-threshold 0`` fires the
+    interrupt unconditionally on a night with zero cascade activity,
+    silently disabling the lottery's whole rotation premise). Each arg
+    gets an explicit, named decision here rather than three independent
+    patches, so a fourth bad value doesn't wait for a fourth reviewer to
+    notice it by hand:
+
+    - ``--count < 1``: REJECTED. A draw that draws nothing has no design
+      purpose, and when no interrupt fires it also silently defeats the
+      re-entrancy guard (no category's ``last_run_turn`` gets stamped, so
+      a same-turn re-run is never detected).
+    - ``--interrupt-threshold < 1``: REJECTED. ``interrupt_fired =
+      cascade_count >= interrupt_threshold`` is unconditionally true for
+      any ``threshold <= 0`` (cascade_count is never negative), which is
+      also the exact value someone would plausibly type meaning "no
+      threshold" -- the opposite of what it actually does.
+    - ``--limit`` (history subcommand, not draw): deliberately NOT a
+      reject case. ``<= 0`` is a documented sentinel meaning "no limit"
+      (issue #1911) -- handled in ``tally_history``, not here.
+    - ``--turn``: NOT validated here. No concrete failure mode has been
+      found for a non-positive turn number (the re-entrancy guard and the
+      aging logic are turn-sign-agnostic) -- left open pending a real
+      case rather than guarded against a hypothetical one.
+    """
+    if args.count < 1:
+        return (
+            f"--count must be >= 1 (got {args.count}). A draw that draws nothing "
+            "has no design purpose and, when no interrupt fires, silently defeats "
+            "the re-entrancy guard (no category's last_run_turn gets set, so a "
+            "same-turn re-run is never detected)."
+        )
+    if args.interrupt_threshold < 1:
+        return (
+            f"--interrupt-threshold must be >= 1 (got {args.interrupt_threshold}). "
+            "interrupt_fired = cascade_count >= interrupt_threshold is "
+            "unconditionally true for threshold <= 0, silently forcing the "
+            "interrupt-mapped categories in every night regardless of real "
+            "cascade activity."
+        )
+    return None
+
+
 def cmd_draw(args: argparse.Namespace) -> int:
+    validation_error = _validate_draw_args(args)
+    if validation_error:
+        print(f"error: {validation_error}", file=sys.stderr)
+        return 1
     state = load_state(args.state)
+    if not args.dry_run and not args.force and _already_drawn_this_turn(state, args.turn):
+        print(
+            f"error: a draw already ran for turn {args.turn} (state: {args.state}). "
+            "Re-running would double-apply the aging step and corrupt the sequence. "
+            "Pass --force to override.",
+            file=sys.stderr,
+        )
+        return 1
     interrupt_types = (
         frozenset(int(x) for x in args.interrupt_types.split(","))
         if args.interrupt_types
@@ -414,19 +508,23 @@ def tally_history(path: str, limit: int | None = None) -> dict:
     ``skipped_malformed`` rather than raising -- one bad line must not hide
     every good one before/after it.
 
-    ``limit`` (if given) restricts the tally to the most recent N raw
-    lines in the file (append-only, so "most recent" == "last N lines"),
-    matching before parsing/validity-filtering -- consistent with "the
-    most recent N cycles" read as "the most recent N draw attempts",
-    malformed or not.
+    ``limit`` (if given and positive) restricts the tally to the most
+    recent N raw lines in the file (append-only, so "most recent" ==
+    "last N lines"), matching before parsing/validity-filtering --
+    consistent with "the most recent N cycles" read as "the most recent N
+    draw attempts", malformed or not. `limit=None` OR `limit <= 0` both
+    mean NO restriction -- `--limit 0` is the natural way to type "no
+    limit", and a silent empty tally there would be a false-clean in a
+    diagnostic tool (indistinguishable from "no draws recorded"); see
+    #1911.
     """
     p = Path(path)
     if p.exists():
         lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
     else:
         lines = []
-    if limit is not None:
-        lines = lines[-limit:] if limit > 0 else []
+    if limit is not None and limit > 0:
+        lines = lines[-limit:]
 
     per_category = {
         str(n): {
@@ -512,11 +610,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_draw.add_argument("--state", default=DEFAULT_STATE_PATH, help="Path to dream-lottery.json")
     p_draw.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to knowledge.db")
     p_draw.add_argument("--turn", type=int, required=True, help="Current turn number (pre-advance)")
-    p_draw.add_argument("--count", type=int, default=1, help="Types to draw (default 1; design allows raising to 2 later)")
+    p_draw.add_argument("--count", type=int, default=1, help="Types to draw (default 1; design allows raising to 2 later; must be >= 1)")
     p_draw.add_argument("--interrupt-types", default=None, help="Comma-separated category numbers force-included on cascade interrupt (default: 2,5)")
-    p_draw.add_argument("--interrupt-threshold", type=int, default=DEFAULT_INTERRUPT_THRESHOLD, help="Cascade-marker count that triggers the interrupt")
+    p_draw.add_argument("--interrupt-threshold", type=int, default=DEFAULT_INTERRUPT_THRESHOLD, help="Cascade-marker count that triggers the interrupt (must be >= 1)")
     p_draw.add_argument("--seed", type=int, default=None, help="Seed the RNG (testing/reproducibility only)")
     p_draw.add_argument("--dry-run", action="store_true", help="Compute and print the draw without persisting state")
+    p_draw.add_argument(
+        "--force",
+        action="store_true",
+        help="Override the same-turn re-entrancy guard (corrupts the aging sequence if misused)",
+    )
     p_draw.add_argument(
         "--history",
         default=None,
@@ -539,7 +642,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to dream-lottery-history.jsonl (default: derived from --state)",
     )
-    p_history.add_argument("--limit", type=int, default=None, help="Restrict tally to the most recent N cycles")
+    p_history.add_argument("--limit", type=int, default=None, help="Restrict tally to the most recent N cycles (0 or negative = no limit)")
     p_history.set_defaults(func=cmd_history)
 
     return parser

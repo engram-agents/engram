@@ -54,6 +54,33 @@ Covers:
     26. A malformed/truncated line is skipped and counted in
         `skipped_malformed`, not fatal.
     27. A missing history file tallies as a valid, all-zero empty result.
+
+  re-entrancy guard (issue #1907):
+    28. A second real draw for the same --turn is refused (non-zero exit,
+        no second state/history write) unless --force is passed.
+    29. --force overrides the guard and the second draw proceeds normally.
+    30. --dry-run is exempt from the guard even when a real draw already
+        ran this turn (dry-run never persists, so nothing to corrupt).
+    31. A draw for a genuinely different --turn is never blocked.
+
+  history --limit false-clean fix (issue #1911):
+    32. --limit 0 means "no limit", not "return nothing".
+    33. A negative --limit also means "no limit".
+    34. A positive --limit still restricts to the most recent N raw lines
+        (sanity-checks the existing behavior stays intact).
+
+  --count validation (reviewer-fairy finding on #1912's own review):
+    35. --count 0 is rejected outright, before any write.
+    36. A negative --count is rejected outright, before any write.
+    37. Regression: two real --count 0 draws for the same turn both used
+        to succeed silently (the guard's blind spot) -- both must now be
+        rejected.
+
+  --interrupt-threshold validation (Borges's third instance of the class):
+    38. --interrupt-threshold 0 is rejected outright, before any write.
+    39. A negative --interrupt-threshold is rejected outright.
+    40. Regression: threshold 0 against a graph with zero cascade activity
+        used to still report interrupt_fired=True -- must now be rejected.
 """
 
 from __future__ import annotations
@@ -565,3 +592,201 @@ def test_missing_history_file_returns_empty(tmp_path):
     assert tally["first_timestamp"] is None
     assert tally["last_timestamp"] is None
     assert all(c["total_runs"] == 0 for c in tally["categories"])
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy guard (issue #1907)
+# ---------------------------------------------------------------------------
+
+def test_second_draw_same_turn_is_refused(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    rc1 = _draw_cli(state_path, db, turn=5, seed=1)
+    state_after_first = state_path.read_text()
+    capsys.readouterr()
+    assert rc1 == 0
+
+    rc2 = _draw_cli(state_path, db, turn=5, seed=2)
+    out = capsys.readouterr()
+    assert rc2 != 0
+    assert "already ran" in out.err.lower()
+    # Neither state nor history changed as a result of the refused draw.
+    assert state_path.read_text() == state_after_first
+    assert len(history_path.read_text().splitlines()) == 1
+
+
+def test_force_overrides_reentrancy_guard(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    rc1 = _draw_cli(state_path, db, turn=5, seed=1)
+    capsys.readouterr()
+    assert rc1 == 0
+
+    rc2 = _draw_cli(state_path, db, turn=5, seed=2, extra=["--force"])
+    capsys.readouterr()
+    assert rc2 == 0
+    # The forced second draw for the same turn re-applied the aging step --
+    # two history lines now exist, both stamped turn=5.
+    lines = history_path.read_text().splitlines()
+    assert len(lines) == 2
+    assert all(json.loads(ln)["turn"] == 5 for ln in lines)
+
+
+def test_dry_run_bypasses_reentrancy_guard(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc1 = _draw_cli(state_path, db, turn=5, seed=1)
+    capsys.readouterr()
+    assert rc1 == 0
+
+    rc2 = _draw_cli(state_path, db, turn=5, seed=2, dry_run=True)
+    out = capsys.readouterr()
+    assert rc2 == 0
+    result = json.loads(out.out)
+    assert result["turn"] == 5
+
+
+def test_different_turn_draw_is_allowed(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    rc1 = _draw_cli(state_path, db, turn=5, seed=1)
+    capsys.readouterr()
+    assert rc1 == 0
+
+    rc2 = _draw_cli(state_path, db, turn=6, seed=2)
+    capsys.readouterr()
+    assert rc2 == 0
+    assert len(history_path.read_text().splitlines()) == 2
+
+
+# ---------------------------------------------------------------------------
+# history --limit false-clean fix (issue #1911)
+# ---------------------------------------------------------------------------
+
+def _write_n_history_lines(path: Path, n: int) -> None:
+    lines = [
+        json.dumps(
+            {
+                "turn": i,
+                "now": f"2026-08-0{i}T00:00:00Z",
+                "drawn_types": [1],
+                "interrupt_types": [],
+                "interrupt_fired": False,
+            },
+            sort_keys=True,
+        )
+        for i in range(1, n + 1)
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_limit_zero_means_no_limit(tmp_path):
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    _write_n_history_lines(history_path, 3)
+    tally = tally_history(str(history_path), limit=0)
+    assert tally["cycles_counted"] == 3
+
+
+def test_limit_negative_means_no_limit(tmp_path):
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    _write_n_history_lines(history_path, 3)
+    tally = tally_history(str(history_path), limit=-1)
+    assert tally["cycles_counted"] == 3
+
+
+def test_limit_positive_restricts_to_last_n(tmp_path):
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    _write_n_history_lines(history_path, 5)
+    tally = tally_history(str(history_path), limit=2)
+    assert tally["cycles_counted"] == 2
+    # the last 2 of 5 lines are turns 4 and 5
+    assert tally["categories"][0]["last_run_turn"] == 5
+
+
+# ---------------------------------------------------------------------------
+# --count validation (reviewer-fairy finding on #1912's own review):
+# --count 0 (or negative) with no interrupt firing leaves ran_keys empty,
+# so no category's last_run_turn gets stamped and the re-entrancy guard
+# silently never fires -- verified live via a real two-invocation CLI
+# reproduction before this fix shipped.
+# ---------------------------------------------------------------------------
+
+def test_count_zero_is_rejected(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=5, extra=["--count", "0"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "count must be" in out.err.lower()
+    assert not state_path.exists()
+
+
+def test_count_negative_is_rejected(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=5, extra=["--count", "-3"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "count must be" in out.err.lower()
+    assert not state_path.exists()
+
+
+def test_count_zero_no_longer_defeats_reentrancy_guard(tmp_path, capsys):
+    """Regression test for the reviewer-fairy's exact reproduction: two
+    real `draw --turn 5 --count 0` calls against the same state file used
+    to both succeed (rc=0), silently double-aging every category's weight
+    with no category's last_run_turn ever getting stamped. Both calls must
+    now be rejected before touching state at all."""
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc1 = _draw_cli(state_path, db, turn=5, extra=["--count", "0"])
+    rc2 = _draw_cli(state_path, db, turn=5, extra=["--count", "0"])
+    capsys.readouterr()
+    assert rc1 != 0
+    assert rc2 != 0
+    assert not state_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# --interrupt-threshold validation (Borges's third instance of the same
+# class, found on #1912's own review): threshold <= 0 makes
+# `interrupt_fired = cascade_count >= interrupt_threshold` unconditionally
+# true, silently forcing the interrupt-mapped categories in every single
+# night regardless of real cascade activity.
+# ---------------------------------------------------------------------------
+
+def test_interrupt_threshold_zero_is_rejected(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "0"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "interrupt-threshold must be" in out.err.lower()
+    assert not state_path.exists()
+
+
+def test_interrupt_threshold_negative_is_rejected(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "-1"])
+    out = capsys.readouterr()
+    assert rc != 0
+    assert "interrupt-threshold must be" in out.err.lower()
+    assert not state_path.exists()
+
+
+def test_interrupt_threshold_zero_no_longer_fires_unconditionally(tmp_path, capsys):
+    """Regression test for Borges's exact reproduction: threshold=0 (or
+    negative) against a graph with ZERO cascade activity used to still
+    report interrupt_fired=True, silently forcing categories 2/5 in every
+    night and defeating the lottery's whole rotation premise. Must now be
+    rejected before any draw computation happens."""
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])  # zero cascade rows
+    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "0"])
+    capsys.readouterr()
+    assert rc != 0
+    assert not state_path.exists()

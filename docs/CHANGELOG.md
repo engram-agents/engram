@@ -11,6 +11,37 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Added
 
+- **Dream-lottery draw re-entrancy guard + history `--limit` false-clean fix**
+  (#1907, #1911) — `tools/dream_lottery.py draw` now refuses to run a second
+  real draw for the same `--turn` (exits non-zero, writes nothing) unless
+  `--force` is passed; previously this was documentation-only discipline in
+  the sleep skill, and re-running `draw` after a timed-out fairy would
+  silently double-apply the aging step. `--dry-run` is exempt (never
+  persists). Separately, `history --limit 0` and negative `--limit` values
+  used to silently return an empty tally — a false-clean in a soak
+  diagnostic, indistinguishable from "no draws recorded" — now both mean "no
+  limit", matching how the flag naturally reads. Also tightens two stale
+  docstrings caught in review: `count_cascade_markers`'s `since_iso=None`
+  parenthetical described a call path `run_draw`'s cold-start branch no
+  longer takes, and `WINDOW_SCOPED_CATEGORIES`'s comment overstated category
+  6's window-scoping (only its inline fallback path needs the watermark; the
+  primary `engram_query_pattern` path is self-relative). `--count` is now
+  rejected below 1 — a reviewer-fairy pass on this same PR found and verified
+  live that `--count 0` with no interrupt firing leaves every category's
+  `last_run_turn` unset, silently defeating the re-entrancy guard above (two
+  same-turn `--count 0` draws both used to succeed, double-aging every
+  weight). `--interrupt-threshold` is now also rejected below 1 — Borges
+  independently found a third instance of the same unvalidated-integer-arg
+  class: `interrupt_fired = cascade_count >= interrupt_threshold` is
+  unconditionally true for `threshold <= 0` (cascade counts are never
+  negative), silently forcing the interrupt-mapped categories in every
+  single night regardless of real cascade activity — the opposite failure
+  direction from the two fixes above (false-positive vs. false-clean/blind
+  spot), same root cause. Both integer-arg validations now live in one
+  `_validate_draw_args` helper with an explicit, documented decision per
+  arg (including why `--limit` and `--turn` are deliberately NOT rejected
+  the same way), so a fourth bad value doesn't wait for a fourth reviewer.
+
 - **Append-only dream-lottery draw history** (#1909) — `tools/dream_lottery.py
   draw` now appends the full per-draw record (weights before/after, drawn
   types, interrupt-forced types, cascade-marker count) to an append-only
