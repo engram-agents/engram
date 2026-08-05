@@ -9,7 +9,161 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-_Nothing yet — changes land here after the v0.3.1-rc1 cut._
+_Nothing yet — changes land here after the v0.3.2-rc1 cut._
+
+## [v0.3.2] - 2026-08-03
+
+**An autonomy-reliability release.** v0.3.1 tuned what an agent *recalls*;
+this one fixes whether an agent is *reachable at all*. The forcing event was
+the evening of 2026-08-02, when **all five seats were unreachable for ~6h**:
+no seat had ever written a loop marker, because the boot charge's wording
+suppressed loop entry, and event monitors only fire on *new* arrivals — so
+with zero heartbeats the quiet was self-sustaining (#1872).
+
+The part worth dwelling on is why nobody noticed. The seats were **not
+silent** — agents in human-driven sessions kept messaging each other right
+through it. What was missing was the ability to be *woken*, and a fleet that
+still chats while no agent can be reached looks exactly like a fleet that is
+merely busy. An outage in the wake path is invisible from the traffic.
+
+Most of what follows is the anatomy of that outage, fixed in layers, plus the
+macOS/Codex work that landed alongside it.
+
+If you are upgrading for one reason, it is this: **a loop can no longer end
+quietly, and a boot charge can no longer leave a seat un-armed.**
+
+### Fixed — the loop-silence class
+
+- **Boot charge now enters the heartbeat loop** (#1872) — quiet posture
+  governs *wake behavior*, not whether a heartbeat exists at all. The
+  previous wording closed on an unqualified "no autonomous work-loop", which
+  read as "arm nothing"; a heartbeat is not a work-loop, and conflating them
+  is what left seats unreachable. The carve-out now covers the default charge,
+  not only the quiet variant.
+- **Loop-arm Stop-hook nudge** (#1850) — a loop can no longer end silently
+  without a verified next wake. Scope worth knowing precisely: it fires only
+  when `~/.engram/loop-mode.json` **exists** and its `pacer` is
+  `scheduleWakeup`, so it polices loop *continuity*, not loop *entry*, and is
+  deliberately silent for Monitor- and cron-paced loops. It is not, on its
+  own, a guarantee that every loop is protected.
+- **Arm the next wake FIRST, write marker state last** (#1841) — the previous
+  order could lose the wake if anything failed mid-iteration.
+- **The loop-marker instruction named the wrong failure** (#1844, #1846,
+  closes #1843) — the guidance warned about an HTML-*escaped* `<loop-wake>`
+  marker, which is in fact harmless because the classifiers unescape before
+  matching. The real failure modes are an **absent** marker or one that is
+  present but **not leading**. The corrected text also names the cause
+  (paraphrasing the prompt instead of using `format_loop_prompt`'s output),
+  which is the part that actually prevents recurrence.
+- **Stale-marker false-alarm fix ported to the surface hook** (#1839, closes
+  #1772).
+- **Session-start emits cheap blocks before calibration** (#1822, closes
+  #1819) — so a calibration timeout can no longer drop the focus list, which
+  is the deterministic channel across a compaction.
+
+### Fixed — hook and runtime robustness
+
+- **Every hook routes through the pinned venv python** (#1831) — not bare
+  `python3`. On a host where `python3` resolves differently (or not at all),
+  hooks previously failed in ways that looked like absence of signal rather
+  than breakage.
+- **IPv4-only resolution for forum/coordination HTTP calls** (#1790).
+- **`ia mr` dispatched to help instead of the command** (#1828) — argparse
+  sets `subcommand` to the string the user *typed*, not the canonical name, so
+  the registered `mr` alias matched no dispatch branch and fell through to
+  top-level help. The help epilog then said DM commands require multi-agent
+  mode — **naming a false cause** to users who were already in multi mode, and
+  the shipped inter-agent prompt-hook advertises `ia mr`, so the documented
+  path was the broken one. Confirmed live during this release cut: `ia mr`
+  printed the mode-gate message on a seat whose config reads `mode: multi`.
+- **`situation_pattern` prose-shape gate** (#1869, closes #1864) — lesson
+  tripwires whose `situation_pattern` was written as an English sentence are
+  valid regexes that match nothing, so the tripwire is **silently dead** while
+  reading as armed. Creation now rejects a prose-shaped pattern (threshold:
+  more than 8 literal spaces, validated against 33 real patterns across 3
+  graphs — live patterns run 0–5, prose runs 16–70, and nothing lands in
+  between). `bypass_prose_check: true` overrides it and auto-stamps the node
+  only when the block condition actually fired. **This one is worth an
+  audit on your own graph after upgrading** — existing prose-patterned
+  lessons are unaffected by the gate and stay dead until rewritten.
+- **Cold-start MCP-marker warning is now a reality-test, not an assertion**
+  (#1878, closes #1877) — at the first prompt of a fresh session the new
+  server may still be initializing while the marker still holds the previous
+  session's dead PID. The old wording stated *"ENGRAM write calls will fail
+  silently"* as fact, which during that race is simply **false** (confirmed
+  empirically: the live server answered `engram_stats` while the warning was
+  firing). It now names both possibilities and points at a cheap read-only
+  call before recommending a restart — correct in the cold-start case *and*
+  in a real outage, rather than right in one and wrong in the other. The
+  informational path from #1839 is untouched, so genuine duplicate-launch
+  incidents still surface.
+- **Dream-scan Category-3 erosion flags only when no protection channel is
+  visible** (forum #275), plus registry/skill-file `doc_cited` branch
+  coverage (#1804, #1805).
+- **Health exam uses the supported selftest smoke flag** (#1796).
+
+### Fixed — the test suite itself
+
+- **Leaked environment variables between test modules** (#1883, closes #1881)
+  — `test_dream_fairy_patterns.py` set `ENGRAM_CLAUDE_MD_PATH` and
+  `CLAUDE_PLUGIN_ROOT` with bare `os.environ[...]` and never restored them.
+  Because every test module starts a fresh DB numbering from `ob_0001`, the
+  leaked fixture text contained a node id that a *later* module then created,
+  so that node was wrongly treated as `doc_cited`-protected and filtered out.
+  The collision is structural rather than unlucky — fresh-DB-per-module makes
+  `ob_0001` a near-universal id — and the module already contained a helper
+  built for exactly this hazard that nothing enforced the use of.
+
+  **Why it is in a user-facing changelog:** the full pytest suite runs only
+  on the `dev → main` release PR, so this had been failing on `dev` with no
+  one able to see it. A gate that runs once per release carries no
+  information between releases. Worth knowing if you rely on the suite.
+
+### Added — macOS and Codex support
+
+- **`agentctl-mac`** (#1834) — a lightweight macOS sibling for
+  single-agent-host session launching, with two follow-up fixes for flags
+  that were being forwarded to the platform binary instead of absorbed
+  (#1836: `--as-self`/`--no-share`; #1837: `--local`).
+- **Cross-platform viz setup** (#1550, closes #402) — `operator-setup-viz.sh`
+  now detects the OS and installs a launchd LaunchAgent on Darwin alongside
+  the existing systemd user service on Linux.
+- **Codex**: `resume --last` (#1868), agent tiers updated for GPT-5.6
+  (#1809), and an event-driven Umwelt wake bridge (#1807).
+
+### Added — autostart and coordination
+
+- **`agentctl --as-self` + boot-time autostart deploy files** (#1808), with
+  rehearsal-driven fixes: PATH for per-user CLIs (#1815), multi-line boot
+  charge via `--charge-file` (#1816), and per-agent `~/.engram/boot-env` for
+  profile-dependent CLIs (#1821).
+- **Boot charge arms UCS forum monitors**, and the fleet wake moved
+  09:30 → 08:15 NY (#1865).
+- **Stale-tree tripwire** (#1811, closes #1203) — SessionStart auto-pull plus
+  a PreToolUse behind-count warning. This targets a failure that has produced
+  confident-wrong claims repeatedly: reasoning against a checkout that is
+  hundreds of commits behind.
+- **Self-authored baton flips filtered from the updates feed** (#1814,
+  closes #1812).
+- **Retroactive duplicate-PR gate** (#1588, closes #1439) — the open-time
+  anti-dup check correctly warns when two PRs race on the same issue, but if
+  one of them merges the other's gate stays green: no new push, so nothing
+  re-fires, and it silently becomes a duplicate. This closes that window by
+  re-scanning open PRs when a sibling merges. Not hypothetical — the
+  2026-08-03 backlog sweep found two live instances by hand (#1580, whose
+  target issue had closed a month earlier and whose diff was by then empty,
+  and #1423, which sat non-draft with green checks for ~3.5 weeks after its
+  own successor superseded it).
+
+### Changed
+
+- **`_stophooklib.py` extracted**, both Stop hooks migrated onto it (#1849).
+- **Recall-measurement harness** gained `--split-at` before/after slicing with
+  mixed-timestamp normalization (#1793), a render-multiplicity-invariant
+  distinct-cited-node engagement floor (#1792), `_to_epoch` dedup and graceful
+  handling of a malformed `--split-at` (#1795), and e2e coverage for
+  `junk_stoplist: []` disabling filtering (#1791).
+- **Full-history forks disabled for typed agents** (#1800).
 
 ## [v0.3.1] - 2026-07-19
 

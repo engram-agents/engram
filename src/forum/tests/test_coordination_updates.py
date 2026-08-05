@@ -73,11 +73,12 @@ class StubStore(CoordinationStore):
 
 
 def _proj(pid, turn, seq, *, status="in-progress", title="t", reason="r",
-          turn_since="2026-06-26T00:00:00Z"):
+          turn_since="2026-06-26T00:00:00Z", turn_by=""):
     return ProjectRecord(
         project_id=pid, title=title, status=status, turn=turn,
         turn_since=turn_since, turn_reason=reason,
         participants=("ariadne", "borges"), seq=seq, raw="",
+        turn_by=turn_by,
     )
 
 
@@ -169,6 +170,61 @@ def test_baton_empty_turn_since_ships_empty_event_ts_not_none():
     item = _build(store, "ariadne")["updates"][0]
     assert item["event_ts"] == ""          # present + empty, NOT None / NOT missing
     assert item["event_ts"] is not None
+
+
+# ---------------------------------------------------------------------------
+# baton self-exclusion (turn_by) — #1812
+# ---------------------------------------------------------------------------
+def test_baton_self_flip_excluded():
+    # agent A (ariadne) flipped the baton to A (by_agent=A too) — self-authored,
+    # redundant to notify: A already knows A's own turn.
+    store = StubStore(projects=[
+        _proj("PR-self", turn="ariadne", seq=10, turn_by="ariadne"),
+    ])
+    out = _build(store, "ariadne")
+    assert out["updates"] == []
+
+
+def test_baton_peer_flip_still_notifies():
+    # agent B (borges) flipped the baton INTO A's (ariadne's) court — the
+    # invariant this feature must preserve: only self→self is filtered.
+    store = StubStore(projects=[
+        _proj("PR-peer", turn="ariadne", seq=10, turn_by="borges"),
+    ])
+    out = _build(store, "ariadne")
+    assert [(u["kind"], u["project_id"]) for u in out["updates"]] == [("baton", "PR-peer")]
+    assert out["updates"][0]["turn_by"] == "borges"
+
+
+def test_baton_self_init_excluded():
+    # A initialised a new baton with turn=A, by_agent=A — same self-authored
+    # shape as a self-flip; must not appear in A's own feed.
+    store = StubStore(projects=[
+        _proj("PR-init-self", turn="ariadne", seq=10, turn_by="ariadne"),
+    ])
+    out = _build(store, "ariadne")
+    assert out["updates"] == []
+
+
+def test_baton_init_to_other_notifies_the_other():
+    # A initialised a baton with turn=B, by_agent=A — B did not author this
+    # turn assignment, so B's feed must include it (turn_by=A != B).
+    store = StubStore(projects=[
+        _proj("PR-init-other", turn="borges", seq=10, turn_by="ariadne"),
+    ])
+    out = _build(store, "borges")
+    assert [(u["kind"], u["project_id"]) for u in out["updates"]] == [("baton", "PR-init-other")]
+
+
+def test_baton_legacy_no_turn_by_still_notifies():
+    # A ProjectRecord parsed from frontmatter with NO turn_by field (legacy
+    # baton, pre-#1812) defaults turn_by="" — "" != agent, so it still fires.
+    # This is the load-bearing back-compat case: no crash, no suppression.
+    store = StubStore(projects=[
+        _proj("PR-legacy", turn="ariadne", seq=10),  # turn_by defaults to ""
+    ])
+    out = _build(store, "ariadne")
+    assert [(u["kind"], u["project_id"]) for u in out["updates"]] == [("baton", "PR-legacy")]
 
 
 # ---------------------------------------------------------------------------

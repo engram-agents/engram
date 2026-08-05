@@ -77,6 +77,31 @@ _DEFAULT_FORUM_URL = "http://localhost:5002"
 _FORUM_URL_CACHE: Optional[str] = None
 
 
+def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
+    """urlopen, forced to IPv4-only DNS resolution.
+
+    The forum host's mDNS record advertises unreachable IPv6 candidates (a
+    link-local address plus globally-scoped ones with no route on this LAN)
+    ahead of the working IPv4 address in getaddrinfo's result order. stdlib
+    socket.create_connection tries each candidate serially at the full
+    per-attempt timeout before falling through to the next — enough,
+    compounded across the dead entries, to blow multi-second budgets (first
+    observed via UserPromptSubmit hook timeouts; see forum_api.py's
+    ForumClient._execute for the canonical writeup — duplicated here since
+    this CLI predates forum_api.py and isn't yet migrated to it).
+    """
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+
+
 # ---------------------------------------------------------------------------
 # Config helpers  (mirrors ia.py / baton.py conventions)
 # ---------------------------------------------------------------------------
@@ -277,7 +302,7 @@ def _do_request(req: urllib.request.Request, url: str) -> dict:
     """Execute an HTTP request; handle errors uniformly."""
     forum_url = _resolve_forum_url()
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _ipv4_only_urlopen(req, timeout=10) as resp:
             body = resp.read().decode("utf-8")
             return json.loads(body)
     except urllib.error.HTTPError as e:
@@ -962,7 +987,7 @@ def cmd_describe(args: argparse.Namespace, config: dict, agent_name: str) -> Non
     url = f"{forum_url}/forum.md"
     req = urllib.request.Request(url, headers={"Accept": "text/plain, text/markdown"})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _ipv4_only_urlopen(req, timeout=10) as resp:
             content = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -1030,7 +1055,7 @@ def _do_binary_request(req: urllib.request.Request, url: str) -> bytes:
     """
     forum_url = _resolve_forum_url()
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _ipv4_only_urlopen(req, timeout=30) as resp:
             return resp.read()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")

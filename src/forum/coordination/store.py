@@ -88,6 +88,12 @@ class ProjectRecord:
     seq: int  # the seq of this item's last mutation (0 if pre-migration / unseen)
     raw: str  # the full markdown, for callers that re-write it
     github: str = ""  # optional anchor: "project/N" or "pr/N" (from frontmatter github: field)
+    turn_by: str = ""  # the agent who performed the CURRENT turn's flip/init/claim/release
+    # (the flip-actor, not the turn holder). "" means unknown/unrecorded — either a
+    # legacy baton written before this field existed, or a genuinely unattributed
+    # write. An empty turn_by is NEVER treated as a self-flip by the updates feed
+    # (empty != any real agent name), so back-compat is automatic: old batons keep
+    # notifying exactly as they did before this field was introduced.
 
 
 def dm_thread_key(a: str, b: str) -> str:

@@ -1,9 +1,17 @@
 """Shared helpers for the ENGRAM prompt hooks (gh#1657).
 
-SSoT for the one concern genuinely duplicated, byte-for-byte, across the
-baton and inter-agent prompt hooks (and near-identically, parameterized on a
-different marker file, in the forum prompt hook): resolving `tools/` across
-the two build topologies this repo ships in.
+SSoT for two concerns genuinely duplicated, byte-for-byte, across hooks:
+
+1. Resolving `tools/` across the two build topologies this repo ships in
+   (baton + inter-agent + forum prompt hooks).
+2. Scoped detection of THIS agent's own MCP server.py process (session-start
+   + surface hooks) -- see resolve_own_server_py_path / is_own_server_py_running
+   below. Extracted after PR #1839's colleague review found the
+   surface hook had copied session-start hook's already-broken unscoped
+   `pgrep -f server.py` verbatim, doubling the blast radius of a bug that
+   made the liveness probe permanently report healthy on any multi-agent
+   host: the bare "server.py" substring matches every agent's server process
+   (and any unrelated *_server.py), not just this agent's own.
 
 Why this exists (CLAUDE.md "Plugin build restructures code paths"): the
 plugin build FLATTENS `hooks/claude/*` -> `hooks/*`, so a hook sees `tools/`
@@ -64,3 +72,81 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     if tools_dir is not None and str(tools_dir) not in sys.path:
         sys.path.insert(0, str(tools_dir))
     return tools_dir
+
+
+def resolve_own_server_py_path(engram_home: str) -> str:
+    """Resolve the path to THIS agent's own MCP server.py.
+
+    Mirrors the session-start hook's pre-existing (correct) priority order
+    for the primary health check -- extracted here so the secondary
+    liveness check (is_own_server_py_running below) can share it instead of
+    each hook re-deriving its own candidate list:
+
+      1. Runtime-root server.py: `_hooklib.py` lives in the SAME directory
+         as the hooks that call it, in both topologies (source:
+         `hooks/claude/`; deployed: `hooks/`) -- but server.py is a SIBLING
+         of that hooks directory, one level up, NOT colocated inside it
+         (verified empirically against a live plugin install: `server.py`
+         sits at `<plugin>/server.py`, while `_hooklib.py` sits at
+         `<plugin>/hooks/_hooklib.py`). So the candidate is
+         `dirname(dirname(this file))/server.py`, exactly mirroring
+         `_resolve_mcp_server_path`'s `hook_dir` -> `runtime_dir` climb.
+         This is the only candidate that works in a plugin install, where
+         the MCP server runs from the plugin tree, not ENGRAM_HOME.
+         (Round-2 review caught this: an earlier version of this function
+         used `dirname(this file)` directly -- one level too shallow --
+         which silently made is_own_server_py_running() return False even
+         when this agent's own server WAS running, reintroducing #1772's
+         false-alarm behavior in exactly the hook where this path is live
+         on every prompt. Confirmed via the same "instrument the deployed
+         artifact" method this project's own CLAUDE.md prescribes for this
+         bug class, not just re-reading the source.)
+      2. `$ENGRAM_HOME/server.py` (legacy scatter-install pattern, in case
+         hooks were copied separately from server.py).
+      3. `~/engram-alpha/server.py` (live-source dev fallback).
+
+    Returns an absolute path suitable for a SCOPED `pgrep -f <path>` match.
+    Never returns a bare "server.py" -- an unscoped pgrep -f server.py
+    matches every process whose command line contains that substring
+    anywhere, including every OTHER agent's server.py on a shared
+    multi-agent host (and unrelated *_server.py files by substring). See
+    is_own_server_py_running's docstring for the regression this fixes.
+    """
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    runtime_dir = os.path.dirname(hook_dir)
+    colocated = os.path.join(runtime_dir, "server.py")
+    if os.path.exists(colocated):
+        return colocated
+    candidate = os.path.join(engram_home, "server.py")
+    if os.path.exists(candidate):
+        return candidate
+    return os.path.expanduser("~/engram-alpha/server.py")
+
+
+def is_own_server_py_running(engram_home: str) -> bool:
+    """Return True if THIS agent's own MCP server.py process is running.
+
+    Scoped `pgrep -f <resolved-path>` match against
+    resolve_own_server_py_path's result -- never a bare "server.py"
+    substring. The unscoped form was PR #1839's colleague-review blocker:
+    on a shared multi-agent host, `pgrep -f server.py` matches
+    every agent's own server.py (and any unrelated *_server.py, e.g. a
+    viz_server.py, by substring), so the probe was permanently True
+    regardless of whether THIS agent's own server was actually alive --
+    turning a liveness check that should fail closed into one that can
+    never report unhealthy.
+
+    Best-effort: returns False on any error (including a failed import of
+    this module by the caller) so callers degrade to the conservative
+    (unhealthy) path rather than a false positive.
+    """
+    import subprocess
+
+    try:
+        server_path = resolve_own_server_py_path(engram_home)
+        result = subprocess.run(
+            ["pgrep", "-f", server_path], capture_output=True, timeout=2
+        )
+        return result.returncode == 0
+    except Exception:
+        return False

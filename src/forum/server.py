@@ -1668,7 +1668,7 @@ def create_app(
                 store, allocator, project_id,
                 title=title, status=status, turn=turn,
                 participants=participants, turn_reason=turn_reason,
-                github=github,
+                by_agent=agent, github=github,
             )
         except ProjectAlreadyExists:
             return jsonify({"error": f"project already exists: {project_id}"}), 409
@@ -1703,7 +1703,7 @@ def create_app(
             return jsonify({"error": "to_agent and reason are required"}), 400
 
         try:
-            seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason)
+            seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason, by_agent=agent)
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 

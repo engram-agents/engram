@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -183,6 +184,23 @@ class ForumClient:
         return url
 
     def _execute(self, req: urllib.request.Request) -> Dict[str, Any]:
+        # Force IPv4-only resolution: chameleon.local's mDNS record advertises
+        # unreachable IPv6 candidates (a link-local address plus two
+        # globally-scoped ones with no route on this LAN) ahead of the
+        # working IPv4 address in getaddrinfo's result order. stdlib
+        # socket.create_connection tries each candidate serially with the
+        # full per-attempt timeout before falling through to the next, so
+        # every dead IPv6 entry costs up to self._timeout seconds — enough,
+        # compounded across 2-4 dead entries, to blow past the UserPromptSubmit
+        # hook's outer budget (observed: 8-12s actual vs. a 5s hook budget).
+        # curl doesn't hit this because it races families (Happy Eyeballs);
+        # stdlib urllib has no such racing, so pin the family explicitly.
+        real_getaddrinfo = socket.getaddrinfo
+
+        def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+            return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+        socket.getaddrinfo = _ipv4_only_getaddrinfo
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 return json.loads(resp.read().decode())
@@ -191,3 +209,5 @@ class ForumClient:
             raise ForumHttpError(e.code, body)
         except urllib.error.URLError as e:
             raise ForumNetworkError(str(e.reason))
+        finally:
+            socket.getaddrinfo = real_getaddrinfo

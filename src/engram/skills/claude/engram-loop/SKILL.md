@@ -150,8 +150,9 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 cat > ~/.engram/loop-mode.json <<JSON
 {
+  "FIRST_ACTION": "RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. (3) CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue. Only then continue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "kind": "work|research|autonomous",
+  "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
   "instructions": "<what to do each iteration — the loop's standing brief>",
   "state": "<live handoff: pending work, in-flight fairies, key node IDs, next step>",
@@ -162,7 +163,19 @@ cat > ~/.engram/loop-mode.json <<JSON
 JSON
 ```
 
+- `FIRST_ACTION` — the arm-first instruction, kept as field #1 deliberately.
+  **This is the BACKSTOP; the wake prompt (Step 2 §2) is the primary channel** —
+  the marker gets rewritten wholesale each iteration, so an invariant living
+  here can be silently lost, whereas the prompt cannot. Keep both: they fail
+  differently (a hand-armed wake missing the stub is caught by this field; a
+  first arm that omitted the line propagates through every later arm and is
+  caught only here). Never reorder it below `state` — a reader who reaches
+  `state` first starts working, and the arm degrades into something to
+  remember. The text is fixed; copy it verbatim.
 - `kind` — informational; the drowsiness hook only checks the marker's existence.
+  `"heartbeat"` is the standard token for the quiet on-call cache-warm loop the
+  boot charge enters (grep target for reachability audits — write exactly this
+  value for that case, per the 2026-08-02 fleet-silence follow-up).
 - `topic` / `instructions` — the standing brief, written once at start.
 - `state` — the live handoff, **rewritten each iteration** (Step 2.3) so the
   marker always reflects where the loop is. This is what a post-compaction self
@@ -187,8 +200,15 @@ loop-mode.
 (not a fresh START — START goes through Step 1's write, skip this step)**,
 spot-check its `state` field against your in-context understanding of where
 the work is. If they diverge — the marker is stale FROM the PREVIOUS
-iteration's failure to run the update-then-arm ritual (Step 2.3) — fix it
-now before proceeding so this iteration's actions get recorded properly.
+iteration's failure to run the arm-first ritual's marker-update half
+(Step 2.3 d/e) — fix it now before proceeding so this iteration's actions get
+recorded properly.
+
+**A stale marker is the TOLERATED failure under arm-first** (Step 2.3) — the
+ordering guarantees that if something has to be dropped, it is this and not the
+wake. That is a fallback, **not a licence to skip Step 2.3 d/e**, which remains
+required. Reconcile and move on; don't treat it as evidence something went badly
+wrong, and don't treat it as normal either.
 
 ```bash
 cat ~/.engram/loop-mode.json | jq -r .state | head -20
@@ -280,21 +300,90 @@ cannot be stale.)*
    > (your context was just reset — you'll see a `[source=compact]` or
    > `[source=startup]` session banner, or a compaction summary in your prior
    > context), **read `~/.engram/warm-briefing.md` first** before proceeding.
+   > **FIRST, before anything else: re-arm the next wakeup.** `CronList`; if no
+   > pending wake, `ScheduleWakeup` at this loop's cadence with this same stub.
+   > Do it before reading any file, before any other tool call.
+   >
    > Then: read `~/.engram/loop-mode.json` for the loop topic, instructions, and
    > current state. **If the file is absent → the loop already ended; STOP, do
-   > not execute, do not re-arm.** If present → continue per its contents.*
+   > not execute** (and cancel the wake you just armed). If present → continue
+   > per its contents.*
+
+   **The re-arm line lives in the PROMPT, and that is the primary channel —
+   not the marker.** Two reasons, and the first is the load-bearing one:
+
+   - **The marker is rewritten wholesale every iteration** (`cat > …loop-mode.json`).
+     An invariant stored inside mutable per-iteration state is one careless
+     heredoc away from vanishing, and its absence is silent. The prompt is
+     written once per arm and consumed immediately — nothing rewrites it.
+   - **The prompt ARRIVES; the marker must be FETCHED.** The stub *is* the wake:
+     it is in context before any tool call. Reaching the marker already requires
+     doing something, and "do this before doing anything" cannot live behind a
+     step that is itself doing something.
+
+   Keep `FIRST_ACTION` in the marker too, as a **backstop** — the two channels
+   fail differently, which is exactly why both are worth having. If someone
+   hand-arms a wake without the stub text, the marker still catches it; if the
+   very first arm of a loop omits the line, every later arm inherits the
+   omission by copying the previous stub, and only the marker breaks that chain.
+   This is redundancy in *delivery* of one fixed instruction, not two competing
+   writers of mutable state — the failure mode that redundancy usually invites
+   doesn't apply.
+
+   *(Credit: Lei, 2026-07-31 — "make it part of the wake-up prompt itself, not
+   the marker, which may be rewritten and accidentally overwritten.")*
 
    The warm-briefing step is conditional — only when context was just reset
    (post-compaction `[source=compact]`, or fresh-terminal/cross-day
    `[source=startup]`). Same-session wakes skip it (warm-briefing is already in
    context). (Rationale: Step 0 CONTINUATION incident note above.)
-3. **Update-then-arm ritual (every iteration end, in this order):**
+3. **ARM-FIRST ritual — arm at the TOP of the iteration, not the end.**
 
-   a. **Compose current state**: pending work, in-flight fairies, key node IDs, next step.
-   b. **Rewrite the marker's `state` field** via `cat > ~/.engram/loop-mode.json` or `jq` patch with the composed content. The marker file is the CANONICAL HANDOFF; the wake prompt is just a pointer.
-   c. **Verify the marker reflects reality**: `cat ~/.engram/loop-mode.json | jq -r .state | head -20` — does it match what you want the next iteration to see? If still stale, fix it now.
-   d. **`CronList`** — if a pending wake already exists, DON'T re-arm (check-before-arm).
-   e. **If queue empty**, `ScheduleWakeup` with a MINIMAL STUB prompt (per §2 above). Do NOT stuff state into the prompt — the marker carries it.
+   The re-arm is the **first action after a wake**, before any work, and
+   certainly before composing state:
+
+   a. **`CronList`** — if a pending wake already exists, DON'T re-arm
+      (check-before-arm; the lifeline rule still holds).
+   b. **If the queue is empty**, `ScheduleWakeup` at `cadence_seconds` with the
+      MINIMAL STUB prompt (per §2 above). Do NOT stuff state into the prompt —
+      the marker carries it.
+   c. *…then do the iteration's actual work…*
+   d. **At iteration end, rewrite the marker's `state`** via
+      `cat > ~/.engram/loop-mode.json` or a `jq` patch: pending work, in-flight
+      fairies, key node IDs, next step. The marker is the CANONICAL HANDOFF;
+      the wake prompt is just a pointer.
+   e. **Verify it reflects reality**: `cat ~/.engram/loop-mode.json | jq -r .state | head -20`.
+
+   **The end-of-iteration marker update (d/e) is still REQUIRED, not optional.**
+   It stays at the end on purpose: only there do you know what the burst
+   actually produced, so only there can the handoff be complete. Arming can
+   move to the top precisely *because* it needs none of that — the armed prompt
+   is a stub pointing at the marker, so it carries no burst detail and can be
+   fired before you know anything about the iteration. Two steps, two natural
+   homes: **arm early because it's contentless; write state late because it
+   isn't.**
+
+   **Why that order, and it is the whole point of the step.** The two ways to
+   fail here have wildly asymmetric costs, so the cheap-to-fail one goes last:
+
+   | forgotten | consequence | recoverable? |
+   |---|---|---|
+   | marker `state` update (d/e) | next iteration reads a slightly stale progress note | **yes** — Step 1.5's staleness check catches and reconciles it |
+   | the re-arm (a/b) | **the loop goes dark** | **no** — a heartbeat's absence produces no event, so nothing inside the process can notice; only an external observer can |
+
+   Arming last means every interruption between wake and end-of-turn — a
+   compaction, a user message, a long sub-task, or simply a turn that *felt*
+   finished — silently costs the loop its next wake. Arming first means the
+   worst case is a stale note.
+
+   *(Origin: 2026-07-31. A wake fired, the iteration's work and a nap ran, and
+   the turn ended without re-arming — 44 minutes dark. The bell Monitor stayed
+   alive, so addressed traffic would still have woken the agent; what lapsed
+   was exactly the layer covering "nothing addressed to me, but work waiting,"
+   which was the live state — a counterpart's letter and two forum mentions sat
+   unread the whole window. Caught by the user noticing the silence, because
+   there was no other available detector. Lei's ruling: make the re-arm the
+   rigid first step, and accept a stale marker as the acceptable failure.)*
 
    **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction

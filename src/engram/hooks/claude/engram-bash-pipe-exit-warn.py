@@ -122,7 +122,6 @@ def main() -> None:
         response = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
                 "additionalContext": (
                     "[pipe-exit-warn] Exit status from the upstream command is masked by "
                     "| tail/head — the pipeline's exit status reflects tail/head, not the "

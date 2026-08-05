@@ -4324,7 +4324,7 @@ def engram_goal_tension(payload_json: str) -> str:
 
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
-    "reasoning_type", "context_ids", "situation_pattern",
+    "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
 })
 
 
@@ -4377,14 +4377,38 @@ def engram_add_lesson(payload_json: str) -> str:
             logical_chain (str, required): How the incidents lead to this lesson.
             reasoning_type (str, optional): Default 'inductive_generalization'.
             context_ids (str, optional): Comma-separated node IDs for context references.
-            situation_pattern (str, optional): Regex matched against the pending Bash
-                COMMAND at action-moment by the PreToolUse tripwire hook. When the
-                pattern fires, scaffolding_nudge is injected as additionalContext before
+            situation_pattern (str, optional): Regex matched by the PreToolUse
+                tripwire hook (build_match_target() in
+                engram-lesson-tripwire-hook.py) against a per-tool-type match
+                target at action-moment, BEFORE the tool call runs:
+                  - tool_name == "Bash": the raw Bash COMMAND string.
+                  - tool_name starts with "mcp__": f"{tool_name} {compact_json_args}"
+                    — the MCP tool's own name concatenated with its compact-JSON
+                    args, so patterns can match either the tool name or a
+                    substring of its arguments.
+                  - any other tool_name: "" — NEVER matched. Non-Bash/non-MCP
+                    tool calls (Read, Edit, Write, Glob, etc.) are invisible to
+                    this field; those situations rely on the separate
+                    prompt-time semantic recall path instead, not this
+                    action-moment tripwire.
+                When the pattern fires, scaffolding_nudge is injected as additionalContext before
                 the command runs. Use for lessons whose retrieval cue is a command shape
                 (a specific CLI/tool invocation) — NOT lessons cued by the semantic
                 content of what you're about to say; those still rely on the prompt-time
                 recall hook and are uncovered by this one when the cue lands in pure prose.
+                Must be a compilable regex (rejected at write time otherwise) and must not
+                read as English prose (see bypass_prose_check).
                 Example: r'(?:forum\\s+reply|ia\\s+write)'
+            bypass_prose_check (bool, optional): Default False. When situation_pattern
+                reads as prose rather than a command-shape regex (more than 8 literal
+                space characters — validated on 33 real patterns across 3 graphs: live
+                patterns run 0-5, prose runs 16-70), the lesson is refused by default — a
+                prose "pattern" is syntactically valid but will never match a real
+                command, so the tripwire would be silently dead. Set True to force
+                creation anyway; the lesson's metadata is then stamped with
+                bypass_prose_check: true so the graph can audit how often this
+                override was actually exercised. Has no effect when situation_pattern
+                doesn't look like prose, or is empty.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar

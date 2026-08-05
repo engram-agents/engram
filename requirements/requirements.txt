@@ -9,6 +9,9 @@
 # Upgrade:  pip install -U -r requirements.txt
 
 fastmcp>=3.0,<4
+# Direct runtime import for Codex app-server WebSocket transports.
+# Keep aligned with the reproducible lock snapshot (currently 16.x).
+websockets>=16,<17
 # Hard-pinned (not >=/<) — sentence-transformers 5.4.x hangs on HuggingFace
 # Hub metadata fetch during cold-start, even with weights fully cached. The
 # hang originates in huggingface_hub.file_download.get_hf_file_metadata, so

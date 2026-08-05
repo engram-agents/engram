@@ -14,6 +14,7 @@ House rules (wave pattern):
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 
 import engram_core as core
@@ -23,6 +24,25 @@ import engram_core as core
 # ---------------------------------------------------------------------------
 
 _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
+
+
+def _looks_like_prose(pattern: str) -> bool:
+    """Discriminate a command-shape regex from a dead-prose situation_pattern.
+
+    Threshold: a literal-space count over 8 (#1864 colleague round, Ariadne +
+    Borges, validated on 33 real patterns across 3 graphs — live patterns
+    carry 0-5 literal spaces, prose carries 16-70, nothing lands in 6-15,
+    so 8 sits in that empty band). The first version of this predicate also
+    required an ABSENCE of \\s/\\b/(?: constructs, on the theory that a real
+    command-shape regex always writes \\s+ rather than a literal space. That
+    leaked on two real, live patterns: a multi-command alternation naturally
+    carries literal spaces (`(?:gh pr diff|git diff|gh pr view)` IS three
+    space-separated words), and a bare command with no alternation at all
+    (`gh issue close`) has neither a construct nor much reason to need one.
+    Isolated in its own predicate so a future threshold change is a
+    one-function edit.
+    """
+    return pattern.count(" ") > 8
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +668,7 @@ def _add_lesson_impl(
     reasoning_type: str = "inductive_generalization",
     context_ids: str = "",
     situation_pattern: str = "",
+    bypass_prose_check: bool = False,
 ) -> str:
     """Internal implementation — see engram_add_lesson MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -693,10 +714,20 @@ def _add_lesson_impl(
             Most lessons are inductive: multiple incidents → general pattern.
         context_ids: Optional comma-separated node IDs for context references
             (e.g., definitions, related derivations). Creates cites edges.
+        situation_pattern: Optional regex matched against the pending Bash
+            command / MCP call at action-moment by the PreToolUse tripwire
+            hook (see engram_add_lesson's docstring for the exact matched
+            surface). Must compile; must not read as English prose unless
+            bypass_prose_check=True (#1864).
+        bypass_prose_check: Default False. Overrides the prose-shape gate on
+            situation_pattern — see engram_add_lesson's docstring for the
+            discriminator + audit-stamp contract.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar existing
-        lessons for consolidation hints.
+        lessons for consolidation hints. Returns {"error": "..."} if
+        situation_pattern fails to compile as a regex, or looks like prose and
+        bypass_prose_check is not set.
     """
     if not claim or not claim.strip():
         return json.dumps({"error": "claim is required and cannot be empty."})
@@ -711,6 +742,51 @@ def _add_lesson_impl(
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
             "valid_types": sorted(core.REASONING_TYPES),
         })
+    # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
+    # "false" is truthy in Python; without this check, a bypass_prose_check: "false"
+    # payload would silently bypass the #1864 prose-shape guard.
+    # Same guard pattern as _derive_impl's use_stale/use_contested (engram_derive.py).
+    if not isinstance(bypass_prose_check, bool):
+        return json.dumps({
+            "error": (
+                f"bypass_prose_check must be a JSON boolean (true/false), got "
+                f"{type(bypass_prose_check).__name__}: {bypass_prose_check!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+
+    # #1864 — situation_pattern must be a compilable, command-shape regex.
+    # Compile check runs BEFORE the prose-shape check regardless of
+    # bypass_prose_check: the bypass only overrides the prose gate, never
+    # lets a malformed regex through.
+    prose_bypass_exercised = False
+    if situation_pattern:
+        try:
+            re.compile(situation_pattern)
+        except re.error as e:
+            return json.dumps({
+                "error": f"situation_pattern is not a valid regex: {e}. "
+                         f"Pattern: {situation_pattern!r}",
+            })
+        # mutation-tested: see test_prose_situation_pattern_blocked_by_default
+        # and test_mutation_check_prose_gate_actually_blocks
+        if _looks_like_prose(situation_pattern):
+            if not bypass_prose_check:
+                n_spaces = situation_pattern.count(" ")
+                return json.dumps({
+                    "error": (
+                        f"`situation_pattern` looks like prose, not a regex: "
+                        f"{n_spaces} literal space(s), over the 8-space "
+                        f"threshold (#1864: live patterns run 0-5, prose "
+                        f"runs 16-70). It is a valid regex but will never "
+                        f"match a real command, so the tripwire would be "
+                        f"silently dead. A command-shape pattern looks like "
+                        f"`(?:gh\\s+pr\\s+create|ia\\s+write)`. If this is "
+                        f"intentional, pass bypass_prose_check=true."
+                    ),
+                })
+            prose_bypass_exercised = True
 
     ids = [s.strip() for s in core._as_csv(incident_ids).split(",") if s.strip()]
     if not ids:
@@ -764,6 +840,13 @@ def _add_lesson_impl(
         }
         if situation_pattern:
             meta["situation_pattern"] = situation_pattern
+        if prose_bypass_exercised:
+            # Auto-stamped only when _looks_like_prose actually fired AND
+            # bypass_prose_check=True let it through — never merely because
+            # the caller passed the flag (#1864, following engram_derive's
+            # built_on_stale/built_on_contested precedent: the stamp records
+            # that an override was exercised against a real block condition).
+            meta["bypass_prose_check"] = True
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,

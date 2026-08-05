@@ -173,6 +173,23 @@ class TestProjectInit:
         })
         assert resp.status_code == 400
 
+    def test_init_threads_agent_into_turn_by(self, client, app):
+        # #1812: the endpoint's `agent` (the API caller) becomes turn_by —
+        # verified via the store's parsed records since the list/show
+        # responses don't (yet) surface turn_by.
+        client.post("/api/projects", json={
+            "agent": "luria",
+            "project_id": "PR-102",
+            "title": "t",
+            "status": "in-progress",
+            "turn": "ariadne",  # by_agent (luria) != turn (ariadne)
+            "participants": ["luria", "ariadne"],
+            "turn_reason": "r",
+        })
+        store = app.config["COORD_STORE"]
+        rec = next(r for r in store.read_projects() if r.project_id == "PR-102")
+        assert rec.turn_by == "luria"
+
     def test_participants_as_string(self, client):
         resp = client.post("/api/projects", json={
             "agent": "luria",
@@ -241,6 +258,18 @@ class TestProjectFlip:
             "to_agent": "luria",
         })
         assert resp.status_code == 400
+
+    def test_flip_threads_agent_into_turn_by(self, client, app):
+        # #1812: the endpoint's `agent` (the API caller) becomes turn_by, which
+        # may differ from to_agent (a third party flipping the baton onward).
+        client.post("/api/projects/PR-42/flip", json={
+            "agent": "ariadne",
+            "to_agent": "luria",
+            "reason": "please review",
+        })
+        store = app.config["COORD_STORE"]
+        rec = next(r for r in store.read_projects() if r.project_id == "PR-42")
+        assert rec.turn_by == "ariadne"
 
 
 # ---------------------------------------------------------------------------

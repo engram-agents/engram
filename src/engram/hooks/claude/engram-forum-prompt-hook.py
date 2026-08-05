@@ -45,6 +45,7 @@ Design doc: forum/spec.md
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -133,6 +134,33 @@ except Exception:
 # "frozen at import time" ENGRAM_HOME timing the pre-extraction inline code
 # had.
 # ---------------------------------------------------------------------------
+
+def _ipv4_only_urlopen(req: urllib.request.Request, timeout: float):
+    """urlopen, forced to IPv4-only DNS resolution.
+
+    The forum host's mDNS record advertises unreachable IPv6 candidates (a
+    link-local address plus globally-scoped ones with no route on this LAN)
+    ahead of the working IPv4 address in getaddrinfo's result order. stdlib
+    socket.create_connection tries each candidate serially at the full
+    per-attempt timeout before falling through to the next — enough,
+    compounded across the dead entries, to blow this hook's outer
+    UserPromptSubmit budget (observed: multi-second stalls vs. a 5s budget).
+    curl doesn't hit this because it races families (Happy Eyeballs); stdlib
+    urllib has no such racing, so pin the family explicitly. See
+    tools/forum_api.py's ForumClient._execute for the canonical writeup —
+    duplicated here (not imported) per this hook's zero-import-back design.
+    """
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        return real_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+
 
 def _load_config() -> dict:
     """Load $ENGRAM_HOME/config.json. Returns {} on any failure."""
@@ -393,7 +421,7 @@ def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Opt
             url,
             headers={"Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _ipv4_only_urlopen(req, timeout=5) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             return data.get("threads", [])
@@ -425,7 +453,7 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
             url,
             headers={"Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with _ipv4_only_urlopen(req, timeout=5) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             inbox = data.get("inbox", [])
@@ -605,7 +633,7 @@ def main() -> None:
                     method="POST",
                 )
                 try:
-                    with urllib.request.urlopen(req, timeout=2) as resp:
+                    with _ipv4_only_urlopen(req, timeout=2) as resp:
                         resp.read()  # consume response body; discard result
                     # POST succeeded — advance the throttle timestamp.
                     _save_publish_state(state, activity, queue, cadence, _now)

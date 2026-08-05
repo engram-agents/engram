@@ -66,10 +66,14 @@ Both checks must pass before proceeding to the iteration body.
 This is engram-loop's Step 1 marker write (see engram-loop SKILL.md). School-day extends the generic schema with skill-identification + per-iteration state:
 
 ```bash
-echo '{"activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":1800,"pacer":"scheduleWakeup","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
+echo '{"FIRST_ACTION":"RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'"'"'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word '"'"'stub'"'"' invites paraphrasing, so don'"'"'t. (3) CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue. Only then continue.","activated":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","kind":"research","topic":"school-day Phase 1 curriculum","instructions":"7-iteration fixed rotation (aspiration, research ×3, consolidation, audit, debrief); baseline data collection","state":"Cycle 1, Iteration 1 — starting","cadence_seconds":1800,"pacer":"scheduleWakeup","loop_prompt":"<loop-wake> school-day continuation. FIRST_ACTION: re-arm this wakeup now per the marker, before anything else. Then read ~/.engram/loop-mode.json for cycle/iteration and continue the rotation.","skill":"school-day","cycle":1,"iteration":1}' > ~/.engram/loop-mode.json
 ```
 
-The base fields (`activated`, `kind`, `topic`, `instructions`, `state`, `cadence_seconds`, `pacer`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 0 stale-check (above) keys off of.
+The base fields (`FIRST_ACTION`, `activated`, `kind`, `topic`, `instructions`, `state`, `cadence_seconds`, `pacer`, `loop_prompt`) match engram-loop's Step 1 contract; `skill`, `cycle`, `iteration` are school-day extras that the Step 0 stale-check (above) keys off of.
+
+`FIRST_ACTION` must stay **first** and verbatim — it is the arm-first guarantee (engram-loop Step 2.3), and it works by being the first thing read on wake. School-day's fixed 7-iteration rotation makes this *more* load-bearing, not less: a rotation that loses its wake mid-cycle strands the remaining iterations with no external trigger to resume them.
+
+`loop_prompt` is **required, not optional**, because `FIRST_ACTION` tells the reader to copy it verbatim — a marker without it silently forces the hand-typing that store-and-copy exists to eliminate.
 
 ### 2. Record session start health
 

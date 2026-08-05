@@ -7,7 +7,7 @@ Idle-suppression (issue #840)
 -----------------------------
 Problem: before #824, this hook emitted plain text on stdout, which Claude Code
 discarded as invalid hook output — so it was silently mute. #824 wrapped the
-nudge in the strict-JSON envelope (hookSpecificOutput.additionalContext),
+nudge in the Stop-hook JSON envelope ({"decision":"block","reason":"..."}),
 delivering it to the model for the first time. That exposed a second problem:
 on contentless turns where the agent replies "nothing to record," the hook fires
 again (Stop fires after every assistant turn), creating a self-sustaining
@@ -119,17 +119,59 @@ Config: cadence.write_nudge_prose_threshold in ~/.engram/config.json.
   - Absent or unreadable → use default (400).
   - Set to 0 or negative → prose gate disabled; treat all prose as exceeding
     (emit unless an engram write is present).
+
+_stophooklib extraction (PR-A, 2026-07-31-loop-arm-nudge-SPEC.md)
+-------------------------------------------------------------------
+The byte-offset state read/write, the delta read, the per-line JSONL parse
+(with its any_record_parsed sentinel), and the message.content block walk
+below now delegate to hooks/claude/_stophooklib.py -- shared with
+engram-deference-detector-stop.py. This is a PURE refactor: every early
+return, every exception type caught, and every fail-open direction is
+unchanged. The state-file PATH (_NUDGE_STATE_FILE) stays local to this hook,
+passed into the shared functions rather than owned by them. This hook does
+NOT use the lib's transcript-path session-marker fallback (resolve_
+transcript_path) -- it has never had one (payload["transcript_path"] is used
+directly, with no existence check), and this hook's behavior must stay
+byte-identical, so that extraction is not wired in here. If _stophooklib
+somehow fails to import (_STOPHOOKLIB_OK = False), this does NOT degrade to
+a silent no-op -- unlike the UserPromptSubmit hooks that gate their whole
+main() on their prologue-lib import, this hook only gates the suppression
+CHECK on it. _should_suppress returns False (not suppressed) and
+_update_state returns without writing, so the stored offset never advances.
+The observable effect is the LOUDEST possible failure, and a self-
+perpetuating one: the write-nudge fires on every single turn, indefinitely,
+until the import is fixed. This is still fail-open in the direction this
+file's own "Fail-open rule" (above) requires -- the suppression check is an
+optimization, not a blocker, and uncertainty about its own dependencies
+resolves to nudging, never to silent suppression -- it is simply NOT quiet
+about it.
 """
 import json
 import os
 import sqlite3
 import sys
 import time
+from pathlib import Path
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
+
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+try:
+    from _stophooklib import (
+        read_offset_state as _read_offset_state,
+        write_offset_state as _write_offset_state_impl,
+        read_delta as _read_delta,
+        parse_jsonl_records as _parse_jsonl_records,
+        walk_content_blocks as _walk_content_blocks,
+    )
+    _STOPHOOKLIB_OK = True
+except Exception:
+    _STOPHOOKLIB_OK = False
 
 # State file for idle suppression. Stores transcript_path + byte_offset from
 # the previous fire so we can read only the delta on the next fire.
@@ -364,25 +406,16 @@ def _parse_delta_prose_and_writes(
     }
     """
     try:
-        text = delta_bytes.decode("utf-8", errors="replace")
+        if not _STOPHOOKLIB_OK:
+            # Lib unavailable — fail toward emission, same direction as every
+            # other failure path in this function.
+            raise RuntimeError("_stophooklib unavailable")
+
+        records, any_record_parsed = _parse_jsonl_records(delta_bytes)
         prose_length = 0
         has_engram_write = False
-        any_record_parsed = False
 
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except (json.JSONDecodeError, ValueError):
-                # Skip unparseable lines silently — fail-open.
-                continue
-
-            any_record_parsed = True
-
-            if not isinstance(rec, dict):
-                continue
+        for rec in records:
             if rec.get("type") != "assistant":
                 continue
 
@@ -390,9 +423,7 @@ def _parse_delta_prose_and_writes(
             if not isinstance(content, list):
                 continue
 
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
+            for block in _walk_content_blocks(content):
                 block_type = block.get("type")
                 if block_type == "text":
                     text_val = block.get("text", "")
@@ -440,14 +471,16 @@ def _should_suppress(transcript_path: str) -> bool:
         if not transcript_path:
             return False  # no transcript → unknown → emit
 
+        if not _STOPHOOKLIB_OK:
+            # Lib unavailable — fail toward emission, same direction as
+            # every other failure path in this function.
+            return False
+
         # Read stored state.
         stored_path: str | None = None
         stored_offset: int = 0
         try:
-            with open(_NUDGE_STATE_FILE, encoding="utf-8") as f:
-                state = json.load(f)
-            stored_path = state.get("transcript_path")
-            stored_offset = int(state.get("byte_offset", 0))
+            stored_path, stored_offset = _read_offset_state(_NUDGE_STATE_FILE)
         except (OSError, ValueError, json.JSONDecodeError, TypeError):
             # Missing or corrupt state file — first fire ever or after session
             # rotation. Treat as unknown → emit.
@@ -473,9 +506,7 @@ def _should_suppress(transcript_path: str) -> bool:
 
         # Read only the delta.
         try:
-            with open(transcript_path, "rb") as f:
-                f.seek(stored_offset)
-                delta = f.read(current_size - stored_offset)
+            delta = _read_delta(transcript_path, stored_offset, current_size)
         except OSError:
             return False  # can't read → emit
 
@@ -516,20 +547,9 @@ def _should_suppress(transcript_path: str) -> bool:
 
 def _update_state(transcript_path: str) -> None:
     """Write the current EOF offset to the state file. Failure is silenced."""
-    try:
-        offset = 0
-        if transcript_path:
-            try:
-                offset = os.path.getsize(transcript_path)
-            except OSError:
-                pass
-        state = {"transcript_path": transcript_path, "byte_offset": offset}
-        tmp = _NUDGE_STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp, _NUDGE_STATE_FILE)
-    except Exception:  # noqa: BLE001
-        pass
+    if not _STOPHOOKLIB_OK:
+        return
+    _write_offset_state_impl(_NUDGE_STATE_FILE, transcript_path)
 
 
 def main() -> None:
@@ -584,7 +604,7 @@ def main() -> None:
         "If not, end the turn with NO output - do not reply to or acknowledge this check; "
         "a text-only acknowledgment wastes a turn.]"
     )
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "Stop", "additionalContext": output}}))
+    print(json.dumps({"decision": "block", "reason": output}))
 
     # Update state after a real emit so the next fire scans only new bytes.
     _update_state(transcript_path)

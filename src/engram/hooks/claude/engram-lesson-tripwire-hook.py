@@ -587,7 +587,6 @@ def main() -> None:
         response = {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
                 "additionalContext": "\n".join(parts),
             }
         }
