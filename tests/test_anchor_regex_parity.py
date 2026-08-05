@@ -18,8 +18,22 @@ differ in one legitimate way: baton.py's callers lowercase the anchor
 before matching, so its regex has no re.IGNORECASE; board_projects.py's
 regex carries re.IGNORECASE itself since some of its callers pass through
 without a lowering step first). The contract that matters is behavioral
-agreement on RESOLVED (repo, pr_number) for the same input, not identical
-implementation.
+agreement on shape (accept/reject) and, for a REPO-QUALIFIED anchor, the
+resolved (repo, pr_number).
+
+#1918 update: for an UNQUALIFIED pr/<N> anchor, the two modules now
+DELIBERATELY diverge on repo resolution rather than agree -- baton.py
+removed its DEFAULT_GITHUB_REPO fallback entirely (an unqualified anchor
+resolves to no repo, and every baton.py caller refuses/skips rather than
+guessing); board_projects.py's own DEFAULT_GITHUB_REPO is unchanged
+(out of scope for #1918 -- board_projects.py is read-only/display-only,
+already being superseded by umwelt's gh_reconcile.py per that module's own
+docstring, and Borges's #1918 comment explicitly deferred it to a sibling
+issue rather than folding it into this fix). This file's job narrows
+accordingly: still catch #1715-shaped drift on anchor SHAPE and PR NUMBER
+extraction for every case, and still catch repo-resolution drift for
+repo-qualified anchors specifically; no longer assert repo agreement for
+the unqualified case, where disagreement is now the intended contract.
 """
 
 from __future__ import annotations
@@ -54,12 +68,17 @@ _board_projects = _load_board_projects()
 def _baton_parse(anchor: str):
     """Return (repo, pr_number) via tools/baton.py's parser, or None if
     not a PR-shaped anchor. Mirrors baton.py's own calling convention:
-    callers lowercase+strip before calling _parse_github_anchor."""
+    callers lowercase+strip before calling _parse_github_anchor.
+
+    #1918: repo is None (not a guessed default) when the anchor is
+    unqualified -- baton.py itself refuses/skips in that case rather than
+    resolving a repo. Returning None here, not a fallback string, is the
+    accurate mirror of that contract."""
     parsed = _baton._parse_github_anchor(anchor.strip().lower())
     if parsed is None or parsed[0] != "pr":
         return None
     kind, repo, number = parsed
-    return (repo or _baton.DEFAULT_GITHUB_REPO, number)
+    return (repo, number)
 
 
 def _board_projects_parse(anchor: str):
@@ -112,10 +131,20 @@ def test_both_parsers_accept_the_same_pr_anchor_forms_and_agree_on_repo():
             f"{anchor!r}: PR number disagreement -- baton={baton_result[1]!r} "
             f"board_projects={board_result[1]!r}"
         )
-        assert baton_result[0].lower() == board_result[0].lower(), (
-            f"{anchor!r}: resolved repo disagreement -- baton={baton_result[0]!r} "
-            f"board_projects={board_result[0]!r}"
-        )
+        if baton_result[0] is None:
+            # #1918: unqualified anchor -- baton.py deliberately resolves no
+            # repo (refuse/skip contract); board_projects.py still applies
+            # its own DEFAULT_GITHUB_REPO (out of scope here, see module
+            # docstring). Divergence is the intended, current contract.
+            assert board_result[0].lower() == _board_projects.DEFAULT_GITHUB_REPO.lower(), (
+                f"{anchor!r}: board_projects.py resolved {board_result[0]!r}, "
+                f"expected its own DEFAULT_GITHUB_REPO {_board_projects.DEFAULT_GITHUB_REPO!r}"
+            )
+        else:
+            assert baton_result[0].lower() == board_result[0].lower(), (
+                f"{anchor!r}: resolved repo disagreement on a REPO-QUALIFIED "
+                f"anchor -- baton={baton_result[0]!r} board_projects={board_result[0]!r}"
+            )
 
 
 def test_both_parsers_reject_the_same_non_pr_anchor_forms():

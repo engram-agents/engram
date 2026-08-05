@@ -1647,13 +1647,17 @@ class TestPoolSentinel:
         monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
         monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
 
-        # Baton with short-form sentinel in turn (the bug trigger).
-        # No github: anchor → Gates 3/4 (CI + approval) are skipped automatically.
+        # Baton with short-form sentinel in turn (the bug trigger). Repo-
+        # qualified github: anchor so this reaches gate 2 rather than
+        # tripping the #1918 no-repo refusal gate that now sits before it;
+        # the monkeypatched CI/approval fakes above make gates 3/4 no-ops
+        # regardless of repo.
         client = _make_client(
             post_return={"seq": 1},
             get_return={"raw": _make_raw_baton(
                 "PR-9999", title="short-form merge gate test", turn="alex",
                 participants="[borges, ariadne]", status="in-progress",
+                github="pr/example-org/example-repo/9999",
             )},
         )
 
@@ -1764,10 +1768,12 @@ class TestPoolSentinel:
         assert cmd[cmd.index("--repo") + 1] == "engram-agents/engram-paper"
         assert "9302" in cmd
 
-    def test_merge_bare_anchor_resolves_default_repo(self, engram_home, monkeypatch):
-        """Backward-compat: a baton with no github anchor at all (pre-#1715)
-        still merges, resolving against DEFAULT_GITHUB_REPO rather than
-        erroring or leaving repo unresolved."""
+    def test_merge_bare_anchor_refuses(self, engram_home, monkeypatch, capsys):
+        """#1918: a baton with no github anchor at all refuses to merge --
+        there is no default repo to guess against, and gate 5 is an
+        irreversible `gh pr merge --squash`. Supersedes the old
+        test_merge_bare_anchor_resolves_default_repo, which asserted the
+        exact behavior this issue fixes."""
         owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
         _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
         monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
@@ -1786,9 +1792,44 @@ class TestPoolSentinel:
             get_return={"raw": _make_raw_baton("PR-9303", turn="alex")},
         )
         args = argparse.Namespace(pr="PR-9303", dry_run=True, force=False)
-        _baton.cmd_merge(args, owner_config, "borges", client)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
 
-        assert ("ci", "9303", _baton.DEFAULT_GITHUB_REPO) in calls
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert calls == []  # refused before any gh call was made
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "no repo-qualified github anchor" in captured.err
+
+    def test_merge_bare_anchor_refuses_even_with_force(self, engram_home, monkeypatch, capsys):
+        """#1918: --force skips CI/approval quality gates (3-4), never the
+        repo-identity gate -- it has never meant 'merge without knowing
+        which repo'."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Alex Chen"}
+        _write_config(engram_home, agent_name="borges", primary_user="Alex Chen")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        calls = []
+        monkeypatch.setattr(
+            _baton, "_pr_ci_state",
+            lambda pr, repo=None: calls.append(("ci", pr, repo)) or ("green", "ok"),
+        )
+        monkeypatch.setattr(
+            _baton, "_pr_approval_state",
+            lambda pr, repo=None: calls.append(("approval", pr, repo)) or ("fresh", "ok"),
+        )
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton("PR-9304", turn="alex")},
+        )
+        args = argparse.Namespace(pr="PR-9304", dry_run=False, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        assert calls == []
+        client.post.assert_not_called()
 
     def test_missing_config_fails_loud(self, capsys):
         """cmd_claim with empty config (no mode) exits EXIT_STATE (single-agent mode).
@@ -1883,7 +1924,7 @@ class TestCiStateDedup:
         })
         mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
         with _mock.patch("subprocess.run", return_value=mock_result):
-            state, detail = baton._pr_ci_state("123")
+            state, detail = baton._pr_ci_state("123", repo="example-org/example-repo")
         assert state == "green"
         assert "CLEAN" in detail
 
@@ -1901,7 +1942,7 @@ class TestCiStateDedup:
         })
         mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
         with _mock.patch("subprocess.run", return_value=mock_result):
-            state, detail = baton._pr_ci_state("123")
+            state, detail = baton._pr_ci_state("123", repo="example-org/example-repo")
         assert state == "green", f"expected green, got {state!r}: {detail}"
 
     def test_pr_ci_state_genuine_failure_is_red(self, baton):
@@ -1914,7 +1955,7 @@ class TestCiStateDedup:
         })
         mock_result = _mock.MagicMock(returncode=0, stdout=payload, stderr="")
         with _mock.patch("subprocess.run", return_value=mock_result):
-            state, detail = baton._pr_ci_state("123")
+            state, detail = baton._pr_ci_state("123", repo="example-org/example-repo")
         assert state == "red"
         assert "trap-check" in detail
 
@@ -2178,7 +2219,13 @@ class TestGcRepoAware:
     """#1715: cmd_gc must never guess a repo -- it reads the stored `github`
     anchor per project (never re-derives the PR number from project_id via
     regex, which has zero repo awareness) and SKIPS any PR-baton lacking a
-    parseable PR anchor rather than defaulting silently."""
+    parseable PR anchor rather than defaulting silently.
+
+    Sibling coverage: src/forum/tests/test_baton_thin_client.py::TestCmdGc
+    tests the same cmd_gc surface from the thin-client-migration angle
+    (POST body shape, error-code mapping). #1918 review round caught these
+    two files drifting independently on the same anchor-contract change --
+    if you touch cmd_gc's anchor handling, check both."""
 
     def test_gc_uses_repo_from_github_field_not_ambient_cwd(self, monkeypatch):
         client = _make_client(get_return={"projects": [
@@ -2204,10 +2251,11 @@ class TestGcRepoAware:
         assert cmd[cmd.index("--repo") + 1] == "engram-agents/engram-paper"
         assert "22" in cmd
 
-    def test_gc_defaults_unqualified_anchor_to_default_repo_explicitly(self, monkeypatch):
-        """A bare pr/<N> anchor (no repo) still passes --repo explicitly
-        (DEFAULT_GITHUB_REPO), never omits it to fall back on gh's ambient
-        cwd -- that ambient-cwd fallback was itself part of the #1715 bug."""
+    def test_gc_skips_unqualified_anchor_never_guesses(self, monkeypatch, capsys):
+        """#1918: a bare pr/<N> anchor (no repo) is skipped-and-counted like
+        a missing anchor -- there is no default repo to pass to --repo.
+        Supersedes the old test_gc_defaults_unqualified_anchor_to_default_repo_explicitly,
+        which asserted the exact silent-guess behavior this issue fixes."""
         client = _make_client(get_return={"projects": [
             {"project_id": "PR-1711", "github": "pr/1711"},
         ]})
@@ -2225,10 +2273,10 @@ class TestGcRepoAware:
         args = argparse.Namespace(dry_run=True, limit=30)
         _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
 
-        assert len(captured_cmds) == 1
-        cmd = captured_cmds[0]
-        assert "--repo" in cmd
-        assert cmd[cmd.index("--repo") + 1] == _baton.DEFAULT_GITHUB_REPO
+        assert captured_cmds == []  # no gh call at all -- never guessed
+        captured = capsys.readouterr()
+        assert "skipped 1 PR-baton" in captured.err
+        assert "unqualified" in captured.err
 
     def test_gc_skips_pr_baton_with_no_github_anchor(self, monkeypatch, capsys):
         """A PR-<N> baton with no (or unparseable) github field is skipped,
@@ -2248,15 +2296,16 @@ class TestGcRepoAware:
         assert "skipped 1 PR-baton" in captured.err
 
     def test_gc_two_different_repos_same_number_both_handled_correctly(self, monkeypatch):
-        """The exact #1715 collision shape: two PR-batons for the SAME bare
-        number (22) in DIFFERENT repos must each query their OWN repo and
-        never share a result (reviewer-fairy caught: the original version of
-        this test constructed only one project, so it never actually
-        exercised the collision -- it was equivalent to the single-project
-        test just above it)."""
+        """The exact #1715 collision shape: two PR-batons for the SAME
+        number (22) in DIFFERENT (both repo-qualified, per #1918 -- a bare
+        anchor is never queried at all now) repos must each query their OWN
+        repo and never share a result (reviewer-fairy caught: the original
+        version of this test constructed only one project, so it never
+        actually exercised the collision -- it was equivalent to the
+        single-project test just above it)."""
         client = _make_client(get_return={"projects": [
             {"project_id": "PR-9200", "github": "pr/engram-agents/engram-paper/22"},
-            {"project_id": "PR-9201", "github": "pr/22"},  # bare -> DEFAULT_GITHUB_REPO
+            {"project_id": "PR-9201", "github": "pr/example-org/example-repo/22"},
         ]})
         captured_cmds = []
 
@@ -2278,12 +2327,84 @@ class TestGcRepoAware:
         assert len(captured_cmds) == 2
         by_repo = {cmd[cmd.index("--repo") + 1]: cmd for cmd in captured_cmds}
         assert "engram-agents/engram-paper" in by_repo
-        assert _baton.DEFAULT_GITHUB_REPO in by_repo
+        assert "example-org/example-repo" in by_repo
         # Both invocations target PR number 22, and each carries its OWN repo
         # -- confirms they are not the same call, and neither's repo bleeds
         # into the other's.
         assert "22" in by_repo["engram-agents/engram-paper"]
-        assert "22" in by_repo[_baton.DEFAULT_GITHUB_REPO]
+        assert "22" in by_repo["example-org/example-repo"]
+
+
+class TestGcFailedVsSkipped:
+    """#1918 defect 2: a gh query failure must be counted as `failed`, not
+    `skipped` -- the old code bucketed both together, so a run's own
+    summary line could read `failed 0` immediately after printing dozens of
+    'gh query failed' lines, making a completely inert sweep look clean."""
+
+    def test_gh_query_failure_counted_as_failed_not_skipped(self, monkeypatch, capsys):
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-31", "github": "pr/example-org/example-repo/31"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=1, stdout="", stderr="not found"),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_IO
+        captured = capsys.readouterr()
+        assert "would close 0, skipped 0, failed 1" in captured.out
+
+    def test_pr_still_open_counted_as_skipped_not_failed(self, monkeypatch, capsys):
+        """The companion case: a SUCCESSFUL gh query whose PR is simply
+        still OPEN (no action needed) stays a `skipped`, not a `failed` --
+        this test guards against over-correcting #1918 into flagging every
+        non-close as an error."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-32", "github": "pr/example-org/example-repo/32"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=0, stdout="OPEN", stderr=""),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+
+        # No SystemExit -- a clean sweep with nothing to close is not a failure.
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, skipped 1, failed 0" in captured.out
+
+    def test_mixed_run_exits_nonzero_and_reports_accurate_counts(self, monkeypatch, capsys):
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-41", "github": "pr/example-org/example-repo/41"},  # fails
+            {"project_id": "PR-42", "github": "pr/example-org/example-repo/42"},  # open, skipped
+            {"project_id": "PR-43", "github": "pr/example-org/example-repo/43"},  # merged, closed
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            pr_num = cmd[3]  # ["gh", "pr", "view", pr_num, "--repo", ...]
+            if pr_num == "41":
+                return MagicMock(returncode=1, stdout="", stderr="gh: not found")
+            if pr_num == "42":
+                return MagicMock(returncode=0, stdout="OPEN", stderr="")
+            return MagicMock(returncode=0, stdout="MERGED", stderr="")
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_IO
+        captured = capsys.readouterr()
+        assert "would close 1, skipped 1, failed 1" in captured.out
 
 
 class TestFlipRepoQualifiedGuard:
@@ -2362,10 +2483,13 @@ class TestFlipRepoQualifiedGuard:
         assert ("ci", "9101", "engram-agents/engram-paper") in calls
         assert ("approval", "9101", "engram-agents/engram-paper") in calls
 
-    def test_flip_bare_anchor_still_resolves_default_repo(self, monkeypatch):
-        """Backward-compat: an existing bare pr/<N> anchor still triggers
-        the guard (unlike before this test existed to prove it) and
-        resolves against DEFAULT_GITHUB_REPO, not None/unresolved."""
+    def test_flip_bare_anchor_skips_guard_never_guesses(self, monkeypatch, capsys):
+        """#1918: an unqualified bare pr/<N> anchor skips the CI/approval/
+        colleague guard entirely (no gh call, no guessed repo) rather than
+        resolving against a default -- the flip still succeeds, just
+        unverified, with a warning. Supersedes the old
+        test_flip_bare_anchor_still_resolves_default_repo, which asserted
+        the exact silent-guess behavior this issue fixes."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         calls = []
 
@@ -2390,4 +2514,6 @@ class TestFlipRepoQualifiedGuard:
         _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
 
         client.post.assert_called_once()
-        assert ("ci", "9102", _baton.DEFAULT_GITHUB_REPO) in calls
+        assert calls == []  # no gh call at all -- never guessed a repo
+        captured = capsys.readouterr()
+        assert "not repo-qualified" in captured.err

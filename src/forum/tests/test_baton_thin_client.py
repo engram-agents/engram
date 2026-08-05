@@ -758,6 +758,12 @@ class TestNotFound:
 # ---------------------------------------------------------------------------
 
 class TestCmdGc:
+    """Sibling coverage: tests/test_baton.py::TestGcRepoAware tests the same
+    cmd_gc surface from the repo-qualification angle (never-guess-a-repo).
+    #1918 review round caught these two files drifting independently on the
+    same anchor-contract change -- if you touch cmd_gc's anchor handling,
+    check both."""
+
     def _gh_state(self, state: str):
         """A fake subprocess.run result for `gh pr view ... -q .state`."""
         return MagicMock(returncode=0, stdout=f"{state}\n", stderr="")
@@ -769,9 +775,13 @@ class TestCmdGc:
         `github` anchor, not by re-deriving it from project_id -- a baton
         with no anchor is skipped (see TestGcRepoAware in tests/test_baton.py),
         so this fixture must carry one to remain gc-eligible.
+
+        #1918: the anchor must be repo-qualified -- an unqualified pr/<N>
+        is now refused-and-counted (ungauged), never queried at all, so a
+        bare anchor here would make this test assert 0 calls instead of 1.
         """
         client = _make_client(
-            get_return={"projects": [{"project_id": "PR-500", "github": "pr/500"}]},
+            get_return={"projects": [{"project_id": "PR-500", "github": "pr/example-org/example-repo/500"}]},
             post_return={"seq": 9},
         )
         monkeypatch.setattr(_baton.shutil, "which", lambda name: "/usr/bin/gh")
@@ -786,8 +796,14 @@ class TestCmdGc:
         assert body["new_status"] == "merged"
 
     def test_dry_run_does_not_post(self, monkeypatch):
-        """--dry-run previews without writing."""
-        client = _make_client(get_return={"projects": [{"project_id": "PR-501", "github": "pr/501"}]})
+        """--dry-run previews without writing.
+
+        #1918: repo-qualified anchor -- see test_closes_merged_pr_baton's
+        note. Kept qualified here too so this test still exercises the
+        query-then-preview path, not just the (also-true) unqualified
+        never-queried path.
+        """
+        client = _make_client(get_return={"projects": [{"project_id": "PR-501", "github": "pr/example-org/example-repo/501"}]})
         monkeypatch.setattr(_baton.shutil, "which", lambda name: "/usr/bin/gh")
         monkeypatch.setattr(_baton.subprocess, "run", lambda *a, **k: self._gh_state("MERGED"))
         args = _ns(dry_run=True, limit=30)
