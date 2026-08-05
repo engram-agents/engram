@@ -332,6 +332,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/os-harness-check.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/release-cutover.py",
       "tier": "dev"
     },

@@ -12,6 +12,10 @@
 # Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
 #   spawn    finalize-name
 #
+# os-harness-check: linux-only  (bash 4.3+ namerefs/mapfile/case-mod are
+#   intentional here and MUST NOT be "portability-fixed" — see the macOS note
+#   directly below. The macOS path is tools/agentctl-mac, which IS scanned.)
+#
 # macOS: this tool assumes a multi-agent Linux host (per-agent "agent-<name>"
 # users, sudo user-switch, ACL sharing) and does not run there. For a Mac
 # host running exactly one agent, see the sibling tools/agentctl-mac — a

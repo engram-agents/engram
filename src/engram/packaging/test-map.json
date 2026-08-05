@@ -375,6 +375,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/os-harness-check.py",
+      "test_globs": [
+        "tests/test_os_harness_check.py"
+      ],
+      "note": "The checker reports an ABSENCE (no bash-4-only constructs in shipped shell scripts), and an absence-reporting tool is trustworthy only if its detector demonstrably fires on a positive. The mapped suite therefore weights the detector's falsifiability — every pattern matches a known-positive AND rejects the portable bash-3.2 equivalent — over its plumbing. The hyphenated filename means it is loaded by path, not imported, so it has no import-graph edge and would otherwise be layer-1-unreachable."
+    },
+    {
       "path_prefix_or_glob": "tools/release-cutover.py",
       "test_globs": [
         "tests/test_release_cutover.py"
