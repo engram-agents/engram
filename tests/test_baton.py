@@ -1147,7 +1147,16 @@ class TestRelease:
 # ===========================================================================
 
 import re as _re
-_GITHUB_ANCHOR_PATTERN = _re.compile(r"^(pr|project)/\d+$")
+# Mirrors production `_GITHUB_ANCHOR_RE` in src/engram/tools/baton.py.
+# It had drifted: this test-local copy still only accepted the BARE
+# `pr/<N>` form and rejected the repo-qualified `pr/<owner>/<repo>/<N>`
+# that #1715 introduced, so a fixture using the recommended (qualified)
+# form failed a pattern check that production accepts. Kept as a
+# deliberate local copy rather than an import (this file asserts the
+# WIRE shape independently of the module under test) -- but it has to
+# actually match. See tests/test_anchor_regex_parity.py for the pinned
+# cross-parser contract.
+_GITHUB_ANCHOR_PATTERN = _re.compile(r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?\d+|project/\d+)$")
 
 
 class TestAnchor:
@@ -1162,12 +1171,12 @@ class TestAnchor:
         args = argparse.Namespace(
             project_id="PR-env-home", title="env home test",
             participants="borges,ariadne", status="planning",
-            turn=None, github="pr/123", colleague=None,
+            turn=None, github="pr/example-org/example-repo/123", colleague=None,
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
         _, body = client.post.call_args[0]
-        assert body["github"] == "pr/123"
+        assert body["github"] == "pr/example-org/example-repo/123"
         assert _GITHUB_ANCHOR_PATTERN.match(body["github"])
 
     def test_init_github_pr_reflected_in_show(self, monkeypatch, capsys):
@@ -1180,11 +1189,11 @@ class TestAnchor:
         args_init = argparse.Namespace(
             project_id="PR-show-test", title="show test",
             participants="borges,ariadne", status="planning",
-            turn=None, github="pr/456", colleague=None,
+            turn=None, github="pr/example-org/example-repo/456", colleague=None,
         )
         _baton.cmd_init(args_init, MULTI_CONFIG, "borges", client)
         _, init_body = client.post.call_args[0]
-        assert init_body["github"] == "pr/456"
+        assert init_body["github"] == "pr/example-org/example-repo/456"
 
         # Step 2: show — API returns the server-written state including github field
         raw_with_github = (
@@ -1196,7 +1205,7 @@ class TestAnchor:
             "turn_since: 2026-01-01T00:00:00Z\n"
             'turn_reason: "initialized"\n'
             "participants: [borges, ariadne]\n"
-            "github: pr/456\n"
+            "github: pr/example-org/example-repo/456\n"
             "---\n\n"
             "# PR-show-test\n\n"
             "## Turn log\n\n"
@@ -1206,7 +1215,7 @@ class TestAnchor:
         args_show = argparse.Namespace(project_id="PR-show-test")
         _baton.cmd_show(args_show, MULTI_CONFIG, "borges", client2)
         captured = capsys.readouterr()
-        assert "pr/456" in captured.out
+        assert "pr/example-org/example-repo/456" in captured.out
 
     def test_init_github_rejects_malformed_value(self, engram_home):
         """init --github with malformed value exits non-zero (validation before API)."""
@@ -1222,6 +1231,100 @@ class TestAnchor:
             assert rc != 0, (
                 f"Expected non-zero exit for --github '{bad_val}'; got rc={rc}"
             )
+
+    # --- #1924: the mint path must not create what gc/flip/merge refuse -----
+
+    def test_init_warns_on_explicit_unqualified_pr_anchor(self, monkeypatch, capsys):
+        """#1924: --github pr/<N> with no repo WARNS at creation and still creates.
+
+        #1918/#1920 made gc/flip/merge refuse-and-count an unqualified PR
+        anchor; cmd_init minted one silently, so the refusal surfaced weeks
+        later on whoever tried to merge. The warning moves that signal to the
+        one moment the author can act on it. It deliberately does NOT refuse --
+        see the comment at the call site for the blast-radius reasoning.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-777", title="unqualified anchor",
+            participants="borges,ariadne", status="planning",
+            turn=None, github="pr/777", colleague=None, repo=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/777"          # still created
+        err = capsys.readouterr().err
+        assert "REFUSE this baton later" in err     # names the real consequence
+        assert "baton anchor PR-777" in err         # and the after-the-fact fix
+
+    def test_init_warns_on_auto_derived_bare_anchor(self, monkeypatch, capsys):
+        """#1924: the SILENT path -- no --github at all, anchor auto-derived
+        from a PR-<N> project_id. This is the plainest possible invocation and
+        was the one that produced most unqualified anchors in practice."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-1234", title="auto derived",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, colleague=None, repo=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/1234"
+        err = capsys.readouterr().err
+        # the message must name WHY the anchor exists at all, or the caller
+        # cannot tell why they are being warned about a flag they never passed
+        assert "auto-derived" in err
+        assert "--repo" in err
+
+    def test_init_accepts_repo_qualified_via_repo_flag(self, monkeypatch):
+        """#1924 gate does not fire when --repo qualifies the derived anchor."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-1234", title="qualified via --repo",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, colleague=None,
+            repo="example-org/example-repo",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/example-org/example-repo/1234"
+
+    def test_init_accepts_fully_qualified_github_anchor(self, monkeypatch):
+        """#1924 gate does not fire on an already-qualified --github value."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-99", title="fully qualified",
+            participants="borges,ariadne", status="planning",
+            turn=None, github="pr/example-org/example-repo/99",
+            colleague=None, repo=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        _, body = client.post.call_args[0]
+        assert body["github"] == "pr/example-org/example-repo/99"
+
+    def test_init_non_pr_baton_is_unaffected(self, monkeypatch):
+        """#1924 is scoped to anchors that RESOLVE TO A PR. A project baton
+        (and any baton with no github anchor) must still init cleanly --
+        widening the gate to those would break every DESIGN-* project."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        for gh in (None, "project/4"):
+            client = _make_client({"seq": 1})
+            args = argparse.Namespace(
+                project_id="DESIGN-trust-tier", title="design baton",
+                participants="borges,ariadne", status="planning",
+                turn=None, github=gh, colleague=None, repo=None,
+            )
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+            _, body = client.post.call_args[0]
+            assert body["github"] == gh
 
     def test_anchor_sets_github_on_existing_baton(self, monkeypatch):
         """init → anchor: the anchor API is called with github=project/4."""

@@ -735,6 +735,60 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             sys.exit(EXIT_VALIDATION)
         github_anchor = f"pr/{repo_arg}/{parsed[2]}"
 
+    # #1924: the mint path must not produce what the consume paths refuse.
+    # #1918/#1920 made cmd_gc/cmd_flip/cmd_merge refuse-and-count an
+    # unqualified pr/<N> anchor (there is no default repo to guess against),
+    # but left cmd_init free to keep creating them -- including SILENTLY, via
+    # the auto-derive above, on the plainest possible invocation
+    # (`baton init PR-1234 --title ... --participants ...`). The result was a
+    # baton born unmergeable: `baton merge` hard-refuses it later with
+    # "run baton anchor first", and that refusal lands on whoever tries to
+    # merge, days or weeks after the person who could trivially have avoided
+    # it has moved on.
+    #
+    # WARN, deliberately, rather than refuse -- and the reason is worth
+    # recording because my first draft of this fix DID refuse:
+    #
+    #   * Refusing breaks the plainest invocation there is
+    #     (`baton init PR-1234 --title ... --participants ...`), which is what
+    #     every agent and script on this host actually types. Seven existing
+    #     tests failed on it.
+    #   * One of those, test_init_auto_derives_bare_anchor_from_pr_project_id,
+    #     exists specifically to PIN bare auto-derivation as intended #1715
+    #     behavior. Flipping a pinned contract is a team decision, not a
+    #     follow-up's to make unilaterally. #1924 carries that question.
+    #
+    # A creation-time warning is also better targeted than I first argued.
+    # I had reasoned by analogy to cmd_flip's stderr warning, which reaches
+    # the flipping agent while the consequence lands on the maintainer -- but
+    # that analogy is wrong here. At init the author IS the party who can fix
+    # it, holds the missing flag right now, and is the only one who knows
+    # which repo is meant. The displaced-consequence problem is precisely what
+    # warning HERE (rather than only refusing later, at merge) removes.
+    #
+    # Scope note: fires only when an anchor RESOLVES TO A PR and is
+    # unqualified. A baton with no github anchor at all (a DESIGN-* project,
+    # or a PR-shaped id the auto-derive regex doesn't match, e.g.
+    # UMWELT-PR-<N>) is untouched -- cmd_gc already counts those as ungauged,
+    # and widening this to cover them needs a broader notion of "is this a PR
+    # baton" than project_id shape alone. Tracked in #1924, not guessed at.
+    _final_anchor = _parse_github_anchor(github_anchor) if github_anchor else None
+    if _final_anchor is not None and _final_anchor[0] == "pr" and _final_anchor[1] is None:
+        _n = _final_anchor[2]
+        _derived = repo_arg is None and not getattr(args, "github", None)
+        print(
+            f"baton init: warning: '{project_id}' is being created with the "
+            f"unqualified PR anchor 'pr/{_n}'"
+            + (" (auto-derived from the project id)" if _derived else "")
+            + " -- there is no default repo (#1918), so gc/flip/merge will all "
+            "REFUSE this baton later. Qualify it now:\n"
+            f"    baton init {project_id} ... --repo <owner>/<repo>\n"
+            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}\n"
+            f"  or fix it after the fact:\n"
+            f"    baton anchor {project_id} --github pr/<owner>/<repo>/{_n}",
+            file=sys.stderr,
+        )
+
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
