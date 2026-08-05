@@ -11,6 +11,24 @@ with an `-alpha` suffix during the alpha phase.
 
 ### Added
 
+- **Append-only dream-lottery draw history** (#1909) — `tools/dream_lottery.py
+  draw` now appends the full per-draw record (weights before/after, drawn
+  types, interrupt-forced types, cascade-marker count) to an append-only
+  JSONL history file, derived from the `--state` path (default
+  `~/.engram/dream-lottery-history.jsonl`; override with `--history`). Fixes
+  the gap where this record was printed to stdout and then lost, leaving no
+  mechanical data source for "which category wins, how often, how often does
+  the cascade interrupt fire" during the lottery's soak period on `dev`. A
+  new `history` subcommand tallies the file: per-category drawn-vs-
+  interrupt-forced counts, total cycles, interrupt-cycle count, and
+  first/last timestamp covered (`--limit N` restricts to the most recent N
+  cycles). State persists before the history append (ordering is
+  load-bearing — see the module docstring); a history-write failure is
+  caught and downgraded to a stderr warning, never breaking the draw itself.
+  `--dry-run` writes neither state nor history. The sleep skill's dream-record
+  transcription step is unchanged (belt and braces), but a missed
+  transcription is now recoverable from this file instead of lost for good.
+
 - **Weight-aging dream-fairy lottery** (#1901) — the sleep cycle's Phase B no
   longer dispatches all 9 dream-fairy scan categories every night. A
   weight-aging lottery (`tools/dream_lottery.py`) draws one category per

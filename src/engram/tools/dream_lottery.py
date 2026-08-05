@@ -44,6 +44,28 @@ now spread across a longer inter-draw gap. Flagged in the audit, not solved
 here; a timed-out lottery draw is a rare event, not a routine correctness
 gap.
 
+History file (issue #1909): ``~/.engram/dream-lottery-history.jsonl`` —
+derived from the state path (``dream-lottery.json`` ->
+``dream-lottery-history.jsonl``, same directory), not a fixed path, so a
+``--state`` override (tests, alternate installs) stays isolated end to end.
+Override explicitly with ``--history``. One compact JSON line is appended
+per draw — the full ``result`` record from ``run_draw`` (it already carries
+``turn`` and ``now``), so the rich per-draw shape (``weights_before``,
+``weights_after``, ``drawn_types``, ``types_to_run``, ``interrupt_fired``,
+``cascade_marker_count``) that used to be printed to stdout and lost is now
+durable and queryable via the ``history`` subcommand. No rotation or
+pruning: one line a night is ~365 lines/year, cheap indefinitely — do not
+add log rotation here without a real reason to.
+
+**Ordering is load-bearing: ``save_state`` runs FIRST, the history append
+SECOND.** State is required for the aging sequence to be correct; history
+is observability on top of an already-correct draw. A logged draw that
+never took effect (state write failed/skipped) would be worse than an
+effective draw that went unlogged (history write failed) — so state
+commits before we even attempt to log it, and a history-write failure is
+caught and downgraded to a stderr warning: it must never fail the command
+or imply the draw itself didn't happen. See ``cmd_draw``.
+
 The `INTERRUPT_TYPES` default ({2, 5} -- contradictions + tainted-valid) is
 this module's own reading of the issue's "cascade/contradiction fairy"
 phrase, not literally specified there (Kepler's formal spec had not landed
@@ -53,6 +75,7 @@ as of #1901's filing). Flagged for Kepler/Lei's read; override via
 Usage:
     python -m tools.dream_lottery draw --db ~/.engram/knowledge.db --turn 39
     python -m tools.dream_lottery status
+    python -m tools.dream_lottery history --limit 30
 """
 
 from __future__ import annotations
@@ -68,6 +91,22 @@ from pathlib import Path
 
 DEFAULT_STATE_PATH = os.path.expanduser("~/.engram/dream-lottery.json")
 DEFAULT_DB_PATH = os.path.expanduser("~/.engram/knowledge.db")
+
+
+def history_path_for_state(state_path: str) -> str:
+    """Derive the append-only draw-history path from a state path.
+
+    ``dream-lottery.json`` -> ``dream-lottery-history.jsonl``, same
+    directory. Deriving from the state path (rather than a fixed constant)
+    keeps a ``--state`` override (tests, alternate installs) isolated end
+    to end -- a test pointing ``--state`` at tmp_path must not also leak a
+    history line into the real ``~/.engram/``.
+    """
+    p = Path(state_path)
+    return str(p.with_name(f"{p.stem}-history.jsonl"))
+
+
+DEFAULT_HISTORY_PATH = history_path_for_state(DEFAULT_STATE_PATH)
 
 # Canonical category table -- mirrors engram-sleep/SKILL.md Step 6 and
 # engram-dream-fairy.md's category numbering. Update both when adding,
@@ -146,6 +185,21 @@ def save_state(state: dict, path: str = DEFAULT_STATE_PATH) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
     tmp.replace(p)  # atomic on POSIX
+
+
+def append_history(result: dict, path: str = DEFAULT_HISTORY_PATH) -> None:
+    """Append one compact JSON line for this draw's ``result`` record.
+
+    Append-only -- no rotation/pruning here (see module docstring: ~365
+    lines/year is cheap indefinitely). Callers must NOT rely on this for
+    draw correctness: it is observability layered on top of an already-
+    persisted state write (see the ordering note on ``cmd_draw``), and a
+    caller should treat any exception from this function as non-fatal.
+    """
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(result, sort_keys=True) + "\n")
 
 
 def count_cascade_markers(db_path: str, since_iso: str | None) -> int:
@@ -304,8 +358,23 @@ def cmd_draw(args: argparse.Namespace) -> int:
         interrupt_threshold=args.interrupt_threshold,
         rng=rng,
     )
+    history_path = args.history or history_path_for_state(args.state)
     if not args.dry_run:
+        # Ordering is load-bearing -- see module docstring. save_state
+        # first: it is required for the aging sequence to be correct.
+        # append_history second, wrapped so a history-write failure can
+        # never break the draw: state is already persisted by this point,
+        # so a logged draw that didn't take effect would be worse than an
+        # effective draw that wasn't logged.
         save_state(outcome["state"], args.state)
+        try:
+            append_history(outcome["result"], history_path)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad; see docstring
+            print(
+                f"warning: failed to append dream-lottery draw history to "
+                f"{history_path}: {exc}",
+                file=sys.stderr,
+            )
     print(json.dumps(outcome["result"], indent=2, sort_keys=True))
     return 0
 
@@ -334,6 +403,104 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def tally_history(path: str, limit: int | None = None) -> dict:
+    """Read the append-only draw-history file and tally per-category and
+    per-cycle stats.
+
+    Missing file -> a valid, all-zero result (not an error): a fresh
+    install or a soak that hasn't drawn yet is a legitimate empty state,
+    not a failure. Malformed/truncated lines (a crash mid-append can leave
+    a partial trailing line) are skipped and counted in
+    ``skipped_malformed`` rather than raising -- one bad line must not hide
+    every good one before/after it.
+
+    ``limit`` (if given) restricts the tally to the most recent N raw
+    lines in the file (append-only, so "most recent" == "last N lines"),
+    matching before parsing/validity-filtering -- consistent with "the
+    most recent N cycles" read as "the most recent N draw attempts",
+    malformed or not.
+    """
+    p = Path(path)
+    if p.exists():
+        lines = [ln for ln in p.read_text().splitlines() if ln.strip()]
+    else:
+        lines = []
+    if limit is not None:
+        lines = lines[-limit:] if limit > 0 else []
+
+    per_category = {
+        str(n): {
+            "category": n,
+            "slug": CATEGORIES[n],
+            "drawn_count": 0,
+            "interrupt_forced_count": 0,
+            "total_runs": 0,
+            "last_run_at": None,
+            "last_run_turn": None,
+        }
+        for n in CATEGORIES
+    }
+
+    cycles_counted = 0
+    interrupt_cycles = 0
+    skipped_malformed = 0
+    first_timestamp: str | None = None
+    last_timestamp: str | None = None
+
+    for line in lines:
+        try:
+            rec = json.loads(line)
+            drawn = rec["drawn_types"]
+            interrupt = rec["interrupt_types"]
+            turn = rec["turn"]
+            now = rec["now"]
+            interrupt_fired = rec["interrupt_fired"]
+        except (ValueError, TypeError, KeyError):
+            skipped_malformed += 1
+            continue
+
+        cycles_counted += 1
+        if interrupt_fired:
+            interrupt_cycles += 1
+        if first_timestamp is None:
+            first_timestamp = now
+        last_timestamp = now
+
+        for cat_num in drawn:
+            entry = per_category.get(str(cat_num))
+            if entry is None:
+                continue
+            entry["drawn_count"] += 1
+            entry["total_runs"] += 1
+            entry["last_run_at"] = now
+            entry["last_run_turn"] = turn
+        for cat_num in interrupt:
+            entry = per_category.get(str(cat_num))
+            if entry is None:
+                continue
+            entry["interrupt_forced_count"] += 1
+            entry["total_runs"] += 1
+            entry["last_run_at"] = now
+            entry["last_run_turn"] = turn
+
+    return {
+        "history_path": str(p),
+        "cycles_counted": cycles_counted,
+        "interrupt_cycles": interrupt_cycles,
+        "skipped_malformed": skipped_malformed,
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "categories": [per_category[str(n)] for n in sorted(CATEGORIES)],
+    }
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    history_path = args.history or history_path_for_state(args.state)
+    result = tally_history(history_path, limit=args.limit)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -350,11 +517,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_draw.add_argument("--interrupt-threshold", type=int, default=DEFAULT_INTERRUPT_THRESHOLD, help="Cascade-marker count that triggers the interrupt")
     p_draw.add_argument("--seed", type=int, default=None, help="Seed the RNG (testing/reproducibility only)")
     p_draw.add_argument("--dry-run", action="store_true", help="Compute and print the draw without persisting state")
+    p_draw.add_argument(
+        "--history",
+        default=None,
+        help="Path to the append-only draw-history JSONL (default: derived from --state)",
+    )
     p_draw.set_defaults(func=cmd_draw)
 
     p_status = sub.add_parser("status", help="Print current lottery state (human/CI readable)")
     p_status.add_argument("--state", default=DEFAULT_STATE_PATH, help="Path to dream-lottery.json")
     p_status.set_defaults(func=cmd_status)
+
+    p_history = sub.add_parser("history", help="Tally the append-only draw-history file")
+    p_history.add_argument(
+        "--state",
+        default=DEFAULT_STATE_PATH,
+        help="Path to dream-lottery.json (used only to derive the default --history path)",
+    )
+    p_history.add_argument(
+        "--history",
+        default=None,
+        help="Path to dream-lottery-history.jsonl (default: derived from --state)",
+    )
+    p_history.add_argument("--limit", type=int, default=None, help="Restrict tally to the most recent N cycles")
+    p_history.set_defaults(func=cmd_history)
 
     return parser
 

@@ -41,6 +41,19 @@ Covers:
   cascade counting:
     20. count_cascade_markers counts only the four cascade actions, not
         unrelated edit_history rows, and respects the since_iso cutoff.
+
+  draw-history (append-only, issue #1909):
+    21. A real `draw` CLI invocation appends exactly one JSONL line; three
+        draws append three lines.
+    22. `--dry-run` writes neither state nor history.
+    23. The default history path derives correctly from a custom `--state`.
+    24. A history-write failure (unwritable path) does not break the draw:
+        the CLI still exits 0 and state is still saved.
+    25. The `history` subcommand tally is correct and distinguishes
+        drawn-by-lottery from interrupt-forced counts.
+    26. A malformed/truncated line is skipped and counted in
+        `skipped_malformed`, not fatal.
+    27. A missing history file tallies as a valid, all-zero empty result.
 """
 
 from __future__ import annotations
@@ -63,9 +76,12 @@ from tools.dream_lottery import (  # noqa: E402
     WINDOW_SCOPED_CATEGORIES,
     count_cascade_markers,
     default_state,
+    history_path_for_state,
     load_state,
+    main,
     run_draw,
     save_state,
+    tally_history,
     weighted_draw,
 )
 
@@ -376,3 +392,176 @@ def test_count_cascade_markers_filters_action_and_since(tmp_path):
     assert count_cascade_markers(str(db), None) == 4  # all cascade actions, any time
     assert count_cascade_markers(str(db), "2026-08-03T00:00:00Z") == 2  # stale_flagged + support_lost
     assert count_cascade_markers(str(db), "2026-08-10T00:00:00Z") == 0
+
+
+# ---------------------------------------------------------------------------
+# Draw history (append-only, issue #1909)
+# ---------------------------------------------------------------------------
+
+def _draw_cli(state_path, db_path, turn, seed=None, extra=None, dry_run=False):
+    """Invoke `draw` through the real CLI entrypoint (main()), not run_draw
+    directly -- these tests exercise the CLI-level history-append wiring in
+    cmd_draw, not the pure algorithm (already covered above)."""
+    argv = ["draw", "--state", str(state_path), "--db", str(db_path), "--turn", str(turn)]
+    if seed is not None:
+        argv += ["--seed", str(seed)]
+    if dry_run:
+        argv.append("--dry-run")
+    if extra:
+        argv += extra
+    rc = main(argv)
+    return rc
+
+
+def test_history_path_derives_from_custom_state(tmp_path):
+    state_path = tmp_path / "sub" / "dream-lottery.json"
+    expected = tmp_path / "sub" / "dream-lottery-history.jsonl"
+    assert history_path_for_state(str(state_path)) == str(expected)
+
+
+def test_real_draw_appends_one_history_line(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=1, seed=1)
+    capsys.readouterr()
+    assert rc == 0
+    assert state_path.exists()
+    assert history_path.exists()
+    lines = history_path.read_text().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["turn"] == 1
+    assert "drawn_types" in rec and "now" in rec
+
+
+def test_three_draws_append_three_lines(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    for i, seed in enumerate((1, 2, 3), start=1):
+        rc = _draw_cli(state_path, db, turn=i, seed=seed)
+        assert rc == 0
+    capsys.readouterr()
+    lines = history_path.read_text().splitlines()
+    assert len(lines) == 3
+
+
+def test_dry_run_writes_neither_state_nor_history(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    rc = _draw_cli(state_path, db, turn=1, seed=1, dry_run=True)
+    capsys.readouterr()
+    assert rc == 0
+    assert not state_path.exists()
+    assert not history_path.exists()
+
+
+def test_history_write_failure_does_not_break_draw(tmp_path, capsys):
+    """Simulate a history-write failure (unwritable directory) -- the draw
+    must still exit 0 and state must still be saved (state persists BEFORE
+    the history append is even attempted -- see module docstring)."""
+    state_path = tmp_path / "dream-lottery.json"
+    readonly_dir = tmp_path / "readonly"
+    readonly_dir.mkdir(mode=0o555)
+    history_path = readonly_dir / "dream-lottery-history.jsonl"
+    db = _make_edit_history_db(tmp_path, [])
+    try:
+        rc = _draw_cli(
+            state_path, db, turn=1, seed=1, extra=["--history", str(history_path)]
+        )
+        out = capsys.readouterr()
+        assert rc == 0
+        assert state_path.exists()
+        assert not history_path.exists()
+        assert "warning" in out.err.lower()
+        # stdout must still carry the draw result JSON (draw itself succeeded)
+        result = json.loads(out.out)
+        assert result["turn"] == 1
+    finally:
+        readonly_dir.chmod(0o755)  # allow tmp_path cleanup
+
+
+def test_history_subcommand_distinguishes_drawn_from_interrupt_forced(tmp_path, capsys):
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+
+    # Draw 1: cold start, no interrupt possible (last_interrupt_check_at is
+    # None on a fresh state -> cascade_marker_count is seeded to 0 by
+    # design). Picks one category by the random draw. seed=0 draws category
+    # 8 (verified against weighted_draw directly) -- deliberately NOT 2 or
+    # 5, so draw 1's random pick and draw 2's interrupt-forced set below
+    # stay disjoint and the drawn-vs-forced assertions are unambiguous.
+    rc1 = _draw_cli(state_path, db, turn=1, seed=0)
+    out1 = json.loads(capsys.readouterr().out)
+    assert rc1 == 0
+    assert out1["interrupt_fired"] is False
+
+    # Add cascade rows timestamped at/after draw 1's own `now`, at the
+    # default interrupt_threshold (3), so draw 2's since-filter (seeded
+    # from draw 1's last_interrupt_check_at) picks them all up.
+    conn = sqlite3.connect(str(db))
+    for i in range(3):
+        conn.execute(
+            "INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details) "
+            "VALUES (?, 1, 'retracted', ?, 'observation', '{}')",
+            (out1["now"], f"ob_x{i:02d}"),
+        )
+    conn.commit()
+    conn.close()
+
+    rc2 = _draw_cli(state_path, db, turn=2, seed=2)
+    out2 = json.loads(capsys.readouterr().out)
+    assert rc2 == 0
+    assert out2["interrupt_fired"] is True
+    assert out2["interrupt_types"] == [2, 5]  # DEFAULT_INTERRUPT_TYPES
+
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    tally = tally_history(str(history_path))
+    assert tally["cycles_counted"] == 2
+    assert tally["interrupt_cycles"] == 1
+    assert tally["skipped_malformed"] == 0
+
+    by_cat = {c["category"]: c for c in tally["categories"]}
+    drawn1 = out1["drawn_types"][0]
+    drawn2 = out2["drawn_types"][0]
+
+    assert by_cat[drawn1]["drawn_count"] >= 1
+    assert by_cat[drawn2]["drawn_count"] >= 1
+    assert by_cat[2]["interrupt_forced_count"] == 1
+    assert by_cat[2]["drawn_count"] == 0
+    assert by_cat[5]["interrupt_forced_count"] == 1
+    assert by_cat[5]["drawn_count"] == 0
+    # Drawn and interrupt-forced are tallied separately even for the same
+    # category, and total_runs is their sum.
+    for cat in tally["categories"]:
+        assert cat["total_runs"] == cat["drawn_count"] + cat["interrupt_forced_count"]
+
+
+def test_malformed_line_skipped_and_counted(tmp_path):
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    good = json.dumps(
+        {
+            "turn": 1,
+            "now": "2026-08-04T00:00:00Z",
+            "drawn_types": [1],
+            "interrupt_types": [],
+            "interrupt_fired": False,
+        },
+        sort_keys=True,
+    )
+    history_path.write_text(good + "\n" + '{"turn": 2, "now": "trunc' + "\n")
+    tally = tally_history(str(history_path))
+    assert tally["cycles_counted"] == 1
+    assert tally["skipped_malformed"] == 1
+
+
+def test_missing_history_file_returns_empty(tmp_path):
+    history_path = tmp_path / "does-not-exist.jsonl"
+    tally = tally_history(str(history_path))
+    assert tally["cycles_counted"] == 0
+    assert tally["skipped_malformed"] == 0
+    assert tally["first_timestamp"] is None
+    assert tally["last_timestamp"] is None
+    assert all(c["total_runs"] == 0 for c in tally["categories"])

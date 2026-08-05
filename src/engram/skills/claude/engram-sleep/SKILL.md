@@ -541,7 +541,7 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 - `types_to_run_slugs` — `{category_num: slug}` for the categories above, for building dispatch prompts.
 - `interrupt_fired` / `interrupt_types` / `cascade_marker_count` — whether the cascade-urgency interrupt forced any categories in tonight, and why.
 - `window_params` — `{category_num: prev_last_run_at_or_null}` for the window-scoped categories (currently 6 and 7 — see the Phase B audit note above). Only present for categories that are both window-scoped AND running tonight.
-- `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement).
+- `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`~/.engram/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
 
 **This state write is eager and irreversible for the night** — weights update at draw time, not at fairy-completion time (see `dream_lottery.py`'s module docstring for the accepted timeout-edge-case tradeoff). Do not re-run `draw` if a fairy times out; that would draw again and corrupt the aging sequence. If you must re-attempt a failed dispatch, re-dispatch the SAME `types_to_run` from the JSON you already have — don't call `draw` a second time this cycle.
 
@@ -732,7 +732,11 @@ Agent(
     prompt="""You are the dream master for tonight's consolidation cycle.
 
     TONIGHT'S LOTTERY DRAW (dream_lottery.py, #1901 — log this verbatim in the dream
-    record's provenance section; this is the "logged draws" requirement from the design):
+    record's provenance section; this is the "logged draws" requirement from the design.
+    #1909: `draw` also appends this same record to ~/.engram/dream-lottery-history.jsonl
+    automatically, so a missed transcription here is recoverable from that file — but
+    still transcribe it; the dream record is the reviewable narrative copy, the history
+    file is the raw mechanical backstop, not a substitute):
     - Drawn: <drawn_types_slugs> | Interrupt-forced: <interrupt_types_slugs, or "none — cascade_marker_count <N> below threshold <T>">
     - weights_before: <weights_before JSON> -> weights_after: <weights_after JSON>
 
@@ -798,7 +802,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
-- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`.
+- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
 - **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one of 9 categories per dispatch, the lottery-drawn subset each night (was all 9 nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
