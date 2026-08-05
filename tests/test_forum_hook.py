@@ -848,6 +848,41 @@ def test_reply_on_my_thread_only_inbox_no_banner(
 
 
 # ---------------------------------------------------------------------------
+# B10: Worst-case three-call budget regression (PR #1642 colleague review)
+#      Worst case per fire is threads + inbox + publish, not threads-or-inbox
+#      + publish. FETCH_TIMEOUT_SECONDS covers BOTH the threads and inbox call
+#      sites, so the real invariant is 2*FETCH + PUBLISH, not FETCH + PUBLISH.
+# ---------------------------------------------------------------------------
+
+def test_worst_case_three_call_budget_under_hook_timeout():
+    """Borges's PR #1642 review catch: a slow-but-succeeding threads fetch
+    followed by a timed-out inbox fetch, followed by the unconditional publish
+    POST, is three calls in one hook fire — not the two the original comment
+    assumed. This regression-guards the actual sum against the 5s hooks.json
+    budget, so a future constant bump can't silently reintroduce the gap.
+
+    Scope note (gh#1906): this guards the three calls owned by THIS module's
+    two constants. A fourth, uncached call (_fetch_held_batons, via
+    derive_own_status, on its own independent _FORUM_REQUEST_TIMEOUT_SECONDS
+    in _status_derive.py) is a separate, still-open gap — not asserted here.
+    See the KNOWN GAP comment above FETCH_TIMEOUT_SECONDS in the hook module.
+    """
+    hook = _load_hook()
+    worst_case = 2 * hook.FETCH_TIMEOUT_SECONDS + hook.PUBLISH_TIMEOUT_SECONDS
+    assert worst_case < 5.0, (
+        f"Worst-case three-call budget ({worst_case}s) must stay under the "
+        f"5s hooks.json timeout, or a slow-succeeding threads fetch followed "
+        f"by a timed-out inbox fetch (publish still firing) can blow the "
+        f"outer hook budget"
+    )
+    assert worst_case <= 4.2, (
+        f"Worst case ({worst_case}s) should leave at least ~0.8s margin under "
+        f"the 5s budget for interpreter startup + JSON parsing, matching the "
+        f"margin the original (two-call) design already relied on"
+    )
+
+
+# ---------------------------------------------------------------------------
 # C1: Same-second cursor precision regression (#751)
 #     Cursor written at T:00.000000Z must NOT exclude a post at T:00.000500Z.
 # ---------------------------------------------------------------------------
