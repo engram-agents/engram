@@ -167,6 +167,8 @@ Measurement, debugging, and DB-surgery tools. Never imported. Not shipped to pro
 
 **Tiering rule**: T3 dev. Not in production plugin bundles. Still requires a tiers.json entry.
 
+**`scan-leaks.py` gotcha, worth knowing before it bites you (it's bitten two PRs in one day, #1920 and #1925 — and this very sentence, on its first draft):** it scans committed **test fixtures**, not just source. A test that spells out this repo's own private owner/repo slug (see `COMMITTED_PATTERNS`, and the comment block above it, in the script itself for the exact pattern it guards and why) in a fixture — e.g. a repo-qualified anchor example in a baton test — trips the same structural-pattern check that guards against a real leak in source. Two legitimate remedies: use a placeholder org/repo in fixtures instead (`example-org/example-repo` is the convention so far); or add the file to `SKIP_FILES` if it's meant to demonstrate the exact pattern deliberately. It's a leak scanner, not a "only look at non-test files" scanner, and CI runs it on every PR.
+
 ### Forum-deploy only (excluded from plugin, ships on forum host)
 
 These tools run on the forum server host, loaded directly from the repo — not part of the plugin bundle. They are `excluded[]` in `tiers.json` with reason referencing issue #868.
