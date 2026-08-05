@@ -523,6 +523,182 @@ def test_cornerstone_candidate_excludes_axiom_goal_definition_includes_ob_dv():
     assert dv_id in mcp_ids, f"derivation {dv_id} must appear in MCP cornerstone_candidate results"
 
 
+def test_cornerstone_candidate_excludes_nodes_already_anchored_to_a_cornerstone():
+    """#1913 regression: a node wired as an existing cornerstone's own
+    supporting evidence (cornerstone --supported_by--> node) must NOT be
+    nominated as a candidate for a *new* cornerstone, even with high
+    importance + >=3 citations from ordinary observations. Counting the
+    cornerstone's own edge toward the node's citation score was the bug —
+    it double-counts the very relationship that disqualifies the node.
+    """
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    now = "2026-05-25T00:00:00Z"
+
+    citer_a = _add_observation(obs, "Citer A for anchored-node fixture")
+    citer_b = _add_observation(obs, "Citer B for anchored-node fixture")
+    citer_c = _add_observation(obs, "Citer C for anchored-node fixture")
+
+    def _boost_importance(node_id):
+        conn = core._get_db()
+        try:
+            conn.execute(
+                "UPDATE nodes SET importance_base=2.0, importance_score=2.0 WHERE id=?",
+                (node_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Evidence node: high importance, 2 ordinary citations + 1 edge FROM an
+    # existing cornerstone (its own supported_by link to this evidence).
+    # Total incoming edges = 3 (>= min_citations), but it must still be
+    # excluded because one of those edges comes from a current cornerstone.
+    evidence_id = _add_observation(obs, "Evidence already anchored to an existing cornerstone")
+    _boost_importance(evidence_id)
+    conn = core._get_db()
+    try:
+        for src in (citer_a, citer_b):
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'supported_by', ?)",
+                (src, evidence_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cst_result = json.loads(cst._add_cornerstone_impl(
+        tag="test-anchor",
+        title="Test cornerstone anchoring evidence_id",
+        new_frame="A durable operating principle for this test",
+        prior_frame="No such principle yet",
+        triggering_experience="A fixture needed a cornerstone to anchor evidence to",
+        supporting_ids=evidence_id,
+    ))
+    cornerstone_id = cst_result["cornerstone_id"]
+
+    # Untouched control: same importance + citation count, but all 3 citing
+    # edges come from ordinary observations, not the cornerstone — must
+    # still be nominated.
+    control_id = _add_observation(obs, "Load-bearing claim with no cornerstone anchor")
+    _boost_importance(control_id)
+    conn = core._get_db()
+    try:
+        for src in (citer_a, citer_b, citer_c):
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'cites', ?)",
+                (src, control_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+
+    result_ids = [c["id"] for c in candidates]
+    assert evidence_id not in result_ids, (
+        f"{evidence_id} is already anchored to cornerstone {cornerstone_id} "
+        "and must be excluded, not merely down-scored"
+    )
+    assert control_id in result_ids, (
+        f"{control_id} has the same importance/citation profile but no "
+        "cornerstone edge and must still be nominated"
+    )
+
+
+def test_cornerstone_candidate_exclusion_is_relation_agnostic():
+    """#1913 colleague-review follow-up (Borges, PR #1917): the exclusion
+    check is deliberately relation-agnostic -- ANY incoming edge from a
+    current cornerstone disqualifies a candidate, not just the
+    supported_by/cites/derives_from relations the citation count tallies.
+    The prior test only ever exercised supported_by; this one exercises a
+    DIFFERENT relation (about, which cornerstones use in the wild per
+    Borges's live-graph check on the review) to pin the anti-drift
+    property the code comment claims but didn't have a test for -- so a
+    future 'optimize the query with a relation IN (...) filter' change
+    can't silently narrow the exclusion back to the three counted
+    relations without a test catching it.
+    """
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    now = "2026-05-25T00:00:00Z"
+
+    citer_a = _add_observation(obs, "Citer A for relation-agnostic fixture")
+    citer_b = _add_observation(obs, "Citer B for relation-agnostic fixture")
+    citer_c = _add_observation(obs, "Citer C for relation-agnostic fixture")
+
+    def _boost_importance(node_id):
+        conn = core._get_db()
+        try:
+            conn.execute(
+                "UPDATE nodes SET importance_base=2.0, importance_score=2.0 WHERE id=?",
+                (node_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    # High importance + 3 ordinary citations (clears min_citations on its
+    # own merit, unlike the supported_by fixture above where the
+    # cornerstone's own edge was needed to cross the threshold) -- isolates
+    # the relation-agnostic check from the double-counting check.
+    node_id = _add_observation(obs, "Node cited by a cornerstone via a non-supported_by relation")
+    _boost_importance(node_id)
+    conn = core._get_db()
+    try:
+        for src in (citer_a, citer_b, citer_c):
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'cites', ?)",
+                (src, node_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    cst_result = json.loads(cst._add_cornerstone_impl(
+        tag="test-anchor-relation-agnostic",
+        title="Test cornerstone anchoring node_id via a non-supported_by edge",
+        new_frame="A durable operating principle for this test",
+        prior_frame="No such principle yet",
+        triggering_experience="A fixture needed a cornerstone to anchor node_id to, via a different relation",
+        supporting_ids="",
+    ))
+    cornerstone_id = cst_result["cornerstone_id"]
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+            " VALUES (?, ?, 'about', ?)",
+            (cornerstone_id, node_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+
+    result_ids = [c["id"] for c in candidates]
+    assert node_id not in result_ids, (
+        f"{node_id} has an incoming 'about' edge from cornerstone {cornerstone_id} "
+        "-- the exclusion is relation-agnostic and must catch this, not just supported_by"
+    )
+
+
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
 
 def test_open_question_answerable_dispatches_cleanly():

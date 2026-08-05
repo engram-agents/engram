@@ -516,6 +516,14 @@ def _pattern_cornerstone_candidate(
     Gating uses importance_base (time-invariant) so the threshold is stable
     across turns.
 
+    A node already wired to an existing cornerstone (any incoming edge whose
+    source is a current cornerstone — e.g. a cornerstone's own `supported_by`
+    edge to its supporting evidence) is excluded outright, not merely
+    down-scored: it is evidence *for* an existing cornerstone, not itself a
+    candidate for a new one, and counting that edge toward its own citation
+    count would double-count the very relationship that disqualifies it
+    (#1913).
+
     Returns: list of {id, type, claim, score, importance_base, citation_count,
     recall_count, suggested_action}.
     """
@@ -533,6 +541,20 @@ def _pattern_cornerstone_candidate(
 
     candidates: list[dict] = []
     for nid, ntype, claim, imp_base, recalls in rows:
+        # Deliberately relation-agnostic: ANY incoming edge from a current
+        # cornerstone disqualifies the candidate, not just the
+        # supported_by/cites/derives_from relations the citation count below
+        # tallies. "Wired to a cornerstone" is what matters, not by which
+        # relation — a future edge type sourced from a cornerstone should
+        # disqualify too without needing this list updated in lockstep.
+        already_anchored = conn.execute(
+            "SELECT COUNT(*) FROM edges e "
+            "JOIN nodes n ON e.source_id = n.id "
+            "WHERE e.target_id=? AND n.type='cornerstone' AND n.is_current=1",
+            (nid,),
+        ).fetchone()[0]
+        if already_anchored:
+            continue
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supported_by', 'cites', 'derives_from')",
