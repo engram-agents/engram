@@ -459,10 +459,23 @@ def enqueue_event(state: dict[str, Any], event: dict[str, Any], logger: Logger |
 def enqueue_collab_completion_notification(
     notification: dict[str, Any],
     *,
-    target_thread_id: str,
+    target_thread_id: str | None,
     state: dict[str, Any],
     logger: Logger,
 ) -> bool:
+    if target_thread_id is None:
+        # Before delivery has resolved a live parent thread, an
+        # item/completed notification is still safely routable only when its
+        # own attested params.threadId agrees with the item's sender thread.
+        # Reuse the ordinary parser for both checks rather than trusting the
+        # notification field by itself.
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return False
+        attested_thread_id = str(params.get("threadId") or "").strip()
+        if not attested_thread_id:
+            return False
+        target_thread_id = attested_thread_id
     event = parse_collab_item_completed_event(notification, target_thread_id)
     if event is None:
         return False
@@ -479,8 +492,6 @@ def drain_buffered_collab_completion_notifications(
     state: dict[str, Any],
     logger: Logger,
 ) -> int:
-    if not target_thread_id:
-        return 0
     drain = getattr(rpc, "drain_buffered_notifications", None)
     if not callable(drain):
         return 0
@@ -1592,19 +1603,38 @@ class CodexItemCompletedMonitor:
             self._rpc = None
             self._reconciled_thread_id = None
 
+    def _salvage_buffered_notifications(
+        self,
+        *,
+        state: dict[str, Any],
+        target_thread_id: str,
+        persist_state=None,
+    ) -> int:
+        if self._rpc is None:
+            return 0
+        enqueued = drain_buffered_collab_completion_notifications(
+            self._rpc,
+            target_thread_id=target_thread_id,
+            state=state,
+            logger=self.logger,
+        )
+        if enqueued and persist_state is not None:
+            persist_state(state)
+        return enqueued
+
     def _ensure_connected(self) -> None:
         if self._rpc is not None:
             return
         transport = self.transport_resolver(self.app_server)
         rpc_context = self.rpc_opener(transport)
         rpc = rpc_context.__enter__()
-        try:
-            rpc.initialize()
-        except Exception:
-            rpc_context.__exit__(*sys.exc_info())
-            raise
+        # Keep the just-opened transport reachable while initialize() runs:
+        # JSON-RPC notifications can legitimately arrive before its response.
+        # drain() salvages the pending, attested notifications if initialize
+        # then fails (for example on a mismatched response id).
         self._rpc_context = rpc_context
         self._rpc = rpc
+        rpc.initialize()
         self.logger.log(f"connected Codex item/completed monitor via {transport.kind}:{transport.value}")
 
     def drain(
@@ -1613,6 +1643,7 @@ class CodexItemCompletedMonitor:
         state: dict[str, Any],
         sessions_dir: Path,
         thread_override: str | None,
+        persist_state=None,
     ) -> int:
         target_thread_id, target_error = monitor_target_thread_id(state, sessions_dir, thread_override)
         if target_error:
@@ -1620,23 +1651,37 @@ class CodexItemCompletedMonitor:
             return 0
         if not target_thread_id:
             return 0
+        enqueued = 0
         try:
             self._ensure_connected()
         except Exception as exc:
+            enqueued += self._salvage_buffered_notifications(
+                state=state,
+                target_thread_id=target_thread_id,
+                persist_state=persist_state,
+            )
             self.close()
             self.logger.log(f"Codex item/completed monitor unavailable: {exc}")
-            return 0
+            return enqueued
 
-        enqueued = 0
         if self._reconciled_thread_id != target_thread_id:
             assert self._rpc is not None
-            thread_result = self._rpc.call("thread/read", {"threadId": target_thread_id, "includeTurns": True})
-            enqueued += recover_collab_completion_events(
-                thread_result,
-                target_thread_id=target_thread_id,
-                state=state,
-                logger=self.logger,
-            )
+            try:
+                thread_result = self._rpc.call("thread/read", {"threadId": target_thread_id, "includeTurns": True})
+                enqueued += recover_collab_completion_events(
+                    thread_result,
+                    target_thread_id=target_thread_id,
+                    state=state,
+                    logger=self.logger,
+                )
+            except Exception:
+                self._salvage_buffered_notifications(
+                    state=state,
+                    target_thread_id=target_thread_id,
+                    persist_state=persist_state,
+                )
+                self.close()
+                raise
             self._reconciled_thread_id = target_thread_id
         while True:
             assert self._rpc is not None
@@ -1645,6 +1690,11 @@ class CodexItemCompletedMonitor:
             except TimeoutError:
                 break
             except Exception as exc:
+                enqueued += self._salvage_buffered_notifications(
+                    state=state,
+                    target_thread_id=target_thread_id,
+                    persist_state=persist_state,
+                )
                 self.logger.log(f"Codex item/completed monitor disconnected: {exc}")
                 self.close()
                 break
@@ -2066,7 +2116,12 @@ def run_cycle(
 
     try:
         if codex_monitor is not None:
-            codex_monitor.drain(state=state, sessions_dir=sessions_dir, thread_override=thread_override)
+            codex_monitor.drain(
+                state=state,
+                sessions_dir=sessions_dir,
+                thread_override=thread_override,
+                persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
+            )
         if context is not None:
             try:
                 poll_umwelt(WorldClient(context), state, logger)

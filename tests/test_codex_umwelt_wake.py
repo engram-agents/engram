@@ -1642,6 +1642,38 @@ def test_stream_websocket_rpc_preserves_completion_before_thread_read_response(t
     assert [json.loads(payload)["method"] for payload in methods] == ["initialize", "initialized", "thread/read"]
 
 
+def test_monitor_initialize_error_salvages_buffered_completion_before_teardown(tmp_path):
+    notification = _collab_item_completed_notification(item_id="initialize-race")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    logger = _logger(tmp_path)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=logger,
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+    persisted = []
+
+    assert monitor.drain(
+        state=state,
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    ) == 1
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+    assert "unexpected response id while waiting for initialize" in (tmp_path / "watcher.log").read_text(encoding="utf-8")
+
+
 def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
     notification = _collab_item_completed_notification(item_id="during-delivery")
     fake_conn = FakeWebsocketConnection([
@@ -1677,6 +1709,48 @@ def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
         for snapshot, closed in persisted
     )
     assert fake_conn.closed is True
+
+
+def test_stream_delivery_self_routes_buffered_completion_without_resolved_target(tmp_path, monkeypatch):
+    handshake_key = b"AAAAAAAAAAAAAAAAAAAAAA=="
+    accept = wake.base64.b64encode(wake.hashlib.sha1(handshake_key + wake.WS_GUID.encode("ascii")).digest())
+    handshake = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
+    notification = _collab_item_completed_notification(item_id="unresolved-target")
+    fake_io = FakeIo([
+        handshake,
+        _server_frame(0x1, json.dumps(notification).encode("utf-8")),
+        _server_frame(0x1, json.dumps({"id": 1, "result": {}}).encode("utf-8")),
+    ])
+    monkeypatch.setattr(wake.os, "urandom", lambda n: b"\x00" * n)
+    rpc = FakeStreamRpc(fake_io)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="unix:///tmp/fake.sock",
+        sessions_dir=tmp_path / "sessions",
+        thread_override=None,
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="unix", value="/tmp/fake.sock"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_io.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert result.status == "waiting_for_thread"
+    assert result.thread_id is None
+    assert state["queue"] == [original_event, expected_event]
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_io.closed is True
 
 
 def test_rpc_rejects_mismatched_response_id():
