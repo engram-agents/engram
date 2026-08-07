@@ -1184,7 +1184,7 @@ def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
             print(
                 f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
                 f"(reason={detection.get('reason')}); leaving marker in place. "
-                f"Do not run a hard checkpoint — request a clean MCP restart. (#786)",
+                f"Do not run a hard checkpoint. {_wg.recovery_banner_text()}",
                 file=sys.stderr,
             )
             return
@@ -1200,6 +1200,25 @@ def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
             )
             return
         if ic_ok:
+            # Re-fire the dump at recovery time (#1947 slice D), BEFORE clearing
+            # the marker: everything written between detection and restart falls
+            # outside every backup otherwise — the emergency dump only fires at
+            # detection. Runs under the degraded-marker skip_checkpoint override
+            # (the marker is still present here), same as the emergency call
+            # site. Never allowed to raise or block clearing the marker.
+            try:
+                _commit_snapshot(
+                    conn,
+                    message="WAL-index displacement recovered — securing recovery dump (#786)",
+                    mode="recovery",
+                    skip_checkpoint=True,
+                )
+            except Exception as rde:
+                print(
+                    f"[walguard] recovery dump raised (non-fatal, marker still cleared): "
+                    f"{rde!r} (#786)",
+                    file=sys.stderr,
+                )
             _wg.clear_degraded_marker(DATA_DIR)
             print(
                 "[walguard] degraded marker cleared after healthy restart. (#786)",
@@ -1351,7 +1370,7 @@ def _walguard_degraded_banner() -> str:
         return (
             f"⚠️ SUBSTRATE DEGRADED: WAL-index displaced at {ts}; "
             f"emergency dump {sha}; "
-            f"do not hard-kill the session — request a clean MCP restart. (#786)"
+            f"do not hard-kill the session. {_wg.recovery_banner_text()}"
         )
     except Exception:
         return ""

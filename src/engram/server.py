@@ -297,6 +297,32 @@ def _run_walguard_check(*args, **kwargs):
 def _walguard_degraded_banner(*args, **kwargs):
     return core._walguard_degraded_banner(*args, **kwargs)
 
+
+def _attach_walguard_banner(json_response: str) -> str:
+    """Attach the `_walguard_warning` banner (#786) to a write tool's JSON
+    response when the degraded marker is present, else return it unchanged.
+
+    Reuses _walguard_degraded_banner() — the same banner text the read/stat
+    surfaces already attach at engram_surface/engram_nap/engram_advance_turn
+    (and engram_stats._surface_stats_impl / _diagnose_impl). This is the
+    write-tool counterpart (#1947 slice E): without it, a write made during a
+    split-brain WAL-index window returns an ordinary success payload with no
+    signal that it may not be durable. Never raises; a malformed json_response
+    is returned unchanged.
+    """
+    banner = _walguard_degraded_banner()
+    if not banner:
+        return json_response
+    try:
+        result_dict = json.loads(json_response)
+    except (TypeError, ValueError):
+        return json_response
+    if isinstance(result_dict, dict):
+        result_dict["_walguard_warning"] = banner
+        return json.dumps(result_dict)
+    return json_response
+
+
 def _git(*args, **kwargs):
     return core._git(*args, **kwargs)
 
@@ -1698,7 +1724,7 @@ def engram_add_observation(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_OBSERVATION_FIELDS)}"
         })
 
-    return _add_observation_impl(**params)
+    return _attach_walguard_banner(_add_observation_impl(**params))
 
 
 # _add_observation_impl body moved to engram_observation.py (family A, #872 wave 9).
@@ -1805,7 +1831,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_OBSERVATION_BATCH_FIELDS)}"
         })
 
-    return _add_observation_batch_impl(**params)
+    return _attach_walguard_banner(_add_observation_batch_impl(**params))
 
 
 # _add_observation_batch_impl body moved to engram_observation.py (family A, #872 wave 9).
@@ -2900,7 +2926,7 @@ def engram_add_axiom(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_AXIOM_FIELDS)}"
         })
 
-    return _add_axiom_impl(**params)
+    return _attach_walguard_banner(_add_axiom_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_definition payload.
@@ -2966,7 +2992,7 @@ def engram_add_definition(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_DEFINITION_FIELDS)}"
         })
 
-    return _add_definition_impl(**params)
+    return _attach_walguard_banner(_add_definition_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_conjecture payload.
@@ -3045,7 +3071,7 @@ def engram_add_conjecture(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_CONJECTURE_FIELDS)}"
         })
 
-    return _add_conjecture_impl(**params)
+    return _attach_walguard_banner(_add_conjecture_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_goal payload.
@@ -3115,7 +3141,7 @@ def engram_add_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_GOAL_FIELDS)}"
         })
 
-    return _add_goal_impl(**params)
+    return _attach_walguard_banner(_add_goal_impl(**params))
 
 
 # Set of legitimate field names for the engram_deactivate_goal payload.
@@ -3183,7 +3209,7 @@ def engram_deactivate_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_DEACTIVATE_GOAL_FIELDS)}"
         })
 
-    return _deactivate_goal_impl(**params)
+    return _attach_walguard_banner(_deactivate_goal_impl(**params))
 
 
 # Set of legitimate field names for the engram_activate_goal payload.
@@ -3243,7 +3269,7 @@ def engram_activate_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_ACTIVATE_GOAL_FIELDS)}"
         })
 
-    return _activate_goal_impl(**params)
+    return _attach_walguard_banner(_activate_goal_impl(**params))
 
 
 _ADD_PERSON_FIELDS = frozenset({
@@ -3349,7 +3375,7 @@ def engram_add_person(payload_json: str) -> str:
             "error": "is_self must be a JSON boolean (true/false), not a string or other type."
         })
 
-    return _trust_mod._add_person_impl(**params)
+    return _attach_walguard_banner(_trust_mod._add_person_impl(**params))
 
 
 _UPDATE_PERSON_FIELDS = frozenset({
@@ -3424,11 +3450,11 @@ def engram_update_person(payload_json: str) -> str:
             )
         })
 
-    return _trust_mod._update_person_impl(
+    return _attach_walguard_banner(_trust_mod._update_person_impl(
         node_id=params.get("node_id", ""),
         updates=params.get("updates", {}),
         reason=params.get("reason", ""),
-    )
+    ))
 
 
 _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
@@ -3507,7 +3533,7 @@ def engram_add_special_moment(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_SPECIAL_MOMENT_FIELDS)}"
         })
 
-    return _trust_mod._add_special_moment_impl(**params)
+    return _attach_walguard_banner(_trust_mod._add_special_moment_impl(**params))
 
 
 _SET_TRUST_TIER_FIELDS = frozenset({
@@ -3587,12 +3613,12 @@ def engram_set_trust_tier(payload_json: str) -> str:
     tier = params.get("tier", "")
     justification_obs_id = params.get("justification_obs_id", "") or ""
     approval_flag = params.get("primary_user_approval_obtained", False)
-    return _trust_mod._set_trust_tier_impl(
+    return _attach_walguard_banner(_trust_mod._set_trust_tier_impl(
         target_pn=target_pn,
         tier=tier,
         justification_obs_id=justification_obs_id,
         primary_user_approval_obtained=approval_flag,
-    )
+    ))
 
 
 _SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
@@ -3652,10 +3678,10 @@ def engram_set_person_lineage(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_SET_PERSON_LINEAGE_FIELDS)}"
         })
-    return _trust_mod._set_person_lineage_impl(
+    return _attach_walguard_banner(_trust_mod._set_person_lineage_impl(
         target_pn=params.get("target_pn", ""),
         model_id=params.get("model_id", ""),
-    )
+    ))
 
 
 _ADD_TRUST_SIGNAL_FIELDS = frozenset({
@@ -3745,7 +3771,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_ADD_TRUST_SIGNAL_FIELDS)}"
         })
-    return _trust_mod._add_trust_signal_impl(**{k: params[k] for k in params})
+    return _attach_walguard_banner(_trust_mod._add_trust_signal_impl(**{k: params[k] for k in params}))
 
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
@@ -3821,7 +3847,7 @@ def engram_add_cornerstone(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_CORNERSTONE_FIELDS)}"
         })
 
-    return _add_cornerstone_impl(**params)
+    return _attach_walguard_banner(_add_cornerstone_impl(**params))
 
 
 _OUTGROW_CORNERSTONE_FIELDS = frozenset({
@@ -3899,7 +3925,7 @@ def engram_outgrow_cornerstone(payload_json: str) -> str:
                      f"Allowed: {sorted(_OUTGROW_CORNERSTONE_FIELDS)}"
         })
 
-    return _outgrow_cornerstone_impl(**params)
+    return _attach_walguard_banner(_outgrow_cornerstone_impl(**params))
 
 
 # Set of legitimate field names for the engram_link_about payload.
@@ -3972,7 +3998,7 @@ def engram_link_about(payload_json: str) -> str:
                      f"Allowed: {sorted(_LINK_ABOUT_FIELDS)}"
         })
 
-    return _link_about_impl(**params)
+    return _attach_walguard_banner(_link_about_impl(**params))
 
 
 # Set of legitimate field names for the engram_remove_edge payload.
@@ -4060,7 +4086,7 @@ def engram_remove_edge(payload_json: str) -> str:
                      f"Allowed: {sorted(_REMOVE_EDGE_FIELDS)}"
         })
 
-    return _remove_edge_impl(**params)
+    return _attach_walguard_banner(_remove_edge_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_edge payload.
@@ -4160,7 +4186,7 @@ def engram_add_edge(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_EDGE_FIELDS)}"
         })
 
-    return _add_edge_impl(**params)
+    return _attach_walguard_banner(_add_edge_impl(**params))
 
 
 _SCAN_EMERGENCE_FIELDS = frozenset({
@@ -4316,7 +4342,7 @@ def engram_goal_tension(payload_json: str) -> str:
                      f"Allowed: {sorted(_GOAL_TENSION_FIELDS)}"
         })
 
-    return _goal_tension_impl(**params)
+    return _attach_walguard_banner(_goal_tension_impl(**params))
 
 
 # ---------------------------------------------------------------------------
@@ -4431,7 +4457,7 @@ def engram_add_lesson(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_LESSON_FIELDS)}"
         })
 
-    return _add_lesson_impl(**params)
+    return _attach_walguard_banner(_add_lesson_impl(**params))
 
 
 def _rebuild_incidents_cache(*args, **kwargs):
@@ -4537,7 +4563,7 @@ def engram_lesson_register_incident(payload_json: str) -> str:
             raw = json.dumps(result)
     except (json.JSONDecodeError, TypeError):
         pass
-    return raw
+    return _attach_walguard_banner(raw)
 
 
 _UPDATE_LESSON_FIELDS = frozenset({
@@ -4652,12 +4678,12 @@ def engram_update_lesson(payload_json: str) -> str:
             )
         })
 
-    return _update_lesson_impl(
+    return _attach_walguard_banner(_update_lesson_impl(
         node_id=params.get("node_id", ""),
         updates=params.get("updates", {}),
         reason=params.get("reason", ""),
         bypass_prose_check=params.get("bypass_prose_check", False),
-    )
+    ))
 
 
 _REGISTER_EXEMPLAR_FIELDS = frozenset({
@@ -4731,7 +4757,7 @@ def engram_register_exemplar(payload_json: str) -> str:
                      f"Allowed: {sorted(_REGISTER_EXEMPLAR_FIELDS)}"
         })
 
-    return _register_exemplar_impl(**params)
+    return _attach_walguard_banner(_register_exemplar_impl(**params))
 
 
 
@@ -4811,7 +4837,7 @@ def engram_add_task(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_TASK_FIELDS)}"
         })
 
-    return _add_task_impl(**params)
+    return _attach_walguard_banner(_add_task_impl(**params))
 
 
 
@@ -4886,7 +4912,7 @@ def engram_update_task(payload_json: str) -> str:
                      f"Allowed: {sorted(_UPDATE_TASK_FIELDS)}"
         })
 
-    return _update_task_impl(**params)
+    return _attach_walguard_banner(_update_task_impl(**params))
 
 
 
@@ -4967,7 +4993,7 @@ def engram_report_feeling(payload_json: str) -> str:
                      f"Allowed: {sorted(_REPORT_FEELING_FIELDS)}"
         })
 
-    return _report_feeling_impl(**params)
+    return _attach_walguard_banner(_report_feeling_impl(**params))
 
 
 
@@ -5084,7 +5110,7 @@ def engram_derive(payload_json: str) -> str:
                      f"Allowed: {sorted(_DERIVE_FIELDS)}"
         })
 
-    return _derive_impl(**params)
+    return _attach_walguard_banner(_derive_impl(**params))
 
 
 
@@ -5157,7 +5183,7 @@ def engram_contradict(payload_json: str) -> str:
                      f"Allowed: {sorted(_CONTRADICT_FIELDS)}"
         })
 
-    return _contradict_impl(**params)
+    return _attach_walguard_banner(_contradict_impl(**params))
 
 
 
@@ -5230,7 +5256,7 @@ def engram_ask(payload_json: str) -> str:
                      f"Allowed: {sorted(_ASK_FIELDS)}"
         })
 
-    return _ask_impl(**params)
+    return _attach_walguard_banner(_ask_impl(**params))
 
 
 
@@ -5325,7 +5351,7 @@ def engram_resolve(payload_json: str) -> str:
                      f"Allowed: {sorted(_RESOLVE_FIELDS)}"
         })
 
-    return _resolve_impl(**params)
+    return _attach_walguard_banner(_resolve_impl(**params))
 
 
 # _resolve_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5405,7 +5431,7 @@ def engram_supersede(payload_json: str) -> str:
                      f"Allowed: {sorted(_SUPERSEDE_FIELDS)}"
         })
 
-    return _supersede_impl(**params)
+    return _attach_walguard_banner(_supersede_impl(**params))
 
 
 # _supersede_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5520,7 +5546,7 @@ def engram_retract(payload_json: str) -> str:
         or os.environ.get("ANTHROPIC_SESSION_ID")
         or ""
     )
-    return _retract_impl(**params, initiation_ref=_initiation_ref)
+    return _attach_walguard_banner(_retract_impl(**params, initiation_ref=_initiation_ref))
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5589,7 +5615,7 @@ def engram_focus(payload_json: str) -> str:
         return json.dumps({"error": "payload_json must include required field 'node_ids'"})
     if "reason" not in params:
         return json.dumps({"error": "payload_json must include required field 'reason'"})
-    return _focus_mod._focus_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_impl(**params))
 
 
 _UNFOCUS_FIELDS = frozenset({
@@ -5638,7 +5664,7 @@ def engram_unfocus(payload_json: str) -> str:
         })
     if "node_ids" not in params:
         return json.dumps({"error": "payload_json must include required field 'node_ids'"})
-    return _focus_mod._unfocus_impl(**params)
+    return _attach_walguard_banner(_focus_mod._unfocus_impl(**params))
 
 
 @mcp.tool(
@@ -5715,7 +5741,7 @@ def engram_focus_save(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_save_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_save_impl(**params))
 
 
 _FOCUS_LOAD_FIELDS = frozenset({
@@ -5767,7 +5793,7 @@ def engram_focus_load(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_load_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_load_impl(**params))
 
 
 _FOCUS_SWAP_FIELDS = frozenset({
@@ -5817,7 +5843,7 @@ def engram_focus_swap(payload_json: str) -> str:
         })
     if "save_as" not in params:
         return json.dumps({"error": "payload_json must include required field 'save_as'"})
-    return _focus_mod._focus_swap_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_swap_impl(**params))
 
 
 @mcp.tool(
@@ -5887,7 +5913,7 @@ def engram_focus_delete_set(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_delete_set_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_delete_set_impl(**params))
 
 
 # ---------------------------------------------------------------------------
@@ -5931,7 +5957,7 @@ def engram_set_recall_summaries(payload_json: str) -> str:
             "failed": M
         }
     """
-    return _recall_summaries_mod._set_recall_summaries_impl(payload_json)
+    return _attach_walguard_banner(_recall_summaries_mod._set_recall_summaries_impl(payload_json))
 
 
 # ---------------------------------------------------------------------------
