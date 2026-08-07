@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import deque
+import contextlib
 import hashlib
 import json
 import os
@@ -120,6 +121,10 @@ class ThreadResolution:
 
 class RpcError(RuntimeError):
     """JSON-RPC error returned by the Codex app-server."""
+
+
+class RpcProtocolError(RuntimeError):
+    """Malformed or out-of-order JSON-RPC message from the Codex app-server."""
 
 
 class Logger:
@@ -449,6 +454,46 @@ def enqueue_event(state: dict[str, Any], event: dict[str, Any], logger: Logger |
     if logger is not None:
         logger.log(f"queued {event['kind']} {event_id}")
     return True
+
+
+def enqueue_collab_completion_notification(
+    notification: dict[str, Any],
+    *,
+    target_thread_id: str,
+    state: dict[str, Any],
+    logger: Logger,
+) -> bool:
+    event = parse_collab_item_completed_event(notification, target_thread_id)
+    if event is None:
+        return False
+    recovery = monitor_recovery_state(state)
+    if recovery.get("thread_id") == target_thread_id:
+        remember_seen_terminal_event_id(recovery, event["id"])
+    return enqueue_event(state, event, logger=logger)
+
+
+def drain_buffered_collab_completion_notifications(
+    rpc: Any,
+    *,
+    target_thread_id: str | None,
+    state: dict[str, Any],
+    logger: Logger,
+) -> int:
+    if not target_thread_id:
+        return 0
+    drain = getattr(rpc, "drain_buffered_notifications", None)
+    if not callable(drain):
+        return 0
+    enqueued = 0
+    for notification in drain():
+        if enqueue_collab_completion_notification(
+            notification,
+            target_thread_id=target_thread_id,
+            state=state,
+            logger=logger,
+        ):
+            enqueued += 1
+    return enqueued
 
 
 def event_source(event: dict[str, Any]) -> str:
@@ -810,6 +855,8 @@ def resolve_live_thread(
     for candidate in candidates:
         try:
             result = rpc.call("thread/read", {"threadId": candidate.thread_id, "includeTurns": False})
+        except RpcProtocolError:
+            raise
         except Exception:
             continue
         status = _thread_status(result)
@@ -1096,10 +1143,22 @@ class BaseRpc:
     def _recv_json(self, timeout: float) -> dict[str, Any]:
         raise NotImplementedError
 
+    @staticmethod
+    def _validate_notification(msg: dict[str, Any]) -> None:
+        method = msg.get("method")
+        if not isinstance(method, str) or not method:
+            raise RpcProtocolError("unexpected id-less RPC message without a valid notification method")
+
     def _preserve_notification(self, msg: dict[str, Any]) -> None:
+        self._validate_notification(msg)
         if len(self._pending_notifications) >= MAX_PENDING_RPC_NOTIFICATIONS:
             raise RuntimeError("pending websocket notification queue exceeded limit")
         self._pending_notifications.append(msg)
+
+    def drain_buffered_notifications(self) -> list[dict[str, Any]]:
+        notifications = list(self._pending_notifications)
+        self._pending_notifications.clear()
+        return notifications
 
     def _recv_response(self, request_id: int, method: str) -> dict[str, Any]:
         deadline = time.monotonic() + REPLY_TIMEOUT
@@ -1112,7 +1171,10 @@ class BaseRpc:
                 self._preserve_notification(msg)
                 continue
             if msg.get("id") != request_id:
-                continue
+                raise RpcProtocolError(
+                    f"unexpected response id while waiting for {method}: "
+                    f"expected {request_id}, got {msg.get('id')!r}"
+                )
             return msg
 
     def recv_notification(self, timeout: float) -> dict[str, Any]:
@@ -1125,7 +1187,8 @@ class BaseRpc:
                 raise TimeoutError("timeout waiting for websocket notification")
             msg = self._recv_json(remaining)
             if "id" in msg:
-                continue
+                raise RpcProtocolError("unexpected response while waiting for RPC notification")
+            self._validate_notification(msg)
             return msg
 
 
@@ -1585,13 +1648,13 @@ class CodexItemCompletedMonitor:
                 self.logger.log(f"Codex item/completed monitor disconnected: {exc}")
                 self.close()
                 break
-            event = parse_collab_item_completed_event(notification, target_thread_id)
-            if event is not None:
-                recovery = monitor_recovery_state(state)
-                if recovery.get("thread_id") == target_thread_id:
-                    remember_seen_terminal_event_id(recovery, event["id"])
-                if enqueue_event(state, event, logger=self.logger):
-                    enqueued += 1
+            if enqueue_collab_completion_notification(
+                notification,
+                target_thread_id=target_thread_id,
+                state=state,
+                logger=self.logger,
+            ):
+                enqueued += 1
         return enqueued
 
 
@@ -1619,16 +1682,29 @@ def attempt_delivery(
     if target_thread_error is not None:
         return DeliveryResult(status="waiting_for_thread", detail=target_thread_error)
     status_thread_id = target_thread_id or discover_codex_thread_id(sessions_dir, thread_override)
+    delivery_notification_thread_id = target_thread_id
 
     try:
         transport = transport_resolver(app_server)
     except Exception as exc:
         return DeliveryResult(status="waiting_for_app_server", detail=str(exc), thread_id=status_thread_id)
 
+    def persist_buffered_delivery_notifications(rpc: Any) -> None:
+        if drain_buffered_collab_completion_notifications(
+            rpc,
+            target_thread_id=delivery_notification_thread_id,
+            state=state,
+            logger=logger,
+        ) and persist_state is not None:
+            persist_state(state)
+
     try:
-        with rpc_opener(transport) as rpc:
+        with contextlib.ExitStack() as stack:
+            rpc = stack.enter_context(rpc_opener(transport))
+            stack.callback(persist_buffered_delivery_notifications, rpc)
             rpc.initialize()
             if inflight is not None:
+                delivery_notification_thread_id = inflight["thread_id"]
                 try:
                     thread_result, status, found_turn = reconcile_inflight_batch_detail(rpc, inflight)
                 except Exception as exc:
@@ -1662,6 +1738,7 @@ def attempt_delivery(
                         thread_id=inflight["thread_id"],
                     )
             if active_wake is not None:
+                delivery_notification_thread_id = active_wake["thread_id"]
                 try:
                     thread_result = rpc.call("thread/read", {"threadId": active_wake["thread_id"], "includeTurns": True})
                 except Exception as exc:
@@ -1823,6 +1900,7 @@ def attempt_delivery(
                         detail="no loaded interactive Codex thread discovered",
                         thread_id=target_thread_id,
                     )
+                delivery_notification_thread_id = resolution.thread_id
                 if resolution.status != "idle":
                     return DeliveryResult(
                         status="waiting_for_idle",

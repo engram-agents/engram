@@ -1642,6 +1642,78 @@ def test_stream_websocket_rpc_preserves_completion_before_thread_read_response(t
     assert [json.loads(payload)["method"] for payload in methods] == ["initialize", "initialized", "thread/read"]
 
 
+def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
+    notification = _collab_item_completed_notification(item_id="during-delivery")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps(notification),
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+        json.dumps({"id": 3, "result": {"turn": {"id": "turn_123"}}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    state["queue"] = [_event("delivery-trigger")]
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert result.status == "delivered"
+    assert state["queue"] == [expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(
+        expected_event in snapshot["queue"] and not closed
+        for snapshot, closed in persisted
+    )
+    assert fake_conn.closed is True
+
+
+def test_rpc_rejects_mismatched_response_id():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"id": 2, "result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match=r"unexpected response id.*expected 1, got 2"):
+        rpc.call("thread/read", {"threadId": "thread-1"})
+
+
+def test_rpc_rejects_malformed_idless_response():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match="without a valid notification method"):
+        rpc.call("thread/read", {"threadId": "thread-1"})
+
+
+def test_recv_notification_rejects_id_bearing_response():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"id": 1, "result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match="unexpected response while waiting for RPC notification"):
+        rpc.recv_notification(1)
+
+
+def test_pending_rpc_notification_queue_capacity_and_overflow():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([]))
+    notification = {"method": "item/completed", "params": {}}
+
+    for _ in range(wake.MAX_PENDING_RPC_NOTIFICATIONS):
+        rpc._preserve_notification(notification)
+
+    assert len(rpc._pending_notifications) == wake.MAX_PENDING_RPC_NOTIFICATIONS
+    with pytest.raises(RuntimeError, match="pending websocket notification queue exceeded limit"):
+        rpc._preserve_notification(notification)
+    assert rpc.drain_buffered_notifications() == [notification] * wake.MAX_PENDING_RPC_NOTIFICATIONS
+    assert rpc.drain_buffered_notifications() == []
+
+
 def test_current_status_requires_matching_watcher_cmdline(tmp_path, monkeypatch):
     paths = wake.build_paths(tmp_path / "codex-wake")
     paths.state_dir.mkdir(parents=True, exist_ok=True)
