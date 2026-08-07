@@ -1706,6 +1706,9 @@ class CodexItemCompletedMonitor:
                 self.close()
                 raise
             self._reconciled_thread_id = target_thread_id
+        # recv_notification() drains notifications buffered by the successful
+        # thread/read call before it reads the transport. Reaching TimeoutError
+        # therefore means that pending buffer is already empty, not discarded.
         while True:
             assert self._rpc is not None
             try:
