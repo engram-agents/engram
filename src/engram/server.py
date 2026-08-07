@@ -1956,8 +1956,15 @@ def engram_surface(payload_json: str) -> str:
 # (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
 # recall, not neighbors — the chain itself is engram_get_subgraph's job.
 _INSPECT_FIELDS = frozenset({
-    "node_id", "view", "dream_mode", "include_superseded",
+    "node_id", "node_ids", "view", "dream_mode", "include_superseded",
 })
+
+# Cap on a single batch inspect. Refused loudly rather than truncated silently:
+# a batch read usually feeds a correctness check ("do these premises actually
+# support the claim citing them?"), and silently returning a subset of what was
+# asked for is the failure mode where the caller concludes from data they never
+# saw. See #1956.
+_INSPECT_BATCH_MAX = 25
 
 
 @mcp.tool(
@@ -1990,7 +1997,19 @@ def engram_inspect(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            node_id (str, required): The node ID to inspect (e.g. 'dv_NNNN').
+            node_id (str): The node ID to inspect (e.g. 'dv_NNNN'). Required
+                unless node_ids is given; the two are mutually exclusive.
+            node_ids (list of str): Batch form — inspect several nodes in ONE
+                call, e.g. checking whether a derivation's premises actually
+                support the claim citing them. Returns
+                {"count": N, "nodes": [...]} with results in the order given,
+                duplicates removed (a repeated ID would refresh that node's
+                memory twice). A node that is missing or invalid yields a
+                per-entry {"error": ...} instead of failing the whole batch.
+                Capped at 25 and REFUSED — never silently truncated — above
+                that. Side effects are per node: a batch inspect is N
+                inspections, so memory refresh and importance boost apply to
+                each, and dream_mode opts all of them out.
             view (str, optional): One of "recall" (default), "deep", "edges".
             dream_mode (bool, optional): If True, skip memory refresh and
                 importance-score boost. Use during dream/audit cycles.
@@ -2018,9 +2037,54 @@ def engram_inspect(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_INSPECT_FIELDS)}"
         })
-    if "node_id" not in params:
-        return json.dumps({"error": "payload_json must include required field 'node_id'"})
-    return _inspect_impl(**params)
+    has_one = "node_id" in params
+    has_many = "node_ids" in params
+    if has_one and has_many:
+        return json.dumps({
+            "error": "Pass either 'node_id' (single) or 'node_ids' (batch), not both."
+        })
+    if not has_one and not has_many:
+        return json.dumps({
+            "error": "payload_json must include required field 'node_id' (or 'node_ids' for a batch)"
+        })
+    if has_one:
+        return _inspect_impl(**params)
+
+    # ---- batch path (#1956) ----
+    node_ids = params.pop("node_ids")
+    if not isinstance(node_ids, list):
+        return json.dumps({
+            "error": f"'node_ids' must be a list of node IDs, got {type(node_ids).__name__}"
+        })
+    if not node_ids:
+        return json.dumps({"error": "'node_ids' must not be empty (omit it to inspect a single node)"})
+    bad = [n for n in node_ids if not isinstance(n, str)]
+    if bad:
+        return json.dumps({"error": f"'node_ids' entries must be strings, got {bad[:3]!r}"})
+    if len(node_ids) > _INSPECT_BATCH_MAX:
+        return json.dumps({
+            "error": f"'node_ids' has {len(node_ids)} entries, over the {_INSPECT_BATCH_MAX} cap. "
+                     f"Refused rather than truncated — a partial result you did not ask for is "
+                     f"indistinguishable from a complete one. Split the batch."
+        })
+
+    # Dedupe preserving caller order. Inspecting the same node twice in one call
+    # would refresh its memory twice, which is a side effect the caller did not
+    # ask for and cannot see.
+    seen: set[str] = set()
+    ordered = [n for n in node_ids if not (n in seen or seen.add(n))]
+
+    # A missing or invalid node yields a per-entry error rather than failing the
+    # whole batch: the other nodes were legitimately requested and are still
+    # useful, and the caller can see exactly which one was bad.
+    results = []
+    for nid in ordered:
+        results.append(json.loads(_inspect_impl(node_id=nid, **params)))
+
+    out = {"count": len(results), "nodes": results}
+    if len(ordered) != len(node_ids):
+        out["deduped"] = len(node_ids) - len(ordered)
+    return json.dumps(out)
 
 
 # Set of legitimate field names for the engram_query payload.
