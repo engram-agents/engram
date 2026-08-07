@@ -1547,9 +1547,10 @@ def delivery_target_thread_id(
     sessions_dir: Path,
     thread_override: str | None,
 ) -> tuple[str | None, str | None]:
-    if thread_override:
-        return thread_override, None
-    for key in ("active_wake", "inflight_batch"):
+    # Persisted work is an unresolved delivery interval, so it owns recovery
+    # before a live override can select a different thread. Inflight precedes
+    # active because it is the earlier unresolved boundary when both survive.
+    for key in ("inflight_batch", "active_wake"):
         item = state.get(key)
         if isinstance(item, dict):
             thread_id = str(item.get("thread_id") or "").strip()
@@ -1560,6 +1561,8 @@ def delivery_target_thread_id(
         return None, "queued Codex completion events span multiple target threads"
     if queued_target_ids:
         return next(iter(queued_target_ids)), None
+    if thread_override:
+        return thread_override, None
     return None, None
 
 
@@ -1586,13 +1589,10 @@ def monitor_target_thread_id(
     sessions_dir: Path,
     thread_override: str | None,
 ) -> tuple[str | None, str | None]:
-    persisted_target_thread_id = notification_target_thread_id(state, None)
-    if persisted_target_thread_id:
-        return persisted_target_thread_id, None
     target_thread_id, target_error = delivery_target_thread_id(state, sessions_dir, thread_override)
     if target_thread_id or target_error:
-        return notification_target_thread_id(state, target_thread_id), target_error
-    return notification_target_thread_id(state, discover_codex_thread_id(sessions_dir, thread_override)), None
+        return target_thread_id, target_error
+    return discover_codex_thread_id(sessions_dir, thread_override), None
 
 
 class CodexItemCompletedMonitor:

@@ -1780,6 +1780,50 @@ def test_delivery_initialize_error_salvages_persisted_inflight_thread_before_ove
     assert fake_conn.closed is True
 
 
+def test_delivery_queued_codex_completion_precedes_override_after_persisted_work_clears(tmp_path):
+    notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="salvaged-completion",
+    )
+    queued_completion = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert queued_completion is not None
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+        json.dumps({"id": 3, "result": {"turn": {"id": "turn_A"}}}),
+    ])
+    state = wake.default_state()
+    # This is the post-recovery state: the persisted A interval has cleared,
+    # but its salvaged Codex completion is still queued for delivery.
+    state["queue"] = [queued_completion]
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: FakeWebsocketRpc(fake_conn),
+    )
+
+    assert result.status == "delivered"
+    assert result.thread_id == "thread-A"
+    requests = [json.loads(message) for message in fake_conn.sent]
+    assert [request["method"] for request in requests] == ["initialize", "initialized", "thread/read", "turn/start"]
+    assert requests[2]["params"]["threadId"] == "thread-A"
+    assert requests[3]["params"]["threadId"] == "thread-A"
+    assert state["active_wake"]["thread_id"] == "thread-A"
+
+
+def test_delivery_target_override_wins_when_queue_has_only_ordinary_event(tmp_path):
+    state = wake.default_state()
+    state["queue"] = [_event("ordinary-override")]
+
+    assert wake.delivery_target_thread_id(state, tmp_path / "sessions", "thread-B") == ("thread-B", None)
+
+
 def test_delivery_override_filters_unrelated_buffered_completion_without_persisted_work(tmp_path):
     unrelated_notification = _collab_item_completed_notification(
         thread_id="thread-A",
