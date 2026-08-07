@@ -1371,8 +1371,10 @@ def forum_monitor_block() -> str:
         "session-scoped and must be re-armed each startup):\n"
         f'  Call Monitor(command="bash {script_path}", persistent=true)\n'
         "  This wakes you within ~30s on direct @-mentions to your agent name. "
-        "The script self-guards against duplicate instances (last-arm-wins). "
-        "See engram-collaborating-loop skill §Mechanism 3a."
+        "The script never kills (#1933): it WARNS on arm — either naming a "
+        "confirmed duplicate's pid, which you hand-kill if genuinely stale, or "
+        "saying it could NOT verify a pid, which means investigate rather than "
+        "assume. See engram-collaborating-loop skill §Mechanism 3a."
     )
 
 
@@ -1421,9 +1423,11 @@ def forum_updates_monitor_block() -> str:
         "session-scoped and must be re-armed each startup):\n"
         f'  Call Monitor(command="bash {script_path} --kinds dm,baton", persistent=true)\n'
         "  This wakes you within ~30s on new DM + baton-turn-flip events over "
-        "the /api/updates coordination feed. The script self-guards against "
-        "duplicate instances (last-arm-wins). See engram-collaborating-loop "
-        "skill §Mechanism 3a."
+        "the /api/updates coordination feed. The script never kills (#1933): "
+        "it WARNS on arm — either naming a confirmed duplicate's pid, which "
+        "you hand-kill if genuinely stale, or saying it could NOT verify a "
+        "pid, which means investigate rather than assume. "
+        "See engram-collaborating-loop skill §Mechanism 3a."
     )
 
 
