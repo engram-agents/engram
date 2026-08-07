@@ -360,6 +360,33 @@ def test_relevant_crossing_distinguishes_gong_message_and_irrelevant():
     assert wake.relevant_crossing(nope, "mira") is None
 
 
+def test_relevant_crossing_treats_self_addressed_crossings_as_addressee():
+    self_gong = {
+        "viewer_relation": "sender",
+        "to_agent": "mira",
+        "wake_granted": True,
+    }
+    self_message = {
+        "viewer_relation": "sender",
+        "to_agent": "mira",
+        "wake_granted": False,
+    }
+    self_broadcast = {
+        "viewer_relation": "sender",
+        "wake_granted": True,
+    }
+    case_insensitive_self_message = {
+        "viewer_relation": "sender",
+        "to_agent": "MiRa",
+        "wake_granted": False,
+    }
+
+    assert wake.relevant_crossing(self_gong, "mira") == "gong"
+    assert wake.relevant_crossing(self_message, "mira") == "message"
+    assert wake.relevant_crossing(self_broadcast, "mira") is None
+    assert wake.relevant_crossing(case_insensitive_self_message, "mira") == "message"
+
+
 def test_parse_collab_item_completed_event_matches_target_thread():
     notification = _collab_item_completed_notification(agent_statuses={"thread-child": "completed", "thread-child-2": "errored"})
 

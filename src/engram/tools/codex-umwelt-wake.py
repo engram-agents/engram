@@ -326,7 +326,9 @@ def relevant_crossing(crossing: dict[str, Any], self_name: str) -> str | None:
         for x in (crossing.get("wakes_granted") or [])
         if x is not None
     }
-    is_addressee = crossing.get("viewer_relation") == "addressee"
+    to_agent = crossing.get("to_agent")
+    is_self_addressed = isinstance(to_agent, str) and to_agent.casefold() == self_name.casefold()
+    is_addressee = crossing.get("viewer_relation") == "addressee" or is_self_addressed
     is_mentioned = self_name.casefold() in mentions
     if not (is_addressee or is_mentioned):
         return None
