@@ -1732,7 +1732,20 @@ def attempt_delivery(
     if target_thread_error is not None:
         return DeliveryResult(status="waiting_for_thread", detail=target_thread_error)
     status_thread_id = target_thread_id or discover_codex_thread_id(sessions_dir, thread_override)
-    delivery_notification_thread_id = target_thread_id
+    # Notifications can arrive while initialize() is waiting for its reply.
+    # When recovering persisted work, that work owns the transport interval
+    # even if an explicit override now points at a different live thread.
+    # Select this before opening the RPC so teardown salvages an initialize-
+    # time notification against the thread that actually attests it.
+    delivery_notification_thread_id = next(
+        (
+            thread_id
+            for item in (inflight, active_wake)
+            if isinstance(item, dict)
+            if (thread_id := str(item.get("thread_id") or "").strip())
+        ),
+        target_thread_id,
+    )
 
     try:
         transport = transport_resolver(app_server)

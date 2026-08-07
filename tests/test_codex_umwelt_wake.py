@@ -1711,6 +1711,69 @@ def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
     assert fake_conn.closed is True
 
 
+def test_delivery_initialize_error_salvages_persisted_inflight_thread_before_override(tmp_path):
+    notification = _collab_item_completed_notification(thread_id="thread-A", sender_thread_id="thread-A", item_id="inflight-race")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+    state["inflight_batch"] = wake.build_inflight_batch([original_event], "thread-A")
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert expected_event is not None
+    assert result.status == "wake_failed"
+    assert state["queue"] == [original_event, expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+
+
+def test_delivery_override_filters_unrelated_buffered_completion_without_persisted_work(tmp_path):
+    unrelated_notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="unrelated-race",
+    )
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(unrelated_notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+
+    assert result.status == "wake_failed"
+    assert state["queue"] == [original_event]
+    assert fake_conn.closed is True
+
+
 def test_stream_delivery_self_routes_buffered_completion_without_resolved_target(tmp_path, monkeypatch):
     handshake_key = b"AAAAAAAAAAAAAAAAAAAAAA=="
     accept = wake.base64.b64encode(wake.hashlib.sha1(handshake_key + wake.WS_GUID.encode("ascii")).digest())
