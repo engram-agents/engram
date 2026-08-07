@@ -121,6 +121,39 @@ class FakeStreamRpc(wake.StreamWebSocketRpc):
         return self.fake_io
 
 
+class FakeWebsocketConnection:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.timeouts = []
+        self.closed = False
+        self.socket = self
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self):
+        if not self.messages:
+            raise TimeoutError("no more fake websocket messages queued")
+        return self.messages.pop(0)
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeWebsocketRpc(wake.WebsocketRpc):
+    def __init__(self, fake_conn: FakeWebsocketConnection):
+        super().__init__("ws://fake")
+        self.fake_conn = fake_conn
+
+    def __enter__(self):
+        self.conn = self.fake_conn
+        return self
+
+
 @contextlib.contextmanager
 def live_app_server(listen_url: str):
     proc = subprocess.Popen(
@@ -1540,6 +1573,73 @@ def test_stream_websocket_rpc_handles_ping_and_masks_client_frames():
     assert json.loads(req_payload) == {"id": 1, "method": "thread/read", "params": {"threadId": "thread-1", "includeTurns": False}}
     pong_opcode, pong_masked, pong_payload = _parse_client_frame(fake_io.writes[2])
     assert pong_opcode == 0xA and pong_masked is True and pong_payload == b"ping"
+
+
+def test_websocket_rpc_preserves_completion_before_thread_read_response(tmp_path):
+    notification = _collab_item_completed_notification()
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+
+    try:
+        assert monitor.drain(state=state, sessions_dir=tmp_path / "sessions", thread_override="thread-1") == 1
+    finally:
+        monitor.close()
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert [json.loads(message)["method"] for message in fake_conn.sent] == [
+        "initialize", "initialized", "thread/read"
+    ]
+
+
+def test_stream_websocket_rpc_preserves_completion_before_thread_read_response(tmp_path, monkeypatch):
+    handshake_key = b"AAAAAAAAAAAAAAAAAAAAAA=="
+    accept = wake.base64.b64encode(wake.hashlib.sha1(handshake_key + wake.WS_GUID.encode("ascii")).digest())
+    handshake = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
+    notification = _collab_item_completed_notification()
+    fake_io = FakeIo([
+        handshake,
+        _server_frame(0x1, json.dumps({"id": 1, "result": {}}).encode("utf-8")),
+        _server_frame(0x1, json.dumps(notification).encode("utf-8")),
+        _server_frame(0x1, json.dumps({"id": 2, "result": _thread_read("idle")}).encode("utf-8")),
+    ])
+    monkeypatch.setattr(wake.os, "urandom", lambda n: b"\x00" * n)
+    rpc = FakeStreamRpc(fake_io)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="unix:///tmp/fake.sock",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="unix", value="/tmp/fake.sock"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+
+    try:
+        assert monitor.drain(state=state, sessions_dir=tmp_path / "sessions", thread_override="thread-1") == 1
+    finally:
+        monitor.close()
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    methods = [_parse_client_frame(frame)[2] for frame in fake_io.writes[1:4]]
+    assert [json.loads(payload)["method"] for payload in methods] == ["initialize", "initialized", "thread/read"]
 
 
 def test_current_status_requires_matching_watcher_cmdline(tmp_path, monkeypatch):

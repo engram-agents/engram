@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 import hashlib
 import json
 import os
@@ -69,6 +70,7 @@ REPLY_TIMEOUT = 10
 WS_MESSAGE_LIMIT = 32 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CODEX_NOTIFICATION_DRAIN_TIMEOUT = 0.001
+MAX_PENDING_RPC_NOTIFICATIONS = 256
 TERMINAL_COLLAB_AGENT_STATUSES = {"completed", "errored", "interrupted", "shutdown", "notFound"}
 
 _STOP_REQUESTED = False
@@ -1069,6 +1071,9 @@ def resolve_transport_target(app_server: str) -> TransportTarget:
 
 
 class BaseRpc:
+    def __init__(self) -> None:
+        self._pending_notifications: deque[dict[str, Any]] = deque()
+
     def initialize(self) -> None:
         self.call(
             "initialize",
@@ -1091,7 +1096,28 @@ class BaseRpc:
     def _recv_json(self, timeout: float) -> dict[str, Any]:
         raise NotImplementedError
 
+    def _preserve_notification(self, msg: dict[str, Any]) -> None:
+        if len(self._pending_notifications) >= MAX_PENDING_RPC_NOTIFICATIONS:
+            raise RuntimeError("pending websocket notification queue exceeded limit")
+        self._pending_notifications.append(msg)
+
+    def _recv_response(self, request_id: int, method: str) -> dict[str, Any]:
+        deadline = time.monotonic() + REPLY_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timeout waiting for {method} reply")
+            msg = self._recv_json(remaining)
+            if "id" not in msg:
+                self._preserve_notification(msg)
+                continue
+            if msg.get("id") != request_id:
+                continue
+            return msg
+
     def recv_notification(self, timeout: float) -> dict[str, Any]:
+        if self._pending_notifications:
+            return self._pending_notifications.popleft()
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -1105,6 +1131,7 @@ class BaseRpc:
 
 class WebsocketRpc(BaseRpc):
     def __init__(self, endpoint: str):
+        super().__init__()
         self.endpoint = endpoint
         self.conn = None
         self.request_id = 0
@@ -1147,20 +1174,13 @@ class WebsocketRpc(BaseRpc):
             "method": method,
             "params": params,
         }))
-        deadline = time.monotonic() + REPLY_TIMEOUT
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timeout waiting for {method} reply")
-            msg = self._recv_json(remaining)
-            if msg.get("id") != req_id:
-                continue
-            if "error" in msg:
-                raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
-            result = msg.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
-            return result
+        msg = self._recv_response(req_id, method)
+        if "error" in msg:
+            raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
+        return result
 
 
 class StreamIo:
@@ -1226,6 +1246,7 @@ class ProcessStreamIo(StreamIo):
 
 class StreamWebSocketRpc(BaseRpc):
     def __init__(self):
+        super().__init__()
         self.io: StreamIo | None = None
         self.request_id = 0
         self._read_buffer = bytearray()
@@ -1387,20 +1408,13 @@ class StreamWebSocketRpc(BaseRpc):
             0x1,
             json.dumps({"id": req_id, "method": method, "params": params}, separators=(",", ":")).encode("utf-8"),
         )
-        deadline = time.monotonic() + REPLY_TIMEOUT
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timeout waiting for {method} reply")
-            msg = self._recv_json(remaining)
-            if msg.get("id") != req_id:
-                continue
-            if "error" in msg:
-                raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
-            result = msg.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
-            return result
+        msg = self._recv_response(req_id, method)
+        if "error" in msg:
+            raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
+        return result
 
 
 class UnixSocketRpc(StreamWebSocketRpc):
