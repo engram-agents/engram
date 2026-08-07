@@ -817,6 +817,10 @@
     {
       "path": "src/engram/tools/migrate_person_nodes.py",
       "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
+    },
+    {
+      "path": "tools/engram-backfill-special-moment-edges.py",
+      "reason": "one-shot data-integrity repair: creates the missing 'about' edges every special_moments[].node_id should have had, for nodes written before this backfill existed (issue #1948); idempotent and safe to re-run, but not a recurring shipped mechanism any install needs to run regularly"
     }
   ],
   "repo_only": [

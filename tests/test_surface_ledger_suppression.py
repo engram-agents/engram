@@ -426,6 +426,86 @@ class TestLedgerRetentionPruning(LedgerTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Person-moment cooldown bucket must not corrupt the general ledger
+#     (#1940 round-5 fast-follow — reviewer-fairy REQUEST_CHANGES repro)
+# ---------------------------------------------------------------------------
+
+
+class TestPersonMomentRenderDoesNotPruneOtherSessions(LedgerTestBase):
+    """Regression test for the reviewer-fairy's exact repro.
+
+    _record_person_moment_render used to reuse _append_surface_ledger_entry
+    (the general per-session ledger's append+prune helper) to write into the
+    reserved __person_moment_cooldown__ bucket. That helper's internal
+    _prune_surface_ledger call prunes the ENTIRE ledger dict — every session
+    key, not just the reserved bucket — using a retention size derived from
+    whatever k was passed in. The call site could only ever pass a
+    hardcoded k (this bucket has no session_id and thus no k of its own),
+    NOT the operator-configured recall_suppression.k — so firing a
+    person-moment render silently re-pruned every OTHER session's ledger
+    entries down to the hardcoded k's retention window.
+
+    Invisible at the default k=5 (the hardcoded fallback and a configured
+    k=5 both compute retention=20 via max(4*k, DEFAULT_LEDGER_RETENTION_ENTRIES)),
+    so this test deliberately configures recall_suppression.k above 5 (k=10,
+    matching the reviewer's own repro) to make the divergence observable:
+    intended retention at k=10 is max(4*10, 20) = 40, so an unrelated
+    session grown to 36 real entries must NOT be truncated by a
+    person-moment render.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"recall_suppression": {"k": 10}}, f)
+
+    def test_unrelated_session_entries_survive_a_person_moment_render(self):
+        # Grow "other-session" past the OLD buggy retention (20, from the
+        # hardcoded k=5 fallback) but within the correctly-configured one
+        # (40, from k=10) — via the SAME real append pathway format_nudge
+        # itself uses for ordinary renders.
+        for i in range(36):
+            self.hook._append_surface_ledger_entry(
+                "other-session", {f"n{i}"}, k=10,
+            )
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            before = json.load(f)
+        self.assertEqual(len(before["other-session"]), 36)
+
+        # Fire a person-moment render — must touch ONLY the reserved bucket.
+        self.hook._record_person_moment_render("pn_unrelated_test")
+
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertEqual(
+            len(after["other-session"]), 36,
+            "person-moment render must not prune/truncate an unrelated "
+            "session's ledger entries (round-5 regression: it used to "
+            "silently collapse them to a hardcoded-k retention window)",
+        )
+        self.assertEqual(after["other-session"], before["other-session"])
+        # And the reserved bucket itself got the new entry, untouched by
+        # any other pruning pass.
+        bucket = after[self.hook._PERSON_MOMENT_LEDGER_KEY]
+        self.assertEqual(len(bucket), 1)
+        self.assertIn("pn_unrelated_test:moment", bucket[0]["ids"])
+
+    def test_person_moment_bucket_retention_capped_independently_of_k(self):
+        """The reserved bucket's own retention
+        (_PERSON_MOMENT_LEDGER_RETENTION) bounds ITS OWN growth regardless
+        of the configured recall_suppression.k — sanity check that the new
+        scoped read-modify-write still bounds this bucket's size at all
+        (not unbounded now that it no longer goes through the general
+        pruning helper)."""
+        for i in range(30):
+            self.hook._record_person_moment_render(f"pn_{i}")
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+        bucket = ledger[self.hook._PERSON_MOMENT_LEDGER_KEY]
+        self.assertEqual(len(bucket), self.hook._PERSON_MOMENT_LEDGER_RETENTION)
+
+
+# ---------------------------------------------------------------------------
 # 7. Tripwire output is never suppressed
 # ---------------------------------------------------------------------------
 

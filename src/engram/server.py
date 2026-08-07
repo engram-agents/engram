@@ -3467,12 +3467,17 @@ _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
 # Confirm step for the special_moment_suggestion nudge that engram_link_about
 # emits after every new `about` edge (see _link_about_impl in
 # engram_cornerstone.py). PR #1604 shipped the curated special_moments
-# highlights field (max 7, oldest rotated out on cap) plus its write path
-# (_add_special_moment_impl in engram_trust.py) but deliberately left it
-# module-level only — "moments enter via Stage 2 workflow" — so there was no
-# way for an agent to act on the nudge. This tool closes that #1587/#1604 gap
-# by exposing the existing, already-tested impl as an MCP tool. No new write
-# logic here — purely a thin validating wrapper.
+# highlights field plus its write path (_add_special_moment_impl in
+# engram_trust.py) but deliberately left it module-level only — "moments
+# enter via Stage 2 workflow" — so there was no way for an agent to act on
+# the nudge. This tool closes that #1587/#1604 gap by exposing the existing,
+# already-tested impl as an MCP tool. No new write logic here — purely a
+# thin validating wrapper.
+#
+# #1948: the cap was originally 7 with silent-eviction-on-overflow (a
+# write-side render budget that #1940's rotating display made unnecessary).
+# It is now 100 with a loud, non-destructive failure at the ceiling — see
+# _SPECIAL_MOMENTS_CAP in engram_trust.py for the full reasoning.
 #
 # Single-payload signature (payload_json), per this repo's MCP tool
 # parameter-style convention (see project CLAUDE.md) — every @mcp.tool()
@@ -3497,11 +3502,13 @@ def engram_add_special_moment(payload_json: str) -> str:
     letting the suggestion go unactioned.
 
     Appends {description, node_id, added_at} to the person node's
-    metadata.special_moments list. Max 7 slots: once at cap, the oldest
-    entry is rotated out of the list (its underlying `about` edge is NOT
-    removed — special_moments is a highlights reel over the full history,
-    not the history itself). Not idempotent: calling this twice with the
-    same arguments appends a second, separate entry.
+    metadata.special_moments list. Cap is 100 (#1948) — storage is
+    decoupled from display; the rotating recall/inspect surfaces show one
+    moment per surfacing regardless of how many are stored, so the write
+    side no longer needs a small render budget. At the cap, this returns
+    {"error": "..."} and does NOT modify special_moments — no silent
+    eviction, nothing destroyed. Not idempotent: calling this twice with the
+    same arguments appends a second, separate entry (below the cap).
 
     Args:
         payload_json: JSON object (as a string) with these REQUIRED fields:
@@ -3517,8 +3524,9 @@ def engram_add_special_moment(payload_json: str) -> str:
         JSON with status="added", person_id, the updated special_moments
         list, slot_count, and cap. On any validation failure (person not
         found / not type=person / not current; description or node_id
-        missing/blank; anchor node not found / not current) returns
-        {"error": "..."} instead.
+        missing/blank; anchor node not found / not current; cap reached)
+        returns {"error": "..."} instead — special_moments is left
+        untouched in every error case.
 
     See _add_special_moment_impl in engram_trust.py for full semantics.
     """
