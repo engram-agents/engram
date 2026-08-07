@@ -1674,6 +1674,42 @@ def test_monitor_initialize_error_salvages_buffered_completion_before_teardown(t
     assert "unexpected response id while waiting for initialize" in (tmp_path / "watcher.log").read_text(encoding="utf-8")
 
 
+def test_monitor_initialize_error_salvages_persisted_inflight_completion_before_override(tmp_path):
+    notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="persisted-initialize-race",
+    )
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+    state["inflight_batch"] = wake.build_inflight_batch([_event("persisted-monitor")], "thread-A")
+    persisted = []
+
+    assert monitor.drain(
+        state=state,
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    ) == 1
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+
+
 def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
     notification = _collab_item_completed_notification(item_id="during-delivery")
     fake_conn = FakeWebsocketConnection([

@@ -1563,15 +1563,36 @@ def delivery_target_thread_id(
     return None, None
 
 
+def notification_target_thread_id(
+    state: dict[str, Any],
+    ordinary_target_thread_id: str | None,
+) -> str | None:
+    """Return the thread that owns notifications during persisted wake recovery."""
+    # A persisted batch represents a concrete delivery interval. It must own
+    # notifications before any current override can select a different live
+    # thread. Inflight wins over active because it is the earlier unresolved
+    # delivery boundary when a state snapshot contains both.
+    for key in ("inflight_batch", "active_wake"):
+        item = state.get(key)
+        if isinstance(item, dict):
+            thread_id = str(item.get("thread_id") or "").strip()
+            if thread_id:
+                return thread_id
+    return ordinary_target_thread_id
+
+
 def monitor_target_thread_id(
     state: dict[str, Any],
     sessions_dir: Path,
     thread_override: str | None,
 ) -> tuple[str | None, str | None]:
+    persisted_target_thread_id = notification_target_thread_id(state, None)
+    if persisted_target_thread_id:
+        return persisted_target_thread_id, None
     target_thread_id, target_error = delivery_target_thread_id(state, sessions_dir, thread_override)
     if target_thread_id or target_error:
-        return target_thread_id, target_error
-    return discover_codex_thread_id(sessions_dir, thread_override), None
+        return notification_target_thread_id(state, target_thread_id), target_error
+    return notification_target_thread_id(state, discover_codex_thread_id(sessions_dir, thread_override)), None
 
 
 class CodexItemCompletedMonitor:
@@ -1737,15 +1758,7 @@ def attempt_delivery(
     # even if an explicit override now points at a different live thread.
     # Select this before opening the RPC so teardown salvages an initialize-
     # time notification against the thread that actually attests it.
-    delivery_notification_thread_id = next(
-        (
-            thread_id
-            for item in (inflight, active_wake)
-            if isinstance(item, dict)
-            if (thread_id := str(item.get("thread_id") or "").strip())
-        ),
-        target_thread_id,
-    )
+    delivery_notification_thread_id = notification_target_thread_id(state, target_thread_id)
 
     try:
         transport = transport_resolver(app_server)
