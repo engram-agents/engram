@@ -863,6 +863,86 @@ def starred_block(engram_home: str) -> str:
         return ""
 
 
+def _resolve_tool_capability_index_path() -> str:
+    """Locate the generated tool-capability-index artifact (issue #1958).
+
+    The artifact is checked-in repo content that travels with server.py, not
+    engram_home data — so resolution mirrors _resolve_mcp_server_path's
+    colocation-first strategy rather than the engram_home-based lookups the
+    focus/starred blocks use. It ships as a ROOT-LEVEL file directly beside
+    server.py (not in a generated/ subdirectory) — build.py's plugin copier
+    only has prefix-specific sections for tools/, templates/, hooks/,
+    skills/, agents/, and output-styles/; a generated/ subdirectory would
+    fall through every one of them silently despite being declared in
+    packaging/tiers.json (the manifest test only checks that a role is
+    DECLARED, not that the copier actually implements it — see #1958's
+    PR discussion). Root-level (no "/" in the manifest path) is the one
+    category build.py's copier derives automatically from the manifest with
+    no hardcoded list, so that's where this artifact lives:
+
+      1. Plugin/flat layout: this hook lives at <runtime_dir>/hooks/<hook>.py
+         and server.py is colocated at <runtime_dir>/server.py, so the
+         artifact is expected at <runtime_dir>/tool_capability_index.txt.
+      2. Dev-repo layout: this hook lives at
+         src/engram/hooks/claude/<hook>.py, so the checked-in artifact is at
+         src/engram/tool_capability_index.txt — two directories up from the
+         hook's own directory.
+
+    Returns the first candidate that exists on disk, or the plugin-layout
+    candidate (unchecked) if neither exists — the caller's own
+    os.path.exists / read-failure handling degrades gracefully either way.
+    """
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    runtime_dir = os.path.dirname(hook_dir)
+    candidates = [
+        os.path.join(runtime_dir, "tool_capability_index.txt"),
+        os.path.join(os.path.dirname(runtime_dir), "tool_capability_index.txt"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def tool_capability_index_block() -> str:
+    """Render the generated tool-capability index as a short prefixed section.
+
+    Reads the checked-in STATIC artifact produced by
+    tools/engram-generate-tool-capability-index.py (issue #1958) — this hook
+    is deliberately fastmcp-free (matches the existing engram-surface-hook.py
+    precedent of duplicating logic rather than importing server.py, which
+    would pull in fastmcp's ~150-package dependency chain) and never imports
+    server.py or TOOL_CAPABILITIES directly.
+
+    Each artifact line is "<tool_name>: <capability text>", one line per
+    registered tool, sorted by name. Rendered near-verbatim with a 2-space
+    indent under a short header.
+
+    Returns "" when the artifact is missing, unreadable, or empty — never
+    raises. SessionStart hooks must never crash the session over an optional
+    context surface; a missing/stale artifact just means the agent falls
+    back to ToolSearch schema fetches for capability discovery, same as
+    before this feature existed.
+    """
+    try:
+        path = _resolve_tool_capability_index_path()
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8") as f:
+            raw_lines = [ln.rstrip("\n") for ln in f]
+        entries = [ln for ln in raw_lines if ln.strip()]
+        if not entries:
+            return ""
+
+        header = "ENGRAM tools — what each CAN do (fetch the schema for HOW):"
+        block_lines = [header] + [f"  {entry}" for entry in entries]
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface tool-capability-index errors at
+        # session start — this block is optional context, not load-bearing.
+        return ""
+
+
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 # Effective session role — updated by main() after write_marker() resolves CWD.
 # Starts equal to SESSION_ROLE (env-var), may be promoted to "fairy" by CWD detection.
@@ -1704,6 +1784,22 @@ def main() -> None:
         _starred = starred_block(ENGRAM_HOME)
         if _starred:
             lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── Tool-capability index (cheap: single local static-file read) ───────
+    # Issue #1958: Claude Code defers MCP tool schemas, so an agent sees tool
+    # NAMES only at decision time — learning what a tool CAN do costs a full
+    # schema fetch. This block injects a checked-in, generated one-liner per
+    # tool (CAN, not HOW) so the agent can pick the right tool without a
+    # ToolSearch round trip. Reads a static text file only — no DB, no
+    # subprocess, no server.py/fastmcp import — so it belongs with the cheap
+    # local blocks per the #1819 ordering invariant. Silent skip on any
+    # failure or missing artifact — hook must not block session start.
+    try:
+        _tool_caps = tool_capability_index_block()
+        if _tool_caps:
+            lines.append(_tool_caps)
     except Exception:
         pass
 

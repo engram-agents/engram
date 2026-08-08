@@ -198,6 +198,10 @@
       "tier": "essential"
     },
     {
+      "path": "tool_capability_index.txt",
+      "tier": "essential"
+    },
+    {
       "path": "tools/engram-fix-git-backup.sh",
       "tier": "convenience"
     },
@@ -694,6 +698,10 @@
     }
   ],
   "excluded": [
+    {
+      "path": "tools/engram-generate-tool-capability-index.py",
+      "reason": "maintainer/CI-time regeneration tool for the #1958 tool-capability index: reads server.py's real TOOL_CAPABILITIES dict + FastMCP's registered tool set and writes the checked-in tool_capability_index.txt artifact (root-level, not a generated/ subdirectory). No install ever needs to run it — it's invoked by repo contributors when a tool's capability line changes or a new tool is added, and by the drift-guard test in CI. Same shape as tools/engram-backfill-special-moment-edges.py's excluded[] entry: idempotent, safe to re-run, but not a recurring shipped mechanism."
+    },
     {
       "path": "tools/selftest.py",
       "reason": "developer pre-deploy test runner \u2014 wraps pytest for quick confidence checks; not shipped in any install tier"

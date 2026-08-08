@@ -1419,14 +1419,71 @@ def _strip_similar_block(*args, **kwargs):
 _SIMILAR_STRIP_KEYS = core._SIMILAR_STRIP_KEYS
 
 
+# ---------------------------------------------------------------------------
+# Tool-capability index (issue #1958)
+# ---------------------------------------------------------------------------
+# Claude Code now defers MCP tool schemas: at decision time an agent sees
+# ~58 tool NAMES and nothing else — no descriptions, no parameter info.
+# Learning what a tool CAN do costs a full schema fetch via ToolSearch. This
+# splits CAN from HOW and only ships HOW, so agents reach for workarounds
+# (raw sqlite3 scripts, guessing) instead of the tool built for exactly
+# their question.
+#
+# capability=<str> is a REQUIRED kwarg on every @mcp.tool() call site — a
+# one-line, boundary-focused statement of what the tool can/cannot do (NOT
+# a restatement of the docstring's happy path). TOOL_CAPABILITIES collects
+# these at decoration time, keyed by the tool's registered name. This dict
+# is populated only inside a full server.py import (fastmcp available) —
+# tools/engram-generate-tool-capability-index.py reads it to produce the
+# checked-in static artifact (src/engram/tool_capability_index.txt — root-level,
+# not a generated/ subdirectory; see #1958's PR for why)
+# that the (deliberately fastmcp-free) SessionStart hook injects.
+TOOL_CAPABILITIES: dict[str, str] = {}
+
+
 _original_mcp_tool = mcp.tool
 
 
 def _timing_mcp_tool(*args, **kwargs):
-    """Drop-in replacement for mcp.tool that wraps the function in a timing shim."""
+    """Drop-in replacement for mcp.tool that wraps the function in a timing shim.
+
+    Also enforces + records the required `capability` kwarg (issue #1958 —
+    tool-capability index). capability is popped from kwargs before
+    delegating to the real mcp.tool decorator: FastMCP does not recognize
+    this kwarg and would reject the call if it saw it. A missing or
+    non-string/empty capability raises ValueError at decoration time (i.e.
+    at module-import time for every real tool) — fail loud, not a silently
+    incomplete index that a future tool addition could slip past unnoticed.
+    """
+    if "capability" not in kwargs:
+        raise ValueError(
+            f"@mcp.tool() call is missing the required capability= kwarg "
+            f"(args={args!r}, kwargs={kwargs!r}). Every ENGRAM tool must "
+            f"declare a one-line, boundary-focused capability statement for "
+            f"the tool-capability index (issue #1958) — see TOOL_CAPABILITIES "
+            f"and any existing @mcp.tool() call site for the shape."
+        )
+    capability = kwargs.pop("capability")
+    if not isinstance(capability, str) or not capability.strip():
+        raise ValueError(
+            f"@mcp.tool() capability= must be a non-empty string, got "
+            f"{capability!r} (args={args!r}, kwargs={kwargs!r})."
+        )
+
     inner_decorator = _original_mcp_tool(*args, **kwargs)
+    # Captured here (outer scope) rather than re-read from kwargs inside
+    # wrapper() below: kwargs is this call's dict, available for the whole
+    # closure regardless of decorator invocation order.
+    _registered_name = kwargs.get("name")
 
     def wrapper(func):
+        # Recorded at DECORATION time (module import), not call time — the
+        # index must be fully populated before any tool is ever invoked.
+        # name= kwarg takes priority when present (all 56 real ENGRAM tool
+        # call sites pass it); fall back to func.__name__ for the
+        # theoretical case of a bare @mcp.tool() with no name= override.
+        TOOL_CAPABILITIES[_registered_name or func.__name__] = capability
+
         @functools.wraps(func)
         def timed(*a, **kw):
             start = time.perf_counter()
@@ -1591,6 +1648,11 @@ _ADD_OBSERVATION_FIELDS = frozenset({
 # predicted) + a target (what was predicted). Use for falsifiable forecasts.
 @mcp.tool(
     name="engram_add_observation",
+    capability=(
+        "Files ONE claim with verified provenance (quote checked verbatim against the "
+        "source/session). Not for several claims from one source — use "
+        "engram_add_observation_batch."
+    ),
     annotations={
         "title": "Extract Observation from Source",
         "readOnlyHint": False,
@@ -1762,6 +1824,10 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # protection same as singleton add_observation.
 @mcp.tool(
     name="engram_add_observation_batch",
+    capability=(
+        "Bulk variant: files MULTIPLE observations sharing one source's evidence in one "
+        "call. Same verbatim-quote rules per item; not a multi-source batch."
+    ),
     annotations={
         "title": "Extract Multiple Observations from Source",
         "readOnlyHint": False,
@@ -1866,6 +1932,10 @@ _SURFACE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_surface",
+    capability=(
+        "Lossy 'sounds familiar' scan — IDs + compact summary only, NO full content, NO "
+        "memory refresh. Use engram_query/inspect to actually read a hit."
+    ),
     annotations={
         "title": "Shallow Knowledge Surface",
         "readOnlyHint": True,
@@ -1969,6 +2039,11 @@ _INSPECT_BATCH_MAX = 25
 
 @mcp.tool(
     name="engram_inspect",
+    capability=(
+        "Full content + neighbours for one node id, OR a batch (node_ids, capped 25, "
+        "refused not truncated). Refreshes recall unless dream_mode=True. Does NOT search "
+        "— id(s) required."
+    ),
     annotations={
         "title": "Inspect Single Node",
         "readOnlyHint": True,
@@ -2119,6 +2194,10 @@ _QUERY_FIELDS = frozenset({
 # preserves the full legacy shape for eval/harness contracts.
 @mcp.tool(
     name="engram_query",
+    capability=(
+        "Semantic+keyword search returning ranked (tiered) nodes; REFRESHES recall on "
+        "every hit. Use engram_surface for an ambient hint with no refresh."
+    ),
     annotations={
         "title": "Search Knowledge Graph",
         "readOnlyHint": True,
@@ -2218,6 +2297,10 @@ _SUBGRAPH_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_get_subgraph",
+    capability=(
+        "Browses topology N hops from a known node — adjacency + hop-graduated summaries, "
+        "not full content. view='deep' rejected; drill in with engram_inspect."
+    ),
     annotations={
         "title": "Inspect Node Neighborhood",
         "readOnlyHint": True,
@@ -2314,6 +2397,11 @@ _NAP_FIELDS = frozenset({
 # engram-nap skill §5b.
 @mcp.tool(
     name="engram_nap",
+    capability=(
+        "Lossless checkpoint usable ANY time — no turn advance, no forgetting-curve "
+        "effect. Use engram_advance_turn for the once-daily irreversible sleep "
+        "checkpoint."
+    ),
     annotations={
         "title": "Pre-compaction Nap (no turn advance)",
         "readOnlyHint": False,
@@ -2462,6 +2550,11 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # tonight?" before calling this.
 @mcp.tool(
     name="engram_advance_turn",
+    capability=(
+        "[Sleep/first-session only] IRREVERSIBLE turn-advance checkpoint — at most "
+        "once/24h, no self-guard against double-call. Mid-session saves should use "
+        "engram_nap instead."
+    ),
     annotations={
         "title": "[Sleep cycle / first session only — DO NOT call awake.] Session Checkpoint with Turn Advance (irreversible)",
         "readOnlyHint": False,
@@ -2603,6 +2696,10 @@ _REFLECT_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_reflect",
+    capability=(
+        "[Sleep-cycle] Heavyweight categorized self-audit that opens the dream cycle. "
+        "Awake-callable but wasteful — use engram_diagnose for awake-state health checks."
+    ),
     annotations={
         "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
         "readOnlyHint": True,
@@ -2703,6 +2800,10 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
 # wrong with the reasoning-type discount path).
 @mcp.tool(
     name="engram_stats",
+    capability=(
+        "Fixed graph-level sections (counts, confidence distribution, memory tiers) — NOT "
+        "arbitrary group-bys. mode= restricts to a recent creation-time window."
+    ),
     annotations={
         "title": "Knowledge Graph Statistics",
         "readOnlyHint": True,
@@ -2804,6 +2905,10 @@ def engram_stats(payload_json: str = "{}") -> str:
 # operational config audit — "what knobs is this install currently set to?"
 @mcp.tool(
     name="engram_diagnose",
+    capability=(
+        "Side-effect-free quantitative health audit across seven fixed dimensions plus a "
+        "composite health_score. No filtering args — always audits the whole graph."
+    ),
     annotations={
         "title": "Comprehensive Diagnostic Health Audit",
         "readOnlyHint": True,
@@ -2870,6 +2975,11 @@ _HISTORY_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_history",
+    capability=(
+        "Side-effect-free audit trail: 'edits' mode is the mutation log "
+        "(create/supersede/retract/resolve); 'diagnostics' mode is health-score snapshots "
+        "over time."
+    ),
     annotations={
         "title": "Browse Edit and Diagnostic History",
         "readOnlyHint": True,
@@ -2952,6 +3062,10 @@ _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_axiom",
+    capability=(
+        "Records a TERMINAL principle (confidence always 1.0, no premises). "
+        "Identity-layer, discuss-first, use sparingly — not for ordinary claims."
+    ),
     annotations={
         "title": "Add Axiom",
         "readOnlyHint": False,
@@ -3017,6 +3131,10 @@ _ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_definition",
+    capability=(
+        "Anchors what a TERM means in this graph — vocabulary grounding, not a claim "
+        "about the world. Refine via engram_supersede, not re-filing."
+    ),
     annotations={
         "title": "Add Definition",
         "readOnlyHint": False,
@@ -3090,6 +3208,10 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_conjecture",
+    capability=(
+        "Files a speculative hypothesis (confidence capped [0.10, 0.60]). Promote via "
+        "engram_resolve, NOT engram_supersede — cross-type promotion is rejected."
+    ),
     annotations={
         "title": "Add Conjecture",
         "readOnlyHint": False,
@@ -3165,6 +3287,10 @@ _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_goal",
+    capability=(
+        "Records a directional aspiration — no completion state. motivation is REQUIRED. "
+        "Discuss-first; not a task (use engram_add_task)."
+    ),
     annotations={
         "title": "Add Goal",
         "readOnlyHint": False,
@@ -3229,6 +3355,10 @@ _DEACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
 # Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
 @mcp.tool(
     name="engram_deactivate_goal",
+    capability=(
+        "Pauses a goal (hides it from engram_reflect) WITHOUT retracting — reversible via "
+        "engram_activate_goal. Not for a goal that was wrong."
+    ),
     annotations={
         "title": "Deactivate Goal",
         "readOnlyHint": False,
@@ -3292,6 +3422,10 @@ _ACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
 # Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
 @mcp.tool(
     name="engram_activate_goal",
+    capability=(
+        "Restores a goal paused by engram_deactivate_goal. Errors if already active — not "
+        "a general goal-status setter."
+    ),
     annotations={
         "title": "Activate Goal",
         "readOnlyHint": False,
@@ -3376,6 +3510,11 @@ _ADD_PERSON_FIELDS = frozenset({
 # Single-payload signature.
 @mcp.tool(
     name="engram_add_person",
+    capability=(
+        "Records a person node with typed relational fields only — NOT free-form facts "
+        "(those are observations via engram_link_about). At most one is_self=true node "
+        "per graph."
+    ),
     annotations={
         "title": "Record a Person",
         "readOnlyHint": False,
@@ -3463,6 +3602,10 @@ _UPDATE_PERSON_FIELDS = frozenset({
 # (dismissible). Coarse-emit: node-scoped, not field-scoped.
 @mcp.tool(
     name="engram_update_person",
+    capability=(
+        "In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, "
+        "aliases, location_contact). Immutable fields rejected — use engram_supersede."
+    ),
     annotations={
         "title": "Update Mutable Fields on a Person Node",
         "readOnlyHint": False,
@@ -3549,6 +3692,10 @@ _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
 # antml-prefix argument-swallow surface.
 @mcp.tool(
     name="engram_add_special_moment",
+    capability=(
+        "Appends a highlight to a person's special_moments list (cap 100, loud refusal at "
+        "cap, never silently evicts). Not idempotent — repeats append duplicates."
+    ),
     annotations={
         "title": "Add a Special Moment to a Person Node",
         "readOnlyHint": False,
@@ -3630,6 +3777,12 @@ _SET_TRUST_TIER_FIELDS = frozenset({
 # the discipline from friction, not from prompt context.
 @mcp.tool(
     name="engram_set_trust_tier",
+    capability=(
+        "Sets a person's persistent trust tier. primary_user/user_family/our_side are "
+        "approval-gated (requires justification + an attestation the server cannot "
+        "itself verify); tier='self' is exempt via its own is_self structural "
+        "attestation, not this gate."
+    ),
     annotations={
         "title": "Set Trust Tier for a Person",
         "readOnlyHint": False,
@@ -3714,6 +3867,10 @@ _SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_set_person_lineage",
+    capability=(
+        "Parses a model_id into provider/family/version onto a person node — a narrow "
+        "patch, not a general field updater (use engram_update_person)."
+    ),
     annotations={
         "title": "Record Model Lineage on a Person Node",
         "readOnlyHint": False,
@@ -3777,6 +3934,10 @@ _ADD_TRUST_SIGNAL_FIELDS = frozenset({
 # superseded source ob_ stales the ts_. Standard cascade machinery applies.
 @mcp.tool(
     name="engram_add_trust_signal",
+    capability=(
+        "Records an INTERPRETIVE trust signal derived from an observation about a person "
+        "— non-claim-bearing, never usable as a derivation premise."
+    ),
     annotations={
         "title": "Record a Trust Signal",
         "readOnlyHint": False,
@@ -3877,6 +4038,10 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_cornerstone",
+    capability=(
+        "Records an identity-forming dispositional pivot (prior_frame -> new_frame). "
+        "Distinct from axioms (terminal) and goals (directional)."
+    ),
     annotations={
         "title": "Record a Cornerstone",
         "readOnlyHint": False,
@@ -3948,6 +4113,10 @@ _OUTGROW_CORNERSTONE_FIELDS = frozenset({
 # multi-arg swallow risk.
 @mcp.tool(
     name="engram_outgrow_cornerstone",
+    capability=(
+        "Specialized supersede for a cornerstone ALONG ITS TAG AXIS — predecessor's "
+        "new_frame rolls into successor's prior_frame. Tag is always inherited."
+    ),
     annotations={
         "title": "Outgrow a Cornerstone (Reframe Along Same Axis)",
         "readOnlyHint": False,
@@ -4028,6 +4197,10 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_link_about",
+    capability=(
+        "Wires a CONTEXTUAL 'about' edge (node -> person, default self-anchor) for recall "
+        "routing only — no effect on confidence/cascade. Idempotent."
+    ),
     annotations={
         "title": "Link Node About Person",
         "readOnlyHint": False,
@@ -4117,6 +4290,11 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_remove_edge",
+    capability=(
+        "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
+        "serves, exemplifies, instantiates). Cascade/provenance edges blocked — use "
+        "engram-surgical."
+    ),
     annotations={
         "title": "Remove a Non-Cascade Edge Between Nodes",
         "readOnlyHint": False,
@@ -4200,6 +4378,10 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_add_edge",
+    capability=(
+        "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
+        "exemplifies, serves, subtask_of, tensions, instantiates). Idempotent."
+    ),
     annotations={
         "title": "Add a Non-Cascade Edge Between Nodes",
         "readOnlyHint": False,
@@ -4269,6 +4451,10 @@ _SCAN_EMERGENCE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_scan_emergence",
+    capability=(
+        "[Sleep-cycle] Scans for clusters that could seed a new cornerstone — surfaces "
+        "candidates only, creates nothing. Wasteful awake, not destructive."
+    ),
     annotations={
         "title": "[Sleep cycle] Scan for Emergent Cornerstone Candidates",
         "readOnlyHint": True,
@@ -4371,6 +4557,10 @@ _GOAL_TENSION_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_goal_tension",
+    capability=(
+        "Records an explicit incompatibility between two goals — does not resolve or "
+        "auto-detect anything. Pair with engram_resolve."
+    ),
     annotations={
         "title": "Record Goal Tension",
         "readOnlyHint": False,
@@ -4453,6 +4643,10 @@ _ADD_LESSON_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_lesson",
+    capability=(
+        "Creates a tripwire pattern generalized from incident observations, with a nudge "
+        "injected on situation-pattern match. Not for a one-off note."
+    ),
     annotations={
         "title": "Add Lesson from Error",
         "readOnlyHint": False,
@@ -4565,6 +4759,10 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_lesson_register_incident",
+    capability=(
+        "Backward-compat alias of engram_register_exemplar scoped to lesson targets — new "
+        "code should call engram_register_exemplar directly."
+    ),
     annotations={
         "title": "Register Incident on Existing Lesson",
         "readOnlyHint": False,
@@ -4676,6 +4874,10 @@ _UPDATE_LESSON_FIELDS = frozenset({
 # convention.
 @mcp.tool(
     name="engram_update_lesson",
+    capability=(
+        "In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence "
+        "stay supersede-only. Prose-shaped patterns rejected unless overridden."
+    ),
     annotations={
         "title": "Update Mutable Fields on a Lesson Node",
         "readOnlyHint": False,
@@ -4786,6 +4988,10 @@ _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 # Single-payload signature (per engram-alpha CLAUDE.md convention).
 @mcp.tool(
     name="engram_register_exemplar",
+    capability=(
+        "Wires ONE exemplifies edge (claim-bearing node -> lesson OR cornerstone); "
+        "refreshes the lesson tripwire cache. Doesn't create the exemplar node."
+    ),
     annotations={
         "title": "Register Exemplar on Lesson or Cornerstone",
         "readOnlyHint": False,
@@ -4867,6 +5073,10 @@ _ADD_TASK_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_task",
+    capability=(
+        "Records a concrete, completable work item — distinct from goals (no completion "
+        "state) and conjectures (hypotheses)."
+    ),
     annotations={
         "title": "Add Task",
         "readOnlyHint": False,
@@ -4943,6 +5153,10 @@ _UPDATE_TASK_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_update_task",
+    capability=(
+        "Transitions a task's status and auto-rebalances importance per a fixed status "
+        "map — not a free-form field editor."
+    ),
     annotations={
         "title": "Update Task Status",
         "readOnlyHint": False,
@@ -5021,6 +5235,10 @@ _REPORT_FEELING_FIELDS = frozenset({
 # hit this tool 2x on 2026-05-08 (a feeling-report instance + a feeling-report instance attempts).
 @mcp.tool(
     name="engram_report_feeling",
+    capability=(
+        "Non-claim-bearing first-person self-report (only reports, never verifies own "
+        "state) — dedup-exempt, always creates a new node."
+    ),
     annotations={
         "title": "Report a Self-Aware Internal State",
         "readOnlyHint": False,
@@ -5113,6 +5331,11 @@ _DERIVE_FIELDS = frozenset({
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
     name="engram_derive",
+    capability=(
+        "Creates a derivation from EXISTING claim-bearing premises with an explicit "
+        "logical_chain. Blocked if a premise is stale or contested (overridable via "
+        "use_stale/use_contested) or tainted (never overridable — no override path)."
+    ),
     annotations={
         "title": "Create Derived Claim",
         "readOnlyHint": False,
@@ -5192,6 +5415,10 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 
 @mcp.tool(
     name="engram_contradict",
+    capability=(
+        "Explicitly flags a conflict between two CURRENT nodes — the substrate does NOT "
+        "auto-detect contradictions; this is the manual pin."
+    ),
     annotations={
         "title": "Flag Contradiction Between Claims",
         "readOnlyHint": False,
@@ -5284,6 +5511,10 @@ _ASK_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_ask",
+    capability=(
+        "Registers a persistent open question that survives across sessions via "
+        "recall/dream scans. Pair with engram_resolve for the answer."
+    ),
     annotations={
         "title": "Register Open Research Question",
         "readOnlyHint": False,
@@ -5372,6 +5603,10 @@ _RESOLVE_FIELDS = frozenset({
 # default 0.70); otherwise "partially_resolved" with the resolver still wired.
 @mcp.tool(
     name="engram_resolve",
+    capability=(
+        "Pure-wire: wires a resolves edge from an EXISTING claim-bearing node to a target "
+        "and flips its status. Does NOT create the resolving derivation."
+    ),
     annotations={
         "title": "Resolve an Open Question, Contradiction, or Prediction",
         "readOnlyHint": False,
@@ -5463,6 +5698,10 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_supersede",
+    capability=(
+        "Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create "
+        "the replacement node. Not error correction — use engram_retract."
+    ),
     annotations={
         "title": "Link a Replacement Node to the Node It Supersedes",
         "readOnlyHint": False,
@@ -5558,6 +5797,10 @@ _RETRACT_FIELDS = frozenset({
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_retract",
+    capability=(
+        "Error correction (never-was-valid) — node preserved for audit, downstream "
+        "TAINTED not deleted. Not for a valid-then claim — use engram_supersede."
+    ),
     annotations={
         "title": "Retract Erroneous Node",
         "readOnlyHint": False,
@@ -5639,6 +5882,10 @@ _FOCUS_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus",
+    capability=(
+        "Pins node ids so they MUST survive the next compaction (cap 15; over-cap fails "
+        "loudly, no eviction). Not a bookmark — use engram_focus_save."
+    ),
     annotations={
         "title": "Pin Nodes to Compaction Summary",
         "readOnlyHint": False,
@@ -5697,6 +5944,10 @@ _UNFOCUS_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_unfocus",
+    capability=(
+        "Releases node ids from the active focus list. Idempotent — already-unfocused ids "
+        "report success."
+    ),
     annotations={
         "title": "Release Pinned Nodes from Compaction Summary",
         "readOnlyHint": False,
@@ -5741,6 +5992,10 @@ def engram_unfocus(payload_json: str) -> str:
 
 @mcp.tool(
     name="engram_list_focused",
+    capability=(
+        "Pure-read: returns the active focus list oldest-first. No recall refresh, no "
+        "other side effects."
+    ),
     annotations={
         "title": "List Focused Nodes",
         "readOnlyHint": True,
@@ -5771,6 +6026,10 @@ _FOCUS_SAVE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_save",
+    capability=(
+        "Snapshots the CURRENT active focus list under a name — bookmark only, active "
+        "list unchanged."
+    ),
     annotations={
         "title": "Snapshot Current Active Focus List Under a Name",
         "readOnlyHint": False,
@@ -5823,6 +6082,10 @@ _FOCUS_LOAD_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_load",
+    capability=(
+        "Loads a saved focus set into active — errors if active is non-empty unless "
+        "if_active='overwrite'. Use engram_focus_swap for an atomic pivot."
+    ),
     annotations={
         "title": "Load a Saved Focus Set Into Active",
         "readOnlyHint": False,
@@ -5875,6 +6138,10 @@ _FOCUS_SWAP_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_swap",
+    capability=(
+        "Atomic save-current-then-load-other in one transaction — the canonical pivot, "
+        "avoids engram_focus_load's non-empty-active error."
+    ),
     annotations={
         "title": "Atomic Save-Current + Load-Other",
         "readOnlyHint": False,
@@ -5920,6 +6187,10 @@ def engram_focus_swap(payload_json: str) -> str:
 
 @mcp.tool(
     name="engram_focus_sets",
+    capability=(
+        "Pure-read: lists saved focus-set bookmarks with usage metadata, recently-used "
+        "first. Doesn't touch the active list."
+    ),
     annotations={
         "title": "List All Saved Focus Sets",
         "readOnlyHint": True,
@@ -5948,6 +6219,10 @@ _FOCUS_DELETE_SET_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_delete_set",
+    capability=(
+        "Deletes a saved focus-set BOOKMARK only — nodes stay focused even if it was "
+        "active; active_set_name clears to NULL."
+    ),
     annotations={
         "title": "Delete a Saved Focus Set",
         "readOnlyHint": False,
@@ -5997,6 +6272,10 @@ def engram_focus_delete_set(payload_json: str) -> str:
 
 @mcp.tool(
     name="engram_set_recall_summaries",
+    capability=(
+        "Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, "
+        "partial failures don't roll back the batch."
+    ),
     annotations={
         "title": "Batch-Set Recall Summaries and Keywords",
         "readOnlyHint": False,
@@ -6070,6 +6349,10 @@ _LIST_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_list",
+    capability=(
+        "Mechanical filter/scan over node columns (AND/OR/NOT trees, field projection) — "
+        "NO aggregation, no recall refresh, unlike engram_query."
+    ),
     annotations={
         "title": "List Nodes by Type and Status",
         "readOnlyHint": True,
@@ -6221,6 +6504,10 @@ _QUERY_PATTERN_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_query_pattern",
+    capability=(
+        "Runs ONE of a fixed named library of graph-pattern scans (dream-fairy "
+        "primitives) — pattern_name must be a registered preset."
+    ),
     annotations={
         "title": "Run a Named Pattern Query",
         "readOnlyHint": True,
@@ -6307,6 +6594,10 @@ _EMBEDDING_CLUSTER_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_embedding_cluster",
+    capability=(
+        "Clusters up to 500 GIVEN node ids by stored-embedding cosine similarity — uses "
+        "EXISTING embeddings only, no on-the-fly model calls."
+    ),
     annotations={
         "title": "Cluster Nodes by Embedding Similarity",
         "readOnlyHint": True,
