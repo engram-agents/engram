@@ -1,48 +1,21 @@
-# mira-codex-session@.service.example — Codex app-server VARIANT (documented
-# example only; the .example suffix means systemd will NOT pick this up as
-# an installable unit as-is).
+# RETIRED — do not install this as a systemd unit.
 #
-# +--------------------------------------------------------------------+
-# | WARNING: UNTESTED on a fresh boot. Needs one supervised trial       |
-# | before this is renamed (dropping .example) and wired into           |
-# | agent-sessions.target for real. Per Mira's own caveat from her prior session: fresh-boot end-to-end is unverified.    |
-# +--------------------------------------------------------------------+
+# A direct `codex app-server` service creates a topology that is incompatible
+# with the managed daemon used by `agentctl session mira`, `agentctl attach
+# mira`, and codex-umwelt-wake. It may leave the autonomous wake watcher on a
+# dead or different socket from the human TUI.
 #
-# Mira runs Codex, not Claude Code. Codex has no `claude "<prompt>"`
-# equivalent for an initial-prompt argv, so her boot flow differs from the
-# six Claude agents' agent-session@.service in two structural ways:
+# For a supervised Codex boot trial, use the existing generic
+# agent-session@mira.service chain instead. It first creates tmux session
+# `agent-mira`; the in-pane `agentctl session mira --as-self` invocation then:
+#   1. idempotently ensures `codex app-server daemon start`;
+#   2. verifies `codex app-server daemon version` and its socket; and
+#   3. execs `codex --remote unix://<socket>` in that same pane.
 #
-#   1. ExecStart starts `codex app-server` directly as a background daemon
-#      — there is no tmux wrapper here. `codex app-server` IS the
-#      long-running foreground process; systemd supervises it directly, so
-#      Type=simple is correct (contrast agent-session@.service's
-#      Type=oneshot + RemainAfterExit=yes, needed there because the tmux
-#      session — not the launcher script — is the actual long-lived thing).
-#   2. Mira's morning charge is delivered SEPARATELY, over the app-server
-#      API, once this unit is confirmed up — NOT via an ExecStart argv.
-#      Building/scheduling that delivery is OUT OF SCOPE for this unit file
-#      (it needs its own trigger, timed after app-server is confirmed
-#      listening) — tracked as follow-up work, not shipped here.
+# The operator interaction surface is therefore always:
+#   agentctl attach mira
+#   agentctl attach mira -r   # read-only
 #
-# Same After=/Wants= ordering rationale as agent-session@.service: umwelt's
-# world/forum/gateway servers (umwelt-world.service et al) must be up first;
-# this unit itself only starts at 09:30 America/New_York via the same
-# agent-sessions.timer -> agent-sessions.target path (once wired in — see
-# the WARNING above).
-
-[Unit]
-Description=Agent Codex app-server (boot-time auto-start) - mira [UNTESTED VARIANT - see header]
-After=network-online.target umwelt-world.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=agent-mira
-ExecStart=/usr/bin/env codex app-server
-
-# Restart=no — same rationale as agent-session@.service: a crashed/failed
-# morning start must be VISIBLE to the operator, not silently respawned.
-Restart=no
-
-[Install]
-WantedBy=agent-sessions.target
+# A failed/stale socket is intentionally fatal and must be repaired; never
+# replace it with a local direct Codex process. This .example remains only as
+# a guard against reinstalling the retired direct-app-server architecture.

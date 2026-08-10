@@ -1,7 +1,7 @@
 # Boot-time agent auto-start
 
-Systemd units + boot-charge templates that bring agent Claude Code (and, as
-an untested variant, Codex) sessions up automatically at 09:30
+Systemd units + boot-charge templates that bring agent Claude Code (and, after
+a supervised trial, Codex) sessions up automatically at 09:30
 America/New_York on a host that already auto-boots at 8:00 America/New_York.
 
 ## Design in one paragraph
@@ -25,10 +25,10 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
 | `agent-session-launch.sh` | wrapper: sources optional per-agent `~/.engram/boot-env` first, resolves the boot-charge path + session cwd, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
-| `agent-session-run.sh` | runs INSIDE tmux: `agentctl session <name> -dr --as-self --cd <dir> --charge-file <file>`, logs every launch/exit to `~/.engram/logs/autostart-launch.log`, holds a failed pane open for autopsy (2026-07-25 lesson: a dead launch must leave a corpse) |
+| `agent-session-run.sh` | runs INSIDE tmux: `agentctl session <name> -d [-r for Claude] --as-self --cd <dir> --charge-file <file>`, logs every launch/exit to `~/.engram/logs/autostart-launch.log`, holds a failed pane open for autopsy (2026-07-25 lesson: a dead launch must leave a corpse) |
 | `boot-charge-default.md` | default morning charge (orient, log in, check the charge board, hold quiet on-call) |
 | `boot-charge-quiet.md` | variant for zephyr/mira: same, plus skip heartbeat loops / minimize token spend / stand by |
-| `mira-codex-session@.service.example` | Codex `app-server` daemon VARIANT — **UNTESTED**, documented example only (see its own header) |
+| `mira-codex-session@.service.example` | **RETIRED safety note**: explains why a direct app-server unit must not be installed; Codex uses the ordinary tmux launcher + daemon-managed remote TUI. |
 
 ## Install (operator/sudo actions — HOST-OWNER-ONLY)
 
@@ -88,9 +88,10 @@ sessions.
 
 3. **Enable the timer + the per-agent instances** (five Claude agents — only
    agents with an `agent-<name>` Linux user on THIS host; Luria is off-host
-   (her instance fails with status=217/USER — found live 2026-07-24), and
-   Mira's Codex variant is NOT enabled here — see the WARNING in
-   `mira-codex-session@.service.example`):
+   (her instance fails with status=217/USER — found live 2026-07-24). Mira's
+   Codex instance remains excluded pending a supervised trial; when enabled,
+   add the ordinary `agent-session@mira.service` instance (not a direct
+   app-server unit):
 
    ```bash
    sudo systemctl enable agent-sessions.timer
@@ -105,6 +106,22 @@ sessions.
    **system** units (`/etc/systemd/system/`, `User=agent-%i`), which systemd
    starts on its own schedule regardless of whether the target user is
    logged in. Linger is a `--user`-unit concern only.
+
+
+### Codex topology (Mira)
+
+Codex must not run as a standalone `codex app-server` systemd service. The
+operator's TUI and `codex-umwelt-wake` must talk to the **same managed daemon**
+and the same persisted thread. The ordinary `agent-session@mira.service` chain
+already supplies the required named `agent-mira` tmux pane. Inside that pane,
+`agentctl session mira --as-self ...` detects Codex, runs the idempotent
+`codex app-server daemon start`, verifies `daemon version` and its Unix socket,
+and then executes `codex --remote unix://<socket> ...` in that pane.
+
+For an interactive terminal, use `agentctl attach mira` (or `-r` to observe).
+A stale/unreachable daemon socket is a loud launch failure: do not work around
+it by opening a local Codex TUI, because that splits the wake watcher from the
+human-facing thread.
 
 ## Stagger the five agents ~30s apart
 

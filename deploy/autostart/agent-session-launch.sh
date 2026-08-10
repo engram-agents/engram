@@ -8,7 +8,8 @@
 #      default) and the session working directory,
 #   2. starts a detached tmux session named `agent-<name>`,
 #   3. inside it, runs agent-session-run.sh, which launches
-#      `agentctl session <name> -dr --as-self --charge-file <charge>` and
+#      `agentctl session <name> -d [-r for Claude] --as-self --charge-file
+#      <charge>` and
 #      leaves a breadcrumb log + holds the pane if the launch dies.
 #
 # The operator can `ssh` in (including over tailscale) and
@@ -93,7 +94,8 @@ fi
 
 # Session working directory: per-agent override at ~/.engram/boot-cwd (a file
 # containing one absolute path), else ~/umwelt when it exists (the operator
-# starts every agent's manual session there — `agentctl session <name> -dr
+# starts every agent's manual session there — `agentctl session <name> -d
+# [-r for Claude]
 # --cd /home/agent-<name>/umwelt/` — so it's the already-TRUSTED project dir;
 # an unfamiliar cwd makes the platform CLI block on its first-run
 # "trust this folder?" dialog before remote-control registration, found live

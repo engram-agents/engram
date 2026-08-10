@@ -13,8 +13,10 @@
 # --remote-control <name> by hand, and don't hit claude's own -d/--debug
 # collision). This script reuses that logic — and the platform-detection
 # ladder — directly from tools/agentctl's tested internal verbs
-# (__expand-session-args, __detect-platform-as-self), so the two never drift
-# apart on the part they share.
+# (__expand-session-args, __detect-platform-as-self). Codex sessions also
+# reuse agentctl's portable __codex-managed-session core, so they share the
+# verified app-server socket and one named tmux TUI rather than silently
+# creating a local app server.
 #
 # macOS bash-3.2 compatibility note (found while building this, not assumed):
 # Apple ships bash 3.2.57 as /bin/bash (frozen since ~2007, GPLv2-licensed —
@@ -24,8 +26,10 @@
 #      (bash 4.3+) and hard-crashes under bash 3.2 ("local: -n: invalid
 #      option"). __expand-session-args and __detect-platform-as-self do NOT
 #      use namerefs and DO work fine under 3.2 (verified directly) — so this
-#      script reuses those two only, and re-implements the much smaller
-#      --platform/--cd/--charge-file parsing itself, nameref-free, below.
+#      script reuses them for expansion/detection, reuses the portable Codex
+#      managed-session core only on the Codex path, and re-implements the
+#      much smaller --platform/--cd/--charge-file parsing itself, nameref-free,
+#      below.
 #   2. `mapfile`/`readarray` (bash 4.0+) doesn't exist in 3.2 either — a
 #      plain `while read` loop is used instead everywhere a verb's
 #      one-line-per-word output needs collecting into an array.
@@ -51,7 +55,8 @@
 #                  exactly one agent (you) — a required label, not a lookup.
 #   -d             --dangerously-skip-permissions (claude) /
 #                  --dangerously-bypass-approvals-and-sandbox (codex)
-#   -r             --remote-control <agent>  (claude only; codex errors)
+#   -r             --remote-control <agent> (claude); silently ignored
+#                  (codex has no remote-control equivalent)
 #   -c             --continue (claude) / resume --last (codex)
 #   -drc, -rdc, ...  any bundle order — expanded in char order, same alias
 #                  grammar as tools/agentctl session (see its own --help).
@@ -72,8 +77,8 @@
 # would reject them as unknown flags) -- but they're handled two different
 # ways. --as-self/--no-share are true no-ops (this script never does
 # anything they'd need to suppress). --local prints the same deprecated-no-op
-# notice as tools/agentctl (sessions are always direct on both scripts now;
-# the flag is a historical carry-over, not silently swallowed). --charge-file
+# notice as tools/agentctl (the platform selects the session topology; the
+# flag is a historical carry-over, not silently swallowed). --charge-file
 # is the one exception that errors loudly instead of absorbing — boot-charge
 # is a systemd-unit concept; pass the content via the platform binary's own
 # flags after `--` if you need it.
@@ -127,6 +132,8 @@ fi
 # only) than the full alias-expansion grammar, so duplicating it here is a
 # reasonable, low-drift trade-off; the two never-duplicated verbs
 # (__expand-session-args, __detect-platform-as-self) still ARE reused below.
+# The Codex managed-session core is reused after expansion as well; it is
+# portable because it has no Linux-user or sudo dependency.
 #
 # --dry-run is intercepted in the same pass; --charge-file is parsed only so
 # it can be rejected with a clear error (see header: not supported here).
@@ -166,10 +173,10 @@ while [[ $# -gt 0 ]]; do
             # set (--platform/--local/--no-share/--as-self/--cd/--charge-file
             # -- this script now handles all six). Same deprecated-no-op
             # notice as the Linux tool, not silent absorption -- matches
-            # tools/agentctl:303-304 exactly. Found missing by a second
+            # tools/agentctl's _parse_session_flags exactly. Found missing by a second
             # reviewer-fairy pass (on the --as-self/--no-share fix itself),
             # via this repo's own sibling-completeness-check convention.
-            echo "(--local is deprecated: sessions are always direct now)" >&2
+            echo "(--local is deprecated: agentctl selects the platform-managed session topology)" >&2
             shift ;;
         --platform)
             [[ -z "${2:-}" ]] && { echo "ERROR: --platform requires an argument (claude|codex)" >&2; exit 2; }
@@ -203,9 +210,10 @@ PLATFORM="$(bash "$AGENTCTL_LINUX" __detect-platform-as-self "$PLATFORM")"
 
 # Alias expansion, reused from tools/agentctl (also nameref-free, also
 # verified under bash 3.2). Command substitution (not process substitution)
-# so a nonzero exit here (e.g. codex -r, or an unrecognized alias char)
-# propagates under `set -e` instead of being swallowed -- the same blocker
-# class documented in tools/agentctl's own _expand_session_args comment.
+# so an alias-expansion error (e.g. an unrecognized alias char) propagates
+# under `set -e` instead of being swallowed -- the same blocker class
+# documented in tools/agentctl's own _expand_session_args comment. Codex -r
+# is deliberately compatible and silently consumed by that shared expansion.
 EXPANDED_RAW="$(bash "$AGENTCTL_LINUX" __expand-session-args "$PLATFORM" "$AGENT" "${EXTRA[@]}")"
 
 # No mapfile/readarray -- bash 4.0+ only, absent from macOS's 3.2 (see
@@ -229,6 +237,16 @@ if [[ $DRY_RUN -eq 1 ]]; then
     printf '%q ' "$BIN" "${ARGS[@]}"
     printf '\n'
     exit 0
+fi
+
+# Codex must use the same managed app-server and single named tmux TUI as the
+# Linux session launcher. Calling codex directly here would create an
+# unrelated local app server, making --continue and later attaches target a
+# different surface. Pass the actual post-`--cd` cwd: the helper uses it for a
+# newly created tmux pane and also applies it when this command already runs
+# inside that managed pane.
+if [[ "$PLATFORM" == "codex" ]]; then
+    exec bash "$AGENTCTL_LINUX" __codex-managed-session "$AGENT" --cwd "$(pwd -P)" -- "${ARGS[@]}"
 fi
 
 exec "$BIN" "${ARGS[@]}"
