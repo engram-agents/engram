@@ -160,3 +160,33 @@ def test_impl_callable_with_kwargs():
     assert "error" not in r, r
     assert r.get("total") == 2
     assert r.get("created") == 2
+
+
+# ── standpoint_author_id hard gate (#1827 layer 1) — batch per-item ────────
+
+
+def test_standpoint_author_id_gate_applies_per_item_in_batch():
+    """The batch impl delegates each item to _add_observation_impl and already
+    follows a per-item partial-failure convention (index + {"error": ...} for
+    the failing item, other items still created) — the standpoint gate rides
+    that existing convention unchanged rather than needing new batch-level
+    handling."""
+    server = fresh_server()
+    obs = _two_obs()
+    obs[1]["standpoint_author_id"] = "John Smith"  # display-name shape → REJECT
+    payload = {
+        "observations_json": json.dumps(obs),
+        "url": f"file://{TEST_FILE}",
+        "title": "Test source",
+    }
+    r = json.loads(server.engram_add_observation_batch(payload_json=json.dumps(payload)))
+    assert "error" not in r, f"Batch call itself must not error: {r}"
+    assert r.get("total") == 2, r
+    assert r.get("created") == 1, r
+    results = r.get("results", [])
+    assert len(results) == 2, results
+    assert results[0].get("index") == 0
+    assert results[0].get("status") == "created", results[0]
+    assert results[1].get("index") == 1
+    assert "error" in results[1], results[1]
+    assert "John Smith" in results[1]["error"], results[1]["error"]

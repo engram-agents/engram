@@ -1751,18 +1751,22 @@ def engram_add_observation(payload_json: str) -> str:
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
                 produced the source claim (the "who observes" axis). Used for provenance-uniformity
-                detection. Tiered convention (proposed-pending-Lei-ratification): for in-graph
-                entities (peer agents, anyone already a person node) use the pn_* node ID — it
-                carries trust-tier, bio, and about edges. For external one-off authors (a cited
-                journalist, paper author) use a canonical namespaced string such as
+                detection. Tiered convention: for in-graph entities (peer agents, anyone already a
+                person node) use the pn_* node ID — it carries trust-tier, bio, and about edges, and
+                MUST resolve to an existing, current person node. For external one-off authors (a
+                cited journalist, paper author) use a canonical namespaced string such as
                 orcid:0000-0001-2345-6789, doi-author:10.1000/xyz123, or domain:handle — NOT a raw
                 display name; the independence gate needs same-author → same-string and
                 different-author → different-string, and display names are bad join keys ('J. Smith'
                 ≠ 'John Smith'; homonym collisions). Promote a namespaced string to a pn_* node when
                 the author becomes load-bearing (cited ≥2 times or a reliability view forms) —
                 mirrors conjecture→derivation promotion. Non-goal: minting a person node for every
-                author; the independence gate needs only a stable equality key. A format warning is
-                emitted (but the write proceeds) if the value looks like a raw display name.
+                author; the independence gate needs only a stable equality key. Write-time hard gate
+                (#1827): a raw display-name shape, or a well-formed pn_* id that does not resolve to
+                an existing current person node, is REJECTED with a repair hint (a fuzzy-matched
+                existing person, or a mint-one pointer to engram_add_person). Config kill-switch
+                `standpoint.author_id_hard_gate` (default true) restores the pre-#1827 warn-not-reject
+                behavior when set false.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
@@ -1857,7 +1861,8 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id (see tiered-ID convention in
                 engram_add_observation — pn_* for in-graph entities, namespaced
-                string for external authors; display names emit a warning),
+                string for external authors; a display-name shape or a dangling
+                pn_* is REJECTED per-item, #1827),
                 standpoint_collection_id, standpoint_override_tag,
                 standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
                 the most load-bearing bias axis for AI-agent premises; format-validated;

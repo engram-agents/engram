@@ -115,8 +115,8 @@ def _composite_line(warnings):
 
 def test_cross_lineage_diverse_no_warning():
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="openai:gpt", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="openai:gpt", author="test:a2", collection="c2")
     assert _read_lineage(o1) == "anthropic:opus"
 
     _dv, warnings = _derive(client, [o1, o2])
@@ -134,9 +134,9 @@ def test_cross_lineage_diverse_no_warning():
 def test_mixed_fs_ratio_no_composite():
     client = fresh_client()
     o1 = _obs(client, 1, quote_type="hard_data", lineage="anthropic:opus",
-              author="a1", collection="c1")
+              author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus",
-              author="a2", collection="c2")
+              author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     fl = _falsification_line(warnings)
@@ -157,8 +157,8 @@ def test_uniform_lineage_warning_fires_when_actionable():
     # A third, unrelated cross-lineage observation makes the graph
     # demonstrate >= 2 distinct lineages — the ⚠ is actionable.
     _obs(client, 9, lineage="openai:gpt")
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     sp = _standpoint_line(warnings)
@@ -175,8 +175,8 @@ def test_uniform_lineage_warning_fires_when_actionable():
 
 def test_partial_lineage_axis_omitted():
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="", author="a2", collection="c2")  # no lineage
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="", author="test:a2", collection="c2")  # no lineage
 
     _dv, warnings = _derive(client, [o1, o2])
     sp = _standpoint_line(warnings)
@@ -195,9 +195,9 @@ def test_partial_lineage_axis_omitted():
 def test_author_diverse_lineage_uniform_caught():
     client = fresh_client()
     _obs(client, 9, lineage="openai:gpt")  # make the ⚠ actionable
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="ariadne", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="borges", collection="c2")
-    o3 = _obs(client, 3, lineage="anthropic:opus", author="luria", collection="c3")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:ariadne", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:borges", collection="c2")
+    o3 = _obs(client, 3, lineage="anthropic:opus", author="test:luria", collection="c3")
 
     _dv, warnings = _derive(client, [o1, o2, o3])
     sp = _standpoint_line(warnings)
@@ -215,9 +215,9 @@ def test_author_diverse_lineage_uniform_caught():
 def test_composite_escalation_fires_all_frozen_uniform():
     client = fresh_client()
     o1 = _obs(client, 1, quote_type="editorial", lineage="anthropic:opus",
-              author="a1", collection="c1")
+              author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="personal_communication",
-              lineage="anthropic:opus", author="a2", collection="c2")
+              lineage="anthropic:opus", author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     comp = _composite_line(warnings)
@@ -237,9 +237,9 @@ def test_composite_cross_lineage_remedy_when_actionable():
     client = fresh_client()
     _obs(client, 9, lineage="openai:gpt")  # graph now has 2 distinct lineages
     o1 = _obs(client, 1, quote_type="editorial", lineage="anthropic:opus",
-              author="a1", collection="c1")
+              author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus",
-              author="a2", collection="c2")
+              author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     comp = _composite_line(warnings)
@@ -291,9 +291,9 @@ def test_malformed_lineage_redirecting_rejection():
 def test_proxy_label_invariant():
     client = fresh_client()
     o1 = _obs(client, 1, quote_type="hard_data", lineage="anthropic:opus",
-              author="a1", collection="c1")
+              author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus",
-              author="a2", collection="c2")
+              author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     fl = _falsification_line(warnings)
@@ -327,9 +327,9 @@ def test_verified_discharges_composite():
     # an unknown no longer suppresses — verified-status, not F-S, is the gate).
     client = fresh_client()
     o1 = _obs(client, 1, quote_type="attributed_analysis",
-              lineage="anthropic:opus", author="a1", collection="c1")
+              lineage="anthropic:opus", author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus",
-              author="a2", collection="c2")
+              author="test:a2", collection="c2")
     _dv, warnings = _derive(client, [o1, o2])
     assert _composite_line(warnings), (
         f"⚠⚠ must fire: zero verified leaves + uniform lineage, even with an "
@@ -341,9 +341,9 @@ def test_verified_discharges_composite():
     # would NOT discharge; hard_data is the state-3 content-type.)
     client2 = fresh_client()
     v1 = _obs(client2, 1, quote_type="hard_data",
-              lineage="anthropic:opus", author="a1", collection="c1")
+              lineage="anthropic:opus", author="test:a1", collection="c1")
     e2 = _obs(client2, 2, quote_type="editorial", lineage="anthropic:opus",
-              author="a2", collection="c2")
+              author="test:a2", collection="c2")
     _dv2, warnings2 = _derive(client2, [v1, e2])
     assert _composite_line(warnings2) == "", (
         f"a single verified (hard_data) leaf must discharge ⚠⚠: {warnings2}"
@@ -358,8 +358,8 @@ def test_verified_discharges_composite():
 
 def test_single_lineage_gate_informational_then_live():
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:a2", collection="c2")
 
     # Direction 1: one-lineage graph → NO standalone lineage line at all. The
     # informational line was dropped (Component B, Borges #721): under null=self
@@ -400,8 +400,8 @@ def test_retracted_cross_lineage_does_not_activate_gate():
     gate exists to honor. Discriminating: this fails pre-fix (gate fires) and
     passes post-fix (gate stays informational)."""
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:a2", collection="c2")
     # File the only cross-lineage row, then RETRACT it -> non-current.
     o9 = _obs(client, 9, lineage="openai:gpt")
     r = client.call("engram_retract", {
@@ -441,8 +441,8 @@ def test_noncitable_lineage_row_does_not_activate_gate():
     passes post-fix (the type filter excludes it -> gate stays informational).
     Origin: Mira #954 colleague review."""
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:a2", collection="c2")
     # Inject a CURRENT non-observation (goal) row carrying a DIFFERENT lineage,
     # directly in the DB -- exactly the non-enforced path Mira probed.
     import server as _server
@@ -493,8 +493,8 @@ def test_predictive_cross_lineage_activates_gate():
     passes post-fix (the family predicate counts it -> ⚠ goes live). Origin:
     Mira #954 second re-review."""
     client = fresh_client()
-    o1 = _obs(client, 1, lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, lineage="anthropic:opus", author="a2", collection="c2")
+    o1 = _obs(client, 1, lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, lineage="anthropic:opus", author="test:a2", collection="c2")
     # The ONLY cross-lineage row is a current PREDICTIVE observation.
     rp = client.call("engram_add_observation", {
         "url": "https://example.com/pred-9",
@@ -616,9 +616,9 @@ def _node_fs_class_via_core(node_id):
 def test_fs_class_native_field_no_proxy_label():
     client = fresh_client()
     o1 = _obs_fs(client, 1, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a1", collection="c1")
+                 lineage="anthropic:opus", author="test:a1", collection="c1")
     o2 = _obs_fs(client, 2, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a2", collection="c2")
+                 lineage="anthropic:opus", author="test:a2", collection="c2")
 
     # _node_fs_class must return source="field" for a native-filed node.
     fc, src = _node_fs_class_via_core(o1)
@@ -649,9 +649,9 @@ def test_fs_class_absent_falls_back_to_proxy():
     client = fresh_client()
     # No fs_class → Phase-1 proxy must apply.
     o1 = _obs(client, 1, quote_type="hard_data",
-              lineage="anthropic:opus", author="a1", collection="c1")
+              lineage="anthropic:opus", author="test:a1", collection="c1")
     o2 = _obs(client, 2, quote_type="editorial",
-              lineage="anthropic:opus", author="a2", collection="c2")
+              lineage="anthropic:opus", author="test:a2", collection="c2")
 
     # _node_fs_class must return source="proxy:quote_type" (no native field).
     fc, src = _node_fs_class_via_core(o1)
@@ -681,13 +681,13 @@ def test_mixed_native_and_null_any_proxy_precision():
     client = fresh_client()
     # Premise 1: native fs_class — source will be "field".
     o1 = _obs_fs(client, 1, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a1", collection="c1")
+                 lineage="anthropic:opus", author="test:a1", collection="c1")
     # Premise 2: no fs_class, attributed_analysis → proxy maps to "unknown".
     # _node_fs_class returns ("unknown", "proxy:quote_type") for this node.
     # It is EXCLUDED from known_fs (c == "unknown"). So any_proxy scans
     # known_fs and finds only the native premise → any_proxy = False.
     o2 = _obs_fs(client, 2, fs_class=None, quote_type="attributed_analysis",
-                 lineage="anthropic:opus", author="a2", collection="c2")
+                 lineage="anthropic:opus", author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     fl = _falsification_line(warnings)
@@ -711,10 +711,10 @@ def test_mixed_source_per_source_split():
     client = fresh_client()
     # Premise 1: native fs_class="re-executable" → source="field"
     o1 = _obs_fs(client, 1, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a1", collection="c1")
+                 lineage="anthropic:opus", author="test:a1", collection="c1")
     # Premise 2: no fs_class, hard_data → proxy "re-executable", source="proxy:quote_type"
     o2 = _obs_fs(client, 2, fs_class=None, quote_type="hard_data",
-                 lineage="anthropic:opus", author="a2", collection="c2")
+                 lineage="anthropic:opus", author="test:a2", collection="c2")
 
     _dv, warnings = _derive(client, [o1, o2])
     fl = _falsification_line(warnings)
@@ -742,11 +742,11 @@ def test_proxy_label_drops_when_all_native():
     client = fresh_client()
     # Three premises all with native fs_class="re-executable".
     o1 = _obs_fs(client, 1, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a1", collection="c1")
+                 lineage="anthropic:opus", author="test:a1", collection="c1")
     o2 = _obs_fs(client, 2, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a2", collection="c2")
+                 lineage="anthropic:opus", author="test:a2", collection="c2")
     o3 = _obs_fs(client, 3, fs_class="re-executable",
-                 lineage="anthropic:opus", author="a3", collection="c3")
+                 lineage="anthropic:opus", author="test:a3", collection="c3")
 
     _dv, warnings = _derive(client, [o1, o2, o3])
     fl = _falsification_line(warnings)
@@ -784,10 +784,10 @@ def _obs_leaves_via_core(node_id):
 def test_layered_derivation_closure_walk_to_observation_leaves():
     client = fresh_client()
     # Four frozen (editorial→frozen proxy), same-lineage observations.
-    o1 = _obs(client, 1, quote_type="editorial", lineage="anthropic:opus", author="a1", collection="c1")
-    o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus", author="a2", collection="c2")
-    o3 = _obs(client, 3, quote_type="editorial", lineage="anthropic:opus", author="a3", collection="c3")
-    o4 = _obs(client, 4, quote_type="editorial", lineage="anthropic:opus", author="a4", collection="c4")
+    o1 = _obs(client, 1, quote_type="editorial", lineage="anthropic:opus", author="test:a1", collection="c1")
+    o2 = _obs(client, 2, quote_type="editorial", lineage="anthropic:opus", author="test:a2", collection="c2")
+    o3 = _obs(client, 3, quote_type="editorial", lineage="anthropic:opus", author="test:a3", collection="c3")
+    o4 = _obs(client, 4, quote_type="editorial", lineage="anthropic:opus", author="test:a4", collection="c4")
 
     # Two intermediate derivations, then a FINAL derivation over the derivations.
     dvA, _ = _derive(client, [o1, o2], claim="Intermediate A")
