@@ -604,6 +604,9 @@ _codex_managed_session() {
     # The boot runner already owns the intended tmux pane. Replace that pane's
     # shell with the remote TUI rather than attaching tmux to itself.
     if [[ -n "${TMUX:-}" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null || true)" == "$tmux_session" ]]; then
+        # Keep terminal-wheel scrolling on the TUI's output instead of
+        # forwarding wheel events to Codex's input-history navigation.
+        tmux set-option -t "$tmux_session" mouse on
         # `--cwd` must apply here too: unlike the new-session path below,
         # tmux cannot set it for an already-existing pane. The boot runner
         # passes --cd explicitly, so execing without this cd would launch the
@@ -622,6 +625,7 @@ _codex_managed_session() {
             echo "       Use 'agentctl attach $name' to interact with the existing thread (or 'agentctl attach $name -r' to observe)." >&2
             return 1
         fi
+        tmux set-option -t "$tmux_session" mouse on
         exec tmux attach -t "$tmux_session"
     fi
 
@@ -640,6 +644,7 @@ _codex_managed_session() {
         echo "       Daemon remains untouched; inspect tmux and attach only after it exists." >&2
         return 1
     fi
+    tmux set-option -t "$tmux_session" mouse on
     exec tmux attach -t "$tmux_session"
 }
 

@@ -374,6 +374,7 @@ def _write_mac_codex_stubs(tmp_path: Path) -> tuple[Path, Path, Path]:
         "case \"${1:-}\" in\n"
         "  has-session) test -f \"$FAKE_TMUX_STATE\" ;;\n"
         "  new-session) touch \"$FAKE_TMUX_STATE\" ;;\n"
+        "  set-option) exit 0 ;;\n"
         "  attach) exit 0 ;;\n"
         "  display-message) printf '%s\\n' \"${FAKE_TMUX_NAME:-other-session}\" ;;\n"
         "  *) printf 'unexpected fake tmux invocation\\n' >&2; exit 98 ;;\n"
@@ -434,6 +435,7 @@ def test_mac_codex_ensures_verified_daemon_then_starts_remote_tui_in_cwd(tmp_pat
     assert f"-c {cwd}" in new_session
     assert "codex\\ --remote\\ unix://" in new_session
     assert "resume\\ --last" in new_session
+    assert "tmux set-option -t agent-luria mouse on" in lines
     assert "tmux attach -t agent-luria" in lines
     assert not any(line.startswith("codex --remote") for line in lines)
 
@@ -444,6 +446,7 @@ def test_mac_codex_reuses_existing_tui_by_attaching_without_second_session(tmp_p
     assert "codex app-server daemon start" in calls
     assert "codex app-server daemon version" in calls
     assert "tmux new-session" not in calls
+    assert "tmux set-option -t agent-luria mouse on" in calls
     assert "tmux attach -t agent-luria" in calls
 
 

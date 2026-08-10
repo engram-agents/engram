@@ -648,6 +648,7 @@ def _write_daemon_stubs(tmp_path: Path, socket_path: Path) -> tuple[Path, Path, 
         "case \"${1:-}\" in\n"
         "  has-session) test -f \"$FAKE_TMUX_STATE\" ;;\n"
         "  new-session) touch \"$FAKE_TMUX_STATE\" ;;\n"
+        "  set-option) exit 0 ;;\n"
         "  attach) exit 0 ;;\n"
         "  display-message) printf '%s\\n' \"${FAKE_TMUX_NAME:-other-session}\" ;;\n"
         "  *) printf 'unexpected fake tmux invocation\\n' >&2; exit 98 ;;\n"
@@ -720,6 +721,7 @@ def test_codex_managed_session_starts_daemon_then_one_remote_tmux_tui(tmp_path):
     new_session = next(line for line in lines if line.startswith("tmux new-session"))
     assert "codex\\ --remote\\ unix://" in new_session
     assert "--dangerously-bypass-approvals-and-sandbox" in new_session
+    assert "tmux set-option -t agent-mira mouse on" in lines
     assert "tmux attach -t agent-mira" in lines
     assert not any(line.startswith("codex --remote") for line in lines), calls
 
@@ -730,6 +732,7 @@ def test_codex_managed_session_already_running_attaches_without_second_tui(tmp_p
     assert "codex app-server daemon start" in calls
     assert "codex app-server daemon version" in calls
     assert "tmux new-session" not in calls
+    assert "tmux set-option -t agent-mira mouse on" in calls
     assert "tmux attach -t agent-mira" in calls
 
 
@@ -809,6 +812,7 @@ def test_codex_autostart_pane_reuses_its_managed_tmux_without_nesting(tmp_path):
     assert "tmux new-session" not in calls
     assert "tmux attach" not in calls
     assert "tmux display-message -p" in calls
+    assert "tmux set-option -t agent-mira mouse on" in calls
     assert any(line.startswith("codex --remote unix://") and "resume --last" in line for line in calls.splitlines())
     assert (tmp_path / "codex-process-cwd").read_text(encoding="utf-8").strip() == str(tmp_path)
 
