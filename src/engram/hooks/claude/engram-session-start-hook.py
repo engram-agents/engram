@@ -725,6 +725,51 @@ def peer_topology_block(agent_name: str) -> str:
         return ""
 
 
+# Staleness gate (#1975 layer 3): a focus pin older than this many days
+# renders with a trailing ⚠ marker in focus_block(). Config-overridable via
+# config.json `focus.focus_staleness_days`. Default 7 mirrors Lei's original
+# "~7 days" proposal in issue #1975.
+FOCUS_STALENESS_DAYS_DEFAULT = 7
+
+
+def _get_focus_staleness_days(engram_home: str) -> int:
+    """Read `focus.focus_staleness_days` from config.json; default 7.
+
+    Same inline read-with-fallback pattern as the backup staleness threshold
+    above (this hook is standalone and does not import engram_core).
+    """
+    try:
+        config_path = os.path.join(engram_home, "config.json")
+        with open(config_path) as _f:
+            _cfg = json.load(_f)
+        return int(_cfg.get("focus", {}).get("focus_staleness_days", FOCUS_STALENESS_DAYS_DEFAULT))
+    except Exception:
+        return FOCUS_STALENESS_DAYS_DEFAULT
+
+
+def _parse_iso_timestamp(ts: str):
+    """Parse an ISO-8601 timestamp (with 'Z' or '+00:00' offset, with or
+    without microseconds) into a tz-aware UTC datetime. Returns None on any
+    parse failure — callers treat that as "age unknown, don't mark stale".
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _humanize_age_days(age_days: int) -> str:
+    """Compact age string: '<7d' as '<N>d', '>=7d' as '<N>w' (whole weeks)."""
+    if age_days < 7:
+        return f"{age_days}d"
+    return f"{age_days // 7}w"
+
+
 def focus_block(engram_home: str) -> str:
     """Render the live focus list as a deterministic, verbatim continuity block.
 
@@ -740,6 +785,17 @@ def focus_block(engram_home: str) -> str:
         - [<id>] (<focus_reason>) <claim>
         - [<id>] <claim>                (when focus_reason is empty/NULL)
 
+    Staleness gate (#1975 layer 3): a pin whose focused_at is older than
+    config `focus.focus_staleness_days` (default 7) gets a trailing
+    "  ⚠ pinned <age> ago — rotate out or re-pin with a current reason"
+    marker, and the block ends with one summary line
+    "⚠ N pin(s) stale — focus is CURRENT work; park threads with
+    engram_focus_save, drop the rest." when N >= 1. Age is computed against
+    ALL rows (not just the ones inside the FOCUS_LIST_CAP display window),
+    so the summary count reflects the true stale total. A pin whose
+    focused_at can't be parsed is treated as fresh (no marker) rather than
+    erroring the whole block.
+
     Returns "" when the DB is missing, the focus list is empty, or any read
     error occurs. Never raises — hook must not block session start.
     """
@@ -753,7 +809,7 @@ def focus_block(engram_home: str) -> str:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, claim, focus_reason FROM nodes "
+                "SELECT id, claim, focus_reason, focused_at FROM nodes "
                 "WHERE focused_at IS NOT NULL AND is_current = 1 "
                 "ORDER BY focused_at"
             ).fetchall()
@@ -767,15 +823,29 @@ def focus_block(engram_home: str) -> str:
         if not rows:
             return ""
 
+        staleness_days = _get_focus_staleness_days(engram_home)
+        now = datetime.now(timezone.utc)
+        stale_count = 0
+
         lines = []
         for row in rows:
             node_id = row["id"]
             claim = row["claim"]
             focus_reason = row["focus_reason"]
+            stale_marker = ""
+            focused_dt = _parse_iso_timestamp(row["focused_at"])
+            if focused_dt is not None:
+                age_days = (now - focused_dt).days
+                if age_days > staleness_days:
+                    stale_count += 1
+                    stale_marker = (
+                        f"  ⚠ pinned {_humanize_age_days(age_days)} ago — "
+                        "rotate out or re-pin with a current reason"
+                    )
             if focus_reason:
-                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}")
+                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}{stale_marker}")
             else:
-                lines.append(f"  - [{node_id}] {claim}")
+                lines.append(f"  - [{node_id}] {claim}{stale_marker}")
 
         total = len(lines)
         display_lines = lines[:FOCUS_LIST_CAP]
@@ -785,9 +855,94 @@ def focus_block(engram_home: str) -> str:
         block_lines = [header] + display_lines
         if remaining > 0:
             block_lines.append(f"  ... +{remaining} more")
+        if stale_count > 0:
+            block_lines.append(
+                f"⚠ {stale_count} pin(s) stale — focus is CURRENT work; "
+                "park threads with engram_focus_save, drop the rest."
+            )
         return "\n".join(block_lines)
     except Exception:
         # Hook discipline: never surface focus-block errors at session start.
+        return ""
+
+
+def saved_focus_sets_block(engram_home: str) -> str:
+    """Render saved, non-active focus_sets as a compact pointer listing
+    (#1975 layer 1) — the noetic "these exist" signal every session,
+    directly after the live 📌 focus block.
+
+    Compact single line when <= 3 sets:
+        💼 Saved focus-sets: name-a (1 node, saved 2026-08-10) · name-b (...)
+    One line per set (with description appended) when > 3:
+        💼 Saved focus-sets:
+          - name-a (1 node, saved 2026-08-10) — description text
+          - name-b (2 nodes, saved 2026-08-09)
+
+    The currently-active set (focus_state.active_set_name) is excluded —
+    it's already fully rendered by focus_block() above; listing it again
+    here would be redundant. Sets are ordered by name (deterministic,
+    byte-stable across renders). Pure read of focus_sets/focus_state; same
+    never-fail discipline as focus_block() — any exception, a missing DB,
+    or an empty table all render "".
+    """
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            active_row = conn.execute(
+                "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+            ).fetchone()
+            active_name = active_row["active_set_name"] if active_row else None
+            rows = conn.execute(
+                "SELECT name, node_ids, description, created_at FROM focus_sets "
+                "ORDER BY name ASC"
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        entries = []
+        for row in rows:
+            if row["name"] == active_name:
+                continue
+            try:
+                node_ids = json.loads(row["node_ids"])
+                node_count = len(node_ids) if isinstance(node_ids, list) else 0
+            except (json.JSONDecodeError, TypeError):
+                node_count = 0
+            saved_date = (row["created_at"] or "")[:10]
+            entries.append({
+                "name": row["name"],
+                "node_count": node_count,
+                "saved_date": saved_date,
+                "description": (row["description"] or "").strip(),
+            })
+
+        if not entries:
+            return ""
+
+        def _summary(e: dict) -> str:
+            unit = "node" if e["node_count"] == 1 else "nodes"
+            return f"{e['name']} ({e['node_count']} {unit}, saved {e['saved_date']})"
+
+        if len(entries) <= 3:
+            return "💼 Saved focus-sets: " + " · ".join(_summary(e) for e in entries)
+
+        block_lines = ["💼 Saved focus-sets:"]
+        for e in entries:
+            desc_part = f" — {e['description']}" if e["description"] else ""
+            block_lines.append(f"  - {_summary(e)}{desc_part}")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface saved-focus-sets errors at session start.
         return ""
 
 
@@ -1771,6 +1926,17 @@ def main() -> None:
         _focus = focus_block(ENGRAM_HOME)
         if _focus:
             lines.append(_focus)
+    except Exception:
+        pass
+
+    # ── Saved focus-sets listing (cheap: single local DB read) ─────────────
+    # #1975 layer 1 — noetic "these exist" signal every session, directly
+    # after the live focus block. Pure read; same never-fail discipline as
+    # focus_block(). Empty table / DB-missing / any exception → nothing.
+    try:
+        _saved_sets = saved_focus_sets_block(ENGRAM_HOME)
+        if _saved_sets:
+            lines.append(_saved_sets)
     except Exception:
         pass
 

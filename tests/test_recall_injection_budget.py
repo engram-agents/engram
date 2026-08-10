@@ -458,6 +458,8 @@ class TestStatsPopulated(BudgetTestBase):
             "nodes_suppressed": 0,
             "nodes_cut_budget": 0,
             "nodes_suppressed_echo": 0,
+            "sets_checked": 0,
+            "set_lines_rendered": 0,
         })
 
     def test_stats_none_default_is_a_pure_no_op(self):

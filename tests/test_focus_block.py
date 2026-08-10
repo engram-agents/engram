@@ -21,9 +21,11 @@ Covers:
 """
 
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -190,3 +192,77 @@ class TestFocusBlockHelper:
         mod = _load_session_start_module(engram_home)
         result = mod.focus_block(str(engram_home))
         assert "+3 more" in result, f"expected '+3 more' tail; got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# Layer 3 (#1975) — staleness gate on live pins
+# ---------------------------------------------------------------------------
+
+class TestFocusBlockStaleness:
+    """Pins older than focus_staleness_days (config, default 7) get a
+    trailing ⚠ marker + one summary line when >= 1 pin is stale."""
+
+    def test_fresh_pin_unmarked(self, engram_home):
+        db_path = _make_db(engram_home)
+        now = datetime.now(timezone.utc)
+        _insert_node(
+            db_path, "ob_0001", "Fresh claim.",
+            (now - timedelta(days=1)).isoformat(), None, 1,
+        )
+        mod = _load_session_start_module(engram_home)
+        result = mod.focus_block(str(engram_home))
+        assert "⚠" not in result, f"fresh pin must not be marked stale; got {result!r}"
+
+    def test_pin_older_than_default_threshold_marked(self, engram_home):
+        """Default threshold is 7 days; a 10-day-old pin is marked, with a
+        one-pin summary line at the block's end."""
+        db_path = _make_db(engram_home)
+        now = datetime.now(timezone.utc)
+        _insert_node(
+            db_path, "ob_0001", "Stale claim.",
+            (now - timedelta(days=10)).isoformat(), None, 1,
+        )
+        mod = _load_session_start_module(engram_home)
+        result = mod.focus_block(str(engram_home))
+        assert "⚠ pinned" in result, f"expected stale marker; got {result!r}"
+        assert "rotate out or re-pin with a current reason" in result
+        assert "⚠ 1 pin(s) stale" in result
+
+    def test_pin_at_exactly_default_threshold_unmarked(self, engram_home):
+        """Boundary: 'older than' N days excludes a pin exactly N days old."""
+        db_path = _make_db(engram_home)
+        now = datetime.now(timezone.utc)
+        _insert_node(
+            db_path, "ob_0001", "Exactly-at-threshold claim.",
+            (now - timedelta(days=7)).isoformat(), None, 1,
+        )
+        mod = _load_session_start_module(engram_home)
+        result = mod.focus_block(str(engram_home))
+        assert "⚠" not in result, f"pin exactly at threshold must not be marked; got {result!r}"
+
+    def test_threshold_configurable(self, engram_home):
+        """config.json focus.focus_staleness_days overrides the default 7."""
+        (engram_home / "config.json").write_text(
+            json.dumps({"focus": {"focus_staleness_days": 2}})
+        )
+        db_path = _make_db(engram_home)
+        now = datetime.now(timezone.utc)
+        _insert_node(
+            db_path, "ob_0001", "Aged 3 days.",
+            (now - timedelta(days=3)).isoformat(), None, 1,
+        )
+        mod = _load_session_start_module(engram_home)
+        result = mod.focus_block(str(engram_home))
+        assert "⚠ pinned" in result, (
+            f"3-day-old pin should be stale under a 2-day config threshold; got {result!r}"
+        )
+
+    def test_summary_line_counts_all_stale_pins(self, engram_home):
+        db_path = _make_db(engram_home)
+        now = datetime.now(timezone.utc)
+        _insert_node(db_path, "ob_0001", "Stale one.", (now - timedelta(days=10)).isoformat(), None, 1)
+        _insert_node(db_path, "ob_0002", "Stale two.", (now - timedelta(days=20)).isoformat(), None, 1)
+        _insert_node(db_path, "ob_0003", "Fresh.", (now - timedelta(days=1)).isoformat(), None, 1)
+        mod = _load_session_start_module(engram_home)
+        result = mod.focus_block(str(engram_home))
+        assert "⚠ 2 pin(s) stale" in result, f"expected 2-pin summary; got {result!r}"

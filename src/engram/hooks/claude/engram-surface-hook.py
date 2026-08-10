@@ -1166,6 +1166,111 @@ def _budget_try_spend(line_text: str, budget_state: dict) -> bool:
     return True
 
 
+def _budget_try_spend_extra(line_text: str, budget_state: dict) -> bool:
+    """Same char-budget accounting as _budget_try_spend, for auxiliary lines
+    that share the render's character budget (per #1975: "these lines count
+    against the #1692 injection budget like node lines") WITHOUT being
+    counted in nodes_shown / nodes_cut_budget — those two fields are pinned
+    by existing tests (tests/test_recall_injection_budget.py) as an exact
+    node-line-only invariant (nodes_shown + nodes_cut_budget == total
+    eligible node candidates). Auxiliary-line telemetry (e.g. layer 2's
+    set_lines_rendered) is tracked separately by the caller instead.
+
+    Same one-way-stop semantics as _budget_try_spend: once budget_state is
+    exhausted (by a node line OR a prior auxiliary line), every subsequent
+    call returns False.
+    """
+    if budget_state["exhausted"]:
+        return False
+    if budget_state["remaining"] is None:
+        budget_state["chars_rendered"] += len(line_text) + 1
+        return True
+    cost = len(line_text) + 1
+    if cost > budget_state["remaining"]:
+        budget_state["exhausted"] = True
+        return False
+    budget_state["remaining"] -= cost
+    budget_state["chars_rendered"] += cost
+    return True
+
+
+# #1975 layer 2 — at most this many dormant-set pointer lines per prompt.
+_DORMANT_FOCUS_SET_LINES_CAP = 2
+
+
+def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
+    """Layer 2 (#1975) — find saved, non-active focus_sets whose immutable
+    node_ids overlap `rendered_ids` (the ids that actually rendered in the
+    Specials/Top-claims full-summary tiers this prompt).
+
+    One SELECT for focus_state.active_set_name + one SELECT for
+    `name, node_ids, last_loaded_at FROM focus_sets` per prompt (fired
+    unconditionally, even when rendered_ids is empty — e.g. every candidate
+    that would've reached Specials/Top claims was budget-cut or suppressed
+    this prompt — so sets_checked/telemetry reflects the actual per-prompt
+    read, not a lucky-empty-set skip); each node_ids JSON blob is parsed
+    into a Python set once, then membership is tested per rendered id —
+    O(S) per id, S = number of saved sets (S is capped by
+    engram_focus_save's focus_sets_cap, default 10, so this stays
+    effectively constant). Never raises: any DB/parse failure returns
+    ([], 0), same never-fail discipline as the rest of this hook.
+
+    Returns (candidates, sets_checked). candidates is sorted by match-count
+    desc, ties broken by most-recent last_loaded_at desc (stable two-pass
+    sort — see implementation). sets_checked is the number of focus_sets
+    rows read (including the excluded active set, if any), for the
+    stats["sets_checked"] telemetry. The caller applies the
+    _DORMANT_FOCUS_SET_LINES_CAP top-N cut and the shared render budget.
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        active_row = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
+        active_name = active_row["active_set_name"] if active_row else None
+        rows = conn.execute(
+            "SELECT name, node_ids, last_loaded_at FROM focus_sets"
+        ).fetchall()
+    except Exception:
+        return [], 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    sets_checked = len(rows)
+    candidates: list[dict] = []
+    for row in rows:
+        name = row["name"]
+        if name == active_name:
+            continue
+        try:
+            ids = json.loads(row["node_ids"])
+            if not isinstance(ids, list):
+                continue
+        except (json.JSONDecodeError, TypeError):
+            continue
+        matched = sorted(rendered_ids & set(ids))
+        if not matched:
+            continue
+        candidates.append({
+            "name": name,
+            "matched": matched,
+            "last_loaded_at": row["last_loaded_at"] or "",
+        })
+
+    # Stable two-pass sort: secondary key (most-recent last_loaded_at) first,
+    # then primary key (match count desc) — Python's sort is stable, so ties
+    # on match count preserve the recency ordering from the first pass.
+    candidates.sort(key=lambda c: c["last_loaded_at"], reverse=True)
+    candidates.sort(key=lambda c: len(c["matched"]), reverse=True)
+    return candidates, sets_checked
+
+
 def _get_attached_packs() -> list[dict]:
     """Read attached_packs from $ENGRAM_HOME/config.json.
 
@@ -1641,11 +1746,15 @@ def format_nudge(
     stats: optional caller-owned dict, mutated in place (out-parameter) with
     render telemetry for the engram.surface.render_size event (issue #1692):
     {budget_enabled, budget_total_chars, budget_exhausted, chars_rendered,
-    nodes_shown, nodes_suppressed, nodes_cut_budget}. Populated even on the
-    total==0 early-return (all zeroed / budget config echoed) so callers can
-    rely on the dict shape unconditionally. None (the default) skips
-    telemetry entirely — no behavior change, matches the pack_results /
-    session_id optional-param precedent above.
+    nodes_shown, nodes_suppressed, nodes_cut_budget, sets_checked,
+    set_lines_rendered}. sets_checked/set_lines_rendered are #1975 layer-2
+    telemetry (dormant focus-set surfacing) — sets_checked is the number of
+    focus_sets rows read this prompt, set_lines_rendered is how many
+    survived the top-2 cap + render budget. Populated even on the total==0
+    early-return (all zeroed / budget config echoed) so callers can rely on
+    the dict shape unconditionally. None (the default) skips telemetry
+    entirely — no behavior change, matches the pack_results / session_id
+    optional-param precedent above.
     """
     budget_cfg = _get_budget_config()
     if stats is not None:
@@ -1659,6 +1768,8 @@ def format_nudge(
             "nodes_suppressed": 0,
             "nodes_cut_budget": 0,
             "nodes_suppressed_echo": 0,
+            "sets_checked": 0,
+            "set_lines_rendered": 0,
         })
 
     total = result.get("match_count", 0)
@@ -1880,6 +1991,15 @@ def format_nudge(
             lines.append("  Top claims:")
             lines.extend(top_claim_lines)
 
+    # Snapshot of the rendered full-summary tier ids (Specials + Top claims
+    # only — the top <=6 lines that actually made it to "full" tier) for
+    # layer-2 dormant focus-set surfacing (#1975) below. Taken here, before
+    # the reservation loop / Others pool add more ids to
+    # rendered_ids_this_prompt, per spec: "membership-check the rendered
+    # full-summary nodes only (Specials + Top claims tiers) — NOT
+    # Others/reservation lines".
+    specials_and_topclaims_ids = set(rendered_ids_this_prompt)
+
     matched_meta = result.get("matched_meta") or []
 
     # --- Not-recalled slot reservation (recall-triggering blueprint §3-P1,
@@ -2080,6 +2200,54 @@ def format_nudge(
         ]
         if matched_ids:
             lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
+
+    # --- Layer 2: dormant focus-set surfacing (#1975, the load-bearing layer)
+    # After the tier walk above has decided what actually rendered, check
+    # whether any of the rendered Specials/Top-claims ids (snapshotted into
+    # specials_and_topclaims_ids before the reservation/Others pools ran)
+    # belong to a saved, non-active focus_sets entry. Own-graph content only
+    # (appended here, after Others — before the attached-library section,
+    # which is external-pack content and stays last). Judgment call: the
+    # spec says "after Others, before the footer" without addressing where
+    # the (separate, optional) attached-library section falls between them —
+    # placed here to keep own-graph content grouped together.
+    if stats is not None:
+        stats["sets_checked"] = 0
+        stats["set_lines_rendered"] = 0
+    try:
+        set_candidates, _sets_checked = _dormant_focus_set_candidates(specials_and_topclaims_ids)
+    except Exception:
+        set_candidates, _sets_checked = [], 0
+    if stats is not None:
+        stats["sets_checked"] = _sets_checked
+    # Whole render block guarded, mirroring saved_focus_sets_block()'s
+    # whole-function guard: format_nudge() has no try/except at its only
+    # call site (main()), so an exception here would crash the prompt hook.
+    try:
+        if set_candidates:
+            set_lines = []
+            for cand in set_candidates[:_DORMANT_FOCUS_SET_LINES_CAP]:
+                ids_preview = cand["matched"][:3]
+                ids_str = ", ".join(ids_preview)
+                if len(cand["matched"]) > 3:
+                    ids_str += ", …"
+                set_line = (
+                    f"  💼 saved focus-set '{cand['name']}' holds {len(cand['matched'])} "
+                    f"node(s) matching this prompt ({ids_str}) — engram_focus_load to swap it in."
+                )
+                if not _budget_try_spend_extra(set_line, budget_state):
+                    # Budget exhaustion cuts set-lines too, same one-way stop as
+                    # node lines — NOT counted in nodes_shown/nodes_cut_budget
+                    # (those track actual node-line renders; set_lines_rendered
+                    # is this layer's own telemetry, see _budget_try_spend_extra).
+                    continue
+                set_lines.append(set_line)
+            if set_lines:
+                lines.extend(set_lines)
+                if stats is not None:
+                    stats["set_lines_rendered"] = len(set_lines)
+    except Exception:
+        pass
 
     # Attached-library section — appended AFTER all own-graph content.
     # Only rendered when pack results exist; zero packs → section omitted

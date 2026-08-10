@@ -5883,8 +5883,10 @@ _FOCUS_FIELDS = frozenset({
 @mcp.tool(
     name="engram_focus",
     capability=(
-        "Pins node ids so they MUST survive the next compaction (cap 15; over-cap fails "
-        "loudly, no eviction). Not a bookmark — use engram_focus_save."
+        "Current workstream working set — parked threads go in focus_sets, standing "
+        "principles go in the warm briefing/cornerstones, NOT here. Pins node ids so "
+        "they MUST survive the next compaction (cap 15; over-cap fails loudly, no "
+        "eviction). Not a bookmark — use engram_focus_save."
     ),
     annotations={
         "title": "Pin Nodes to Compaction Summary",
@@ -5895,7 +5897,10 @@ _FOCUS_FIELDS = frozenset({
     },
 )
 def engram_focus(payload_json: str) -> str:
-    """Pin nodes as focused — they MUST appear in the next compaction summary.
+    """Current workstream working set — parked threads go in focus_sets,
+    standing principles go in the warm briefing/cornerstones, NOT here.
+
+    Pin nodes as focused — they MUST appear in the next compaction summary.
 
     Focus is the deterministic channel for load-bearing knowledge to cross
     compaction boundaries (normal recall is probabilistic; focus is "I cannot
@@ -6027,8 +6032,10 @@ _FOCUS_SAVE_FIELDS = frozenset({
 @mcp.tool(
     name="engram_focus_save",
     capability=(
-        "Snapshots the CURRENT active focus list under a name — bookmark only, active "
-        "list unchanged."
+        "Per-workstream swap semantics: snapshots the CURRENT active focus list under a "
+        "name — bookmark only, active list unchanged. Refuses NEW sets beyond the "
+        "focus_sets_cap (default 10; overwrites of existing names always allowed) — "
+        "delete/merge via engram_focus_delete_set first."
     ),
     annotations={
         "title": "Snapshot Current Active Focus List Under a Name",
@@ -6039,10 +6046,17 @@ _FOCUS_SAVE_FIELDS = frozenset({
     },
 )
 def engram_focus_save(payload_json: str) -> str:
-    """Snapshot the current active focus list under `name`.
+    """Per-workstream swap semantics: snapshot the current active focus list
+    under `name`, so it can be swapped back in whole later via
+    engram_focus_load / engram_focus_swap.
 
     Bookmark, not rotation: active list unchanged. Cascade resolution
     (supersede auto-follow, retract drop) happens at load time, not save time.
+
+    Refuses to create a NEW set once the number of saved sets reaches the
+    config `focus.focus_sets_cap` (default 10) — delete or merge sets first
+    via engram_focus_delete_set. Overwriting an existing set name
+    (overwrite=True) is always allowed, even at/over the cap.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -6083,8 +6097,9 @@ _FOCUS_LOAD_FIELDS = frozenset({
 @mcp.tool(
     name="engram_focus_load",
     capability=(
-        "Loads a saved focus set into active — errors if active is non-empty unless "
-        "if_active='overwrite'. Use engram_focus_swap for an atomic pivot."
+        "Per-workstream swap semantics: loads a saved focus set into active — errors if "
+        "active is non-empty unless if_active='overwrite'. Use engram_focus_swap for an "
+        "atomic pivot."
     ),
     annotations={
         "title": "Load a Saved Focus Set Into Active",
@@ -6095,7 +6110,8 @@ _FOCUS_LOAD_FIELDS = frozenset({
     },
 )
 def engram_focus_load(payload_json: str) -> str:
-    """Load a saved focus set into the active list.
+    """Per-workstream swap semantics: load a saved focus set into the active
+    list, swapping in that workstream's working knowledge whole.
 
     Default errors if active list is non-empty (use if_active="overwrite" or
     engram_focus_swap for atomic save-then-load). Cascade resolution at load
@@ -6139,8 +6155,9 @@ _FOCUS_SWAP_FIELDS = frozenset({
 @mcp.tool(
     name="engram_focus_swap",
     capability=(
-        "Atomic save-current-then-load-other in one transaction — the canonical pivot, "
-        "avoids engram_focus_load's non-empty-active error."
+        "Per-workstream swap semantics: atomic save-current-then-load-other in one "
+        "transaction — the canonical pivot, avoids engram_focus_load's non-empty-active "
+        "error."
     ),
     annotations={
         "title": "Atomic Save-Current + Load-Other",
@@ -6151,7 +6168,9 @@ _FOCUS_SWAP_FIELDS = frozenset({
     },
 )
 def engram_focus_swap(payload_json: str) -> str:
-    """Atomic save-current + optionally-load-other. The canonical pivot op.
+    """Per-workstream swap semantics: atomic save-current + optionally-
+    load-other, swapping one workstream's working knowledge out for another's
+    whole. The canonical pivot op.
 
     Both halves in one transaction: if the load target doesn't exist, the
     save rolls back too. save_as == load is a no-op (returns already_active).

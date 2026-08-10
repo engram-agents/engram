@@ -19,12 +19,12 @@ engram_deactivate_goal: Pauses a goal (hides it from engram_reflect) WITHOUT ret
 engram_derive: Creates a derivation from EXISTING claim-bearing premises with an explicit logical_chain. Blocked if a premise is stale or contested (overridable via use_stale/use_contested) or tainted (never overridable — no override path).
 engram_diagnose: Side-effect-free quantitative health audit across seven fixed dimensions plus a composite health_score. No filtering args — always audits the whole graph.
 engram_embedding_cluster: Clusters up to 500 GIVEN node ids by stored-embedding cosine similarity — uses EXISTING embeddings only, no on-the-fly model calls.
-engram_focus: Pins node ids so they MUST survive the next compaction (cap 15; over-cap fails loudly, no eviction). Not a bookmark — use engram_focus_save.
+engram_focus: Current workstream working set — parked threads go in focus_sets, standing principles go in the warm briefing/cornerstones, NOT here. Pins node ids so they MUST survive the next compaction (cap 15; over-cap fails loudly, no eviction). Not a bookmark — use engram_focus_save.
 engram_focus_delete_set: Deletes a saved focus-set BOOKMARK only — nodes stay focused even if it was active; active_set_name clears to NULL.
-engram_focus_load: Loads a saved focus set into active — errors if active is non-empty unless if_active='overwrite'. Use engram_focus_swap for an atomic pivot.
-engram_focus_save: Snapshots the CURRENT active focus list under a name — bookmark only, active list unchanged.
+engram_focus_load: Per-workstream swap semantics: loads a saved focus set into active — errors if active is non-empty unless if_active='overwrite'. Use engram_focus_swap for an atomic pivot.
+engram_focus_save: Per-workstream swap semantics: snapshots the CURRENT active focus list under a name — bookmark only, active list unchanged. Refuses NEW sets beyond the focus_sets_cap (default 10; overwrites of existing names always allowed) — delete/merge via engram_focus_delete_set first.
 engram_focus_sets: Pure-read: lists saved focus-set bookmarks with usage metadata, recently-used first. Doesn't touch the active list.
-engram_focus_swap: Atomic save-current-then-load-other in one transaction — the canonical pivot, avoids engram_focus_load's non-empty-active error.
+engram_focus_swap: Per-workstream swap semantics: atomic save-current-then-load-other in one transaction — the canonical pivot, avoids engram_focus_load's non-empty-active error.
 engram_get_subgraph: Browses topology N hops from a known node — adjacency + hop-graduated summaries, not full content. view='deep' rejected; drill in with engram_inspect.
 engram_goal_tension: Records an explicit incompatibility between two goals — does not resolve or auto-detect anything. Pair with engram_resolve.
 engram_history: Side-effect-free audit trail: 'edits' mode is the mutation log (create/supersede/retract/resolve); 'diagnostics' mode is health-score snapshots over time.
