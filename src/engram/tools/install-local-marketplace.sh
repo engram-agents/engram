@@ -330,17 +330,75 @@ if [[ "$TARGET" == "codex" ]]; then
     log "      Run manually in Codex: codex plugin add engram@engram-local"
     exit 0
   fi
-  log "Installing/updating plugin with Codex"
-  codex plugin add engram@engram-local
 
   CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  # Normalize lexically (rather than resolving symlinks) before trusting the
+  # hook-provided cache root.  The compat cleanup below may remove and replace
+  # OLD_CODEX_PLUGIN_CACHE_DIR, so it must only ever receive a direct child of
+  # this plugin's versioned cache directory.
+  CODEX_CACHE_PARENT="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
+import os
+import sys
+print(os.path.abspath(os.path.normpath(sys.argv[1])))
+PY
+)"
+
+  # Resolve the active cache path BEFORE `codex plugin add`.  Codex may remove
+  # that directory while replacing its versioned cache, so discovering only
+  # after the add leaves no path to preserve for hooks in this live session.
+  # Prefer the hook-provided root when it is a direct child of this plugin's
+  # cache; otherwise, fall back to the newest development cache directory.
+  # A raw prefix check would accept traversal or nested paths and let the
+  # compat cleanup modify paths outside that set.  Plain release caches are
+  # not eligible fallbacks because this cleanup replaces its selected path.
+  OLD_CODEX_PLUGIN_CACHE_DIR=""
+  if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    NORMALIZED_CLAUDE_PLUGIN_ROOT="$(python3 - "$CLAUDE_PLUGIN_ROOT" <<'PY'
+import os
+import sys
+print(os.path.abspath(os.path.normpath(sys.argv[1])))
+PY
+)"
+    if [[ "$(dirname "$NORMALIZED_CLAUDE_PLUGIN_ROOT")" == "$CODEX_CACHE_PARENT" ]] && [[ -d "$NORMALIZED_CLAUDE_PLUGIN_ROOT" ]]; then
+      OLD_CODEX_PLUGIN_CACHE_DIR="$NORMALIZED_CLAUDE_PLUGIN_ROOT"
+    fi
+  fi
+  if [[ -z "$OLD_CODEX_PLUGIN_CACHE_DIR" && -d "$CODEX_CACHE_PARENT" ]]; then
+    OLD_CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+
+def version_key(name: str) -> tuple[int, ...]:
+    parts = re.split(r"[^0-9]+", name)
+    return tuple(int(part) for part in parts if part)
+
+candidates = [
+    os.path.join(root, name)
+    for name in os.listdir(root)
+    if re.fullmatch(r".+-dev\..+", name) and os.path.isdir(os.path.join(root, name))
+]
+if candidates:
+    candidates.sort(key=lambda path: (version_key(os.path.basename(path)), os.path.basename(path)))
+    print(candidates[-1])
+PY
+)"
+  fi
+  if [[ -n "$OLD_CODEX_PLUGIN_CACHE_DIR" ]]; then
+    log "Capturing active Codex cache path for in-session compat: $OLD_CODEX_PLUGIN_CACHE_DIR"
+  fi
+
+  log "Installing/updating plugin with Codex"
+  codex plugin add engram@engram-local
 
   # Codex 0.137.0 does not expand ${CLAUDE_PLUGIN_ROOT} in plugin .mcp.json
   # command strings at MCP startup.  Patch the installed cache entry to the
   # absolute cache path so the next session can spawn ENGRAM reliably.
   CODEX_PLUGIN_CACHE_DIR=""
-  if [[ -d "$CODEX_HOME/plugins/cache/engram-local/engram" ]]; then
-    CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
+  if [[ -d "$CODEX_CACHE_PARENT" ]]; then
+    CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re
 import sys
@@ -380,11 +438,22 @@ PY
       for old_dir in "$CACHE_PARENT"/*-dev.*; do
         [[ -e "$old_dir" || -L "$old_dir" ]] || continue
         [[ "$(basename "$old_dir")" == "$NEW_BASE" ]] && continue
+        [[ "$old_dir" == "$OLD_CODEX_PLUGIN_CACHE_DIR" ]] && continue
         log "Symlinking stale cache dir for in-session compat: $(basename "$old_dir") -> $NEW_BASE"
         rm -rf "$old_dir"
         ln -s "$CODEX_PLUGIN_CACHE_DIR" "$old_dir"
       done
       shopt -u nullglob
+
+      # The immediately preceding live cache can have been removed by `codex
+      # plugin add`, so it will not appear in the stale-dir scan above. Restore
+      # that exact path only after the new cache exists, including across
+      # consecutive dev upgrades where the prior compatibility link was gone.
+      if [[ -n "$OLD_CODEX_PLUGIN_CACHE_DIR" && "$OLD_CODEX_PLUGIN_CACHE_DIR" != "$CODEX_PLUGIN_CACHE_DIR" ]]; then
+        log "Symlinking prior live cache for in-session compat: $(basename "$OLD_CODEX_PLUGIN_CACHE_DIR") -> $NEW_BASE"
+        rm -rf "$OLD_CODEX_PLUGIN_CACHE_DIR"
+        ln -s "$CODEX_PLUGIN_CACHE_DIR" "$OLD_CODEX_PLUGIN_CACHE_DIR"
+      fi
     fi
   fi
 
