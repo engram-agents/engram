@@ -545,7 +545,7 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 
 **This state write is eager and irreversible for the night** — weights update at draw time, not at fairy-completion time (see `dream_lottery.py`'s module docstring for the accepted timeout-edge-case tradeoff). Do not re-run `draw` if a fairy times out; that would draw again and corrupt the aging sequence. If you must re-attempt a failed dispatch, re-dispatch the SAME `types_to_run` from the JSON you already have — don't call `draw` a second time this cycle. **As of #1907 this is mechanically enforced, not just advised**: a second real `draw` for the same `--turn` exits non-zero and refuses to write, unless `--force` is passed explicitly (a deliberate escape hatch for genuine recovery — never pass it just to silence the error).
 
-**Step 6b — Dispatch exactly the categories `draw` returned**, `subagent_type="engram-dream-fairy"`, one per category in `types_to_run`. Category names below are canonical from `engram-dream-fairy.md` (do NOT derive from memory — the category numbering changes across versions and must be read here each dispatch):
+**Step 6b — Dispatch exactly the categories `draw` returned**, `subagent_type="engram-dream-fairy"`, one per category in `types_to_run` — **EXCEPT category 10, which dispatches `subagent_type="engram-person-node-fairy"` instead** (its own agent spec, `engram-person-node-fairy.md`; it owns all person-node maintenance jobs per issue #1827 layer 2 and runs all six of its sub-scans in one dispatch). Category names below are canonical from `engram-dream-fairy.md` (do NOT derive from memory — the category numbering changes across versions and must be read here each dispatch):
 
 | `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
 |-------|-------------------|----------|
@@ -558,6 +558,7 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 | 7 | Missing principle-edges (instantiates/serves) | missing-edges |
 | 8 | Open tasks with stale external references | stale-task-refs |
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
+| 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 

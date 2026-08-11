@@ -639,6 +639,10 @@
       "tier": "essential"
     },
     {
+      "path": "agents/claude/engram-person-node-fairy.md",
+      "tier": "essential"
+    },
+    {
       "path": "agents/claude/engram-coder-fairy.md",
       "tier": "convenience"
     },
