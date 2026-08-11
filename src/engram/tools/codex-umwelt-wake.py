@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
+import contextlib
 import hashlib
 import json
 import os
@@ -57,14 +59,20 @@ DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
 STATUS_VERSION = 1
-STATE_VERSION = 3
+STATE_VERSION = 5
 MAX_RECENT_DELIVERED = 256
+MAX_MONITOR_RECOVERY_TURNS = 32
+MAX_MONITOR_RECOVERY_ITEMS = 256
+MAX_MONITOR_SEEN_TERMINAL_EVENTS = 256
 HTTP_READ_LIMIT = 64 * 1024
 HTTP_OPEN_TIMEOUT = 5
 WS_OPEN_TIMEOUT = 5
 REPLY_TIMEOUT = 10
 WS_MESSAGE_LIMIT = 32 * 1024 * 1024
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+CODEX_NOTIFICATION_DRAIN_TIMEOUT = 0.001
+MAX_PENDING_RPC_NOTIFICATIONS = 256
+TERMINAL_COLLAB_AGENT_STATUSES = {"completed", "errored", "interrupted", "shutdown", "notFound"}
 
 _STOP_REQUESTED = False
 
@@ -115,6 +123,10 @@ class RpcError(RuntimeError):
     """JSON-RPC error returned by the Codex app-server."""
 
 
+class RpcProtocolError(RuntimeError):
+    """Malformed or out-of-order JSON-RPC message from the Codex app-server."""
+
+
 class Logger:
     def __init__(self, path: Path, *, stdout: bool) -> None:
         self.path = path
@@ -163,6 +175,49 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
         return dict(default)
 
 
+def default_monitor_recovery() -> dict[str, Any]:
+    return {
+        "thread_id": None,
+        "armed": False,
+        "seen_terminal_event_ids": [],
+    }
+
+
+def normalize_monitor_recovery(value: Any) -> dict[str, Any]:
+    normalized = default_monitor_recovery()
+    if not isinstance(value, dict):
+        return normalized
+    normalized.update(value)
+    thread_id = normalized.get("thread_id")
+    normalized["thread_id"] = thread_id if isinstance(thread_id, str) and thread_id else None
+    normalized["armed"] = bool(normalized.get("armed"))
+    seen_ids: list[str] = []
+    for event_id in normalized.get("seen_terminal_event_ids", []):
+        if not isinstance(event_id, str) or not event_id or event_id in seen_ids:
+            continue
+        seen_ids.append(event_id)
+    normalized["seen_terminal_event_ids"] = seen_ids[-MAX_MONITOR_SEEN_TERMINAL_EVENTS:]
+    return normalized
+
+
+def monitor_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
+    recovery = normalize_monitor_recovery(state.get("codex_monitor_recovery"))
+    state["codex_monitor_recovery"] = recovery
+    return recovery
+
+
+def seen_terminal_event_ids(recovery: dict[str, Any]) -> set[str]:
+    return {x for x in recovery.get("seen_terminal_event_ids", []) if isinstance(x, str)}
+
+
+def remember_seen_terminal_event_id(recovery: dict[str, Any], event_id: str) -> None:
+    seen = [x for x in recovery.get("seen_terminal_event_ids", []) if isinstance(x, str)]
+    if event_id in seen:
+        seen.remove(event_id)
+    seen.append(event_id)
+    recovery["seen_terminal_event_ids"] = seen[-MAX_MONITOR_SEEN_TERMINAL_EVENTS:]
+
+
 def default_state() -> dict[str, Any]:
     return {
         "state_version": STATE_VERSION,
@@ -172,6 +227,7 @@ def default_state() -> dict[str, Any]:
         "delivered_event_ids": [],
         "inflight_batch": None,
         "active_wake": None,
+        "codex_monitor_recovery": default_monitor_recovery(),
     }
 
 
@@ -192,6 +248,7 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     active_wake = normalized.get("active_wake")
     if active_wake is not None and not isinstance(active_wake, dict):
         normalized["active_wake"] = None
+    normalized["codex_monitor_recovery"] = normalize_monitor_recovery(normalized.get("codex_monitor_recovery"))
     normalized["state_version"] = STATE_VERSION
     return normalized
 
@@ -269,7 +326,9 @@ def relevant_crossing(crossing: dict[str, Any], self_name: str) -> str | None:
         for x in (crossing.get("wakes_granted") or [])
         if x is not None
     }
-    is_addressee = crossing.get("viewer_relation") == "addressee"
+    to_agent = crossing.get("to_agent")
+    is_self_addressed = isinstance(to_agent, str) and to_agent.casefold() == self_name.casefold()
+    is_addressee = crossing.get("viewer_relation") == "addressee" or is_self_addressed
     is_mentioned = self_name.casefold() in mentions
     if not (is_addressee or is_mentioned):
         return None
@@ -290,11 +349,103 @@ def build_event(place_id: str, crossing: dict[str, Any], self_name: str) -> dict
     return {
         "id": event_id,
         "kind": kind,
+        "source": "umwelt",
         "place_id": bounded_meta(place_id),
         "sender": bounded_meta(crossing.get("sender")),
         "crossing_ref": bounded_meta(ref, 48),
         "prompt_token": stable_hash(event_id, 12),
     }
+
+
+def collab_terminal_agents(item: dict[str, Any], target_thread_id: str) -> list[dict[str, str]]:
+    agents_states = item.get("agentsStates")
+    if not isinstance(agents_states, dict):
+        return []
+
+    receiver_ids: list[str] = []
+    for raw_receiver in item.get("receiverThreadIds") or []:
+        receiver_id = str(raw_receiver or "").strip()
+        if receiver_id and receiver_id != target_thread_id:
+            receiver_ids.append(receiver_id)
+    if not receiver_ids:
+        receiver_ids = [
+            str(receiver_id).strip()
+            for receiver_id in agents_states
+            if str(receiver_id or "").strip() and str(receiver_id).strip() != target_thread_id
+        ]
+
+    terminal: list[dict[str, str]] = []
+    for receiver_id in receiver_ids:
+        agent_state = agents_states.get(receiver_id)
+        if not isinstance(agent_state, dict):
+            continue
+        status = str(agent_state.get("status") or "").strip()
+        if status in TERMINAL_COLLAB_AGENT_STATUSES:
+            terminal.append({"thread_id": receiver_id, "status": status})
+    terminal.sort(key=lambda item: (item["status"], item["thread_id"]))
+    return terminal
+
+
+def _status_summary(terminal_agents: list[dict[str, str]]) -> str:
+    counts: dict[str, int] = {}
+    for agent in terminal_agents:
+        status = agent["status"]
+        counts[status] = counts.get(status, 0) + 1
+    return ",".join(f"{status}={counts[status]}" for status in sorted(counts))
+
+
+def parse_collab_completion_item(item: dict[str, Any], target_thread_id: str) -> dict[str, Any] | None:
+    if not target_thread_id:
+        return None
+    if str(item.get("type") or "").strip() != "collabAgentToolCall":
+        return None
+    if str(item.get("senderThreadId") or "").strip() != target_thread_id:
+        return None
+    if str(item.get("status") or "").strip() != "completed":
+        return None
+    if str(item.get("tool") or "").strip() != "spawnAgent":
+        return None
+    item_id = str(item.get("id") or "").strip()
+    if not item_id:
+        return None
+    terminal_agents = collab_terminal_agents(item, target_thread_id)
+    if not terminal_agents:
+        return None
+    event_key = {
+        "target_thread_id": target_thread_id,
+        "item_id": item_id,
+        "terminal_agents": terminal_agents,
+    }
+    event_id = f"codex-collab-completed:{stable_hash(json.dumps(event_key, sort_keys=True), 24)}"
+    return {
+        "id": event_id,
+        "kind": "child-completed",
+        "source": "codex",
+        "target_thread_id": target_thread_id,
+        "sender_thread_id": target_thread_id,
+        "tool": bounded_meta(item.get("tool"), 24),
+        "item_id": bounded_meta(item_id, 64),
+        "terminal_agent_count": len(terminal_agents),
+        "status_summary": _status_summary(terminal_agents),
+        "prompt_token": stable_hash(event_id, 12),
+    }
+
+
+def parse_collab_item_completed_event(notification: dict[str, Any], target_thread_id: str) -> dict[str, Any] | None:
+    if not target_thread_id:
+        return None
+    if notification.get("method") != "item/completed":
+        return None
+    params = notification.get("params")
+    if not isinstance(params, dict):
+        return None
+    thread_id = str(params.get("threadId") or "").strip()
+    if thread_id != target_thread_id:
+        return None
+    item = params.get("item")
+    if not isinstance(item, dict):
+        return None
+    return parse_collab_completion_item(item, target_thread_id)
 
 
 def enqueue_event(state: dict[str, Any], event: dict[str, Any], logger: Logger | None = None) -> bool:
@@ -305,6 +456,64 @@ def enqueue_event(state: dict[str, Any], event: dict[str, Any], logger: Logger |
     if logger is not None:
         logger.log(f"queued {event['kind']} {event_id}")
     return True
+
+
+def enqueue_collab_completion_notification(
+    notification: dict[str, Any],
+    *,
+    target_thread_id: str | None,
+    state: dict[str, Any],
+    logger: Logger,
+) -> bool:
+    if target_thread_id is None:
+        # Before delivery has resolved a live parent thread, an
+        # item/completed notification is still safely routable only when its
+        # own attested params.threadId agrees with the item's sender thread.
+        # Reuse the ordinary parser for both checks rather than trusting the
+        # notification field by itself.
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return False
+        attested_thread_id = str(params.get("threadId") or "").strip()
+        if not attested_thread_id:
+            return False
+        target_thread_id = attested_thread_id
+    event = parse_collab_item_completed_event(notification, target_thread_id)
+    if event is None:
+        return False
+    recovery = monitor_recovery_state(state)
+    if recovery.get("thread_id") == target_thread_id:
+        remember_seen_terminal_event_id(recovery, event["id"])
+    return enqueue_event(state, event, logger=logger)
+
+
+def drain_buffered_collab_completion_notifications(
+    rpc: Any,
+    *,
+    target_thread_id: str | None,
+    state: dict[str, Any],
+    logger: Logger,
+) -> int:
+    drain = getattr(rpc, "drain_buffered_notifications", None)
+    if not callable(drain):
+        return 0
+    enqueued = 0
+    for notification in drain():
+        if enqueue_collab_completion_notification(
+            notification,
+            target_thread_id=target_thread_id,
+            state=state,
+            logger=logger,
+        ):
+            enqueued += 1
+    return enqueued
+
+
+def event_source(event: dict[str, Any]) -> str:
+    source = event.get("source")
+    if isinstance(source, str) and source:
+        return source
+    return "umwelt"
 
 
 def _batch_places(events: list[dict[str, Any]], limit: int = 4) -> str:
@@ -328,20 +537,60 @@ def _batch_kinds(events: list[dict[str, Any]]) -> str:
     return ",".join(f"{kind}={counts[kind]}" for kind in sorted(counts))
 
 
+def render_codex_batch_prompt(events: list[dict[str, Any]], *, active_followup: bool) -> str:
+    batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
+    count = len(events)
+    noun = "event" if count == 1 else "events"
+    agents = sum(int(event.get("terminal_agent_count") or 0) for event in events)
+    statuses = sorted({bounded_meta(event.get("status_summary"), 48) for event in events})
+    intro = "Codex child completion batch" if not active_followup else "Codex child completion follow-up"
+    action = (
+        "Read the attested child-agent completion notification(s) in this thread and continue from there."
+        if not active_followup
+        else "Additional child-agent completions arrived while you were already handling the earlier wake. Stay in the same turn, read the attested completion notification(s), and continue from there."
+    )
+    return (
+        f"[{intro} {batch_token}: count={count} {noun}; agents={agents}; statuses={'; '.join(statuses)}. "
+        f"{action} This notification is only a bounded batch summary; do not infer or repeat task results from it.]"
+    )
+
+
+def render_mixed_batch_prompt(events: list[dict[str, Any]], *, active_followup: bool) -> str:
+    batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
+    count = len(events)
+    noun = "event" if count == 1 else "events"
+    kinds = _batch_kinds(events)
+    sources = ",".join(sorted({event_source(event) for event in events}))
+    action = (
+        "Sweep the attested source notifications across Codex and Umwelt, then continue from there."
+        if not active_followup
+        else "Additional Codex/Umwelt wake signals arrived while you were already handling the earlier wake. Stay in the same turn, sweep the attested source notifications, and continue from there."
+    )
+    return (
+        f"[Mixed wake batch {batch_token}: count={count} {noun}; sources={sources}; kinds={kinds}. "
+        f"{action} This notification is only a bounded batch summary; do not infer or repeat message or task contents from it.]"
+    )
+
+
 def render_batch_prompt(events: list[dict[str, Any]]) -> str:
     if not events:
         raise ValueError("cannot render empty wake batch")
-    batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
-    count = len(events)
-    kinds = _batch_kinds(events)
-    places = _batch_places(events)
-    noun = "event" if count == 1 else "events"
-    return (
-        f"[Umwelt wake batch {batch_token}: count={count} {noun}; kinds={kinds}; places={places}. "
-        "Enter the world through the umwelt-login/world skills, sweep the attested source crossings in Umwelt, "
-        "and continue from there. This notification is only a bounded batch summary; do not infer or repeat "
-        "message contents from it.]"
-    )
+    sources = {event_source(event) for event in events}
+    if sources == {"umwelt"}:
+        batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
+        count = len(events)
+        kinds = _batch_kinds(events)
+        places = _batch_places(events)
+        noun = "event" if count == 1 else "events"
+        return (
+            f"[Umwelt wake batch {batch_token}: count={count} {noun}; kinds={kinds}; places={places}. "
+            "Enter the world through the umwelt-login/world skills, sweep the attested source crossings in Umwelt, "
+            "and continue from there. This notification is only a bounded batch summary; do not infer or repeat "
+            "message contents from it.]"
+        )
+    if sources == {"codex"}:
+        return render_codex_batch_prompt(events, active_followup=False)
+    return render_mixed_batch_prompt(events, active_followup=False)
 
 
 def render_prompt(event: dict[str, Any]) -> str:
@@ -418,17 +667,22 @@ def commit_inflight_batch(state: dict[str, Any], inflight: dict[str, Any], logge
 def render_active_wake_prompt(events: list[dict[str, Any]]) -> str:
     if not events:
         raise ValueError("cannot render empty active-wake batch")
-    batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
-    count = len(events)
-    kinds = _batch_kinds(events)
-    places = _batch_places(events)
-    noun = "event" if count == 1 else "events"
-    return (
-        f"[Umwelt wake follow-up {batch_token}: count={count} {noun}; kinds={kinds}; places={places}. "
-        "Additional Umwelt wake signals arrived while you were already handling the earlier wake. "
-        "Stay in the same turn, sweep the attested source crossings in Umwelt, and continue from there. "
-        "This notification is only a bounded batch summary; do not infer or repeat message contents from it.]"
-    )
+    sources = {event_source(event) for event in events}
+    if sources == {"umwelt"}:
+        batch_token = stable_hash("|".join(str(event.get("id")) for event in events), 12)
+        count = len(events)
+        kinds = _batch_kinds(events)
+        places = _batch_places(events)
+        noun = "event" if count == 1 else "events"
+        return (
+            f"[Umwelt wake follow-up {batch_token}: count={count} {noun}; kinds={kinds}; places={places}. "
+            "Additional Umwelt wake signals arrived while you were already handling the earlier wake. "
+            "Stay in the same turn, sweep the attested source crossings in Umwelt, and continue from there. "
+            "This notification is only a bounded batch summary; do not infer or repeat message contents from it.]"
+        )
+    if sources == {"codex"}:
+        return render_codex_batch_prompt(events, active_followup=True)
+    return render_mixed_batch_prompt(events, active_followup=True)
 
 
 def build_active_wake(
@@ -614,6 +868,8 @@ def resolve_live_thread(
     for candidate in candidates:
         try:
             result = rpc.call("thread/read", {"threadId": candidate.thread_id, "includeTurns": False})
+        except RpcProtocolError:
+            raise
         except Exception:
             continue
         status = _thread_status(result)
@@ -637,6 +893,102 @@ def thread_contains_client_message(thread_read_result: dict[str, Any], client_us
 
 def thread_turns(thread_read_result: dict[str, Any]) -> list[dict[str, Any]]:
     return [turn for turn in (((thread_read_result.get("thread") or {}).get("turns") or [])) if isinstance(turn, dict)]
+
+
+def _turn_items(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    return [item for item in (turn.get("items") or []) if isinstance(item, dict)]
+
+
+def _latest_turn_boundary(turns: list[dict[str, Any]]) -> tuple[str | None, int]:
+    for turn in reversed(turns):
+        turn_id = str(turn.get("id") or "").strip() or None
+        items = _turn_items(turn)
+        if turn_id is not None:
+            return turn_id, len(items) - 1
+    return None, -1
+
+
+def recover_collab_completion_events(
+    thread_read_result: dict[str, Any],
+    *,
+    target_thread_id: str,
+    state: dict[str, Any],
+    logger: Logger | None = None,
+) -> int:
+    recovery = monitor_recovery_state(state)
+    if recovery.get("thread_id") != target_thread_id:
+        recovery.clear()
+        recovery.update(default_monitor_recovery())
+        recovery["thread_id"] = target_thread_id
+
+    turns = thread_turns(thread_read_result)
+    recent_turns = turns[-MAX_MONITOR_RECOVERY_TURNS:]
+    latest_turn_id, _latest_item_index = _latest_turn_boundary(recent_turns)
+    thread_status = _thread_status(thread_read_result)
+    if recent_turns and latest_turn_id is None:
+        raise RuntimeError("codex monitor recovery requires turn ids in thread/read includeTurns snapshots")
+
+    if not recent_turns:
+        recovery["armed"] = True
+        return 0
+
+    entries_by_turn: dict[str, list[dict[str, Any]]] = {}
+    terminal_count = 0
+    for turn in recent_turns:
+        turn_id = str(turn.get("id") or "").strip()
+        if not turn_id:
+            continue
+        turn_entries: list[dict[str, Any]] = []
+        for item in _turn_items(turn):
+            event = parse_collab_completion_item(item, target_thread_id)
+            if event is None:
+                continue
+            terminal_count += 1
+            turn_entries.append(event)
+        if turn_entries:
+            entries_by_turn[turn_id] = turn_entries
+
+    if terminal_count > MAX_MONITOR_RECOVERY_ITEMS:
+        raise RuntimeError(
+            "codex monitor recovery exceeded bounded terminal-item scan "
+            f"({terminal_count}>{MAX_MONITOR_RECOVERY_ITEMS})"
+        )
+
+    seen_ids = seen_terminal_event_ids(recovery)
+    enqueued = 0
+    if not recovery.get("armed"):
+        replay_ids: set[str] = set()
+        # Brand-new watcher bootstrap: when the parent thread is already idle,
+        # replay only completions from the latest visible turn so we can wake for
+        # the outstanding idle child result without flooding older history.
+        if thread_status == "idle" and latest_turn_id is not None:
+            replay_ids = {event["id"] for event in entries_by_turn.get(latest_turn_id, [])}
+        for turn_id, turn_events in entries_by_turn.items():
+            for event in turn_events:
+                event_id = event["id"]
+                if event_id in seen_ids:
+                    continue
+                remember_seen_terminal_event_id(recovery, event_id)
+                seen_ids.add(event_id)
+                if turn_id == latest_turn_id and event_id in replay_ids and enqueue_event(state, event, logger=logger):
+                    enqueued += 1
+        recovery["armed"] = True
+        return enqueued
+
+    for turn in recent_turns:
+        turn_id = str(turn.get("id") or "").strip()
+        if not turn_id:
+            continue
+        for event in entries_by_turn.get(turn_id, []):
+            event_id = event["id"]
+            if event_id in seen_ids:
+                continue
+            remember_seen_terminal_event_id(recovery, event_id)
+            seen_ids.add(event_id)
+            if enqueue_event(state, event, logger=logger):
+                enqueued += 1
+
+    return enqueued
 
 
 def turn_contains_client_message(turn: dict[str, Any], client_user_message_id: str) -> bool:
@@ -779,6 +1131,9 @@ def resolve_transport_target(app_server: str) -> TransportTarget:
 
 
 class BaseRpc:
+    def __init__(self) -> None:
+        self._pending_notifications: deque[dict[str, Any]] = deque()
+
     def initialize(self) -> None:
         self.call(
             "initialize",
@@ -798,9 +1153,61 @@ class BaseRpc:
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
 
+    def _recv_json(self, timeout: float) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _validate_notification(msg: dict[str, Any]) -> None:
+        method = msg.get("method")
+        if not isinstance(method, str) or not method:
+            raise RpcProtocolError("unexpected id-less RPC message without a valid notification method")
+
+    def _preserve_notification(self, msg: dict[str, Any]) -> None:
+        self._validate_notification(msg)
+        if len(self._pending_notifications) >= MAX_PENDING_RPC_NOTIFICATIONS:
+            raise RuntimeError("pending websocket notification queue exceeded limit")
+        self._pending_notifications.append(msg)
+
+    def drain_buffered_notifications(self) -> list[dict[str, Any]]:
+        notifications = list(self._pending_notifications)
+        self._pending_notifications.clear()
+        return notifications
+
+    def _recv_response(self, request_id: int, method: str) -> dict[str, Any]:
+        deadline = time.monotonic() + REPLY_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timeout waiting for {method} reply")
+            msg = self._recv_json(remaining)
+            if "id" not in msg:
+                self._preserve_notification(msg)
+                continue
+            if msg.get("id") != request_id:
+                raise RpcProtocolError(
+                    f"unexpected response id while waiting for {method}: "
+                    f"expected {request_id}, got {msg.get('id')!r}"
+                )
+            return msg
+
+    def recv_notification(self, timeout: float) -> dict[str, Any]:
+        if self._pending_notifications:
+            return self._pending_notifications.popleft()
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timeout waiting for websocket notification")
+            msg = self._recv_json(remaining)
+            if "id" in msg:
+                raise RpcProtocolError("unexpected response while waiting for RPC notification")
+            self._validate_notification(msg)
+            return msg
+
 
 class WebsocketRpc(BaseRpc):
     def __init__(self, endpoint: str):
+        super().__init__()
         self.endpoint = endpoint
         self.conn = None
         self.request_id = 0
@@ -824,6 +1231,15 @@ class WebsocketRpc(BaseRpc):
         assert self.conn is not None
         self.conn.send(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}))
 
+    def _recv_json(self, timeout: float) -> dict[str, Any]:
+        assert self.conn is not None
+        self.conn.socket.settimeout(timeout)
+        raw = self.conn.recv()
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            raise RuntimeError("unexpected websocket JSON message shape")
+        return msg
+
     def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         assert self.conn is not None
         self.request_id += 1
@@ -834,22 +1250,13 @@ class WebsocketRpc(BaseRpc):
             "method": method,
             "params": params,
         }))
-        deadline = time.monotonic() + REPLY_TIMEOUT
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timeout waiting for {method} reply")
-            self.conn.socket.settimeout(remaining)
-            raw = self.conn.recv()
-            msg = json.loads(raw)
-            if msg.get("id") != req_id:
-                continue
-            if "error" in msg:
-                raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
-            result = msg.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
-            return result
+        msg = self._recv_response(req_id, method)
+        if "error" in msg:
+            raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
+        return result
 
 
 class StreamIo:
@@ -915,6 +1322,7 @@ class ProcessStreamIo(StreamIo):
 
 class StreamWebSocketRpc(BaseRpc):
     def __init__(self):
+        super().__init__()
         self.io: StreamIo | None = None
         self.request_id = 0
         self._read_buffer = bytearray()
@@ -1076,20 +1484,13 @@ class StreamWebSocketRpc(BaseRpc):
             0x1,
             json.dumps({"id": req_id, "method": method, "params": params}, separators=(",", ":")).encode("utf-8"),
         )
-        deadline = time.monotonic() + REPLY_TIMEOUT
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"timeout waiting for {method} reply")
-            msg = self._recv_json(remaining)
-            if msg.get("id") != req_id:
-                continue
-            if "error" in msg:
-                raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
-            result = msg.get("result")
-            if not isinstance(result, dict):
-                raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
-            return result
+        msg = self._recv_response(req_id, method)
+        if "error" in msg:
+            raise RpcError(json.dumps(msg["error"], ensure_ascii=False, sort_keys=True))
+        result = msg.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"unexpected result shape for {method}: {type(result).__name__}")
+        return result
 
 
 class UnixSocketRpc(StreamWebSocketRpc):
@@ -1130,6 +1531,209 @@ def open_rpc(transport: TransportTarget):
     raise RuntimeError(f"unsupported transport kind: {transport.kind}")
 
 
+def queued_codex_target_thread_ids(state: dict[str, Any]) -> set[str]:
+    thread_ids: set[str] = set()
+    for event in state.get("queue", []):
+        if not isinstance(event, dict):
+            continue
+        if event_source(event) != "codex":
+            continue
+        thread_id = str(event.get("target_thread_id") or "").strip()
+        if thread_id:
+            thread_ids.add(thread_id)
+    return thread_ids
+
+
+def delivery_target_thread_id(
+    state: dict[str, Any],
+    sessions_dir: Path,
+    thread_override: str | None,
+) -> tuple[str | None, str | None]:
+    # Persisted work is an unresolved delivery interval, so it owns recovery
+    # before a live override can select a different thread. Inflight precedes
+    # active because it is the earlier unresolved boundary when both survive.
+    for key in ("inflight_batch", "active_wake"):
+        item = state.get(key)
+        if isinstance(item, dict):
+            thread_id = str(item.get("thread_id") or "").strip()
+            if thread_id:
+                return thread_id, None
+    queued_target_ids = queued_codex_target_thread_ids(state)
+    if len(queued_target_ids) > 1:
+        return None, "queued Codex completion events span multiple target threads"
+    if queued_target_ids:
+        return next(iter(queued_target_ids)), None
+    if thread_override:
+        return thread_override, None
+    return None, None
+
+
+def notification_target_thread_id(
+    state: dict[str, Any],
+    ordinary_target_thread_id: str | None,
+) -> str | None:
+    """Return the thread that owns notifications during persisted wake recovery."""
+    # A persisted batch represents a concrete delivery interval. It must own
+    # notifications before any current override can select a different live
+    # thread. Inflight wins over active because it is the earlier unresolved
+    # delivery boundary when a state snapshot contains both.
+    for key in ("inflight_batch", "active_wake"):
+        item = state.get(key)
+        if isinstance(item, dict):
+            thread_id = str(item.get("thread_id") or "").strip()
+            if thread_id:
+                return thread_id
+    return ordinary_target_thread_id
+
+
+def monitor_target_thread_id(
+    state: dict[str, Any],
+    sessions_dir: Path,
+    thread_override: str | None,
+) -> tuple[str | None, str | None]:
+    target_thread_id, target_error = delivery_target_thread_id(state, sessions_dir, thread_override)
+    if target_thread_id or target_error:
+        return target_thread_id, target_error
+    return discover_codex_thread_id(sessions_dir, thread_override), None
+
+
+class CodexItemCompletedMonitor:
+    def __init__(
+        self,
+        *,
+        app_server: str,
+        logger: Logger,
+        transport_resolver=resolve_transport_target,
+        rpc_opener=open_rpc,
+    ) -> None:
+        self.app_server = app_server
+        self.logger = logger
+        self.transport_resolver = transport_resolver
+        self.rpc_opener = rpc_opener
+        self._rpc_context = None
+        self._rpc: BaseRpc | None = None
+        self._reconciled_thread_id: str | None = None
+
+    def close(self) -> None:
+        if self._rpc_context is None:
+            self._rpc = None
+            self._reconciled_thread_id = None
+            return
+        try:
+            self._rpc_context.__exit__(None, None, None)
+        finally:
+            self._rpc_context = None
+            self._rpc = None
+            self._reconciled_thread_id = None
+
+    def _salvage_buffered_notifications(
+        self,
+        *,
+        state: dict[str, Any],
+        target_thread_id: str,
+        persist_state=None,
+    ) -> int:
+        if self._rpc is None:
+            return 0
+        enqueued = drain_buffered_collab_completion_notifications(
+            self._rpc,
+            target_thread_id=target_thread_id,
+            state=state,
+            logger=self.logger,
+        )
+        if enqueued and persist_state is not None:
+            persist_state(state)
+        return enqueued
+
+    def _ensure_connected(self) -> None:
+        if self._rpc is not None:
+            return
+        transport = self.transport_resolver(self.app_server)
+        rpc_context = self.rpc_opener(transport)
+        rpc = rpc_context.__enter__()
+        # Keep the just-opened transport reachable while initialize() runs:
+        # JSON-RPC notifications can legitimately arrive before its response.
+        # drain() salvages the pending, attested notifications if initialize
+        # then fails (for example on a mismatched response id).
+        self._rpc_context = rpc_context
+        self._rpc = rpc
+        rpc.initialize()
+        self.logger.log(f"connected Codex item/completed monitor via {transport.kind}:{transport.value}")
+
+    def drain(
+        self,
+        *,
+        state: dict[str, Any],
+        sessions_dir: Path,
+        thread_override: str | None,
+        persist_state=None,
+    ) -> int:
+        target_thread_id, target_error = monitor_target_thread_id(state, sessions_dir, thread_override)
+        if target_error:
+            self.logger.log(target_error)
+            return 0
+        if not target_thread_id:
+            return 0
+        enqueued = 0
+        try:
+            self._ensure_connected()
+        except Exception as exc:
+            enqueued += self._salvage_buffered_notifications(
+                state=state,
+                target_thread_id=target_thread_id,
+                persist_state=persist_state,
+            )
+            self.close()
+            self.logger.log(f"Codex item/completed monitor unavailable: {exc}")
+            return enqueued
+
+        if self._reconciled_thread_id != target_thread_id:
+            assert self._rpc is not None
+            try:
+                thread_result = self._rpc.call("thread/read", {"threadId": target_thread_id, "includeTurns": True})
+                enqueued += recover_collab_completion_events(
+                    thread_result,
+                    target_thread_id=target_thread_id,
+                    state=state,
+                    logger=self.logger,
+                )
+            except Exception:
+                self._salvage_buffered_notifications(
+                    state=state,
+                    target_thread_id=target_thread_id,
+                    persist_state=persist_state,
+                )
+                self.close()
+                raise
+            self._reconciled_thread_id = target_thread_id
+        # recv_notification() drains notifications buffered by the successful
+        # thread/read call before it reads the transport. Reaching TimeoutError
+        # therefore means that pending buffer is already empty, not discarded.
+        while True:
+            assert self._rpc is not None
+            try:
+                notification = self._rpc.recv_notification(CODEX_NOTIFICATION_DRAIN_TIMEOUT)
+            except TimeoutError:
+                break
+            except Exception as exc:
+                enqueued += self._salvage_buffered_notifications(
+                    state=state,
+                    target_thread_id=target_thread_id,
+                    persist_state=persist_state,
+                )
+                self.logger.log(f"Codex item/completed monitor disconnected: {exc}")
+                self.close()
+                break
+            if enqueue_collab_completion_notification(
+                notification,
+                target_thread_id=target_thread_id,
+                state=state,
+                logger=self.logger,
+            ):
+                enqueued += 1
+        return enqueued
+
+
 def attempt_delivery(
     state: dict[str, Any],
     *,
@@ -1150,15 +1754,38 @@ def attempt_delivery(
     if not queue and not inflight and not active_wake:
         return DeliveryResult(status="idle", detail="queue empty")
 
+    target_thread_id, target_thread_error = delivery_target_thread_id(state, sessions_dir, thread_override)
+    if target_thread_error is not None:
+        return DeliveryResult(status="waiting_for_thread", detail=target_thread_error)
+    status_thread_id = target_thread_id or discover_codex_thread_id(sessions_dir, thread_override)
+    # Notifications can arrive while initialize() is waiting for its reply.
+    # When recovering persisted work, that work owns the transport interval
+    # even if an explicit override now points at a different live thread.
+    # Select this before opening the RPC so teardown salvages an initialize-
+    # time notification against the thread that actually attests it.
+    delivery_notification_thread_id = notification_target_thread_id(state, target_thread_id)
+
     try:
         transport = transport_resolver(app_server)
     except Exception as exc:
-        return DeliveryResult(status="waiting_for_app_server", detail=str(exc), thread_id=discover_codex_thread_id(sessions_dir, thread_override))
+        return DeliveryResult(status="waiting_for_app_server", detail=str(exc), thread_id=status_thread_id)
+
+    def persist_buffered_delivery_notifications(rpc: Any) -> None:
+        if drain_buffered_collab_completion_notifications(
+            rpc,
+            target_thread_id=delivery_notification_thread_id,
+            state=state,
+            logger=logger,
+        ) and persist_state is not None:
+            persist_state(state)
 
     try:
-        with rpc_opener(transport) as rpc:
+        with contextlib.ExitStack() as stack:
+            rpc = stack.enter_context(rpc_opener(transport))
+            stack.callback(persist_buffered_delivery_notifications, rpc)
             rpc.initialize()
             if inflight is not None:
+                delivery_notification_thread_id = inflight["thread_id"]
                 try:
                     thread_result, status, found_turn = reconcile_inflight_batch_detail(rpc, inflight)
                 except Exception as exc:
@@ -1192,6 +1819,7 @@ def attempt_delivery(
                         thread_id=inflight["thread_id"],
                     )
             if active_wake is not None:
+                delivery_notification_thread_id = active_wake["thread_id"]
                 try:
                     thread_result = rpc.call("thread/read", {"threadId": active_wake["thread_id"], "includeTurns": True})
                 except Exception as exc:
@@ -1346,12 +1974,14 @@ def attempt_delivery(
                 return DeliveryResult(status="idle", detail="queue empty")
 
             if inflight is None:
-                resolution = resolve_live_thread(rpc, sessions_dir, thread_override)
+                resolution = resolve_live_thread(rpc, sessions_dir, target_thread_id)
                 if resolution is None:
                     return DeliveryResult(
                         status="waiting_for_thread",
                         detail="no loaded interactive Codex thread discovered",
+                        thread_id=target_thread_id,
                     )
+                delivery_notification_thread_id = resolution.thread_id
                 if resolution.status != "idle":
                     return DeliveryResult(
                         status="waiting_for_idle",
@@ -1377,7 +2007,7 @@ def attempt_delivery(
         return DeliveryResult(
             status="wake_failed",
             detail=str(exc),
-            thread_id=inflight["thread_id"] if inflight else discover_codex_thread_id(sessions_dir, thread_override),
+            thread_id=inflight["thread_id"] if inflight else status_thread_id,
         )
 
     assert inflight is not None
@@ -1488,6 +2118,7 @@ def run_cycle(
     thread_override: str | None,
     logger: Logger,
     started_at: str,
+    codex_monitor: CodexItemCompletedMonitor | None = None,
 ) -> dict[str, Any]:
     state = normalize_state(load_json(paths.state_path, default_state()))
     base_status = default_status(paths)
@@ -1512,13 +2143,22 @@ def run_cycle(
     )
 
     context = load_umwelt_context(umwelt_config)
-    if context is None:
-        base_status.update({"mode": "waiting_for_umwelt", "detail": f"missing or invalid {umwelt_config}"})
-        update_status(paths, base_status)
-        return base_status
+    umwelt_detail = None if context is not None else f"missing or invalid {umwelt_config}"
 
     try:
-        poll_umwelt(WorldClient(context), state, logger)
+        if codex_monitor is not None:
+            codex_monitor.drain(
+                state=state,
+                sessions_dir=sessions_dir,
+                thread_override=thread_override,
+                persist_state=lambda current_state: atomic_write_json(paths.state_path, current_state),
+            )
+        if context is not None:
+            try:
+                poll_umwelt(WorldClient(context), state, logger)
+            except Exception as exc:
+                umwelt_detail = f"poll failed: {exc}"
+                logger.log(f"umwelt poll failed: {exc}")
         atomic_write_json(paths.state_path, state)
         result = attempt_delivery(
             state,
@@ -1530,14 +2170,23 @@ def run_cycle(
             after_inflight_persist=lambda current_state, _inflight: atomic_write_json(paths.state_path, current_state),
         )
         atomic_write_json(paths.state_path, state)
+        status_mode = result.status
+        status_detail = result.detail
+        if umwelt_detail is not None:
+            if result.status == "idle":
+                status_mode = "waiting_for_umwelt"
+                status_detail = umwelt_detail
+            else:
+                degrade_note = f"umwelt degraded: {umwelt_detail}"
+                status_detail = f"{status_detail}; {degrade_note}" if status_detail else degrade_note
         base_status.update(
             {
-                "mode": result.status,
-                "detail": result.detail,
+                "mode": status_mode,
+                "detail": status_detail,
                 "thread_id": result.thread_id
                 or (state.get("active_wake") or {}).get("thread_id")
                 or (state.get("inflight_batch") or {}).get("thread_id")
-                or discover_codex_thread_id(sessions_dir, thread_override),
+                or monitor_target_thread_id(state, sessions_dir, thread_override)[0],
                 "queue_depth": len(state.get("queue", [])),
                 "seeded": bool(state.get("seeded")),
                 "known_places": len(state.get("cursors", {})),
@@ -1602,6 +2251,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         write_pid(paths)
         install_signal_handlers(paths, started_at)
 
+    codex_monitor = CodexItemCompletedMonitor(app_server=args.app_server, logger=logger)
+
     try:
         while True:
             run_cycle(
@@ -1612,11 +2263,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 thread_override=args.thread_id,
                 logger=logger,
                 started_at=started_at,
+                codex_monitor=codex_monitor,
             )
             if args.once or _STOP_REQUESTED:
                 break
             time.sleep(args.interval)
     finally:
+        codex_monitor.close()
         if not args.once:
             remove_pid(paths)
             stopped = current_status(paths)
