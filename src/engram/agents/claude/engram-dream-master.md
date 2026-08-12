@@ -389,32 +389,30 @@ After the sleep-success marker is written (post-`engram_advance_turn`), surface 
 
 The user's morning queue lives in two files (the three-file pattern):
 
-- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded digest. One short line per active item, citing ENGRAM node IDs.
+- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded daily digest. ONLY the top 3 questions needing the user's action, decision, or input; one short line + detail-slug link each.
 - `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
 
-(There may also be `~/.engram/ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT your concern.)
+- `~/.engram/ask-{{USER_NAME}}-backlog.md` — unresolved questions not selected for today's top 3. Dream overflow IS your concern: append there without deleting its detail section.
 
 ## Procedure
 
-1. **Read** `~/.engram/ask-{{USER_NAME}}.md` to see existing content.
+1. **Read** the digest, backlog, and details files. Count current unresolved digest questions; the post-update digest MUST contain at most 3.
 
-2. **Identify dedup targets** — locate the "🌙 Dream-flagged backlog" section in `ask-{{USER_NAME}}.md` (if it exists). Extract every ENGRAM node ID (`ob_NNNN`, `qu_NNNN`, `tk_NNNN`, etc.) mentioned within THAT SECTION ONLY (not other sections). These are items prior dream cycles already surfaced (or the awake-parent dragged in from prior dream output); you should NOT re-surface them. Items appearing in other sections (PRs, design decisions, bigger questions) are different contexts — do NOT dedup against those; the dream-master is the authority for the dream-output section only.
+2. **Identify dedup targets** across BOTH digest and backlog. Extract every ENGRAM node ID already present. Do not re-surface an existing unresolved question regardless of which file holds it.
 
 3. **For each item in the dream record's "Flagged for the user" section** that references a node ID:
-   - If the referenced node ID already appears in the "🌙 Dream-flagged backlog" section → SKIP (already surfaced by a prior dream cycle; carryover handled by user triage).
+   - If the referenced node ID already appears in the digest or backlog → SKIP (already surfaced).
    - Otherwise → mark for inclusion in the new sub-section.
 
    Items in "Flagged for the user" that do NOT reference a specific node ID (e.g. a meta-pattern observation): include them all — they're new by definition.
 
-4. **Locate or create the dream-output section** in ask-{{USER_NAME}}.md. Look for an existing heading along the lines of "🌙 Dream-flagged backlog" or "🌙 From last night's dream" or any heading containing "dream-flagged" / "dream-output". If absent, create one with the heading `## 🌙 Dream-flagged backlog (back-burner)`.
+4. **Rank all new questions by urgency and impact.** Fill only currently available digest slots (3 minus the existing unresolved digest count). A selected question must actually need the user's action, decision, or input; general observations do not belong here.
 
-5. **PREPEND** a new sub-section under that heading, dated for this cycle:
+5. **PREPEND selected questions to the digest; append overflow to backlog.** Every line uses the same durable form:
 ```
-### From dream YYYY-MM-DD
-- [node_id] (proposed action) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
-- ...
+- [node_id] (question/action needed) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
 ```
-   Use stable slug names — `dream-YYYY-MM-DD-<short-topic>`. One bullet per item identified in step 3.
+Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lower question goes to `ask-{{USER_NAME}}-backlog.md` with the same detail-slug link. Never discard it and never exceed three digest questions.
 
 6. **APPEND corresponding sections** to `~/.engram/ask-{{USER_NAME}}-details.md`:
 ```
@@ -441,15 +439,15 @@ The user's morning queue lives in two files (the three-file pattern):
    For a number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready" / "awaiting merge" / "in your court" line), prune the entry; if the entry carries an undecided sub-question alongside the resolved reference, keep the entry and strike only the resolved reference. `UNKNOWN` → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. This authority is **strictly limited to externally-checkable facts** — the prune decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
 
    **(b) Everything else in those sections stays untouched.** "Open design decisions", "Deferred empirical checks", value-laden orderings, anything whose resolution requires judgment about the user's intent — the awake-parent's and the user's territory. Beyond the sweep in (a), you write ONLY:
-   - The "🌙 Dream-flagged backlog" section (PREPEND a new dated sub-section; do not touch prior sub-sections)
+   - New top-three digest questions and backlog overflow according to steps 4–5
    - The "Last updated" timestamp
 
-9. **Carryover discipline** — prior-cycle sub-sections under "🌙 Dream-flagged backlog" remain UNTOUCHED by judgment-pruning. The user triages them in the morning by convention. The step-8a mechanical sweep applies here too (a backlog item whose anchoring issue/PR is now CLOSED may be pruned per the step-8a rules, including the only-pending-state guard and the namespace guard), but do NOT inspect-and-prune carryover items on content — that's outside your scope and risks accidental data loss.
+9. **Carryover discipline** — unresolved backlog questions remain untouched by judgment-pruning. The user/awake parent promotes them into a future day's top 3. The step-8a mechanical sweep may prune a resolved externally-checkable backlog item, but never drop unresolved carryover merely to control length.
 
 10. **Commit** the ask-{{USER_NAME}}.md + ask-{{USER_NAME}}-details.md changes in the .engram git repo, separately from the dream record commit:
 
 ```bash
-git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md
+git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md ask-{{USER_NAME}}-backlog.md
 # If items were added this cycle:
 git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD flagged-for-user items"
 # If no items this cycle (only timestamp update):

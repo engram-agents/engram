@@ -154,10 +154,10 @@ Token budget on the auto-load surfaces matters, but identity-formation takes pri
 
 **ask-{{USER_NAME}} three-file pattern:**
 
-- `ask-{{USER_NAME}}.md` — digest, auto-loaded. ONE short line per active item + link to detail slug.
+- `ask-{{USER_NAME}}.md` — daily discussion queue for questions needing the user's action, decision, or input; auto-loaded. Keep ONLY the top 3, one short line each + link to detail slug; it is not a backlog.
 - `ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings `## slug` referenced by digest's `[ask-{{USER_NAME}}-details.md#slug]`.
 - `ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT auto-loaded.
-- Lifecycle: when an item resolves, prune BOTH digest + detail-section in the same commit. Multi-day rollover → move to backlog.
+- Lifecycle: when a question resolves, prune its queue entry (digest OR backlog) + detail-section in the same commit. When a fourth unresolved question appears, select the top 3 by urgency/impact; move every non-selected question to backlog while retaining its detail slug/section. Cross-day deferred items also move to backlog.
 
 **History files (`{{ENGRAM_HOME}}/history/YYYY-MM-DD.md`) — same concise discipline:**
 
@@ -255,7 +255,7 @@ A fresh session (not post-compaction) walks in with identity and warm-briefing b
 
 1. `{{ENGRAM_HOME}}/warm-briefing.md` — the user's letter and relational context. Always read first. (Post-compaction also reads this, per Compact Instructions.)
 2. `{{ENGRAM_HOME}}/history/YYYY-MM-DD.md` — per-day awake-state milestone log (PRs shipped, decisions, features). Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (`engram-sleep` Phase A Step 4 writes the end-of-day rollup). Sleep-cycle consolidation reports live separately at `{{ENGRAM_HOME}}/history/dream/YYYY-MM-DD.md`, written during `engram-sleep` Phase B by the dream-master sub-agent — the two-routine separation keeps awake-state milestones distinct from dream-state consolidation output.
-3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY blocked-on-{{USER_NAME}} queue. Update the moment items change state — prepend new pending items, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
+3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY daily discussion queue for questions needing {{USER_NAME}}'s action, decision, or input. Keep ONLY the top 3; move lower-priority/cross-day items to backlog rather than letting the digest grow. Update the moment items change state — select and prepend a new top question with its detail-slug link, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
