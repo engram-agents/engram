@@ -439,3 +439,115 @@ def test_install_local_marketplace_replaces_direct_child_symlink_not_external_ta
     assert external_target.is_dir()
     assert (external_target / "sentinel").read_text() == "keep"
     assert "Symlinking prior live cache" in result.stdout
+
+
+def _fake_venv(tmp_path, log_file, *, exit_code=0):
+    """Create a fake $ENGRAM_HOME/venv/bin/python that logs every argv it sees.
+
+    exit_code controls the fake python's exit status, so the failure-recovery
+    path (pip install fails → install completes but exits non-zero) is testable.
+    """
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    fake_py = venv_bin / "python"
+    fake_py.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s\\n" "$*" >> "{log_file}"\n'
+        f"exit {exit_code}\n"
+    )
+    fake_py.chmod(0o755)
+    return fake_py
+
+
+def _run_installer_skip_build(tmp_path, *, env_extra):
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    return subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, **env_extra),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+    )
+
+
+def test_install_local_marketplace_provisions_venv_dev_tier_installs_test_deps(tmp_path):
+    """At the dev tier the venv gets requirements-dev.txt (runtime + pytest)
+    on top of the runtime requirements, so the local test runner works out of
+    the box (Lei, 2026-08-10)."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: dev" in result.stdout
+    assert "Dev tier: installing test dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "-m pip install --quiet -r" in calls
+    assert "requirements/requirements.txt" in calls
+    assert "requirements/requirements-dev.txt" in calls
+
+
+def test_install_local_marketplace_provisions_venv_convenience_tier_runtime_only(tmp_path):
+    """Below the dev tier, only the runtime requirements are installed into the
+    venv — pytest is a dev-tier extra, not a runtime need."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "convenience"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: convenience" in result.stdout
+    assert "Dev tier: installing test dependencies" not in result.stdout
+    calls = log_file.read_text()
+    assert "-m pip install --quiet -r" in calls
+    assert "requirements/requirements.txt" in calls
+    assert "requirements/requirements-dev.txt" not in calls
+
+
+def test_install_local_marketplace_skips_venv_provisioning_when_no_venv(tmp_path):
+    """A fresh ENGRAM_HOME with no venv is left alone — the provisioning block
+    is a no-op, not an error, so a first install before venv creation still
+    succeeds."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Provisioning venv at" not in result.stdout
+    assert result.returncode == 0
+
+
+def test_install_local_marketplace_runtime_req_failure_exits_nonzero(tmp_path):
+    """A failed RUNTIME-requirements install must not exit 0 — a successful
+    exit over a venv that can't start the server is the silent-broken-venv
+    failure mode this PR exists to prevent (Lei, 2026-08-10). The install still
+    completes (marketplace assembled, WARN logged) so it leaves a re-runnable
+    state; the non-zero exit is the unattended-upgrade signal."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file, exit_code=1)
+
+    # check=False: the whole point of this test is the non-zero exit.
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    # Install completed the provisioning attempt + surfaced the WARN...
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: dev" in result.stdout
+    assert "WARN: venv runtime-requirements install failed" in result.stdout
+    # ...and the end-of-script ERROR that carries the non-zero exit.
+    assert "ERROR: venv runtime-requirements provisioning failed" in result.stdout
+    # The contract: non-zero exit (the unattended-upgrade signal).
+    assert result.returncode != 0
+    # The fake venv was actually invoked for the runtime install.
+    assert "requirements/requirements.txt" in log_file.read_text()

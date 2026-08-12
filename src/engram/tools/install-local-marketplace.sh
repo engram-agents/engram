@@ -57,6 +57,27 @@ set -euo pipefail
 log() { printf '[install-local-marketplace] %s\n' "$*"; }
 die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Venv-provisioning failure flag + EXIT-trap surfacing. The installer has
+# several early `exit 0` short-circuits (--skip-add, codex-not-found, the
+# codex plugin path) that fire BEFORE the end of the script, so an end-of-
+# script check would be unreachable from those paths. A runtime-requirements
+# install failure (see the tier-aware venv block) must surface as a non-zero
+# exit on EVERY path — a successful exit over a venv that can't start the
+# server is the silent-broken-venv failure mode this PR exists to prevent
+# (Lei, 2026-08-10). The trap catches all exits; it is a no-op when the
+# venv block never flagged (the normal case).
+_venv_fail=0
+_venv_fail_trap() {
+  if [[ "${_venv_fail:-0}" == "1" ]]; then
+    log ""
+    log "ERROR: venv runtime-requirements provisioning failed."
+    log "       The MCP server may not start until the venv is repaired."
+    log "       Re-run this installer to retry, or inspect the pip output above."
+    exit 1
+  fi
+}
+trap _venv_fail_trap EXIT
+
 usage() {
   cat <<'EOF'
 Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch]
@@ -296,6 +317,60 @@ if changed:
         f.write('\n')
     print(f"[install-local-marketplace] config.json updated: install_tier={tier or 'unset'} multi_agent={ma}")
 PY
+fi
+
+# ── Tier-aware venv provisioning (Lei 2026-08-10, #576/#578) ──────────────────
+# Keep the runtime venv's installed packages in sync with the chosen install
+# tier on EVERY install/upgrade, so a new release that adds a dependency
+# auto-installs it instead of leaving the user's venv broken after upgrade
+# (Lei, 2026-08-10: "making the venv updated with the tier config in every
+# upgrade is actually the desired behavior").
+#
+# The venv lives at ~/.engram/venv/ — canonical since #578's plugin port
+# colocated all engram state under ENGRAM_HOME=~/.engram (per #576). The
+# pre-plugin ~/.engram-venv hyphen path was retired then; agent-bootstrap now
+# creates the venv at the same slash path.
+#
+# All tiers need the runtime requirements (fastmcp etc.) to run the server;
+# the dev tier additionally installs requirements-dev.txt (runtime + pytest)
+# so the local test runner (tools/run-all-tests.sh --engram-only) works out
+# of the box. `pip install -r` is a no-op when the installed versions already
+# satisfy the spec, so re-running on every upgrade is cheap and safe. Runs
+# for --skip-build callers too: a venv kept in sync is independent of whether
+# this run rebuilt the plugin tree.
+_ENGRAM_VENV_PY="$ENGRAM_HOME/venv/bin/python"
+if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
+  _eff_tier="$(python3 -c "import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get('install_tier','convenience'))
+except Exception:
+    print('convenience')
+" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+  [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
+  _runtime_req="$REPO_ROOT/requirements/requirements.txt"
+  if [[ -f "$_runtime_req" ]]; then
+    log "Provisioning venv at $ENGRAM_HOME/venv (tier: $_eff_tier)"
+    # A failed RUNTIME-requirements install leaves the MCP server unable to
+    # start — the exact "broken venv after upgrade" this block exists to
+    # prevent. We let the rest of the install complete (marketplace + hooks
+    # are already assembled) but flag it so the script exits non-zero at the
+    # end — unattended/cron upgrades key on exit code and would otherwise
+    # report success over a broken server (Lei, 2026-08-10).
+    "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req" \
+      || { log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"; _venv_fail=1; }
+  fi
+  if [[ "$_eff_tier" == "dev" ]]; then
+    _dev_req="$REPO_ROOT/requirements/requirements-dev.txt"
+    if [[ -f "$_dev_req" ]]; then
+      log "Dev tier: installing test dependencies into $ENGRAM_HOME/venv"
+      # A failed DEV-requirements install (pytest etc.) only breaks the local
+      # test runner — the server still runs on the runtime reqs above. Failing
+      # the whole install over a missing test dep would block a working
+      # server update, so this is WARN-and-continue only (NOT flagged).
+      "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_dev_req" \
+        || log "WARN: venv dev-requirements install failed (continuing; server still runs)"
+    fi
+  fi
 fi
 
 # ── Hook-registration-change detection ────────────────────────────────────────
