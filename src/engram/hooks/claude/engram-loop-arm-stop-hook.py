@@ -58,29 +58,51 @@ re-derive):
    prompt carried it (per `tools/loop_prompt.py`'s `format_loop_prompt`).
 4. Blocking IS needed -- this hook emits `{"decision": "block", "reason":
    ...}`, matching engram-stop-hook.py's own write-nudge exactly, never
-   `hookSpecificOutput.additionalContext`. This was NOT the original design
-   (2026-08-12 correction, same day as the retarget above, caught during
-   PR #2002's colleague review -- Borges, who traced the claim to its
-   actual source rather than accepting it): the hook originally used
-   `_stophooklib.emit_context` (`additionalContext`-only), on the
-   unexamined assumption that "the write-nudge's injected context
-   effectively wakes the agent already" applied here too. It does not
-   apply, because the write-nudge is a DIFFERENT mechanism: it emits
-   `{"decision": "block", ...}` (verified by reading its source, not
-   inferring from its behavior), and per Claude Code's own Stop-hook docs
-   (`hooks.md`, "Stop decision control"), `additionalContext` is not even
-   a documented field for a Stop hook's `hookSpecificOutput` -- only
-   `permissionDecision`/`permissionDecisionReason` (or this codebase's
-   working legacy `decision`/`reason` pair, empirically proven live by the
-   write-nudge) actually interrupt a stopping turn. Without a blocking
-   decision, "the turn ends normally" (the docs' own words) and injected
-   `additionalContext` is not delivered to the agent at all. Consequence:
-   this hook had never actually delivered its nudge to any agent, on any
-   host, since it was created -- a real, live, pre-existing gap this
-   correction closes, not a hypothetical one. The `stop_hook_active`
-   re-fire guard below (already required because engram-stop-hook.py's
-   OWN block could force this hook to re-fire mid-turn) is what makes it
-   SAFE for this hook to also block: on a re-fire caused by its own block,
+   `hookSpecificOutput.additionalContext`. Evidence, grade first, then the
+   conclusion it supports (2026-08-12 correction, same day as the retarget
+   above -- restructured per PR #2004's colleague review so a future
+   caveat can't fall off a trailing clause the way this one did the first
+   time):
+     - PER THE DOCS (documentation-derived, not measured): Claude Code's
+       Stop-hook docs (`hooks.md`, "Stop decision control") do not list
+       `additionalContext` as a supported `hookSpecificOutput` field for
+       the Stop event at all -- only `permissionDecision`/
+       `permissionDecisionReason` are documented as interrupting a
+       stopping turn.
+     - MEASURED, live, 2026-08-12: this codebase's legacy `decision`/
+       `reason` pair (not the docs' newer field names) demonstrably
+       interrupts a turn -- engram-stop-hook.py's write-nudge has used it
+       for its own effect all along. Separately, on two independent seats,
+       a nudge carrying only `additionalContext` (this hook's
+       pre-correction version) WAS observed landing in the agent's
+       context -- but not until a subsequent turn, never the one that was
+       ending. **Open, not resolved:** whether `additionalContext` alone
+       causes that delivery, or whether it rode on a DIFFERENT Stop hook
+       (e.g. the write-nudge) blocking in the SAME multi-hook firing event
+       and merely carrying this hook's text along -- "borrowed liveness,"
+       which would mean this hook had never worked on its own merit. A
+       discriminating test was proposed (a Stop event where this hook's
+       old gate fires but no other hook blocks) and attempted twice; both
+       attempts were retracted by their own author as invalid
+       instrumentation, not as a negative result. Deliberately unresolved
+       here rather than adjudicated by argument.
+     - CONCLUSION: this open question does not change the fix. Whichever
+       hypothesis is true, `decision:block` makes this hook self-
+       sufficient -- it no longer needs a same-turn assist from a sibling
+       hook's block, and it no longer depends on a next-turn delivery that
+       cannot exist when the turn it needed to interrupt was the last one
+       (a forgotten re-arm leaves no next turn for a delayed nudge to land
+       in). `decision:block` converts "delivered eventually, maybe on its
+       own merit" into "acted on now, unconditionally" -- the actual
+       defect this fixes either way.
+   The original version of this design fact stated its conclusion before
+   any evidence grading, and claimed the nudge "had never actually
+   delivered... on any host" -- a false universal (an unmeasured claim
+   asserted as measured, corrected in this revision). The real defect was
+   always delivery TIMING, not delivery ABSENCE. The `stop_hook_active` re-fire guard
+   below (already required because engram-stop-hook.py's OWN block could
+   force this hook to re-fire mid-turn) is what makes it SAFE for this
+   hook to also block: on a re-fire caused by its own block,
    `stop_hook_active` is true and the guard returns early, so blocking
    cannot recurse.
 
