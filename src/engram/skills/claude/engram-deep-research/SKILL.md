@@ -109,7 +109,7 @@ engram_nap(
 ```
 
 ### Update loop-mode.json marker state
-If running as a cross-compaction loop, rewrite the marker's `state` field (per **engram-loop** Step 2.3) with:
+If running as a cross-compaction loop, rewrite the marker's `state` field (per **engram-loop** Step 2 item 3(b)) with:
 - Current research question
 - Sub-questions registered (IDs)
 - Conjectures registered (IDs)

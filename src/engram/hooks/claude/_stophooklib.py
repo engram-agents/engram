@@ -72,14 +72,26 @@ Extracted here:
     this generic walker does not reproduce identically).
 
   - emit_context(): print the `hookSpecificOutput.additionalContext`
-    envelope to stdout, with `hookEventName: "Stop"`. NEW infrastructure --
-    neither existing Stop hook currently emits additionalContext (both use
-    other channels: engram-stop-hook.py uses `{"decision": "block", ...}`;
-    engram-deference-detector-stop.py writes a marker file consumed by its
-    UserPromptSubmit companion). Added here so PR-B's loop-arm hook has it
-    ready-made; NOT wired into either existing hook's main() in this PR --
-    doing so would change their observable output shape, which is exactly
-    the kind of behavior change PR-A's "pure refactor" scope forbids.
+    envelope to stdout, with `hookEventName: "Stop"`. **CONFIRMED NON-
+    FUNCTIONAL for its intended purpose (2026-08-12 correction) -- do not
+    wire this into a new Stop hook's nudge path.** engram-loop-arm-stop-
+    hook.py originally used this (the only hook that ever did), on the
+    unexamined assumption that Stop-hook `additionalContext` reaches the
+    agent the way UserPromptSubmit/SessionStart's does. It does not:
+    Claude Code's own Stop-hook docs (`hooks.md`, "Stop decision control")
+    do not list `additionalContext` as a supported `hookSpecificOutput`
+    field at all -- only `permissionDecision`/`permissionDecisionReason`
+    (or this codebase's proven legacy `decision`/`reason` pair) actually
+    interrupt a stopping turn; without one, "the turn ends normally" and
+    injected `additionalContext` is never delivered. engram-loop-arm-stop-
+    hook.py was switched to `{"decision": "block", "reason": ...}` --
+    matching engram-stop-hook.py's already-proven pattern -- and no longer
+    calls this function. Kept here (unused) only because
+    test_emit_context_envelope_shape_uses_stop_event_name() still validates
+    its JSON shape is well-formed; that test's assertion is still true, it
+    just no longer implies the shape is useful for a Stop hook. Use
+    `{"decision": "block", "reason": ...}` directly instead, as both
+    existing Stop-hook nudges now do.
 
 Like `_hooklib.py` / `_prompthooklib.py`, this module lives alongside the
 hooks it serves in BOTH build topologies (source: `hooks/claude/`; deployed:
@@ -279,13 +291,22 @@ def walk_content_blocks(content) -> list[dict]:
 
 
 def emit_context(text: str) -> None:
-    """Emit an additionalContext block on stdout (the Stop-hook channel).
+    """Emit an additionalContext block on stdout.
+
+    **Do not use this for a new Stop hook's nudge** -- see the module
+    docstring's 2026-08-12 correction. `additionalContext` is not a
+    documented `hookSpecificOutput` field for the Stop event; without a
+    blocking decision, a stopping turn ends regardless of what this prints,
+    so the text is never delivered to the agent. Use
+    `{"decision": "block", "reason": text}` instead (matches
+    engram-stop-hook.py and engram-loop-arm-stop-hook.py, both proven live).
 
     Mirrors `_prompthooklib.emit_context` exactly, except `hookEventName` is
-    `"Stop"` (that module's is `"UserPromptSubmit"` -- the two hookEventName
-    values are NOT interchangeable; Claude Code routes the envelope by this
-    field). Not called by either PR-A-migrated hook (see module docstring);
-    added for PR-B's loop-arm hook to use.
+    `"Stop"` (that module's is `"UserPromptSubmit"`, where additionalContext
+    IS the documented, working channel -- the two hookEventName values are
+    NOT interchangeable, and neither is which channel actually works for
+    each). Currently unused by any hook in this codebase; kept only for its
+    shape-validation test (see module docstring).
     """
     print(json.dumps({
         "hookSpecificOutput": {
