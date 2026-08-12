@@ -57,7 +57,7 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 - `write_marker()` (398–436): writes per-session marker with session_id, transcript_path, cwd, started_at, role.
 - `write_baseline()` (45): context_tracker import to reset per-session JSONL baseline.
 - `piece_c_git_log()` (439–477): collects commits from PIECE_C_REPOS (ENGRAM_HOME + optional extra repos) over PIECE_C_WINDOW (2 days). Limits to PIECE_C_MAX_LINES=20 per repo.
-- `sleep_status_block()` (480–562): reads LAST_SLEEP_MARKER_PATH, computes hours-since-sleep, surfaces banner if stale (>SLEEP_DEBT_HOURS_THRESHOLD=28h) or marker missing on established DB (>SLEEP_BASELINE_NODE_THRESHOLD=100 nodes).
+- `sleep_status_block()` (480–562): reads LAST_SLEEP_MARKER_PATH, computes hours-since-sleep, surfaces banner if stale (>SLEEP_DEBT_HOURS_THRESHOLD=28h) or marker missing on established DB (>SLEEP_BASELINE_NODE_THRESHOLD=100 nodes) — but stays silent even when stale if nodes_since < SLEEP_DEBT_MIN_NODES_THRESHOLD=10 (quiet day, no catch-up needed).
 - `starred_block()` (244–312): renders inter-agent-starred.json as one-line pointers with staleness nudges (STARRED_STALE_DAYS=7).
 - `format_calibration_block()` (134–234): formats 6–10 line calibration anchor from engram_stats (all-time + 7-turn rolling) with per-type quantile rows.
 - `auto_sleep_cron_block()` (565–668): emits cron-registration nudge when cadence.auto_sleep_enabled=true; parses HH:MM time from config.json and computes jitter (hashlib-derived, 0–9 minutes) for clock-spread.
@@ -70,9 +70,9 @@ Based on tracked file inventory (`git ls-files hooks/claude/`, 19 tracked files)
 
 **files** — engram-session-start-hook.py (968 lines), context_tracker.py (library), engram_log_emitter.py (for event logging).
 
-**key constants** — STARRED_CAP=10, STARRED_STALE_DAYS=7, SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
+**key constants** — STARRED_CAP=10, STARRED_STALE_DAYS=7, SLEEP_DEBT_HOURS_THRESHOLD=28, SLEEP_DEBT_MIN_NODES_THRESHOLD=10, SLEEP_BASELINE_NODE_THRESHOLD=100, PIECE_C_WINDOW="2 days ago", PIECE_C_MAX_LINES=20, PIECE_C_MAX_LINE_CHARS=140, SEVEN_DAYS=604800, DEFAULT_PURPOSES dict (role → fallback purpose), INTER_AGENT_DIR="/home/agents-shared/inter-agent" (env-override).
 
-**tests** — test_session_start_hook_calibration.py (format_calibration_block with per-type stats), test_session_start_hook_auto_sleep_cron.py (cron expr generation + jitter), test_session_start_hook_mcp_health.py (pgrep probe resilience), test_hooks_json_stdout_audit.py (JSON envelope), test_codex_hook_envelopes.py (nested envelope shape).
+**tests** — test_session_start_hook_calibration.py (format_calibration_block with per-type stats), test_session_start_hook_auto_sleep_cron.py (cron expr generation + jitter), test_session_start_hook_mcp_health.py (pgrep probe resilience), test_hooks_json_stdout_audit.py (JSON envelope), test_codex_hook_envelopes.py (nested envelope shape), test_sleep_status_block.py (quiet-day node-count guard: below/at-threshold, fail-open on query error).
 
 ---
 

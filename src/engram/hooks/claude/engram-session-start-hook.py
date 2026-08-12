@@ -1136,6 +1136,10 @@ PIECE_C_MAX_LINE_CHARS = 140
 LAST_SLEEP_MARKER_PATH = os.path.join(SESSIONS_DIR, "last-sleep-success.json")
 ENGRAM_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 SLEEP_DEBT_HOURS_THRESHOLD = 28
+# Below this many new nodes since the last coordinated sleep, skip the
+# nudge even if hours_since exceeds the threshold above — a quiet day
+# (host was off, or genuinely idle) doesn't need a catch-up cycle.
+SLEEP_DEBT_MIN_NODES_THRESHOLD = 10
 # Node-count above which a missing marker is treated as a real anomaly
 # (mechanism-just-shipped, or marker accidentally deleted) rather than a
 # genuine first-ever boot. A fresh install has only a handful of seed
@@ -1300,9 +1304,18 @@ def sleep_status_block() -> str:
     The decision to run /engram-sleep stays with the user — this just
     surfaces the data so the user can choose case-by-case.
 
-    Three paths:
+    Four paths:
       - Marker fresh (≤ threshold): silent.
       - Marker stale (> threshold): banner with hours-since and nodes-added.
+      - Marker stale but nodes_since below SLEEP_DEBT_MIN_NODES_THRESHOLD:
+        silent (quiet day, no catch-up needed). Note nodes_since is a
+        creation-count proxy for consolidation debt, not a mutation-count
+        one — a day with few new nodes but heavy supersede/retract/cascade
+        activity (what dream_lottery.py's edit_history-based urgency
+        measures) is not distinguished by this guard. Measured against one
+        real graph across 9 days (PR #1996 review) and creation tracked
+        cascade-edit volume closely with no false-suppression case found,
+        but a correction-heavy, low-filing day is the untested edge.
       - Marker missing on established DB (> SLEEP_BASELINE_NODE_THRESHOLD):
         banner asking the user to run /engram-sleep to establish a baseline.
         Genuine first-ever boot (DB below threshold) stays silent.
@@ -1362,6 +1375,8 @@ def sleep_status_block() -> str:
         conn.close()
     except sqlite3.Error:
         pass
+    if nodes_since is not None and nodes_since < SLEEP_DEBT_MIN_NODES_THRESHOLD:
+        return ""
     nodes_part = (
         f"{nodes_since} nodes added since"
         if nodes_since is not None
