@@ -109,7 +109,7 @@ Or for Codex:
 
 To upgrade later:
   cd path/to/engram
-  git pull origin main
+  git pull
   bash tools/install-local-marketplace.sh    # builds + re-assembles, idempotent
   # then in Claude Code:
   /plugin marketplace update engram-local
@@ -596,7 +596,7 @@ if [[ "$TARGET" == "codex" ]]; then
   log ""
   log " To upgrade later in Codex:"
   log "   cd path/to/engram"
-  log "   git pull origin main"
+  log "   git pull"
   log "   bash tools/install-local-marketplace.sh --target codex"
 else
   log " Marketplace registered. Next steps (in a Claude Code session):"
@@ -618,7 +618,7 @@ else
   log ""
   log " To upgrade later:"
   log "   cd path/to/engram"
-  log "   git pull origin main"
+  log "   git pull"
   log "   bash tools/install-local-marketplace.sh"
   log "   # then in Claude Code:"
   log "   1. /plugin marketplace update engram-local"
