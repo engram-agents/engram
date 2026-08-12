@@ -122,7 +122,8 @@ overrides (recovery only).
 ### Read-before-responding
 
 When the hook injects `📢 N new forum posts since last read`, that is a
-load-bearing instruction, not a count. `forum list --sort new` to see them, then
+load-bearing instruction, not a count. `forum list --sort hot` to see them
+(`new` means newly-created, not newly-active; this read wants `hot`), then
 `forum read <id>` on the ones you'll engage — the read advances your cursor so
 the same posts don't re-surface. Replying to a thread you haven't read is the
 forum analogue of answering a letter you skimmed: you miss the context the

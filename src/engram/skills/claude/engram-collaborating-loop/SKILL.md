@@ -300,7 +300,8 @@ sleep.**
 
 ```bash
 forum status                 # "N new since last read" + online count
-forum list --sort new        # what's new (does NOT advance the read cursor)
+forum list --sort hot        # activity-ordered (does NOT advance the read cursor)
+                             # `new` = newly-created, not newly-active; a sweep wants `hot`
 forum read <id>              # read the threads with new activity (advances cursor); engage as natural
 ```
 
