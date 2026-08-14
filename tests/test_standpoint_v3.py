@@ -1171,6 +1171,148 @@ def test_standpoint_unchecked_partial_premises_missing():
     print(f"  PASS: unchecked (partial): {line}")
 
 
+# ---------------------------------------------------------------------------
+# Base-STANDPOINT-line verification-awareness (gap closed alongside the
+# already-verification-aware ⚠⚠ composite): the base STANDPOINT line must
+# report the same n_verified/n_leaves count the composite reads, so a reader
+# can see at a glance whether reported uniformity rests on reality-verified
+# measurements or pure testimony.
+# ---------------------------------------------------------------------------
+
+def test_standpoint_base_line_reports_verified_count():
+    """The base STANDPOINT line (the 'parts' line, not the unchecked variants)
+    carries '· N/M premises reality-verified' reflecting _leaf_verified over
+    the observation leaves — both when all leaves are verified and when none
+    are."""
+    # All-verified: both premises hard_data (state-3).
+    c = fresh_client()
+    v1 = _obs(c, 1, quote_type="hard_data", lineage="anthropic:opus",
+              author="test:a1", collection="c1")
+    v2 = _obs(c, 2, quote_type="hard_data", lineage="anthropic:opus",
+              author="test:a2", collection="c2")
+    _dv, w = _derive(c, [v1, v2])
+    sp = _standpoint_line(w)
+    assert "· 2/2 premises reality-verified" in sp, (
+        f"expected 2/2 verified count in base STANDPOINT line: {sp}"
+    )
+
+    # All-unverified: both premises editorial (never reaches state-3).
+    c2 = fresh_client()
+    e1 = _obs(c2, 1, quote_type="editorial", lineage="anthropic:opus",
+              author="test:a1", collection="c1")
+    e2 = _obs(c2, 2, quote_type="editorial", lineage="anthropic:opus",
+              author="test:a2", collection="c2")
+    _dv2, w2 = _derive(c2, [e1, e2], claim="Second derived claim")
+    sp2 = _standpoint_line(w2)
+    assert "· 0/2 premises reality-verified" in sp2, (
+        f"expected 0/2 verified count in base STANDPOINT line: {sp2}"
+    )
+    print(f"  PASS: base STANDPOINT line reports verified count: {sp[:140]!r} / {sp2[:140]!r}")
+
+
+def test_composite_predicate_unchanged_alongside_new_suffix():
+    """The ⚠⚠ escalation predicate (lineage_uniform AND n_verified == 0) must
+    fire and not-fire in exactly the same cases as before this change, even
+    though the base STANDPOINT line now also reports n_verified. Pins both
+    directions side by side with the new suffix visible on the base line."""
+    # Direction 1: uniform lineage + zero verified leaves → ⚠⚠ FIRES, and the
+    # base line's suffix independently reads 0/2 (same n_verified value).
+    c = fresh_client()
+    e1 = _obs(c, 1, quote_type="editorial", lineage="anthropic:opus",
+              author="test:a1", collection="c1")
+    e2 = _obs(c, 2, quote_type="personal_communication", lineage="anthropic:opus",
+              author="test:a2", collection="c2")
+    _dv, w = _derive(c, [e1, e2])
+    assert _composite_line(w), f"⚠⚠ must fire: uniform + zero verified: {w}"
+    sp = _standpoint_line(w)
+    assert "· 0/2 premises reality-verified" in sp, (
+        f"base line suffix must agree with the composite's zero-verified reading: {sp}"
+    )
+
+    # Direction 2: uniform lineage + >= 1 verified leaf → ⚠⚠ does NOT fire, and
+    # the base line's suffix independently reads 1/2.
+    c2 = fresh_client()
+    v1 = _obs(c2, 1, quote_type="hard_data", lineage="anthropic:opus",
+              author="test:a1", collection="c1")
+    e3 = _obs(c2, 2, quote_type="editorial", lineage="anthropic:opus",
+              author="test:a2", collection="c2")
+    _dv2, w2 = _derive(c2, [v1, e3], claim="One verified premise")
+    assert _composite_line(w2) == "", (
+        f"⚠⚠ must NOT fire: uniform + >= 1 verified leaf: {w2}"
+    )
+    sp2 = _standpoint_line(w2)
+    assert "· 1/2 premises reality-verified" in sp2, (
+        f"base line suffix must agree with the composite's discharged reading: {sp2}"
+    )
+    print("  PASS: ⚠⚠ predicate unchanged in both directions alongside the new suffix")
+
+
+# ---------------------------------------------------------------------------
+# ⚠⚠-line verified-count reporting (reviewer-fairy round 2, engram-alpha#2020):
+# the base STANDPOINT line's suffix is placed inside variants that don't
+# always render (the mixed-axis "partially unchecked" line carries no ratio;
+# the fully-bare-fields case renders no STANDPOINT line at all). ⚠⚠ is the
+# ONE placement guaranteed to render whenever its predicate fires, independent
+# of which STANDPOINT variant ran — these two tests pin the two cases where
+# the base line's suffix does NOT reach the reader, so the ⚠⚠-line count is
+# the only one that does.
+# ---------------------------------------------------------------------------
+
+def test_composite_carries_verified_count_when_base_line_has_no_ratio():
+    """Mixed-axis partial coverage (one premise author-tagged, one not; no
+    explicit lineage — self_lineage synthesizes a uniform lineage for both):
+    the base STANDPOINT line renders the 'partially unchecked (mixed-axis
+    coverage ...)' variant, which carries no N/M ratio at all. The ⚠⚠
+    composite must still carry the count."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    o1 = _obs(c, 1, quote_type="editorial", author="test:a1")  # author set
+    o2 = _obs(c, 2, quote_type="editorial")                     # author absent
+    _dv, w = _derive(c, [o1, o2], claim="Mixed-axis, no ratio on base line")
+
+    sp = _standpoint_line(w)
+    assert "partially unchecked" in sp and "mixed-axis" in sp, (
+        f"expected the mixed-axis partial-coverage variant: {sp}"
+    )
+    assert "reality-verified" not in sp, (
+        f"base line is expected to carry NO ratio in this variant: {sp}"
+    )
+
+    comp = _composite_line(w)
+    assert comp, f"⚠⚠ expected: uniform (via null=self) + zero verified: {w}"
+    assert "· 0/2 premises reality-verified" in comp, (
+        f"⚠⚠ line must carry the N/M count when the base line's variant "
+        f"carries none: {comp}"
+    )
+    print(f"  PASS: ⚠⚠ carries count when base line has no ratio: {comp[:140]}")
+
+
+def test_composite_carries_verified_count_when_base_line_absent():
+    """Fully bare standpoint fields (no lineage/author/collection on either
+    premise; self_lineage synthesizes a uniform lineage read-time): the
+    STANDPOINT block emits NO line at all (all axes absent/actionability-
+    gated). The ⚠⚠ composite must still carry the count — it is the only
+    placement that reaches the reader in this case."""
+    c = fresh_client()
+    _set_self_lineage("anthropic:opus")
+    o1 = _obs(c, 1, quote_type="editorial")  # no lineage/author/collection
+    o2 = _obs(c, 2, quote_type="editorial")
+    _dv, w = _derive(c, [o1, o2], claim="Fully bare fields, no base line at all")
+
+    sp = _standpoint_line(w)
+    assert sp == "", (
+        f"expected NO STANDPOINT line at all for fully-bare fields: {sp}"
+    )
+
+    comp = _composite_line(w)
+    assert comp, f"⚠⚠ expected: uniform (via null=self) + zero verified: {w}"
+    assert "· 0/2 premises reality-verified" in comp, (
+        f"⚠⚠ line must carry the N/M count when no STANDPOINT line rendered "
+        f"at all: {comp}"
+    )
+    print(f"  PASS: ⚠⚠ carries count when base line is absent: {comp[:140]}")
+
+
 if __name__ == "__main__":
     test_cross_lineage_diverse_no_warning()
     test_mixed_fs_ratio_no_composite()
@@ -1208,4 +1350,10 @@ if __name__ == "__main__":
     # Issue #761 — explicit unchecked emission
     test_standpoint_unchecked_all_premises_missing()
     test_standpoint_unchecked_partial_premises_missing()
+    # Base-STANDPOINT-line verified-count reporting (n_verified hoist)
+    test_standpoint_base_line_reports_verified_count()
+    test_composite_predicate_unchanged_alongside_new_suffix()
+    # ⚠⚠-line verified-count reporting (round 2, #2020)
+    test_composite_carries_verified_count_when_base_line_has_no_ratio()
+    test_composite_carries_verified_count_when_base_line_absent()
     print("All standpoint v3 tests passed.")

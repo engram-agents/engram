@@ -5394,6 +5394,23 @@ def _validate_reasoning_structure(
         # even when the standpoint block is skipped.
         lineage_uniform = False
 
+        # n_verified: hoisted above BOTH sibling blocks (single call site, two
+        # consumers — Borges) so the STANDPOINT base line can report the same
+        # reality-verified count the FALSIFICATION `⚠⚠ unverified + uniform`
+        # composite already reads below. None when obs_leaves is empty — an
+        # honesty floor: a printed "0/0" would read as "nothing verified"
+        # when it actually means "not applicable", so downstream consumers
+        # must treat None as "omit", not coerce it to 0.
+        # Computed unconditionally whenever obs_leaves is non-empty, even on
+        # paths where neither consumer ends up rendering it (e.g. the
+        # mixed-axis "partially unchecked" STANDPOINT variant, or ⚠⚠ never
+        # firing) — accepted tradeoff, bounded by leaf count (typically
+        # small), for having the value ready for both sibling blocks.
+        n_verified = (
+            sum(1 for leaf in obs_leaves if _leaf_verified(conn, leaf))
+            if obs_leaves else None
+        )
+
         # --- STANDPOINT block: gated on all leaves carrying standpoint data ---
         if obs_leaves:
             axis_keys = [_standpoint_cluster_key(conn, lid) for lid in obs_leaves]
@@ -5531,8 +5548,22 @@ def _validate_reasoning_structure(
                     and any(r is None for r in arch_raw_list)
                 )
                 if parts:
+                    # Verification-aware base line (gap closed alongside the
+                    # already-verification-aware ⚠⚠ composite below): report
+                    # the same n_verified/n_leaves count so a reader can see at
+                    # a glance whether the reported uniformity rests on
+                    # reality-verified measurements or on pure testimony.
+                    # Honesty floor: n_verified is None only when obs_leaves is
+                    # empty, which cannot happen inside this obs_leaves-gated
+                    # block — but the guard is kept explicit rather than
+                    # assumed, so a "0/0" never prints.
+                    verified_suffix = (
+                        f" · {n_verified}/{n_leaves} premises reality-verified"
+                        if n_verified is not None else ""
+                    )
                     warnings.append(
                         f"STANDPOINT: {'; '.join(parts)}; others unchecked."
+                        f"{verified_suffix}"
                         " (load skill `engram-standpoint` for the calibration theory)"
                     )
                 elif has_partial_author or has_partial_collection or has_partial_arch:
@@ -5610,8 +5641,14 @@ def _validate_reasoning_structure(
                 # re-executable-but-unrun leaf does NOT discharge. The old
                 # n_unknown==0 floor is dropped — _leaf_verified is fully
                 # determinate (no unknown bucket; Luria #723).
-                n_verified = sum(1 for leaf in obs_leaves if _leaf_verified(conn, leaf))
-                if lineage_uniform and n_verified == 0:
+                # n_verified is now hoisted above the STANDPOINT block (single
+                # call site shared with the base STANDPOINT line's verified-
+                # count report). The `obs_leaves` conjunct below makes that
+                # guarantee local rather than relying on lineage_uniform's
+                # assignment site ~200 lines above (it is only ever True
+                # inside `if obs_leaves:`) — not `not n_verified`, since None
+                # means "not applicable", not "zero verified".
+                if obs_leaves and lineage_uniform and n_verified == 0:
                     proxy_suffix = (
                         " [F-S via quote_type-proxy — Phase-2 field may revise]"
                         if any_proxy else ""
@@ -5632,11 +5669,19 @@ def _validate_reasoning_structure(
                             "premise is added (re-executable-but-unverified is "
                             "not enough)"
                         )
+                    # Carry the same N/M reality-verified count the base
+                    # STANDPOINT line reports (see `verified_suffix` in the
+                    # STANDPOINT block above) — the ⚠⚠ line is the
+                    # ONE placement guaranteed to render whenever the composite
+                    # predicate fires, independent of which STANDPOINT variant
+                    # (or none) rendered above, so it is where the count must
+                    # land to actually reach the reader in every case.
                     warnings.append(
                         f"⚠⚠ unverified + uniform: no premise is reality-verified "
                         f"and all share training lineage — corroboration on this "
                         f"derivation cannot be improved by re-checking; "
-                        f"{remedy}{proxy_suffix}."
+                        f"{remedy}{proxy_suffix}"
+                        f" · {n_verified}/{n_leaves} premises reality-verified."
                     )
 
         # Role-axis prompt (issue #933): only meaningful for multi-premise
