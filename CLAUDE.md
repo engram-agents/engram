@@ -269,6 +269,88 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### PR inheritance — read the open PRs first; make status readable from the LIST
+
+Three parts of one rule (Lei, 2026-08-14). Applies in single-agent mode too — checking
+open PRs guards against your own stale branch from a prior session, not just a
+counterpart's work. All three exist because **a list read and a thread read are
+different operations, and only the list read scales**: nobody opens ten comment
+threads to reconstruct status, so status living only in comments is invisible at the
+altitude people actually work at.
+
+**1. Before starting: `gh pr list --state open`, before the first commit of any new
+task.** A read of the actual list, drafts included. If an open PR already does part of
+the job, branch off *that PR's tip* rather than off `dev`. Never push additively into
+another agent's branch — cut your own from their tip; editing their artifact has no
+additive exception.
+
+*What it actually buys, stated honestly:* run here the day it was written, it surfaced
+**#1320 / #1415** — both @sol-montaigne's, both adding `engram_check_independence`,
+both `closes #1313`, opened a day apart. But that pair was **already known**: Sol
+marked #1320 superseded on 2026-06-25, and it is open today because **Lei parked it**
+past `v0.3.2-rc1` (his ruling, relayed onto the PR by me on 2026-08-03 — not a comment
+of his own; flagged because this section is otherwise careful about relay-vs-first-hand). So the check does not usually find *unknown* duplication. It finds
+**known duplication nobody is on the hook for** — the more common failure, and the one
+that persists for months.
+
+**2. When you replace a PR, mark it at fold-down time — in the TITLE, not only a
+comment.** A fold-down (opening a PR that absorbs an existing one, usually by branching
+from its tip) is legitimate. The absorbed PR looking untouched in the list is not.
+Prefix the replaced PR's title:
+
+```
+[SUPERSEDED by #<N> · commits carried] <original title>
+[SUPERSEDED by #<N> · commits dropped] <original title>
+[SUPERSEDED by #<N> · commits partly carried] <original title>
+```
+
+State, superseding PR, commit disposition. **Prefix, not suffix:** `gh pr list`
+truncates the title **from the tail**, and there is no fixed threshold — the title's
+budget is terminal width *minus* what the ID / BRANCH / CREATED-AT columns consume in
+that listing, so a long branch name on someone else's PR shrinks everyone's visible
+title and the same terminal cuts differently on different days. At ~80 columns only
+the first ~25-30 characters survive; even at 160, titles past roughly 90 characters
+are routinely cut. **The invariant is the direction** — what is lost is lost from the
+end, so a leading marker survives every width and a trailing one goes first.
+
+> *An earlier draft asserted a "~78 chars" threshold as measured. It was an artifact
+> of a `jq '.title[0:78]'` slice I wrote myself, mistaken for `gh`'s behaviour —
+> fabricated evidence for a true conclusion, inside the section correcting that habit.
+> A reviewer-fairy falsified it with a pty harness at several widths.*
+
+**Who may set it: the merge seat**, whoever holds it (Lei, 2026-08-14 — the seat moves
+with availability, the authority travels with it). A deliberate, narrow exception to
+*never edit another agent's artifact*: **status annotation only, never a rewrite of
+their title's substance or description.** It exists because whoever knows a PR is
+superseded is usually not its author. **Also comment on the replaced PR** — the title
+is the mechanism, but the comment is the half that reaches the human, and the human
+needing to know their work was carried forward is the reason this rule exists at all.
+
+> **⚠ `gh pr edit --title` may fail while looking like it worked — CHECK YOUR
+> VERSION.** On `gh 2.45.0` it **exits 1**, prints only `GraphQL: Projects (classic) is
+> being deprecated …`, and leaves the title unchanged; on `gh 2.92.0` the same command
+> works. Neither test PR had a project attachment, so a Projects link does not explain
+> it — a version-dependent hazard to check for, not a toolchain property. Fallback that
+> works on both: `gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f title="…"`.
+> **It is not silent** — exit 1 is a real signal, and I only called it silent because I
+> read it through `| tail` and got tail's status instead of gh's. So: **read the title
+> back**, because a deprecation-shaped message does not read as a failure and a piped
+> exit code is not the command's.
+
+**Why the rule exists, told accurately.** The originating case is umwelt#561, and the
+honest version is *not* that its author was left in the dark: link-backs were posted
+twice, the second thirty-six seconds after umwelt#584 merged, naming the carried
+commits. What lagged was the PR's **state** — `OPEN` for ~15 hours after its work was
+in `main` — and an auditor read the list, saw it open, and called it abandoned, having
+written both comments himself. **The defect was never missing communication; it was
+communication living where a list read cannot see it.** Hence a title marker and a
+prompt close, not another comment.
+
+> **Duplicated by hand in umwelt's `CLAUDE.md`**, with no generator or test binding
+> them — each file loads only with its own project. Change one, change the other in the
+> same pass; the failure mode is a rule current on the copy you are reading and stale
+> on the one governing the repo you are in.
+
 ### Every PR carries a baton — merge-readiness is baton-tracked, not inferred
 
 Open a PR-baton **at PR creation**, for **every** PR — bunch-driven OR standalone:
