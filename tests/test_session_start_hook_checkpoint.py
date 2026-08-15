@@ -441,6 +441,47 @@ def test_corrupt_marker_reseeds_rather_than_crashing(engram_home):
     )
 
 
+def test_persist_checkpoint_at_mid_write_failure_leaves_original_intact(engram_home):
+    """The property atomicity actually buys: if the write is interrupted,
+    the marker on disk is still the OLD one, not a torn/partial one.
+
+    Simulates interruption by making json.dump raise partway through
+    _persist_checkpoint_at's call into atomic_write_json. Asserts:
+      1. _persist_checkpoint_at itself does not raise (fail-soft, per its
+         own docstring -- the outer except Exception: pass must still hold).
+      2. The marker file on disk afterward is BYTE-IDENTICAL to before the
+         call -- still valid JSON, still carrying the OLD checkpoint_at.
+      3. No leftover *.tmp file in the sessions directory.
+    """
+    session_id = "sess-mid-write-kill"
+    marker_path = engram_home / "sessions" / f"{session_id}.json"
+    original_marker = {
+        "session_id": session_id,
+        "transcript_path": "/tmp/t.jsonl",
+        "source": "startup",
+        "cwd": "/home/x",
+        "started_at": "2026-08-15T00:00:00+00:00",
+        "role": "interactive",
+        "purpose": "Interactive session with user",
+        "session_started_at": "2026-08-15T00:00:00+00:00",
+        "checkpoint_at": "2026-08-15T00:00:00Z",
+    }
+    marker_path.write_text(json.dumps(original_marker))
+    original_bytes = marker_path.read_bytes()
+
+    mod = _load_hook_module(engram_home)
+    with patch("_hooklib.json.dump", side_effect=RuntimeError("simulated mid-write kill")):
+        mod._persist_checkpoint_at(str(engram_home), session_id, "2026-08-15T99:99:99Z")
+        # must not raise -- if it does, the fail-soft contract is broken
+
+    assert marker_path.read_bytes() == original_bytes, (
+        "a failed write must leave the original marker completely untouched"
+    )
+    assert not list((engram_home / "sessions").glob("*.tmp")), (
+        "a failed write must not leave a temp file behind"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 9. Block ordering: new block appears before the calibration block.
 # ---------------------------------------------------------------------------

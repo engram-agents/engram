@@ -27,6 +27,11 @@ import re
 import sqlite3
 import sys
 
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
+
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
@@ -118,8 +123,7 @@ def main():
     if speaker:
         # New prefix detected — switch active user
         try:
-            with open(CURRENT_USER_PATH, "w") as f:
-                json.dump(speaker, f)
+            atomic_write_json(CURRENT_USER_PATH, speaker)
         except OSError:
             pass
         context = (

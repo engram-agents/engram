@@ -228,6 +228,7 @@ ENGRAM_HOME = (
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -776,8 +777,11 @@ def _rate_limit_escalation(transcript_path: str) -> bool:
             allowed = False
             new_count = count + 1
 
-        with open(_NEAR_COMPACTION_RATE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"transcript_path": transcript_path, "count": new_count}, f)
+        atomic_write_json(
+            _NEAR_COMPACTION_RATE_STATE_FILE,
+            {"transcript_path": transcript_path, "count": new_count},
+            encoding="utf-8",
+        )
 
         return allowed
     except Exception:  # noqa: BLE001

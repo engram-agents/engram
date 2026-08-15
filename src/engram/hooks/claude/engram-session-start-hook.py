@@ -54,6 +54,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
+from _hooklib import atomic_write_json
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -1570,8 +1571,7 @@ def write_marker(hook_input: dict) -> dict | None:
             prune_stale_session_markers(session_id)
         except Exception as exc:
             print(f"[engram-session-start] prune: unexpected error, skipped: {exc}", file=sys.stderr)
-        with open(session_marker_path, "w") as f:
-            json.dump(marker, f)
+        atomic_write_json(session_marker_path, marker)
     except OSError:
         return None
     return marker
@@ -1596,15 +1596,15 @@ def _persist_checkpoint_at(engram_home: str, session_id: str, new_checkpoint_at:
     markers are keyed by session_id and a second writer to the same
     session_id is not a case this hook is designed around.
 
-    The write itself IS atomic (temp file in the same directory +
-    os.replace), matching the registry and config.json writes elsewhere in
-    this file, and that part is not optional. This hook runs under a 5s
-    harness timeout and is KILLED on overrun — see main()'s ordering
-    invariant — so a plain truncate-and-write can leave a torn marker. A
-    torn marker reads as corrupt, write_marker() then treats it as absent,
-    and checkpoint_at silently reseeds to now(): a GAP in the continuity
-    window, which is the one direction this whole workstream exists to
-    rule out. Overlap is the safe error; a gap is not.
+    The write itself IS atomic, via `_hooklib.atomic_write_json` (temp file
+    in the same directory + os.replace), matching the registry and
+    config.json writes elsewhere in this file, and that part is not
+    optional. This hook runs under a 5s harness timeout and is KILLED on
+    overrun — see main()'s ordering invariant — so a plain truncate-and-write
+    can leave a torn marker. A torn marker reads as corrupt, write_marker()
+    then treats it as absent, and checkpoint_at silently reseeds to now(): a
+    GAP in the continuity window, which is the one direction this whole
+    workstream exists to rule out. Overlap is the safe error; a gap is not.
 
     Fail-soft: any exception is swallowed. Must never raise — called from
     the cheap tier of SessionStart, same discipline as every other block
@@ -1617,21 +1617,10 @@ def _persist_checkpoint_at(engram_home: str, session_id: str, new_checkpoint_at:
         if not isinstance(data, dict):
             return
         data["checkpoint_at"] = new_checkpoint_at
-        # Atomic write: temp file in same dir + os.replace (same-fs, no torn
-        # write if this process is killed mid-dump). Same pattern as the
-        # agent-registry and config.json writes above.
-        marker_dir = os.path.dirname(marker_path)
-        fd, tmp_path = tempfile.mkstemp(dir=marker_dir, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f)
-            os.replace(tmp_path, marker_path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+        # Atomic write via the shared helper (gh#2035) -- same guarantee as
+        # before (temp file in same dir + os.replace), now via the single
+        # named convention instead of a hand-rolled copy of it.
+        atomic_write_json(marker_path, data)
     except Exception:
         pass
 

@@ -72,6 +72,7 @@ SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
 try:
     from _stophooklib import (
         resolve_transcript_path as _resolve_transcript_path,
@@ -438,8 +439,7 @@ def main() -> None:
     }
     try:
         Path(DEFERENCE_MARKER_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with open(DEFERENCE_MARKER_PATH, "w") as f:
-            json.dump(marker, f)
+        atomic_write_json(DEFERENCE_MARKER_PATH, marker)
     except OSError:
         pass
 

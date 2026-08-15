@@ -134,6 +134,28 @@ def _enable(hook, tmp: str, **overrides):
     conn.close()
 
 
+def _broken_lockfile_open(real_open, *, error_cls=PermissionError):
+    """Build an os.open replacement that fails ONLY for the fcntl lockfile
+    (STATE_PATH + ".lock"), passing every other os.open call through to the
+    real implementation unchanged.
+
+    gh#2035: the state write (_write_state) now goes through
+    _hooklib.atomic_write_json(), which -- unlike the old builtin-open()-based
+    write it replaced -- itself uses tempfile.mkstemp() and so calls
+    os.open() internally (CPython's builtin open() bypasses os.open at the C
+    level, but tempfile.mkstemp() is pure Python and calls os.open()
+    directly; verified empirically). A blanket monkeypatch of hook.os.open
+    (the pre-#2035 form of these tests) therefore now ALSO breaks the state
+    write it is supposed to leave functioning -- these tests exist precisely
+    to prove the degrade flag still reaches disk when the LOCK's os.open()
+    call fails, so the mock must be scoped to that one path."""
+    def _broken(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            raise error_cls("simulated: lockfile open unavailable")
+        return real_open(path, *a, **kw)
+    return _broken
+
+
 def _stub_idf_capture(terms):
     """Install a fake engram_idf whose extract_keywords records the min_idf
     it was called with, into the returned dict (key 'min_idf')."""
@@ -414,10 +436,7 @@ def test_missing_fcntl_degrades_to_unlocked(tmp_path, monkeypatch):
     _stub_idf([["omega"]])
     monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
 
-    def broken_open(*a, **kw):
-        raise OSError("simulated: lockfile open unavailable")
-
-    monkeypatch.setattr(hook.os, "open", broken_open)
+    monkeypatch.setattr(hook.os, "open", _broken_lockfile_open(hook.os.open, error_cls=OSError))
 
     out = hook.check_in_turn_recall("omega call")
     assert "ENGRAM in-turn recall" in out
@@ -435,10 +454,7 @@ def test_lock_degrade_stamps_state_and_emits_stderr_tell(tmp_path, monkeypatch, 
     _stub_idf([["omega"]])
     monkeypatch.setattr(hook, "_query_recall_daemon", lambda q, top_k=5: _daemon_result(["ob_1"]))
 
-    def broken_open(*a, **kw):
-        raise PermissionError("simulated: lockfile open unavailable")
-
-    monkeypatch.setattr(hook.os, "open", broken_open)
+    monkeypatch.setattr(hook.os, "open", _broken_lockfile_open(hook.os.open))
 
     out = hook.check_in_turn_recall("omega call")
     assert "ENGRAM in-turn recall" in out, "degrade must still run the unlocked path, not go silent"
@@ -464,10 +480,7 @@ def test_lock_degrade_flag_cleared_once_lock_recovers(tmp_path, monkeypatch):
 
     real_open = hook.os.open
 
-    def broken_open(*a, **kw):
-        raise PermissionError("simulated: lockfile open unavailable")
-
-    monkeypatch.setattr(hook.os, "open", broken_open)
+    monkeypatch.setattr(hook.os, "open", _broken_lockfile_open(real_open))
     hook.check_in_turn_recall("omega call")
     state = json.load(open(hook.STATE_PATH))
     assert state["lock_degraded"] is True
@@ -494,10 +507,7 @@ def test_lock_degrade_persists_even_when_cooldown_gate_short_circuits(tmp_path, 
     # Prime the cooldown with a normal (non-degraded) fire first.
     hook.check_in_turn_recall("prime call")
 
-    def broken_open(*a, **kw):
-        raise PermissionError("simulated: lockfile open unavailable")
-
-    monkeypatch.setattr(hook.os, "open", broken_open)
+    monkeypatch.setattr(hook.os, "open", _broken_lockfile_open(hook.os.open))
 
     # This call degrades AND immediately hits the just-primed cooldown gate
     # (9999s) -- the old code returned "" here without ever calling
@@ -524,10 +534,7 @@ def test_lock_degrade_flag_clears_even_when_cooldown_gate_short_circuits(tmp_pat
 
     real_open = hook.os.open
 
-    def broken_open(*a, **kw):
-        raise PermissionError("simulated: lockfile open unavailable")
-
-    monkeypatch.setattr(hook.os, "open", broken_open)
+    monkeypatch.setattr(hook.os, "open", _broken_lockfile_open(real_open))
     hook.check_in_turn_recall("degraded prime call")
     state = json.load(open(hook.STATE_PATH))
     assert state["lock_degraded"] is True

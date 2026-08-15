@@ -472,7 +472,7 @@
     },
     {
       "path": "hooks/claude/_hooklib.py",
-      "tier": "convenience"
+      "tier": "essential"
     },
     {
       "path": "hooks/claude/_prompthooklib.py",

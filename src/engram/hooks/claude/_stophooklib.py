@@ -105,8 +105,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Optional
+
+# _hooklib.py lives alongside this module in both build topologies (see
+# module docstring above), so -- unlike the "each hook must add its own
+# directory to sys.path before importing THIS module" bootstrap problem for
+# _stophooklib itself -- this module CAN add its own directory before
+# importing its sibling _hooklib, once it is already running (gh#2035:
+# atomic_write_json for write_offset_state below).
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
 
 
 def resolve_transcript_path(
@@ -175,8 +187,8 @@ def write_offset_state(state_file_path: str, transcript_path: str) -> None:
     Best-effort: any failure (can't stat the transcript, can't write the
     state file) is silenced, matching engram-stop-hook.py's pre-extraction
     `_update_state` exactly -- state-file bookkeeping must never crash the
-    hook. Uses tmp-file + os.replace so a concurrent reader never observes a
-    partial write.
+    hook. Uses _hooklib.atomic_write_json() (tmp-file + os.replace) so a
+    concurrent reader never observes a partial write.
     """
     try:
         offset = 0
@@ -186,10 +198,7 @@ def write_offset_state(state_file_path: str, transcript_path: str) -> None:
             except OSError:
                 pass
         state = {"transcript_path": transcript_path, "byte_offset": offset}
-        tmp = state_file_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp, state_file_path)
+        atomic_write_json(state_file_path, state, encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
 

@@ -97,7 +97,10 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
 try:
-    from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
+    from _hooklib import (
+        is_own_server_py_running as _is_own_server_py_running_impl,
+        atomic_write_json,
+    )
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
@@ -514,8 +517,11 @@ def _write_surface_ledger(ledger: dict) -> None:
     try:
         path = _surface_ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(ledger, f)
+        if _HOOKLIB_OK:
+            atomic_write_json(path, ledger, encoding="utf-8")
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(ledger, f)
     except Exception:
         pass
 
@@ -2325,8 +2331,11 @@ def read_prompt_counter() -> dict:
 def write_prompt_counter(state: dict):
     """Write the prompt counter state."""
     os.makedirs(os.path.dirname(COUNTER_PATH), exist_ok=True)
-    with open(COUNTER_PATH, "w") as f:
-        json.dump(state, f)
+    if _HOOKLIB_OK:
+        atomic_write_json(COUNTER_PATH, state)
+    else:
+        with open(COUNTER_PATH, "w") as f:
+            json.dump(state, f)
 
 
 def check_write_reminder() -> str:
@@ -2337,8 +2346,11 @@ def check_write_reminder() -> str:
         if marker.get("pending"):
             # Clear the marker so it doesn't repeat
             marker["pending"] = False
-            with open(WRITE_REMINDER_PATH, "w") as f:
-                json.dump(marker, f)
+            if _HOOKLIB_OK:
+                atomic_write_json(WRITE_REMINDER_PATH, marker)
+            else:
+                with open(WRITE_REMINDER_PATH, "w") as f:
+                    json.dump(marker, f)
             return (
                 "[ENGRAM Write Check: Did your last response contain a decision, insight, "
                 "or design choice worth recording? If so, write to ENGRAM now (observation, "
@@ -2397,8 +2409,11 @@ def check_repair_marker() -> str:
             return ""
         # Clear the marker so it doesn't repeat
         marker["pending"] = False
-        with open(REPAIR_MARKER_PATH, "w") as f:
-            json.dump(marker, f)
+        if _HOOKLIB_OK:
+            atomic_write_json(REPAIR_MARKER_PATH, marker)
+        else:
+            with open(REPAIR_MARKER_PATH, "w") as f:
+                json.dump(marker, f)
         tool_name = marker.get("tool_name", "?")
         repairs = marker.get("repairs", [])
         lines = [
@@ -2846,15 +2861,18 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
             # interleave, but a concurrent snapshot READ (the one at the top
             # of this function, which deliberately stays outside the lock)
             # could still observe a torn/truncated file mid-write and
-            # degrade to an empty state, risking a spurious re-fire. Switch
-            # to tmp+os.replace so a reader never sees a partial write,
-            # matching the convention already used by _reset_principle_
-            # enactments and by _write_state in the sibling in_turn_recall
-            # state file.
-            tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(fresh_state, f)
-            os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
+            # degrade to an empty state, risking a spurious re-fire. Now via
+            # the shared _hooklib.atomic_write_json() helper (gh#2035) so a
+            # reader never sees a partial write, matching the convention
+            # already used by _reset_principle_enactments and by
+            # _write_state in the sibling in_turn_recall state file.
+            if _HOOKLIB_OK:
+                atomic_write_json(str(PRINCIPLE_TRIGGER_STATE_PATH), fresh_state)
+            else:
+                tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(fresh_state, f)
+                os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
         except OSError:
             pass  # state write failure -> worst case an early re-fire; never block
 
