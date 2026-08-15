@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -750,6 +751,15 @@ GIT_EXE = os.environ.get(
 GIT_TIMEOUT = 15
 
 
+# `git gc` is far slower than any other git call this module makes — measured
+# 2026-08-15 against a 1.1 GB copy of a real ~/.engram/.git (1196 loose
+# objects): ~14s for the first (non-incremental) run, ~1.4s on a repeat call
+# with nothing new to pack. GIT_TIMEOUT (15s) is sized for cheap plumbing
+# calls and would be a coin-flip timeout for a bigger/slower-disk repo, so gc
+# gets its own generous, bounded budget instead of borrowing GIT_TIMEOUT.
+GIT_GC_TIMEOUT = 300
+
+
 def _git(*args: str, **kwargs) -> subprocess.CompletedProcess:
     """Run a git command with timeout and no interactive prompts."""
     env = os.environ.copy()
@@ -827,7 +837,13 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
     Idempotent: if the file already contains ALL required patterns it is left
     unchanged. If it is absent or missing patterns, the canonical content is
     written (replacing any prior content — the canonical set is the authoritative
-    truth, not a patch-on-top).
+    truth, not a patch-on-top). Any hand-added negation lines (`!pattern`) in the
+    prior content are preserved across a rewrite — see the diary.db note below.
+
+    A .gitignore rule alone does NOT untrack files git already has committed
+    (git only reads .gitignore when deciding whether to stage *new* paths), so
+    every write here also calls _untrack_gitignored_paths — see that function's
+    docstring for why this is the load-bearing half of the fix.
 
     Patterns rationale (each earned by a real file that slipped through):
       *.db / *.db-shm / *.db-wal / *.db-journal — SQLite binary + WAL files; binary,
@@ -837,10 +853,49 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
       *.backfill-snapshot-* — temporary backfill snapshots.
       *.log — log files; noise, never part of the backup.
       marketplace/ venv/ __pycache__/ *.pyc — runtime / build artifacts.
+      db-backup/ — the daily binary db ladder (_write_binary_backup) dir. Measured
+          2026-08-15 on a real install: 1.03 GB / 35 committed *.sql files at
+          34-36 MB each, from an older dated-dump mechanism (knowledge-YYYY-MM-DD.sql,
+          stopped 2026-08-08) that shared this directory with the current *.db
+          producer without a matching ignore rule — a plain bug, not intended.
+      claude-projects-archive/ — raw local Claude Code session transcripts. Measured
+          2026-08-15: 1.85 GB / 6592 objects. Local archive; never belonged in a
+          version-controlled backup (Lei, 2026-08-15).
+      session-logs-archive/ — same class of local archive as claude-projects-archive/
+          (Lei, 2026-08-15): a rotation of session-log snapshots kept for local
+          reference, not a thing a full-history git backup should carry.
+      session_log.md — strictly append-only (verified monotonic size across history:
+          8.11 MB on 2026-06-02 to 9.75 MB on 2026-08-15). Committing every version of
+          an append-only file stores the same information once per commit; the single
+          HEAD copy already contains everything every prior version held. Measured
+          2026-08-15: 1.35 GB of logical bytes across 152 committed versions of this
+          one file. It is still written to disk every turn (unchanged) and still
+          staged by _commit_snapshot_sync's files_to_stage list; the check-ignore
+          filter added for #731 is what makes staging-then-skipping silent rather
+          than an aborted commit.
 
-    NOT excluded: knowledge.sql (the text dump), graph_snapshot.md, session_log.md,
-    config.json, warm-briefing.md, diary/*, history/*, *.json identity files — these
-    ARE the backup.
+    NOT excluded: knowledge.sql (the text dump), graph_snapshot.md, config.json,
+    warm-briefing.md, diary/*, history/*, *.json identity files — these ARE the
+    backup. session_log.md moved out of this list 2026-08-15 (see above) — it is
+    still written locally every turn, it is simply no longer version-controlled,
+    because an append-only file gains nothing from version control.
+
+    diary/diary.db negation — NOT in this canonical list, investigated 2026-08-15:
+    at least one deployed .gitignore hand-adds `!diary/diary.db` (a 32K static
+    derived store _commit_snapshot stages alongside the diary entries) to un-ignore
+    it against the *.db rule above. That negation is NOT part of _GITIGNORE_PATTERNS
+    and was never meant to be canonical — see the comment on that negation for why
+    (a structural fix in _commit_snapshot's own staging, landed separately, makes
+    the negation no longer load-bearing: gitignored files are filtered out of
+    staging defensively rather than aborting the commit). Before this change, a
+    refresh here was a no-op on such an install (the all-patterns-present check only
+    requires the canonical lines to be present, and doesn't care what else is in the
+    file) so the negation survived untouched. Adding new patterns above changes
+    that: the file becomes incomplete on that install, forcing a rewrite — which,
+    absent the negation-preservation this function now does, would have silently
+    dropped the hand-added `!diary/diary.db` line and re-ignored that file. Preserving
+    `!`-prefixed lines across a rewrite (see above) closes that gap generically rather
+    than hardcoding this one filename.
     """
     _GITIGNORE_PATTERNS = [
         "*.db",
@@ -857,19 +912,182 @@ def _ensure_engram_gitignore(data_dir: "Path") -> None:
         "venv/",
         "__pycache__/",
         "*.pyc",
+        "db-backup/",
+        "claude-projects-archive/",
+        "session-logs-archive/",
+        "session_log.md",
     ]
     gitignore_path = data_dir / ".gitignore"
     canonical = "\n".join(_GITIGNORE_PATTERNS) + "\n"
     try:
+        existing = ""
         if gitignore_path.exists():
             existing = gitignore_path.read_text(encoding="utf-8")
             # Check if ALL required patterns are present (exact-line match)
             existing_lines = {l.strip() for l in existing.splitlines()}
             if all(p in existing_lines for p in _GITIGNORE_PATTERNS):
                 return  # Already complete — leave it alone
-        gitignore_path.write_text(canonical, encoding="utf-8")
+        # Preserve any hand-added negation lines (e.g. `!diary/diary.db`) that
+        # aren't already part of the canonical set — a wholesale overwrite would
+        # otherwise silently re-ignore whatever a deployed install un-ignored by
+        # hand. See the diary/diary.db note above.
+        negations = [
+            l.strip() for l in existing.splitlines()
+            if l.strip().startswith("!") and l.strip() not in _GITIGNORE_PATTERNS
+        ]
+        content = canonical
+        if negations:
+            content += "\n".join(negations) + "\n"
+            # Keeping every `!`-prefixed line, not just `!diary/diary.db`, is
+            # deliberate (see the diary.db note above) — narrowing this filter
+            # risks re-ignoring the exact file it exists to protect. The
+            # tradeoff is that a stale hand-added negation would also survive
+            # indefinitely and silently re-include something the canonical set
+            # wants ignored, so name what's preserved rather than staying silent.
+            import sys
+            print(
+                f"[engram] preserving {len(negations)} hand-added .gitignore "
+                f"negation line(s) across a canonical-pattern refresh: {negations}",
+                file=sys.stderr,
+            )
+        gitignore_path.write_text(content, encoding="utf-8")
+        _untrack_gitignored_paths(data_dir, _GITIGNORE_PATTERNS)
     except OSError:
         pass  # Best-effort — if we can't write it, git init still proceeds
+
+
+def _untrack_gitignored_paths(data_dir: "Path", patterns: list) -> list:
+    """Remove now-gitignored paths from the git INDEX only — never the working tree.
+
+    A .gitignore entry does not untrack files git already has committed — git
+    only consults .gitignore when deciding whether to stage *new, untracked*
+    paths. Without this, an existing install with db-backup/*.sql,
+    claude-projects-archive/, session-logs-archive/, or session_log.md already
+    committed would keep re-committing every one of them forever, despite a
+    correct-looking .gitignore rule (measured 2026-08-15 on a real install: 1.85
+    GB claude-projects-archive/, 1.35 GB session_log.md history, 1.03 GB
+    db-backup/*.sql — see _ensure_engram_gitignore's docstring). This is the
+    load-bearing half of the fix; the .gitignore entry alone only stops the bleed
+    for content that hasn't been committed yet.
+
+    Directory patterns (trailing '/') and bare filenames are handled via
+    `git rm -r --cached --ignore-unmatch`. Glob patterns (*.db, *?mode=*, etc.)
+    are skipped — they aren't concrete paths `git rm` can target. Most
+    pre-existing canonical patterns ARE globs and get filtered out here, but
+    three are not: `marketplace/`, `venv/`, `__pycache__/` are concrete
+    directory patterns too, so they are passed to `git rm --cached
+    --ignore-unmatch` on every rewrite alongside the new patterns — harmless
+    (`--ignore-unmatch` no-ops on paths already untracked), but this function
+    does NOT activate only for the new directory/filename patterns, despite an
+    earlier version of this docstring claiming so.
+
+    --cached only: files are removed from the git index, never from disk. This
+    targets backup/archive directories — deleting a user's local copies would be
+    destructive and unrecoverable, and is never this function's job.
+    --ignore-unmatch: a path that was never tracked (or was already untracked by
+    a prior call) is a silent no-op, not an error. This is what makes repeat
+    calls idempotent.
+
+    Deliberately does NOT go through the shared `_git()` helper: `_git()` hardcodes
+    `cwd=DATA_DIR` (the module-global), so it would silently ignore this function's
+    own `data_dir` argument and operate on whatever repo the global happens to point
+    at instead — a real bug, caught in review, where a caller passing a non-global
+    `data_dir` (e.g. tests pointing at a tmp repo) would have git commands run
+    against the WRONG repository while reporting success. Every subprocess call
+    below binds `cwd=data_dir` explicitly instead, the same way
+    `_maybe_run_daily_git_gc` does.
+
+    Best-effort, matching the surrounding `except OSError: pass` discipline —
+    git init must still proceed if this fails for any reason. A path whose `git
+    rm` fails unexpectedly (index lock, permissions, corruption) is skipped
+    rather than aborting the whole call, but — unlike a plain silent `continue`
+    — is reported on stderr so a persistent failure is visible instead of
+    silently never untracking anything. Returns the list of paths actually
+    removed from the index (empty if none were tracked, the directory isn't a
+    git repo yet, or git is unavailable) and prints a one-line stderr summary
+    when the list is non-empty, so the effect is visible rather than silent.
+    """
+    removed: list = []
+    try:
+        if not (data_dir / ".git").exists():
+            return removed  # not a git repo yet (or a bare/non-standard layout) — nothing to untrack
+        # Concrete path patterns only — a glob like *.db or *?mode=* isn't a
+        # literal path `git rm -- <path>` can target.
+        concrete = [p.rstrip("/") for p in patterns if "*" not in p and "?" not in p]
+        import sys
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"  # never prompt for credentials/input
+        for path in concrete:
+            # Ask git structurally what's tracked under this pathspec BEFORE
+            # removing it, rather than hand-parsing `git rm`'s porcelain stdout
+            # afterward. That parse (previously `startswith("rm '") and
+            # endswith("'")`) depends on `git rm` never emitting anything the
+            # shape doesn't expect — which is not guaranteed across git
+            # versions/platforms, and demonstrably breaks even on THIS git
+            # version for a path containing a literal newline (its own
+            # `.splitlines()` step cuts the single-path message into two
+            # lines, neither of which matches, silently dropping the count).
+            # `-z` NUL-terminates entries, which is correct for any filename
+            # regardless of git's message-formatting choices.
+            try:
+                ls_result = subprocess.run(
+                    [GIT_EXE, "ls-files", "--cached", "-z", "--", path],
+                    cwd=data_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT,
+                    env=env,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                print(
+                    f"[engram] git ls-files failed for {path!r} while untracking "
+                    f"gitignored paths from {data_dir}: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            tracked_before = (
+                [p for p in ls_result.stdout.split("\0") if p]
+                if ls_result.returncode == 0 else []
+            )
+
+            try:
+                rm_result = subprocess.run(
+                    [GIT_EXE, "rm", "-r", "--cached", "--ignore-unmatch", "--", path],
+                    cwd=data_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=GIT_TIMEOUT,
+                    env=env,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+                print(
+                    f"[engram] git rm failed for {path!r} while untracking "
+                    f"gitignored paths from {data_dir}: {e}",
+                    file=sys.stderr,
+                )
+                continue
+            if rm_result.returncode != 0:
+                # Loud, not silent: a persistently locked index (or permissions,
+                # corruption) would otherwise fail every run forever, invisibly.
+                # Still best-effort — one failed path must not block the rest.
+                print(
+                    f"[engram] git rm --cached exited {rm_result.returncode} for "
+                    f"{path!r} in {data_dir}: {(rm_result.stderr or '')[:300]}",
+                    file=sys.stderr,
+                )
+                continue
+            removed.extend(tracked_before)
+        if removed:
+            preview = removed[:5]
+            more = f" (+{len(removed) - 5} more)" if len(removed) > 5 else ""
+            print(
+                f"[engram] untracked {len(removed)} gitignored path(s) from the git "
+                f"index (files kept on disk): {preview}{more}",
+                file=sys.stderr,
+            )
+    except OSError:
+        pass  # best-effort — git init still proceeds
+    return removed
 
 
 def _ensure_data_dir():
@@ -3390,6 +3608,118 @@ def _write_binary_backup(
         return {"error": str(e)}
 
 
+def _maybe_run_daily_git_gc(data_dir: "Path") -> dict:
+    """Run `git gc` at most once per calendar day to compact loose objects.
+
+    Why this exists: loose objects are stored as full zlib copies with NO
+    delta compression — deltas are only computed at pack time, i.e. by gc.
+    Measured 2026-08-15 on a real install: one knowledge.sql commit landed as
+    8.9 MB of loose objects vs a real content delta of ~100 KB gzipped. The
+    delta-friendly text-dump design (knowledge.sql, session_log.md before this
+    change, graph_snapshot.md) buys nothing without periodic gc to realize it.
+
+    `git gc --auto` will NOT fire on its own at ENGRAM's object counts: its
+    default threshold (gc.auto) is 6700 loose objects (confirmed via `git
+    gc --help` / `man git-gc`, not assumed), and a real install measured
+    2026-08-15 sits around ~1200. Hence an explicit daily gc, not reliance on
+    the automatic heuristic.
+
+    Idempotency: a date-stamped marker file (data_dir / ".git-gc-stamp",
+    contents = YYYYMMDD), same one-run-per-calendar-day shape as
+    _write_binary_backup's knowledge-YYYYMMDD.db naming, so this runs at most
+    once a day regardless of how many naps/checkpoints happen that day.
+
+    Timing (measured 2026-08-15, real repo copy, NOT the live install — see
+    GIT_GC_TIMEOUT above): ~14s first run on a 1.1 GB / 1196-loose-object
+    repo (1.1 GB -> 586 MB packed), ~1.4s on a repeat run with nothing new
+    to pack. GIT_GC_TIMEOUT (300s) is a generous bound, not the expected
+    duration.
+
+    Best-effort: never raises, never blocks a nap/checkpoint. A failed or
+    timed-out gc just means the next calendar day tries again (the stamp is
+    only written on success).
+
+    Returns:
+        {"skipped": "not a git repo"}       — no .git yet (e.g. brand-new install)
+        {"skipped": "already ran today"}    — idempotent skip
+        {"ran": True, "duration_s": float}  — successful gc
+        {"error": str}                      — timeout / non-zero exit / exception
+    """
+    try:
+        if not (data_dir / ".git").exists():
+            return {"skipped": "not a git repo"}
+
+        stamp_path = data_dir / ".git-gc-stamp"
+        today_str = date.today().strftime("%Y%m%d")
+        if stamp_path.exists():
+            try:
+                if stamp_path.read_text(encoding="utf-8").strip() == today_str:
+                    return {"skipped": "already ran today"}
+            except OSError:
+                pass  # unreadable stamp — fall through and just try gc again
+
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        start = time.monotonic()
+
+        # `git gc` forks `git pack-objects` / `git repack`. subprocess.run's own
+        # timeout handling only kills the immediate `git gc` process, which can
+        # orphan a still-running child that keeps writing into .git after we've
+        # given up and moved on to `git add`/`git commit` (#2048 review). Use
+        # Popen directly (run()'s TimeoutExpired doesn't hand back the process
+        # object, so there is nothing to kill the group of) and launch gc in its
+        # own session/process-group so a timeout can take the whole tree with it.
+        popen_kwargs: dict = dict(
+            cwd=data_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        try:
+            proc = subprocess.Popen([GIT_EXE, "gc", "--quiet"], **popen_kwargs)
+        except (FileNotFoundError, OSError) as e:
+            return {"error": str(e)}
+
+        try:
+            stdout, stderr = proc.communicate(timeout=GIT_GC_TIMEOUT)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                if os.name == "nt":
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)
+                else:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass  # process (or group) already gone — nothing left to kill
+            proc.kill()  # make sure the immediate process itself is reaped too
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # best-effort cleanup — don't hang the caller on a stuck reap
+            return {"error": f"git gc timed out after {GIT_GC_TIMEOUT}s"}
+        except OSError as e:
+            return {"error": str(e)}
+        duration = time.monotonic() - start
+
+        if returncode != 0:
+            return {"error": f"git gc exited {returncode}: {(stderr or '')[:300]}"}
+
+        try:
+            stamp_path.write_text(today_str, encoding="utf-8")
+        except OSError:
+            pass  # best-effort marker — a missed write just re-runs gc later today
+
+        return {"ran": True, "duration_s": round(duration, 2)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _commit_snapshot(
     conn: sqlite3.Connection,
     message: str,
@@ -3516,6 +3846,19 @@ def _commit_snapshot_async(
     #    per-turn snapshots for the coarse 7-day restore window.
     _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
 
+    # 4b. Daily git gc (best-effort, once per calendar day) — see
+    #     _maybe_run_daily_git_gc's docstring for why this is needed: loose
+    #     objects carry no delta compression until packed by gc.
+    #     This runs on the main thread while the snapshot worker thread may be
+    #     mid `git add`/`git commit` from a prior job — a considered decision,
+    #     not an oversight: probed empirically (#2048 review) with concurrent
+    #     add/commit interleaved against gc, zero errors, clean `git fsck`,
+    #     consistent with git relying on its own on-disk lock files (.git/index.lock
+    #     etc.) plus gc.pruneExpire's default 2-week grace window, which keeps gc
+    #     from pruning an object the worker's commit is still in the middle of
+    #     using.
+    _git_gc_result = _maybe_run_daily_git_gc(DATA_DIR)
+
     # 5. Durably enqueue the async commit job (fsync'd inside enqueue_job) — the tool
     #    returns only after this, honoring the "return after enqueue + fsync" guarantee.
     _sw.enqueue_job(turn, seq, message, mode)
@@ -3530,6 +3873,7 @@ def _commit_snapshot_async(
         "enqueued_seq": seq,
         "binary_backup": capture,
         "db_backup": _db_backup_result,
+        "git_gc": _git_gc_result,
         "snapshot_lag": _sw.compute_snapshot_lag(),
     }
     if wal_warning:
@@ -3706,6 +4050,12 @@ def _commit_snapshot_sync(
     #     line-diff friendly.  The .gitignore lives at runtime, not in the source tree.
     _db_backup_result = _write_binary_backup(str(DB_PATH), DATA_DIR / "db-backup")
 
+    # 2c. Daily git gc (best-effort, once per calendar day) — see
+    #     _maybe_run_daily_git_gc's docstring: loose objects carry no delta
+    #     compression until packed by gc, and our object counts never trip
+    #     git gc --auto's own threshold.
+    _git_gc_result = _maybe_run_daily_git_gc(DATA_DIR)
+
     # 3 (was 2). Flush WAL into the main db file so the next nap starts clean.
     # Runs AFTER dump_stripped — see ordering note above (#786 Option A).
     # Skipped entirely when skip_checkpoint=True (degraded-marker override or
@@ -3730,13 +4080,15 @@ def _commit_snapshot_sync(
     # but invisible to the agent reading the nap/sleep response (the class-5
     # silent-failure mode this PR eliminates).
     # Keys: sql_dump (stats from dump_stripped), sql_dump_error (if dump failed),
-    #       db_backup (result from _write_binary_backup — path/bytes/pruned or skipped/error).
+    #       db_backup (result from _write_binary_backup — path/bytes/pruned or skipped/error),
+    #       git_gc (result from _maybe_run_daily_git_gc — ran/skipped/error).
     _dump_fields: dict = {}
     if _dump_stats is not None:
         _dump_fields["sql_dump"] = _dump_stats
     if _dump_error is not None:
         _dump_fields["sql_dump_error"] = _dump_error
     _dump_fields["db_backup"] = _db_backup_result
+    _dump_fields["git_gc"] = _git_gc_result
 
     # 3. Stage explicit files only (never `git add .` — would pull in backups,
     #    daemon sockets, etc.)
