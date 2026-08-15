@@ -3,12 +3,30 @@
 clear sticky user identity, and inject session info into the conversation.
 
 Reading-reminder injection is source-conditional:
-  - source=="startup" (fresh terminal): warm-briefing + newest history file +
-    Piece C git log (last 2 days of commits from both repos).
-  - source=="compact"/"resume" (or anything else): warm-briefing only. The
-    history file is skipped because the compaction summary carries
-    work-thread continuity, and re-reading today's active-day log mid-day
-    introduces "yesterday/today" framing confusion (ob_NNNN, 2026-04-24).
+  - source=="startup" (fresh terminal): warm-briefing + newest history file
+    (the agent's own reading-list discipline resolves "newest", unchanged
+    and out of scope for this hook) + Piece C git log (last 2 days of
+    commits from both repos).
+  - source=="compact"/"resume" (or anything else): warm-briefing +
+    newest-BY-FILENAME history file, injected directly by this hook
+    (#2026 WS2), NOT skipped. Two reasons originally justified skipping
+    this file post-compact; only one survives:
+      1. "the compaction summary carries work-thread continuity" —
+         MEASURED FALSE (16/135 sessions, ~12%, gh#2026). No longer live
+         rationale for anything in this hook.
+      2. "re-reading today's active-day log mid-day introduces
+         yesterday/today framing confusion" (ob_NNNN, 2026-04-24) — STILL
+         TRUE, and the reason WS2 injects with explicit framing rather than
+         merely un-skipping: the same file read fresh (source=="startup",
+         newest file is YESTERDAY's — a handover) and read mid-day
+         (source=="compact", newest file is TODAY's — an already-lived
+         arc) means opposite things, and nothing in the file itself says
+         which. history_arc_block() discharges this by building the
+         "already lived, not a to-do list" framing into the injected block
+         itself, rather than leaving the reading agent to infer the speech
+         act — see that function's docstring for the full design,
+         including why "today" is resolved by filename (not mtime) on this
+         path specifically, and why the rendered label never asserts a day.
 
 The history/git-log bundle is Piece C of the three-piece session-handover
 fix: on startup the agent cross-checks pending-status claims
@@ -1247,6 +1265,215 @@ def session_checkpoint_block(engram_home: str, checkpoint_at: str | None) -> str
         return ""
 
 
+HISTORY_ARC_CHAR_CAP = 32000
+# 2026-08-15: now a two-seat sample, not a single-seat one — the original
+# 16000 was reasoned from this seat's own history files alone (largest
+# observed 8413 bytes, 2026-06-21) and Ariadne's review measured against her
+# own seat's files found it too small: her heaviest single day is 42,760
+# bytes (2026-08-08), median around 5.4KB, but with a long, asymmetric tail
+# — the heavy days are exactly the days worth reading after a compaction.
+# 16000 would have elided roughly two-thirds of her heaviest day. Both
+# samples are anthropic:opus lineage, dated 2026-08-15 — noted here as a
+# confound (Ariadne's own request): the two seats sharing a model family
+# means this is still not evidence the number holds across model families,
+# only that it holds across two same-family seats. Same discipline as
+# CHECKPOINT_LIST_CAP's in-file numbers above: date it, and say plainly
+# what kind of evidence backs it — an undated in-file measurement on this
+# same hook (a #1819 comment) already went stale once and misled a reader
+# earlier today; don't repeat that here.
+
+_HISTORY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+
+
+def _history_arc_header(filename: str, timestamp: str) -> str:
+    """Build the arc-block header for a resolved, non-empty history file,
+    naming the file rather than asserting a day (Ariadne's correction,
+    gh#2026 WS2): "today" can be WRONG at the exact boundary this
+    workstream exists to handle correctly (a post-midnight compact), while
+    the filename -- whichever one newest-by-filename resolution picked --
+    is always right. The framing clause ("already lived, not a to-do
+    list") is what discharges the yesterday/today speech-act confusion
+    this workstream exists to fix -- that part is unchanged and
+    load-bearing; only the day-claiming word is gone.
+    """
+    return (
+        f"📅 Most recent arc — {filename}, last entry {timestamp}. "
+        "Already lived, not a to-do list:"
+    )
+
+
+def history_arc_block(engram_home: str) -> str:
+    """Render today's history-file arc for post-compact SessionStart (#2026 WS2).
+
+    Design context (Ariadne's doc, gh#2026 "Design: WS2"; this function
+    builds §5 of it):
+
+    Today's history file means two different things depending on WHEN it is
+    read. On a fresh terminal (source=="startup") the newest history file is
+    YESTERDAY's — a handover, things already done, some implying work still
+    outstanding. On a mid-day post-compact wake (source=="compact") the
+    newest history file is TODAY's — an arc already lived, nothing left to
+    do about it. Same file, same content, opposite speech act, and nothing
+    in the file itself says which. Injecting the content without fixing
+    this would just relocate the framing-confusion bug from "the agent
+    decides whether to read it" to "the agent decides how to read it" — so
+    the header text below ("already lived, not a to-do list") is not
+    decoration, it is the fix. It is deliberately built into the rendered
+    block itself, never left to the reading agent's own interpretation.
+
+    "Today" resolution — newest-by-filename, not mtime (corrected 2026-08-15,
+    Ariadne's review, gh#2026 WS2; this function originally resolved by
+    mtime instead, and that was wrong). The builder's original reasoning
+    for mtime was the midnight-rollover case: resolving "today" by filename
+    match (YYYY-MM-DD.md == today's wall-clock date) breaks exactly when a
+    session runs past midnight, because the burst that was just compacted
+    may live in YESTERDAY's file by wall-clock-today. But mtime turns out
+    to fail on a DIFFERENT, more common case than the one it was chosen to
+    handle: a maintenance process (a dream-cycle backfill, a consolidation
+    pass) touching an OLDER history file's mtime bumps it later than
+    today's own file's mtime, so mtime-selection picks the wrong file —
+    and this is a real, currently-occurring pattern, not a hypothetical
+    edge case. Newest-by-filename (the highest-sorting YYYY-MM-DD.md that
+    exists) resolves the midnight-rollover case it was originally chosen to
+    handle just as well, with no special case needed — it falls back to
+    yesterday's file naturally, purely because the glob won't find today's
+    file until it exists — while also being immune to the backfill-mtime
+    trap that plain mtime is not. It is the one rule that is right in both
+    windows.
+
+    Boundary timestamp — computed fresh, never stored (design §4, Kepler's
+    argument, quoted because it is the argument someone needs when they
+    re-open the question): "a stored gap is wrong by exactly the age of the
+    marker; a stored timestamp never is." So this function persists nothing
+    of its own; it reads the resolved file's own os.path.getmtime() at
+    render time, every call, and reports that raw signal rather than a
+    precomputed "N minutes ago" derivation that would go stale the moment
+    it was written.
+
+    No shared header with session_checkpoint_block()'s WS1 block (builder
+    decision, matching Ariadne's own stated lean in §7 of her doc: "a
+    shared header implies a shared boundary, which is exactly the coupling
+    we are avoiding"). This block states its own boundary and is rendered
+    immediately adjacent to WS1's, in main() — neither function knows the
+    other exists.
+
+    Sizing: injects the file's own content (the "digest" per design §5.5),
+    capped at HISTORY_ARC_CHAR_CAP with an explicit elision line — never
+    silent truncation. Where a same-basename `-details.md` sidecar exists,
+    the elision line points at it rather than inlining its content (mirrors
+    the checkpoint-node-list's recall_summary-over-full-claim preference:
+    point at the fuller record rather than dumping it into every render).
+
+    Distinguishing "nothing written yet" from "read failed" (design §5.4):
+    an absent history file, an empty (but existing) one, and a HISTORY_DIR
+    that doesn't exist yet at all are all legitimate "no history entries"
+    states and render an explicit line saying so — never "". "" is reserved
+    for a GENUINE read error (permission denied, a broken-symlink
+    HISTORY_DIR that exists-as-a-link but resolves to nothing): an absent
+    block must never be mistaken for a failed one, matching the same
+    principle session_checkpoint_block() states for the checkpoint list.
+
+    Fail-soft like every other block in this file: never raises. Pure read
+    — never writes any file, including its own boundary marker (there is
+    none to write, per the store-nothing rule above).
+    """
+    try:
+        history_dir = os.path.join(engram_home, "history")
+
+        # A HISTORY_DIR that is itself a dangling symlink is a genuine read
+        # error (the link exists but resolves to nothing) — distinct from a
+        # HISTORY_DIR that simply does not exist yet. os.path.isdir() alone
+        # cannot tell these apart (it follows the link, fails, and returns
+        # False either way), so the broken-symlink case is checked first.
+        if os.path.islink(history_dir) and not os.path.exists(history_dir):
+            return ""
+
+        if not os.path.isdir(history_dir):
+            return _history_no_entries_block(filename=None, mtime=None)
+
+        try:
+            names = os.listdir(history_dir)
+        except OSError:
+            # Genuine read error (e.g. permission denied on HISTORY_DIR
+            # itself) — distinct from "nothing written yet".
+            return ""
+
+        candidates = []
+        for name in names:
+            if not _HISTORY_FILE_RE.match(name):
+                continue
+            full = os.path.join(history_dir, name)
+            if not os.path.isfile(full):
+                continue
+            candidates.append(full)
+
+        if not candidates:
+            return _history_no_entries_block(filename=None, mtime=None)
+
+        try:
+            resolved = max(candidates)
+            mtime = os.path.getmtime(resolved)
+        except OSError:
+            return ""
+
+        try:
+            with open(resolved, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return ""
+
+        stripped = content.strip()
+        if not stripped:
+            return _history_no_entries_block(
+                filename=os.path.basename(resolved), mtime=mtime
+            )
+
+        timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        header = _history_arc_header(os.path.basename(resolved), timestamp)
+
+        sidecar_path = resolved[: -len(".md")] + "-details.md"
+        has_sidecar = os.path.isfile(sidecar_path)
+        pointer_path = sidecar_path if has_sidecar else resolved
+
+        if len(stripped) <= HISTORY_ARC_CHAR_CAP:
+            return f"{header}\n{stripped}"
+
+        truncated = stripped[:HISTORY_ARC_CHAR_CAP]
+        cut_chars = len(stripped) - len(truncated)
+        elision = f"... [+{cut_chars} more chars — see {pointer_path}]"
+        return f"{header}\n{truncated}\n{elision}"
+    except Exception:
+        # Hook discipline: never surface history-arc-block errors at session
+        # start.
+        return ""
+
+
+def _history_no_entries_block(filename: str | None, mtime: float | None) -> str:
+    """Render the explicit "no history entries" line for history_arc_block().
+
+    Two callers, two shades of "nothing yet": an EXISTING file whose content
+    is blank (filename + mtime are both real — the file's own name and
+    last-touch time) vs. no history file existing at all (filename and
+    mtime are both None — there is nothing to name or date). The first
+    still names the file and carries a boundary timestamp per design §4 ("a
+    coverage claim must name its own boundary"); the second has no file to
+    name a boundary FROM, so both the filename and the "(as of ...)" wording
+    are simply omitted rather than substituting a fabricated value (e.g.
+    "today", "now") that would misrepresent what the block actually covers.
+    This split is a builder judgment call not spelled out in the design
+    doc — flagged as such in the PR body.
+
+    Naming the file rather than claiming "today" is Ariadne's WS2
+    correction (gh#2026): whichever file newest-by-filename resolution
+    picked is always right, "today" is provably wrong at exactly the
+    post-midnight boundary this workstream exists to handle correctly.
+    """
+    if mtime is None:
+        return "📅 No history entries — no history files exist yet."
+    timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    return f"📅 No history entries — newest file is {filename}, empty (as of {timestamp})."
+
+
 def _resolve_tool_capability_index_path() -> str:
     """Locate the generated tool-capability-index artifact (issue #1958).
 
@@ -2258,15 +2485,32 @@ def main() -> None:
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
-            "responding (relational context post-compact, per Compact "
-            "Instructions). Other Session Start Reading items can be skipped; "
-            "the compaction summary carries work-thread continuity.]"
+            "responding (relational context post-compact). The compaction "
+            "summary is a table-of-contents index into what happened, not a "
+            "full record — useful for navigating back to specifics, not as "
+            "your sole source of continuity. Today's arc below (if present) "
+            "is the fuller picture; ENGRAM nodes below that are the raw "
+            "claims.]"
         )
         lines.append(
             "⚡ A compaction just completed — your context window is fresh and your "
             "energy is refreshed. Any drowsiness figure carried in the summary is "
             "stale-on-arrival; disregard it. You have a full window to work."
         )
+        # History-arc injection (#2026 WS2) — pure filesystem read, does NOT
+        # depend on `marker` (unlike the WS1 checkpoint block below), so it
+        # is called unconditionally here. Rendered adjacent to WS1's
+        # checkpoint block by design (no shared header — see
+        # history_arc_block()'s docstring); both stay in the cheap tier,
+        # before the #1819 ordering-invariant divider, since recovering
+        # session context is the point of this epic and must not be at the
+        # mercy of blocks that are conveniences layered on top of it.
+        try:
+            _history_text = history_arc_block(ENGRAM_HOME)
+        except Exception:
+            _history_text = ""
+        if _history_text:
+            lines.append(_history_text)
 
     # ── Session checkpoint / node-injection block (#2026 WS1) — placed
     # BEFORE the #1819 ordering-invariant comment below, not merely early
