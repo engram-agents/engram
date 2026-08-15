@@ -785,6 +785,33 @@ def focus_block(engram_home: str) -> str:
         - [<id>] (<focus_reason>) <claim>
         - [<id>] <claim>                (when focus_reason is empty/NULL)
 
+    Repeated-reason dedup: a sleep/nap focus rotation typically stamps one
+    shared rationale across every node pinned in that batch, so the naive
+    render duplicates the same reason text once per node (measured 2026-08-15
+    on a real graph: 15 focused nodes carrying only 10 distinct reasons, 39%
+    of focus_reason bytes duplicated, 44,222 -> 30,139 chars). On the SECOND
+    and later appearance of a focus_reason string BYTE-IDENTICAL to one
+    already rendered earlier IN THIS BLOCK, the inline reason is replaced
+    with a back-reference to the FIRST node id that carried it:
+
+        - [<id-A>] (<full reason text>) <claim>           (first occurrence)
+        - [<id-B>] (reason: same as <id-A>) <claim>       (later occurrence)
+
+    Exact-match only — no normalization, no whitespace-stripping, no
+    fuzzy/prefix matching; a single differing byte is a different reason and
+    renders in full. Dedup is computed over the DISPLAYED rows only (i.e.
+    after the FOCUS_LIST_CAP slice is applied), so a back-reference can never
+    dangle by pointing at a first-occurrence row that got cut by the cap.
+    Order is untouched — rows are still emitted in `focused_at` order; dedup
+    only changes what's inlined at a given row, never the row sequence.
+
+    NOT a size guarantee. The back-reference costs ~24 bytes plus the anchor
+    id, so a shared reason SHORTER than that renders slightly larger than
+    simply repeating it. Real rotation rationales are long descriptive
+    passages (the measured case above), which is what makes the trade
+    overwhelmingly favourable in practice — but "always smaller" is not a
+    promise this function makes, and a caller must not rely on one.
+
     Staleness gate (#1975 layer 3): a pin whose focused_at is older than
     config `focus.focus_staleness_days` (default 7) gets a trailing
     "  ⚠ pinned <age> ago — rotate out or re-pin with a current reason"
@@ -827,7 +854,10 @@ def focus_block(engram_home: str) -> str:
         now = datetime.now(timezone.utc)
         stale_count = 0
 
-        lines = []
+        # Pass 1: compute per-row fields (id, claim, reason, stale marker) for
+        # ALL rows — staleness counting must cover every pin, not just the
+        # displayed window (see docstring). Row order is preserved throughout.
+        row_infos = []
         for row in rows:
             node_id = row["id"]
             claim = row["claim"]
@@ -842,14 +872,43 @@ def focus_block(engram_home: str) -> str:
                         f"  ⚠ pinned {_humanize_age_days(age_days)} ago — "
                         "rotate out or re-pin with a current reason"
                     )
-            if focus_reason:
-                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}{stale_marker}")
-            else:
-                lines.append(f"  - [{node_id}] {claim}{stale_marker}")
+            row_infos.append((node_id, claim, focus_reason, stale_marker))
 
-        total = len(lines)
-        display_lines = lines[:FOCUS_LIST_CAP]
-        remaining = total - len(display_lines)
+        total = len(row_infos)
+        display_infos = row_infos[:FOCUS_LIST_CAP]
+        remaining = total - len(display_infos)
+
+        # Pass 2: render only the DISPLAYED rows, deduping repeated
+        # focus_reason text against the first occurrence WITHIN THIS PASS.
+        #
+        # LOAD-BEARING, and it is this line rather than the pass order: the
+        # anchor is drawn from `display_infos`, i.e. from the rows that will
+        # actually be rendered. That alone makes a dangling back-reference
+        # impossible, for ANY cap shape — you cannot reference a row that was
+        # not a candidate.
+        #
+        # What is NOT load-bearing, measured rather than assumed (2026-08-15):
+        # moving dedup BEFORE the cap slice does not by itself break this,
+        # because a prefix cap over the ascending `focused_at` sort always
+        # keeps the earliest occurrence. Dangling needs pre-cap dedup AND a
+        # cap that can drop the anchor (e.g. a suffix cap) — constructed and
+        # confirmed. So if you change where the anchor is drawn from, do not
+        # expect tests/test_focus_block.py to catch it; that test is a smoke
+        # check and says so in its own docstring.
+        first_reason_id = {}  # exact focus_reason string -> first node_id
+        display_lines = []
+        for node_id, claim, focus_reason, stale_marker in display_infos:
+            if focus_reason:
+                if focus_reason in first_reason_id:
+                    anchor_id = first_reason_id[focus_reason]
+                    display_lines.append(
+                        f"  - [{node_id}] (reason: same as {anchor_id}) {claim}{stale_marker}"
+                    )
+                else:
+                    first_reason_id[focus_reason] = node_id
+                    display_lines.append(f"  - [{node_id}] ({focus_reason}) {claim}{stale_marker}")
+            else:
+                display_lines.append(f"  - [{node_id}] {claim}{stale_marker}")
 
         header = "📌 Focused nodes — the deterministic focus channel (verbatim, must survive compaction):"
         block_lines = [header] + display_lines
@@ -1908,8 +1967,25 @@ def main() -> None:
     # that are expensive or depend on runtime state come LAST. A timeout then
     # costs only the optional tail instead of everything.
     #
-    # Measured on a real install (2026-07-25):
-    #     focus_block()              0.002s   (19,958 chars — free)
+    # Measured on a real install:
+    #     focus_block() TIME         ~0.002s   (2026-07-25 — still free; this
+    #                                invariant is about TIME, and TIME is
+    #                                what stays cheap as the graph grows)
+    #     focus_block() SIZE         19,958 chars (2026-07-25) -> 44,222 chars
+    #                                pre-dedup -> 30,139 chars post-dedup
+    #                                (2026-08-15, real graph, 15 focused nodes
+    #                                carrying only 10 distinct reasons) —
+    #                                SIZE is a token-budget concern, NOT what
+    #                                this invariant guards; tracked separately
+    #                                at engram-alpha#127. Repeated-reason
+    #                                dedup (this function, see docstring)
+    #                                cuts the duplicated-reason bytes but
+    #                                does not cap SIZE outright.
+    #                                Note the 3-week 19,958 -> 44,222 drift:
+    #                                nothing reports this block's growth, so
+    #                                DATE every number you add here. The
+    #                                stale figure above read as current for
+    #                                three weeks because it carried no date.
     #     starred_block()            local DB read
     #     calibration block          0.61s warm  (~79% of the hook's warm total
     #                                of 0.81s; dominated by EngramClient()
