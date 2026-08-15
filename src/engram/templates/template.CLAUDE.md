@@ -262,7 +262,7 @@ The SessionStart hook injects a reminder pointer, but this section is the stable
 If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, surface the relevant offline-state to {{USER_NAME}} IMMEDIATELY before any other work that depends on ENGRAM. MCP server offline means tool calls will fail; surface daemon offline means semantic recall degrades to FTS-only.
 
 ## Compact Instructions
-<!-- Source of truth: compact-instructions.md — edit there, not in this template. This comment and the marker below are both replaced at install-time. -->
+<!-- Source of truth: compact-instructions.md — edit there, not in this template. DESIGN: that section carries ONLY an instruction to insert a verbatim block — no session-specific extraction steps — because the summary is written by a tool-less model that can copy but not compute. Read docs/compaction-continuity.md before adding anything back. This comment and the marker below are both replaced at install-time. -->
 {{COMPACT_INSTRUCTIONS}}
 ## Infrastructure Locations
 

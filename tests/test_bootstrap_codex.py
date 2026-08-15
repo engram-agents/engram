@@ -110,10 +110,10 @@ def test_claude_compact_instructions_substitution_integrity():
     2. templates/compact-instructions.md exists and is non-empty.
     3. After substitution, the rendered output contains NO literal
        {{COMPACT_INSTRUCTIONS}} (marker fully resolved).
-    4. The rendered output contains the sentinel substring
-       "This section tells the pre-compaction agent how to write the summary."
-       — a stable, placeholder-free line from the compact body, proving the
-       content actually landed in the render.
+    4. The rendered output contains the compact-instructions.md body
+       verbatim, read from the source file at test time (not a hardcoded
+       literal) — proving the content actually landed in the render without
+       this assertion going stale the next time the compact wording changes.
     5. The ## Compact Instructions header line is present in the rendered output
        (the header stays in the template; only the body moved to the file).
     """
@@ -137,23 +137,27 @@ def test_claude_compact_instructions_substitution_integrity():
         "compact-instructions.md is empty — substitution would produce a gap"
     )
 
-    # 3 + 4 + 5. Apply substitutions and verify rendered output
-    dummy_subs = {
-        "{{AX_HONESTY}}": "ax_0001",
-        "{{AX_HONESTY_DISCRETION}}": "ax_0002",
-        "{{AX_PROVENANCE}}": "ax_0003",
-        "{{DF_ENGRAM}}": "df_0001",
-        "{{DF_EPISTEMIC_IDENTITY}}": "df_0002",
-        "{{GL_EPISTEMIC_HUMILITY}}": "gl_0001",
-        "{{ENGRAM_HOOKS_DIR}}": "/tmp/test/.engram/hooks",
-        "{{ENGRAM_HOME}}": "/tmp/test/.engram",
-        "{{PYTHON}}": "python3",
-        "{{COMPACT_INSTRUCTIONS}}": compact_body,
-    }
+    # 3 + 4 + 5. Render via the production fold function and verify output.
+    #
+    # This MUST call the real fold_compact_instructions() rather than
+    # re-implementing substitution as a local loop. A hand-rolled loop here
+    # (`rendered = template_text; rendered = rendered.replace(marker, body)`)
+    # only proves the test's own two lines are self-consistent — it never
+    # exercises production code, so assertion 4 below would pass even if a
+    # garbage string were substituted for compact_body: the test verifies
+    # its own substitution, not bootstrap's. Routing through the same
+    # function bootstrap.py and the drift tool call (see
+    # test_bootstrap_claude_fold_behavioral_equivalence and
+    # test_codex_bootstrap_renders_three_files, which already do this) makes
+    # the assertion capable of failing when the real fold breaks.
+    import sys as _sys
 
-    rendered = template_text
-    for k, v in dummy_subs.items():
-        rendered = rendered.replace(k, v)
+    src_dir = str(REPO_ROOT / "src" / "engram")
+    if src_dir not in _sys.path:
+        _sys.path.insert(0, src_dir)
+    from template_render import fold_compact_instructions
+
+    rendered = fold_compact_instructions(template_text, compact_body)
 
     # 3. No unreplaced marker remains
     assert "{{COMPACT_INSTRUCTIONS}}" not in rendered, (
@@ -161,14 +165,14 @@ def test_claude_compact_instructions_substitution_integrity():
         "substitution machinery is broken or the marker was duplicated"
     )
 
-    # 4. Sentinel from the compact body is present (proves content landed)
-    sentinel = "This section tells the pre-compaction agent how to write the summary."
-    assert sentinel in rendered, (
-        f"Compact-instructions sentinel not found in rendered output.\n"
-        f"Sentinel: {sentinel!r}\n"
-        f"This means the compact body did NOT land in the render — "
+    # 4. The compact body (read from the source file above, not hardcoded)
+    #    is present verbatim in the rendered output — proves content landed.
+    #    Reading from compact_body directly means this assertion cannot go
+    #    stale when the wording of compact-instructions.md changes.
+    assert compact_body in rendered, (
+        f"compact-instructions.md content did NOT land in the rendered output — "
         f"the {{{{COMPACT_INSTRUCTIONS}}}} substitution produced an empty or "
-        f"wrong result, or the sentinel line was removed from compact-instructions.md."
+        f"wrong result."
     )
 
     # 5. ## Compact Instructions header is present (header stays in the template)
@@ -208,6 +212,43 @@ def test_claude_compact_instructions_substitution_integrity():
     )
 
 
+def test_compact_breadcrumb_doc_pointer_resolves():
+    """The doc path COMPACT_BREADCRUMB_LINE points at must actually exist.
+
+    COMPACT_BREADCRUMB_LINE tells template editors to "Read
+    docs/compaction-continuity.md before adding anything back." A pointer
+    that reads as precise while resolving to nothing is exactly the defect
+    class this whole PR guards against (see the marker/breadcrumb drift
+    guards above) — so guard the pointer itself, not just the marker.
+
+    The path is parsed out of COMPACT_BREADCRUMB_LINE with a regex rather
+    than hardcoded a second time here, so this test cannot itself go stale
+    if the doc is ever renamed and the breadcrumb is updated to match: it
+    always checks whatever path the live breadcrumb currently names.
+    """
+    import sys as _sys
+
+    src_dir = str(REPO_ROOT / "src" / "engram")
+    if src_dir not in _sys.path:
+        _sys.path.insert(0, src_dir)
+    from template_render import COMPACT_BREADCRUMB_LINE
+
+    m = re.search(r"\bdocs/[\w./-]+\.md\b", COMPACT_BREADCRUMB_LINE)
+    assert m, (
+        "No docs/*.md path found inside COMPACT_BREADCRUMB_LINE — "
+        "the breadcrumb no longer points editors anywhere, or the pointer "
+        "changed shape and this test's regex needs updating to match."
+    )
+    doc_relpath = m.group(0)
+    doc_path = REPO_ROOT / doc_relpath
+    assert doc_path.exists(), (
+        f"COMPACT_BREADCRUMB_LINE points at {doc_relpath!r}, but "
+        f"{doc_path} does not exist — the breadcrumb is a dangling pointer. "
+        "Either restore the doc at that path or update the breadcrumb "
+        "(and this test will follow it automatically)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Component B: Codex target renders all three files
 # ---------------------------------------------------------------------------
@@ -243,12 +284,25 @@ def test_codex_bootstrap_renders_three_files():
         assert compact_path.exists(), "codex-compact-prompt.md was not created"
         compact_content = compact_path.read_text()
 
-        # Must contain compact instructions content
-        assert "pre-compaction agent" in compact_content, (
-            "codex-compact-prompt.md missing compact instructions content"
+        # Must contain compact instructions content — read the source file
+        # at test time (not a hardcoded literal) so this cannot go stale
+        # when the wording of compact-instructions.md changes. The seed-ID/
+        # ENGRAM_HOME substitutions don't touch this file's content (it has
+        # no such placeholders), so the raw source text lands unchanged.
+        compact_source = (TEMPLATES_DIR / "compact-instructions.md").read_text()
+        assert compact_source.strip() in compact_content, (
+            "codex-compact-prompt.md missing compact instructions content "
+            "(source file body not found verbatim in rendered output)"
         )
-        assert "FIRST ACTION" in compact_content, (
-            "codex-compact-prompt.md missing FIRST ACTION compact block"
+        # Must contain the "read warm-briefing + history before the task"
+        # directive — the specific behavioral requirement the old "FIRST
+        # ACTION" sentinel guarded. Restated in v2 wording as the "Do these
+        # two reads first" block in compact-instructions.md; guarded here as
+        # its own phrase (distinct from the full-body check above) because
+        # it is the one durable, specific-content property worth naming.
+        assert "Do these two reads first" in compact_content, (
+            "codex-compact-prompt.md missing the read-before-task directive "
+            "('Do these two reads first' block)"
         )
 
         # {{AGENT_NAME}} must remain (first-session's job)
@@ -298,7 +352,7 @@ def test_codex_bootstrap_renders_three_files():
             "config.toml instructions= must NOT contain ## Compact Instructions "
             "(that content belongs in codex-compact-prompt.md)"
         )
-        assert "pre-compaction agent" not in config_content, (
+        assert compact_source.strip() not in config_content, (
             "config.toml instructions= must NOT contain compact instructions body"
         )
 
@@ -577,10 +631,13 @@ def test_bootstrap_claude_fold_behavioral_equivalence():
         "(argument-order bug or wrong variable in bootstrap.py?)"
     )
 
-    # Additionally: compact content is present in the output
-    sentinel = "This section tells the pre-compaction agent how to write the summary."
-    assert sentinel in actual, (
-        f"Compact sentinel not found in bootstrap claude-target output: {sentinel!r}"
+    # Additionally: compact content is present in the output — read from the
+    # source file (compact_text, already loaded above) rather than a
+    # hardcoded literal, so this cannot go stale when the wording of
+    # compact-instructions.md changes.
+    assert compact_text.strip() in actual, (
+        "compact-instructions.md content not found in bootstrap "
+        "claude-target output"
     )
 
     # And the breadcrumb comment is NOT present in the output

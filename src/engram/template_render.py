@@ -71,7 +71,7 @@ from pathlib import Path
 #:
 #: Kept single-line so test_bootstrap_codex.py can find it as a literal
 #: substring of this file's source text (the test reads the raw .py file).
-COMPACT_BREADCRUMB_LINE: str = "<!-- Source of truth: compact-instructions.md — edit there, not in this template. This comment and the marker below are both replaced at install-time. -->\n"  # noqa: E501
+COMPACT_BREADCRUMB_LINE: str = "<!-- Source of truth: compact-instructions.md — edit there, not in this template. DESIGN: that section carries ONLY an instruction to insert a verbatim block — no session-specific extraction steps — because the summary is written by a tool-less model that can copy but not compute. Read docs/compaction-continuity.md before adding anything back. This comment and the marker below are both replaced at install-time. -->\n"  # noqa: E501
 
 #: Files (relative to src/engram/templates/) that are folded together by
 #: bootstrap.py to produce the installed ~/.claude/CLAUDE.md.  The CI guard
