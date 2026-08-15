@@ -1077,6 +1077,175 @@ def starred_block(engram_home: str) -> str:
         return ""
 
 
+# Cap for the per-session node-injection block (#2026 WS1). This is a SAFETY
+# NET for a pathological window (e.g. checkpoint_at stuck at a very old value
+# after a long-unused session), NOT a budget control -- so it must sit clear
+# of every window shape we actually expect, or it starts eliding real work on
+# an ordinary busy day.
+#
+# Measured 2026-08-15 on a real graph: ~121 chars/node; a per-burst window is
+# ~15-20 nodes (~2 KB); the heaviest single DAY observed was 87 nodes
+# (~10.5 KB). An earlier draft used 100, which is only ~15% clear of that 87
+# -- close enough that a slightly busier day than any yet recorded would trip
+# it, which is exactly the wrong place for a net to sit. 200 puts the net
+# roughly 2.3x clear of the busiest observed day while still bounding the
+# pathological case at ~24 KB.
+#
+# The elision is never silent (an explicit "... +N more" line renders), so the
+# failure mode if this is still too low is visible rather than quiet. DATE any
+# number you revise this against; the sibling caps in this file went stale
+# once already for want of one.
+CHECKPOINT_LIST_CAP = 200
+
+
+def _liveness_tag(row) -> str:
+    """Return " [superseded]" / " [retracted]" for a node no longer current.
+
+    The window deliberately includes non-current nodes — a claim I filed and
+    then replaced inside the same burst is part of what happened, and hiding
+    it would erase exactly the self-correction the post-compaction self most
+    needs to know about. But rendering it UNMARKED would present a dead claim
+    as a live one, so the tag carries both facts at four characters' cost.
+
+    Keys on `is_current`, NOT on `status`, and that is the whole subtlety:
+    a superseded node keeps `status='active'` while its `is_current` drops
+    to 0 — measured on a real graph, 175 nodes in that state — so `status`
+    positively asserts liveness on a replaced claim (the same root cause
+    tracked in engram-alpha#2003). A reader keying on `status` alone would
+    label every superseded node "active". Retraction is the one case that
+    does move `status`, so it is distinguished by that; anything else
+    non-current is reported as superseded.
+
+    Fail-soft like everything else in this block: a row missing either
+    column returns "" rather than raising.
+    """
+    try:
+        if row["is_current"]:
+            return ""
+        if (row["status"] or "").strip().lower() == "retracted":
+            return " [retracted]"
+        return " [superseded]"
+    except Exception:
+        return ""
+
+
+def session_checkpoint_block(engram_home: str, checkpoint_at: str | None) -> str:
+    """Render nodes created since checkpoint_at — the per-session "nodes
+    created this session" list (#2026 WS1).
+
+    checkpoint_at is "the start of the window the hook's own channel has
+    not yet injected" (Kepler's wording, #5506, quoted verbatim). Its full
+    lifecycle — seeded once, advanced only on source=="compact", never on
+    nap, and only strictly AFTER this function's return value has been
+    appended to additionalContext — is documented on write_marker(), which
+    owns the field. This function is a PURE READ of it: it never writes the
+    marker file itself, matching focus_block()/starred_block()'s discipline
+    (pure read, fail-soft, returns "" on anything unexpected, never raises
+    — hook must never block session start).
+
+    checkpoint_at is None ⇒ returns "" immediately, covering two cases this
+    function treats identically (the caller distinguishes them for its own
+    seeding step — see write_marker()'s docstring): a legacy marker written
+    before this field existed, and a genuinely first-ever SessionStart for
+    this session_id. Neither case falls back to "beginning of time" — that
+    would dump the whole graph on the very first render, which is exactly
+    the failure this guard exists to prevent.
+
+    Window: nodes with created_at >= checkpoint_at, no upper bound. A node
+    created between this query and the caller's advance-after-inject write
+    is safe to double-report in the NEXT window — an overlap is the safe
+    direction of error, never a gap (same principle as advance-after-inject
+    itself: never claim coverage that wasn't actually rendered).
+
+    Exclusion is by PROPERTY, not by type: a node is skipped when
+    `not (claim or recall_summary)` — i.e. it would render blank either
+    way. Do NOT special-case type == 'evidence' — that is a proxy for the
+    property actually measured (Borges, #5504) and goes stale silently the
+    day an 'ev_' node starts carrying its own claim text. Measured: this
+    drops 64/310 (~21%) of a real week's nodes, all of which render blank;
+    every dropped 'ev_' node stays reachable from the observation citing it.
+
+    Per node: `id`, `type`, and `recall_summary` falling back to
+    `claim[:100]` (recall_summary is present on 214/310 = 69% of a recent
+    week — the #1952 degrade path is already partly live and this fallback
+    covers the rest). No further truncation is applied to recall_summary
+    itself — unlike the unrelated _reflect_rs_or_claim helper in
+    engram_core.py (200-char cap), which this hook deliberately does not
+    import (fastmcp-free discipline, same as the tool-capability-index
+    block above).
+
+    Capped at CHECKPOINT_LIST_CAP with an explicit "... +N more" line —
+    never truncated silently.
+
+    Placement (see main()): this function's call site sits BEFORE the
+    #1819 ordering-invariant comment, in the same cheap tier as
+    focus_block(). Measured 2026-08-15: the underlying query is a FULL
+    TABLE SCAN — there is no index on created_at — and costs 1.2ms over
+    2957 nodes. Cheap today; at 30k+ nodes this will be the first thing
+    someone wants to speed up, and by then this number will be stale —
+    that is the whole reason this spec exists: an undated in-file
+    measurement on this same hook (focus_block's SIZE figure) already went
+    stale once. DATE every number you add here.
+
+    Returns "" when the DB is missing, checkpoint_at is None, the window is
+    empty (before or after exclusion), or on any read error. Never raises.
+    """
+    if not checkpoint_at:
+        return ""
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, type, claim, recall_summary, created_at, "
+                "is_current, status FROM nodes "
+                "WHERE created_at >= ? ORDER BY created_at ASC",
+                (checkpoint_at,),
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not rows:
+            return ""
+
+        entries = []
+        for row in rows:
+            claim = (row["claim"] or "").strip()
+            recall_summary = (row["recall_summary"] or "").strip()
+            # Property-based exclusion (not type-based) — see docstring.
+            if not (claim or recall_summary):
+                continue
+            text = recall_summary if recall_summary else claim[:100]
+            entries.append((row["id"], row["type"], text, _liveness_tag(row)))
+
+        if not entries:
+            return ""
+
+        total = len(entries)
+        display_entries = entries[:CHECKPOINT_LIST_CAP]
+        remaining = total - len(display_entries)
+
+        header = f"[Nodes created since checkpoint ({checkpoint_at}) — {total} node(s)]:"
+        block_lines = [header]
+        for node_id, node_type, text, liveness in display_entries:
+            block_lines.append(f"  - [{node_id}] ({node_type}){liveness} {text}")
+        if remaining > 0:
+            block_lines.append(f"  ... +{remaining} more")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface checkpoint-block errors at session start.
+        return ""
+
+
 def _resolve_tool_capability_index_path() -> str:
     """Locate the generated tool-capability-index artifact (issue #1958).
 
@@ -1270,6 +1439,70 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
 
 
 def write_marker(hook_input: dict) -> dict | None:
+    """Write/refresh the per-session marker; also owns two checkpoint fields
+    consumed by session_checkpoint_block() (#2026 WS1).
+
+    `session_started_at` — written ONCE, on the first SessionStart for a
+    given session_id. Never clobbered thereafter, unlike `started_at`
+    below (still overwritten with now() on every SessionStart including
+    source=="compact" — that overwrite already destroys the pre-compaction
+    burst's start time for anything reading `started_at` alone; it's why
+    this field exists as a second, protected value). If an existing marker
+    for this session_id already carries `session_started_at`, it is carried
+    forward VERBATIM; otherwise it adopts this call's own `started_at`.
+
+    `checkpoint_at` — "the start of the window the hook's own channel has
+    not yet injected" (Kepler's wording, #5506, quoted verbatim). This
+    function NEVER advances checkpoint_at — it only ever carries forward
+    whatever value (possibly absent) the prior marker held. The only writer
+    of a NEW checkpoint_at value is main()'s advance-after-inject step (see
+    main() and _persist_checkpoint_at()), which runs strictly AFTER
+    session_checkpoint_block() has rendered for this turn — never before.
+    If the order inverted, a failed or partial render would leave a
+    boundary claiming coverage it never actually delivered, and the next
+    window would silently start too late (same discipline as the
+    forum/letter cursors' seed-on-successful-poll-only).
+
+    checkpoint_at moves ONLY on SessionStart with source=="compact" — NOT
+    on nap. This was a genuinely contested design question (two senior
+    colleagues reached opposite answers) settled by measurement, not
+    intuition: advancing on nap would couple WS1's *floor* mechanism (this
+    field — a mechanical, always-fires guarantee) to WS3's *discipline*
+    mechanism (the nap routine — an authored, sometimes-thorough summary),
+    giving both the same blind spot, which is the one thing WS1 exists not
+    to have. Measured 2026-08-14: across a single real nap, a graph took 74
+    nodes that day, and 40 of them (54%) were created BEFORE the nap ran.
+    Naps run about once a day, so the rare-nap case makes the hidden window
+    LARGER if nap were allowed to advance it, not smaller. If a future
+    workstream (WS3) wants a nap-updatable arc pointer, that is a THIRD
+    field with its own name — never a repurposing of this one.
+
+    Pre-empting the post-WS2 version of the same argument: once WS2 ships
+    (history-file injection), the day's history arc IS present in the
+    post-compaction reader too, and someone will notice that and re-argue
+    that nap can advance checkpoint_at after all, now that "the content is
+    covered elsewhere." The answer stays no. The history arc is AUTHORED
+    coverage — as complete as the nap chose to write it, no more. The node
+    list this field gates is MECHANICAL coverage — every node, regardless
+    of whether anyone thought to mention it. Letting the mechanical
+    channel's window depend on the authored channel's quality re-couples
+    the floor to the discipline — the exact independence this workstream
+    exists to provide. The two channels are allowed to overlap in content;
+    neither's BOUNDARY may depend on the other's content.
+
+    Backward compatibility: existing marker files predating this field pair
+    have neither. Both are treated as absent-not-error, never as reason to
+    fail the write:
+      - missing session_started_at -> adopt this call's own started_at.
+      - missing checkpoint_at -> carried forward as absent (still None) by
+        THIS function; session_checkpoint_block() renders nothing for that
+        turn (see its own docstring — it never falls back to "beginning of
+        time"), and main()'s advance-after-inject step seeds a fresh value
+        after that empty render completes — on ANY source, not just
+        source=="compact", because a field that could only ever be seeded
+        on a compact event might go unseeded indefinitely for a session
+        that never compacts before ending.
+    """
     session_id = hook_input.get("session_id")
     transcript_path = hook_input.get("transcript_path")
     if not session_id or not transcript_path:
@@ -1281,14 +1514,45 @@ def write_marker(hook_input: dict) -> dict | None:
     _cwd_val = hook_input.get("cwd") or ""
     if _effective_role == "interactive" and _FAIRY_CWD_RE.search(_cwd_val):
         _effective_role = "fairy"
+
+    session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+    # Carry forward session_started_at + checkpoint_at from any existing
+    # marker for this session_id (see docstring above). Absence of a prior
+    # marker (first-ever SessionStart) and an unreadable/corrupt prior
+    # marker are both treated the same way: nothing to carry forward.
+    _existing_session_started_at = None
+    _existing_checkpoint_at = None
+    _existing_started_at = None
+    try:
+        with open(session_marker_path) as _existing_f:
+            _existing_marker = json.load(_existing_f)
+        if isinstance(_existing_marker, dict):
+            _existing_session_started_at = _existing_marker.get("session_started_at")
+            _existing_checkpoint_at = _existing_marker.get("checkpoint_at")
+            _existing_started_at = _existing_marker.get("started_at")
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    _started_at = datetime.now(timezone.utc).isoformat()
     marker = {
         "session_id": session_id,
         "transcript_path": transcript_path,
         "source": hook_input.get("source"),
         "cwd": hook_input.get("cwd"),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": _started_at,
         "role": _effective_role,
         "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(_effective_role, _effective_role),
+        # Legacy-upgrade order matters and is not cosmetic: a marker predating
+        # this field still holds a `started_at` written at the PREVIOUS
+        # SessionStart, which for a session that has not yet compacted IS its
+        # true start. Adopting now() there would discard the one piece of real
+        # history the old marker carries, so the prior `started_at` is
+        # preferred over now() and only a wholly-absent marker falls through.
+        "session_started_at": (
+            _existing_session_started_at or _existing_started_at or _started_at
+        ),
+        "checkpoint_at": _existing_checkpoint_at,
     }
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
@@ -1306,12 +1570,70 @@ def write_marker(hook_input: dict) -> dict | None:
             prune_stale_session_markers(session_id)
         except Exception as exc:
             print(f"[engram-session-start] prune: unexpected error, skipped: {exc}", file=sys.stderr)
-        session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
         with open(session_marker_path, "w") as f:
             json.dump(marker, f)
     except OSError:
         return None
     return marker
+
+
+def _persist_checkpoint_at(engram_home: str, session_id: str, new_checkpoint_at: str) -> None:
+    """Persist an advanced checkpoint_at to the per-session marker file.
+
+    Called ONLY from main(), strictly AFTER session_checkpoint_block() has
+    already rendered for this SessionStart (advance-after-inject invariant
+    — see write_marker()'s docstring). If the file can't be read back, the
+    checkpoint simply doesn't move this turn — an unadvanced boundary
+    under-covers less badly than a falsely-advanced one that claims
+    coverage it never actually rendered.
+
+    Re-reading the marker rather than patching an in-memory copy avoids
+    clobbering with THIS invocation's already-stale `marker` dict. Stated
+    precisely because it is easy to over-claim: it does NOT close the
+    read-modify-write race against a genuinely concurrent writer to the
+    same path — two processes can still interleave read/read/write/write
+    and the later write wins. That residual race is accepted; per-session
+    markers are keyed by session_id and a second writer to the same
+    session_id is not a case this hook is designed around.
+
+    The write itself IS atomic (temp file in the same directory +
+    os.replace), matching the registry and config.json writes elsewhere in
+    this file, and that part is not optional. This hook runs under a 5s
+    harness timeout and is KILLED on overrun — see main()'s ordering
+    invariant — so a plain truncate-and-write can leave a torn marker. A
+    torn marker reads as corrupt, write_marker() then treats it as absent,
+    and checkpoint_at silently reseeds to now(): a GAP in the continuity
+    window, which is the one direction this whole workstream exists to
+    rule out. Overlap is the safe error; a gap is not.
+
+    Fail-soft: any exception is swallowed. Must never raise — called from
+    the cheap tier of SessionStart, same discipline as every other block
+    there.
+    """
+    try:
+        marker_path = os.path.join(engram_home, "sessions", f"{session_id}.json")
+        with open(marker_path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        data["checkpoint_at"] = new_checkpoint_at
+        # Atomic write: temp file in same dir + os.replace (same-fs, no torn
+        # write if this process is killed mid-dump). Same pattern as the
+        # agent-registry and config.json writes above.
+        marker_dir = os.path.dirname(marker_path)
+        fd, tmp_path = tempfile.mkstemp(dir=marker_dir, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp_path, marker_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception:
+        pass
 
 
 def piece_c_git_log() -> str:
@@ -1956,6 +2278,45 @@ def main() -> None:
             "energy is refreshed. Any drowsiness figure carried in the summary is "
             "stale-on-arrival; disregard it. You have a full window to work."
         )
+
+    # ── Session checkpoint / node-injection block (#2026 WS1) — placed
+    # BEFORE the #1819 ordering-invariant comment below, not merely early
+    # within its cheap tier: recovering session context across compaction
+    # is the entire point of this workstream, so its render must not be at
+    # the mercy of blocks that exist only as conveniences layered on top of
+    # it. It is nonetheless cheap by the same measure the divider cares
+    # about — a single indexed-free full-table-scan read, 1.2ms @ 2957
+    # nodes (2026-08-15, see session_checkpoint_block()'s docstring).
+    # checkpoint_at's full lifecycle (definition, why nap must never
+    # advance it, why advance happens strictly after render) is documented
+    # on write_marker(); this is only the render-then-advance call site.
+    _checkpoint_advance_now = datetime.now(timezone.utc).isoformat()
+    if marker:
+        _checkpoint_at_before = marker.get("checkpoint_at")
+        try:
+            _checkpoint_text = session_checkpoint_block(ENGRAM_HOME, _checkpoint_at_before)
+        except Exception:
+            _checkpoint_text = ""
+        if _checkpoint_text:
+            lines.append(_checkpoint_text)
+
+        # Advance-after-inject, strictly: persist a new checkpoint_at ONLY
+        # after the render above has completed — whether or not it produced
+        # any text (an empty window is still a completed render, not a
+        # failed one; the guard below is about ORDER, not about the render
+        # succeeding non-emptily). Two distinct triggers:
+        #   - seed: checkpoint_at was absent (legacy marker, or genuinely
+        #     first SessionStart for this session) — fires on ANY source.
+        #     A field that could only ever be seeded on source=="compact"
+        #     might go unseeded indefinitely for a session that never
+        #     compacts; "renders nothing this once" (session_checkpoint_
+        #     block's None-guard) already makes the no-window case safe.
+        #   - advance: checkpoint_at was already present — fires ONLY on
+        #     source=="compact". NEVER on nap — nap is a different routine
+        #     entirely and never invokes this hook; see write_marker()'s
+        #     docstring for the measured 54% figure behind this gate.
+        if not _checkpoint_at_before or source == "compact":
+            _persist_checkpoint_at(ENGRAM_HOME, marker["session_id"], _checkpoint_advance_now)
 
     # ══ ORDERING INVARIANT (#1819) ═════════════════════════════════════════
     # This hook runs under a 5s harness timeout. If it overruns, the process is
