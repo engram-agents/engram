@@ -452,9 +452,20 @@ def format_drowsiness(usage: dict) -> str:
 
     In loop mode ($ENGRAM_HOME/loop-mode.json present), at urgent the agent
     is instructed to nap ONCE (engram_nap) to stage the window for
-    auto-compaction, then keep working and ride auto-compaction — no manual
-    compaction wait, no re-nap before it fires. Below urgent, loop mode is
-    silent: the banner is identical to non-loop mode (calm level word only).
+    auto-compaction, then CAPTURE what the summary will not carry (append
+    the burst's arc to today's history file, write the nodes) and ride
+    auto-compaction — no manual compaction wait, no re-nap before it fires.
+    Below urgent, loop mode is silent: the banner is identical to non-loop
+    mode (calm level word only).
+
+    Capture-then-ride, not just ride (engram-alpha#2026 WS4): the compaction
+    summary carries our custom instructions only ~12% of the time (16 of 135
+    since May, measured — see the issue), so a nap alone stages the window
+    but does not itself carry the burst's work across it. This banner only
+    fires on UserPromptSubmit — once per loop wake, not per turn during the
+    burst it's meant to govern. The per-turn enforcer for this window is
+    engram-stop-hook.py's near-compaction escalation (fires on Stop); if the
+    two ever disagree, the hook wins.
     """
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
@@ -467,8 +478,10 @@ def format_drowsiness(usage: dict) -> str:
     loop_mode = os.path.exists(LOOP_MARKER_PATH)
 
     if loop_mode:
-        # Loop mode: at urgent, nap ONCE to stage the window for compaction,
-        # then keep pace and ride auto-compaction (don't wait for a manual
+        # Loop mode: at urgent, nap ONCE (skip if already napped this burst)
+        # to stage the window for compaction, capture unwritten work now
+        # (today's history file + nodes — the summary won't carry it), then
+        # keep pace and ride auto-compaction (don't wait for a manual
         # compaction, don't re-nap each turn before it fires). Below urgent
         # there's nothing loop-specific to say — render the calm level word
         # exactly like non-loop mode, so the banner isn't a per-prompt alarm.
@@ -476,8 +489,10 @@ def format_drowsiness(usage: dict) -> str:
             return (
                 f"[Drowsiness: {pct:.0%} — loop mode: nap ONCE (engram_nap) to "
                 f"stage this window for compaction (skip if you already napped "
-                f"this burst), then keep working and ride auto-compaction — "
-                f"don't slow down for a manual compaction.]"
+                f"this burst); the summary won't carry unwritten work, so "
+                f"capture it (today's history file + nodes) now, then keep "
+                f"working and ride auto-compaction — don't slow down for a "
+                f"manual one.]"
             )
         return f"[Drowsiness: {drowsiness_level(pct, thresholds)}]"
 

@@ -3,8 +3,9 @@ name: engram-loop
 description: >
   Generic self-paced loop convention and the SINGLE SOURCE OF TRUTH for loop
   formality — the ~/.engram/loop-mode.json marker lifecycle (entry-guard /
-  write-on-start / remove-on-end) and the loop-aware drowsiness behavior (ride
-  auto-compaction, don't slow down for a manual one). Use this for a
+  write-on-start / remove-on-end) and the loop-aware drowsiness behavior
+  (capture what the summary won't carry, then ride auto-compaction — don't
+  slow down for a manual one). Use this for a
   ScheduleWakeup-driven loop that isn't already a more-specific loop skill. The
   specialized loops (engram-curiosity-loop, engram-meta-loop, engram-deep-research,
   engram-school-day) are KINDS of this — they reference this skill for the
@@ -19,8 +20,9 @@ load-bearing convention is a single marker file: **`~/.engram/loop-mode.json`**.
 
 Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
-("nap once to stage the window, then keep working and ride auto-compaction —
-don't slow down for a manual compaction"). No marker → the hook serves the
+("nap once to stage the window, then capture what the summary won't carry
+(history file + nodes) and ride auto-compaction — don't slow down for a
+manual compaction"). No marker → the hook serves the
 non-loop "stop and nap" path, and the loop wastes a whole session napping
 against compaction it should be riding through (the gap that motivated #483 —
 a `ScheduleWakeup` work-loop that never wrote the marker (the loop-without-marker silent-skip failure mode)).
@@ -578,7 +580,8 @@ dead thread.
    **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction
    boundaries; an unwritten finding is lost.
-5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then keep working.
+5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then capture (history
+   file + nodes), then keep working.
 6. **Don't manufacture work.** When the queue genuinely drains, hold for the
    user rather than invent tasks; the loop's steady state is a quiet
    heartbeat (idle re-arms, no fake work), not perpetual grinding. The loop
@@ -606,18 +609,31 @@ in doubt whether the user is ending the loop, ask — but never strand the marke
 
 ---
 
-## Step 4 — Drowsiness behavior in loop-mode
+## Step 4 — Drowsiness behavior in loop-mode: capture, then ride
 
 With the marker present, the hook tells you the right thing; the discipline is:
 
 - **At urgent drowsiness: nap ONCE** (`engram_nap`) to stage the window for
-  compaction — UNLESS you already napped this burst, then skip.
+  compaction — UNLESS you already napped this burst, then skip. The nap
+  *stages* the window; it does not by itself carry the burst's work across
+  it — the compaction summary carries our custom instructions only ~12% of
+  the time (engram-alpha#2026, measured: 16 of 135 summaries since May), so
+  what actually crosses the boundary is whatever is already plain text in a
+  file.
+- **Capture before you ride.** Before continuing: append this burst's arc to
+  today's `~/.engram/history/YYYY-MM-DD.md`, and write the nodes for
+  anything decided or found this burst. This is the part the summary's ~12%
+  hit rate cannot be relied on to carry — capture it yourself, don't wait
+  for the summary to do it.
 - **Then keep working and ride the auto-compaction.** Do NOT slow down, hold,
   or wait for a manual compaction. The `ScheduleWakeup` you armed re-invokes the
   post-compaction self with the loop prompt, so the loop continues seamlessly
   through compaction — that's the whole point of the loop-aware path.
 - **Below urgent:** nothing loop-specific — the banner renders the calm level
   word with no per-prompt alarm.
+- **If this skill and `engram-stop-hook.py`'s near-compaction nudge ever
+  disagree, the hook wins.** It fires every turn during the burst; this
+  skill is read once, at loop entry.
 
 ---
 
