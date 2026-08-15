@@ -1438,10 +1438,37 @@ def history_arc_block(engram_home: str) -> str:
         if len(stripped) <= HISTORY_ARC_CHAR_CAP:
             return f"{header}\n{stripped}"
 
-        truncated = stripped[:HISTORY_ARC_CHAR_CAP]
-        cut_chars = len(stripped) - len(truncated)
-        elision = f"... [+{cut_chars} more chars — see {pointer_path}]"
-        return f"{header}\n{truncated}\n{elision}"
+        # Tail-slice, not head-slice: history files are chronological
+        # ascending (oldest entry first, newest last), and the header above
+        # advertises "Most recent arc" — so an over-cap file must keep the
+        # NEWEST HISTORY_ARC_CHAR_CAP chars and drop the oldest, never the
+        # reverse (gh#2052).
+        # start_idx > 0 is guaranteed by the `len(stripped) <= CAP` guard
+        # just above (this branch only runs when len(stripped) > CAP), so
+        # `stripped[start_idx - 1]` below never wraps to stripped[-1].
+        start_idx = len(stripped) - HISTORY_ARC_CHAR_CAP
+        tail = stripped[start_idx:]
+        if start_idx > 0 and stripped[start_idx - 1] != "\n":
+            # The raw tail slice lands mid-line; advance to the start of
+            # the next complete line so the kept content never opens on a
+            # fragment. This can only shrink the kept text, never grow it
+            # past the cap. If the tail contains no newline at all (one
+            # pathologically long line at least CAP chars long), there is
+            # no clean boundary to advance to -- fall back to the raw,
+            # possibly-ragged tail rather than returning nothing: a
+            # slightly ragged first line still shows the newest content,
+            # while an empty kept region would silently look like a
+            # normal trim and hide a real read failure behind the elision
+            # line's ordinary-looking wording.
+            newline_idx = tail.find("\n")
+            kept = tail[newline_idx + 1 :] if newline_idx != -1 else tail
+        else:
+            # The slice boundary already falls right after a newline, so
+            # the tail already starts on a complete line.
+            kept = tail
+        cut_chars = len(stripped) - len(kept)
+        elision = f"... [+{cut_chars} earlier chars elided — see {pointer_path}]"
+        return f"{header}\n{elision}\n{kept}"
     except Exception:
         # Hook discipline: never surface history-arc-block errors at session
         # start.

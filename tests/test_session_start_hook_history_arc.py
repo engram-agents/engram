@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import time
 from contextlib import redirect_stdout
@@ -299,8 +300,10 @@ def test_cap_enforcement_renders_explicit_elision_line(engram_home):
     text = mod.history_arc_block(str(engram_home))
     assert ("X" * cap) in text
     assert ("X" * (cap + 1)) not in text, "content must be capped, not silently included in full"
-    assert f"+{overflow} more chars" in text
+    assert f"+{overflow} earlier chars elided" in text
     assert str(path) in text  # no sidecar -> points at the file's own path
+    # Elision line precedes the kept content, not follows it (gh#2052).
+    assert text.index("earlier chars elided") < text.index("X" * cap)
 
 
 # ---------------------------------------------------------------------------
@@ -413,3 +416,219 @@ def test_history_arc_precedes_calibration_and_is_adjacent_to_checkpoint(engram_h
     # before the checkpoint header in `lines`).
     between = ctx[history_idx:checkpoint_idx]
     assert between.count("\n\n") <= 2, f"unexpected content between the two adjacent blocks: {between!r}"
+
+
+# ---------------------------------------------------------------------------
+# 11. gh#2052 regression: history_arc_block() was tail-slicing wrong — it
+#     did `stripped[:CAP]` (a HEAD slice) on files that are chronological
+#     ASCENDING (oldest entry first, newest last), so an over-cap file kept
+#     the OLDEST content and dropped the NEWEST -- while the block's own
+#     header claims "Most recent arc". These tests exercise the fix: a TAIL
+#     slice, cut on a clean line boundary, with the elision line ABOVE the
+#     kept content and an accurate, start-naming char count.
+# ---------------------------------------------------------------------------
+
+def _split_block(text: str):
+    """Split a history_arc_block() over-cap render into its three guaranteed
+    single-line-header/single-line-elision/multi-line-kept parts. Relies on
+    the function's own contract: `f"{header}\\n{elision}\\n{kept}"`, where
+    header and elision are always exactly one line each."""
+    header_line, elision_line, kept_content = text.split("\n", 2)
+    return header_line, elision_line, kept_content
+
+
+def test_direction_keeps_newest_drops_oldest(engram_home):
+    """The regression test for gh#2052: an over-cap file's NEWEST entries
+    must survive and its OLDEST entries must be dropped -- never the
+    reverse. Asserts on specific marker strings, not on lengths."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    filler = "x" * 60
+    n_lines = (cap // (len(filler) + 20)) + 40  # comfortably over the cap
+    lines = [f"- entry {i:04d} {filler}" for i in range(n_lines)]
+    lines[0] = f"- OLDEST-ENTRY-MARKER {filler}"
+    lines[-1] = f"- NEWEST-ENTRY-MARKER {filler}"
+    big_content = "\n".join(lines)
+    assert len(big_content.strip()) > cap, "fixture must actually exceed the cap"
+
+    _write_history_file(history_dir, "2026-08-15.md", big_content)
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    assert "NEWEST-ENTRY-MARKER" in text, "the newest entry must survive the cap (gh#2052)"
+    assert "OLDEST-ENTRY-MARKER" not in text, "the oldest entry must be dropped, not the newest (gh#2052)"
+
+
+def test_elision_line_precedes_content_and_names_the_start(engram_home):
+    """The elision line renders ABOVE the kept content (not below), and its
+    wording names what was elided FROM THE START -- not a generic
+    "more chars" phrase that reads as trimming the end (gh#2052)."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    filler = "x" * 60
+    n_lines = (cap // (len(filler) + 20)) + 40
+    lines = [f"- entry {i:04d} {filler}" for i in range(n_lines)]
+    big_content = "\n".join(lines)
+    path = _write_history_file(history_dir, "2026-08-15.md", big_content)
+
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, elision_line, kept_content = _split_block(text)
+    assert "earlier chars elided" in elision_line, elision_line
+    assert str(path) in elision_line
+    # The old, misleading wording must be gone entirely.
+    assert "more chars" not in text
+    # Elision line is structurally BEFORE the kept content (it is the
+    # middle of the three split() parts, and kept_content carries none of
+    # the elision wording).
+    assert "elided" not in kept_content
+
+
+def test_boundary_cleanliness_advances_to_next_complete_line(engram_home):
+    """A raw tail slice can land mid-line; the kept content must always
+    open on a COMPLETE line, never a fragment. Construct a fixture where a
+    naive `stripped[-cap:]` slice demonstrably lands inside one very long
+    line, and assert the returned text carries no fragment of it (gh#2052)."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    marker = "STRADDLE-MID-LINE-MARKER-"
+    straddle = marker + ("s" * cap)  # one single line, longer than the cap alone
+    rest = "\n- NEWEST-KEPT-LINE-MARKER\n"
+    big_content = straddle + rest
+    stripped = big_content.strip()
+    assert len(stripped) > cap
+
+    # Confirm the fixture actually exercises the mid-line case: a raw
+    # `stripped[-cap:]` slice must land inside `straddle`, not at a
+    # newline -- otherwise this test would not be testing what it claims.
+    start_idx = len(stripped) - cap
+    assert stripped[start_idx - 1] != "\n", "fixture must land mid-line for this test to be meaningful"
+    assert marker not in stripped[start_idx:], "fixture must cut past the marker, inside the filler run"
+
+    _write_history_file(history_dir, "2026-08-15.md", big_content)
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    assert "NEWEST-KEPT-LINE-MARKER" in text
+    assert marker not in text, "the straddled line must be dropped whole, not partially kept"
+    assert "sss" not in text, "a raw mid-line cut would leak straddle filler ('s' runs) into the kept content"
+
+    _header_line, _elision_line, kept_content = _split_block(text)
+    assert kept_content == "- NEWEST-KEPT-LINE-MARKER", repr(kept_content)
+
+
+def test_cut_chars_accurate_after_boundary_adjustment(engram_home):
+    """cut_chars must equal len(stripped) - len(kept) for what is ACTUALLY
+    returned -- i.e. computed AFTER the line-boundary adjustment, not the
+    pre-adjustment `len(stripped) - HISTORY_ARC_CHAR_CAP` figure (gh#2052)."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    filler = "x" * 60
+    n_lines = (cap // (len(filler) + 20)) + 40
+    lines = [f"- entry {i:04d} {filler}" for i in range(n_lines)]
+    big_content = "\n".join(lines)
+    stripped = big_content.strip()
+    assert len(stripped) > cap
+
+    _write_history_file(history_dir, "2026-08-15.md", big_content)
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, elision_line, kept_content = _split_block(text)
+    m = re.search(r"\+(\d+) earlier chars elided", elision_line)
+    assert m, elision_line
+    reported_cut = int(m.group(1))
+
+    assert reported_cut == len(stripped) - len(kept_content), (
+        reported_cut, len(stripped), len(kept_content)
+    )
+    # And the pre-adjustment figure (what the OLD/buggy report would have
+    # said) must NOT be what's reported, since the boundary snap changes
+    # the kept length by a nonzero amount for this fixture.
+    naive_cut_chars = len(stripped) - cap
+    assert kept_content != stripped[-cap:], "fixture must actually exercise a mid-line boundary snap"
+    assert reported_cut != naive_cut_chars or len(kept_content) == cap
+
+
+def test_undercap_path_unchanged_no_elision_line(engram_home):
+    """Under the cap: full content, byte-identical to today, no elision
+    line at all (unchanged behaviour -- gh#2052 only touches the over-cap
+    branch)."""
+    history_dir = engram_home / "history"
+    content = "- a small entry\n- another small entry\n"
+    _write_history_file(history_dir, "2026-08-15.md", content)
+
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    assert "elided" not in text
+    assert "more chars" not in text
+    assert content.strip() in text
+    _header_line, rest = text.split("\n", 1)
+    assert rest == content.strip()
+
+
+def test_kept_content_never_exceeds_the_cap(engram_home):
+    """The kept content length must never exceed HISTORY_ARC_CHAR_CAP -- the
+    line-boundary snap can only shrink it, never grow it past the cap
+    (gh#2052)."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    filler = "x" * 60
+    n_lines = (cap // (len(filler) + 20)) + 40
+    lines = [f"- entry {i:04d} {filler}" for i in range(n_lines)]
+    big_content = "\n".join(lines)
+    _write_history_file(history_dir, "2026-08-15.md", big_content)
+
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, _elision_line, kept_content = _split_block(text)
+    assert len(kept_content) <= cap, len(kept_content)
+
+
+def test_no_newline_in_capped_tail_falls_back_to_raw_tail_not_empty(engram_home):
+    """Degenerate case: the final HISTORY_ARC_CHAR_CAP characters of the file
+    contain no newline at all (e.g. one pathologically long single line --
+    a pasted blob, a very long one-line entry). There is no clean line
+    boundary to advance to. Round-2 review finding (gh#2052): falling back
+    to an empty kept region here is strictly worse than the original bug --
+    it silently renders a real file as content-free behind an
+    ordinary-looking elision line. The fix must fall back to the RAW tail
+    (a possibly-ragged first line) rather than dropping everything."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    # One single line with no newline anywhere in it, long enough on its
+    # own to exceed the cap -- so the entire capped tail region is inside
+    # this one line, with no '\n' for the boundary-snap logic to find.
+    single_line = "NO-NEWLINE-AT-ALL-" + ("z" * (cap + 500))
+    _write_history_file(history_dir, "2026-08-15.md", single_line)
+    stripped = single_line.strip()
+    assert len(stripped) > cap
+    # Sanity: confirm the fixture actually has no newline in the capped
+    # tail region, so this test exercises the fallback and not the normal
+    # line-boundary-snap path.
+    start_idx = len(stripped) - cap
+    assert "\n" not in stripped[start_idx:], "fixture must contain no newline in the capped tail"
+
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, _elision_line, kept_content = _split_block(text)
+    assert kept_content != "", "no-newline-in-tail must fall back to the raw tail, not return empty content"
+    assert len(kept_content) <= cap, len(kept_content)
+    # The newest text (the file's tail end) must be present.
+    assert kept_content.endswith("z" * 100), kept_content[-120:]
