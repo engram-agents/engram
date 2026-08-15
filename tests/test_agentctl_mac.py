@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import socket
 import subprocess
 from pathlib import Path
+
+import pytest
 
 AGENTCTL_MAC = Path(__file__).resolve().parent.parent / "tools" / "agentctl-mac"
 AGENTCTL_LINUX = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
@@ -56,6 +59,66 @@ def test_missing_agent_name_errors():
     assert rc == 2
     assert not out
     assert "agent name" in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# attach subcommand
+#
+# `claude agents --json` output is real, live, and not something these tests
+# control -- so only the parts that are deterministic regardless of what
+# background sessions happen to exist are exercised directly via subprocess
+# (argument validation). The zero-match error path is a real discriminator
+# IF `claude` is on PATH in this environment; if it is not, the equivalent
+# "claude CLI not found" path is exercised instead (equally real, equally
+# deterministic, and doesn't require fabricating a `claude agents --json`
+# fixture this suite doesn't control).
+# ---------------------------------------------------------------------------
+
+_CLAUDE_ON_PATH = shutil.which("claude") is not None
+
+# A name virtually guaranteed not to match any real background claude
+# session in any environment this test runs in.
+_ABSENT_AGENT_NAME = "test-agentctl-mac-attach-nonexistent-xyz123"
+
+
+def test_attach_missing_agent_name_errors():
+    rc, out, err = _run("attach")
+    assert rc == 2
+    assert not out
+    assert "agent name" in err.lower()
+
+
+def test_attach_unknown_extra_args_error():
+    rc, out, err = _run("attach", "luria", "--bogus-flag")
+    assert rc == 2
+    assert not out
+    assert "unknown extra args" in err.lower()
+
+
+def test_attach_unknown_extra_args_after_dry_run_error():
+    rc, out, err = _run("attach", "luria", "--dry-run", "--bogus-flag")
+    assert rc == 2
+    assert not out
+    assert "unknown extra args" in err.lower()
+
+
+@pytest.mark.skipif(not _CLAUDE_ON_PATH, reason="claude not on PATH in this environment")
+def test_attach_zero_match_errors_and_lists_active_sessions():
+    rc, out, err = _run("attach", _ABSENT_AGENT_NAME, "--dry-run")
+    assert rc == 1
+    assert not out
+    assert "no background claude session" in err.lower()
+    assert _ABSENT_AGENT_NAME in err
+    assert "active sessions" in err.lower()
+
+
+@pytest.mark.skipif(_CLAUDE_ON_PATH, reason="claude IS on PATH in this environment -- covered by the zero-match test instead")
+def test_attach_claude_not_on_path_errors():
+    rc, out, err = _run("attach", _ABSENT_AGENT_NAME, "--dry-run")
+    assert rc == 1
+    assert not out
+    assert "claude" in err.lower()
+    assert "not found" in err.lower()
 
 
 # ---------------------------------------------------------------------------
