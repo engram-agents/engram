@@ -145,73 +145,6 @@ file's own "Fail-open rule" (above) requires -- the suppression check is an
 optimization, not a blocker, and uncertainty about its own dependencies
 resolves to nudging, never to silent suppression -- it is simply NOT quiet
 about it.
-
-Near-compaction capture escalation (engram-alpha#2026, workstream 4)
----------------------------------------------------------------------
-Problem: the compaction summary carries our custom instructions only ~12% of
-the time (16 of 135 summaries since May, measured -- see the issue). Anything
-not already plain text in a file is lost at the compaction boundary. The
-Stop path had no emitter aware of this at all -- the "ride auto-compaction"
-guidance lived only on engram-surface-hook.py (a UserPromptSubmit hook that
-fires once per loop wake, not per turn during the burst it's meant to
-govern) and on the dormant context_tracker_hook.py.
-
-Fix -- this hook's existing prose-without-writes signal (the prose gate
-above) ESCALATES when the session is near compaction. It does not become a
-new unconditional per-Stop check: on a 1M-context session the drowsiness
-reading has been measured sitting at 97-99% for roughly an hour (~3
-heartbeat iterations) with no compaction firing at all (measured
-first-hand). An unconditional block in that window would interrupt every
-turn end for that whole hour. So:
-
-  - the near-compaction window is detected via context_tracker.estimate_usage()
-    + the same _load_drowsiness_thresholds() / urgent_at_or_above comparison
-    format_drowsiness() uses -- not a re-implementation, not a hardcoded
-    percentage;
-  - inside the window, the prose gate's threshold is LOWERED (unwritten
-    means lost, not merely deferred, so capture eagerly) and the nudge text
-    changes to ask for the two things that actually survive: the burst's
-    arc appended to today's history file, and the nodes for anything
-    decided or found;
-  - the escalation is rate-limited to at most one emission per
-    _NEAR_COMPACTION_RATE_LIMIT_K eligible Stop fires, so the plateau above
-    cannot turn into a per-turn block;
-  - outside the window, behavior is byte-identical to the prose gate
-    described above -- this is the regression that matters, and the reason
-    the window check fails CLOSED (toward "no escalation") on any missing
-    or corrupt drowsiness reading, unlike this file's other checks, which
-    fail open toward emission. Escalating on bad data reproduces exactly the
-    per-turn-block regression the rate limit exists to prevent; the base
-    (unescalated) nudge machinery is untouched and still applies.
-
-Maturity gate does NOT apply inside the window (round 2, 2026-08-15)
-----------------------------------------------------------------------
-The maturity gate (#845, above) is a PROXY: it suppresses on node count,
-standing in for "this agent has internalized the write habit, stop nagging."
-The near-compaction escalation fires on a directly OBSERVED signal instead --
-prose written THIS burst with no accompanying ENGRAM writes, measured from
-the actual transcript delta on this very fire. A proxy must not suppress a
-stronger, more specific, directly-observed signal, so the maturity gate is
-now consulted only for the BASE (unescalated) nudge path -- main() determines
-the near-compaction window BEFORE the maturity check, and only returns early
-on maturity when out of window.
-
-This does not make the escalation noisier for a genuinely mature agent: if
-they really are writing reliably, the prose-without-writes condition is
-false and nothing fires, mature or not. The only agent this newly reaches is
-one who is mature by node count AND has an unwritten burst right now -- and
-near-compaction-unwritten means LOST, not deferred, so no amount of
-accumulated write habit changes that deadline. Do not re-collapse this to a
-single early-return gate; that reintroduces the bug this section documents.
-
-Delivery is decision:block, and the reason for that needs to be precise,
-because the coarse version is false. hookSpecificOutput.additionalContext
-DOES reach the agent from a Stop hook -- verified first-hand: the field
-arrives, but only on the NEXT turn, not the stopping one. This nudge is
-about the boundary that is about to happen now, so decision:block is what
-makes it land before that boundary rather than after it -- never write
-"additionalContext never reaches the agent" here, that claim is false and
-has already needed correcting once.
 """
 import json
 import os
@@ -241,32 +174,9 @@ try:
 except Exception:
     _STOPHOOKLIB_OK = False
 
-# Near-compaction escalation (engram-alpha#2026 WS4): reuse context_tracker's
-# own ceiling/threshold logic rather than re-implementing it. Threading
-# transcript_path/session_id from THIS hook's stdin payload (below, in
-# main()) matches engram-surface-hook.py:3247-3256 -- the per-session
-# marker, not a global one (#140).
-try:
-    from context_tracker import (
-        estimate_usage as _estimate_usage,
-        _load_drowsiness_thresholds as _load_drowsiness_thresholds,
-    )
-    _CONTEXT_TRACKER_OK = True
-except Exception:
-    _CONTEXT_TRACKER_OK = False
-
 # State file for idle suppression. Stores transcript_path + byte_offset from
 # the previous fire so we can read only the delta on the next fire.
 _NUDGE_STATE_FILE = os.path.join(ENGRAM_HOME, ".write-nudge-last-fire.json")
-
-# State file for the near-compaction rate limiter (decision D). Stores
-# transcript_path + a count of escalation-eligible fires since the last
-# escalated emission. Separate from _NUDGE_STATE_FILE because it tracks a
-# different thing (eligible-fire count, not byte offset) on a different
-# cadence (reset on window entry/exit, not on every fire).
-_NEAR_COMPACTION_RATE_STATE_FILE = os.path.join(
-    ENGRAM_HOME, ".near-compaction-nudge-rate.json"
-)
 
 # Default threshold for the maturity gate: suppress nudge when the graph has
 # at least this many current nodes. Overridable via config.json.
@@ -277,25 +187,6 @@ _DEFAULT_NODE_THRESHOLD = 300
 # cadence.write_nudge_prose_threshold in config.json.
 # 0 or negative means "disabled" — all prose lengths treated as exceeding.
 _DEFAULT_PROSE_THRESHOLD = 400
-
-# Near-compaction escalation (engram-alpha#2026 WS4, decision C1): lower
-# prose threshold used inside the near-compaction window, where unwritten
-# work means LOST (not merely deferred), so the gate should catch eagerly.
-# Overridable via cadence.write_nudge_prose_threshold_near_compaction in
-# config.json. Same 0-or-negative-disables convention as the base threshold.
-# The specific number is not spec-mandated -- chosen as a quarter of the
-# base default so escalated capture triggers well below the point that
-# would otherwise be judged "substantial enough to nudge."
-_DEFAULT_PROSE_THRESHOLD_NEAR_COMPACTION = 100
-
-# Near-compaction escalation (decision D): at most one escalated emission per
-# this many escalation-ELIGIBLE Stop fires (fires where the lowered prose
-# gate would otherwise emit). A module constant, not a magic number, per the
-# spec. Without this, decision B's near-compaction plateau (measured ~97-99%
-# for ~1hr / ~3 heartbeat iterations with no compaction firing, measured
-# first-hand)
-# turns into a blocking interrupt on every turn end for that hour.
-_NEAR_COMPACTION_RATE_LIMIT_K = 3
 
 # Verb suffixes that constitute an ENGRAM write. The engram tool name has the
 # form: mcp__engram__engram_<verb> or mcp__plugin_engram_engram__engram_<verb>.
@@ -387,28 +278,6 @@ def _read_prose_threshold() -> int:
         return int(val)
     except Exception:  # noqa: BLE001
         return _DEFAULT_PROSE_THRESHOLD
-
-
-def _read_prose_threshold_near_compaction() -> int:
-    """Read cadence.write_nudge_prose_threshold_near_compaction from config.json.
-
-    Returns the configured value, or _DEFAULT_PROSE_THRESHOLD_NEAR_COMPACTION
-    if absent or unreadable. Same 0-or-negative-disables convention as
-    _read_prose_threshold. Used only inside the near-compaction window
-    (engram-alpha#2026 WS4 decision C1) — outside it, _read_prose_threshold
-    is used unchanged.
-    """
-    config_path = os.path.join(ENGRAM_HOME, "config.json")
-    try:
-        with open(config_path, encoding="utf-8") as f:
-            config = json.load(f)
-        cadence = config.get("cadence", {})
-        val = cadence.get("write_nudge_prose_threshold_near_compaction")
-        if val is None:
-            return _DEFAULT_PROSE_THRESHOLD_NEAR_COMPACTION
-        return int(val)
-    except Exception:  # noqa: BLE001
-        return _DEFAULT_PROSE_THRESHOLD_NEAR_COMPACTION
 
 
 def _maturity_muted() -> bool:
@@ -580,9 +449,7 @@ def _parse_delta_prose_and_writes(
         return 0, False
 
 
-def _should_suppress(
-    transcript_path: str, prose_threshold_override: int | None = None
-) -> bool:
+def _should_suppress(transcript_path: str) -> bool:
     """Return True iff the nudge should be suppressed for this fire.
 
     Prose-gate predicate (issue #845 step 1.5):
@@ -598,13 +465,6 @@ def _should_suppress(
     were EMIT under #844). Long-prose toolless turns now EMIT (they were
     SUPPRESS under #844, because no tool_use was present). This is the intended
     refinement — the discussion-turn case is the one that actually needs nudging.
-
-    prose_threshold_override (engram-alpha#2026 WS4, decision C1): when given,
-    used in place of _read_prose_threshold() for condition A. The
-    near-compaction escalation path passes the lowered near-compaction
-    threshold here so it reuses this function's delta-read/parse machinery
-    unchanged rather than duplicating it. None (the default) preserves the
-    out-of-window call exactly as before — byte-identical behavior.
 
     Fail-open: any exception returns False (emit the nudge).
     """
@@ -667,11 +527,7 @@ def _should_suppress(
             return False  # force EMIT
 
         prose_len = parse_result  # int in the normal path
-        prose_threshold = (
-            prose_threshold_override
-            if prose_threshold_override is not None
-            else _read_prose_threshold()
-        )
+        prose_threshold = _read_prose_threshold()
 
         # Condition A: prose exceeds threshold.
         # When threshold <= 0, the gate is disabled: all prose lengths are
@@ -688,127 +544,6 @@ def _should_suppress(
     except Exception:  # noqa: BLE001
         # Fail-open: any unexpected error → emit the nudge.
         return False
-
-
-def _in_near_compaction_window(transcript_path: str, session_id: str) -> bool:
-    """Return True iff this session's drowsiness reading is at/above urgent.
-
-    engram-alpha#2026 WS4 decision B: this determines whether the EXISTING
-    prose-without-writes signal (_should_suppress above) escalates — it does
-    not create a new unconditional trigger of its own.
-
-    Reuses context_tracker.estimate_usage() threaded with THIS hook's own
-    stdin-payload transcript_path/session_id (matches
-    engram-surface-hook.py:3247-3256, the per-session marker, #140 — no
-    global-marker fallback here) and _load_drowsiness_thresholds()'s
-    urgent_at_or_above comparison — the same ceiling/threshold logic
-    format_drowsiness() uses, not a re-implementation or a hardcoded
-    percentage.
-
-    Fail CLOSED (returns False = out-of-window) on any missing/corrupt
-    reading, missing usage data, or exception — including when
-    context_tracker itself failed to import. This is the opposite fail
-    direction from the rest of this file (which fails toward emission):
-    escalating on a bad or unavailable reading would reproduce exactly the
-    per-turn-block regression the rate limit (decision D) exists to
-    prevent, while failing closed here only falls back to the base
-    (unescalated) prose-gate path below, which is unaffected and still
-    applies.
-    """
-    if not _CONTEXT_TRACKER_OK:
-        return False
-    try:
-        usage = _estimate_usage(transcript_path=transcript_path, session_id=session_id)
-        if not usage:
-            return False
-        mode = usage.get("mode", "1m")
-        thresholds = _load_drowsiness_thresholds(mode)
-        return usage["usage_pct"] >= thresholds["urgent_at_or_above"]
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _rate_limit_escalation(transcript_path: str) -> bool:
-    """Return True iff an escalation-eligible fire may emit NOW.
-
-    engram-alpha#2026 WS4 decision D: at most one escalated emission per
-    _NEAR_COMPACTION_RATE_LIMIT_K escalation-eligible fires (fires where the
-    lowered near-compaction prose gate would otherwise emit). Only called
-    when the caller has already determined this fire is eligible to emit —
-    this function decides whether THIS particular eligible fire is the one
-    that gets to.
-
-    Tracks a per-transcript_path count of eligible fires since the last
-    escalated emission, in _NEAR_COMPACTION_RATE_STATE_FILE. A missing state
-    file or a transcript_path change (new/rotated session) resets to fully
-    eligible — the count starts at _NEAR_COMPACTION_RATE_LIMIT_K itself, so
-    the very first eligible fire after any reset always emits immediately
-    (an agent freshly entering the danger zone should be warned right away,
-    not after two more silent fires).
-
-    Fail-open: any read/write/parse failure returns True (allow the emit).
-    Losing the rate limit occasionally is far cheaper than silently
-    swallowing the capture-before-loss warning — consistent with this
-    file's fail-open posture everywhere else; only the WINDOW DETECTION
-    itself (_in_near_compaction_window, above) fails in the opposite
-    direction, and for a different reason (see its own docstring).
-    """
-    try:
-        state: dict = {}
-        if os.path.exists(_NEAR_COMPACTION_RATE_STATE_FILE):
-            with open(_NEAR_COMPACTION_RATE_STATE_FILE, encoding="utf-8") as f:
-                state = json.load(f)
-
-        stored_path = state.get("transcript_path")
-        count = state.get("count", _NEAR_COMPACTION_RATE_LIMIT_K)
-        if stored_path != transcript_path or not isinstance(count, int):
-            count = _NEAR_COMPACTION_RATE_LIMIT_K
-
-        if count >= _NEAR_COMPACTION_RATE_LIMIT_K:
-            allowed = True
-            # Reset to 1, not 0: this call itself is one eligible fire (the
-            # one that just emitted), so the next K-1 eligible fires after it
-            # are the ones that must be suppressed for the period to be
-            # exactly K. Resetting to 0 undercounts by one and stretches the
-            # observed period to K+1 (measured: 3 consecutive Falses after
-            # every True, not 2).
-            new_count = 1
-        else:
-            allowed = False
-            new_count = count + 1
-
-        atomic_write_json(
-            _NEAR_COMPACTION_RATE_STATE_FILE,
-            {"transcript_path": transcript_path, "count": new_count},
-            encoding="utf-8",
-        )
-
-        return allowed
-    except Exception:  # noqa: BLE001
-        return True  # fail-open: allow the emit
-
-
-def _reset_near_compaction_rate_state() -> None:
-    """Clear the rate-limit state (called when out-of-window).
-
-    So the NEXT window entry starts fully eligible rather than inheriting a
-    stale count from a previous window earlier in the same session. Best-
-    effort hygiene, not a gate — failure is silenced.
-    """
-    try:
-        if os.path.exists(_NEAR_COMPACTION_RATE_STATE_FILE):
-            os.remove(_NEAR_COMPACTION_RATE_STATE_FILE)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-_NEAR_COMPACTION_NUDGE_TEXT = (
-    "[ENGRAM Write Check — near compaction: Compaction is near and the "
-    "summary will not carry this. Before you stop: (1) append this burst's "
-    "arc to today's ~/.engram/history/YYYY-MM-DD.md, (2) write the nodes for "
-    "anything you decided or found, (3) nap once if you haven't this burst. "
-    "Anything left only in context is lost at the boundary, not deferred.]"
-)
 
 
 def _update_state(transcript_path: str) -> None:
@@ -837,32 +572,18 @@ def main() -> None:
     except Exception:
         pass
 
-    # Near-compaction window check (engram-alpha#2026 WS4 decision B), moved
-    # ahead of the maturity gate (round 2, 2026-08-15 -- see "Maturity gate
-    # does NOT apply inside the window" in the module docstring). Determined
-    # first so the maturity-gate decision below can tell whether it is
-    # allowed to short-circuit. This only decides whether the prose-gate
-    # check further down escalates — it is not itself a trigger. Wrapped so
-    # any failure here falls back to the unescalated (out-of-window) path,
-    # never to a crash.
-    in_window = False
-    try:
-        in_window = _in_near_compaction_window(transcript_path, session_id)
-    except Exception:  # noqa: BLE001
-        in_window = False  # fail closed toward "no escalation"
-
-    # Maturity-gate check (issue #845) applies ONLY to the base (unescalated)
-    # nudge path (round 2, 2026-08-15). A mature graph means the base
-    # write-discipline fires from identity, not from this tripwire — but the
-    # near-compaction escalation below is a directly-observed signal, not the
-    # maturity proxy, so it must not be muted by node count. _maturity_muted()
-    # itself never raises (its own fail direction is baked in: any DB error
-    # returns False = not muted), so this comparison cannot throw and there is
-    # nothing further to guard here. Do NOT touch the #840 state file on the
-    # early-return path; the gate is stateless so crossing back under
-    # threshold (e.g. restore from backup) leaves the idle machinery
+    # Maturity-gate check (issue #845). engram-alpha#2026 WS4 had briefly
+    # bypassed this for an in-window near-compaction escalation; that
+    # escalation is retired (2026-08-16, see the maintainer's ruling in the
+    # module docstring history / commit message), so this is restored to its
+    # pre-WS4 form: an unconditional early return, no window carve-out.
+    # _maturity_muted() itself never raises (its own fail direction is baked
+    # in: any DB error returns False = not muted), so this call cannot throw
+    # and there is nothing further to guard here. Do NOT touch the #840 state
+    # file on the early-return path; the gate is stateless so crossing back
+    # under threshold (e.g. restore from backup) leaves the idle machinery
     # undisturbed.
-    if not in_window and _maturity_muted():
+    if _maturity_muted():
         # Empty stdout is the canonical no-op per #824/#832 contract.
         return
 
@@ -870,30 +591,10 @@ def main() -> None:
     # Wrap entirely in try/except so any failure here cannot prevent the nudge
     # from emitting.
     suppress = False
-    escalate = False
     try:
-        if in_window:
-            # Decision C1: lowered prose threshold inside the window — reuses
-            # _should_suppress's own delta-read/parse machinery unchanged.
-            suppress = _should_suppress(
-                transcript_path,
-                prose_threshold_override=_read_prose_threshold_near_compaction(),
-            )
-            if not suppress:
-                # Decision D: this fire would escalate-emit; the rate limiter
-                # decides whether THIS fire is the one that actually gets to.
-                if _rate_limit_escalation(transcript_path):
-                    escalate = True
-                else:
-                    suppress = True  # rate-limited this fire
-        else:
-            suppress = _should_suppress(transcript_path)
-            # Out of the window: keep the rate-limit state from going stale,
-            # so the next window entry starts fully eligible.
-            _reset_near_compaction_rate_state()
+        suppress = _should_suppress(transcript_path)
     except Exception:  # noqa: BLE001
         suppress = False  # fail-open
-        escalate = False
 
     if suppress:
         # Silent no-op: update state so next fire scans the correct delta.
@@ -903,20 +604,13 @@ def main() -> None:
         # no meaningful hook event to record.
         return
 
-    if escalate:
-        # Decision C2 text + decision E delivery: additionalContext/reason
-        # DOES reach the agent from a Stop hook, but only on the NEXT turn
-        # (verified first-hand) — decision:block is what lands this one
-        # before the compaction boundary it warns about, not after it.
-        output = _NEAR_COMPACTION_NUDGE_TEXT
-    else:
-        output = (
-            "[ENGRAM Write Check: Did your last response contain a decision, insight, "
-            "or design choice worth recording? If so, write to ENGRAM now "
-            "(observation, derivation, question, or conjecture). "
-            "If not, end the turn with NO output - do not reply to or acknowledge this check; "
-            "a text-only acknowledgment wastes a turn.]"
-        )
+    output = (
+        "[ENGRAM Write Check: Did your last response contain a decision, insight, "
+        "or design choice worth recording? If so, write to ENGRAM now "
+        "(observation, derivation, question, or conjecture). "
+        "If not, end the turn with NO output - do not reply to or acknowledge this check; "
+        "a text-only acknowledgment wastes a turn.]"
+    )
     print(json.dumps({"decision": "block", "reason": output}))
 
     # Update state after a real emit so the next fire scans only new bytes.

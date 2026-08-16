@@ -20,9 +20,9 @@ load-bearing convention is a single marker file: **`~/.engram/loop-mode.json`**.
 
 Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
-("nap once to stage the window, then capture what the summary won't carry
-(history file + nodes) and ride auto-compaction — don't slow down for a
-manual compaction"). No marker → the hook serves the
+("compaction is near and the summary will not carry your work across it —
+capture the LAST burst (history arc + nodes), nap to checkpoint, then keep
+working and ride auto-compaction"). No marker → the hook serves the
 non-loop "stop and nap" path, and the loop wastes a whole session napping
 against compaction it should be riding through (the gap that motivated #483 —
 a `ScheduleWakeup` work-loop that never wrote the marker (the loop-without-marker silent-skip failure mode)).
@@ -580,8 +580,8 @@ dead thread.
    **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction
    boundaries; an unwritten finding is lost.
-5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then capture (history
-   file + nodes), then keep working.
+5. **Drowsiness in loop-mode** (Step 4) — capture the COMPLETED burst
+   (history arc + nodes), nap to checkpoint, then keep working.
 6. **Don't manufacture work.** When the queue genuinely drains, hold for the
    user rather than invent tasks; the loop's steady state is a quiet
    heartbeat (idle re-arms, no fake work), not perpetual grinding. The loop
@@ -613,27 +613,38 @@ in doubt whether the user is ending the loop, ask — but never strand the marke
 
 With the marker present, the hook tells you the right thing; the discipline is:
 
-- **At urgent drowsiness: nap ONCE** (`engram_nap`) to stage the window for
-  compaction — UNLESS you already napped this burst, then skip. The nap
-  *stages* the window; it does not by itself carry the burst's work across
-  it — the compaction summary carries our custom instructions only ~12% of
-  the time (engram-alpha#2026, measured: 16 of 135 summaries since May), so
-  what actually crosses the boundary is whatever is already plain text in a
-  file.
-- **Capture before you ride.** Before continuing: append this burst's arc to
-  today's `~/.engram/history/YYYY-MM-DD.md`, and write the nodes for
-  anything decided or found this burst. This is the part the summary's ~12%
-  hit rate cannot be relied on to carry — capture it yourself, don't wait
-  for the summary to do it.
+- **At urgent drowsiness: capture the COMPLETED burst, before you start the
+  next one.** Append the burst that just ended to today's
+  `~/.engram/history/YYYY-MM-DD.md`, and write the nodes for anything it
+  decided or found. The compaction summary carries our custom instructions
+  only ~12% of the time (engram-alpha#2026, measured: 16 of 135 summaries
+  since May), so what crosses the boundary is whatever is already plain text
+  in a file. **Anything left only in context is lost at the boundary, not
+  deferred.**
+- **Then nap to checkpoint it** (`engram_nap`) — after the writes, not
+  instead of them. A nap checkpoints what is *already* in the graph and
+  commits a snapshot; napping with nothing newly written saves nothing.
+  Repeated writes are the protection; repeated naps are not.
+- **Why the PAST burst, not the current one** (maintainer's ruling,
+  2026-08-16): compaction can land mid-burst, so the in-flight burst cannot
+  be protected whenever you capture. Capturing at the end of burst N and at
+  the start of burst N+1 therefore cover exactly the same content — there is
+  nothing in between. That is why the banner fires once per wake and points
+  backwards, and why once-per-wake is correct rather than a gap.
 - **Then keep working and ride the auto-compaction.** Do NOT slow down, hold,
   or wait for a manual compaction. The `ScheduleWakeup` you armed re-invokes the
   post-compaction self with the loop prompt, so the loop continues seamlessly
   through compaction — that's the whole point of the loop-aware path.
 - **Below urgent:** nothing loop-specific — the banner renders the calm level
   word with no per-prompt alarm.
-- **If this skill and `engram-stop-hook.py`'s near-compaction nudge ever
-  disagree, the hook wins.** It fires every turn during the burst; this
-  skill is read once, at loop entry.
+- **There is no per-turn Stop-path enforcer for this window, by design.**
+  An earlier revision of engram-alpha#2026 WS4 put one in
+  `engram-stop-hook.py`; it was retired on 2026-08-16 because it emitted
+  `decision: block` with no `stop_hook_active` guard and a *lowered* prose
+  threshold inside the window, so it could re-fire exactly when turns are
+  most expensive — and because it bought no coverage the once-per-wake
+  banner does not already have. Do not reintroduce one without revisiting
+  that reasoning.
 
 ---
 
