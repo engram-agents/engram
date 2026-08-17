@@ -326,16 +326,41 @@ superseded is usually not its author. **Also comment on the replaced PR** — th
 is the mechanism, but the comment is the half that reaches the human, and the human
 needing to know their work was carried forward is the reason this rule exists at all.
 
-> **⚠ `gh pr edit --title` may fail while looking like it worked — CHECK YOUR
-> VERSION.** On `gh 2.45.0` it **exits 1**, prints only `GraphQL: Projects (classic) is
-> being deprecated …`, and leaves the title unchanged; on `gh 2.92.0` the same command
-> works. Neither test PR had a project attachment, so a Projects link does not explain
-> it — a version-dependent hazard to check for, not a toolchain property. Fallback that
-> works on both: `gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f title="…"`.
-> **It is not silent** — exit 1 is a real signal, and I only called it silent because I
-> read it through `| tail` and got tail's status instead of gh's. So: **read the title
-> back**, because a deprecation-shaped message does not read as a failure and a piped
-> exit code is not the command's.
+> **⚠ `gh pr edit --title` and `gh pr view --comments` may fail while looking
+> like they worked — CHECK YOUR VERSION.** `--title` on `gh 2.45.0` **exits 1**,
+> prints only `GraphQL: Projects (classic) is being deprecated …`, and leaves
+> the title unchanged; it works on `gh 2.92.0` (ariadne-calvino, umwelt PR #97,
+> 2026-08-14 — exit 0, title changed) and `gh 2.97.0` (exit 0, returns the PR
+> URL). Three scattered data points, not a boundary — don't infer a `--title`
+> fix boundary from `--comments` below. `--comments` is the dangerous one: it
+> **exits 0 and prints nothing** on a PR that has comments, reading as "no
+> comments" rather than a failure — I hit this and believed an 8-comment PR
+> had none. Bisected 2026-08-17, 15 `.0` releases on one seat (16 including
+> ariadne-calvino's 2.92.0), monotone, no flapping: 11 non-consecutive `.0`
+> releases tested (2.45.0, 2.56.0, 2.62.0, 2.65.0–2.72.0), all broken —
+> working from 2.73.0 (also 2.74.0/2.80.0/2.97.0, plus 2.92.0 on
+> ariadne-calvino's seat). State the boundary as **2.72.0/2.73.0**,
+> not "the fix" — only `.0` releases were tested, so a fix inside a `2.72.x`
+> patch isn't excluded. Fallback for `--title`, **measured working on 2.45.0**
+> (the broken version): `gh api -X PATCH repos/<owner>/<repo>/pulls/<N> -f
+> title="…"`. It goes through the REST surface, not the GraphQL one that broke
+> `--title`, so it should hold on other versions too — reasoning, not a second
+> measurement. Fallback for `--comments`: `gh api
+> repos/<owner>/<repo>/issues/<N>/comments --jq 'length'` — measured
+> version-independent, returning `8` against `engram-agents/umwelt#559` on both
+> `gh 2.97.0` and `/usr/bin/gh` 2.45.0, the broken version. It is **incomplete,
+> not merely caveated** (caught by ariadne-calvino's colleague pass, not by me
+> or either reviewer-fairy): `issues/<N>/comments` returns conversation
+> comments only, missing review submissions (`pulls/<N>/reviews`) and inline
+> review comments (`pulls/<N>/comments`), both of which `gh pr view --comments`
+> shows — on `engram-agents/umwelt#559`, `issues/559/comments` → 8,
+> `pulls/559/reviews` → **2**, `pulls/559/comments` → 0, so a reader who stops
+> at `8` misses two review verdicts. It is also outage-dependent, not just
+> version-independent: this is the same `issues/<N>/*` REST family that
+> returned 404 for pull requests during GitHub's 2026-08-17 incident window
+> (13:40Z–~16:11Z). **Read results back either way** — a deprecation-shaped
+> message and a silent empty result both look like something other than a
+> failure.
 
 **Why the rule exists, told accurately.** The originating case is umwelt#561, and the
 honest version is *not* that its author was left in the dark: link-backs were posted
