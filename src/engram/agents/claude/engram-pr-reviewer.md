@@ -56,6 +56,22 @@ The distinguishing principle: **does the decision live in the merged PR?** If no
 
 **Never escape the worktree to work around a failure.** Two equivalent escape patterns to avoid: `cd /home/<user>/<repo> && git ...` (changing cwd to the primary repo) AND `git -C /home/<user>/<repo> ...` (using `-C` flag to operate git on the primary repo from within the worktree). Both silently corrupt the source state you're reviewing — you may end up reviewing the wrong branch's content, or stale content from another worktree, producing a review grounded in code that isn't actually in the PR. If something blocks your worktree-local progress and isn't transient, stop and report — that's the discipline.
 
+## The isolation boundary is a PATH, and some git state ignores paths
+
+Everything above defends a *path* boundary. But your worktree isolates your **files**, not all of git: refs, branches, and **the stash stack** live in the shared `.git` common directory, reachable from inside your worktree with no `cd` and no `-C`. The branch-name collision described above is the harmless face of this. `git stash` is the harmful one.
+
+**Never run `git stash`. Not in any repo, not even to "briefly set something aside"** — and reviewing is exactly when the temptation arrives, because comparing a PR against another ref feels like it needs the tree swapped out from under you.
+
+On a clean tree `git stash` saves nothing and says so — `No local changes to save`. A paired `git stash pop` then takes **the top of the pre-existing stack anyway**: whatever some other agent, or some past session, left there — possibly months ago. On a clean tree **with a non-empty stash stack**, that is the *guaranteed* outcome rather than bad luck, and `pop` **drops** the entry on success, so the original owner loses it. When the stack is empty instead, `pop` fails loudly — `No stash entries found.` — and nothing is lost; that is not reassurance, it is a trap, because a reader who tests the claim against an empty stack sees only the loud failure and no damage, and concludes the warning is overstated in exactly the case where the precondition wasn't checked. The precondition is not theoretical here: per @ariadne-calvino's 2026-08-17 check, engram-alpha's own stash stack currently holds 6 entries, the oldest from May, one left by a fairy worktree; umwelt's holds 0. Test this claim in the repo these specs ship in, not a neighboring one where the stack happens to be clean.
+
+This is not hypothetical. A coder-fairy ran `git stash && <tests> && git stash pop`, obeyed every rule on this page, never left its worktree — and applied a stranger's five-week-old work into its own tree. Nothing on this page forbade it. For a reviewer the damage is compounded: a tree silently carrying someone else's changes produces a review of code that is in nobody's PR.
+
+Use instead, all worktree-local and none of them touching shared state:
+
+- `git show <ref>:<path>` — read one file at another ref. No tree change at all; reach for this first, and it covers most review comparisons.
+- `git worktree add <path> <ref>` — a real second tree when you need more than one file.
+- **Commit first, then `git reset`** — your own work is safe in an object you own.
+
 # Output contract
 
 ```
