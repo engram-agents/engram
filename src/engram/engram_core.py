@@ -1842,17 +1842,86 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         pass
 
     # FTS5 index (separate try since it may already exist)
+    #
+    # Column list is single-sourced from engram_backup.NODES_FTS_COLUMNS
+    # (#2077) — this used to be a hand-written literal here that drifted from
+    # engram_backup.py's rebuild_fts_index, which kept a stale 3-column copy.
+    # Falls back to the literal list ONLY if engram_backup itself cannot be
+    # imported (defensive only; same directory as this module, always
+    # present) — narrowed to ImportError rather than a bare Exception so a
+    # real bug inside engram_backup (e.g. an AttributeError from a renamed
+    # NODES_FTS_COLUMNS) surfaces loudly instead of being swallowed and
+    # silently falling back to this untested third hand-written copy. Kept
+    # in sync with NODES_FTS_COLUMNS by test_engram_core.py's literal-parity
+    # test rather than by a live import, so it stays correct even on the
+    # (never-expected) import-failure path.
+    try:
+        import engram_backup
+        _fts_cols_sql = ", ".join(engram_backup.NODES_FTS_COLUMNS)
+    except ImportError:
+        _fts_cols_sql = "claim, quoted_text, interpretation, reported_state, trigger_text"
     try:
         conn.execute(
-            """
+            f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                claim, quoted_text, interpretation, reported_state, trigger_text,
+                {_fts_cols_sql},
                 content='nodes', content_rowid='rowid'
             )
         """
         )
     except sqlite3.OperationalError:
         pass  # already exists
+
+    # #2077 finding 1 — startup self-heal for an already-corrupted nodes_fts.
+    #
+    # The CREATE VIRTUAL TABLE IF NOT EXISTS above only handles the "table
+    # absent" case. If a live server's nodes_fts already exists with a stale
+    # column set (e.g. restored from a backup taken with a pre-#2077
+    # engram_backup.rebuild_fts_index, which wrote only 3 columns), IF NOT
+    # EXISTS silently no-ops and the server keeps running under-indexed
+    # forever — restart does not repair it. So compare the live table's
+    # columns against the canonical list on every startup (cheap: a single
+    # PRAGMA table_info read) and, on mismatch, delegate the drop + rebuild +
+    # reindex to engram_backup.rebuild_fts_index — the same repair path the
+    # backup/restore flow already exercises, rather than a second
+    # hand-maintained copy of that logic here.
+    try:
+        import engram_backup
+
+        _existing_fts_cols = engram_backup._existing_fts_columns(conn)
+        _canonical_fts_cols = list(engram_backup.NODES_FTS_COLUMNS)
+        if _existing_fts_cols is not None and _existing_fts_cols != _canonical_fts_cols:
+            _fts_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+            print(
+                f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
+                f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
+                f"canonical {_canonical_fts_cols} — delegating to "
+                "engram_backup.rebuild_fts_index."
+            )
+            # rebuild_fts_index opens its OWN connection to the same file, so
+            # `conn`'s own pending writes (the trust-tier backfill UPDATE
+            # above, and any ALTER TABLE ADD COLUMN backfills before it) must
+            # be flushed first — otherwise the two connections collide over
+            # WAL's single-writer lock and rebuild_fts_index's DROP/CREATE
+            # raises "database is locked", which would silently no-op the
+            # repair under this block's own except-Exception fallback below.
+            # Safe to commit early here: every statement `conn` has issued so
+            # far this call is independently idempotent (see this function's
+            # own docstring), so an early flush changes nothing about retry
+            # safety on a later failure.
+            conn.commit()
+            engram_backup.rebuild_fts_index(_fts_db_path)
+    except Exception as _fts_selfheal_err:
+        # engram_backup unavailable, or the repair itself failed — non-fatal
+        # (a startup self-heal must never block server startup), but LOUD:
+        # without this line a failed repair is indistinguishable from a
+        # successful one on the console, and the server would keep running
+        # under-indexed with the only signal being the earlier "repairing"
+        # line that never got a follow-up (loud-not-fatal class).
+        print(
+            "[_run_db_one_time_setup] nodes_fts startup self-heal FAILED "
+            f"(continuing under-indexed until repaired): {_fts_selfheal_err!r}"
+        )
 
     # FTS5 vocabulary table — required by engram_idf.extract_keywords for IDF
     # lookups used by the new _sanitize_fts_query path (alpha #177 area 1).

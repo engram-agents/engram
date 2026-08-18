@@ -43,6 +43,34 @@ _DERIVED_TABLE_PREFIXES = ("nodes_fts",)
 _DERIVED_TABLE_NAMES = ("vec_nodes",)
 
 
+# Canonical nodes_fts column list — SINGLE SOURCE OF TRUTH (#2077).
+#
+# Before this fix, the column list was hand-written in TWO places that
+# drifted apart: engram_core.py's CREATE VIRTUAL TABLE nodes_fts carried all
+# five columns (added by #403 to cover feeling_report's reported_state /
+# trigger_text fields), while this module's rebuild_fts_index still had the
+# original three. Two independent consequences followed:
+#   1. rebuild_fts_index's delete-insert only touched 3 columns, so a
+#      retracted node stayed FTS-findable through reported_state/trigger_text.
+#   2. On restore, the dump strips nodes_fts and rebuild_fts_index recreated
+#      it with 3 columns; engram_core's `CREATE TABLE IF NOT EXISTS` then
+#      no-ops forever, leaving the graph permanently under-indexed.
+#
+# engram_core.py's CREATE VIRTUAL TABLE statement and every INSERT /
+# delete-insert in this module now derive their column list from this one
+# tuple. engram_backup.py is intentionally the home for it (not
+# engram_core.py): it is the leaner, stdlib-only module several call sites
+# (engram-regenerate-embeddings.py, the server's own restore path) already
+# import without pulling in engram_core's full dependency chain.
+NODES_FTS_COLUMNS: tuple = (
+    "claim",
+    "quoted_text",
+    "interpretation",
+    "reported_state",
+    "trigger_text",
+)
+
+
 def _derived_drop_plan(conn: sqlite3.Connection) -> tuple[list[str], list[str], list[str]]:
     """Return (fts_triggers, vocab_tables, base_virtual_tables) to drop, in safe order.
 
@@ -155,6 +183,23 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     }
 
 
+def _existing_fts_columns(conn: sqlite3.Connection) -> list | None:
+    """Return the visible column names of an existing ``nodes_fts`` table, in
+    declared order, or None if the table doesn't exist.
+
+    PRAGMA table_info works on FTS5 virtual tables and reports exactly the
+    columns declared in the ``fts5(...)`` clause (excluding the content=/
+    content_rowid= key=value config, which aren't columns) — a more reliable
+    read than parsing the stored CREATE VIRTUAL TABLE SQL text by hand.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ).fetchone()
+    if not has_table:
+        return None
+    return [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+
+
 def rebuild_fts_index(db_path: str) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
 
@@ -168,6 +213,19 @@ def rebuild_fts_index(db_path: str) -> bool:
 
     Order is load-bearing: rebuild THEN delete (not delete THEN rebuild, which
     is the original crash path).
+
+    Column list is single-sourced from NODES_FTS_COLUMNS (#2077), intersected
+    with whatever columns ``nodes`` actually has — real ENGRAM DBs always carry
+    all five (engram_core's ALTER TABLE ADD COLUMN backfill guarantees it);
+    minimal/legacy test fixtures that only carry claim/quoted_text/
+    interpretation still get a 3-column index rather than failing outright.
+
+    Detect-and-repair (#2077 consequence 2): if a ``nodes_fts`` table already
+    exists with a column set that doesn't match the canonical target (e.g. a
+    stale 3-column table left behind by the pre-fix rebuild path), that stale
+    table is dropped and recreated from the canonical list before reindexing.
+    This is logged loudly — never a silent no-op — because `CREATE TABLE IF
+    NOT EXISTS` would otherwise leave the graph permanently under-indexed.
 
     Returns True if the rebuild ran, False if the ``nodes`` table does not
     exist (the DB is not ENGRAM-shaped — nothing to do).
@@ -187,9 +245,9 @@ def rebuild_fts_index(db_path: str) -> bool:
             return False
 
         # Create the FTS table if it was stripped from the dump (it always is).
-        # Guard: only create if nodes has the three columns the FTS table
-        # indexes (claim, quoted_text, interpretation).  Minimal test fixtures
-        # may have a stripped-down nodes schema; we skip creation for those.
+        # Guard: only create if nodes has the three original required columns
+        # (claim, quoted_text, interpretation).  Minimal test fixtures may
+        # have a stripped-down nodes schema; we skip creation for those.
         node_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
@@ -199,10 +257,26 @@ def rebuild_fts_index(db_path: str) -> bool:
         if not has_fts_cols:
             # nodes schema is incomplete — cannot create or rebuild FTS safely.
             return True  # Still report True: nodes exists, we just can't index.
+
+        # Canonical target columns: NODES_FTS_COLUMNS intersected with what
+        # `nodes` actually has, preserving declared order.
+        target_cols = [c for c in NODES_FTS_COLUMNS if c in node_cols]
+
+        existing_cols = _existing_fts_columns(conn)
+        if existing_cols is not None and existing_cols != target_cols:
+            print(
+                f"[rebuild_fts_index] repairing under-indexed nodes_fts on {db_path}: "
+                f"existing columns {existing_cols} != canonical {target_cols} "
+                "— dropping and rebuilding from the canonical column list."
+            )
+            conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts")
+
+        cols_sql = ", ".join(target_cols)
         conn.execute(
-            """
+            f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                claim, quoted_text, interpretation,
+                {cols_sql},
                 content='nodes', content_rowid='rowid'
             )
             """
@@ -218,20 +292,18 @@ def rebuild_fts_index(db_path: str) -> bool:
         # crash that step 1 prevents.
         # Guard: only query status='retracted' if the status column exists
         # (minimal test fixtures may omit it; real ENGRAM DBs always have it).
-        col_names = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
-        }
-        if "status" in col_names:
+        if "status" in node_cols:
+            select_cols_sql = ", ".join(f"COALESCE({c}, '')" for c in target_cols)
             retracted = conn.execute(
-                "SELECT rowid, COALESCE(claim,''), COALESCE(quoted_text,''), "
-                "COALESCE(interpretation,'') FROM nodes WHERE status='retracted'"
+                f"SELECT rowid, {select_cols_sql} FROM nodes WHERE status='retracted'"
             ).fetchall()
-            for rowid, claim, quoted_text, interpretation in retracted:
+            insert_cols_sql = ", ".join(target_cols)
+            placeholders_sql = ", ".join(["?"] * (len(target_cols) + 1))
+            for row in retracted:
                 conn.execute(
-                    "INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation) "
-                    "VALUES ('delete', ?, ?, ?, ?)",
-                    (rowid, claim, quoted_text, interpretation),
+                    f"INSERT INTO nodes_fts(nodes_fts, rowid, {insert_cols_sql}) "
+                    f"VALUES ('delete', {placeholders_sql})",
+                    row,
                 )
 
         # Step 3: gate the server's #274 migration so it doesn't re-fire.

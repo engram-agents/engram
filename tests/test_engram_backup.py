@@ -866,3 +866,431 @@ def test_verify_roundtrip_retracted_term_absent_from_recon_fts(tmp_path):
     assert active_hits == 1, (
         f"active-node term 'xyzzy_active' should be present in recon FTS, got {active_hits} hits"
     )
+
+
+# ---------------------------------------------------------------------------
+# #2077 — nodes_fts column list single-sourcing
+# ---------------------------------------------------------------------------
+#
+# Background: the column list was hand-written in two places that drifted —
+# engram_core.py's CREATE VIRTUAL TABLE carried 5 columns (claim,
+# quoted_text, interpretation, reported_state, trigger_text), while
+# rebuild_fts_index here still had the original 3 (claim, quoted_text,
+# interpretation). Consequence 1: the delete-insert only scrubbed 3 columns,
+# so a retracted node stayed FTS-findable through reported_state/
+# trigger_text. Consequence 2: on restore, rebuild_fts_index recreated
+# nodes_fts with 3 columns and engram_core's `CREATE TABLE IF NOT EXISTS`
+# then permanently no-op'd, leaving the graph under-indexed forever.
+#
+# All three tests below use only temp DBs (tmp_path) — no ~/.engram is ever
+# touched.
+
+
+def _build_five_column_engram_db(path: str, rows: list) -> None:
+    """Build a nodes table + a full 5-column nodes_fts index (the real
+    production shape post-#403), matching engram_core's live schema closely
+    enough to exercise rebuild_fts_index's column handling.
+
+    ``rows`` is a list of dicts with keys: id, claim, quoted_text,
+    interpretation, reported_state, trigger_text, status.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id             TEXT PRIMARY KEY,
+            claim          TEXT,
+            quoted_text    TEXT,
+            interpretation TEXT,
+            reported_state TEXT,
+            trigger_text   TEXT,
+            status         TEXT,
+            embedding      TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation, reported_state, trigger_text,
+            content='nodes', content_rowid='rowid'
+        );
+        """
+    )
+    for r in rows:
+        conn.execute(
+            "INSERT INTO nodes (id, claim, quoted_text, interpretation, "
+            "reported_state, trigger_text, status, embedding) VALUES (?,?,?,?,?,?,?,NULL)",
+            (
+                r["id"], r["claim"], r["quoted_text"], r["interpretation"],
+                r["reported_state"], r["trigger_text"], r["status"],
+            ),
+        )
+    # Populate the FTS index the way a live install would have it before a
+    # rebuild — i.e. everything indexed, including the retracted row, mirroring
+    # the pre-#274-migration / pre-repair state.
+    conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
+    conn.commit()
+    conn.close()
+
+
+def _fts_match_ids(db_path: str, token: str) -> set:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT n.id AS id FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid "
+        "WHERE nodes_fts MATCH ?",
+        (token,),
+    ).fetchall()
+    conn.close()
+    return {r["id"] for r in rows}
+
+
+def test_2077_retracted_node_scrubbed_from_all_five_fts_columns(tmp_path):
+    """Regression for #2077 consequence 1 (the issue's exact measured case).
+
+    Before the fix, rebuild_fts_index's delete-insert only touched 3 of the
+    5 FTS columns, so a retracted node stayed FTS-findable through
+    reported_state and trigger_text (the two columns feeling_report/lesson
+    nodes rely on). After rebuild_fts_index, the retracted node's unique
+    tokens must be absent from a MATCH probe against ALL five columns, and
+    the current node's tokens must remain present.
+    """
+    db_path = str(tmp_path / "knowledge.db")
+    rows = [
+        {
+            "id": "ob_current",
+            "claim": "current2077_claimtoken",
+            "quoted_text": "current2077_quotedtoken",
+            "interpretation": "current2077_interptoken",
+            "reported_state": "current2077_reportedtoken",
+            "trigger_text": "current2077_triggertoken",
+            "status": "active",
+        },
+        {
+            "id": "ob_retracted",
+            "claim": "retracted2077_claimtoken",
+            "quoted_text": "retracted2077_quotedtoken",
+            "interpretation": "retracted2077_interptoken",
+            "reported_state": "retracted2077_reportedtoken",
+            "trigger_text": "retracted2077_triggertoken",
+            "status": "retracted",
+        },
+    ]
+    _build_five_column_engram_db(db_path, rows)
+
+    # Confirm the pre-rebuild state: the retracted row IS indexed (both nodes
+    # were populated by the bare 'rebuild' in the fixture builder).
+    assert "ob_retracted" in _fts_match_ids(db_path, "retracted2077_reportedtoken")
+
+    assert engram_backup.rebuild_fts_index(db_path) is True
+
+    # The issue's exact MATCH probes: none of the retracted node's five
+    # column tokens may match after rebuild_fts_index.
+    for token in (
+        "retracted2077_claimtoken",
+        "retracted2077_quotedtoken",
+        "retracted2077_interptoken",
+        "retracted2077_reportedtoken",
+        "retracted2077_triggertoken",
+    ):
+        matched = _fts_match_ids(db_path, token)
+        assert "ob_retracted" not in matched, (
+            f"retracted node must not match on {token!r} after rebuild_fts_index, got {matched}"
+        )
+
+    # The current node's tokens across all five columns must still match.
+    for token in (
+        "current2077_claimtoken",
+        "current2077_quotedtoken",
+        "current2077_interptoken",
+        "current2077_reportedtoken",
+        "current2077_triggertoken",
+    ):
+        matched = _fts_match_ids(db_path, token)
+        assert "ob_current" in matched, (
+            f"current node must match on {token!r} after rebuild_fts_index, got {matched}"
+        )
+
+
+def test_2077_repairs_stale_three_column_nodes_fts(tmp_path):
+    """Regression for #2077 consequence 2: a stale 3-column nodes_fts table
+    (left behind by the pre-fix rebuild_fts_index on a restore) must be
+    detected, dropped, and rebuilt to the full 5-column canonical schema —
+    not silently skipped by `CREATE TABLE IF NOT EXISTS`.
+    """
+    db_path = str(tmp_path / "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id             TEXT PRIMARY KEY,
+            claim          TEXT,
+            quoted_text    TEXT,
+            interpretation TEXT,
+            reported_state TEXT,
+            trigger_text   TEXT,
+            status         TEXT,
+            embedding      TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        -- Stale pre-fix shape: only 3 columns, even though `nodes` has all 5.
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation,
+            content='nodes', content_rowid='rowid'
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO nodes (id, claim, quoted_text, interpretation, reported_state, "
+        "trigger_text, status, embedding) VALUES "
+        "('fl_repair', 'a lesson claim', 'src', 'interp', "
+        "'repairtoken2077_reportedstate', 'repairtoken2077_triggertext', 'active', NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    # Confirm the pre-repair gap: reported_state content is not indexable —
+    # the stale 3-column table has no such column to match against.
+    stale_cols = [row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(nodes_fts)").fetchall()]
+    assert stale_cols == ["claim", "quoted_text", "interpretation"]
+
+    assert engram_backup.rebuild_fts_index(db_path) is True
+
+    conn = sqlite3.connect(db_path)
+    repaired_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+    assert repaired_cols == list(engram_backup.NODES_FTS_COLUMNS), (
+        f"nodes_fts must be repaired to the canonical 5-column schema, got {repaired_cols}"
+    )
+
+    # Full reindex: the reported_state / trigger_text tokens must now match,
+    # which is only possible once the table has been dropped and recreated.
+    hits_rs = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'repairtoken2077_reportedstate'"
+    ).fetchone()[0]
+    hits_tt = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'repairtoken2077_triggertext'"
+    ).fetchone()[0]
+    conn.close()
+    assert hits_rs == 1, "reported_state token must be indexed after repair"
+    assert hits_tt == 1, "trigger_text token must be indexed after repair"
+
+
+def test_2077_drift_guard_create_and_insert_derive_from_canonical_constant(tmp_path):
+    """Drift guard: both consumers of the column list — engram_core's
+    CREATE VIRTUAL TABLE and engram_backup's rebuild_fts_index — must
+    actually produce a nodes_fts table matching engram_backup.NODES_FTS_COLUMNS,
+    not a second hand-written copy that happens to agree today.
+
+    This is a functional (behavioral) guard rather than a source-text grep:
+    it exercises each consumer and inspects the resulting table shape, so a
+    future hand-written literal that silently diverges from the constant
+    fails this test even if it currently matches by coincidence.
+    """
+    # --- Consumer 1: engram_backup.rebuild_fts_index ---
+    backup_db = str(tmp_path / "backup_knowledge.db")
+    conn = sqlite3.connect(backup_db)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id             TEXT PRIMARY KEY,
+            claim          TEXT,
+            quoted_text    TEXT,
+            interpretation TEXT,
+            reported_state TEXT,
+            trigger_text   TEXT,
+            status         TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        """
+    )
+    conn.execute(
+        "INSERT INTO nodes VALUES ('ob_x', 'claim', 'qt', 'interp', 'rs', 'tt', 'active')"
+    )
+    conn.commit()
+    conn.close()
+    assert engram_backup.rebuild_fts_index(backup_db) is True
+    conn = sqlite3.connect(backup_db)
+    backup_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+    conn.close()
+    assert backup_cols == list(engram_backup.NODES_FTS_COLUMNS), (
+        f"rebuild_fts_index must derive its column list from NODES_FTS_COLUMNS, got {backup_cols}"
+    )
+
+    # --- Consumer 2: engram_core's CREATE VIRTUAL TABLE nodes_fts ---
+    import importlib
+    import shutil
+    import tempfile
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from conftest import fresh_module  # local import — keeps this module's own
+    # top-level imports free of engram_core/engram_tasks, per this file's
+    # existing pure-engram_backup import contract.
+
+    engram_core = importlib.import_module("engram_core")
+    core = fresh_module(engram_core)
+
+    core_test_dir = tempfile.mkdtemp(prefix="engram_test_2077_drift_guard_")
+    try:
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        core._configure_paths(core_test_dir)
+        core._ensure_data_dir()
+        conn = core._get_db()
+        core_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+        conn.close()
+        assert core_cols == list(engram_backup.NODES_FTS_COLUMNS), (
+            f"engram_core's CREATE VIRTUAL TABLE nodes_fts must derive its column "
+            f"list from engram_backup.NODES_FTS_COLUMNS, got {core_cols}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
+    """Regression for #2077 finding 1 (reviewer round 2): a LIVE server whose
+    nodes_fts is already a stale 3-column table must self-heal on the next
+    ``_get_db()`` call (i.e. the next process/server restart), not just on an
+    explicit backup-restore via engram_backup.rebuild_fts_index.
+
+    Before this fix, engram_core's ``CREATE VIRTUAL TABLE IF NOT EXISTS``
+    silently no-ops once nodes_fts exists in ANY shape, so a corrupted
+    3-column table survived every restart forever. This mirrors the
+    reviewer's exact probe: build a real DB via engram_core._get_db(),
+    manually downgrade nodes_fts to 3 columns behind engram_core's back, then
+    re-run _get_db() and assert the table is back to 5 columns with the
+    reported_state/trigger_text content actually reindexed (not just present
+    in `nodes`).
+    """
+    import importlib
+    import shutil
+    import tempfile
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from conftest import fresh_module
+
+    engram_core = importlib.import_module("engram_core")
+    core = fresh_module(engram_core)
+
+    core_test_dir = tempfile.mkdtemp(prefix="engram_test_2077_startup_self_heal_")
+    try:
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        core._configure_paths(core_test_dir)
+        core._ensure_data_dir()
+
+        # First _get_db(): builds the DB fresh, with the correct 5-column
+        # nodes_fts (this is the happy path #2077's first fix already covers).
+        conn = core._get_db()
+        conn.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, quoted_text, "
+            "interpretation, reported_state, trigger_text, status) VALUES "
+            "('fl_selfheal', 'feeling_report', '2026-08-18T00:00:00Z', "
+            "'a feeling claim', 'src quote', 'interp', "
+            "'selfhealtoken2077_reportedstate', 'selfhealtoken2077_triggertext', "
+            "'active')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Simulate a corrupted live server: downgrade nodes_fts to the stale
+        # pre-#2077 3-column shape, behind engram_core's back (e.g. as if a
+        # pre-fix engram_backup.rebuild_fts_index had run against this file).
+        raw = sqlite3.connect(str(core.DB_PATH))
+        raw.executescript(
+            """
+            DROP TABLE IF EXISTS nodes_fts_vocab;
+            DROP TABLE IF EXISTS nodes_fts;
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                claim, quoted_text, interpretation,
+                content='nodes', content_rowid='rowid'
+            );
+            INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild');
+            """
+        )
+        raw.commit()
+        raw.close()
+
+        stale_cols = [
+            row[1]
+            for row in sqlite3.connect(str(core.DB_PATH)).execute(
+                "PRAGMA table_info(nodes_fts)"
+            ).fetchall()
+        ]
+        assert stale_cols == ["claim", "quoted_text", "interpretation"], (
+            "test setup must actually produce the stale 3-column shape"
+        )
+
+        # Force the one-time-setup block to re-run, as it would on the next
+        # real server restart (a fresh process starts with an empty
+        # _db_setup_done_paths — this test reuses one process, so clear the
+        # in-process cache to simulate that restart instead of spinning up a
+        # second interpreter).
+        core._db_setup_done_paths.clear()
+
+        # Second _get_db(): must detect the drift and self-heal, with no
+        # caller-visible action beyond calling _get_db() again.
+        conn = core._get_db()
+        repaired_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+        assert repaired_cols == list(engram_backup.NODES_FTS_COLUMNS), (
+            f"nodes_fts must self-heal to the canonical 5-column schema on "
+            f"the next _get_db() call, got {repaired_cols}"
+        )
+
+        hits_rs = conn.execute(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'selfhealtoken2077_reportedstate'"
+        ).fetchone()[0]
+        hits_tt = conn.execute(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'selfhealtoken2077_triggertext'"
+        ).fetchone()[0]
+        conn.close()
+        assert hits_rs == 1, "reported_state token must be reindexed after startup self-heal"
+        assert hits_tt == 1, "trigger_text token must be reindexed after startup self-heal"
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2077_core_fallback_literal_matches_canonical_constant():
+    """Regression for #2077 finding 2 (reviewer round 2): engram_core's
+    ImportError fallback literal for the FTS column list
+    (``"claim, quoted_text, interpretation, reported_state, trigger_text"``)
+    is a third hand-written copy of NODES_FTS_COLUMNS, never exercised by any
+    test (the ``import engram_backup`` above always succeeds in this
+    environment). Assert it stays byte-identical to the canonical constant so
+    a future edit to NODES_FTS_COLUMNS that forgets this literal fails loudly
+    here instead of silently drifting a third time.
+
+    Reads the literal out of engram_core.py's source via `ast` rather than
+    triggering the fallback at runtime (forcing an ImportError on
+    `engram_backup` mid-suite would poison sys.modules for every other test
+    that imports it afterwards).
+    """
+    import ast
+
+    core_src_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram", "engram_core.py"
+    )
+    with open(core_src_path) as f:
+        tree = ast.parse(f.read(), filename=core_src_path)
+
+    fallback_literal = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "_fts_cols_sql"
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            fallback_literal = node.value.value
+
+    assert fallback_literal is not None, (
+        "could not find the `_fts_cols_sql = \"...\"` fallback literal in "
+        "engram_core.py — has the ImportError fallback been refactored away?"
+    )
+    canonical_sql = ", ".join(engram_backup.NODES_FTS_COLUMNS)
+    assert fallback_literal == canonical_sql, (
+        f"engram_core's ImportError fallback literal {fallback_literal!r} has "
+        f"drifted from engram_backup.NODES_FTS_COLUMNS {canonical_sql!r} — "
+        "update the literal to match."
+    )
