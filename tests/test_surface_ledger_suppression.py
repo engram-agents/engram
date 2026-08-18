@@ -33,6 +33,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -101,16 +102,75 @@ def _make_result(*, special_nodes=None, top_claims=None, match_count=None,
 
 
 class LedgerTestBase(unittest.TestCase):
-    """Common setUp/tearDown: isolated ENGRAM_HOME per test."""
+    """Common setUp/tearDown: isolated ENGRAM_HOME per test.
+
+    #2015/#2081: `self.hook.ENGRAM_HOME = self.tmp` (the old approach, kept
+    below as a redundant belt-and-suspenders assignment) only rebinds the
+    module-level `ENGRAM_HOME` NAME after import. Path constants the module
+    computes ONCE at import time via `os.path.join(ENGRAM_HOME, ...)` --
+    e.g. `PRINCIPLE_TRIGGERS_PATH`, and critically `PRINCIPLE_TRIGGER_STATE_PATH`
+    (the lesson/cornerstone/axiom/goal cross-prompt cooldown state file) --
+    are plain strings baked in at that import, and reassigning the module
+    attribute afterward does not touch them. Those two constants therefore
+    kept resolving against the REAL `$ENGRAM_HOME` (default `~/.engram`),
+    reading and WRITING a live agent's actual cooldown state
+    (`principle-trigger-state.json`) from `TestTripwireExemptFromSuppression`
+    -- both the "fails on a real machine, green in CI" defect (#2015: a real
+    agent's `ls_0001` cooldown state suppresses the tripwire the test expects
+    to always fire) and the cross-run order-sensitivity (#2081: each
+    exec'd-fresh test module still shares that ONE real on-disk state file
+    across process runs, so an earlier run's write changes a later run's
+    read).
+
+    Fix: set `ENGRAM_HOME` in the environment BEFORE importing the module
+    (matching tests/test_principle_triggers_registry.py's
+    `monkeypatch.setenv("ENGRAM_HOME", ...)` convention for the same hook
+    file, translated to unittest via `mock.patch.dict`), so EVERY
+    import-time-computed path constant -- not just the ones an individual
+    test happens to know to override -- resolves against this test's own
+    scratch dir.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="engram_ledger_test_")
+        self._env_patch = mock.patch.dict(os.environ, {"ENGRAM_HOME": self.tmp})
+        self._env_patch.start()
         self.hook = _load_hook_module()
+        # Redundant now that ENGRAM_HOME is set before import (every
+        # import-time constant already resolves against self.tmp), but kept
+        # as a harmless belt-and-suspenders assignment matching this
+        # suite's established `_surface_ledger_path()`-style dynamic-lookup
+        # pattern, and so any code that reads `hook.ENGRAM_HOME` directly at
+        # call time (rather than a frozen constant) still sees the same value.
         self.hook.ENGRAM_HOME = self.tmp
+        # Self-guarding assertion: if the env-patch-before-import fix above
+        # is ever reverted (e.g. ENGRAM_HOME patched only *after*
+        # `_load_hook_module()`, or the `mock.patch.dict` call moved/removed),
+        # the import-time-computed path constants silently fall back to
+        # resolving against the REAL `$ENGRAM_HOME` again -- exactly the
+        # "fails on a real machine, green in CI" defect this fix closes
+        # (#2015). Asserting here makes that regression fail LOUDLY, in CI,
+        # on every run -- not only on a real machine that happens to have
+        # live cooldown state to collide with.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2015/#2081 may have regressed.",
+        )
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGERS_PATH,
+            os.path.join(self.tmp, "principle_triggers.json"),
+            "PRINCIPLE_TRIGGERS_PATH did not resolve against the test's "
+            "isolated ENGRAM_HOME -- the env-patch-before-import fix for "
+            "#2015/#2081 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self._env_patch.stop()
 
     def _ledger_path(self):
         return os.path.join(self.tmp, "surface-ledger.json")
@@ -527,6 +587,11 @@ class TestTripwireExemptFromSuppression(LedgerTestBase):
                     "nudge": "do the corrective action",
                 }
             }, f)
+        # No-op post-fix: PRINCIPLE_TRIGGERS_PATH already resolves to
+        # registry_path via the patched ENGRAM_HOME (see LedgerTestBase),
+        # since registry_path == os.path.join(self.tmp, "principle_triggers.json").
+        # Kept for explicitness/robustness rather than relying solely on
+        # that resolution.
         self.hook.PRINCIPLE_TRIGGERS_PATH = registry_path
 
         # Seed the surfaced ledger as if this id had already been suppressed
