@@ -787,6 +787,33 @@ def _git(*args: str, **kwargs) -> subprocess.CompletedProcess:
 _git_available = False
 
 
+def _has_upstream() -> bool:
+    """True if the current branch already has an upstream tracking ref configured."""
+    r = _git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    return r.returncode == 0
+
+
+def _push_head_ensuring_upstream() -> subprocess.CompletedProcess:
+    """Push HEAD to origin, wiring up the upstream tracking ref if the current
+    branch does not already have one (#2046).
+
+    Without an upstream, `git status` / `git status -sb` cannot report ahead/behind
+    — the exact surface an agent or a human reaches for to check backup health prints
+    a bare `## <branch>` with no divergence marker, indistinguishable from "fully
+    pushed". A stalled worker or a rejected push then produces *no visible signal* on
+    that surface, even though local commits keep piling up.
+
+    `git push -u` is the right primitive: it sets the upstream on success and is a
+    no-op on every push after the first (an already-tracked branch is left alone), so
+    it's safe to call unconditionally rather than gating this behind a one-time
+    install/enrollment step — which matters because a `~/.engram` repo's remote may
+    predate this fix and simply never have had `-u` used against it.
+    """
+    if _has_upstream():
+        return _git("push", "origin", "HEAD")
+    return _git("push", "-u", "origin", "HEAD")
+
+
 def _init_git():
     """Initialize git repo. Called once at startup with a generous timeout.
 
@@ -4246,7 +4273,9 @@ def _commit_snapshot_sync(
 
     # 7. Auto-push to remote (best-effort, never blocks checkpoint)
     # Use HEAD so the push targets the current branch, not hardcoded "master" (#737).
-    push_result = _git("push", "origin", "HEAD")
+    # Also wires up the upstream tracking ref on the first successful push if it's
+    # missing, so `git status -sb` can report backlog instead of staying silent (#2046).
+    push_result = _push_head_ensuring_upstream()
     if push_result.returncode == 0:
         result["remote_push"] = "success"
     else:

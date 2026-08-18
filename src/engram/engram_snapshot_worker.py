@@ -330,7 +330,9 @@ def _commit_snapshot_files(mode: str, message: str) -> dict:
         "commit_sha": sha.stdout.strip() if sha.returncode == 0 else "unknown",
         "files_committed": files,
     }
-    push = git("push", "origin", "HEAD")
+    # Wires up the upstream tracking ref on the first successful push if it's
+    # missing, so `git status -sb` can report backlog instead of staying silent (#2046).
+    push = engram_core._push_head_ensuring_upstream()
     result["remote_push"] = "success" if push.returncode == 0 else f"failed: {push.stderr.strip()[:200]}"
     return result
 
