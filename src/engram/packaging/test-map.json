@@ -502,6 +502,13 @@
         "tests/test_release_gates.py"
       ],
       "note": "scorecard config; consumed by release_gates tests"
+    },
+    {
+      "path_prefix_or_glob": "tools/verify_quote.py",
+      "test_globs": [
+        "tests/test_verify_quote_exit_codes.py"
+      ],
+      "note": "exit-code contract (#1990); subprocess-tested against the real entrypoint"
     }
   ],
   "unmapped": [
@@ -560,10 +567,6 @@
     {
       "path": "tools/session.py",
       "reason": "No dedicated test file found"
-    },
-    {
-      "path": "tools/verify_quote.py",
-      "reason": "No dedicated test file found (verify_quote is tested indirectly via server tests)"
     },
     {
       "path": "tools/write_sleep_marker.py",
