@@ -152,7 +152,7 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 cat > ~/.engram/loop-mode.json <<JSON
 {
-  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ScheduleWakeup at cadence_seconds, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
+  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ScheduleWakeup at cadence_seconds, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
@@ -470,7 +470,12 @@ dead thread.
    > and **at the END of the turn — the FINAL action, only after the work and
    > the state-rewrite are done — `ScheduleWakeup` at this loop's cadence with
    > this same stub** (unconditionally; no check-before-arm). Then `CronList`
-   > to confirm the armed prompt leads with `<loop-wake>`.*
+   > to confirm the armed prompt leads with `<loop-wake>`. **If this turn's
+   > work includes a reply the human must see: batch the arm WITH a sibling
+   > tool call (the marker `state` rewrite is the natural one) in a single
+   > parallel block, then put the reply after it as the turn's FINAL text —
+   > a solo arm ends the turn and a trailing arm swallows the reply (Step 2
+   > item 3's reply-carrying split, #2098).***
 
    **The re-arm line lives in the PROMPT, and that is the primary channel —
    not the marker.** Two reasons, and the first is the load-bearing one:
@@ -576,6 +581,52 @@ dead thread.
    Stop-hook mechanism built since (Part A of #1973) is what actually closes
    the forgotten-re-arm gap now, which is why arm-last is safe today in a way
    it would not have been on 2026-07-31.)*
+
+   **REPLY-CARRYING TURNS: batch the arm with a sibling call, reply last
+   (added 2026-08-18, #2098 — measured on Claude Code 2.1.235, two seats).**
+   Two harness behaviors, established by live discriminating tests with Lei
+   watching the rendered output:
+
+   - (i) On Kepler's seat a **SOLO** `ScheduleWakeup` call — the only tool
+     call in its message — **ends the turn at its result** (n=2, under
+     explicit stated intent to continue; the planned follow-up calls never
+     ran), while the same call **batched with a sibling in one parallel
+     block lets the turn continue normally**, with rendered output
+     confirmed by the user. **NOT reproduced on Borges's seat at the same
+     version: 69/69 solo arms there continued, with a following tool call
+     that executed, and Stop-hook mediation excluded. The divergence is
+     unexplained.** The batched shape is the recommendation because it is
+     the one measured working on both seats — not because the solo failure
+     is universal.
+   - (ii) Only the **final text** of a turn renders to the user — text
+     followed by a trailing tool call is silently not shown. So a
+     reply-then-arm ordering swallows the reply.
+
+   Lei lost five replies to the combination on 2026-08-18 before a
+   controlled no-arm turn isolated (ii) and the batched-arm test isolated
+   (i). Treat the solo-arm termination as measured on 2.1.235, not asserted
+   universal.
+
+   The rule, split by what the turn carries:
+
+   - **Quiet iteration (nothing said to a human):** arm-last exactly as
+     above — (a) work, (b) marker `state` rewrite, (c) arm, (d) verify.
+     A solo arm ending the turn is harmless here.
+   - **Reply-carrying turn:** (a) work, then **(b)+(c) in ONE parallel
+     block** — the marker `state` rewrite (a Bash call, so it is the
+     natural sibling) batched together with the `ScheduleWakeup` — then
+     **(d) the reply as the turn's final text, nothing after it.** The
+     pending sibling call is what carries the turn past the arm; the
+     reply-in-final-position is what makes it render.
+
+   Do NOT end a reply-carrying turn on a solo arm (reply swallowed, per
+   (ii)+(i)), and do not suppress the reply to satisfy the arm ritual:
+   silently dropping the conversation is the worse failure (Lei, verbatim:
+   "concise answer, not too long, but not silently dropping the
+   conversation either"). The loop-arm Stop hook keeps its ordinary role as
+   the safety net for a genuinely forgotten arm — if it blocks after your
+   reply already rendered, just arm in the re-invocation and add nothing
+   after.
 
    **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction

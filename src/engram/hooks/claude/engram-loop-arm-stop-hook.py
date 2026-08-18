@@ -106,6 +106,25 @@ re-derive):
    `stop_hook_active` is true and the guard returns early, so blocking
    cannot recurse.
 
+2026-08-18 note (#2098, measured on Claude Code 2.1.235): on Kepler's
+seat a SOLO `ScheduleWakeup` call -- the only tool call in its message --
+ends the turn at its result (n=2, under explicit intent to continue),
+while the SAME call batched with any sibling tool call in one parallel
+block lets the turn continue normally (measured live, rendered output
+confirmed by the user). NOT reproduced on Borges's seat at the same
+version: 69/69 solo arms there continued, with a following tool call
+that executed and Stop-hook mediation excluded -- the divergence is
+unexplained. The batched shape is the recommendation because it is the
+one measured working on both seats, not because the solo failure is
+universal. Separately, only
+a turn's FINAL text renders to the user. Consequence for reply-carrying
+loop turns (engram-loop Step 2 item 3): batch the arm with a sibling
+call (the marker-state rewrite is the natural one), then the reply as
+the turn's final text. This hook keeps its ordinary safety-net role
+unchanged; `_NUDGE_TEXT` carries a pointer to the batched shape so an
+agent nudged mid-conversation doesn't swallow its next reply. Measured
+on 2.1.235, not asserted universal.
+
 Fire condition -- emit the nudge iff ALL of:
   (a) `~/.engram/loop-mode.json` exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
@@ -364,7 +383,12 @@ _NUDGE_TEXT = (
     "prompt leads with "
     f"{_LOOP_WAKE_MARKER}. CronList alone never satisfies this check, only "
     "verifies after the real arming action. Arming is idempotent: a "
-    "redundant arm replaces, never stacks.]"
+    "redundant arm replaces, never stacks. If your NEXT turn will carry a "
+    "user-facing reply: batch the arm with a sibling tool call in one "
+    "parallel block and put the reply after it as the turn's final text — "
+    "a solo arm ends the turn, a trailing arm swallows the reply (engram-"
+    "loop Step 2 item 3, #2098). If a reply already rendered this turn, "
+    "arm now and add nothing after.]"
 )
 
 
