@@ -81,7 +81,11 @@ def _reload_inspect_raw(monkeypatch: pytest.MonkeyPatch) -> object:
     for k in list(sys.modules.keys()):
         if "inspect_raw" in k:
             del sys.modules[k]
-    sys.path.insert(0, str(REPO_ROOT / "tools"))
+    # append (not insert(0)) -- inspect_raw.py doesn't collide with anything
+    # in src/, but making tools/ a sys.path *root* at position 0 would
+    # outrank src/forum for the rest of the pytest run, shadowing the real
+    # `forum` package for every test collected afterward (#2037/#2063).
+    sys.path.append(str(REPO_ROOT / "tools"))
     import inspect_raw  # type: ignore[import]
     return inspect_raw
 

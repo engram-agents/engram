@@ -25,7 +25,12 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+# append (not insert(0)) -- `tools.config_schema` below is a qualified
+# import that only needs REPO_ROOT (already inserted above) on sys.path;
+# inserting tools/ itself at position 0 would needlessly outrank src/forum
+# for the rest of the pytest run, shadowing the real `forum` package for
+# every test collected afterward (#2037/#2063).
+sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
 
 import viz_server
 from tools.config_schema import SCHEMA, annotate_schema  # noqa: E402

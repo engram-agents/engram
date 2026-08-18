@@ -29,7 +29,12 @@ from unittest.mock import MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+# append (not insert(0)) -- `tools.config_schema` below is a qualified
+# import that only needs REPO_ROOT (already inserted above) on sys.path;
+# inserting tools/ itself at position 0 would needlessly outrank src/forum
+# for the rest of the pytest run, shadowing the real `forum` package for
+# every test collected afterward (#2037/#2063).
+sys.path.append(str(REPO_ROOT / "tools"))
 
 _HOOK_PATH = REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
 

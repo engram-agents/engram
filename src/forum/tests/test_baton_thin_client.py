@@ -27,9 +27,14 @@ import pytest
 # ---------------------------------------------------------------------------
 # Path bootstrap: tools/ contains baton.py + forum_api.py
 # ---------------------------------------------------------------------------
+# append (not insert(0)) -- src/engram/tools/ also holds forum.py (the CLI
+# script tools/forum.py symlinks to); making it a sys.path *root* at
+# position 0 would outrank src/forum for the rest of the pytest run,
+# shadowing the real `forum` package -- the very package this test file
+# lives under -- for every test collected afterward (#2037/#2063).
 _TOOLS_DIR = Path(__file__).resolve().parents[3] / "src" / "engram" / "tools"
 if str(_TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_TOOLS_DIR))
+    sys.path.append(str(_TOOLS_DIR))
 
 import baton as _baton
 from forum_api import ForumHttpError, ForumNetworkError

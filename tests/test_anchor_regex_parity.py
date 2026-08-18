@@ -45,8 +45,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 
 _TOOLS_DIR = str(REPO_ROOT / "tools")
+# append (not insert(0)) -- tools/baton.py doesn't collide with anything
+# under src/, but making tools/ a sys.path *root* at position 0 would
+# outrank src/forum for the rest of the pytest run, shadowing the real
+# `forum` package for every test collected afterward (#2037/#2063).
 if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
+    sys.path.append(_TOOLS_DIR)
 import baton as _baton  # noqa: E402
 
 

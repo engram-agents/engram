@@ -12,7 +12,12 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram" / "tools"))
+# append (not insert(0)) -- src/engram/tools/ also holds forum.py (the CLI
+# script tools/forum.py symlinks to); making it a sys.path *root* at
+# position 0 would outrank src/forum for the rest of the pytest run,
+# shadowing the real `forum` package for every test collected afterward
+# (#2037/#2063).
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src" / "engram" / "tools"))
 import run_matrix as rm  # noqa: E402
 
 

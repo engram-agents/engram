@@ -29,7 +29,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+# append (not insert(0)) -- tools/forum_backup.py doesn't collide with
+# anything in src/, but making tools/ a sys.path *root* here would
+# outrank src/forum for the rest of the pytest run, shadowing the real
+# `forum` package for every test collected afterward (#2037/#2063).
+sys.path.append(str(REPO_ROOT / "tools"))
 
 import forum_backup  # noqa: E402
 from forum_backup import _strip_derived_from_snapshot  # noqa: E402

@@ -17,10 +17,16 @@ import os
 import sys
 from pathlib import Path
 
-# config_schema.py lives in tools/, not at repo root.
+# config_schema.py lives in tools/, not at repo root; imported below via the
+# qualified `tools.config_schema` (never bare `config_schema`), so REPO_ROOT
+# on sys.path is sufficient -- append (not insert(0)) the tools/ dir itself:
+# only REPO_ROOT is actually needed for `tools.config_schema` to resolve, and
+# inserting tools/ at position 0 would outrank src/forum for the rest of the
+# pytest run, shadowing the real `forum` package for tests collected
+# afterward (#2037/#2063).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.append(str(REPO_ROOT / "tools"))
 
 import engram_core  # noqa: E402 — must follow sys.path setup
 

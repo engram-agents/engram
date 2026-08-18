@@ -30,8 +30,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SCAN_LEAKS = REPO_ROOT / "src" / "engram" / "tools" / "scan-leaks.py"
 EXAMPLE_CONFIG = REPO_ROOT / "docs" / ".scan-leaks-local.json.example"
 
-# Insert tools/ parent so we can import scan-leaks as a module.
-sys.path.insert(0, str(REPO_ROOT / "src" / "engram" / "tools"))
+# append (not insert(0)) -- scan-leaks.py is loaded below by explicit file
+# path via importlib, so this dir doesn't need to win any name resolution;
+# inserting it at position 0 would needlessly outrank src/forum for the
+# rest of the pytest run (src/engram/tools/ also holds forum.py), shadowing
+# the real `forum` package for every test collected afterward (#2037/#2063).
+sys.path.append(str(REPO_ROOT / "src" / "engram" / "tools"))
 
 # Import the module. The file is named with a hyphen so we use importlib.
 import importlib.util

@@ -37,9 +37,13 @@ CLI_PATH = Path(__file__).parent.parent / "tools" / "baton.py"
 # Module-level baton import for direct-call tests.
 # Adding tools/ to sys.path covers both baton.py and forum_api.py.
 # ---------------------------------------------------------------------------
+# append (not insert(0)) -- neither baton.py nor forum_api.py collides with
+# anything in src/, but making tools/ a sys.path *root* at position 0 would
+# outrank src/forum for the rest of the pytest run, shadowing the real
+# `forum` package for every test collected afterward (#2037/#2063).
 _TOOLS_DIR = str(Path(__file__).parent.parent / "tools")
 if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
+    sys.path.append(_TOOLS_DIR)
 
 import baton as _baton  # noqa: E402
 from forum_api import ForumHttpError, ForumNetworkError  # noqa: E402
