@@ -2,7 +2,7 @@ name: tests
 
 # Expensive full pytest suite — MAIN-ONLY by design (release merges).
 # Running this on every dev PR is too costly on the GitHub Actions free tier
-# (~5min wall × the py3.11/3.12 matrix per run). Dev-PR coverage is instead:
+# (~5min wall × the py3.12 matrix per run). Dev-PR coverage is instead:
 #   - the cheap scrub gates (check-no-new-shipped-node-ids.yml + manifest-gate.yml) on every PR, and
 #   - a local full-suite run after each merge (maintainer-run, $0 quota).
 # Manual `workflow_dispatch` is available for an on-demand full run.
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12"]
     env:
       # Skip the optional sentence-transformers embedding code path in CI
       # so we don't pay the ~500MB model download per run. Tests pass either way.

@@ -27,11 +27,11 @@ jobs:
   pytest:
     runs-on: ubuntu-latest
     strategy:
-      # Don't cancel 3.12 just because 3.11 failed (or vice versa) — we want
-      # the full signal from a nightly, not a first-failure abort.
+      # Costs nothing on a single-entry matrix, and stays correct if the
+      # matrix ever grows again — so leave it on rather than remove it.
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12"]
     env:
       # Skip the optional sentence-transformers embedding path so we don't pay
       # the ~500MB model download per run. Tests pass either way. (Mirrors

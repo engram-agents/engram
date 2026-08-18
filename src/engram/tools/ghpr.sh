@@ -39,7 +39,7 @@ PYTHON="${GHPR_PYTHON:-${HOME}/.engram/venv/bin/python}"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
 # Proxy constants for the "implied CI minutes" estimate (rough — local wall != GitHub
 # runner wall, but the RATIO touched-vs-full is the decision-relevant signal):
-CI_MATRIX_JOBS=2                 # tests.yml runs python 3.11 + 3.12
+CI_MATRIX_JOBS=1                 # tests.yml runs python 3.12 only
 FULL_SUITE_WALL_SECONDS=235      # measured full-suite wall today (~3m55s)
 
 die() { echo "ghpr: $*" >&2; exit 1; }
