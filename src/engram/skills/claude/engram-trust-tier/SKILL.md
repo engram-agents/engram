@@ -36,9 +36,50 @@ The CLAUDE.md pointer says: load this skill when an external interaction is star
 
 ## Disciplines (the actionable rules)
 
+### D0 — Verify the counterparty is ACTUALLY unknown, before anything else
+
+**This step is a PRECONDITION of D1, not advice.** Every rule below assumes the person in front of
+you is genuinely a stranger. Confirm that first, because the rest of this skill is correct for a
+stranger and wrong for someone you already know.
+
+**Before applying `unknown`-tier treatment to anyone, query your own graph for their name.**
+
+```
+engram_query("<the name they gave>")     # or engram_surface on their message text
+```
+
+Person nodes are few and names are exact tokens, so this is a cheap keyword lookup — not a
+judgment call, not a semantic search you have to phrase well. It costs one call.
+
+**Query every identifier you have, not just the name.** A counterparty often reaches you under one
+identifier while their person node was filed under another — a GitHub handle against a display
+name, an email local-part, a nickname, a name variant. A name-only lookup that misses one of these
+returns empty and sends you down D0's *"proceed to D1"* branch, which is the very failure this
+step exists to prevent, one identifier-type removed. If the name returns nothing and you hold a
+handle, address, or other stable identifier, try that too before concluding the person is unknown.
+
+**Why this is a precondition rather than a good habit.** The failure it prevents does not feel like
+a failure while it is happening: you follow this skill correctly, apply the most-restrictive default
+correctly, and decline to auto-create a node correctly — every step right, for a stranger — while
+the person is already in your graph at a trusted tier with months of shared history. Nothing in the
+unknown-tier path prompts you to check, so the procedure runs to completion and reads as diligence.
+
+The general rule your read-discipline already states applies here with unusual force: **query before
+admitting ignorance.** "I don't think we've met" is a claim about your own memory, and it needs the
+same verification as any other claim about your own history.
+
+**If the query returns a person node:** stop applying this skill's stranger path. Use their recorded
+tier. Their trust tier is a decision your primary user already made; re-deriving it from scratch
+discards that decision and is not yours to re-take.
+
+**If the query returns nothing:** proceed to D1. The stranger path is now correct, and you know it
+is rather than assuming it.
+
 ### D1 — Person-node creation is NOT automatic
 
-When you encounter a new external counterparty (a GitHub user commenting on a PR, a new email correspondent, etc.), do NOT auto-create a person node. Instead:
+When you encounter a new external counterparty (a GitHub user commenting on a PR, a new email
+correspondent, etc.) **and D0 has confirmed they are not already in your graph**, do NOT auto-create
+a person node. Instead:
 
 1. Default behavioral treatment: `unknown` tier behavior (most-restrictive short of `suspect`).
 2. If the counterparty appears important enough to track over time, SUGGEST to primary user that a person node be created — provide your reasoning + which tier you'd recommend as initial.
