@@ -87,6 +87,23 @@ Two reasons drove this convention (Lei + Borges, 2026-05-04):
 
 ## The contributor agent's workflow
 
+> **One-time per clone: set up the venv FIRST, then activate** — the venv is
+> the prerequisite, not the activation line by itself:
+> ```
+> python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+> git config core.hooksPath .githooks
+> ```
+> Activating without the venv hands you a gate that resolves to
+> `~/.engram/venv` (has pytest, not this repo's deps) and reads as your tests
+> being broken when it's really the environment — the gate itself fails open
+> and does not block on this, but it also checked nothing, silently. The
+> activation line wires up the local pre-push hook (PR close-keyword checks +
+> a test-suite gate that runs before `git push` on any `src/**.py` /
+> `tests/**.py` change, and skips instantly otherwise). It's opt-in; a clone
+> that skips this line pushes unprotected with nothing reporting it. Skip a
+> single push with `git push --no-verify`. See CLAUDE.md's "Local pre-push
+> test gate" section.
+
 For each piece of work — a feature, a fix, a polish, even an exploratory
 prototype — the cycle is:
 

@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+"""Pre-push git hook: PR body close-keyword checks (#1001) + local test gate.
+
+Two independent checks run on every `git push`, in this order:
+
+  1. PR body close-keyword checks (defense-in-depth, issue #1001).
+     CI's trap-check workflow already enforces these post-push. This hook
+     provides an earlier signal so the author can fix before the push rather
+     than after CI fails.
+
+       TRAP (exit 1): a body close-keyword references an issue number that
+           does NOT match the title's [closes #N] target — the wrong-issue
+           trap that caused PR #516 and PR #537 incidents. CI catches this
+           too; here it's pre-push.
+       WARN (exit 0): the title has [closes #N] but the body has no
+           close-keyword at all — means GitHub's auto-close parser won't
+           fire on merge. Reminder only; CI doesn't catch this.
+
+     Requires 'gh' CLI with valid auth. If 'gh' is unavailable or fails, this
+     check prints why on stderr and skips (exit 0) — CI provides the real
+     backstop. It never fails silently: see "Failure modes must be loud"
+     below.
+
+  2. Local test suite gate (replaces per-PR CI, which was taken off dev PRs
+     for cost reasons — #1597). Runs the full pytest suite before a push
+     that touches `src/**.py` or `tests/**.py`; docs-only / config-only
+     pushes skip instantly. This is what makes "run the suite locally
+     before pushing" an automated habit instead of a remembered one.
+     Only pytest exit code 1 (tests genuinely failed) blocks the push; every
+     other non-zero exit means the suite could not tell us pass/fail at all
+     (see the table in run_test_suite) and fails OPEN instead, loud on
+     stderr — an unready environment must never read as a broken test suite.
+
+Both checks run on every push — the close-keyword check first (it's fast),
+then the test gate. The push is blocked (non-zero exit) if EITHER fails.
+
+Activation (per-clone, opt-in — nothing runs this for you until you do this):
+  git config core.hooksPath .githooks
+
+To skip for a single push: git push --no-verify ...
+
+Interpreter resolution for the test gate (see _resolve_test_python): this
+hook never invokes bare `python3` for the *test suite* subprocess without
+explanation — see that function's docstring for why bare `python3` is a
+coin-flip across interactive vs. login shells.
+
+Failure modes must be LOUD, never silent: if a check cannot run (no `gh`,
+no interpreter, no pytest installed), it prints why on stderr and exits 0.
+A gate that quietly does nothing is worse than no gate — it reads as
+coverage that was never actually applied.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import traceback
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+
+# ---------------------------------------------------------------------------
+# shared helper
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# check 1 — PR body close-keyword checks (#1001)
+# ---------------------------------------------------------------------------
+
+_CLOSE_KEYWORDS_RE = re.compile(
+    r"\b(close[sd]?|fix(es|ed)?|resolve[sd]?)\s+#(\d+)",
+    re.IGNORECASE,
+)
+_TITLE_BRACKET_RE = re.compile(
+    r"\[clos\w+\s+#(\d+)\]",
+    re.IGNORECASE,
+)
+
+
+def _get_branch_name() -> Optional[str]:
+    result = _run(["git", "symbolic-ref", "--short", "HEAD"])
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def _get_pr_info(branch: str) -> Optional[dict]:
+    """Return {title, body} for the open PR for this branch, or None.
+
+    Uses `gh pr list --head <branch>` to find open PRs (not `gh pr view`,
+    which takes a PR number/URL/branch as a positional arg but may return
+    closed PRs). Returns the first open PR found, or None if none.
+    """
+    result = _run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "title,body", "--limit", "1"],
+    )
+    if result.returncode != 0:
+        return None
+    import json
+    try:
+        data = json.loads(result.stdout)
+        if not isinstance(data, list) or not data:
+            return None
+        return data[0]  # first open PR for this branch
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _check_pr(title: str, body: str) -> int:
+    """Run close-keyword checks. Returns exit code (0=clean/warn, 1=trap-blocked)."""
+    # Collect title targets: numbers from [closes #N] bracket form
+    title_targets = set(_TITLE_BRACKET_RE.findall(title))
+
+    # Collect body close-keyword references: issue numbers
+    body_refs = {m.group(3) for m in _CLOSE_KEYWORDS_RE.finditer(body)}
+
+    if not body_refs:
+        # No close-keywords in body at all
+        if title_targets:
+            print(
+                f"⚠ pre-push: PR title has [closes #{', #'.join(sorted(title_targets, key=int))}] "
+                f"but the PR body has no 'Closes #N.' keyword.\n"
+                f"  GitHub's auto-close parser won't fire on merge — the issue will stay open.\n"
+                f"  Add 'Closes #{sorted(title_targets, key=int)[0]}.' to the PR body to enable auto-close.\n"
+                f"  (CI does not catch this; edit via: gh pr edit <N> --body ...)",
+                file=sys.stderr,
+            )
+        return 0
+
+    if not title_targets:
+        # Body has keywords but title has no [closes #N] — warn but don't block
+        print(
+            f"⚠ pre-push: PR body has close-keyword reference(s) [#{', #'.join(sorted(body_refs, key=int))}] "
+            f"but the title has no [closes #N] target.\n"
+            f"  If this PR closes an issue, add [closes #N] to the title.\n"
+            f"  If it's a partial/EPIC slice, this is expected — warning only.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Title target(s) present — check for traps
+    traps = body_refs - title_targets
+    if traps:
+        trap_str = " ".join(f"#{n}" for n in sorted(traps, key=int))
+        target_str = " ".join(f"#{n}" for n in sorted(title_targets, key=int))
+        print(
+            f"✗ pre-push BLOCKED: off-target close-keyword(s) in PR body: {trap_str}\n"
+            f"  Title close target: {target_str}\n"
+            f"  GitHub's auto-close parser ignores negation, brackets, and backticks —\n"
+            f"  these body references will auto-close the WRONG issue on merge.\n"
+            f"\n"
+            f"  Safe paraphrases (use instead):\n"
+            f"    'this PR does NOT close #{sorted(traps)[0]}'  →  '#{ sorted(traps)[0]} stays open'\n"
+            f"    'fixes #{sorted(traps)[0]} partially'         →  'addresses one slice of #{sorted(traps)[0]}'\n"
+            f"\n"
+            f"  Edit body: gh pr edit <N> --body ...\n"
+            f"  Skip hook once: git push --no-verify",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+def _check_close_keywords() -> int:
+    """Entry point for check 1. Returns 0 (clean/warn/skipped) or 1 (blocked)."""
+    if shutil.which("gh") is None:
+        print(
+            "pre-push: 'gh' CLI not found — skipping the PR close-keyword check "
+            "(CI's trap-check workflow is the backstop for this one).",
+            file=sys.stderr,
+        )
+        return 0  # no gh → skip, loudly
+
+    branch = _get_branch_name()
+    if not branch:
+        return 0  # detached HEAD or similar — nothing to check
+
+    pr_info = _get_pr_info(branch)
+    if not pr_info:
+        return 0  # no open PR for this branch → nothing to check
+
+    title = pr_info.get("title", "")
+    body = pr_info.get("body", "") or ""
+
+    return _check_pr(title, body)
+
+
+# ---------------------------------------------------------------------------
+# check 2 — local test suite gate
+# ---------------------------------------------------------------------------
+
+_ZERO_SHA_RE = re.compile(r"^0+$")
+
+
+def _is_zero_sha(sha: str) -> bool:
+    return bool(_ZERO_SHA_RE.match(sha.strip()))
+
+
+@dataclass
+class RefUpdate:
+    local_ref: str
+    local_sha: str
+    remote_ref: str
+    remote_sha: str
+
+
+def parse_stdin(text: str) -> list[RefUpdate]:
+    """Parse pre-push stdin: one '<local ref> <local sha> <remote ref> <remote sha>' per line."""
+    updates: list[RefUpdate] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            continue  # malformed — ignore rather than crash the push
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        updates.append(RefUpdate(local_ref, local_sha, remote_ref, remote_sha))
+    return updates
+
+
+GitRunner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+def _default_git_runner(args: list[str]) -> subprocess.CompletedProcess:
+    return _run(["git", *args])
+
+
+# Git's canonical empty-tree object (SHA-1 repos; this repo is SHA-1).
+_EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def changed_files_for_update(
+    update: RefUpdate,
+    git_runner: GitRunner = _default_git_runner,
+) -> Optional[list[str]]:
+    """Return changed file paths for one ref update, or None if it's a deletion.
+
+    - local sha all-zero  -> branch deletion; caller should skip this update
+      entirely (nothing was pushed, there is nothing to test).
+    - remote sha all-zero -> new branch; diff against the merge-base with
+      origin/dev (falls back to the empty tree, i.e. "everything changed",
+      if the merge-base can't be computed — a safe over-inclusive default,
+      never a silent skip).
+    - otherwise           -> ordinary update; diff remote_sha..local_sha.
+    """
+    if _is_zero_sha(update.local_sha):
+        return None
+
+    if _is_zero_sha(update.remote_sha):
+        mb = git_runner(["merge-base", update.local_sha, "origin/dev"])
+        if mb.returncode != 0 or not mb.stdout.strip():
+            print(
+                f"⚠ pre-push: could not compute a merge-base with origin/dev for new "
+                f"branch {update.local_ref!r} — diffing against the empty tree instead "
+                f"(over-inclusive default, not a silent skip).",
+                file=sys.stderr,
+            )
+            base = _EMPTY_TREE_SHA
+        else:
+            base = mb.stdout.strip()
+        diff = git_runner(["diff", "--name-only", f"{base}..{update.local_sha}"])
+    else:
+        diff = git_runner(["diff", "--name-only", f"{update.remote_sha}..{update.local_sha}"])
+
+    if diff.returncode != 0:
+        print(
+            f"⚠ pre-push: 'git diff' failed while classifying changed files for "
+            f"{update.local_ref!r} ({diff.stderr.strip()}) — treating this push as "
+            f"changed (safe default) rather than silently skipping the test gate.",
+            file=sys.stderr,
+        )
+        return ["<diff-unavailable>"]
+
+    return [f for f in diff.stdout.splitlines() if f.strip()]
+
+
+def touches_test_relevant_py(files: list[str]) -> bool:
+    """True if any changed file is a *.py under src/ or tests/."""
+    return any(
+        f.endswith(".py") and (f.startswith("src/") or f.startswith("tests/"))
+        for f in files
+    )
+
+
+def _repo_root(git_runner: GitRunner = _default_git_runner) -> str:
+    result = git_runner(["rev-parse", "--show-toplevel"])
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return os.getcwd()
+
+
+def _resolve_test_python(repo_root: str) -> tuple[str, str]:
+    """Resolve which python interpreter runs the test suite. Returns (path, source_label).
+
+    Bare `python3` is NOT a safe default in a git hook: a git hook runs in a
+    non-interactive shell, and on this class of host that resolves through
+    the LOGIN PATH, not the interactive one. Measured directly (2026-08-18):
+    interactive `python3` -> /usr/bin/python3 (3.12.3); login-shell `python3`
+    -> /home/linuxbrew/.linuxbrew/bin/python3 (3.14.4), because linuxbrew
+    sits first on the login PATH. Which one a bare `python3` resolves to
+    inside a hook is therefore a coin-flip, not a fixed fact about the host —
+    and the two interpreters do not share a site-packages, so a coin-flip on
+    interpreter is also a coin-flip on whether `pytest` is even importable.
+
+    Resolution order (first match wins):
+      1. $ENGRAM_PYTHON            — explicit override, always wins
+      2. <repo_root>/.venv/bin/python   — this clone's own dev venv
+      3. ~/.engram/venv/bin/python      — the plugin's venv, if present
+      4. bare 'python3' on PATH         — LAST resort; prints a visible
+         warning naming the resolution risk above, so a failure downstream
+         (missing pytest, wrong version) is traceable to this choice.
+    """
+    env_python = os.environ.get("ENGRAM_PYTHON")
+    if env_python:
+        return env_python, "$ENGRAM_PYTHON"
+
+    venv_python = os.path.join(repo_root, ".venv", "bin", "python")
+    if os.path.isfile(venv_python):
+        return venv_python, ".venv/bin/python"
+
+    home_venv_python = os.path.expanduser("~/.engram/venv/bin/python")
+    if os.path.isfile(home_venv_python):
+        return home_venv_python, "~/.engram/venv/bin/python"
+
+    print(
+        "⚠ pre-push: no $ENGRAM_PYTHON, .venv/bin/python, or ~/.engram/venv/bin/python "
+        "found — falling back to bare 'python3' on PATH. This is a coin-flip across "
+        "interactive vs. login-shell PATH ordering (measured: /usr/bin/python3 3.12 vs. "
+        "linuxbrew's python3 3.14 on this host) and the two interpreters do not share "
+        "site-packages. Set $ENGRAM_PYTHON to pin one explicitly.",
+        file=sys.stderr,
+    )
+    return "python3", "python3 (bare PATH fallback — unpinned, see warning above)"
+
+
+def _pytest_importable(python_path: str) -> bool:
+    try:
+        result = _run([python_path, "-c", "import pytest"])
+    except (FileNotFoundError, OSError):
+        return False
+    return result.returncode == 0
+
+
+# Pytest's own exit-code contract (docs.pytest.org/en/stable/reference/exit-codes.html).
+# Only exit 1 means "the suite actually ran and a test genuinely failed" -- that
+# is the ONE code allowed to block a push. Every other code means the suite
+# could not tell us pass/fail at all (didn't run, crashed, nothing collected),
+# which is the SAME class of problem as "pytest isn't importable" above, and
+# must fail OPEN the same way: loud on stderr, exit 0. A resolved interpreter
+# that has pytest but not this repo's own deps (see the bug this fixes) lands
+# here, not in the block branch.
+#
+#   code  | meaning                              | gate posture
+#   ------|--------------------------------------|-----------------
+#   0     | all tests passed                     | pass   (return 0)
+#   1     | tests genuinely failed                | BLOCK  (return 1)  <- only this one
+#   2     | interrupted (collection error, ^C)    | fail open, loud (return 0)
+#   3     | internal pytest error                 | fail open, loud (return 0)
+#   4     | usage error (bad CLI args/config)     | fail open, loud (return 0)
+#   5     | no tests were collected               | fail open, loud (return 0)
+#   other | undocumented / unrecognized           | fail open, loud (return 0)
+_PYTEST_EXIT_BLOCKS = 1  # the single code that may block a push
+
+_PYTEST_EXIT_LABELS = {
+    0: "all tests passed",
+    1: "tests failed",
+    2: "interrupted -- collection error, KeyboardInterrupt, etc.",
+    3: "internal pytest error",
+    4: "pytest usage error -- bad CLI args or config",
+    5: "no tests were collected",
+}
+
+
+def run_test_suite(repo_root: Optional[str] = None) -> int:
+    """Run the local pytest suite. Returns 0 (passed, or gate could not run/verify
+    — loud skip, never silent) or 1 (suite genuinely ran and failed — exit code 1
+    only, see _PYTEST_EXIT_LABELS above).
+
+    No collect-only pre-flight (spec §3): the exit-code classification below is
+    the whole fix, and a pre-flight would run pytest twice (once to check, once
+    for real) for a speed win only on the fail-open path. Skipped to keep this
+    function's control flow traceable at a glance rather than fast.
+    """
+    repo_root = repo_root or _repo_root()
+    python_path, source_label = _resolve_test_python(repo_root)
+    print(f"pre-push: test-gate interpreter resolved from {source_label}: {python_path}",
+          file=sys.stderr)
+
+    if not _pytest_importable(python_path):
+        print(
+            f"⚠ pre-push: test gate could not run — 'pytest' is not importable under "
+            f"{python_path}. Skipping the gate (NOT blocking this push), but this means "
+            f"nothing checked your suite locally before it left this machine. Install "
+            f"pytest in that interpreter, or set $ENGRAM_PYTHON to one that has it.",
+            file=sys.stderr,
+        )
+        return 0
+
+    test_targets = ["tests"]
+    if os.path.isdir(os.path.join(repo_root, "src", "forum", "tests")):
+        test_targets.append("src/forum/tests")
+
+    print(f"pre-push: running local test suite ({' '.join(test_targets)}) — this may "
+          f"take a while…", file=sys.stderr)
+    result = subprocess.run(
+        [python_path, "-m", "pytest", *test_targets, "-q"],
+        cwd=repo_root,
+        env={**os.environ, "ENGRAM_NO_EMBEDDINGS": "1"},
+    )
+    code = result.returncode
+
+    if code == 0:
+        print("✓ pre-push: local test suite green.", file=sys.stderr)
+        return 0
+
+    if code == _PYTEST_EXIT_BLOCKS:
+        print(
+            "\n✗ pre-push BLOCKED: local test suite failed. Fix the failures above, "
+            "or skip this gate for one push with: git push --no-verify",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Anything other than 0 or 1: the suite never actually reported pass/fail --
+    # this is an ENVIRONMENT problem (wrong interpreter, missing deps, bad
+    # collection), not a code problem. Fail OPEN, loud, same posture as the
+    # pytest-not-importable branch above -- never block a push over this.
+    label = _PYTEST_EXIT_LABELS.get(code, f"unrecognized pytest exit code {code}")
+    print(
+        f"\n⚠ pre-push: test gate could not verify anything — pytest exited {code} "
+        f"({label}) under {python_path} (resolved from {source_label}). Skipping "
+        f"the gate (NOT blocking this push), but this means nothing checked your "
+        f"suite locally before it left this machine. This usually means the "
+        f"resolved interpreter has pytest but not this repo's own dependencies. "
+        f"Fix with:\n"
+        f"    python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest\n"
+        f"or set $ENGRAM_PYTHON to an interpreter that already has both.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def run_test_gate(stdin_text: str, repo_root: Optional[str] = None,
+                   git_runner: GitRunner = _default_git_runner) -> int:
+    """Entry point for check 2. Parses stdin, classifies the push, runs the suite
+    if warranted. Returns 0 (skipped or passed) or 1 (suite failed)."""
+    updates = parse_stdin(stdin_text)
+    if not updates:
+        return 0  # nothing on stdin — nothing to gate
+
+    any_real_update = False
+    changed: list[str] = []
+    for update in updates:
+        files = changed_files_for_update(update, git_runner=git_runner)
+        if files is None:
+            continue  # branch deletion — skip this ref
+        any_real_update = True
+        changed.extend(files)
+
+    if not any_real_update:
+        print("pre-push: all pushed refs are deletions — nothing to test, skipping.",
+              file=sys.stderr)
+        return 0
+
+    if not touches_test_relevant_py(changed):
+        print(
+            "pre-push: no *.py under src/ or tests/ changed — skipping the test gate "
+            "(docs/config-only push stays instant).",
+            file=sys.stderr,
+        )
+        return 0
+
+    return run_test_suite(repo_root=repo_root)
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    """Entry point. Wraps both checks in a top-level try/except so the fail-open
+    guarantee ("only pytest exit 1 blocks a push") is a property of THIS
+    function, not of each check's own internal handling. Any unhandled
+    exception from either check -- a missing binary, a malformed 'gh' JSON
+    response, anything neither check's own code anticipated -- prints its full
+    traceback (so the operator can see and report it) and returns 0. Only a
+    clean, deliberate `return 1` from the checks below reaches sys.exit as a
+    block; every exception path returns 0 instead.
+    """
+    try:
+        close_keyword_exit = _check_close_keywords()
+
+        stdin_text = sys.stdin.read()
+        test_gate_exit = run_test_gate(stdin_text)
+
+        return close_keyword_exit or test_gate_exit
+    # Deliberately `Exception`, not `BaseException`: `BaseException` also catches
+    # KeyboardInterrupt/SystemExit, so a Ctrl-C mid-suite would be swallowed here
+    # and this except's `return 0` would let an unverified push proceed -- exactly
+    # the failure this hook exists to prevent. No test in this file catches that
+    # widening (the `except BaseException:` mutant passes 29/29), so this comment
+    # is the only guard against a future "for robustness" broadening.
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        print(
+            "\n⚠ pre-push: the hook itself failed (see traceback above) -- "
+            "NOT blocking this push. Please report this traceback.",
+            file=sys.stderr,
+        )
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
