@@ -965,6 +965,16 @@ def _add_lesson_impl(
 # computation, so editing it in-place would silently drift a derived value.
 _LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
 
+# #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
+# actually carries a copy of (see core._rebuild_incidents_cache: it stores
+# scaffolding_nudge per incident, keyed via exemplifies edges off the
+# lesson; situation_pattern drives the surface-hook's pattern matching
+# against that same cache). Currently identical to _LESSON_MUTABLE_FIELDS,
+# but named separately since the two sets answer different questions
+# (what's editable vs. what the cache needs refreshed for) and could
+# diverge if a future mutable field doesn't touch the cache.
+_LESSON_CACHE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
+
 
 def _update_lesson_impl(
     node_id: str = "",
@@ -1008,10 +1018,15 @@ def _update_lesson_impl(
             effect on scaffolding_nudge (nothing to bypass).
 
     Returns:
-        JSON with status, node_id, updated_fields, field_traces_delta. Returns
-        {"error": "..."} on any validation failure (unknown field, node not
-        found / wrong type / not current, invalid regex, or prose-shaped
-        pattern without bypass_prose_check).
+        JSON with status, node_id, updated_fields, field_traces_delta. When
+        the update touches situation_pattern or scaffolding_nudge (#2000),
+        also includes cache_rebuild — the error_incidents.json refresh
+        result, same shape _register_exemplar_impl returns for lesson
+        targets — so the caller can see the file-backed tripwire cache was
+        resynced rather than assume it. Omitted when neither field is
+        touched. Returns {"error": "..."} on any validation failure (unknown
+        field, node not found / wrong type / not current, invalid regex, or
+        prose-shaped pattern without bypass_prose_check).
     """
     if updates is None:
         updates = {}
@@ -1132,9 +1147,25 @@ def _update_lesson_impl(
         }
         if prose_bypass_exercised:
             result["prose_bypass_exercised"] = True
-        return json.dumps(result)
     finally:
         conn.close()
+
+    # #2000 — the incidents cache (error_incidents.json) carries a copy of
+    # scaffolding_nudge (and is keyed off situation_pattern-driven matching
+    # at the surface-hook layer); a correction to either field must refresh
+    # it or the file-backed tripwire surface keeps serving the pre-correction
+    # text indefinitely. Mirrors _register_exemplar_impl's lesson-target
+    # cache_rebuild shape so callers can see the refresh happened. Cheap
+    # symmetry, not a blanket rebuild — skipped when the update touches
+    # neither cache-relevant field.
+    if _LESSON_CACHE_FIELDS & set(updated_fields.keys()):
+        try:
+            cache_result = core._rebuild_incidents_cache()
+        except Exception as exc:
+            cache_result = {"status": "error", "detail": str(exc)}
+        result["cache_rebuild"] = cache_result
+
+    return json.dumps(result)
 
 
 def _register_exemplar_impl(
