@@ -20,6 +20,10 @@ Coverage:
   14. Goal-tension findings route to goal_tension_resolutions, not resolutions.
   19. check_snapshot_divergence() — missing node (fetch_safety_row → None)
       raises SnapshotDivergence(field="existence"), not TypeError.
+  21. fetch_safety_row() — #2008: robust to a DEFAULT connection (no
+      row_factory), the documented usage. Existing node, missing node,
+      row_factory=sqlite3.Row parity, the end-to-end guard path, and query
+      errors propagating instead of masquerading as a missing node.
 """
 
 from __future__ import annotations
@@ -804,6 +808,145 @@ def test_missing_node_raises_snapshot_divergence_not_type_error():
             "check_snapshot_divergence raised TypeError instead of "
             "SnapshotDivergence for a missing node (None current_db_row)"
         )
+
+
+# ---------------------------------------------------------------------------
+# 21. fetch_safety_row on a DEFAULT connection (no row_factory set) — #2008
+#
+# The documented usage block (engram-dream-master.md) and fetch_safety_row's
+# own docstring both show a bare `conn` with no row_factory requirement.
+# Before the #2008 fix, `dict(row)` on a default connection raised TypeError
+# for an EXISTING node but returned None cleanly for a MISSING one — the
+# wrong failure direction for a guard that feeds check_snapshot_divergence
+# before every MCP write (loud on the safe path, silent on the dangerous
+# one). These three cases are exactly the table in the issue.
+# ---------------------------------------------------------------------------
+
+
+def _default_conn_with_nodes_table():
+    """A plain sqlite3 connection with NO row_factory set (the documented
+    usage: fetch_safety_row(conn, target_id) with a bare conn)."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    assert conn.row_factory is None, "test setup must use a default connection"
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT PRIMARY KEY, is_current INTEGER, "
+        "status TEXT, superseded_by TEXT)"
+    )
+    return conn
+
+
+def test_fetch_safety_row_default_connection_existing_node():
+    """Default connection + existing node: returns a plain dict, does not raise.
+
+    Before the fix: dict(row) on a bare tuple raised TypeError here — the
+    'loud on the safe path' half of the wrong-direction bug.
+    """
+    conn = _default_conn_with_nodes_table()
+    conn.execute(
+        "INSERT INTO nodes VALUES (?, ?, ?, ?)",
+        ("ob_0100", 1, "active", None),
+    )
+    conn.commit()
+
+    current = fetch_safety_row(conn, "ob_0100")
+    assert current == {"is_current": 1, "status": "active", "superseded_by": None}
+    assert isinstance(current, dict)
+
+
+def test_fetch_safety_row_default_connection_missing_node():
+    """Default connection + missing node: returns None cleanly (unchanged)."""
+    conn = _default_conn_with_nodes_table()
+    conn.commit()
+
+    result = fetch_safety_row(conn, "ob_9999")
+    assert result is None
+
+
+def test_fetch_safety_row_row_factory_connection_existing_node():
+    """sqlite3.Row connection + existing node: still returns an equivalent dict.
+
+    Confirms the fix does not regress the row_factory=sqlite3.Row path all
+    the other tests in this file exercise.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT PRIMARY KEY, is_current INTEGER, "
+        "status TEXT, superseded_by TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO nodes VALUES (?, ?, ?, ?)",
+        ("ob_0101", 1, "active", None),
+    )
+    conn.commit()
+
+    current = fetch_safety_row(conn, "ob_0101")
+    assert current == {"is_current": 1, "status": "active", "superseded_by": None}
+
+
+def test_fetch_safety_row_default_connection_feeds_guard_end_to_end():
+    """Full documented usage path on a DEFAULT connection: fetch → guard.
+
+    This is the end-to-end regression for the issue's documented usage
+    block — `current = fetch_safety_row(conn, target_id)` followed by
+    `check_snapshot_divergence(...)` — run against a bare `conn`, which is
+    exactly what shipped broken. Covers both branches: an existing,
+    diverged node (guard must raise) and a missing node (guard must also
+    raise, with field="existence", not let the fetch step blow up first).
+    """
+    conn = _default_conn_with_nodes_table()
+    conn.execute(
+        "INSERT INTO nodes VALUES (?, ?, ?, ?)",
+        ("qu_0011", 0, "resolved", "qu_0088"),
+    )
+    conn.commit()
+
+    snapshot = {"is_current": True, "status": "open", "superseded_by": None}
+
+    # Existing node, diverged — must not raise TypeError getting there.
+    current = fetch_safety_row(conn, "qu_0011")
+    try:
+        check_snapshot_divergence("qu_0011", snapshot, current)
+        assert False, "Expected SnapshotDivergence for diverged node"
+    except SnapshotDivergence as e:
+        assert e.node_id == "qu_0011"
+        assert e.field == "is_current"
+
+    # Missing node — the dangerous, previously-silent case: must raise too.
+    missing_current = fetch_safety_row(conn, "qu_9999")
+    assert missing_current is None
+    try:
+        check_snapshot_divergence("qu_9999", snapshot, missing_current)
+        assert False, "Expected SnapshotDivergence for missing node"
+    except SnapshotDivergence as e:
+        assert e.node_id == "qu_9999"
+        assert e.field == "existence"
+
+
+def test_fetch_safety_row_propagates_query_errors_instead_of_masking_as_none():
+    """A broken query (e.g. missing table) must raise, not resolve to None.
+
+    Folding a fetch failure into None would let it masquerade as a normal
+    'node not found' result and be silently treated as a divergence by
+    check_snapshot_divergence's existence check — arriving at the right
+    downstream behavior for the wrong reason, and only by accident. The
+    fetch step itself must fail loudly so the two situations are never
+    conflated.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    # No `nodes` table created at all.
+
+    try:
+        fetch_safety_row(conn, "ob_0102")
+        assert False, "Expected an exception for a query against a missing table"
+    except sqlite3.OperationalError:
+        pass
 
 
 # ---------------------------------------------------------------------------
