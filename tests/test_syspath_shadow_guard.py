@@ -28,6 +28,7 @@ caught before it ever reaches the confusing collection-time failure.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -63,32 +64,426 @@ def _all_test_files() -> list[Path]:
 # Part 1: static regression guard -- no test file may `insert(0, ...)` a
 # tools-ish directory. Parametrized per file so a violation names exactly
 # which file (and which line) reintroduced the anti-pattern.
+#
+# #2089: the original per-line regex scan (`_INSERT0_RE` + `_resolve_arg_text`)
+# was demonstrated bypassable four ways in PR #2088's adversarial review --
+# a multi-line call, `sys.path` aliasing, two-hop name indirection, and
+# string-concat literals -- plus a side defect where an assignment itself
+# split across lines was missed. This replaces the regex scan with an
+# AST-based one: it parses each file, finds every `<expr>.insert(...)` Call
+# whose target resolves to `sys.path` (directly, or through a *scoped* alias
+# table covering both module-level and per-function `name = <expr>`
+# assignments -- kills the aliasing bypass), confirms the first argument
+# resolves to the literal `0` (directly or through the same alias table),
+# and constant-folds the second argument (string literals, `str(x)`, `+`
+# concatenation, `/` path-joins, `%`-formatting, `.format(...)`, and
+# fragment-collection through list/tuple/dict/subscript containers,
+# resolved through the alias table) to catch a `tools` path component
+# wherever it appears -- even nested inside an otherwise-unfoldable
+# expression (the two-hop and concat bypasses), and even when the folding
+# assignment itself spans multiple lines (the side defect). Being AST-based
+# also makes the multi-line-call bypass a non-issue: `ast.parse` sees the
+# same Call node regardless of how it is broken across lines.
+#
+# Round 2 (#2089 adversarial re-review of the round-1 AST scan): the
+# round-1 alias table was a single FLAT, module-wide dict built by one
+# `ast.walk` pass over the entire module, so a `name = <expr>` assignment
+# inside one function silently overwrote the same-named assignment inside
+# an unrelated function elsewhere in the file (last-assignment-wins,
+# independent of which function a use site is actually in). That both
+# masked a real violation (an earlier function's tools-ish `insert(0, ...)`
+# got resolved against a LATER, unrelated function's non-tools reassignment
+# of the same name) and produced a false positive (an earlier function's
+# legitimate, non-tools-ish `insert(0, ...)` got resolved against a LATER,
+# unrelated function's same-named tools-ish assignment). Fixed by scoping
+# alias resolution per enclosing function: a MODULE scope table is built
+# from only the assignments that are directly at module level (not inside
+# any function); each function additionally gets its OWN scope table built
+# from `module scope` merged with `that function's own local assignments`
+# (locals shadow same-named module names, matching normal Python scoping).
+# A call site inside function F is resolved against F's own table, never
+# against a sibling function's locals.
+#
+# Round 2 shipped nested functions `their own locals + the module scope
+# only` -- NOT their enclosing function's locals -- as "the simpler of the
+# two options ... sufficient to kill both demonstrated cases". Round 3's
+# verification found that shortcut is itself a coverage regression vs
+# round 1's flat table: an ordinary closure --
+#
+#     def outer():
+#         D = Path('/x') / 'tools'
+#         def inner():
+#             sys.path.insert(0, str(D))   # closure over outer's local D
+#
+# -- was silently NOT flagged, because `inner`'s scope table never saw
+# `outer`'s locals at all. Fixed here by proper lexical chaining: each
+# function's effective resolution table is `module scope -> each enclosing
+# function's own locals, innermost-enclosing last -> that function's own
+# locals`, later entries shadowing earlier ones -- i.e. real Python LEGB
+# scoping (minus globals/builtins, which this guard has no need of). This
+# is built in two passes: first, every function's OWN locals are collected
+# in isolation (unchanged from round 2); second, each function's ancestry
+# chain (its enclosing FunctionDef/AsyncFunctionDef nodes, outermost first)
+# is walked with an explicit parent-stack (not `ast.walk`, which loses
+# nesting order) and the effective table is `merge(module, *[own-locals of
+# each ancestor, outermost -> innermost], own-locals of the function
+# itself)`. SIBLING isolation (the round-2 regression fixtures below) is
+# preserved because two sibling functions never appear in each other's
+# ancestry chain -- only an actual lexical enclosure contributes locals.
 # ---------------------------------------------------------------------------
 
-_INSERT0_RE = re.compile(r"sys\.path\.insert\(\s*0\s*,\s*(?P<arg>[^)]*)\)")
-_ASSIGN_RE_TMPL = r"^\s*{name}\s*=\s*(?P<rhs>.+)$"
+# A resolved path segment counts as "tools-ish" if `tools` appears as an
+# exact `/`-separated path component -- this catches both the top-level
+# `tools/` dir and its canonical `src/engram/tools/` target (the symlink
+# farm), which is the actual defect surface (it's where `forum.py`
+# physically lives), while not false-triggering on an unrelated substring
+# match like `toolshed`.
+def _is_tools_ish_text(text: str) -> bool:
+    parts = re.split(r"[\\/]", text)
+    return any(part == "tools" for part in parts)
 
-# A directory argument counts as "tools-ish" if its literal text names a
-# `tools` path component -- this catches both the top-level `tools/` dir
-# and its canonical `src/engram/tools/` target (the symlink farm), which is
-# the actual defect surface (it's where `forum.py` physically lives).
-_TOOLS_ISH_RE = re.compile(r'["\']tools["\']')
+
+_MAX_ALIAS_CHAIN_DEPTH = 8
 
 
-def _resolve_arg_text(file_lines: list[str], call_line_idx: int, arg: str) -> str:
-    """Best-effort: if *arg* is a bare identifier, trace it back to its
-    nearest preceding assignment in the same file and return that RHS
-    text instead, so `sys.path.insert(0, TOOLS_DIR)` is checked against
-    `TOOLS_DIR = ... "tools" ...`, not the opaque identifier `TOOLS_DIR`."""
-    arg = arg.strip()
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", arg):
-        pattern = re.compile(_ASSIGN_RE_TMPL.format(name=re.escape(arg)))
-        for i in range(call_line_idx, -1, -1):
-            m = pattern.match(file_lines[i])
-            if m:
-                return m.group("rhs")
-        return arg  # no assignment found; check the bare name itself
-    return arg
+def _iter_scope_nodes(root: ast.AST):
+    """Yield every descendant of *root* (not including *root* itself) that
+    belongs to *root*'s own scope -- i.e. does NOT recurse into a nested
+    `FunctionDef`/`AsyncFunctionDef`'s body (the nested function is its own
+    separate scope, handled as its own call to this same generator). The
+    nested function node itself IS yielded (so callers scanning for
+    `FunctionDef` nodes still see it); only its children are skipped."""
+    stack = list(ast.iter_child_nodes(root))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _collect_assignments(nodes) -> "dict[str, ast.expr]":
+    """Extract every simple `name = <expr>` / `name: T = <expr>` assignment
+    from an already-scoped node sequence (as produced by
+    `_iter_scope_nodes`) -- last assignment within THAT scope wins, which is
+    correct scoping (not the round-1 whole-module flattening bug: the node
+    sequence passed in is already scope-bounded)."""
+    assignments: dict[str, ast.expr] = {}
+    for node in nodes:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name):
+                assignments[node.target.id] = node.value
+    return assignments
+
+
+class _AliasTable:
+    """Map of `name -> ast.expr` for one resolution scope (module scope, or
+    one function's own scope merged with the module scope beneath it --
+    see the callers in `_find_insert0_violations`). Deliberately not a full
+    symbol table: #2089 only asks for enough to catch the aliasing bypass
+    (`p = sys.path`) and chained-name indirection (`_D = ROOT / _SEG`)
+    *within the scope a use site actually lives in*, not a flat whole-file
+    table."""
+
+    def __init__(self, assignments: "dict[str, ast.expr]") -> None:
+        self._assignments = assignments
+
+    def lookup(self, name: str) -> "ast.expr | None":
+        return self._assignments.get(name)
+
+
+def _is_sys_path_expr(
+    node: ast.expr, alias: _AliasTable, seen: frozenset = frozenset()
+) -> bool:
+    """True if *node* resolves to `sys.path` -- directly, or through a
+    chain of alias-table lookups (bypass #2: `p = sys.path`)."""
+    if (
+        isinstance(node, ast.Attribute)
+        and node.attr == "path"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "sys"
+    ):
+        return True
+    if isinstance(node, ast.Name):
+        if node.id in seen or len(seen) >= _MAX_ALIAS_CHAIN_DEPTH:
+            return False
+        target = alias.lookup(node.id)
+        if target is None:
+            return False
+        return _is_sys_path_expr(target, alias, seen | {node.id})
+    return False
+
+
+def _resolve_text(
+    node: ast.expr, alias: _AliasTable, seen: frozenset = frozenset()
+) -> "tuple[str | None, list[str]]":
+    """Best-effort constant-folder for the second `sys.path.insert(0, ...)`
+    argument.
+
+    Returns ``(full_value, fragments)``:
+      - ``full_value`` is the exact folded string when *every* part of
+        *node* resolves to a literal; ``None`` when any part does not.
+      - ``fragments`` is every literal string segment reachable while
+        trying, even where full resolution fails -- so a `tools` literal
+        buried inside an otherwise-opaque expression (bypass #3's
+        `ROOT / _SEG` where `ROOT` is a runtime `Path(__file__)...` chain,
+        or bypass #4's `str(ROOT) + "/src/engram/tools"`) is still found
+        even though the outer expression can't be fully folded.
+    """
+    if len(seen) > _MAX_ALIAS_CHAIN_DEPTH:
+        return None, []
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value, [node.value]
+
+    if isinstance(node, ast.Name):
+        if node.id in seen:
+            return None, []
+        target = alias.lookup(node.id)
+        if target is None:
+            return None, []
+        return _resolve_text(target, alias, seen | {node.id})
+
+    if isinstance(node, ast.Call):
+        # str(x) -- stringification; fold through to the argument.
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "str"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            return _resolve_text(node.args[0], alias, seen)
+        # #2089 suggestion (c): '...'.format(...) -- fold the same way
+        # str(x) is unwrapped above: walk the format-string base and every
+        # positional arg for literal fragments.
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+            base_val, base_frags = _resolve_text(node.func.value, alias, seen)
+            fragments: list[str] = list(base_frags)
+            for a in node.args:
+                _, frags = _resolve_text(a, alias, seen)
+                fragments.extend(frags)
+            return None, fragments
+        # Any other call (Path(...), os.path.dirname(...), a helper
+        # function, ...) is opaque as a whole, but its arguments may still
+        # carry a stray literal fragment worth checking.
+        fragments: list[str] = []
+        for a in node.args:
+            _, frags = _resolve_text(a, alias, seen)
+            fragments.extend(frags)
+        return None, fragments
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+        left_val, left_frags = _resolve_text(node.left, alias, seen)
+        right_val, right_frags = _resolve_text(node.right, alias, seen)
+        fragments = left_frags + right_frags
+        if left_val is not None and right_val is not None:
+            sep = "" if isinstance(node.op, ast.Add) else "/"
+            return left_val + sep + right_val, fragments
+        return None, fragments
+
+    if isinstance(node, ast.JoinedStr):  # f-strings -- collect literal parts
+        fragments = [
+            v.value
+            for v in node.values
+            if isinstance(v, ast.Constant) and isinstance(v.value, str)
+        ]
+        return None, fragments
+
+    # #2089 suggestion (b): containers don't fold to one string, but a
+    # tools-ish literal buried inside one (`SEGS = ['tools']; ... / SEGS[0]`)
+    # is still worth catching as a fragment, the same way an unfoldable
+    # Call's args are scanned above.
+    if isinstance(node, (ast.List, ast.Tuple)):
+        fragments = []
+        for elt in node.elts:
+            _, frags = _resolve_text(elt, alias, seen)
+            fragments.extend(frags)
+        return None, fragments
+
+    if isinstance(node, ast.Dict):
+        fragments = []
+        for v in node.values:
+            if v is None:  # `**spread` entry -- no literal value to walk
+                continue
+            _, frags = _resolve_text(v, alias, seen)
+            fragments.extend(frags)
+        return None, fragments
+
+    if isinstance(node, ast.Subscript):
+        # `SEGS[0]` -- don't try to resolve the index, just walk the
+        # container being subscripted for stray literal fragments.
+        _, frags = _resolve_text(node.value, alias, seen)
+        return None, frags
+
+    # #2089 suggestion (c): %-formatting and .format(...) calls are folded
+    # the same way str(x) is unwrapped above -- the format string itself
+    # (and any interpolated args) are walked for literal fragments, which
+    # is enough to catch `'%s/tools' % root` and `'{}/tools'.format(root)`
+    # even without simulating the actual substitution.
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        left_val, left_frags = _resolve_text(node.left, alias, seen)
+        right_frags: list[str] = []
+        if isinstance(node.right, (ast.Tuple, ast.List)):
+            for elt in node.right.elts:
+                _, frags = _resolve_text(elt, alias, seen)
+                right_frags.extend(frags)
+        else:
+            _, frags = _resolve_text(node.right, alias, seen)
+            right_frags.extend(frags)
+        return None, left_frags + right_frags
+
+    return None, []
+
+
+def _resolves_to_zero(
+    node: ast.expr, alias: "_AliasTable", seen: frozenset = frozenset()
+) -> bool:
+    """True if *node* is the literal `0`, or resolves to it through a chain
+    of alias-table lookups (#2089 suggestion (a): `Z = 0; insert(Z, ...)`
+    should flag, symmetric with how the second argument is resolved)."""
+    if (
+        isinstance(node, ast.Constant)
+        and not isinstance(node.value, bool)
+        and node.value == 0
+    ):
+        return True
+    if isinstance(node, ast.Name):
+        if node.id in seen or len(seen) >= _MAX_ALIAS_CHAIN_DEPTH:
+            return False
+        target = alias.lookup(node.id)
+        if target is None:
+            return False
+        return _resolves_to_zero(target, alias, seen | {node.id})
+    return False
+
+
+def _check_insert_call(call: ast.Call, alias: _AliasTable) -> "tuple[bool, str]":
+    """*call* is already known to be `<expr>.insert(...)` on a `sys.path`-
+    resolving target. Returns ``(is_violation, detail)``."""
+    if len(call.args) < 2:
+        return False, ""
+    if not _resolves_to_zero(call.args[0], alias):
+        return False, ""
+    full_value, fragments = _resolve_text(call.args[1], alias)
+    if full_value is not None:
+        if _is_tools_ish_text(full_value):
+            return True, f"resolved to {full_value!r}"
+        return False, ""
+    # Full resolution failed (the second argument isn't a pure constant
+    # expression this folder can fully evaluate -- e.g. it bottoms out at
+    # a runtime Path(__file__)... chain). Fail toward flagging: if ANY
+    # literal fragment reachable along the way is itself tools-ish, treat
+    # it as a violation rather than silently passing on the strength of
+    # the rest being unresolvable (this is what catches bypass #3's
+    # two-hop indirection and bypass #4's string-concat literal, neither
+    # of which folds to one exact constant). An expression with NO literal
+    # fragments at all (e.g. `os.path.dirname(os.path.dirname(os.path.
+    # abspath(__file__)))`, the ordinary same-repo bootstrap idiom used
+    # throughout this suite) carries no evidence either way and is not
+    # flagged -- see the #2089 fairy handoff for why an unconditional
+    # "unresolvable == violation" policy is not viable against this
+    # suite's ~300 existing `sys.path.insert(0, ...)` bootstrap lines.
+    if any(_is_tools_ish_text(f) for f in fragments):
+        return True, f"unresolved expression contains literal fragment(s) {fragments!r}"
+    return False, ""
+
+
+def _scan_calls(nodes, alias: "_AliasTable") -> "list[tuple[int, str]]":
+    """Check every `Call` node in *nodes* (a scope-bounded node sequence)
+    against *alias*, the resolution table for THAT scope. Shared by the
+    module-level scan and every per-function scan below."""
+    offenders: list[tuple[int, str]] = []
+    for node in nodes:
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "insert"):
+            continue
+        if not _is_sys_path_expr(func.value, alias):
+            continue
+        is_violation, detail = _check_insert_call(node, alias)
+        if is_violation:
+            offenders.append((node.lineno, detail))
+    return offenders
+
+
+def _build_func_ancestry(tree: ast.AST) -> "dict[ast.AST, list[ast.AST]]":
+    """Map every `FunctionDef`/`AsyncFunctionDef` node to the list of its
+    LEXICALLY ENCLOSING function nodes, outermost first, NOT including
+    itself. Built with an explicit parent-stack walk (not `ast.walk`,
+    which visits every node in some order but discards nesting structure)
+    so a nested function's chain reflects real lexical enclosure -- the
+    scoping round 1's flat table and round 2's per-scope-only table both
+    got wrong in opposite ways (round 1: everything bled together
+    module-wide; round 2: nothing above a function's own locals was
+    visible at all, missing a closure over an enclosing local, #2089
+    round 3)."""
+    ancestry: "dict[ast.AST, list[ast.AST]]" = {}
+
+    def walk(node: ast.AST, stack: "list[ast.AST]") -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                ancestry[child] = list(stack)
+                walk(child, stack + [child])
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return ancestry
+
+
+def _find_insert0_violations(text: str, filename: str = "<file>") -> "list[tuple[int, str]]":
+    """AST-scan *text* for `sys.path.insert(0, <tools-ish>)` violations
+    (directly or via alias/indirection), with alias resolution built by
+    proper LEXICAL CHAINING (#2089 round 3): a use site inside function
+    `F` resolves through `F`'s own locals, then each enclosing function's
+    own locals (innermost enclosing checked first, i.e. shadowing
+    outward), then the module scope -- ordinary Python LEGB scoping (minus
+    globals/builtins, not needed here). SIBLING functions never appear in
+    each other's ancestry chain, so the round-2 cross-function isolation
+    fix is preserved: only genuine lexical enclosure contributes locals to
+    a nested function's table, never an unrelated function defined
+    elsewhere in the file. Returns a list of ``(lineno, detail)`` pairs."""
+    tree = ast.parse(text, filename=filename)
+
+    module_nodes = list(_iter_scope_nodes(tree))
+    module_assignments = _collect_assignments(module_nodes)
+    module_alias = _AliasTable(module_assignments)
+
+    # Module-level call sites (not inside any function) resolve against
+    # the module scope only.
+    offenders = _scan_calls(module_nodes, module_alias)
+
+    ancestry = _build_func_ancestry(tree)
+
+    # Pass 1: collect every function's OWN locals in isolation (no scope
+    # chaining yet -- this is scope-bounded via `_iter_scope_nodes`, which
+    # does not recurse into a nested function's body).
+    own_assignments: "dict[ast.AST, dict[str, ast.expr]]" = {}
+    for func in ast.walk(tree):
+        if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        own_assignments[func] = _collect_assignments(list(_iter_scope_nodes(func)))
+
+    # Pass 2: chain each function's effective table = module scope, then
+    # every enclosing function's own locals (outermost -> innermost), then
+    # the function's own locals -- each later merge shadowing the earlier
+    # ones, matching normal lexical shadowing.
+    for func, own in own_assignments.items():
+        func_assignments: "dict[str, ast.expr]" = dict(module_assignments)
+        for ancestor in ancestry.get(func, []):
+            func_assignments.update(own_assignments.get(ancestor, {}))
+        func_assignments.update(own)
+        func_alias = _AliasTable(func_assignments)
+        func_nodes = list(_iter_scope_nodes(func))
+        offenders.extend(_scan_calls(func_nodes, func_alias))
+
+    offenders.sort(key=lambda pair: pair[0])
+    return offenders
 
 
 @pytest.mark.parametrize("test_file", _all_test_files(), ids=lambda p: p.name)
@@ -98,15 +493,7 @@ def test_no_tools_dir_insert_at_position_zero(test_file: Path) -> None:
     insert further back) is fine -- only rank-0 insertion can outrank
     src/ packages for the rest of the pytest process."""
     text = test_file.read_text()
-    lines = text.splitlines()
-    offenders = []
-    for i, line in enumerate(lines):
-        m = _INSERT0_RE.search(line)
-        if not m:
-            continue
-        resolved = _resolve_arg_text(lines, i, m.group("arg"))
-        if _TOOLS_ISH_RE.search(resolved):
-            offenders.append((i + 1, line.strip(), resolved.strip()))
+    offenders = _find_insert0_violations(text, filename=str(test_file))
     assert not offenders, (
         f"{test_file.relative_to(REPO_ROOT)} does sys.path.insert(0, ...) "
         f"with a tools-ish directory -- this outranks src/ packages "
@@ -116,6 +503,332 @@ def test_no_tools_dir_insert_at_position_zero(test_file: Path) -> None:
         f"importlib.util.spec_from_file_location. Offending line(s): "
         f"{offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part 1b: adversarial-bypass regression tests (#2089). Each of the four
+# demonstrated bypasses, plus the side-defect (an assignment split across
+# lines), is injected as fixture *text* fed straight to
+# `_find_insert0_violations` -- mirroring how the file-level test above
+# runs the same function, but pointed at a synthetic file (written into
+# `tmp_path`, never a real suite member) instead of a real one, so these
+# fixtures are never collected as violations of the guard on themselves.
+# ---------------------------------------------------------------------------
+
+def _scan_fixture(tmp_path: Path, source: str) -> "list[tuple[int, str]]":
+    fixture = tmp_path / "fixture_test_case.py"
+    fixture.write_text(source)
+    return _find_insert0_violations(fixture.read_text(), filename=str(fixture))
+
+
+class TestAdversarialBypasses:
+    """Each case is exactly the shape from issue #2089's bypass list,
+    verified (pre-fix) to pass the old regex scan silently."""
+
+    def test_multiline_call_is_caught(self, tmp_path: Path) -> None:
+        """Bypass #1: the call itself is split across lines."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path.insert(\n"
+            "    0,\n"
+            "    str(TOOLS_DIR),\n"
+            ")\n",
+        )
+        assert offenders, "multi-line sys.path.insert(0, ...) call was not caught"
+
+    def test_sys_path_aliasing_is_caught(self, tmp_path: Path) -> None:
+        """Bypass #2: `p = sys.path; p.insert(0, ...)`."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "p = sys.path\n"
+            "p.insert(0, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "sys.path aliasing bypass was not caught"
+
+    def test_two_hop_indirection_is_caught(self, tmp_path: Path) -> None:
+        """Bypass #3: `_SEG = 'tools'; _D = ROOT / _SEG; ...insert(0, str(_D))`."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "ROOT = Path(__file__).resolve().parent\n"
+            "_SEG = 'tools'\n"
+            "_D = ROOT / _SEG\n"
+            "sys.path.insert(0, str(_D))\n",
+        )
+        assert offenders, "two-hop name indirection bypass was not caught"
+
+    def test_string_concat_literal_is_caught(self, tmp_path: Path) -> None:
+        """Bypass #4: `str(ROOT) + '/src/engram/tools'`."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "ROOT = Path(__file__).resolve().parent\n"
+            "sys.path.insert(0, str(ROOT) + '/src/engram/tools')\n",
+        )
+        assert offenders, "string-concat literal bypass was not caught"
+
+    def test_split_assignment_is_caught(self, tmp_path: Path) -> None:
+        """Side defect: the *assignment* feeding the call (not the call
+        itself) spans multiple lines -- `_resolve_arg_text`'s documented
+        miss, subsumed by AST parsing since ast.parse doesn't care about
+        line breaks within an expression."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = (\n"
+            "    Path(__file__).resolve().parent\n"
+            "    / 'tools'\n"
+            ")\n"
+            "sys.path.insert(0, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "split multi-line assignment bypass was not caught"
+
+    def test_direct_literal_still_caught(self, tmp_path: Path) -> None:
+        """Sanity: the original, un-bypassed shape is still caught."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "sys.path.insert(0, '/repo/tools')\n",
+        )
+        assert offenders, "direct literal insert(0, '.../tools') regressed"
+
+    def test_append_is_not_flagged(self, tmp_path: Path) -> None:
+        """`append(...)` (any position other than rank 0) must stay legal."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "sys.path.append('/repo/tools')\n",
+        )
+        assert not offenders, "append(...) must not be flagged -- only insert(0, ...) is"
+
+    def test_unrelated_dunder_file_bootstrap_not_flagged(self, tmp_path: Path) -> None:
+        """The ordinary same-repo bootstrap idiom used throughout this
+        suite (`os.path.dirname(os.path.dirname(os.path.abspath(__file__)))`)
+        carries no literal fragment at all and must not be flagged -- this
+        is the case that rules out an unconditional
+        "unresolvable == violation" policy (see `_check_insert_call`)."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import os\n"
+            "import sys\n"
+            "sys.path.insert(0, os.path.dirname(os.path.dirname("
+            "os.path.abspath(__file__))))\n",
+        )
+        assert not offenders, (
+            "an opaque, non-tools-ish __file__-derived insert(0, ...) must "
+            "not be flagged"
+        )
+
+    def test_unrelated_alias_not_flagged(self, tmp_path: Path) -> None:
+        """Aliasing `sys.path` to insert something that is NOT tools-ish
+        must not be flagged -- the guard is about the target directory,
+        not the aliasing shape itself."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "SRC_DIR = Path('/repo') / 'src'\n"
+            "p = sys.path\n"
+            "p.insert(0, str(SRC_DIR))\n",
+        )
+        assert not offenders, "a non-tools-ish alias insert(0, ...) must not be flagged"
+
+    # -- #2089 round 2: adversarial reviewer's BLOCKER (flat module-wide
+    # alias table bleeding across functions) + the three suggestions. --
+
+    def test_masked_violation_across_functions_is_caught(self, tmp_path: Path) -> None:
+        """BLOCKER regression (order-dependent masking): a REAL violation
+        inside `foo()` must still be caught even though an unrelated LATER
+        function `bar()` reassigns the same name `D` to a non-tools value.
+        Under the old flat, module-wide alias table (last-assignment-wins
+        across the whole module), `bar`'s later `D` overwrote `foo`'s
+        entry and masked the violation entirely."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def foo():\n"
+            "    D = Path('/x') / 'tools'\n"
+            "    sys.path.insert(0, str(D))\n"
+            "\n"
+            "def bar():\n"
+            "    D = 'not-tools-related'\n"
+            "    return D\n",
+        )
+        assert offenders, (
+            "foo()'s real sys.path.insert(0, .../tools) violation was masked "
+            "by bar()'s unrelated later reassignment of the same name `D` -- "
+            "alias resolution must be scoped per function, not flat module-wide"
+        )
+
+    def test_mirror_false_positive_across_functions_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """BLOCKER mirror case: a LEGITIMATE, non-tools-ish
+        `sys.path.insert(0, ...)` inside `foo()` must NOT be flagged just
+        because an unrelated LATER function `bar()` happens to reassign the
+        same name `D` to a tools-ish value. Under the old flat table,
+        bar()'s later `D` bled backward into foo()'s resolution and
+        produced a false positive."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def foo():\n"
+            "    D = Path('/x') / 'other'\n"
+            "    sys.path.insert(0, str(D))\n"
+            "\n"
+            "def bar():\n"
+            "    D = Path('/x') / 'tools'\n"
+            "    return D\n",
+        )
+        assert not offenders, (
+            "foo()'s legitimate insert(0, .../other) was falsely flagged due "
+            "to bar()'s unrelated same-named tools-ish `D` -- alias "
+            "resolution must be scoped per function, not flat module-wide"
+        )
+
+    def test_first_arg_alias_zero_is_caught(self, tmp_path: Path) -> None:
+        """Suggestion (a): the first argument (position 0) may itself be an
+        alias resolving to the literal `0` -- symmetric with how the second
+        argument is resolved through the alias table."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "Z = 0\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path.insert(Z, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "insert(Z, ...) with Z aliasing 0 was not caught"
+
+    def test_list_subscript_fragment_is_caught(self, tmp_path: Path) -> None:
+        """Suggestion (b): a tools-ish literal reachable only through a
+        list literal + subscript (`SEGS = ['tools']; ... / SEGS[0]`) must
+        still surface as a fragment even though the expression as a whole
+        doesn't fully constant-fold."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "SEGS = ['tools']\n"
+            "sys.path.insert(0, str(Path('/repo') / SEGS[0]))\n",
+        )
+        assert offenders, "tools-ish fragment inside a list/subscript was not caught"
+
+    def test_percent_formatting_is_caught(self, tmp_path: Path) -> None:
+        """Suggestion (c): %-formatting with a tools-ish literal in the
+        format string must be caught."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "root = '/repo'\n"
+            "sys.path.insert(0, '%s/tools' % root)\n",
+        )
+        assert offenders, "'%s/tools' % root was not caught"
+
+    def test_str_format_is_caught(self, tmp_path: Path) -> None:
+        """Suggestion (c): `.format(...)` with a tools-ish literal in the
+        format string must be caught, folded the same way `str(x)` is."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "root = '/repo'\n"
+            "sys.path.insert(0, '{}/tools'.format(root))\n",
+        )
+        assert offenders, "'{}/tools'.format(root) was not caught"
+
+    # -- #2089 round 3: lexical chaining through nested functions. --
+
+    def test_closure_over_enclosing_local_is_caught(self, tmp_path: Path) -> None:
+        """(a) Round-3 regression: an ordinary closure -- a nested function
+        inserting `str(D)` where `D` is a local of its ENCLOSING function,
+        not its own -- was silently missed by round 2's per-scope-only
+        table (which gave a nested function only its own locals + the
+        module scope, never its enclosing function's locals). Round 1's
+        flat table caught this; proper lexical chaining must too."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def outer():\n"
+            "    D = Path('/x') / 'tools'\n"
+            "    def inner():\n"
+            "        sys.path.insert(0, str(D))\n"
+            "    inner()\n",
+        )
+        assert offenders, (
+            "inner()'s closure over outer()'s tools-ish local D was not "
+            "caught -- lexical chaining must resolve names through each "
+            "enclosing function's locals, not just the nested function's "
+            "own locals + module scope"
+        )
+
+    def test_sibling_isolation_preserved_through_chain(self, tmp_path: Path) -> None:
+        """(b) Inverse of (a), guarding against a chaining fix that
+        over-widens back into round 2's flat-table bug: `outer()`'s local
+        `D` is NON-tools, and `inner()` (nested inside `outer()`) inserts
+        `str(D)` -- so far a true negative. A SIBLING function `sibling()`
+        (not enclosing `inner()` at all) happens to define a tools-ish `D`
+        of its own. `inner()` must resolve against its OWN lexical chain
+        (`outer()` -> module), never against the unrelated sibling's
+        locals -- sibling isolation must survive the move to chaining."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def outer():\n"
+            "    D = Path('/x') / 'other'\n"
+            "    def inner():\n"
+            "        sys.path.insert(0, str(D))\n"
+            "    inner()\n"
+            "\n"
+            "def sibling():\n"
+            "    D = Path('/x') / 'tools'\n"
+            "    return D\n",
+        )
+        assert not offenders, (
+            "inner()'s legitimate insert(0, .../other) was falsely flagged "
+            "due to an unrelated sibling function's same-named tools-ish "
+            "D -- lexical chaining must follow inner()'s actual enclosing "
+            "chain (outer -> module), never a sibling's locals"
+        )
+
+    def test_inner_local_shadows_enclosing(self, tmp_path: Path) -> None:
+        """(c) Shadowing: `outer()`'s local `D` IS tools-ish, but `inner()`
+        reassigns its OWN local `D` to a non-tools value before the insert
+        call. Per normal lexical shadowing, `inner()`'s own local must win
+        over the enclosing one -- the call must NOT be flagged."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "\n"
+            "def outer():\n"
+            "    D = Path('/x') / 'tools'\n"
+            "    def inner():\n"
+            "        D = Path('/x') / 'other'\n"
+            "        sys.path.insert(0, str(D))\n"
+            "    inner()\n",
+        )
+        assert not offenders, (
+            "inner()'s own local D (non-tools) must shadow outer()'s "
+            "enclosing tools-ish D -- it was incorrectly resolved against "
+            "the enclosing scope instead of inner()'s own reassignment"
+        )
 
 
 # ---------------------------------------------------------------------------
