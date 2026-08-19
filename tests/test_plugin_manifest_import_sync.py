@@ -121,6 +121,121 @@ def _project_root_module_names() -> set[str]:
     }
 
 
+HOOKS_CLAUDE_DIR = os.path.join(REPO_ROOT, "src", "engram", "hooks", "claude")
+
+
+def _single_underscore_import_names(py_path: str) -> set[str]:
+    """Module names imported by py_path with exactly one leading underscore.
+
+    Walks the whole AST (not just top-level) so imports nested inside
+    ``try:`` blocks or function bodies are caught regardless of
+    indentation -- all of the real hooks/claude/ sibling imports are inside
+    try: guards, and a column-0-anchored regex would false-pass on every
+    one of them. ``__future__`` and other dunder-prefixed names (two
+    leading underscores) are excluded on purpose: a naive ``_[a-z_]+``
+    regex also matches ``__future__`` and produces false positives.
+    """
+    with open(py_path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=py_path)
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top.startswith("_") and not top.startswith("__"):
+                    names.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                if top.startswith("_") and not top.startswith("__"):
+                    names.add(top)
+    return names
+
+
+def _hook_sibling_tier_violations(manifest: dict) -> list[str]:
+    """Return tier-rank violations among hooks/claude/ sibling imports.
+
+    For every mechanism entry under "hooks/claude/" (i.e. every hooks/claude/
+    file that itself ships as a tiered mechanism), find its single-underscore
+    imports and, for each import that resolves to an actual sibling file on
+    disk in hooks/claude/ (this is what distinguishes a real sibling import
+    from e.g. ``from _status_derive import ...``, which is a tools/ module
+    reached via a runtime sys.path bootstrap rather than a hooks/claude/
+    sibling), require:
+
+      1. the sibling module itself has a mechanisms[] entry, and
+      2. rank(sibling.tier) <= rank(importer.tier)
+         (essential=0 outranks convenience=1 outranks dev=2, i.e. a
+         stricter/lower-rank-numbered tier must not depend on a looser one).
+
+    This check is intentionally strict about guarded-vs-unguarded imports:
+    it applies to every single-underscore sibling import found via AST,
+    whether or not it sits inside a try/except ImportError guard. A guarded
+    import of a missing module still degrades the hook's behavior at
+    runtime (see the docstrings in e.g. engram-baton-prompt-hook.py,
+    engram-forum-prompt-hook.py), so the same-or-stricter-tier invariant is
+    applied uniformly rather than relaxed for guarded call sites.
+    """
+    mechanisms_by_path = {m["path"]: m for m in manifest["mechanisms"]}
+    tier_ranks = _TIER_RANKS
+
+    hook_mechanisms = [
+        m
+        for m in manifest["mechanisms"]
+        if m["path"].startswith("hooks/claude/") and m["path"].endswith(".py")
+    ]
+
+    violations: list[str] = []
+
+    for mech in hook_mechanisms:
+        rel_path = mech["path"]  # e.g. "hooks/claude/engram-stop-hook.py"
+        importer_tier = mech.get("tier", "dev")
+        importer_rank = tier_ranks.get(importer_tier, 2)
+
+        abs_path = os.path.join(REPO_ROOT, "src", "engram", rel_path)
+        if not os.path.isfile(abs_path):
+            continue  # dangling-source is a separate, existing check's job
+
+        imported_names = _single_underscore_import_names(abs_path)
+
+        for name in sorted(imported_names):
+            sibling_disk_path = os.path.join(HOOKS_CLAUDE_DIR, name + ".py")
+            if not os.path.isfile(sibling_disk_path):
+                # Not a physical sibling in hooks/claude/ (e.g. _status_derive
+                # is a tools/ module reached via a runtime sys.path bootstrap
+                # rather than an on-disk hooks/claude/ sibling) -- out of
+                # scope for this check. NOTE (reviewer, #2107): this also means
+                # a DANGLING sibling import (module deleted from disk but still
+                # imported) vanishes from this tier check rather than flagging;
+                # this test's invariant is narrowly tier-rank sync. An UNGUARDED
+                # dangling import fails loudly the moment any test imports that
+                # hook module; a try:-guarded one degrades by design.
+                continue
+
+            sibling_rel_path = f"hooks/claude/{name}.py"
+            sibling_mech = mechanisms_by_path.get(sibling_rel_path)
+            if sibling_mech is None:
+                violations.append(
+                    f"{rel_path} imports sibling {name} "
+                    f"({sibling_rel_path}), which has no mechanisms[] "
+                    f"entry in packaging/tiers.json"
+                )
+                continue
+
+            sibling_tier = sibling_mech.get("tier", "dev")
+            sibling_rank = tier_ranks.get(sibling_tier, 2)
+            if sibling_rank > importer_rank:
+                violations.append(
+                    f"{rel_path} (tier={importer_tier!r}) imports "
+                    f"{sibling_rel_path} (tier={sibling_tier!r}), but "
+                    f"{sibling_tier!r} ranks looser than {importer_tier!r} "
+                    f"-- an install at {importer_tier!r} could ship the "
+                    f"importer without the sibling it imports"
+                )
+
+    return violations
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -235,6 +350,64 @@ def test_server_tools_imports_covered_by_build_plugin():
         + "\n\nAdd each missing module to packaging/tiers.json as a tiered "
         f"mechanism at tier 'essential' (build-plugin.sh guard: every "
         f"tools.X import in server.py must be tagged essential)."
+    )
+
+
+def test_hook_sibling_imports_tier_rank_ok():
+    """Every hooks/claude/ sibling import must not outrank its importer.
+
+    src/engram/hooks/claude/ modules import each other directly (not via
+    build-plugin.sh's copy rules but via a shared install directory), e.g.
+    ``from _hooklib import atomic_write_json``. If an importer ships at a
+    stricter tier than the sibling module it imports unconditionally
+    (essential outranks convenience outranks dev, per depth_tiers order in
+    packaging/tiers.json), an essential-tier install can end up shipping the
+    importer without the module it needs at import time.
+
+    Post-#2041 state: this must FAIL if someone re-tiers _hooklib.py below
+    the essential hooks that import it unguarded — see
+    ``test_hook_sibling_import_tier_rank_mutation_self_test`` below, which
+    exercises exactly that mutation against the checker itself.
+    """
+    manifest = _load_manifest()
+    violations = _hook_sibling_tier_violations(manifest)
+    assert not violations, (
+        "hooks/claude/ sibling imports violate the tier-rank invariant "
+        "(imported module's tier must rank <= importer's tier; essential "
+        "outranks convenience outranks dev per packaging/tiers.json "
+        "depth_tiers):\n" + "\n".join(f"  {v}" for v in violations)
+    )
+
+
+def test_hook_sibling_import_tier_rank_mutation_self_test():
+    """Self-test: the checker must catch a mis-tiered _hooklib.py.
+
+    Mutates a copy of the loaded manifest so that
+    ``hooks/claude/_hooklib.py`` is tiered "dev" (lowest rank) while several
+    essential-tier hooks (e.g. engram-postcompact-hook.py) import it
+    unconditionally. If the checker doesn't flag this, it isn't actually
+    enforcing the invariant it claims to.
+    """
+    manifest = _load_manifest()
+    mutated = json.loads(json.dumps(manifest))  # deep copy
+    found = False
+    for entry in mutated["mechanisms"]:
+        if entry["path"] == "hooks/claude/_hooklib.py":
+            entry["tier"] = "dev"
+            found = True
+            break
+    assert found, "expected hooks/claude/_hooklib.py in tiers.json mechanisms"
+
+    violations = _hook_sibling_tier_violations(mutated)
+    assert violations, (
+        "mutation self-test failed: lowering hooks/claude/_hooklib.py to "
+        "tier 'dev' should have produced at least one tier-rank violation "
+        "(it is imported unconditionally by essential-tier hooks), but the "
+        "checker reported none. The checker is not enforcing the invariant."
+    )
+    assert any("_hooklib" in v for v in violations), (
+        f"mutation self-test produced violations, but none mention "
+        f"_hooklib.py: {violations}"
     )
 
 
