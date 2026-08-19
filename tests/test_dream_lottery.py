@@ -313,6 +313,75 @@ def test_interrupt_and_draw_both_happen(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Default interrupt-types now empty (issue #1992, 2026-08-19): the {2,5}
+# force-set checked contradiction/taint NODES, not the day's stale/taint
+# MARKERS the interrupt intends, and dominated rotation (12 of 19 fairy runs
+# forced over the first 11 real draws). Force-triggering is disabled by
+# default until #2013's cascade machine gives dreams a principled
+# marker-resolution path; --interrupt-types still forces exactly as before
+# when passed explicitly (covered above).
+# ---------------------------------------------------------------------------
+
+def test_default_interrupt_types_is_empty():
+    from tools.dream_lottery import DEFAULT_INTERRUPT_TYPES
+
+    assert DEFAULT_INTERRUPT_TYPES == frozenset()
+
+
+def test_default_draw_forces_no_types_even_above_threshold(tmp_path):
+    """With the (now-empty) default interrupt_types, a cascade count at or
+    above the threshold must NOT force any category -- interrupt_fired must
+    be False, and cascade_marker_count is still recorded (see next test)."""
+    rows = [("retracted", "2026-08-04T00:00:00Z")] * 5
+    db = _make_edit_history_db(tmp_path, rows)
+    outcome = run_draw(
+        _warm_state(),
+        db_path=str(db),
+        turn=1,
+        interrupt_threshold=3,
+        # interrupt_types not passed -> defaults to DEFAULT_INTERRUPT_TYPES
+        count=1,
+        rng=random.Random(0),
+    )
+    r = outcome["result"]
+    assert r["cascade_marker_count"] == 5  # still computed and recorded
+    assert r["interrupt_fired"] is False  # empty type set -> nothing to force
+    assert r["interrupt_types"] == []
+    assert len(r["types_to_run"]) == 1  # only the random draw, no forced types
+
+
+def test_default_draw_cli_forces_no_types(tmp_path, capsys):
+    """CLI-level counterpart: a real `draw` with no --interrupt-types passed
+    (module default) must not force categories 2/5 even with heavy cascade
+    activity, and cascade_marker_count is still present in the record."""
+    state_path = tmp_path / "dream-lottery.json"
+    db = _make_edit_history_db(tmp_path, [])
+
+    rc1 = _draw_cli(state_path, db, turn=1, seed=0)
+    out1 = json.loads(capsys.readouterr().out)
+    assert rc1 == 0
+    assert out1["interrupt_fired"] is False
+
+    conn = sqlite3.connect(str(db))
+    for i in range(5):
+        conn.execute(
+            "INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details) "
+            "VALUES (?, 1, 'retracted', ?, 'observation', '{}')",
+            (out1["now"], f"ob_y{i:02d}"),
+        )
+    conn.commit()
+    conn.close()
+
+    rc2 = _draw_cli(state_path, db, turn=2, seed=2)  # no --interrupt-types
+    out2 = json.loads(capsys.readouterr().out)
+    assert rc2 == 0
+    assert "cascade_marker_count" in out2
+    assert out2["cascade_marker_count"] >= 3  # threshold met
+    assert out2["interrupt_fired"] is False  # but default set is empty
+    assert out2["interrupt_types"] == []
+
+
+# ---------------------------------------------------------------------------
 # window_params
 # ---------------------------------------------------------------------------
 
@@ -538,11 +607,18 @@ def test_history_subcommand_distinguishes_drawn_from_interrupt_forced(tmp_path, 
     conn.commit()
     conn.close()
 
-    rc2 = _draw_cli(state_path, db, turn=2, seed=2)
+    # DEFAULT_INTERRUPT_TYPES is empty as of 2026-08-19 (#1992) -- this test
+    # exercises the CLI-level interrupt-forced bookkeeping (history tally
+    # distinguishing drawn vs forced), which still needs a non-empty
+    # --interrupt-types to exercise at all, so it's passed explicitly here
+    # rather than relying on the (now-empty) default.
+    rc2 = _draw_cli(
+        state_path, db, turn=2, seed=2, extra=["--interrupt-types", "2,5"]
+    )
     out2 = json.loads(capsys.readouterr().out)
     assert rc2 == 0
     assert out2["interrupt_fired"] is True
-    assert out2["interrupt_types"] == [2, 5]  # DEFAULT_INTERRUPT_TYPES
+    assert out2["interrupt_types"] == [2, 5]  # explicit --interrupt-types, not the default
 
     history_path = tmp_path / "dream-lottery-history.jsonl"
     tally = tally_history(str(history_path))

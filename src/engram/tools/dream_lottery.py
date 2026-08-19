@@ -146,9 +146,12 @@ CATEGORIES: dict[int, str] = {
 # category 7 is watermark-scoped throughout, no such split.
 WINDOW_SCOPED_CATEGORIES: frozenset[int] = frozenset({6, 7})
 
-# See module docstring -- this module's own reading of "cascade/contradiction
-# fairy", not a literal quote from #1901. Override with --interrupt-types.
-DEFAULT_INTERRUPT_TYPES: frozenset[int] = frozenset({2, 5})
+# Emptied 2026-08-19 per Lei + #1992 -- the {2,5} force-set checked
+# contradiction/taint NODES, not the day's stale/taint MARKERS the interrupt
+# intends, and dominated rotation (12 of 19 fairy runs forced over the first
+# 11 draws). Re-point via --interrupt-types when the #2013 cascade machine
+# gives dreams a principled marker-resolution path.
+DEFAULT_INTERRUPT_TYPES: frozenset[int] = frozenset()
 
 # #1901 says only "a small threshold" -- 3 is this module's own calibration
 # call, not a value the issue specifies. Override with --interrupt-threshold;
@@ -299,7 +302,11 @@ def run_draw(
         cascade_count = 0
     else:
         cascade_count = count_cascade_markers(db_path, prev_check)
-    interrupt_fired = cascade_count >= interrupt_threshold
+    # An empty interrupt_types set has nothing to force-include, so it must
+    # never report interrupt_fired=True -- the cascade count is still
+    # computed and recorded below regardless (result["cascade_marker_count"]),
+    # only the force-triggering is gated on there being types to force.
+    interrupt_fired = bool(interrupt_types) and cascade_count >= interrupt_threshold
     interrupt_keys = {str(n) for n in interrupt_types} if interrupt_fired else set()
 
     weights_for_draw = {k: v for k, v in weights_before.items() if k not in interrupt_keys}
