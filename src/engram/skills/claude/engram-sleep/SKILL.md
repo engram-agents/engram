@@ -493,10 +493,12 @@ Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drai
 
 **If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
-**Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files:
+**Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files.
+**Pass the cohort IDs inline via `--ids`** — the list from the step above fits
+comfortably in a shell variable (50 ids max, per the cap above), so there is
+no need for an intermediate file at all:
 
 ```bash
-# Write cohort IDs one per line, then run prepare
 COHORT_IDS="ob_XXXX,ob_YYYY,..."  # comma-separated list from the step above
 COHORT_DIR=.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)
 
@@ -511,6 +513,21 @@ The script prints a JSON manifest to stdout listing chunk directories. Each chun
 - `payload.json` — the node content the fairy will see (no recall_summary/recall_keywords)
 
 No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt inline at dispatch time using the paths in the manifest (see Step 6). The default chunk size is 15 (empirically validated 2026-05-27: N=15 worst-case produces quality within in-sample variance of ground truth at ~37K tokens / 1 sub-agent turn).
+
+> **On a shared multi-agent host, never stage the cohort-id list at a bare,
+> predictable `/tmp/<generic-name>` path** (e.g. `/tmp/cohort_ids.txt`).
+> Several agents independently running this same skill, on the same day, at
+> this same step converge on the same filename with no coordination — and
+> mode-644 semantics make the collision silent rather than loud: the first
+> agent's write wins, every other agent's write is denied (`rc=1`, easy to
+> miss), and their *read* of that same path then succeeds — quietly handing
+> them another agent's cohort instead of their own (#2075). `--ids` above
+> avoids the problem entirely by never touching disk. If a list ever is too
+> large for `--ids` and `--ids-file` is needed, write it under your own
+> `$HOME/.engram/tmp/` (per-agent, not shared) rather than `/tmp` —
+> `cohort_dispatch prepare` also refuses to read an `--ids-file` it does not
+> own (owner-uid check), so a foreign-owned file fails loudly instead of
+> being silently ingested.
 
 **Run cohort_dispatch verify-in** to pre-flight the cohort before dispatch:
 

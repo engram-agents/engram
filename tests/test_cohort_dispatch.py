@@ -61,6 +61,7 @@ if PROJECT_ROOT not in sys.path:
 
 from tools.cohort_dispatch import main as dispatch_main  # noqa: E402
 from tools.cohort_dispatch import _parse_agent_output, _build_initial_prompt, _build_retry_prompt  # noqa: E402
+from tools.cohort_dispatch import _check_file_owner, ForeignOwnedFileError  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1327,3 +1328,106 @@ def test_build_retry_prompt_bounded():
     # Must mention both paths
     assert fake_retry_payload_path in prompt, "Prompt must reference the retry payload path"
     assert fake_output_path in prompt, "Prompt must reference the output path"
+
+
+# ---------------------------------------------------------------------------
+# Test 29-31: --ids-file owner-uid guard (#2075 — shared-/tmp scratch collision)
+# ---------------------------------------------------------------------------
+
+
+class _FakeStatResult:
+    """Minimal stand-in for os.stat_result exposing only st_uid."""
+
+    def __init__(self, st_uid: int):
+        self.st_uid = st_uid
+
+
+def test_check_file_owner_accepts_own_file(tmp_path, monkeypatch):
+    """_check_file_owner is a no-op when the file's uid matches ours."""
+    target = tmp_path / "cohort_ids.txt"
+    target.write_text("ob_0001\n")
+
+    my_uid = 12345
+    real_stat = os.stat
+
+    def fake_stat(p, *args, **kwargs):
+        if str(p) == str(target):
+            return _FakeStatResult(st_uid=my_uid)
+        return real_stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getuid", lambda: my_uid, raising=False)
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    # Must not raise.
+    _check_file_owner(target)
+
+
+def test_check_file_owner_refuses_foreign_owned_file(tmp_path, monkeypatch):
+    """_check_file_owner raises loudly when the file is owned by a different uid.
+
+    This is the reader-side half of the #2075 fix: on a shared multi-agent
+    host, a fixed/predictable scratch path can be written by one agent and
+    silently *read* by another whose own write to the same path was denied.
+    Refusing a foreign-owned file converts that silent cross-agent read into
+    an immediate, loud failure.
+    """
+    target = tmp_path / "cohort_ids.txt"
+    target.write_text("ob_9001\nob_9002\n")  # "another agent's" cohort
+
+    my_uid = 12345
+    foreign_uid = 99999
+    real_stat = os.stat
+
+    def fake_stat(p, *args, **kwargs):
+        if str(p) == str(target):
+            return _FakeStatResult(st_uid=foreign_uid)
+        return real_stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getuid", lambda: my_uid, raising=False)
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    with pytest.raises(ForeignOwnedFileError) as excinfo:
+        _check_file_owner(target)
+
+    msg = str(excinfo.value)
+    assert str(foreign_uid) in msg
+    assert str(my_uid) in msg
+
+
+def test_prepare_ids_file_refuses_foreign_owned_file(tmp_path, monkeypatch, capsys):
+    """End-to-end: `prepare --ids-file <foreign-owned path>` exits non-zero
+    and does not silently ingest the foreign cohort into a manifest."""
+    node_ids = ["ob_0001", "ob_0002"]
+    db_path = _make_sqlite_db(node_ids, tmp_path)
+
+    ids_file = tmp_path / "cohort_ids.txt"
+    ids_file.write_text("\n".join(node_ids) + "\n")
+    out_dir = tmp_path / "out"
+
+    my_uid = 12345
+    foreign_uid = 99999
+    real_stat = os.stat
+
+    def fake_stat(p, *args, **kwargs):
+        if str(p) == str(ids_file):
+            return _FakeStatResult(st_uid=foreign_uid)
+        return real_stat(p, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getuid", lambda: my_uid, raising=False)
+    monkeypatch.setattr(os, "stat", fake_stat)
+
+    exit_code = _run([
+        "prepare",
+        "--ids-file", str(ids_file),
+        "--out", str(out_dir),
+        "--db", str(db_path),
+    ])
+
+    assert exit_code != 0, "prepare must refuse a foreign-owned --ids-file"
+    assert not (out_dir / "manifest.json").exists(), (
+        "manifest.json must not be written when the ids-file ownership check fails"
+    )
+    captured = capsys.readouterr()
+    assert "owned by uid" in captured.err.lower() or "refus" in captured.err.lower(), (
+        f"Expected an explicit ownership-refusal message on stderr, got: {captured.err!r}"
+    )
