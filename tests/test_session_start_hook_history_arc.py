@@ -367,7 +367,7 @@ def test_history_arc_precedes_calibration_and_is_adjacent_to_checkpoint(engram_h
     session_id = "sess-order-history"
     mod = _load_hook_module(engram_home)
 
-    # Seed checkpoint_at via a first SessionStart (source=startup, so the
+    # Seed injected_through via a first SessionStart (source=startup, so the
     # history-arc block itself doesn't fire this call, matching real usage).
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
@@ -375,7 +375,7 @@ def test_history_arc_precedes_calibration_and_is_adjacent_to_checkpoint(engram_h
                 "session_id": session_id, "transcript_path": "/tmp/t.jsonl", "source": "startup",
             })
     with open(engram_home / "sessions" / f"{session_id}.json") as f:
-        seeded = json.load(f)["checkpoint_at"]
+        seeded = json.load(f)["injected_through"]
 
     # A node in-window so the checkpoint block actually renders.
     db_path = engram_home / "knowledge.db"

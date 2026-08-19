@@ -4,9 +4,9 @@
 Two mechanisms under test, both living on engram-session-start-hook.py:
 
   - write_marker(): owns `session_started_at` (write-once) and
-    `checkpoint_at` (carried-forward, advanced only by main() after render).
-  - session_checkpoint_block(engram_home, checkpoint_at): pure-read render
-    of "nodes created since checkpoint_at", property-excluding blank
+    `injected_through` (carried-forward, advanced only by main() after render).
+  - session_checkpoint_block(engram_home, injected_through): pure-read render
+    of "nodes created since injected_through", property-excluding blank
     renders (claim/recall_summary both empty) rather than type-excluding.
 
 Mirrors the loading conventions of test_session_start_hook_block_order.py /
@@ -146,11 +146,11 @@ def test_session_started_at_survives_second_session_start(engram_home):
 
 
 # ---------------------------------------------------------------------------
-# 2. checkpoint_at moves on source=compact, NOT on source=startup/resume.
+# 2. injected_through moves on source=compact, NOT on source=startup/resume.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("source", ["startup", "resume"])
-def test_checkpoint_at_does_not_advance_on_non_compact_source(engram_home, source):
+def test_injected_through_does_not_advance_on_non_compact_source(engram_home, source):
     mod = _load_hook_module(engram_home)
     session_id = f"sess-no-advance-{source}"
     hook_input = {
@@ -158,25 +158,25 @@ def test_checkpoint_at_does_not_advance_on_non_compact_source(engram_home, sourc
         "transcript_path": "/tmp/t.jsonl",
         "source": source,
     }
-    # First call seeds checkpoint_at (absent -> seed fires on ANY source).
+    # First call seeds injected_through (absent -> seed fires on ANY source).
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
             _run_hook_main(mod, hook_input)
-    seeded = _read_marker(engram_home, session_id)["checkpoint_at"]
+    seeded = _read_marker(engram_home, session_id)["injected_through"]
     assert seeded is not None
 
-    # Second call, same non-compact source: checkpoint_at must NOT move.
+    # Second call, same non-compact source: injected_through must NOT move.
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
             _run_hook_main(mod, hook_input)
-    after_second = _read_marker(engram_home, session_id)["checkpoint_at"]
+    after_second = _read_marker(engram_home, session_id)["injected_through"]
     assert after_second == seeded, (
-        f"checkpoint_at moved on source={source!r} — it must move ONLY on "
+        f"injected_through moved on source={source!r} — it must move ONLY on "
         "source=='compact'."
     )
 
 
-def test_checkpoint_at_advances_on_compact_source(engram_home):
+def test_injected_through_advances_on_compact_source(engram_home):
     mod = _load_hook_module(engram_home)
     session_id = "sess-advance-compact"
     startup_input = {
@@ -187,15 +187,15 @@ def test_checkpoint_at_advances_on_compact_source(engram_home):
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
             _run_hook_main(mod, startup_input)
-    seeded = _read_marker(engram_home, session_id)["checkpoint_at"]
+    seeded = _read_marker(engram_home, session_id)["injected_through"]
     assert seeded is not None
 
     compact_input = {**startup_input, "source": "compact"}
     with _mock_no_engram_client():
         with patch.object(mod, "_check_mcp_health", return_value=(True, None)):
             _run_hook_main(mod, compact_input)
-    advanced = _read_marker(engram_home, session_id)["checkpoint_at"]
-    assert advanced != seeded, "checkpoint_at must advance on source=='compact'"
+    advanced = _read_marker(engram_home, session_id)["injected_through"]
+    assert advanced != seeded, "injected_through must advance on source=='compact'"
     assert advanced > seeded
 
 
@@ -219,7 +219,7 @@ def test_legacy_marker_upgrades_without_error_and_no_full_dump(engram_home):
     }
     (engram_home / "sessions" / f"{session_id}.json").write_text(json.dumps(legacy_marker))
 
-    # A node that predates the legacy started_at — if checkpoint_at ever
+    # A node that predates the legacy started_at — if injected_through ever
     # fell back to "beginning of time" this would render.
     _make_nodes_db(engram_home, [
         {"id": "ob_0001", "type": "observation_factual", "claim": "Ancient node.",
@@ -237,17 +237,17 @@ def test_legacy_marker_upgrades_without_error_and_no_full_dump(engram_home):
 
     ctx = result["hookSpecificOutput"]["additionalContext"]
     assert "Ancient node" not in ctx, (
-        "missing checkpoint_at must render NOTHING this once, never fall back "
+        "missing injected_through must render NOTHING this once, never fall back "
         "to 'beginning of time' and dump the whole graph"
     )
 
     upgraded = _read_marker(engram_home, session_id)
     assert upgraded["session_started_at"] is not None
-    assert upgraded["checkpoint_at"] is not None, "checkpoint_at must be seeded after the empty render"
+    assert upgraded["injected_through"] is not None, "injected_through must be seeded after the empty render"
 
 
 # ---------------------------------------------------------------------------
-# 4. Window selection: nodes at/after checkpoint_at in; before, out.
+# 4. Window selection: nodes at/after injected_through in; before, out.
 # ---------------------------------------------------------------------------
 
 def test_window_selection_at_and_after_included_before_excluded(engram_home):
@@ -419,7 +419,7 @@ def test_cap_renders_explicit_more_line(engram_home):
 def test_corrupt_marker_reseeds_rather_than_crashing(engram_home):
     """A torn/corrupt marker must degrade to a reseed, never to an exception.
 
-    This is the failure the atomic write in _persist_checkpoint_at exists to
+    This is the failure the atomic write in _persist_injected_through exists to
     prevent, asserted from the other side: if a marker ever DOES arrive
     corrupt, write_marker() must treat it as absent and carry on rather than
     raising into SessionStart. Note the cost being accepted here — a reseed
@@ -435,22 +435,22 @@ def test_corrupt_marker_reseeds_rather_than_crashing(engram_home):
         "session_id": "sess-corrupt", "transcript_path": "/tmp/t.jsonl", "source": "compact",
     })
     assert marker is not None, "a corrupt prior marker must not fail the write"
-    assert marker["checkpoint_at"] is None, "corrupt prior state is treated as absent"
+    assert marker["injected_through"] is None, "corrupt prior state is treated as absent"
     assert marker["session_started_at"] == marker["started_at"], (
         "with nothing readable to carry forward, session_started_at falls back to now()"
     )
 
 
-def test_persist_checkpoint_at_mid_write_failure_leaves_original_intact(engram_home):
+def test_persist_injected_through_mid_write_failure_leaves_original_intact(engram_home):
     """The property atomicity actually buys: if the write is interrupted,
     the marker on disk is still the OLD one, not a torn/partial one.
 
     Simulates interruption by making json.dump raise partway through
-    _persist_checkpoint_at's call into atomic_write_json. Asserts:
-      1. _persist_checkpoint_at itself does not raise (fail-soft, per its
+    _persist_injected_through's call into atomic_write_json. Asserts:
+      1. _persist_injected_through itself does not raise (fail-soft, per its
          own docstring -- the outer except Exception: pass must still hold).
       2. The marker file on disk afterward is BYTE-IDENTICAL to before the
-         call -- still valid JSON, still carrying the OLD checkpoint_at.
+         call -- still valid JSON, still carrying the OLD injected_through.
       3. No leftover *.tmp file in the sessions directory.
     """
     session_id = "sess-mid-write-kill"
@@ -464,14 +464,14 @@ def test_persist_checkpoint_at_mid_write_failure_leaves_original_intact(engram_h
         "role": "interactive",
         "purpose": "Interactive session with user",
         "session_started_at": "2026-08-15T00:00:00+00:00",
-        "checkpoint_at": "2026-08-15T00:00:00Z",
+        "injected_through": "2026-08-15T00:00:00Z",
     }
     marker_path.write_text(json.dumps(original_marker))
     original_bytes = marker_path.read_bytes()
 
     mod = _load_hook_module(engram_home)
     with patch("_hooklib.json.dump", side_effect=RuntimeError("simulated mid-write kill")):
-        mod._persist_checkpoint_at(str(engram_home), session_id, "2026-08-15T99:99:99Z")
+        mod._persist_injected_through(str(engram_home), session_id, "2026-08-15T99:99:99Z")
         # must not raise -- if it does, the fail-soft contract is broken
 
     assert marker_path.read_bytes() == original_bytes, (
@@ -514,7 +514,7 @@ def _make_mock_engram_client():
 
 def test_checkpoint_block_precedes_calibration_block(engram_home):
     session_id = "sess-order"
-    # Seed checkpoint_at via a first SessionStart, then create a node and
+    # Seed injected_through via a first SessionStart, then create a node and
     # run a second SessionStart so the injection block actually renders.
     mod = _load_hook_module(engram_home)
     with _mock_no_engram_client():
@@ -522,7 +522,7 @@ def test_checkpoint_block_precedes_calibration_block(engram_home):
             _run_hook_main(mod, {
                 "session_id": session_id, "transcript_path": "/tmp/t.jsonl", "source": "startup",
             })
-    seeded = _read_marker(engram_home, session_id)["checkpoint_at"]
+    seeded = _read_marker(engram_home, session_id)["injected_through"]
 
     _make_nodes_db(engram_home, [
         {"id": "ob_0099", "type": "observation_factual", "claim": "Ordering-test node.",
@@ -537,8 +537,8 @@ def test_checkpoint_block_precedes_calibration_block(engram_home):
             })
 
     ctx = result["hookSpecificOutput"]["additionalContext"]
-    checkpoint_at_idx = ctx.find("Nodes created since checkpoint")
+    injected_through_idx = ctx.find("Nodes created since checkpoint")
     calib_at = ctx.find("ENGRAM Calibration")
-    assert checkpoint_at_idx != -1, f"checkpoint block missing entirely: {ctx!r}"
+    assert injected_through_idx != -1, f"checkpoint block missing entirely: {ctx!r}"
     assert calib_at != -1, f"calibration block missing entirely: {ctx!r}"
-    assert checkpoint_at_idx < calib_at
+    assert injected_through_idx < calib_at
