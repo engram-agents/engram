@@ -370,6 +370,13 @@ def _pytest_importable(python_path: str) -> bool:
 #   other | undocumented / unrecognized           | fail open, loud (return 0)
 _PYTEST_EXIT_BLOCKS = 1  # the single code that may block a push
 
+# Generous ceiling for the test-suite subprocess. The suite runs ~4 minutes
+# normally; 1800s (30 min) gives a slow/loaded host plenty of room without
+# being unbounded. A timeout here is an ENVIRONMENT signal, not a test
+# failure -- it fails OPEN like every other non-1 outcome above, never
+# blocking the push.
+_TEST_SUITE_TIMEOUT_SECONDS = 1800
+
 _PYTEST_EXIT_LABELS = {
     0: "all tests passed",
     1: "tests failed",
@@ -411,11 +418,23 @@ def run_test_suite(repo_root: Optional[str] = None) -> int:
 
     print(f"pre-push: running local test suite ({' '.join(test_targets)}) — this may "
           f"take a while…", file=sys.stderr)
-    result = subprocess.run(
-        [python_path, "-m", "pytest", *test_targets, "-q"],
-        cwd=repo_root,
-        env={**os.environ, "ENGRAM_NO_EMBEDDINGS": "1"},
-    )
+    try:
+        result = subprocess.run(
+            [python_path, "-m", "pytest", *test_targets, "-q"],
+            cwd=repo_root,
+            env={**os.environ, "ENGRAM_NO_EMBEDDINGS": "1"},
+            timeout=_TEST_SUITE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"\n⚠ pre-push: test gate timed out after {_TEST_SUITE_TIMEOUT_SECONDS}s "
+            f"under {python_path} (resolved from {source_label}) -- skipping the gate "
+            f"(NOT blocking this push), but this means nothing checked your suite "
+            f"locally before it left this machine. If this keeps happening, skip the "
+            f"gate for one push with: git push --no-verify",
+            file=sys.stderr,
+        )
+        return 0
     code = result.returncode
 
     if code == 0:

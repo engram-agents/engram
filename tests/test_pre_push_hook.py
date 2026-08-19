@@ -485,3 +485,151 @@ def test_check_close_keywords_no_gh_skips_cleanly_no_exception(mod, monkeypatch,
     assert exit_code == 0
     err = capsys.readouterr().err
     assert "'gh' CLI not found" in err
+
+
+# ---------------------------------------------------------------------------
+# _check_pr -- the three verdicts (trap / warn / clean)
+# ---------------------------------------------------------------------------
+
+
+def test_check_pr_trap_blocks(mod, capsys):
+    """Body close-keyword targets an issue OTHER than the title's [closes #N]
+    target -- the wrong-issue trap (PR #516/#537). Must block (exit 1)."""
+    title = "fix(x): something [closes #100]"
+    body = "This closes #200 as well."
+
+    exit_code = mod._check_pr(title, body)
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err
+    assert "#200" in err
+    assert "#100" in err
+
+
+def test_check_pr_warn_title_no_bracket(mod, capsys):
+    """Body has a close-keyword but the title has no [closes #N] -- warn,
+    don't block."""
+    title = "fix(x): something, no bracket here"
+    body = "This fixes #300."
+
+    exit_code = mod._check_pr(title, body)
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "no [closes #N] target" in err
+
+
+def test_check_pr_warn_body_no_keyword(mod, capsys):
+    """Title has [closes #N] but body has no close-keyword at all -- warn,
+    don't block (GitHub's auto-close parser won't fire)."""
+    title = "fix(x): something [closes #400]"
+    body = "This is a plain description with no keyword."
+
+    exit_code = mod._check_pr(title, body)
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "no 'Closes #N.' keyword" in err
+    assert "#400" in err
+
+
+def test_check_pr_clean_matching_target(mod, capsys):
+    """Title target and body close-keyword agree -- clean, no warning at all."""
+    title = "fix(x): something [closes #500]"
+    body = "Closes #500."
+
+    exit_code = mod._check_pr(title, body)
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert err == ""
+
+
+# ---------------------------------------------------------------------------
+# _get_pr_info -- malformed 'gh' responses must resolve to None, never raise
+# ---------------------------------------------------------------------------
+
+
+def test_get_pr_info_non_json_output(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_run",
+        lambda cmd, **kw: _fake_completed(stdout="not json at all", returncode=0),
+    )
+
+    assert mod._get_pr_info("some-branch") is None
+
+
+def test_get_pr_info_empty_output(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_run",
+        lambda cmd, **kw: _fake_completed(stdout="", returncode=0),
+    )
+
+    assert mod._get_pr_info("some-branch") is None
+
+
+def test_get_pr_info_gh_nonzero_exit(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_run",
+        lambda cmd, **kw: _fake_completed(stdout="", returncode=1, stderr="gh: not authenticated"),
+    )
+
+    assert mod._get_pr_info("some-branch") is None
+
+
+def test_get_pr_info_empty_json_list(mod, monkeypatch):
+    """gh succeeds but there's no open PR for this branch -- empty list."""
+    monkeypatch.setattr(
+        mod, "_run",
+        lambda cmd, **kw: _fake_completed(stdout="[]", returncode=0),
+    )
+
+    assert mod._get_pr_info("some-branch") is None
+
+
+def test_get_pr_info_valid_returns_first_pr(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod, "_run",
+        lambda cmd, **kw: _fake_completed(
+            stdout='[{"title": "fix: x [closes #1]", "body": "Closes #1."}]',
+            returncode=0,
+        ),
+    )
+
+    info = mod._get_pr_info("some-branch")
+    assert info == {"title": "fix: x [closes #1]", "body": "Closes #1."}
+
+
+# ---------------------------------------------------------------------------
+# run_test_suite -- timeout fails open (new in this change)
+# ---------------------------------------------------------------------------
+
+
+def test_run_test_suite_timeout_fails_open(mod, monkeypatch, tmp_path, capsys):
+    """subprocess.run raising TimeoutExpired must not block the push: the gate
+    resolves into the existing fail-open posture, names the timeout and the
+    hook, and points at --no-verify as the operator escape."""
+    monkeypatch.setattr(mod, "_resolve_test_python",
+                         lambda repo_root: ("/fake/python", "fake-source-label"))
+    monkeypatch.setattr(mod, "_pytest_importable", lambda python_path: True)
+
+    seen = {}
+
+    def raise_timeout(*a, **kw):
+        seen.update(kw)
+        raise subprocess.TimeoutExpired(cmd=["pytest"], timeout=mod._TEST_SUITE_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(mod.subprocess, "run", raise_timeout)
+
+    exit_code = mod.run_test_suite(repo_root=str(tmp_path))
+
+    assert exit_code == 0
+    err = capsys.readouterr().err
+    assert "timed out" in err
+    assert str(mod._TEST_SUITE_TIMEOUT_SECONDS) in err
+    assert "pre-push" in err
+    assert "--no-verify" in err
+    # Pin the WIRING, not just the handler: without this, deleting the
+    # timeout= kwarg makes the gate unbounded again and the suite stays green.
+    assert seen.get("timeout") == mod._TEST_SUITE_TIMEOUT_SECONDS
