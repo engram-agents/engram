@@ -74,8 +74,18 @@ import sys
 
 # Consequential upstream commands — commands whose exit status matters for
 # correctness (test runners, VCS, issue trackers, build tools, CI tools).
+#
+# The anchor alternation includes a single `|` (issue #1899): without it, a
+# consequential command MID-PIPELINE — e.g. `echo '{}' | python3 ctx.py |
+# head -20`, where python3 sits between two pipes rather than at the start —
+# was unreachable, because the anchor only recognized start-of-string, `;`,
+# `&&`, or `||` as valid positions before a command name. `\|{1,2}` (rather
+# than listing `\|` and `\|\|` as separate alternatives) matches both a
+# single pipe and a double pipe in one alternative — greedy `{1,2}` prefers
+# the longer match, so `||` is still consumed whole and doesn't collapse to
+# two single-pipe matches.
 _CONSEQUENTIAL_RE = re.compile(
-    r'(?:^|;|&&|\|\|)\s*'
+    r'(?:^|;|&&|\|{1,2})\s*'
     # Skip any VAR=value env prefixes before the command name — without this,
     # 'ENGRAM_NO_EMBEDDINGS=1 pytest ... | tail' (this repo's own documented
     # pytest convention) and 'FOO=bar git push | tail' were invisible

@@ -306,6 +306,67 @@ class TestPipeExitWarn(unittest.TestCase):
             "Backgrounded redirect without a tail/head reader must not warn",
         )
 
+    # -----------------------------------------------------------------
+    # Mid-pipeline consequential-command anchor (issue #1899)
+    # -----------------------------------------------------------------
+    #
+    # _CONSEQUENTIAL_RE's anchor alternation previously only recognized
+    # start-of-string, `;`, `&&`, or `||` as valid positions before a
+    # command name — a single `|` was missing, so a consequential command
+    # sitting MID-PIPELINE (between two pipes, not at the start) was
+    # unreachable. These fixtures are Borges's verified probes from #1899.
+    #
+    # Foreground note: these bare pipelines carry no in-command actionable
+    # consumer (no &&-chain, no success echo), so per the foreground rules
+    # documented above (BACKGROUNDED COMMANDS, issue #2061) they do not fire
+    # in the foreground even with the anchor fixed — only backgrounded, where
+    # the harness's own completion notification is the out-of-band consumer.
+    # Verified directly against _has_pipe_exit_risk() before writing these
+    # tests; foreground calls for both positives returned False. So these are
+    # written backgrounded, matching the existing background-shape tests
+    # above rather than weakening the foreground gate to force a fire.
+
+    def test_warns_on_mid_pipeline_python3_background(self):
+        """`echo '{}' | python3 ctx.py | head -20` backgrounded — python3 sits
+        mid-pipeline (between two pipes), not at start-of-string; must fire
+        now that the anchor recognizes a single `|` as a valid position."""
+        out = _run_hook(
+            "echo '{}' | python3 ctx.py | head -20", run_in_background=True
+        )
+        self.assertTrue(out.strip(), "Expected JSON output but got empty stdout")
+        response = json.loads(out.strip())
+        ctx = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("pipe-exit-warn", ctx)
+
+    def test_warns_on_mid_pipeline_pytest_background(self):
+        """`cat f | pytest -q | tail -5` backgrounded — pytest sits
+        mid-pipeline; must fire now that the anchor recognizes a single `|`."""
+        out = _run_hook("cat f | pytest -q | tail -5", run_in_background=True)
+        self.assertTrue(out.strip(), "Expected JSON output but got empty stdout")
+        response = json.loads(out.strip())
+        ctx = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("pipe-exit-warn", ctx)
+
+    def test_no_warn_mid_pipeline_ls_background(self):
+        """`ls -la | head -5` backgrounded — no consequential command anywhere
+        in the pipeline; must stay quiet."""
+        out = _run_hook("ls -la | head -5", run_in_background=True)
+        self.assertEqual(
+            out.strip(),
+            "",
+            "No consequential command in the pipeline — must not warn",
+        )
+
+    def test_no_warn_mid_pipeline_grep_background(self):
+        """`cat f | grep x | head` backgrounded — grep is excluded from
+        truncating readers and is not itself consequential; must stay quiet."""
+        out = _run_hook("cat f | grep x | head", run_in_background=True)
+        self.assertEqual(
+            out.strip(),
+            "",
+            "No consequential command in the pipeline — must not warn",
+        )
+
     def test_no_crash_on_malformed_input(self):
         """Malformed JSON input — hook handles gracefully, no exception propagated."""
         hook = _load_hook_module()
