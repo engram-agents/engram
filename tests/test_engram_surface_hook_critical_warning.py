@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,12 +26,33 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ---------------------------------------------------------------------------
 
 
-def _load_hook_module():
-    """Import the surface hook as a module despite the hyphenated filename."""
+def _load_hook_module(engram_home: str | None = None):
+    """Import the surface hook as a module despite the hyphenated filename.
+
+    #2086 (sweep of the #2015/#2081/#2084 ENGRAM_HOME-after-import isolation
+    hazard): engram-surface-hook.py bakes derived path constants (COUNTER_PATH,
+    WRITE_REMINDER_PATH, REPAIR_MARKER_PATH, WARM_BRIEFING_PATH,
+    ERROR_PATTERNS_PATH, ERROR_INCIDENTS_PATH, PRINCIPLE_TRIGGERS_PATH,
+    PRINCIPLE_TRIGGER_STATE_PATH, SOCKET_PATH, KNOWLEDGE_DB_PATH, ...) from
+    ENGRAM_HOME ONCE at import time. This file's tests drive hook.main(),
+    which reads/writes most of those constants directly (e.g. via
+    check_principle_triggers_full, check_write_reminder, check_repair_marker,
+    check_warm_briefing) — so patching only `hook.ENGRAM_HOME` (or a couple
+    of the derived constants) AFTER import, as this file previously did,
+    leaves the rest resolving against the REAL `$ENGRAM_HOME` (default
+    `~/.engram`), reading and writing a live agent's actual state while
+    green in CI. Setting ENGRAM_HOME in the environment BEFORE exec_module
+    (matching test_surface_ledger_suppression.py's LedgerTestBase convention)
+    makes every import-time-computed constant resolve against `engram_home`.
+    """
     hook_path = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
     spec = importlib.util.spec_from_file_location("engram_surface_hook", hook_path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    if engram_home is not None:
+        with mock.patch.dict(os.environ, {"ENGRAM_HOME": engram_home}):
+            spec.loader.exec_module(mod)
+    else:
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -72,9 +94,15 @@ class TestGetUserName(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="engram_critical_test_")
-        self.hook = _load_hook_module()
-        # Override ENGRAM_HOME so config reads come from our tmp dir.
-        self.hook.ENGRAM_HOME = self.tmp
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: if the env-before-import fix above is ever
+        # reverted, this fails loudly instead of silently reading real state.
+        self.assertEqual(
+            self.hook.ENGRAM_HOME, self.tmp,
+            "hook.ENGRAM_HOME did not resolve against the test's isolated "
+            "ENGRAM_HOME -- the env-patch-before-import fix for #2086 may "
+            "have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -132,10 +160,20 @@ class TestCriticalWarningIntegration(unittest.TestCase):
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
         # Load the hook and redirect ENGRAM_HOME to our temp dir.
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -186,10 +224,20 @@ class TestWarmingUpSoft(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -234,10 +282,20 @@ class TestCriticalWhenLaunchAttemptStale(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -282,10 +340,20 @@ class TestIdleShutdownTombstone(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -327,10 +395,20 @@ class TestCriticalWhenTombstoneAbsent(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -367,10 +445,20 @@ class TestStaleTombstone(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
@@ -412,10 +500,20 @@ class TestCorruptTombstone(unittest.TestCase):
         config_path = os.path.join(self.tmp, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump({"primary_user": "Alex"}, f)
-        self.hook = _load_hook_module()
-        self.hook.ENGRAM_HOME = self.tmp
-        self.hook.SOCKET_PATH = os.path.join(self.tmp, "recall-daemon.sock")
-        self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
+        self.hook = _load_hook_module(self.tmp)
+        # #2086 self-guard: hook.main() reads/writes many ENGRAM_HOME-derived
+        # constants (COUNTER_PATH, PRINCIPLE_TRIGGER_STATE_PATH, ...) that a
+        # post-import `hook.ENGRAM_HOME = self.tmp` reassignment does NOT
+        # redirect (they're frozen strings computed once at import). Assert
+        # one of them here so a regression to post-import patching fails
+        # loudly instead of silently reading/writing real ~/.engram state.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2086 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
