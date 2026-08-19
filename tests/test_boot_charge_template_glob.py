@@ -87,3 +87,31 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
+
+
+def test_boot_charge_forum_branch_carries_verbatim_arming_text():
+    """#2019 slice B pin: the conditional wrapper must not drift the forum
+    branch's arming instruction — the segment from the arming order through
+    the pgrep-anchor caveat is safety-relevant (the #2028 self-match fix
+    lives in it). The two charges' texts legitimately differ in phrasing
+    (quiet carries token-spend framing), so this pins each file's own
+    segment for presence + the safety-critical tokens, not cross-file
+    identity; the pgrep pattern itself is byte-pinned across both files by
+    test_pgrep_liveness_reap_patterns.py."""
+    import re
+    from pathlib import Path
+    repo = Path(__file__).resolve().parent.parent
+    start = "Then arm your UCS forum monitors"
+    end = "reports a live monitor as dead."
+    for name in ("boot-charge-default.md", "boot-charge-quiet.md"):
+        text = (repo / "deploy" / "autostart" / name).read_text()
+        m = re.search(re.escape(start) + r".*?" + re.escape(end), text, re.DOTALL)
+        assert m, f"{name}: arming segment not found — forum branch drifted or wrapper broke it"
+        seg = m.group(0)
+        # Monitor names are glob-form post-#2090 (forum-updates-monitor*.sh)
+        for token in ("forum-updates-monitor", "forum-mention-monitor",
+                      "pgrep -u", "^bash"):
+            assert token in seg, f"{name}: arming segment lost token: {token}"
+        assert "If `forum`" in text and "If `umwelt`" in text, (
+            f"{name}: the #2019 conditional frame is missing"
+        )

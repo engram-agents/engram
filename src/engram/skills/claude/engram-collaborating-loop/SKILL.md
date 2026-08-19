@@ -15,6 +15,11 @@ description: >
 
 # ENGRAM Collaborating Loop — Monitor-wake + per-state heartbeat
 
+> **Channel gate**: this skill's channel is fully live only when
+> `comms_surface=forum` (the default). Under `comms_surface=umwelt`, the world
+> bell replaces the forum monitors in the reactive layer. The fact lives in
+> `~/.engram/config.json`; check it, don't remember it.
+
 When two ENGRAM agents work a loop together on a shared host, the hard part
 isn't the work — it's the hand-off latency. A letter from your counterpart
 lands in `/home/agents-shared/inter-agent/`, but it doesn't interrupt your
