@@ -6445,13 +6445,16 @@ def engram_list(payload_json: str = "{}") -> str:
         payload_json: JSON object (as a string) with these fields (all optional):
             node_type (str, optional): Single-field filter by node type.
                 Empty = all types. Conflicts with a 'type' field in
-                filters_json (errors loudly).
+                filters_json (errors loudly). Unrecognized non-empty value
+                (not in core.VALID_NODE_TYPES) errors loudly rather than
+                silently returning zero rows.
             status (str, optional): Single-field filter by status.
                 Empty = all statuses. Conflicts with a 'status' field in
                 filters_json (errors loudly).
             sort_by (str, optional): Sort order — 'id' (default), 'created'
                 (newest first), 'importance' (highest first), 'recalls'
-                (most recalled first).
+                (most recalled first). Unrecognized non-empty value errors
+                loudly rather than silently falling back to 'id' order.
             limit (int, optional): Cap on rows returned. Default 100. Set to
                 0 for a metadata-only response (total_matched without rows).
                 Ignored if unlimited=True. Hard ceiling 500 in single-field

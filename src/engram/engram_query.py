@@ -3172,6 +3172,12 @@ def _list_impl(
         where_parts.append("is_current = 1")
     params: list = []
     if node_type:
+        if node_type not in core.VALID_NODE_TYPES:
+            return json.dumps({
+                "status": "error",
+                "error": f"Unknown node_type: {node_type!r}. "
+                         f"Allowed: {sorted(core.VALID_NODE_TYPES)}",
+            })
         where_parts.append("type = ?")
         params.append(node_type)
     if status:
@@ -3195,6 +3201,12 @@ def _list_impl(
         "importance": "importance_score DESC",
         "recalls": "recall_count DESC",
     }
+    if sort_by and sort_by not in sort_map:
+        return json.dumps({
+            "status": "error",
+            "error": f"Unknown sort_by: {sort_by!r}. "
+                     f"Allowed: {sorted(sort_map.keys())}",
+        })
     order = sort_map.get(sort_by, "id ASC")
 
     # Limit semantics (per issue #81 + Lei's state-table refinement):
