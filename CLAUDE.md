@@ -42,31 +42,6 @@ the unified payload_json signature as of 2026-05-27.
   command above. Fix locally with `git remote set-head origin --auto` to
   re-sync your clone's `origin/HEAD` pointer.
 
-### Local pre-push test gate — opt-in, per clone (2026-08-18)
-
-The full pytest suite does not run on `dev` PRs by design (CI economics, above)
-— so the local run is what actually catches an accidental missed test before a
-PR is pushed and reviewed. `.githooks/pre-push` automates that: it runs the
-suite before `git push` on any push that touches `src/**.py` or `tests/**.py`,
-skips instantly on docs/config-only pushes, and rides the existing PR
-close-keyword check (#1001) along with it.
-
-- **Set up the venv first, THEN activate — the venv is the prerequisite, not the
-  activation line by itself:**
-  ```
-  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
-  git config core.hooksPath .githooks
-  ```
-  Activating without the venv hands you a gate that resolves to
-  `~/.engram/venv` (has pytest, not this repo's deps) and reads as your tests
-  being broken when it's really the environment — the gate itself fails open
-  and does not block on this, but it also checked nothing, silently.
-- **Skip once:** `git push --no-verify`
-- **This is opt-in, not automatic.** A clone that never runs the config line
-  above is completely unprotected, and nothing reports that it's
-  unprotected — there is no ambient signal telling you the gate isn't wired
-  up. Run both lines the moment you clone.
-
 ## Install tiers — a design-time discipline
 
 Tiering is **not** a release-time packaging step bolted on at the end — it starts

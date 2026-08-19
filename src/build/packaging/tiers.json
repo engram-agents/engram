@@ -329,9 +329,7 @@
     },
     {
       "path": ".githooks/pre-push",
-      "tier": "dev",
-      "source": ".githooks/pre-push",
-      "note": "repo dev-workflow git hook (PR close-keyword checks + local test gate, #1001) -- moved to repo-root .githooks/ so its own documented activation command (git config core.hooksPath .githooks) is true. Real file lives at repo-root .githooks/ (not mirrored under src/engram/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/.githooks/pre-push) would wrongly flag this as dangling."
+      "tier": "dev"
     },
     {
       "path": "tools/scan-leaks.py",

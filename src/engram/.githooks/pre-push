@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Pre-push git hook: PR body close-keyword checks (defense-in-depth, issue #1001).
+
+CI's trap-check workflow already enforces these post-push. This hook provides an
+earlier signal so the author can fix before the push rather than after CI fails.
+
+Two checks, different severities:
+  TRAP (exit 1): a body close-keyword references an issue number that does NOT
+      match the title's [closes #N] target — the wrong-issue trap that caused
+      PR #516 and PR #537 incidents. CI catches this too; here it's pre-push.
+  WARN (exit 0): the title has [closes #N] but the body has no close-keyword
+      at all — means GitHub's auto-close parser won't fire on merge. Reminder
+      only; CI doesn't catch this.
+
+Requires 'gh' CLI with valid auth. If 'gh' is unavailable or fails, the hook
+exits 0 (skip gracefully) — CI provides the real backstop.
+
+Activation (per-clone):
+  git config core.hooksPath .githooks
+
+To skip for a single push: git push --no-verify ...
+"""
+
+import re
+import subprocess
+import sys
+from typing import Optional
+
+
+_CLOSE_KEYWORDS_RE = re.compile(
+    r"\b(close[sd]?|fix(es|ed)?|resolve[sd]?)\s+#(\d+)",
+    re.IGNORECASE,
+)
+_TITLE_BRACKET_RE = re.compile(
+    r"\[clos\w+\s+#(\d+)\]",
+    re.IGNORECASE,
+)
+
+
+def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+
+def _get_branch_name() -> Optional[str]:
+    result = _run(["git", "symbolic-ref", "--short", "HEAD"])
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def _get_pr_info(branch: str) -> Optional[dict]:
+    """Return {title, body} for the open PR for this branch, or None.
+
+    Uses `gh pr list --head <branch>` to find open PRs (not `gh pr view`,
+    which takes a PR number/URL/branch as a positional arg but may return
+    closed PRs). Returns the first open PR found, or None if none.
+    """
+    result = _run(
+        ["gh", "pr", "list", "--head", branch, "--state", "open",
+         "--json", "title,body", "--limit", "1"],
+    )
+    if result.returncode != 0:
+        return None
+    import json
+    try:
+        data = json.loads(result.stdout)
+        if not isinstance(data, list) or not data:
+            return None
+        return data[0]  # first open PR for this branch
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _check_pr(title: str, body: str) -> int:
+    """Run close-keyword checks. Returns exit code (0=clean/warn, 1=trap-blocked)."""
+    # Collect title targets: numbers from [closes #N] bracket form
+    title_targets = set(_TITLE_BRACKET_RE.findall(title))
+
+    # Collect body close-keyword references: issue numbers
+    body_refs = {m.group(3) for m in _CLOSE_KEYWORDS_RE.finditer(body)}
+
+    if not body_refs:
+        # No close-keywords in body at all
+        if title_targets:
+            print(
+                f"⚠ pre-push: PR title has [closes #{', #'.join(sorted(title_targets, key=int))}] "
+                f"but the PR body has no 'Closes #N.' keyword.\n"
+                f"  GitHub's auto-close parser won't fire on merge — the issue will stay open.\n"
+                f"  Add 'Closes #{sorted(title_targets, key=int)[0]}.' to the PR body to enable auto-close.\n"
+                f"  (CI does not catch this; edit via: gh pr edit <N> --body ...)",
+                file=sys.stderr,
+            )
+        return 0
+
+    if not title_targets:
+        # Body has keywords but title has no [closes #N] — warn but don't block
+        print(
+            f"⚠ pre-push: PR body has close-keyword reference(s) [#{', #'.join(sorted(body_refs, key=int))}] "
+            f"but the title has no [closes #N] target.\n"
+            f"  If this PR closes an issue, add [closes #N] to the title.\n"
+            f"  If it's a partial/EPIC slice, this is expected — warning only.",
+            file=sys.stderr,
+        )
+        return 0
+
+    # Title target(s) present — check for traps
+    traps = body_refs - title_targets
+    if traps:
+        trap_str = " ".join(f"#{n}" for n in sorted(traps, key=int))
+        target_str = " ".join(f"#{n}" for n in sorted(title_targets, key=int))
+        print(
+            f"✗ pre-push BLOCKED: off-target close-keyword(s) in PR body: {trap_str}\n"
+            f"  Title close target: {target_str}\n"
+            f"  GitHub's auto-close parser ignores negation, brackets, and backticks —\n"
+            f"  these body references will auto-close the WRONG issue on merge.\n"
+            f"\n"
+            f"  Safe paraphrases (use instead):\n"
+            f"    'this PR does NOT close #{sorted(traps)[0]}'  →  '#{ sorted(traps)[0]} stays open'\n"
+            f"    'fixes #{sorted(traps)[0]} partially'         →  'addresses one slice of #{sorted(traps)[0]}'\n"
+            f"\n"
+            f"  Edit body: gh pr edit <N> --body ...\n"
+            f"  Skip hook once: git push --no-verify",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+def main() -> int:
+    # Check gh is available
+    if _run(["which", "gh"]).returncode != 0:
+        return 0  # no gh → skip gracefully
+
+    branch = _get_branch_name()
+    if not branch:
+        return 0
+
+    pr_info = _get_pr_info(branch)
+    if not pr_info:
+        return 0  # no open PR for this branch → nothing to check
+
+    title = pr_info.get("title", "")
+    body = pr_info.get("body", "") or ""
+
+    return _check_pr(title, body)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
