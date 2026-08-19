@@ -632,3 +632,98 @@ def test_no_newline_in_capped_tail_falls_back_to_raw_tail_not_empty(engram_home)
     assert len(kept_content) <= cap, len(kept_content)
     # The newest text (the file's tail end) must be present.
     assert kept_content.endswith("z" * 100), kept_content[-120:]
+
+
+# ---------------------------------------------------------------------------
+# 10. gh#2056: the near-empty boundary snap (a newline landing exactly one
+#     char before the capped tail's own end) is a verified-correct edge, but
+#     nothing previously pinned it DISTINCTLY from the no-newline-at-all
+#     fallback above. Both leave "kept" far short of the cap, so a refactor
+#     that accidentally merged the two branches (e.g. routing the
+#     newline-found case through the no-newline fallback, or vice versa)
+#     would pass every pre-existing test here -- none of them assert on the
+#     EXACT kept length for either branch. These two tests close that gap:
+#     one pins the near-empty snap's kept length at exactly 1 (this is what
+#     "a newline one char before EOF" means -- only the char after the
+#     newline survives), the other pins the no-newline fallback's kept
+#     length at exactly the full cap (the raw, ragged tail is kept in full,
+#     since there's no boundary to advance to). The two expected lengths (1
+#     vs. cap) cannot both be produced by a merged/collapsed code path, so
+#     if the branches are ever accidentally unified these tests fail with
+#     different, path-identifying assertion errors rather than both silently
+#     passing or both silently failing the same way.
+# ---------------------------------------------------------------------------
+
+def test_boundary_snap_one_char_before_eof_keeps_a_single_char(engram_home):
+    """A newline landing exactly one character before the end of the capped
+    tail region must snap the kept content down to that trailing single
+    character -- the verified-correct near-empty edge cited in gh#2056.
+    Distinct from the no-newline fallback (next test): here a newline WAS
+    found in the tail, just pathologically close to the end, so the normal
+    line-boundary-snap branch runs (not the fallback branch)."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    # Prefix keeps the mid-line boundary condition true (the char just
+    # before start_idx must not be '\n', per the guard the function checks)
+    # and is dropped by the cap regardless of its content.
+    prefix = "P" * 500
+    # Tail region (last `cap` chars of the stripped content): cap-2 filler
+    # chars, then a newline one char before the tail's own end, then a
+    # single trailing char -- so only that last char can survive the snap.
+    tail = ("Q" * (cap - 2)) + "\n" + "Z"
+    content = prefix + tail
+    stripped = content.strip()
+    assert len(stripped) > cap, "fixture must actually exceed the cap"
+
+    start_idx = len(stripped) - cap
+    assert stripped[start_idx - 1] != "\n", "fixture must land mid-line for the snap branch to run"
+    assert "\n" in stripped[start_idx:], "fixture must contain a newline in the capped tail (not the fallback case)"
+
+    _write_history_file(history_dir, "2026-08-15.md", content)
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, elision_line, kept_content = _split_block(text)
+    # Verified by direct execution (see handoff transcript): kept == "Z",
+    # cut_chars == len(stripped) - 1 == 32499 for cap == 32000.
+    assert kept_content == "Z", repr(kept_content)
+    assert len(kept_content) == 1, len(kept_content)
+    m = re.search(r"\+(\d+) earlier chars elided", elision_line)
+    assert m, elision_line
+    assert int(m.group(1)) == len(stripped) - 1, (m.group(1), len(stripped))
+
+
+def test_no_newline_fallback_keeps_full_cap_distinct_from_near_empty_snap(engram_home):
+    """Companion to the near-empty-snap test above (gh#2056): the true
+    no-newline-at-all fallback keeps the FULL cap's worth of raw, ragged
+    tail -- not a single character. Pinning both exact kept-lengths (1 vs.
+    `cap`) in the same file means the two branches cannot be silently
+    collapsed into each other without one of these two tests failing."""
+    history_dir = engram_home / "history"
+    mod_probe = _load_hook_module(engram_home)
+    cap = mod_probe.HISTORY_ARC_CHAR_CAP
+
+    single_line = "NO-NEWLINE-AT-ALL-" + ("z" * (cap + 500))
+    stripped = single_line.strip()
+    assert len(stripped) > cap
+    start_idx = len(stripped) - cap
+    assert "\n" not in stripped[start_idx:], "fixture must contain no newline in the capped tail"
+
+    _write_history_file(history_dir, "2026-08-15.md", single_line)
+    mod = _load_hook_module(engram_home)
+    text = mod.history_arc_block(str(engram_home))
+
+    _header_line, elision_line, kept_content = _split_block(text)
+    # Verified by direct execution (see handoff transcript): kept length ==
+    # the full cap (32000), not 1 -- the raw tail is kept whole because
+    # there is no newline to advance past.
+    assert len(kept_content) == cap, len(kept_content)
+    m = re.search(r"\+(\d+) earlier chars elided", elision_line)
+    assert m, elision_line
+    assert int(m.group(1)) == len(stripped) - cap, (m.group(1), len(stripped), cap)
+    # Sanity: the two branches produce provably different kept lengths from
+    # comparably-sized over-cap fixtures (1 vs. cap), which is the whole
+    # point of pairing these tests (gh#2056).
+    assert cap != 1
