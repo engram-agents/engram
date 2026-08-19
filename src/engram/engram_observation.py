@@ -1568,6 +1568,22 @@ def _add_observation_impl(
 
         conn.commit()
 
+        # Durability read-back guard (alpha#2074, #1947 incident) — verify the
+        # commit actually landed on THIS connection before reporting
+        # status:created. A fresh-connection read-back would only exercise
+        # the path that already works; see core._verify_durable_write.
+        if not core._verify_durable_write(conn, node_id):
+            return json.dumps({
+                "status": "failed_not_durable",
+                "observation_id": node_id,
+                "error": (
+                    "Write did not verify as durable on read-back after commit — "
+                    "the row is missing or its claim is empty. Do NOT retry "
+                    "automatically; a retry after a partial commit risks a "
+                    "double-write. See alpha#1947, #2074."
+                ),
+            })
+
         # --- Stage 1 auto-suggest: person-mention detection (§4 of person typed schema) ---
         # Scan the new claim text against name + aliases of every current person node.
         # On match, add an action-hint suggesting the caller wire an about-edge.

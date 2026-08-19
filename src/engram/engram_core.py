@@ -3400,6 +3400,40 @@ def _next_id(conn: sqlite3.Connection, node_type: str) -> str:
     return f"{prefix}_{num:04d}"
 
 
+def _verify_durable_write(conn: sqlite3.Connection, node_id: str, claim_field: str = "claim") -> bool:
+    """Post-commit read-back guard (alpha#2074 / #2097, gating v0.4.0-rc1).
+
+    Motivating incident: alpha#1947 (2026-08-07) — during a WAL/shm
+    split-brain window, two observations filed through the degraded server
+    returned full `status: created` success payloads (node id, evidence id,
+    confidence, dedup neighbours) and were then silently lost when the
+    server was replaced. A caller had no way to tell a durable write from a
+    doomed one purely from the returned payload.
+
+    This helper closes that gap: call it on the SAME connection, AFTER
+    conn.commit() returns, to confirm the just-written row is actually
+    readable back and carries real content — not merely that INSERT/commit
+    did not raise. A fresh connection would test the ordinary path (which
+    already works); the guard only matters read back through the connection
+    that did the write.
+
+    Asserts content, not just existence: a row with an empty claim is what
+    the alpha#1947-class displacement bug produces, so an empty/whitespace
+    claim_field counts as MISSING, same as no row at all.
+
+    Returns:
+        True if the row exists and its claim_field is non-empty after
+        stripping whitespace. False otherwise (row missing OR empty claim).
+    """
+    row = conn.execute(
+        f"SELECT {claim_field} FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    value = row[claim_field]
+    return bool(value and str(value).strip())
+
+
 def _node_to_dict(row: sqlite3.Row) -> dict:
     """Convert a sqlite3.Row to a clean dict, omitting None values.
 
