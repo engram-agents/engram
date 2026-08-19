@@ -22,14 +22,16 @@ short "could this match the invoker / a co-tenant?" answer):
     - forum-mention-monitor.sh
     - forum-updates-monitor.sh
 
-  FINDING, NOT FIXED HERE (reap blast-radius change is out of scope for this
-  inventory pass per the issue's own §3 instruction — reported via xfail):
+  FIXED (#1935 — ported #1933's warn-not-kill + /proc two-layer verification,
+  PLUS anchored the layer-1 candidate pattern itself on
+  `^(\\S*/)?-?bash\\s+...` per #2028's boot-charge fix, so the candidate stage
+  alone already excludes the self-quoting-charge-text decoy):
     - collab-baton-monitor.sh
     - collab-letter-monitor.sh
-      Same self-match trap #1933 fixed in the two forum-*-monitor.sh
-      siblings, still present: a single-layer unanchored `pgrep -f
+      Previously carried the same self-match trap #1933 fixed in the two
+      forum-*-monitor.sh siblings: a single-layer unanchored `pgrep -f
       <script>\\.sh` feeding directly into `kill`, no argv verification, no
-      warn-not-kill guard.
+      warn-not-kill guard. Now fixed.
 
     - deploy/autostart/boot-charge-default.md / boot-charge-quiet.md's
       monitor-verify step: `pgrep -u "$USER" -af
@@ -609,20 +611,16 @@ class _SingleLayerReapMonitorFixture:
 
 
 class TestCollabBatonMonitorReapPattern(_SingleLayerReapMonitorFixture):
+    """FIXED by #1935 (porting #1933/#2028's process-name-anchored candidate
+    pattern -- collab-baton-monitor.sh no longer feeds an unanchored
+    substring match straight into `kill`; the candidate pgrep pattern is now
+    itself anchored on `^(\\S*/)?-?bash\\s+...` so the self-quoting-charge-text
+    decoy is excluded even before any /proc/<pid>/cmdline verification runs,
+    and the script also gained the /proc two-layer verification + warn-not-kill
+    posture (see the script's own inline comments)."""
+
     SCRIPT = _TOOLS / "collab-baton-monitor.sh"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#2029: collab-baton-monitor.sh's reap pattern is unanchored and "
-            "single-layer (no /proc/<pid>/cmdline verification, no "
-            "warn-not-kill guard) -- the same self-match trap #1933 fixed "
-            "for forum-mention-monitor.sh / forum-updates-monitor.sh is "
-            "still present here. Reported as a finding, not fixed, because "
-            "fixing it changes reap blast-radius behavior (out of scope for "
-            "this inventory pass)."
-        ),
-    )
     def test_reap_pattern_matches_exactly_the_target_and_wrapper(self):
         purpose = "unittestpurpose"
         pattern = self._pattern("collab-baton-monitor.sh", purpose)
@@ -638,20 +636,16 @@ class TestCollabBatonMonitorReapPattern(_SingleLayerReapMonitorFixture):
 
 
 class TestCollabLetterMonitorReapPattern(_SingleLayerReapMonitorFixture):
+    """FIXED by #1935 (porting #1933/#2028's process-name-anchored candidate
+    pattern -- collab-letter-monitor.sh no longer feeds an unanchored
+    substring match straight into `kill`; the candidate pgrep pattern is now
+    itself anchored on `^(\\S*/)?-?bash\\s+...` so the self-quoting-charge-text
+    decoy is excluded even before any /proc/<pid>/cmdline verification runs,
+    and the script also gained the /proc two-layer verification + warn-not-kill
+    posture (see the script's own inline comments)."""
+
     SCRIPT = _TOOLS / "collab-letter-monitor.sh"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "#2029: collab-letter-monitor.sh's reap pattern is unanchored "
-            "and single-layer (no /proc/<pid>/cmdline verification, no "
-            "warn-not-kill guard) -- the same self-match trap #1933 fixed "
-            "for forum-mention-monitor.sh / forum-updates-monitor.sh is "
-            "still present here. Reported as a finding, not fixed, because "
-            "fixing it changes reap blast-radius behavior (out of scope for "
-            "this inventory pass)."
-        ),
-    )
     def test_reap_pattern_matches_exactly_the_target_and_wrapper(self):
         purpose = "unittestpurpose"
         pattern = self._pattern("collab-letter-monitor.sh", purpose)
