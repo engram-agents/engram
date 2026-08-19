@@ -1294,3 +1294,79 @@ def test_2077_core_fallback_literal_matches_canonical_constant():
         f"drifted from engram_backup.NODES_FTS_COLUMNS {canonical_sql!r} — "
         "update the literal to match."
     )
+
+
+def test_2087_rebuild_fts_preserves_incoming_user_version(tmp_path):
+    """#2087: rebuild_fts_index must PRESERVE an already-migrated DB's
+    user_version rather than unconditionally pinning it to 1.
+
+    Before the fix, a live DB at user_version 3 (post migration-3, #195)
+    would be silently downgraded to 1 by any call to rebuild_fts_index —
+    e.g. #2080's startup self-heal path — which makes
+    _run_db_one_time_setup's migration-2/3 blocks re-run on the very same
+    setup call, since the self-heal fires before those blocks read
+    PRAGMA user_version.
+    """
+    p = str(tmp_path / "migrated.db")
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            claim TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            status TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        """
+    )
+    conn.execute("INSERT INTO nodes VALUES ('ob_1', 'plugin migration', 'src', 'interp', 'active')")
+    conn.execute("PRAGMA user_version = 3")
+    conn.commit()
+    conn.close()
+
+    assert engram_backup.rebuild_fts_index(p) is True
+
+    conn = sqlite3.connect(p)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert version == 3, f"rebuild_fts_index must preserve incoming user_version 3, got {version}"
+
+
+def test_2087_rebuild_fts_bumps_fresh_db_to_at_least_1(tmp_path):
+    """#2087: a genuinely fresh/pre-migration DB (user_version 0 on entry)
+    must still come out of rebuild_fts_index at user_version >= 1 — the
+    original intent of the PRAGMA write (satisfying the server's one-shot
+    #274 migration gate) must survive for the case it was actually meant to
+    cover.
+    """
+    p = str(tmp_path / "fresh.db")
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE nodes (
+            id TEXT PRIMARY KEY,
+            claim TEXT,
+            quoted_text TEXT,
+            interpretation TEXT,
+            status TEXT
+        );
+        CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
+        """
+    )
+    conn.execute("INSERT INTO nodes VALUES ('ob_1', 'plugin migration', 'src', 'interp', 'active')")
+    conn.commit()
+    conn.close()
+
+    # Confirm the fixture actually starts at user_version 0.
+    conn = sqlite3.connect(p)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+    conn.close()
+
+    assert engram_backup.rebuild_fts_index(p) is True
+
+    conn = sqlite3.connect(p)
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert version >= 1, f"rebuild_fts_index must bump a fresh DB (user_version 0) to >= 1, got {version}"

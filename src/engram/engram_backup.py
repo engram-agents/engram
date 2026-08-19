@@ -207,9 +207,18 @@ def rebuild_fts_index(db_path: str) -> bool:
     rebuilds from all current ``nodes`` rows (so retracted rows are present in
     the index immediately after rebuild), then 'delete'-inserts each retracted
     row to exclude it from the index (this succeeds only because rebuild just
-    populated them — delete-on-empty is the crash).  Finally sets
-    PRAGMA user_version = 1 so the server's one-shot #274 migration gate is
-    satisfied and does not re-fire on the next _get_db call.
+    populated them — delete-on-empty is the crash).  Finally restores
+    PRAGMA user_version to the value it had on entry (#2087): the incoming
+    version is read before the rebuild and written back after, so a
+    already-migrated live DB (user_version 2 or 3) is not silently downgraded
+    to 1 — a downgrade that would make _run_db_one_time_setup's migration-2/3
+    blocks re-run on the next call, since #2080's startup self-heal invokes
+    this function mid-setup, before those later migration blocks are gated.
+    The one exception is an incoming version of 0 (a genuinely fresh/
+    pre-migration DB, or a legacy DB that predates the #274 migration gate):
+    there the original intent of this PRAGMA — marking FTS schema v1 present
+    so the server's one-shot #274 migration gate is satisfied and does not
+    re-fire — still applies, so the version is bumped to at least 1.
 
     Order is load-bearing: rebuild THEN delete (not delete THEN rebuild, which
     is the original crash path).
@@ -243,6 +252,10 @@ def rebuild_fts_index(db_path: str) -> bool:
         ).fetchone()
         if not has_nodes:
             return False
+
+        # #2087: capture the incoming user_version before the rebuild so it
+        # can be restored afterward instead of unconditionally overwritten.
+        incoming_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
         # Create the FTS table if it was stripped from the dump (it always is).
         # Guard: only create if nodes has the three original required columns
@@ -284,6 +297,12 @@ def rebuild_fts_index(db_path: str) -> bool:
 
         # Step 1: rebuild — populates the index from ALL nodes rows, including
         # retracted ones (external-content 'rebuild' mirrors the content table).
+        # Exception-path safety (verified by fault injection, #2113 review):
+        # this INSERT opens SQLite's implicit transaction; if anything below
+        # raises before the commit, conn.close() in the finally ROLLS BACK the
+        # rebuild AND the user_version restore together. Do not add an early
+        # conn.commit() between here and the version restore — that would
+        # split the transaction and let a mid-repair crash strand the version.
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
 
         # Step 2: delete-insert retracted rows — succeeds because they were just
@@ -306,8 +325,20 @@ def rebuild_fts_index(db_path: str) -> bool:
                     row,
                 )
 
-        # Step 3: gate the server's #274 migration so it doesn't re-fire.
-        conn.execute("PRAGMA user_version = 1")
+        # Step 3: restore the incoming user_version rather than unconditionally
+        # overwriting it (#2087). PRAGMA statements do not accept bound
+        # parameters (SQL grammar), so the value is interpolated; it is a
+        # Python int read from this same DB via PRAGMA and is never
+        # caller-supplied. user_version is per-database state persisted in the
+        # file header — which is exactly why it must survive the rebuild
+        # rather than be overwritten.
+        # incoming_user_version == 0 means a genuinely fresh/pre-migration DB
+        # (or a legacy DB predating the #274 gate) — preserve the original
+        # intent of gating the server's #274 migration so it doesn't re-fire
+        # by bumping to at least 1. Any incoming version >= 1 passes through
+        # unchanged (max(...) is a no-op there).
+        restored_user_version = max(incoming_user_version, 1)
+        conn.execute(f"PRAGMA user_version = {restored_user_version}")
 
         conn.commit()
         return True
