@@ -445,6 +445,14 @@
       "note": "No test file found for forum-mention-monitor.sh"
     },
     {
+      "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
+      "test_globs": [
+        "tests/test_forum_monitor_duplicate_warn.py",
+        "tests/test_pgrep_liveness_reap_patterns.py"
+      ],
+      "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table."
+    },
+    {
       "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
       "test_globs": [
         "tests/test_codex_umwelt_wake.py"
