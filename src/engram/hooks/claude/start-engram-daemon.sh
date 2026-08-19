@@ -58,7 +58,24 @@ fi
 # ENGRAM_HOME that merely has this one as a string prefix (e.g. this
 # agent's real `~/.engram` vs. some other checkout's `~/.engram-backup`)
 # -- the shorter path is a substring of the longer one's command line.
-for stale_pid in $(pgrep -f "engram-surface-daemon\.py.*${ENGRAM_HOME}\$" 2>/dev/null); do
+# Named so tests/test_pgrep_liveness_reap_patterns.py can import the exact
+# pattern under test instead of re-typing a copy that could drift (#2029).
+#
+# #2029 inventory answers: could this match the invoking process (this
+# SessionStart hook itself)? No -- this script's own argv never mentions
+# "engram-surface-daemon.py". Could it match a co-tenant's process on a
+# shared host? Not via the pattern alone (no -u scope here), but the
+# end-anchored "...${ENGRAM_HOME}\$" requires the co-tenant's process to
+# have the EXACT same ENGRAM_HOME string as its last argv token -- two
+# different agents' homes (or a boot-charge blob quoting this launch line
+# followed by more text) will not satisfy that end anchor in practice. As
+# with is_own_server_py_running above, pgrep -f is an unescaped-ERE
+# substring match, so a co-tenant ENGRAM_HOME differing only at an ERE
+# metachar position could in theory collide; distinct per-agent home paths
+# make that realistically implausible, not structurally impossible. See
+# tests/test_pgrep_liveness_reap_patterns.py for the synthetic-table proof.
+_reap_pattern="engram-surface-daemon\.py.*${ENGRAM_HOME}\$"
+for stale_pid in $(pgrep -f "$_reap_pattern" 2>/dev/null); do
     kill "$stale_pid" 2>/dev/null || true
 done
 rm -f "$PID_PATH" "$SOCKET_PATH"

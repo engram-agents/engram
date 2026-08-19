@@ -118,6 +118,19 @@ if [ -z "${COLLAB_MONITOR_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; the
     # last-arm-wins for default instances. For an explicit non-default purpose
     # key, match by script name AND purpose so default instances (and instances
     # of a different non-default purpose) are never cross-killed (#1183).
+    #
+    # #2029 FINDING (reported, NOT fixed here -- reap blast-radius change,
+    # out of scope for this inventory pass per the issue's own instruction):
+    # could this pattern match the invoking process? YES -- this is the same
+    # substring-match-as-execution-decision the docstring above still calls
+    # "harmless in production", which #1933 disproved for the sibling
+    # forum-mention-monitor.sh / forum-updates-monitor.sh scripts (those were
+    # fixed to warn-not-kill + /proc/<pid>/cmdline verification; this one and
+    # collab-baton-monitor.sh were not). A boot charge that quotes this
+    # script's launch line in its own argv would be killed by its own arm.
+    # Could it match a co-tenant's process? No -- the -u "$(id -u)" scope
+    # prevents that. See tests/test_pgrep_liveness_reap_patterns.py (xfail,
+    # references this issue) for the synthetic-table proof.
     if [ "$PURPOSE" = "default" ]; then
         _pgrep_pattern='collab-letter-monitor\.sh'
     else

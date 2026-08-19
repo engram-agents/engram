@@ -152,6 +152,17 @@ def is_own_server_py_running(engram_home: str) -> bool:
 
     try:
         server_path = resolve_own_server_py_path(engram_home)
+        # #2029 inventory: could this match the invoking process? No -- the
+        # invoking process is a hook script, never a "server.py" path in its
+        # own argv. Could it match a co-tenant's process? server_path is an
+        # absolute path under THIS agent's own resolve_own_server_py_path
+        # result (per-home), so a co-tenant's equivalent process carries a
+        # different absolute path string, and pgrep -f's match is an
+        # unescaped-ERE substring search -- a co-tenant path that happened
+        # to differ from this one only at an ERE metachar position could in
+        # theory match. In practice, distinct agent-home paths (different
+        # usernames/directories) make that collision implausible, not
+        # impossible.
         result = subprocess.run(
             ["pgrep", "-f", server_path], capture_output=True, timeout=2
         )

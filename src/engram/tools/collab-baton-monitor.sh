@@ -110,6 +110,20 @@ SELF="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.e
 # ---------------------------------------------------------------------------
 if [ -z "${COLLAB_MONITOR_NO_REAP:-}" ] && ! $_ONCE && command -v pgrep >/dev/null 2>&1; then
     # Purpose-scoped reap: only kill prior instances of the SAME purpose.
+    #
+    # #2029 FINDING (reported, NOT fixed here -- reap blast-radius change,
+    # out of scope for this inventory pass per the issue's own instruction):
+    # could this pattern match the invoking process? YES. Unlike
+    # forum-mention-monitor.sh / forum-updates-monitor.sh (fixed by #1933),
+    # this reap is still a bare unanchored `pgrep -u "$(id -u)" -f
+    # "collab-baton-monitor\.sh"` with NO second-layer /proc/<pid>/cmdline
+    # verification and NO warn-not-kill guard -- it kills every match
+    # directly. A boot charge that quotes this script's launch line in its
+    # own argv (the exact #1933 repro) would be killed by its own arm,
+    # taking the whole session down. Could it match a co-tenant's process?
+    # No -- the -u "$(id -u)" scope prevents that. See
+    # tests/test_pgrep_liveness_reap_patterns.py (xfail, references this
+    # issue) for the synthetic-table proof of the self-match trap.
     if [ "$PURPOSE" = "default" ]; then
         _pgrep_pattern='collab-baton-monitor\.sh'
     else

@@ -221,6 +221,11 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
     try:
         server_path = _resolve_mcp_server_path(engram_home)
+        # #2029 inventory: could this match the invoking process? No -- a
+        # SessionStart hook's own argv never contains a "server.py" path.
+        # Could it match a co-tenant's process? No -- server_path is this
+        # agent's own resolved absolute path (per-home), so a co-tenant's
+        # equivalent process carries a different absolute-path string.
         result = subprocess.run(
             ["pgrep", "-f", server_path],
             capture_output=True,

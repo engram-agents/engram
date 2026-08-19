@@ -200,6 +200,20 @@ if [ -z "${FORUM_MENTION_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
     # pre-#1183 behaviour. For an explicit non-default purpose key, match by
     # script name AND purpose so default instances (and instances of a
     # different non-default purpose) are never cross-flagged (#1183).
+    #
+    # #2029 inventory answers: could this candidate pattern match the
+    # invoking process (a boot charge quoting this script's path, #1933)?
+    # YES -- by design, at the pgrep-candidate stage alone. That is exactly
+    # why this site is two-layered: -u "$(id -u)" scopes to this uid only
+    # (so a co-tenant's equivalent process on a shared host can never be a
+    # candidate at all), and every candidate is then re-verified against
+    # /proc/<pid>/cmdline below (_check_forum_mention_dup) before it is even
+    # WARNED about -- and the action is warn-not-kill regardless, so an
+    # over-matched candidate can never cause a reap. See
+    # tests/test_pgrep_liveness_reap_patterns.py for the synthetic-table
+    # proof that this candidate pattern over-matches at layer 1, and
+    # tests/test_forum_monitor_duplicate_warn.py for the end-to-end proof
+    # that the self-quoting decoy is neither reported nor killed.
     if [ "$PURPOSE" = "default" ]; then
         _pgrep_pattern='forum-mention-monitor\.sh'
     else

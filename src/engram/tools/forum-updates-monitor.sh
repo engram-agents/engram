@@ -193,6 +193,16 @@ if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
     # ones. A NAMED purpose matches script + that --purpose only → two
     # different named purposes never cross-flag, but a default arm still
     # considers them candidates. Doc'd in --help.
+    #
+    # #2029 inventory answers: could this candidate pattern match the
+    # invoking process (a boot charge quoting this script's path, #1933)?
+    # YES, at the pgrep-candidate stage -- mitigated the same way as
+    # forum-mention-monitor.sh: -u "$(id -u)" excludes any co-tenant on a
+    # shared host from ever being a candidate, every candidate is
+    # re-verified against /proc/<pid>/cmdline before being reported
+    # (_check_forum_updates_dup), and the action is warn-not-kill
+    # regardless. See tests/test_pgrep_liveness_reap_patterns.py and
+    # tests/test_forum_monitor_duplicate_warn.py.
     if [ "$PURPOSE" = "default" ]; then
         _pgrep_pattern='forum-updates-monitor\.sh'
     else
