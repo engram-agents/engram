@@ -51,6 +51,15 @@ equivalent, across the hooks that used it prior to extraction):
     passes (``forum_api.py`` for baton/inter-agent, ``_status_derive.py``
     for forum).
 
+  - get_comms_surface() (alpha#2019 slice A): reads the single-fact
+    ``comms_surface`` config key ("umwelt" | "forum"). This is NEW shared
+    logic, not an extraction from a pre-existing per-hook copy -- it lives
+    here because it is comms-surface-consuming-hook-shared from day one
+    (the forum prompt hook is the first consumer; the baton/inter-agent
+    hooks are expected to gain the same conditional in a later slice), and
+    because every existing config-resolution helper in this module already
+    follows the engram_home-parameter pattern this function reuses.
+
 NOT extracted (deliberately, per this slice's hard scope bounds): HTTP
 stacks (ForumClient vs urllib), the multi-agent/forum-configured gates
 (_is_multi_agent_mode vs _is_forum_configured -- left exactly as-is in
@@ -73,6 +82,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -143,6 +153,53 @@ def get_agent_name(
         pass
 
     return ""
+
+
+def get_comms_surface(
+    config: Optional[dict] = None,
+    engram_home: Optional[str] = None,
+) -> str:
+    """Resolve this agent's comms surface: "umwelt" or "forum".
+
+    Single-fact SSoT (issue #2019, Lei-approved 2026-08-19): reads
+    ``config.json["comms_surface"]``.
+
+    Semantics:
+      - value == "umwelt" -> "umwelt".
+      - value == "forum" -> "forum".
+      - key ABSENT -> "forum". This is a TRUE optional (a legitimate default,
+        not a failure-hiding fallback — absence genuinely means forum-canonical): an
+        absent key genuinely means "forum-canonical install", not a
+        missing-value error -- so this branch is silent, no warning.
+      - any OTHER value (unrecognized string, wrong type, etc.) -> "forum",
+        with a one-line warning to stderr naming the bad value. Loud, never
+        fatal -- a hook must never crash on a bad config.
+
+    A config.json that fails to load at all (missing file, unreadable,
+    malformed JSON) is indistinguishable from "comms_surface key absent"
+    from this function's perspective, because load_config() already
+    swallows those failures into ``{}`` (its own documented contract) --
+    so that case also falls into the silent absent-key branch, not the
+    loud malformed-value branch. The loud branch is reserved for a
+    config.json that DID load, but whose comms_surface value is not one
+    of the two recognized strings.
+
+    If config is None, loads it via load_config(engram_home) first --
+    matches get_agent_name()'s calling convention above.
+    """
+    if config is None:
+        config = load_config(engram_home)
+    if "comms_surface" not in config:
+        return "forum"
+    value = config.get("comms_surface")
+    if value in ("umwelt", "forum"):
+        return value
+    print(
+        f"[_prompthooklib] comms_surface={value!r} is not a recognized "
+        f"value (expected 'umwelt' or 'forum') -- defaulting to 'forum'",
+        file=sys.stderr,
+    )
+    return "forum"
 
 
 def emit_context(text: str) -> None:

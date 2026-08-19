@@ -3,20 +3,30 @@
 2026-07-31-loop-arm-nudge-SPEC.md, PR-B. Spec verification items 2-6 (item
 1 -- "existing engram-stop-hook tests pass unchanged" -- is a PR-A
 requirement, verified separately; see PR-A's own test run), plus the
-round-3 tool-identity-correlation fix's own required tests (a real hole
-the round-3 review found and reproduced: the gate previously matched on
-TEXT CONTENT alone, so any tool_result -- e.g. a Bash echo, or a Read of
-this hook's own source file, which unavoidably contains the marker and
+round-3 tool-identity fix's own required tests (a real hole the round-3
+review found and reproduced: the gate previously matched on TEXT CONTENT
+alone, so any tool call/result pair -- e.g. a Bash echo, or a Read of this
+hook's own source file, which unavoidably contains the marker and
 pending-job words throughout its docstring -- could silently suppress the
 nudge), plus the round-6 pacer-gating fix's required tests (a colleague
 review asked what happens on a non-scheduleWakeup-paced loop or a
 non-Claude install: the hook previously fired on loop-mode.json's mere
 EXISTENCE, never reading its "pacer" field, so a cron-paced loop -- which
-has no reason to run CronList on any given turn -- got nagged every single
-turn with an instruction to ScheduleWakeup, which is actively wrong for
-that pacer), plus supporting regression tests (marker-fallback
+has no reason to call ScheduleWakeup on any given turn -- got nagged every
+single turn with an instruction to ScheduleWakeup, which is actively wrong
+for that pacer), plus supporting regression tests (marker-fallback
 consistency, stop_hook_active re-fire guard, delta isolation,
 lib-import-failure fallback).
+
+2026-08-12 retarget (#1973, #1987): the gate moved from a `CronList`
+tool_result to a `ScheduleWakeup` tool_use (tool_call), because a
+tool_result showing a pending job is byte-identical whether the job was
+armed an hour ago or this second -- it cannot prove "armed from now", which
+is what the sliding-window heartbeat rule needs. Every fixture below that
+used to build a (CronList tool_use, tool_result-with-marker) correlated
+pair now builds a single ScheduleWakeup tool_use block carrying the marker
+in its `input.prompt` -- the call itself is the evidence, no result or
+correlation needed.
 
 Invocation pattern mirrors tests/test_stop_hook_prose_gate.py: run the hook
 as a real subprocess against a synthetic ENGRAM_HOME + transcript, so the
@@ -66,13 +76,20 @@ def _run_hook(stdin_payload: str, engram_home: Path) -> tuple[str, int]:
 
 
 def _nudge_emitted(stdout: str) -> bool:
-    """Return True if the hook emitted the loop-arm nudge on this invocation."""
+    """Return True if the hook emitted the loop-arm nudge on this invocation.
+
+    2026-08-12 correction: the nudge is a blocking decision
+    (`{"decision": "block", "reason": ...}`), not `additionalContext` --
+    additionalContext is not a documented Stop-hook field and never
+    reached the agent; see the hook's design-fact-4 docstring.
+    """
     if not stdout:
         return False
     try:
         parsed = json.loads(stdout)
-        ctx = parsed.get("hookSpecificOutput", {}).get("additionalContext", "")
-        return "Loop Arm Check" in ctx
+        if parsed.get("decision") != "block":
+            return False
+        return "Loop Arm Check" in parsed.get("reason", "")
     except (json.JSONDecodeError, AttributeError):
         return False
 
@@ -100,14 +117,21 @@ def _append_lines(transcript: Path, *lines: str) -> None:
             f.write(line + "\n")
 
 
-def _tool_use_record(tool_id: str, name: str) -> str:
-    """Build a compact-JSON assistant-role record with a single tool_use block."""
+def _tool_use_record(tool_id: str, name: str, input_: dict | None = None) -> str:
+    """Build a compact-JSON assistant-role record with a single tool_use
+    block. `input_` defaults to {} (matches a tool call with no relevant
+    arguments -- e.g. a bare CronList probe)."""
     return json.dumps(
         {
             "type": "assistant",
             "message": {
                 "content": [
-                    {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": input_ if input_ is not None else {},
+                    }
                 ]
             },
         },
@@ -116,9 +140,10 @@ def _tool_use_record(tool_id: str, name: str) -> str:
 
 
 def _tool_result_record(tool_id: str, text: str) -> str:
-    """Build a compact-JSON user-role record with a single tool_result block,
-    correlated to `tool_id` via `tool_use_id` -- matches the real
-    tool_use/tool_result correlation shape, NOT just text content."""
+    """Build a compact-JSON user-role record with a single tool_result
+    block, correlated to `tool_id` via `tool_use_id` -- used only for the
+    decoy/companion-result fixtures below (the gate itself never inspects
+    tool_result content since the 2026-08-12 retarget)."""
     return json.dumps(
         {
             "type": "user",
@@ -136,33 +161,31 @@ def _tool_result_record(tool_id: str, text: str) -> str:
     )
 
 
-def _correlated_pair(tool_id: str, name: str, text: str) -> tuple[str, str]:
-    """A (tool_use, tool_result) record pair sharing `tool_id`, in the order
-    they'd actually appear in a transcript (tool_use first)."""
-    return _tool_use_record(tool_id, name), _tool_result_record(tool_id, text)
+def _schedule_wakeup_call(tool_id: str, prompt: str) -> str:
+    """A ScheduleWakeup tool_use record carrying `prompt` in its input --
+    the shape the gate now checks directly (no companion tool_result
+    needed; the call itself is the evidence)."""
+    return _tool_use_record(tool_id, "ScheduleWakeup", {"prompt": prompt})
 
 
-# A realistic CronList rendering carrying the loop-wake marker (spec fact
-# #3's example, lightly paraphrased).
-_REAL_CRON_LISTING = (
-    "60ac4983 — Every day at 6:09 PM (one-shot) [session-only]: <loop-wake>\n"
-    "<loop-meta {\"kind\":\"working\"}>\nLoop tick."
+# A realistic loop-wake prompt carrying the marker (spec fact #3's example,
+# lightly paraphrased -- now the CONTENT of a ScheduleWakeup call's
+# `input.prompt`, not a CronList result's text).
+_REAL_LOOP_PROMPT = (
+    "<loop-wake>\n<loop-meta {\"kind\":\"working\"}>\nLoop tick."
 )
 
-# A cron listing for an UNRELATED job -- correctly a CronList result, but
-# NOT the loop-wake marker.
-_UNRELATED_CRON_LISTING = (
-    "aa11bb22 — Every day at 9:00 AM (one-shot) [session-only]: "
-    "Check the mailbox for new letters."
-)
+# A ScheduleWakeup prompt with no loop-wake marker -- correctly a
+# ScheduleWakeup call, but NOT arming the loop-wake.
+_UNRELATED_PROMPT = "Check the mailbox for new letters at 9:00 AM."
 
 
 # ===========================================================================
 # Spec verification item 2: nudge FIRES with loop marker present and no
-# cron result in the delta.
+# ScheduleWakeup call in the delta.
 # ===========================================================================
 
-def test_nudge_fires_with_loop_marker_and_no_cron_result(tmp_path):
+def test_nudge_fires_with_loop_marker_and_no_schedulewakeup_call(tmp_path):
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -172,11 +195,11 @@ def test_nudge_fires_with_loop_marker_and_no_cron_result(tmp_path):
     # Fire 1: establish state at EOF (empty transcript).
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Delta: some ordinary assistant text, no tool_result at all.
+    # Delta: some ordinary assistant text, no tool_use at all.
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Just some prose, no cron check."}
+            {"type": "text", "text": "Just some prose, no arm check."}
         ]}}, separators=(",", ":")),
     )
 
@@ -184,18 +207,18 @@ def test_nudge_fires_with_loop_marker_and_no_cron_result(tmp_path):
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"Loop marker present + no cron result in delta must EMIT the nudge; "
-        f"stdout={stdout!r}"
+        f"Loop marker present + no ScheduleWakeup call in delta must EMIT "
+        f"the nudge; stdout={stdout!r}"
     )
 
 
 # ===========================================================================
-# Spec verification item 3: SUPPRESSES given a tool_result containing a
-# "[session-only] ... <loop-wake>" line -- CORRECTLY CORRELATED to a
-# CronList tool_use (this is also the round-3 fix's core positive case).
+# Spec verification item 3: SUPPRESSES given a ScheduleWakeup tool_use
+# call whose `input.prompt` carries the `<loop-wake>` marker -- this is
+# also the round-3 fix's core positive case, ported to the tool_use shape.
 # ===========================================================================
 
-def test_suppresses_given_correlated_cronlist_result_with_marker(tmp_path):
+def test_suppresses_given_schedulewakeup_call_with_marker(tmp_path):
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -204,17 +227,15 @@ def test_suppresses_given_correlated_cronlist_result_with_marker(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_cronlist", "CronList", _REAL_CRON_LISTING
-    )
-    _append_lines(transcript, tool_use, tool_result)
+    call = _schedule_wakeup_call("toolu_test_swu", _REAL_LOOP_PROMPT)
+    _append_lines(transcript, call)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert stdout == "", (
-        f"A CronList tool_result (correctly correlated via tool_use_id) "
-        f"carrying <loop-wake> must SUPPRESS; got={stdout!r}"
+        f"A ScheduleWakeup tool_use carrying <loop-wake> in its prompt "
+        f"input must SUPPRESS; got={stdout!r}"
     )
 
 
@@ -231,17 +252,11 @@ def test_suppresses_given_html_escaped_marker(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    escaped_listing = (
-        "60ac4983 — Every day at 6:09 PM (one-shot) [session-only]: "
-        + html.escape("<loop-wake>")
-        + "\nLoop tick."
-    )
-    assert "&lt;loop-wake&gt;" in escaped_listing  # sanity on the fixture itself
+    escaped_prompt = html.escape("<loop-wake>") + "\nLoop tick."
+    assert "&lt;loop-wake&gt;" in escaped_prompt  # sanity on the fixture itself
 
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_escaped", "CronList", escaped_listing
-    )
-    _append_lines(transcript, tool_use, tool_result)
+    call = _schedule_wakeup_call("toolu_test_escaped", escaped_prompt)
+    _append_lines(transcript, call)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
@@ -265,7 +280,8 @@ def test_does_not_fire_without_loop_mode_marker(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Delta with prose and no cron result -- would EMIT if loop-mode were active.
+    # Delta with prose and no ScheduleWakeup call -- would EMIT if
+    # loop-mode were active.
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
@@ -283,17 +299,17 @@ def test_does_not_fire_without_loop_mode_marker(tmp_path):
 
 # ===========================================================================
 # Round-6 review fix -- pacer gating. The nudge's own instruction text
-# ("Re-arm now — ScheduleWakeup...") is scheduleWakeup-specific, so firing
-# it at a loop this hook can't positively identify as scheduleWakeup-paced
+# ("Arm now — ScheduleWakeup...") is scheduleWakeup-specific, so firing it
+# at a loop this hook can't positively identify as scheduleWakeup-paced
 # risks telling the agent to take an actively wrong action (mixing pacers
 # is a real, previously-hit double-fire bug). The gate must fire ONLY when
 # `pacer` is (case/whitespace-normalized) "scheduleWakeup"; anything else
-# is a silent no-op, even with no CronList confirmation in the delta at all.
+# is a silent no-op, even with no ScheduleWakeup call in the delta at all.
 # ===========================================================================
 
-def test_schedulewakeup_pacer_still_fires_with_no_cron_result(tmp_path):
+def test_schedulewakeup_pacer_still_fires_with_no_call(tmp_path):
     """Existing behaviour preserved: an explicit pacer="scheduleWakeup"
-    marker with no CronList confirmation in the delta must still fire."""
+    marker with no ScheduleWakeup call in the delta must still fire."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home, pacer="scheduleWakeup")
@@ -305,7 +321,7 @@ def test_schedulewakeup_pacer_still_fires_with_no_cron_result(tmp_path):
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Just some prose, no cron check."}
+            {"type": "text", "text": "Just some prose, no arm check."}
         ]}}, separators=(",", ":")),
     )
 
@@ -313,16 +329,16 @@ def test_schedulewakeup_pacer_still_fires_with_no_cron_result(tmp_path):
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"pacer='scheduleWakeup' with no cron result must still EMIT; "
-        f"stdout={stdout!r}"
+        f"pacer='scheduleWakeup' with no ScheduleWakeup call must still "
+        f"EMIT; stdout={stdout!r}"
     )
 
 
-def test_cron_paced_marker_does_not_fire_even_with_no_cronlist(tmp_path):
+def test_cron_paced_marker_does_not_fire_even_with_no_schedulewakeup_call(tmp_path):
     """A cron/other-paced marker must NOT fire, even though the delta has
-    no CronList confirmation at all -- the OLD (pre-round-6) behaviour
-    would have nagged every turn on a cron-paced loop; this is the bug
-    being fixed."""
+    no ScheduleWakeup call at all -- the OLD (pre-round-6) behaviour would
+    have nagged every turn on a cron-paced loop; this is the bug being
+    fixed."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home, pacer="cron")
@@ -334,7 +350,7 @@ def test_cron_paced_marker_does_not_fire_even_with_no_cronlist(tmp_path):
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Just some prose, no cron check."}
+            {"type": "text", "text": "Just some prose, no arm check."}
         ]}}, separators=(",", ":")),
     )
 
@@ -362,7 +378,7 @@ def test_marker_with_no_pacer_key_does_not_fire(tmp_path):
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Just some prose, no cron check."}
+            {"type": "text", "text": "Just some prose, no arm check."}
         ]}}, separators=(",", ":")),
     )
 
@@ -389,7 +405,7 @@ def test_pacer_comparison_is_case_insensitive(tmp_path):
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Just some prose, no cron check."}
+            {"type": "text", "text": "Just some prose, no arm check."}
         ]}}, separators=(",", ":")),
     )
 
@@ -403,11 +419,11 @@ def test_pacer_comparison_is_case_insensitive(tmp_path):
 
 
 # ===========================================================================
-# Spec verification item 6: an unrelated cron entry (no <loop-wake>) does
-# NOT suppress, even though it IS a correctly-correlated CronList result.
+# Spec verification item 6: a ScheduleWakeup call with no <loop-wake>
+# marker does NOT suppress, even though it IS a real ScheduleWakeup call.
 # ===========================================================================
 
-def test_unrelated_cron_entry_does_not_suppress(tmp_path):
+def test_unrelated_schedulewakeup_call_does_not_suppress(tmp_path):
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -416,33 +432,33 @@ def test_unrelated_cron_entry_does_not_suppress(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_unrelated", "CronList", _UNRELATED_CRON_LISTING
-    )
-    _append_lines(transcript, tool_use, tool_result)
+    call = _schedule_wakeup_call("toolu_test_unrelated", _UNRELATED_PROMPT)
+    _append_lines(transcript, call)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"A correctly-correlated CronList result with no <loop-wake> marker "
+        f"A ScheduleWakeup call with no <loop-wake> marker in its prompt "
         f"must NOT suppress -- the nudge must still fire; stdout={stdout!r}"
     )
 
 
 # ===========================================================================
-# Round-3 review fix -- tool-identity correlation. The gate previously
-# matched on tool_result TEXT alone; these are the four required tests from
-# the round-3 blocker: the two payloads that falsely suppressed before the
-# fix (now must fire), a correctly-correlated result (must suppress,
-# covered above), an unknown tool name (must fire), and an unresolvable
-# tool_use_id (must fire).
+# Round-3 review fix -- tool-identity requirement, ported to the tool_use
+# shape. The gate previously matched on tool_result TEXT alone; these are
+# the required tests from the round-3 blocker, re-derived for tool_use
+# detection: a decoy call/result pair carrying the marker in text that
+# ISN'T a ScheduleWakeup call (must fire), a correctly-identified call
+# (must suppress, covered above), and an unknown tool name whose `input`
+# happens to look exactly like a valid arm (must fire).
 # ===========================================================================
 
 def test_bash_echo_carrying_marker_and_pending_word_does_not_suppress(tmp_path):
-    """Round-3 finding, payload 2: a Bash tool_result whose echoed text
-    happens to contain both the marker and a pending-job word must NOT
-    suppress -- it is not a CronList result, regardless of its text."""
+    """Round-3 finding, payload 2, ported: a Bash tool_use/tool_result pair
+    whose echoed text happens to contain both the marker and a pending-job
+    word must NOT suppress -- it is not a ScheduleWakeup call, regardless
+    of its text."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -451,27 +467,30 @@ def test_bash_echo_carrying_marker_and_pending_word_does_not_suppress(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    bash_text = "<loop-wake> this text is scheduled and came from an echo, not cron"
-    tool_use, tool_result = _correlated_pair("toolu_test_bash", "Bash", bash_text)
+    bash_text = "<loop-wake> this text is scheduled and came from an echo, not arming"
+    tool_use = _tool_use_record(
+        "toolu_test_bash", "Bash", {"command": f"echo '{bash_text}'"}
+    )
+    tool_result = _tool_result_record("toolu_test_bash", bash_text)
     _append_lines(transcript, tool_use, tool_result)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"A Bash tool_result carrying the marker in its echoed text must "
-        f"NOT suppress -- Bash is not the wake-listing tool; "
+        f"A Bash call/result pair carrying the marker in its echoed text "
+        f"must NOT suppress -- Bash is not the wake-arming tool; "
         f"stdout={stdout!r}"
     )
 
 
 def test_read_of_own_source_file_does_not_suppress(tmp_path):
-    """Round-3 finding, payload 3 (the one that matters): a Read tool_result
-    whose content is (a chunk of) THIS HOOK'S OWN SOURCE FILE -- which
-    unavoidably contains '<loop-wake>' and words like 'pending' throughout
-    its docstring -- must NOT suppress. No adversarial intent required: an
-    agent doing ordinary maintenance reading on this file must not silently
-    disable the safety net for that turn."""
+    """Round-3 finding, payload 3 (the one that matters), ported: a Read
+    tool_use/tool_result pair whose result is (a chunk of) THIS HOOK'S OWN
+    SOURCE FILE -- which unavoidably contains '<loop-wake>' and words like
+    'pending' throughout its docstring -- must NOT suppress. No adversarial
+    intent required: an agent doing ordinary maintenance reading on this
+    file must not silently disable the safety net for that turn."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -482,7 +501,10 @@ def test_read_of_own_source_file_does_not_suppress(tmp_path):
 
     own_source = HOOK_PATH.read_text(encoding="utf-8")[:3000]
     assert "<loop-wake>" in own_source  # sanity: this IS the adversarial-by-accident case
-    tool_use, tool_result = _correlated_pair("toolu_test_read", "Read", own_source)
+    tool_use = _tool_use_record(
+        "toolu_test_read", "Read", {"file_path": str(HOOK_PATH)}
+    )
+    tool_result = _tool_result_record("toolu_test_read", own_source)
     _append_lines(transcript, tool_use, tool_result)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
@@ -495,10 +517,11 @@ def test_read_of_own_source_file_does_not_suppress(tmp_path):
     )
 
 
-def test_unknown_tool_name_with_valid_looking_listing_does_not_suppress(tmp_path):
-    """A tool_use_id that DOES resolve, but to a tool name that is not in
-    _WAKE_LISTING_TOOL_NAMES, must NOT suppress -- even though the
-    tool_result's text looks exactly like a valid CronList listing."""
+def test_unknown_tool_name_with_valid_looking_prompt_does_not_suppress(tmp_path):
+    """A tool_use whose `name` is NOT in `_WAKE_ARMING_TOOL_NAMES` must NOT
+    suppress -- even though its `input.prompt` looks exactly like a valid
+    loop-wake arming prompt. Tool identity is required, an input shape
+    alone is not enough."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -507,25 +530,25 @@ def test_unknown_tool_name_with_valid_looking_listing_does_not_suppress(tmp_path
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_unknown_tool", "SomeOtherTool", _REAL_CRON_LISTING
+    call = _tool_use_record(
+        "toolu_test_unknown_tool", "SomeOtherTool", {"prompt": _REAL_LOOP_PROMPT}
     )
-    _append_lines(transcript, tool_use, tool_result)
+    _append_lines(transcript, call)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"An unknown tool name carrying a valid-looking listing must NOT "
-        f"suppress -- tool identity is required, text alone is not enough; "
-        f"stdout={stdout!r}"
+        f"An unknown tool name carrying a valid-looking prompt must NOT "
+        f"suppress -- tool identity is required, prompt shape alone is not "
+        f"enough; stdout={stdout!r}"
     )
 
 
-def test_unresolvable_tool_use_id_does_not_suppress(tmp_path):
-    """A tool_result whose tool_use_id has no corresponding tool_use block
-    anywhere in this delta must NOT suppress -- an uncorrelatable result
-    fails toward emitting, never toward trusting it."""
+def test_schedulewakeup_call_with_no_prompt_field_does_not_suppress(tmp_path):
+    """A ScheduleWakeup call whose `input` is missing the `prompt` field
+    entirely (e.g. a bare probe call with only other args) must NOT
+    suppress -- there is no text to find the marker in."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -534,24 +557,23 @@ def test_unresolvable_tool_use_id_does_not_suppress(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # tool_result only -- no matching tool_use in this delta at all.
-    orphan_result = _tool_result_record("toolu_never_seen", _REAL_CRON_LISTING)
-    _append_lines(transcript, orphan_result)
+    call = _tool_use_record("toolu_test_no_prompt", "ScheduleWakeup", {"seconds": 1800})
+    _append_lines(transcript, call)
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert _nudge_emitted(stdout), (
-        f"A tool_result with no resolvable tool_use_id must NOT suppress; "
+        f"A ScheduleWakeup call with no prompt field must NOT suppress; "
         f"stdout={stdout!r}"
     )
 
 
-def test_tool_use_in_earlier_delta_does_not_correlate(tmp_path):
-    """A tool_use seen on an EARLIER fire's delta must not correlate with a
-    tool_result appearing in a LATER delta -- correlation is scoped to
-    the SAME delta, matching invariant 2 (an out-of-delta tool_use is
-    exactly as unresolvable as a missing one)."""
+def test_tool_use_in_earlier_delta_does_not_bleed_into_later_turn(tmp_path):
+    """A ScheduleWakeup call seen on an EARLIER fire's delta must not
+    satisfy a LATER turn's check -- confirmation is scoped to the SAME
+    delta, matching the byte-offset delta-isolation discipline (an
+    out-of-delta tool_use is exactly as unconfirming as no call at all)."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
@@ -560,20 +582,26 @@ def test_tool_use_in_earlier_delta_does_not_correlate(tmp_path):
 
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Turn 1's delta: only the tool_use (no result yet).
-    _append_lines(transcript, _tool_use_record("toolu_split", "CronList"))
+    # Turn 1's delta: a confirming ScheduleWakeup call.
+    call = _schedule_wakeup_call("toolu_split", _REAL_LOOP_PROMPT)
+    _append_lines(transcript, call)
     stdout1, rc1 = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc1 == 0
-    assert _nudge_emitted(stdout1), "Turn 1 (tool_use only, no result) must EMIT"
+    assert stdout1 == "", f"Turn 1 with a confirming call must suppress; got={stdout1!r}"
 
-    # Turn 2's delta: the tool_result for that SAME id, but the tool_use
-    # itself is no longer in THIS delta (it was consumed by turn 1's read).
-    _append_lines(transcript, _tool_result_record("toolu_split", _REAL_CRON_LISTING))
+    # Turn 2's delta: no new ScheduleWakeup call, just prose. Turn 1's
+    # call must not bleed forward and suppress this turn too.
+    _append_lines(
+        transcript,
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Doing more work, no arm this turn."}
+        ]}}, separators=(",", ":")),
+    )
     stdout2, rc2 = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc2 == 0
     assert _nudge_emitted(stdout2), (
-        f"A tool_result whose matching tool_use fell in an earlier delta "
-        f"must NOT suppress this later turn; stdout={stdout2!r}"
+        f"A ScheduleWakeup call from an earlier delta must not suppress "
+        f"this later turn; stdout={stdout2!r}"
     )
 
 
@@ -688,31 +716,29 @@ def test_no_state_touch_when_loop_mode_absent(tmp_path):
 
 def test_first_fire_on_fresh_transcript_with_confirmation_already_present_suppresses(tmp_path):
     """First-ever fire (no prior state) on a transcript that ALREADY
-    contains a verified, correlated CronList result (e.g. it happened
-    earlier in the same brand-new transcript) must suppress -- the delta
-    starts from byte 0 on first fire, not 'unknown -> always emit'."""
+    contains a confirming ScheduleWakeup call (e.g. it happened earlier in
+    the same brand-new transcript) must suppress -- the delta starts from
+    byte 0 on first fire, not 'unknown -> always emit'."""
     engram_home = tmp_path / "engram"
     engram_home.mkdir()
     _write_loop_marker(engram_home)
     transcript = tmp_path / "transcript.jsonl"
 
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_firstfire", "CronList", _REAL_CRON_LISTING
-    )
-    transcript.write_text(tool_use + "\n" + tool_result + "\n", encoding="utf-8")
+    call = _schedule_wakeup_call("toolu_test_firstfire", _REAL_LOOP_PROMPT)
+    transcript.write_text(call + "\n", encoding="utf-8")
 
     stdout, rc = _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
     assert rc == 0
     assert stdout == "", (
-        f"First fire on a transcript that already contains a verified, "
-        f"correlated CronList result must SUPPRESS; got={stdout!r}"
+        f"First fire on a transcript that already contains a confirming "
+        f"ScheduleWakeup call must SUPPRESS; got={stdout!r}"
     )
 
 
 def test_delta_isolation_prior_confirmation_does_not_bleed_into_later_turn(tmp_path):
-    """A CronList confirmation seen on turn 1 must not satisfy turn 2's
-    check if turn 2 produced no new confirmation -- byte-offset delta
+    """A ScheduleWakeup confirmation seen on turn 1 must not satisfy turn
+    2's check if turn 2 produced no new confirmation -- byte-offset delta
     scoping must prevent an old confirmation from silently covering a
     later turn that never re-armed."""
     engram_home = tmp_path / "engram"
@@ -724,11 +750,9 @@ def test_delta_isolation_prior_confirmation_does_not_bleed_into_later_turn(tmp_p
     # Fire 1: establish state.
     _run_hook(_make_stop_payload(str(transcript)), engram_home)
 
-    # Turn 1: confirmed, correlated cron result in the delta.
-    tool_use, tool_result = _correlated_pair(
-        "toolu_test_turn1", "CronList", _REAL_CRON_LISTING
-    )
-    _append_lines(transcript, tool_use, tool_result)
+    # Turn 1: confirmed, marker-carrying ScheduleWakeup call in the delta.
+    call = _schedule_wakeup_call("toolu_test_turn1", _REAL_LOOP_PROMPT)
+    _append_lines(transcript, call)
     stdout1, rc1 = _run_hook(_make_stop_payload(str(transcript)), engram_home)
     assert rc1 == 0
     assert stdout1 == "", f"Turn 1 with confirmation must suppress; got={stdout1!r}"
@@ -737,7 +761,7 @@ def test_delta_isolation_prior_confirmation_does_not_bleed_into_later_turn(tmp_p
     _append_lines(
         transcript,
         json.dumps({"type": "assistant", "message": {"content": [
-            {"type": "text", "text": "Doing more work, no cron check this turn."}
+            {"type": "text", "text": "Doing more work, no arm this turn."}
         ]}}, separators=(",", ":")),
     )
     stdout2, rc2 = _run_hook(_make_stop_payload(str(transcript)), engram_home)

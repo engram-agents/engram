@@ -1,11 +1,13 @@
-"""Tests for bootstrap.py codex target and Component A substitution guard.
+"""Tests for bootstrap.py codex target and Component A no-compact-section guard.
 
 Covers:
-- Claude compact-instructions substitution-integrity guard: the
-  {{COMPACT_INSTRUCTIONS}} marker is fully resolved after rendering and the
-  compact body actually lands in the output. This is the durable regression
-  guard for Component A (see test docstring for lifecycle note).
-- Codex target renders all three files with correct content.
+- Claude no-compact-section guard: engram-alpha#2067 removed the
+  ``## Compact Instructions`` section from the Claude template entirely (see
+  docs/compaction-continuity.md). This is the durable regression guard for
+  Component A — it must not silently come back (see test docstring for
+  lifecycle note).
+- Codex target renders all three files with correct content, including the
+  compact-instructions.md content that now feeds Codex exclusively.
 - config.toml merge idempotency: run bootstrap-codex twice; identity keys
   present once, no duplication; pre-existing plugin stanzas preserved.
 
@@ -16,7 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -79,133 +80,77 @@ def _run_bootstrap(workdir: Path, target: str, extra: dict[str, str] | None = No
 
 
 # ---------------------------------------------------------------------------
-# Component A: Claude compact-instructions substitution-integrity guard
+# Component A: Claude no-compact-section guard (engram-alpha#2067)
 # ---------------------------------------------------------------------------
 
 
-def test_claude_compact_instructions_substitution_integrity():
-    """Substitution-integrity guard for the {{COMPACT_INSTRUCTIONS}} marker.
+def test_claude_template_has_no_compact_section():
+    """template.CLAUDE.md must not carry the ## Compact Instructions section.
 
-    Lifecycle note: the original test in this slot verified byte-identical
-    rendering before and after the compact-instructions.md extraction (PR #818)
-    by fetching the pre-extraction template from origin/dev. That check was a
-    ONE-TIME guard verified at PR #818 review (losslessness confirmed: old
-    length 32143 == new length 32143, equal). It is intentionally NOT retained
-    here because:
-      1. CI-fragility: actions/checkout@v4 without fetch-depth:0 leaves
-         origin/dev as an unreachable ref in CI; git show returns non-zero and
-         the test errors before it can assert anything meaningful.
-      2. Tautology post-merge: once #818 merges to dev, origin/dev ITSELF
-         carries the {{COMPACT_INSTRUCTIONS}} marker, so the "pre-PR path"
-         would carry an unresolved marker while the "post-PR path" substitutes
-         it — they diverge as a false negative, not as a real regression.
-
-    This test now guards the DURABLE property: the marker substitution stays
-    intact across all future changes to the template or the extracted file.
-    It requires no git dependency and runs cleanly in CI.
+    Lifecycle note: this slot previously guarded the OPPOSITE property — that
+    the {{COMPACT_INSTRUCTIONS}} marker was present and got folded with
+    compact-instructions.md into the Claude render (PR #818, then #1193's
+    SSoT fold). engram-alpha#2067 removed the ``## Compact Instructions``
+    section from the Claude template entirely: it was measured redundant
+    with the warm-briefing template and inert outside the summarizer (see
+    docs/compaction-continuity.md for the full argument). This test now
+    guards the new invariant — that removal doesn't silently regress — while
+    ``compact-instructions.md`` itself keeps shipping as the Codex-only
+    compact-prompt source (see test_codex_bootstrap_renders_three_files).
 
     Asserts (against current HEAD files):
-    1. templates/template.CLAUDE.md contains exactly one {{COMPACT_INSTRUCTIONS}}
-       marker before substitution.
-    2. templates/compact-instructions.md exists and is non-empty.
-    3. After substitution, the rendered output contains NO literal
-       {{COMPACT_INSTRUCTIONS}} (marker fully resolved).
-    4. The rendered output contains the sentinel substring
-       "This section tells the pre-compaction agent how to write the summary."
-       — a stable, placeholder-free line from the compact body, proving the
-       content actually landed in the render.
-    5. The ## Compact Instructions header line is present in the rendered output
-       (the header stays in the template; only the body moved to the file).
+    1. templates/template.CLAUDE.md contains no {{COMPACT_INSTRUCTIONS}}
+       marker.
+    2. templates/template.CLAUDE.md contains no "## Compact Instructions"
+       header.
+    3. templates/compact-instructions.md still exists and is non-empty (it
+       ships — Codex depends on it).
+    4. An end-to-end Claude bootstrap run produces a ~/.claude/CLAUDE.md with
+       neither the marker nor the header.
     """
-    # 1. Template contains exactly one marker
+    # 1 + 2. Template source has no marker, no header.
     template_path = TEMPLATES_DIR / "template.CLAUDE.md"
     assert template_path.exists(), f"template.CLAUDE.md not found at {template_path}"
     template_text = template_path.read_text()
-    marker_count = template_text.count("{{COMPACT_INSTRUCTIONS}}")
-    assert marker_count == 1, (
-        f"Expected exactly 1 {{{{COMPACT_INSTRUCTIONS}}}} marker in "
-        f"template.CLAUDE.md, found {marker_count}"
+    assert "{{COMPACT_INSTRUCTIONS}}" not in template_text, (
+        "template.CLAUDE.md still contains a {{COMPACT_INSTRUCTIONS}} marker — "
+        "engram-alpha#2067 removed the Claude-side fold; the marker should be gone."
+    )
+    assert "## Compact Instructions" not in template_text, (
+        "template.CLAUDE.md still contains a '## Compact Instructions' header — "
+        "engram-alpha#2067 removed this section from the Claude template. "
+        "Read docs/compaction-continuity.md before adding it back."
     )
 
-    # 2. compact-instructions.md exists and is non-empty
+    # 3. compact-instructions.md still ships (Codex-only now).
     compact_path = TEMPLATES_DIR / "compact-instructions.md"
     assert compact_path.exists(), (
-        f"compact-instructions.md not found at {compact_path}"
+        f"compact-instructions.md not found at {compact_path} — it must keep "
+        "shipping; it is now the Codex-only compact-prompt source."
     )
     compact_body = compact_path.read_text()
     assert len(compact_body.strip()) > 0, (
-        "compact-instructions.md is empty — substitution would produce a gap"
+        "compact-instructions.md is empty — the Codex compact prompt would be empty"
     )
 
-    # 3 + 4 + 5. Apply substitutions and verify rendered output
-    dummy_subs = {
-        "{{AX_HONESTY}}": "ax_0001",
-        "{{AX_HONESTY_DISCRETION}}": "ax_0002",
-        "{{AX_PROVENANCE}}": "ax_0003",
-        "{{DF_ENGRAM}}": "df_0001",
-        "{{DF_EPISTEMIC_IDENTITY}}": "df_0002",
-        "{{GL_EPISTEMIC_HUMILITY}}": "gl_0001",
-        "{{ENGRAM_HOOKS_DIR}}": "/tmp/test/.engram/hooks",
-        "{{ENGRAM_HOME}}": "/tmp/test/.engram",
-        "{{PYTHON}}": "python3",
-        "{{COMPACT_INSTRUCTIONS}}": compact_body,
-    }
-
-    rendered = template_text
-    for k, v in dummy_subs.items():
-        rendered = rendered.replace(k, v)
-
-    # 3. No unreplaced marker remains
-    assert "{{COMPACT_INSTRUCTIONS}}" not in rendered, (
-        "{{COMPACT_INSTRUCTIONS}} marker was NOT substituted — "
-        "substitution machinery is broken or the marker was duplicated"
-    )
-
-    # 4. Sentinel from the compact body is present (proves content landed)
-    sentinel = "This section tells the pre-compaction agent how to write the summary."
-    assert sentinel in rendered, (
-        f"Compact-instructions sentinel not found in rendered output.\n"
-        f"Sentinel: {sentinel!r}\n"
-        f"This means the compact body did NOT land in the render — "
-        f"the {{{{COMPACT_INSTRUCTIONS}}}} substitution produced an empty or "
-        f"wrong result, or the sentinel line was removed from compact-instructions.md."
-    )
-
-    # 5. ## Compact Instructions header is present (header stays in the template)
-    assert "## Compact Instructions" in rendered, (
-        "'## Compact Instructions' header not found in rendered output. "
-        "The header should remain in the template even though the body "
-        "was extracted to compact-instructions.md."
-    )
-
-    # 6. Source-of-truth breadcrumb: present in the template (so template editors
-    #    know the real content lives in compact-instructions.md), declared as the
-    #    SSoT constant COMPACT_BREADCRUMB_LINE in template_render.py (not as a
-    #    second literal in bootstrap.py), and GONE once stripped (so it never
-    #    leaks into the rendered ~/.claude/CLAUDE.md or the Codex prompt). This is
-    #    the drift guard: if the template wording and template_render.COMPACT_BREADCRUMB_LINE
-    #    ever diverge, the breadcrumb survives the strip and this test fails loudly.
-    m = re.search(
-        r"<!-- Source of truth: compact-instructions\.md.*?-->", template_text
-    )
-    assert m, (
-        "Source-of-truth breadcrumb comment missing from template.CLAUDE.md — "
-        "template editors lose the pointer to compact-instructions.md."
-    )
-    breadcrumb = m.group(0)
-    template_render_src = (
-        REPO_ROOT / "src" / "engram" / "template_render.py"
-    ).read_text()
-    assert breadcrumb in template_render_src, (
-        "template_render.py COMPACT_BREADCRUMB_LINE does not match the template "
-        f"breadcrumb ({breadcrumb!r}) — the strip would miss it and the breadcrumb "
-        "would leak into the rendered install. Keep COMPACT_BREADCRUMB_LINE in "
-        "template_render.py identical to the template line."
-    )
-    stripped = rendered.replace(breadcrumb + "\n", "")
-    assert breadcrumb not in stripped, (
-        "Breadcrumb survived the strip — the rendered CLAUDE.md would carry it."
-    )
+    # 4. End-to-end: a Claude bootstrap run must not resurrect either string.
+    workdir = Path(tempfile.mkdtemp(prefix="engram_claude_no_compact_"))
+    try:
+        result = _run_bootstrap(workdir, "claude")
+        assert result.returncode == 0, (
+            f"claude bootstrap failed:\n{result.stdout}\n{result.stderr}"
+        )
+        claude_md = (workdir / ".claude" / "CLAUDE.md").read_text()
+        assert "{{COMPACT_INSTRUCTIONS}}" not in claude_md, (
+            "Rendered ~/.claude/CLAUDE.md still contains a raw "
+            "{{COMPACT_INSTRUCTIONS}} marker."
+        )
+        assert "## Compact Instructions" not in claude_md, (
+            "Rendered ~/.claude/CLAUDE.md still contains a '## Compact Instructions' "
+            "section."
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -243,12 +188,25 @@ def test_codex_bootstrap_renders_three_files():
         assert compact_path.exists(), "codex-compact-prompt.md was not created"
         compact_content = compact_path.read_text()
 
-        # Must contain compact instructions content
-        assert "pre-compaction agent" in compact_content, (
-            "codex-compact-prompt.md missing compact instructions content"
+        # Must contain compact instructions content — read the source file
+        # at test time (not a hardcoded literal) so this cannot go stale
+        # when the wording of compact-instructions.md changes. The seed-ID/
+        # ENGRAM_HOME substitutions don't touch this file's content (it has
+        # no such placeholders), so the raw source text lands unchanged.
+        compact_source = (TEMPLATES_DIR / "compact-instructions.md").read_text()
+        assert compact_source.strip() in compact_content, (
+            "codex-compact-prompt.md missing compact instructions content "
+            "(source file body not found verbatim in rendered output)"
         )
-        assert "FIRST ACTION" in compact_content, (
-            "codex-compact-prompt.md missing FIRST ACTION compact block"
+        # Must contain the "read warm-briefing + history before the task"
+        # directive — the specific behavioral requirement the old "FIRST
+        # ACTION" sentinel guarded. Restated in v2 wording as the "Do these
+        # two reads first" block in compact-instructions.md; guarded here as
+        # its own phrase (distinct from the full-body check above) because
+        # it is the one durable, specific-content property worth naming.
+        assert "Do these two reads first" in compact_content, (
+            "codex-compact-prompt.md missing the read-before-task directive "
+            "('Do these two reads first' block)"
         )
 
         # {{AGENT_NAME}} must remain (first-session's job)
@@ -298,7 +256,7 @@ def test_codex_bootstrap_renders_three_files():
             "config.toml instructions= must NOT contain ## Compact Instructions "
             "(that content belongs in codex-compact-prompt.md)"
         )
-        assert "pre-compaction agent" not in config_content, (
+        assert compact_source.strip() not in config_content, (
             "config.toml instructions= must NOT contain compact instructions body"
         )
 
@@ -486,105 +444,3 @@ def test_claude_bootstrap_manifest_has_target_field():
 
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Component D: bootstrap imports and calls fold_compact_instructions (#1193)
-# Structural guard: bootstrap must wire to the SSoT fold function, not
-# re-implement the fold inline — so the two code paths cannot diverge.
-# ---------------------------------------------------------------------------
-
-
-def test_bootstrap_imports_fold_compact_instructions():
-    """bootstrap.py imports fold_compact_instructions from template_render.
-
-    Structural guard for #1193: bootstrap must wire to the SSoT fold function.
-    An absent import means the inline-fold divergence risk is still live.
-    """
-    import ast
-
-    source = (REPO_ROOT / "src" / "engram" / "bootstrap.py").read_text()
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "template_render":
-            names = [alias.name for alias in node.names]
-            if "fold_compact_instructions" in names:
-                return
-    raise AssertionError(
-        "bootstrap.py does not import fold_compact_instructions from template_render "
-        "(#1193 fix requires the SSoT wire-up)"
-    )
-
-
-def test_bootstrap_calls_fold_compact_instructions():
-    """bootstrap.py calls fold_compact_instructions somewhere in its body.
-
-    Structural guard for #1193: bootstrap must invoke the SSoT function,
-    not just import it. A missing call means the inline fold path could
-    still shadow the module's fold logic.
-    """
-    import ast
-
-    source = (REPO_ROOT / "src" / "engram" / "bootstrap.py").read_text()
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Name) and func.id == "fold_compact_instructions":
-                return
-    raise AssertionError(
-        "bootstrap.py does not call fold_compact_instructions (#1193: "
-        "the SSoT function must be invoked, not just imported)"
-    )
-
-
-def test_bootstrap_claude_fold_behavioral_equivalence():
-    """Claude-target fold produces the same result as fold_compact_instructions.
-
-    Behavioral smoke test for #1193: call the new code path directly (not via
-    bootstrap.main()) and verify the output matches fold_compact_instructions
-    applied to the same inputs. Guards argument-order bugs and wrong-variable
-    bugs that structural AST tests cannot catch.
-    """
-    import sys as _sys
-
-    src_dir = str(REPO_ROOT / "src" / "engram")
-    if src_dir not in _sys.path:
-        _sys.path.insert(0, src_dir)
-    from template_render import fold_compact_instructions
-
-    template_text = (TEMPLATES_DIR / "template.CLAUDE.md").read_text()
-    compact_text = (TEMPLATES_DIR / "compact-instructions.md").read_text()
-
-    # Expected: the SSoT function applied to the same inputs
-    expected = fold_compact_instructions(template_text, compact_text)
-
-    # Simulate bootstrap's new claude-target code path (compact file present)
-    actual = fold_compact_instructions(template_text, compact_text)
-    # Then apply a sample of the non-compact substitutions bootstrap would pass
-    dummy_subs = {
-        "{{ENGRAM_HOME}}": "/tmp/test-engram",
-        "{{ENGRAM_HOOKS_DIR}}": "/tmp/test-engram/hooks",
-        "{{PYTHON}}": "python3",
-    }
-    for ph, val in dummy_subs.items():
-        expected = expected.replace(ph, val)
-        actual = actual.replace(ph, val)
-
-    # The two paths produce the same result because they use the same function
-    assert actual == expected, (
-        "Claude-target fold and fold_compact_instructions diverged "
-        "(argument-order bug or wrong variable in bootstrap.py?)"
-    )
-
-    # Additionally: compact content is present in the output
-    sentinel = "This section tells the pre-compaction agent how to write the summary."
-    assert sentinel in actual, (
-        f"Compact sentinel not found in bootstrap claude-target output: {sentinel!r}"
-    )
-
-    # And the breadcrumb comment is NOT present in the output
-    from template_render import COMPACT_BREADCRUMB_LINE
-    assert COMPACT_BREADCRUMB_LINE not in actual, (
-        "Breadcrumb line leaked into bootstrap claude-target output"
-    )

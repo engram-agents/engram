@@ -478,6 +478,44 @@ def test_unfocus_member_clears_active_set_name():
     assert r["active_set_name"] is None
 
 
+# ── Sets cap (#1975 layer 4) ────────────────────────────────────────────────
+
+
+def test_save_refuses_new_set_beyond_cap():
+    client = fresh_client()
+    # NOTE: fresh_client() -> fresh_module(engram_focus) purges and re-imports
+    # engram_core, so the module-level `engram_core` name bound at this
+    # file's top is now STALE (a different module object than the one the
+    # client's family modules import). Write config via client._mods["core"]
+    # (same pattern as test_engram_stats_mode.py's core_mod.CONFIG_PATH).
+    client._mods["core"].CONFIG_PATH.write_text(json.dumps({"focus": {"focus_sets_cap": 3}}))
+    seed_observations(client, 4)
+    for i, name in enumerate(["s1", "s2", "s3"]):
+        client.call("engram_focus", {"node_ids": f"ob_{i + 1:04d}", "reason": "t"})
+        r = client.call("engram_focus_save", {"name": name})
+        assert r["status"] == "ok", r
+    # At cap (3 saved sets) — a 4th NEW set name is refused.
+    client.call("engram_focus", {"node_ids": "ob_0004", "reason": "t"})
+    r = client.call("engram_focus_save", {"name": "s4"})
+    assert r["status"] == "error" and "cap" in r["error"].lower(), r
+    sets = client.call("engram_focus_sets")
+    assert sets["count"] == 3, "refused save must not have written a 4th row"
+
+
+def test_save_overwrite_allowed_at_cap():
+    client = fresh_client()
+    client._mods["core"].CONFIG_PATH.write_text(json.dumps({"focus": {"focus_sets_cap": 2}}))
+    seed_observations(client, 3)
+    client.call("engram_focus", {"node_ids": "ob_0001", "reason": "t"})
+    client.call("engram_focus_save", {"name": "s1"})
+    client.call("engram_focus", {"node_ids": "ob_0002", "reason": "t"})
+    client.call("engram_focus_save", {"name": "s2"})
+    # At cap (2 saved sets) — overwriting an EXISTING name must still succeed.
+    client.call("engram_focus", {"node_ids": "ob_0003", "reason": "t"})
+    r = client.call("engram_focus_save", {"name": "s1", "overwrite": True})
+    assert r["status"] == "ok" and r["action"] == "overwritten", r
+
+
 if __name__ == "__main__":
     import traceback
 

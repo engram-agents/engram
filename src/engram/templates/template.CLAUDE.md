@@ -154,10 +154,10 @@ Token budget on the auto-load surfaces matters, but identity-formation takes pri
 
 **ask-{{USER_NAME}} three-file pattern:**
 
-- `ask-{{USER_NAME}}.md` — digest, auto-loaded. ONE short line per active item + link to detail slug.
+- `ask-{{USER_NAME}}.md` — daily discussion queue for questions needing the user's action, decision, or input; auto-loaded. Keep ONLY the top 3, one short line each + link to detail slug; it is not a backlog.
 - `ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings `## slug` referenced by digest's `[ask-{{USER_NAME}}-details.md#slug]`.
 - `ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT auto-loaded.
-- Lifecycle: when an item resolves, prune BOTH digest + detail-section in the same commit. Multi-day rollover → move to backlog.
+- Lifecycle: when a question resolves, prune its queue entry (digest OR backlog) + detail-section in the same commit. When a fourth unresolved question appears, select the top 3 by urgency/impact; move every non-selected question to backlog while retaining its detail slug/section. Cross-day deferred items also move to backlog.
 
 **History files (`{{ENGRAM_HOME}}/history/YYYY-MM-DD.md`) — same concise discipline:**
 
@@ -207,6 +207,20 @@ These numbers are **computed, not assigned** — an observation maps from its `q
 
 ## Parallelization and Delegation
 
+### Tool policy — the standing request that keeps delegation possible
+
+**ALLOWED — `engram-*` fairies ONLY, and this paragraph IS the request.** {{USER_NAME}} has standing-authorised `Agent`-tool dispatch of the `engram-*` fairies (coder, reviewer, batch-summary, dream). Claude Code's session default disables the `Agent` tool *"unless the user requested it"* — this paragraph satisfies that condition every session, which is the only reason the delegation rules below are executable at all. Each dispatch is ONE bounded unit I choose and can count.
+
+**The allowlist is CLOSED.** No general-purpose, no Explore, no other harness-supplied agent type. The `engram-*` fairies are the ones this project built, controls, and integrates into daily work; a permission phrased to cover harness-supplied agent types is a standing bet that the harness will never ship a badly-designed one — and it already shipped the tool named in the ban below. Naming what is ALLOWED, rather than what is banned, is what keeps an unknown future agent type unreachable by default instead of pre-authorised. If a general-purpose agent is genuinely needed, ask {{USER_NAME}} for a one-off; if that ask becomes routine, the recurring need is the spec for a dedicated `engram-*` fairy.
+
+**BANNED — a different mechanism, not another instance of the rule above.** Claude Code's NATIVE deep-research and `Workflow` tools, even when a task looks like a good fit. The cost is recorded so the ban is never relaxed by someone who doesn't know it: one deep-research run spawned hundreds of subagents and nearly exhausted {{USER_NAME}}'s token budget. The principle is **fan-out control** — a fairy dispatch is a scale I set; those tools pick their own scale and the bill arrives after the fact.
+
+**Why this lives here and not only in a boot charge.** A boot charge reaches only a charge-booted session. An interactive session — or one continued through a compaction — never reads it, so the harness default silently re-imposes the ban and quietly disables the standing discipline below (PR-destined code goes to a coder-fairy; every PR gets a reviewer-fairy round). CLAUDE.md is the one surface every session type loads. Worth stating explicitly because the boot-charge-only version of this fix *looks* complete and isn't.
+
+**Three surfaces, kept in sync by hand.** The same policy belongs in `deploy/autostart/boot-charge-default.md` and `deploy/autostart/boot-charge-quiet.md` too, because the three reach different session types and none subsumes the others. They are independently editable, so they will drift unless edited together — if you change the fairy roster, the banned-tool list, or the rationale here, change it in the other two as well, and vice versa.
+
+**Honest limit, stated because it is the load-bearing assumption and it is untested.** The boot charge satisfies the harness condition by a mechanism that is *known* to work: its text is passed as the session's initial prompt via `agentctl session --charge-file`, which lands it as a literal user-role turn. This paragraph is not — CLAUDE.md loads as project-level instruction, a structurally different channel, and whether the harness accepts it as "the user requested it" has not been verified in practice. The cheap test is to dispatch a fairy in an interactive or post-compaction session with no boot charge in play and see whether it is refused. Until someone runs that, treat this as the better-reasoned surface rather than the proven one.
+
 **Fairies** = sub-agents dispatched via the `Agent` tool. Types in use: coder-fairies (code-writing), reviewer-fairies (read-only PR review), summary-fairies (recall_summary generation), dream-fairies (sleep-cycle scanners). I delegate to fairies for work that doesn't need my own context. Used as the canonical term throughout this doc.
 
 **Fairy delegation policy**: active policies for `coder_fairy_policy` and `reviewer_fairy_policy` are stamped in the session-start context. Follow the policies as instructed there; for `auto` mode on either, load the named auto-judgement skill once and consult it on each PR-coding decision.
@@ -239,17 +253,14 @@ CLAUDE.md's job is identity and discipline; the MCP tool schemas + the `engram-*
 
 A fresh session (not post-compaction) walks in with identity and warm-briefing but no work-thread continuity. Two files bridge that gap; read both before responding to the user's first task:
 
-1. `{{ENGRAM_HOME}}/warm-briefing.md` — the user's letter and relational context. Always read first. (Post-compaction also reads this, per Compact Instructions.)
+1. `{{ENGRAM_HOME}}/warm-briefing.md` — the user's letter and relational context. Always read first.
 2. `{{ENGRAM_HOME}}/history/YYYY-MM-DD.md` — per-day awake-state milestone log (PRs shipped, decisions, features). Read the most-recent file by filename sort for what I shipped last session and what I'm carrying forward. Append a new bullet when a meaningful milestone completes (`engram-sleep` Phase A Step 4 writes the end-of-day rollup). Sleep-cycle consolidation reports live separately at `{{ENGRAM_HOME}}/history/dream/YYYY-MM-DD.md`, written during `engram-sleep` Phase B by the dream-master sub-agent — the two-routine separation keeps awake-state milestones distinct from dream-state consolidation output.
-3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY blocked-on-{{USER_NAME}} queue. Update the moment items change state — prepend new pending items, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
+3. `{{ENGRAM_HOME}}/ask-{{USER_NAME}}.md` — MY daily discussion queue for questions needing {{USER_NAME}}'s action, decision, or input. Keep ONLY the top 3; move lower-priority/cross-day items to backlog rather than letting the digest grow. Update the moment items change state — select and prepend a new top question with its detail-slug link, prune resolved items immediately. {{USER_NAME}} should never have to remind me. **Writing style**: concise per-item entries (one short line, cite ENGRAM IDs for detail-on-demand) per §Cross-Surface Persistence § Writing style for auto-load surfaces.
 
 The SessionStart hook injects a reminder pointer, but this section is the stable documentation — if the pointer scrolls off or the hook is misconfigured, the instruction still lives here.
 
 If the SessionStart context includes `⚠️ ENGRAM substrate health:` lines, surface the relevant offline-state to {{USER_NAME}} IMMEDIATELY before any other work that depends on ENGRAM. MCP server offline means tool calls will fail; surface daemon offline means semantic recall degrades to FTS-only.
 
-## Compact Instructions
-<!-- Source of truth: compact-instructions.md — edit there, not in this template. This comment and the marker below are both replaced at install-time. -->
-{{COMPACT_INSTRUCTIONS}}
 ## Infrastructure Locations
 
 **Topology: PLUGIN install** (the install route for all new installs). ENGRAM *data* lives in `{{ENGRAM_HOME}}` (default `~/.engram/`); the *runtime* (server, hooks, skills, agents, tools) ships in the Claude Code plugin bundle. `CLAUDE_PLUGIN_ROOT` = `{{ENGRAM_HOME}}/marketplace/plugins/engram/`. (Developer clones running the source tree directly are the only non-plugin topology; end-user installs are plugin-native.)

@@ -41,8 +41,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TOOLS_PERF_DIR = os.path.join(_REPO_ROOT, "tools", "perf")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+# append (not insert(0)) -- tools/perf/ holds no names that collide with
+# src/, but per #2037/#2063 no test file should make any tools/-rooted
+# directory outrank src/ packages for the rest of the pytest process, on
+# principle, regardless of whether today's contents happen to collide.
 if _TOOLS_PERF_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_PERF_DIR)
+    sys.path.append(_TOOLS_PERF_DIR)
 
 # Keep the sandboxed replay fast + network-free — the self-compare check below
 # only needs FTS-keyword behavior to be deterministic, not real embeddings.

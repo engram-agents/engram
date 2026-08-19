@@ -516,6 +516,14 @@ def _pattern_cornerstone_candidate(
     Gating uses importance_base (time-invariant) so the threshold is stable
     across turns.
 
+    A node already wired to an existing cornerstone (any incoming edge whose
+    source is a current cornerstone — e.g. a cornerstone's own `supported_by`
+    edge to its supporting evidence) is excluded outright, not merely
+    down-scored: it is evidence *for* an existing cornerstone, not itself a
+    candidate for a new one, and counting that edge toward its own citation
+    count would double-count the very relationship that disqualifies it
+    (#1913).
+
     Returns: list of {id, type, claim, score, importance_base, citation_count,
     recall_count, suggested_action}.
     """
@@ -533,6 +541,20 @@ def _pattern_cornerstone_candidate(
 
     candidates: list[dict] = []
     for nid, ntype, claim, imp_base, recalls in rows:
+        # Deliberately relation-agnostic: ANY incoming edge from a current
+        # cornerstone disqualifies the candidate, not just the
+        # supported_by/cites/derives_from relations the citation count below
+        # tallies. "Wired to a cornerstone" is what matters, not by which
+        # relation — a future edge type sourced from a cornerstone should
+        # disqualify too without needing this list updated in lockstep.
+        already_anchored = conn.execute(
+            "SELECT COUNT(*) FROM edges e "
+            "JOIN nodes n ON e.source_id = n.id "
+            "WHERE e.target_id=? AND n.type='cornerstone' AND n.is_current=1",
+            (nid,),
+        ).fetchone()[0]
+        if already_anchored:
+            continue
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supported_by', 'cites', 'derives_from')",
@@ -987,6 +1009,11 @@ def _build_inspect_recall_view(
     # without requiring view="deep". Only added when the field is present.
     # - quote_verified: observation nodes (set by #1204). See #1283.
     # - warrant: derivation nodes carrying the Toulmin bridging principle.
+    # - pronouns / relation / special_moment: person nodes (#1940). trust_tier
+    #   needs no promotion here — it's a raw `nodes.trust_tier` column, not in
+    #   _RECALL_OMIT above, so it already passes through node_recall
+    #   unconditionally (confirmed pre-existing; this was the "partly wired"
+    #   case the issue itself names).
     _raw_meta = node.get("metadata")
     if _raw_meta:
         try:
@@ -995,6 +1022,16 @@ def _build_inspect_recall_view(
                 node_recall["quote_verified"] = _meta["quote_verified"]
             if node.get("type") == "derivation" and "warrant" in _meta and _meta["warrant"]:
                 node_recall["warrant"] = _meta["warrant"]
+            if node.get("type") == "person":
+                if _meta.get("pronouns"):
+                    node_recall["pronouns"] = _meta["pronouns"]
+                if _meta.get("relation"):
+                    node_recall["relation"] = _meta["relation"]
+                _moments = _meta.get("special_moments")
+                if isinstance(_moments, list) and _moments:
+                    _moment_text = _select_and_render_person_moment(conn, node_id)
+                    if _moment_text:
+                        node_recall["special_moment"] = _moment_text
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -1862,9 +1899,277 @@ def _search_nodes(
     return base_result
 
 
+# ---------------------------------------------------------------------------
+# Person-node special-moment rendering (#1940) — shared by engram_query's
+# tiered results (_build_tiered_results) AND engram_inspect's recall view
+# (_build_inspect_recall_view). Both run server-side in this same process, so
+# this is genuine single-function sharing (not a duplicated port) for those
+# two surfaces.
+#
+# The auto-surface hook (engram-surface-hook.py) is a SEPARATE process (no
+# import of this module — see that file's own precedent of duplicating small
+# primitives, e.g. _cosine_similarity, rather than importing the heavier
+# core/family modules) and therefore cannot call this function directly. It
+# runs its own copy of the same cooldown-gate algorithm
+# (_select_person_moment_candidate / _person_moment_in_cooldown /
+# _record_person_moment_render in engram-surface-hook.py), but reads and
+# writes the IDENTICAL on-disk ledger file + reserved bucket key defined
+# below, so cooldown state is genuinely shared across all three render
+# surfaces even though the code is not. See PR body / handoff for the full
+# design-seam writeup: neither engram_query nor engram_inspect receives a
+# session_id (confirmed: _QUERY_FIELDS / _INSPECT_FIELDS have no such field,
+# and server.py's own comment on the emitter states the MCP server process
+# has no single session_id binding) — the DEFAULT_SUPPRESSION_K/M scoped
+# per-session ledger the general per-node suppression already uses (see
+# docs/recall-triggering-blueprint.md §3-P1) cannot be reused verbatim for
+# these two surfaces, so a dedicated non-session-scoped bucket key is used
+# instead, deliberately shared across ALL sessions/surfaces rather than
+# keyed per-session.
+_PERSON_MOMENT_LEDGER_KEY = "__person_moment_cooldown__"
+# Cooldown is WALL-CLOCK, not a trailing-entries COUNT (unlike the general
+# per-node ledger's k/m model). The general ledger gets an entry appended on
+# EVERY prompt regardless of content, so its trailing-k window is naturally
+# "the last k prompts" and decays as new prompts arrive. This reserved
+# bucket only gets an entry when a moment ACTUALLY fires (sparse, not
+# one-per-call) — a suppressed attempt writes nothing, so a count/window
+# model would never push a suppressed person's one entry out of the window
+# and the suppression would never lift (PERMANENT LOCKOUT — found while
+# implementing the hook-side twin of this same function; already documented
+# in full in this file's own #1940 commit message and in this module's
+# comment block above — see there for the complete writeup, not repeated
+# here so the two explanations don't drift apart). A wall-clock check
+# decays correctly regardless of event sparsity.
+#
+# Default duration (#1940 fast-follow, round 3): originally 600s (10 min),
+# raised to 3600s (1 hour) per Kepler's explicit design ruling on the
+# original spec: "10 minutes is too short — start at 1 hour, configurable.
+# At 10 min a working day admits ~60 fires; with 7 entries rotating that
+# cycles the whole list eight or nine times a day and the moments become
+# wallpaper... Start on the recoverable side and let Lei retune from
+# practice." The "configurable" half of that ruling is
+# _get_person_moment_cooldown_seconds() below: config.json's
+# `person_moment_cooldown.seconds` key overrides this default, same
+# sectioned-config read pattern as the hook's own _get_suppression_config /
+# _get_echo_guard_config (see engram-surface-hook.py). Still matches the
+# hook's twin constant BY VALUE (must stay in sync manually; no shared
+# import path across the hook/server process boundary — see the
+# module-docstring above). Judgment call, flagged for review.
+_PERSON_MOMENT_COOLDOWN_SECONDS = 3600
+# Retention bound for this one reserved bucket's growth (independent of the
+# general ledger's per-session k-derived retention, since this bucket has no
+# k of its own anymore).
+_PERSON_MOMENT_LEDGER_RETENTION = 20
+
+
+def _get_person_moment_cooldown_seconds() -> float:
+    """Read the person-moment cooldown duration from config.json's
+    `person_moment_cooldown.seconds` key, falling back to
+    _PERSON_MOMENT_COOLDOWN_SECONDS (3600) if config.json is absent,
+    unreadable, malformed, the section/key is missing, or the value doesn't
+    parse as a number.
+
+    Fail-open, matching this module's other advisory-cache reads (e.g.
+    _read_person_moment_ledger above) — this is a tuning knob, never
+    load-bearing for correctness. Re-reads core.CONFIG_PATH live on every
+    call rather than caching, same discipline as core._get_memory_config /
+    core._get_embedding_config, so an on-disk edit to config.json takes
+    effect on the next call without a server restart.
+
+    Same read pattern (sectioned dict, `.get(section, {}).get(key,
+    default)`, defaults on any read/parse failure) as the hook's sibling
+    config-read helpers (_get_suppression_config, _get_echo_guard_config,
+    _get_auto_surface_config in engram-surface-hook.py) — followed here so
+    both processes read a config.json in the same shape, even though the
+    hook process cannot import this function directly (see module comment
+    above on why the hook/server process boundary duplicates by value).
+    """
+    try:
+        if core.CONFIG_PATH.exists():
+            config = json.loads(core.CONFIG_PATH.read_text())
+            section = config.get("person_moment_cooldown", {})
+            if isinstance(section, dict):
+                return float(section.get("seconds", _PERSON_MOMENT_COOLDOWN_SECONDS))
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        pass
+    return float(_PERSON_MOMENT_COOLDOWN_SECONDS)
+
+
+def _person_moment_ledger_path() -> str:
+    """Path to the SAME surfaced-recency ledger file the auto-surface hook
+    reads/writes (~/.engram/surface-ledger.json) — read live via
+    core.DATA_DIR (not cached) so test sandboxes (_configure_paths) redirect
+    this correctly, same discipline as the hook's own dynamic ENGRAM_HOME read.
+    """
+    return str(core.DATA_DIR / "surface-ledger.json")
+
+
+def _read_person_moment_ledger() -> dict:
+    """Fail-open JSON read — this ledger is an advisory cooldown cache, never
+    a source of truth. Mirrors engram-surface-hook.py's _read_surface_ledger.
+    """
+    try:
+        with open(_person_moment_ledger_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def _write_person_moment_ledger(ledger: dict) -> None:
+    """Best-effort ledger write — any failure is swallowed (fail-open)."""
+    try:
+        path = _person_moment_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(ledger, f)
+    except Exception:
+        pass
+
+
+def _person_moment_last_fired_at(person_id: str) -> "float | None":
+    """Timestamp of person_id's most recent moment-fire event anywhere in
+    the (already retention-bounded) reserved bucket, or None if it has never
+    fired / the ledger is empty or unreadable (fail-open toward "not in
+    cooldown"). Mirrors engram-surface-hook.py's twin function exactly.
+    """
+    ledger = _read_person_moment_ledger()
+    entries = ledger.get(_PERSON_MOMENT_LEDGER_KEY, [])
+    if not isinstance(entries, list):
+        return None
+    marker = f"{person_id}:moment"
+    last_ts: "float | None" = None
+    for e in entries:  # stored oldest-first (append-only) — keep the LAST match
+        if not isinstance(e, dict):
+            continue
+        ids = e.get("ids")
+        if isinstance(ids, list) and marker in ids:
+            ts = e.get("ts")
+            if isinstance(ts, (int, float)):
+                last_ts = ts
+    return last_ts
+
+
+def _person_moment_in_cooldown(
+    person_id: str, cooldown_seconds: "float | None" = None,
+) -> bool:
+    """True iff person_id's moment has fired (from ANY of the three render
+    surfaces) within the last cooldown_seconds.
+
+    cooldown_seconds defaults to None, resolved via
+    _get_person_moment_cooldown_seconds() (config.json-driven, falling back
+    to _PERSON_MOMENT_COOLDOWN_SECONDS) rather than baking a fixed default
+    into the function signature — a signature default is evaluated once at
+    module-import time and would freeze the value for the process lifetime,
+    defeating the whole point of making this configurable. Callers may still
+    pass an explicit value (tests do, to force known cooldown windows).
+
+    Boolean gate, not the 3-tier full/others/suppress classification the
+    general per-node ledger uses — a single rotating prose sentence has no
+    natural "demoted" form (you either show the sentence or you don't), so
+    this deliberately does not reuse _classify_suppression's tiering (a
+    documented judgment call — see PR body).
+    """
+    if cooldown_seconds is None:
+        cooldown_seconds = _get_person_moment_cooldown_seconds()
+    last = _person_moment_last_fired_at(person_id)
+    if last is None:
+        return False
+    return (time.time() - last) < cooldown_seconds
+
+
+def _record_person_moment_render(person_id: str) -> None:
+    """Append a moment-fire event to the shared reserved bucket. Best-effort;
+    swallows all failures (advisory cooldown bookkeeping, never blocks a
+    render). Bounded retention so this one bucket key doesn't grow unbounded
+    across the install's lifetime.
+    """
+    try:
+        ledger = _read_person_moment_ledger()
+        entries = ledger.get(_PERSON_MOMENT_LEDGER_KEY, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"ts": time.time(), "ids": [f"{person_id}:moment"]})
+        entries = entries[-_PERSON_MOMENT_LEDGER_RETENTION:]
+        ledger[_PERSON_MOMENT_LEDGER_KEY] = entries
+        _write_person_moment_ledger(ledger)
+    except Exception:
+        pass
+
+
+def _select_and_render_person_moment(
+    conn: sqlite3.Connection, node_id: str,
+) -> "str | None":
+    """Select this person's next rotating special moment and, if the
+    cross-surface cooldown gate allows it, render it — committing the cursor
+    advance (metadata.special_moment_cursor, DB write) and the cooldown
+    record together, so the cursor only moves when the moment is ACTUALLY
+    shown (per issue #1940 / Kepler's design comment).
+
+    Re-reads metadata fresh from the DB right before writing (rather than
+    trusting a caller-supplied snapshot, which may be stale relative to
+    special_moments' own FIFO capacity-rotation in _add_special_moment_impl —
+    a DIFFERENT mechanism this function does not touch) and writes back the
+    FULL metadata dict with only special_moment_cursor changed — never a
+    partial dict, which would silently clobber pronouns/relation/aliases/
+    field_traces/etc. This narrows but does not eliminate the read-modify-
+    write race against a concurrent engram_add_special_moment /
+    engram_update_person call (both of which do their own read-then-write of
+    the same metadata blob with no CAS) — judged low-risk in practice since
+    render and person-edit are different call paths that rarely race within
+    the same second; flagged in the PR body rather than solved with a
+    transaction, since ADD/UPDATE_PERSON's own existing writes have the same
+    non-atomic shape and this function is no worse than that precedent.
+
+    special_moment_cursor is an ever-incrementing counter, modulo'd against
+    the CURRENT list length at selection time rather than stored pre-wrapped,
+    so a FIFO pop elsewhere never desyncs an out-of-range stored index.
+
+    No moments, cooldown active, node not found, or a malformed moment entry
+    → None (no render attempted, no side effects). Best-effort on the DB
+    write (fail-open — a persistence hiccup here must never hide otherwise-
+    good content from the caller); the cooldown record still fires even if
+    the cursor write failed, since the moment WAS shown to the caller either
+    way.
+    """
+    row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
+    if not row:
+        return None
+    try:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    moments = meta.get("special_moments")
+    if not isinstance(moments, list) or not moments:
+        return None
+    if _person_moment_in_cooldown(node_id):
+        return None
+    cursor = meta.get("special_moment_cursor")
+    if not isinstance(cursor, int):
+        cursor = 0
+    idx = cursor % len(moments)
+    moment = moments[idx]
+    if not isinstance(moment, dict):
+        return None
+    description = moment.get("description")
+    if not description:
+        return None
+    try:
+        meta["special_moment_cursor"] = cursor + 1
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), node_id),
+        )
+        conn.commit()
+    except Exception:
+        pass  # best-effort cursor persistence; moment still renders below
+    _record_person_moment_render(node_id)
+    return description
+
+
 def _build_tiered_results(
     results: list[dict],
     summary_top_k: int,
+    conn: "sqlite3.Connection | None" = None,
 ) -> list[dict]:
     """Convert a ranked list of node dicts to the Wave-C tiered return shape.
 
@@ -1884,24 +2189,56 @@ def _build_tiered_results(
     to include ``recall_keywords`` for richer Tier 2 rendering on pattern
     queries.
 
+    Person nodes (#1940): pronouns/relation/trust_tier are added to BOTH
+    tiers when populated on the input node dict (cheap fields, no tier
+    gating — matches the issue's "always, when populated" contract).
+    special_moment (prose) is TIER-1-ONLY, mirroring recall_summary's own
+    tier gating — Tier 2 stays keyword-lightweight by design, and a 40-100
+    word relational moment has no more business in a keyword-only entry than
+    a full recall_summary would (a judgment call, not spec-mandated —
+    flagged in the PR body). Requires conn (server-side callers only —
+    _query_impl passes its own connection; engram_query_pattern's call site
+    doesn't pass conn, so person nodes there simply never attempt a moment,
+    which is fine since query_pattern candidates aren't person-node search
+    results in practice).
+
     Args:
         results: Ranked list of node dicts (already processed — metadata stripped,
             neighbors added for engram_query; raw pattern dicts for query_pattern).
         summary_top_k: How many top entries get summaries.  0 = all tier-2;
             >= len(results) = all tier-1.  Caller is responsible for clamping
             to valid range before calling.
+        conn: optional live DB connection — enables the person special-moment
+            selection+render (needs a DB write for the rotation cursor).
+            Omitted (None) → person nodes still get pronouns/relation/
+            trust_tier, just never a special_moment.
     """
     tiered: list[dict] = []
     for i, node in enumerate(results):
         node_id = node.get("id", "")
         confidence = node.get("confidence")
-        if i < summary_top_k:
+        is_tier1 = i < summary_top_k
+
+        person_fields: dict = {}
+        if node.get("type") == "person":
+            if node.get("pronouns"):
+                person_fields["pronouns"] = node["pronouns"]
+            if node.get("relation"):
+                person_fields["relation"] = node["relation"]
+            if node.get("trust_tier"):
+                person_fields["trust_tier"] = node["trust_tier"]
+            if is_tier1 and conn is not None and node_id:
+                moment_text = _select_and_render_person_moment(conn, node_id)
+                if moment_text:
+                    person_fields["special_moment"] = moment_text
+
+        if is_tier1:
             # Tier 1: prefer recall_summary, fall back to truncated claim.
             summary = node.get("recall_summary") or None
             if not summary:
                 claim = node.get("claim") or ""
                 summary = (claim[:160] + "...") if len(claim) > 160 else claim
-            tiered.append({"id": node_id, "confidence": confidence, "summary": summary})
+            entry = {"id": node_id, "confidence": confidence, "summary": summary}
         else:
             # Tier 2: prefer recall_keywords; bare-ID (+ confidence) if missing/empty.
             kw = node.get("recall_keywords")
@@ -1914,9 +2251,11 @@ def _build_tiered_results(
                 except (ValueError, json.JSONDecodeError):
                     kw = None
             if kw:
-                tiered.append({"id": node_id, "confidence": confidence, "keywords": kw})
+                entry = {"id": node_id, "confidence": confidence, "keywords": kw}
             else:
-                tiered.append({"id": node_id, "confidence": confidence})
+                entry = {"id": node_id, "confidence": confidence}
+        entry.update(person_fields)
+        tiered.append(entry)
     return tiered
 
 
@@ -2036,6 +2375,30 @@ def _surface_impl(
                     entry["confidence"] = n.get("confidence")
                 elif ntype == "axiom":
                     entry["confidence"] = n.get("confidence")
+                elif ntype == "person":
+                    # #1940 — surface the typed relational fields the render
+                    # layer never read before this fix. Only populated fields
+                    # (never a default/placeholder — see issue body). Cursor +
+                    # full moments list are attached raw here (read-only,
+                    # unselected) so the auto-surface hook (a separate process
+                    # that reads this response over the daemon socket) can do
+                    # its own suppression-gated selection + cursor-advance —
+                    # see engram-surface-hook.py's _select_person_moment_candidate.
+                    _pmeta_raw = n.get("metadata")
+                    try:
+                        _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
+                    except (json.JSONDecodeError, TypeError):
+                        _pmeta = {}
+                    if _pmeta.get("pronouns"):
+                        entry["pronouns"] = _pmeta["pronouns"]
+                    if _pmeta.get("relation"):
+                        entry["relation"] = _pmeta["relation"]
+                    if n.get("trust_tier"):
+                        entry["trust_tier"] = n.get("trust_tier")
+                    _moments = _pmeta.get("special_moments")
+                    if isinstance(_moments, list) and _moments:
+                        entry["special_moments"] = _moments
+                        entry["special_moment_cursor"] = _pmeta.get("special_moment_cursor", 0)
                 special.append(entry)
         special = special[:3]
 
@@ -2410,6 +2773,26 @@ def _query_impl(
             # MECH-5: extract warnings BEFORE popping metadata so agents
             # reading query results see taint / stale status.
             w = _extract_warnings(node.get("metadata"), conn)
+            # #1940: extract the typed relational fields BEFORE popping
+            # metadata, same ordering discipline as the warnings extraction
+            # above. Gated on `not return_debug`: return_debug=True's
+            # contract is "preserve full legacy shape verbatim" (eval/harness
+            # contract per the docstring below), so no new fields are added
+            # to node dicts on that path — metadata is popped unconditionally
+            # either way (see node.pop("metadata", ...) below), so
+            # return_debug output is genuinely unchanged by this fix.
+            # trust_tier needs no extraction here — it's already a raw
+            # column carried through by _node_to_dict unconditionally.
+            if not return_debug and node.get("type") == "person":
+                _pmeta_raw = node.get("metadata")
+                try:
+                    _pmeta = json.loads(_pmeta_raw) if _pmeta_raw else {}
+                except (json.JSONDecodeError, TypeError):
+                    _pmeta = {}
+                if _pmeta.get("pronouns"):
+                    node["pronouns"] = _pmeta["pronouns"]
+                if _pmeta.get("relation"):
+                    node["relation"] = _pmeta["relation"]
             node.pop("metadata", None)
             node["neighbors"] = _get_neighbors(conn, node["id"])
             if w:
@@ -2462,7 +2845,7 @@ def _query_impl(
         # Clamp summary_top_k to [0, len(output)] so callers don't have to worry
         # about off-by-one edge cases.
         effective_top_k = max(0, min(summary_top_k, len(output)))
-        tiered = _build_tiered_results(output, effective_top_k)
+        tiered = _build_tiered_results(output, effective_top_k, conn=conn)
         return json.dumps(core._strip_agent_facing({
             "results": tiered,
             "query": query,
@@ -2789,6 +3172,12 @@ def _list_impl(
         where_parts.append("is_current = 1")
     params: list = []
     if node_type:
+        if node_type not in core.VALID_NODE_TYPES:
+            return json.dumps({
+                "status": "error",
+                "error": f"Unknown node_type: {node_type!r}. "
+                         f"Allowed: {sorted(core.VALID_NODE_TYPES)}",
+            })
         where_parts.append("type = ?")
         params.append(node_type)
     if status:
@@ -2812,6 +3201,12 @@ def _list_impl(
         "importance": "importance_score DESC",
         "recalls": "recall_count DESC",
     }
+    if sort_by and sort_by not in sort_map:
+        return json.dumps({
+            "status": "error",
+            "error": f"Unknown sort_by: {sort_by!r}. "
+                     f"Allowed: {sorted(sort_map.keys())}",
+        })
     order = sort_map.get(sort_by, "id ASC")
 
     # Limit semantics (per issue #81 + Lei's state-table refinement):

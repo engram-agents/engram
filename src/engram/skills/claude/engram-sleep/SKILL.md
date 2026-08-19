@@ -1,6 +1,6 @@
 ---
 name: engram-sleep
-description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history + stops any active self-loop; pre-turn-advance), Phase B (parent dispatches 8 fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
+description: Use at the natural end-of-day moment when wrapping work. Single end-of-day routine in two strictly-sequential phases — Phase A (parent files missed nodes + erases warm-briefing "From this session" + reconciles history + stops any active self-loop; pre-turn-advance), Phase B (parent draws tonight's dream-fairy set via the weight-aging lottery, dispatches those fairies in parallel + spawns engram-dream-master sub-agent + relays). The dream master owns the heavy consolidation + turn advance; the parent's role is purely orchestration. Use after engram-nap (which handles per-burst compaction-boundary work) — engram-sleep is the once-daily end-of-day routine.
 ---
 
 > **Note for the agent:** Any ENGRAM node IDs cited in this skill come from the alpha developer's graph — they don't exist in your install (every install renumbers from scratch). As you get familiar with this skill, consider cleaning them up: replace each citation with a generalized concept-word, or remove if it isn't load-bearing. The skill is yours now.
@@ -42,10 +42,10 @@ sequential, no branching:
   Step 3.5 — Stop any active self-loop (clear loop-mode.json if present)
   Step 4 — Reconcile today's history file (day arc lives here, not in warm-briefing)
 
-**Phase B — Consolidation orchestration (parent dispatches + spawns + relays)**
+**Phase B — Consolidation orchestration (parent draws + dispatches + spawns + relays)**
   Step 5 — Compute the recall-summary cohort
-  Step 6 — Dispatch all eight fairies in parallel
-  Step 7 — Wait for all 8 fairies + collect reports
+  Step 6 — Draw tonight's dream-fairy set (weight-aging lottery, #1901) + dispatch it in parallel
+  Step 7 — Wait for the drawn fairies + collect reports
   Step 8 — Spawn the dream master with the full report bundle
   Step 9 — Receive the dream master's final return and relay to the user
 
@@ -73,8 +73,9 @@ The parent's role is purely orchestration.
 > twice.) There is **no "lean cycle," no "context-economy" variant, no spawning the
 > dream-master without the full fairy + batch-summary bundle.** The ONLY thing context
 > size ever decides is **whether to compact/nap BEFORE the sleep** — and after compacting,
-> you run the **COMPLETE** routine (all 8 dream-fairies + every batch-summary chunk →
-> collect ALL reports → *then* spawn the dream-master). Context size NEVER decides what
+> you run the **COMPLETE** routine (the lottery-drawn dream-fairy set, per #1901 — see
+> Phase B below — + every batch-summary chunk → collect ALL reports → *then* spawn the
+> dream-master). Context size NEVER decides what
 > runs *inside* the sleep. If you are about to spawn the dream-master and have NOT collected
 > the dream-fairy + batch-summary reports this cycle, **STOP — you are skipping the routine.**
 >
@@ -266,7 +267,7 @@ git -C ~/.engram commit -m "history: end-of-day reconcile for YYYY-MM-DD"
 
 The directory is git-tracked for version history and diff-ability — per-day files keep the context-window cost bounded as the log accumulates. Including this commit in the end-of-day routine is how tomorrow morning's handover becomes reliable.
 
-**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live blocked-on-{{USER_NAME}} queue — items pending {{USER_NAME}}'s action, decisions, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
+**Strategically reconcile `~/.engram/ask-{{USER_NAME}}.md`.** This file is the live daily discussion queue — ONLY the top 3 questions pending {{USER_NAME}}'s action, decision, or input. Across the day items change state (PRs merge, questions get answered, decisions get made). End-of-day reconcile catches anything that slipped during the day. **The prune side is a deterministic sweep, not a memory exercise** — a prepend-only reconcile leaves merged PRs sitting under "Ready" headings (the 2026-06-05 incident: three PRs merged at 17:1x survived that evening's reconcile as "Ready, all CI-green"; engram-alpha #830):
 
 - **Deterministic external-state sweep (the prune gate).** Extract every PR/issue number the file mentions, then check each against ground truth — not against your recollection of the day:
 
@@ -281,9 +282,9 @@ The directory is git-tracked for version history and diff-ability — per-day fi
 
   For every number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready"/"merge-queue"/"awaiting merge" line), **prune the entry**. If the entry carries an undecided sub-question alongside the resolved reference, keep the entry but strike the resolved reference. `UNKNOWN` (cross-repo numbers, rate limits) → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. The prune authority is strictly limited to externally-checkable facts — the decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
 - **Walk the day's commit log** (`git -C ~/engram-alpha log --since=6am`, plus other agent-touched repos) for resolutions the sweep can't see (questions answered in-session, decisions made verbally) — strike those too.
-- **Move deferred items to `~/.engram/ask-{{USER_NAME}}-backlog.md`** (the non-auto-loaded cross-day backlog) if they're no longer actionable today.
+- **Enforce the three-question cap after pruning.** Rank all still-unresolved questions by urgency and impact. Keep only the top 3 digest lines. Move every non-selected question to `~/.engram/ask-{{USER_NAME}}-backlog.md`, retaining its detail-slug link and leaving its detail section intact. Also move cross-day questions that are no longer actionable today. Never drop an unresolved fourth question merely to satisfy the cap.
 - **Audit trail**: list the pruned entries in the commit message body (`#N <one-line summary> — MERGED/CLOSED per gh`, same format as the dream-master's step 10), so a wrong prune is one `git -C ~/.engram revert` away.
-- **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
+- **Commit the file in .engram git** alongside the history file (same commit or separate, your call): `git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-backlog.md && git -C ~/.engram commit -m "ask-{{USER_NAME}}: end-of-day reconcile"`.
 
 This step exists because ask-{{USER_NAME}}.md is auto-loaded into every fresh session — stale items there make {{USER_NAME}} re-read items that are already resolved, and a stale "Ready" line invites a wasted merge attempt. The deterministic sweep is the structural defense against ask-list drift (mechanical gate > vigilance — the associative walk alone demonstrably drifts). (Installs without an ask-{{USER_NAME}}.md file can skip this sub-step; it's a no-op when the file doesn't exist. Installs without `gh` or without a GitHub-backed workflow: skip the sweep, keep the commit-log walk.)
 
@@ -406,15 +407,68 @@ fi
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
 > "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
 >
-> The 8 fairies divide into two groups with different risk profiles:
+> **As of #1901 (2026-08-04), the 9 dream-fairy scan categories are no longer
+> all dispatched every night.** A weight-aging lottery (`tools/dream_lottery.py`)
+> draws a small subset each cycle — see Step 6 below for the mechanism. **The
+> all-or-nothing invariant still holds, just at a different grain: once the
+> lottery has decided tonight's set (the draw plus any cascade-interrupt
+> force-includes), that ENTIRE set is mandatory — never drop a category the
+> lottery drew "for context economy."** The lottery itself, not agent
+> discretion, is now the only sanctioned mechanism for a category not running
+> on a given night. Skipping a drawn category is exactly the 2026-06-24
+> incident this invariant was written to prevent; running fewer categories
+> than the draw is not a lighter version of the routine, it's the same failure
+> in a new shape.
 >
-> - **Truly window-scoped (Category 7; partially Category 6):** Category 7 (missing principle-edges) operates on the *fresh cohort* using an explicit `created_at >= prev-sleep-timestamp` filter. That window closes when `engram_advance_turn` fires — a missed Cat 7 pass is *permanent*, no backfill path. Category 6 (recent-resolution echoes) uses an implementation-defined recency window that also narrows post-advance; its miss is partially recoverable but degrades over cycles.
+> Design of record: Lei, converged with Kepler 2026-08-03
+> (engram-alpha#1901), refined same night to three classes (comment on
+> #1901):
 >
-> - **All-time scoped but never deferrable (Categories 1/2/3/4/5/8):** open questions, contradictions, stale nodes, cornerstone candidates, tainted derivations, and stale task refs query across the full graph — they *can* be caught next cycle. But "catchable next cycle" is the rationalization that lets partial skipping compound silently: skip Cat 1 tonight, skip Cat 3 tomorrow, and consolidation debt accumulates past the capacity of any single pass.
+> 1. **Always-on** — the batch-summary (`recall_summary`) cohort step (Steps
+>    5–7.5 below). Its work scales with the day's new-node cohort and is
+>    essential whenever nodes were created; it was never the mostly-zero-
+>    findings cost the lottery targets, and this feature does not touch it.
+> 2. **Lottery-rotated** — the 9 dream-fairy scan categories. Exactly one is
+>    drawn per sleep by default (`--count` can raise this later per the
+>    design note "maybe two later").
+> 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
+>    markers meet a threshold, cascade-sensitive categories are force-included
+>    regardless of the draw. Lottery = frequency; interrupt = urgency.
 >
-> **Context pressure is never a valid reason to skip fairies.** They run in fresh contexts; the parent's context size is irrelevant to fairy execution. If the parent context is too full, **nap first, then dispatch the full set** — do not drop fairies.
+> **Window semantics under rotation (the audit precondition #1901 asked for,
+> before wiring the lottery in):** a category that doesn't run every night
+> cannot safely use "since last sleep" as its scan window — that's an assumption
+> baked in for an every-night cadence. Audited 2026-08-04 against the actual
+> server-side `query_pattern` implementations and the fairy spec's inline
+> fallbacks:
 >
-> *(Origin: 2026-06-24 incident — a parent skipped 7 fairies "for parent-context economy"; the dream master advanced the turn. Backfill found 3 permanently-missing principle-edges (a derivation → its axiom, and two observations → their goal nodes). Initial fix #1427 (Ariadne) added the all-or-nothing MANDATORY framing; #1429 (Sol) adds the per-category taxonomy to close the "all-time-scoped fairies are catchable next cycle, can I skip them?" loophole.)*
+> - **Category 7 (missing principle-edges) is the one genuine gap.** Its only
+>   candidate-source filter is `created_at >= prev-sleep-timestamp` — under
+>   rotation this silently narrows to almost nothing (or skips nodes outright)
+>   once the category goes more than a night between draws. **Fixed**: the
+>   parent now injects a per-type watermark (`dream_lottery.py`'s
+>   `window_params`, the category's own pre-update `last_run_at`) instead of
+>   the nightly cohort marker — see Step 6.
+> - **Category 6 (recent-resolution echoes)'s primary path is fine as-is.**
+>   `engram_query_pattern(pattern_name='recent_resolution_echo')` ranks the 30
+>   most-recent `resolves` edges by `created_at DESC` — self-relative, not
+>   date-windowed, so it needs no watermark. Only its documented *inline
+>   fallback* text referenced an undefined `since=<recent>`; the fairy spec now
+>   points that fallback at the same per-type watermark as Category 7 (see
+>   `engram-dream-fairy.md` Category 6).
+> - **Categories 1–5, 8, 9 are all-time-scoped full-graph scans with no date
+>   window at all** — confirmed by reading `engram_query.py`'s pattern
+>   implementations (all are recency-*ranked*, `ORDER BY ... LIMIT N`, never
+>   `WHERE created_at >= `) and the Category 8/9 inline methodologies (full
+>   enumeration every run). Running less often is a pure cost win for these —
+>   no correctness gap, nothing to fix.
+> - **`cohort_dispatch.py`'s "since last sleep" cadence is correct as-is** —
+>   it drives the always-on batch-summary step (class 1 above), which
+>   genuinely does run every night, so its window assumption is sound.
+>
+> **Context pressure is never a valid reason to skip fairies.** They run in fresh contexts; the parent's context size is irrelevant to fairy execution. If the parent context is too full, **nap first, then dispatch the full drawn set** — do not drop fairies from tonight's draw.
+>
+> *(Origin: 2026-06-24 incident — a parent skipped 7 fairies "for parent-context economy"; the dream master advanced the turn. Backfill found 3 permanently-missing principle-edges (a derivation → its axiom, and two observations → their goal nodes). Initial fix #1427 (Ariadne) added the all-or-nothing MANDATORY framing; #1429 (Sol) adds the per-category taxonomy to close the "all-time-scoped fairies are catchable next cycle, can I skip them?" loophole. #1901 (Sol, 2026-08-04) replaces "all 9 every night" with the weight-aging lottery, preserving the all-or-nothing invariant at the drawn-set grain.)*
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
@@ -437,12 +491,14 @@ If today's-cohort count < 50, top up from legacy NULLs:
 
 Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy NULL pool over many cycles.
 
-**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — dispatch only the 8 dream-fairies, spawn the dream master with a manifest of 8 fairies, and proceed. The architecture is forward-compat: the dream master handles 8-fairy cycles cleanly.
+**If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
-**Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files:
+**Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files.
+**Pass the cohort IDs inline via `--ids`** — the list from the step above fits
+comfortably in a shell variable (50 ids max, per the cap above), so there is
+no need for an intermediate file at all:
 
 ```bash
-# Write cohort IDs one per line, then run prepare
 COHORT_IDS="ob_XXXX,ob_YYYY,..."  # comma-separated list from the step above
 COHORT_DIR=.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)
 
@@ -458,6 +514,21 @@ The script prints a JSON manifest to stdout listing chunk directories. Each chun
 
 No per-chunk `prompt.md` is written. The dispatcher constructs a short prompt inline at dispatch time using the paths in the manifest (see Step 6). The default chunk size is 15 (empirically validated 2026-05-27: N=15 worst-case produces quality within in-sample variance of ground truth at ~37K tokens / 1 sub-agent turn).
 
+> **On a shared multi-agent host, never stage the cohort-id list at a bare,
+> predictable `/tmp/<generic-name>` path** (e.g. `/tmp/cohort_ids.txt`).
+> Several agents independently running this same skill, on the same day, at
+> this same step converge on the same filename with no coordination — and
+> mode-644 semantics make the collision silent rather than loud: the first
+> agent's write wins, every other agent's write is denied (`rc=1`, easy to
+> miss), and their *read* of that same path then succeeds — quietly handing
+> them another agent's cohort instead of their own (#2075). `--ids` above
+> avoids the problem entirely by never touching disk. If a list ever is too
+> large for `--ids` and `--ids-file` is needed, write it under your own
+> `$HOME/.engram/tmp/` (per-agent, not shared) rather than `/tmp` —
+> `cohort_dispatch prepare` also refuses to read an `--ids-file` it does not
+> own (owner-uid check), so a foreign-owned file fails loudly instead of
+> being silently ingested.
+
 **Run cohort_dispatch verify-in** to pre-flight the cohort before dispatch:
 
 ```bash
@@ -471,11 +542,27 @@ python3 -m tools.cohort_dispatch verify-in \
 
 Verify-in checks: (1) valid JSON per chunk, (2) required fields present (id, type, claim), (3) every id resolves in the DB with matching claim (race-window guard against retracted nodes), (4) no duplicate IDs within or across chunks, (5) chunk size ≤ 15. On non-zero exit, do not proceed to dispatch — the cohort has a structural problem to fix first.
 
-### Step 6 — Dispatch all fairies in parallel (9 dream-fairies + N batch-summary-fairies)
+### Step 6 — Draw tonight's dream-fairy set, then dispatch in parallel (N drawn fairies + M batch-summary-fairies)
 
-Single `Agent`-tool message with all calls, each `run_in_background=true`.
+**Step 6a — Run the lottery draw first, before touching the Agent tool.**
 
-**Fairies 1-9** — `subagent_type="engram-dream-fairy"`, one per well-supported category. **Use these exact substitution values** (canonical from `engram-dream-fairy.md`; do NOT derive from memory or prior-session context — the category numbering changes across versions and must be read here each dispatch):
+```bash
+$HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
+  --db ~/.engram/knowledge.db \
+  --turn <CURRENT_TURN>   # from engram_stats / engram_reflect — the turn this cohort is closing, pre-advance
+```
+
+(Omit `--state`/`--interrupt-types`/`--interrupt-threshold` to use the defaults documented in `dream_lottery.py`'s module docstring; override only if the standing design call has changed.) The command prints and persists a JSON result:
+
+- `types_to_run` — the category numbers to dispatch this cycle (drawn ∪ interrupt-forced; disjoint, so no category is double-counted).
+- `types_to_run_slugs` — `{category_num: slug}` for the categories above, for building dispatch prompts.
+- `interrupt_fired` / `interrupt_types` / `cascade_marker_count` — whether the cascade-urgency interrupt forced any categories in tonight, and why.
+- `window_params` — `{category_num: prev_last_run_at_or_null}` for the window-scoped categories (currently 6 and 7 — see the Phase B audit note above). Only present for categories that are both window-scoped AND running tonight.
+- `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`~/.engram/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
+
+**This state write is eager and irreversible for the night** — weights update at draw time, not at fairy-completion time (see `dream_lottery.py`'s module docstring for the accepted timeout-edge-case tradeoff). Do not re-run `draw` if a fairy times out; that would draw again and corrupt the aging sequence. If you must re-attempt a failed dispatch, re-dispatch the SAME `types_to_run` from the JSON you already have — don't call `draw` a second time this cycle. **As of #1907 this is mechanically enforced, not just advised**: a second real `draw` for the same `--turn` exits non-zero and refuses to write, unless `--force` is passed explicitly (a deliberate escape hatch for genuine recovery — never pass it just to silence the error).
+
+**Step 6b — Dispatch exactly the categories `draw` returned**, `subagent_type="engram-dream-fairy"`, one per category in `types_to_run` — **EXCEPT category 10, which dispatches `subagent_type="engram-person-node-fairy"` instead** (its own agent spec, `engram-person-node-fairy.md`; it owns all person-node maintenance jobs per issue #1827 layer 2 and runs all six of its sub-scans in one dispatch). Category names below are canonical from `engram-dream-fairy.md` (do NOT derive from memory — the category numbering changes across versions and must be read here each dispatch):
 
 | `{N}` | `{CATEGORY_NAME}` | `{SLUG}` |
 |-------|-------------------|----------|
@@ -488,10 +575,14 @@ Single `Agent`-tool message with all calls, each `run_in_background=true`.
 | 7 | Missing principle-edges (instantiates/serves) | missing-edges |
 | 8 | Open tasks with stale external references | stale-task-refs |
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
+| 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
 
-Prompt template (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above):
+Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
 > Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (10, 11).
+> [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
+
+Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
 
 **Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
@@ -511,7 +602,7 @@ All fairies fire in parallel with `run_in_background=true`; the harness fires a 
 
 Receive each fairy's task-notification as it arrives. Collect from the completion result:
 
-- **Fairies 1-9**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
+- **Dream fairies (this cycle's drawn set, per Step 6a's `types_to_run`)**: file path (`~/.engram/dream/<TODAY>-fairy-<N>-<SLUG>.md`) + 5-bullet TL;DR. Full report content lives on disk at the cited path.
 - **Batch-summary fairies**: write each fairy's returned JSON to `<cohort-dir>/chunk-N/agent_output.json`.
 
 **Fairy timeout**: if any fairy doesn't return within the model-appropriate window, mark it as timed-out.
@@ -644,11 +735,12 @@ Log the result: X summaries applied, Y failures deferred to next cycle.
 
 ### Step 8 — Spawn the dream master with the full report bundle
 
-> **PRECONDITION (do not pass without it):** all 8 dream-fairies dispatched (Step 6) and
-> their reports collected or explicitly marked timed-out/failed (Step 7), AND every
-> batch-summary chunk applied (Step 7.5). If you have NOT dispatched the fairies this cycle,
-> you are not at Step 8 — you are skipping the routine (see the invariant at the top). The
-> dream-master is spawned *with* the fairy bundle, never *instead of* it.
+> **PRECONDITION (do not pass without it):** the lottery-drawn dream-fairy set from Step 6a
+> (`types_to_run`) fully dispatched (Step 6b) and their reports collected or explicitly
+> marked timed-out/failed (Step 7), AND every batch-summary chunk applied (Step 7.5). If
+> you have NOT run Step 6a's draw and dispatched its `types_to_run` this cycle, you are not
+> at Step 8 — you are skipping the routine (see the invariant at the top). The dream-master
+> is spawned *with* the fairy bundle, never *instead of* it.
 
 Once all fairy reports are collected (or marked timed-out) and the final payload is ready, spawn the master with everything in its initial prompt:
 
@@ -657,10 +749,20 @@ Agent(
     subagent_type="engram-dream-master",
     prompt="""You are the dream master for tonight's consolidation cycle.
 
-    DREAM-FAIRY REPORTS (full content on disk — read each before integrating):
-    - Category 1 (<CAT1_NAME>): ~/.engram/dream/<TODAY>-fairy-1-<SLUG1>.md — TL;DR: <bullets>
-    - Category 2 (<CAT2_NAME>): ~/.engram/dream/<TODAY>-fairy-2-<SLUG2>.md — TL;DR: <bullets>
-    - ... (categories 3-8 similar) ...
+    TONIGHT'S LOTTERY DRAW (dream_lottery.py, #1901 — log this verbatim in the dream
+    record's provenance section; this is the "logged draws" requirement from the design.
+    #1909: `draw` also appends this same record to ~/.engram/dream-lottery-history.jsonl
+    automatically, so a missed transcription here is recoverable from that file — but
+    still transcribe it; the dream record is the reviewable narrative copy, the history
+    file is the raw mechanical backstop, not a substitute):
+    - Drawn: <drawn_types_slugs> | Interrupt-forced: <interrupt_types_slugs, or "none — cascade_marker_count <N> below threshold <T>">
+    - weights_before: <weights_before JSON> -> weights_after: <weights_after JSON>
+
+    DREAM-FAIRY REPORTS (full content on disk — read each before integrating; this cycle's
+    set is exactly tonight's draw above, not a fixed category list):
+    - Category <N1> (<CAT_NAME1>): ~/.engram/dream/<TODAY>-fairy-<N1>-<SLUG1>.md — TL;DR: <bullets>
+    - Category <N2> (<CAT_NAME2>): ~/.engram/dream/<TODAY>-fairy-<N2>-<SLUG2>.md — TL;DR: <bullets>
+    - ... (one entry per category in tonight's types_to_run) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
     COHORT METADATA:
@@ -671,7 +773,7 @@ Agent(
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read all 9 dream-fairy reports from disk. Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -706,7 +808,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 
 - **Parent does NOT call `engram_reflect`, `engram_advance_turn`, or write the dream record.** Those are dream-master responsibilities. The parent's job is orchestration + relay.
 
-- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full fairy set** — do not reduce or drop fairies. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
+- **Parent's context is light by design.** Dispatch + routing messages costs little context. If your context fills up during the routing phase, **nap first to clear it, then return and dispatch the full lottery-drawn set** — do not reduce or drop fairies from `types_to_run`. The dream master's context is separate and unaffected by parent compaction. (See the Phase B mandatory invariant above: context pressure is never a reason to skip fairies.)
 
 - **Don't retry an interrupted dream.** If the dream master returns a partial result (some fairies timed out, completion checklist short-circuited under self-timeout), unfinished work goes into next cycle's cohort via attrition. The dream master logs unfinished items in the dream record. Don't try to "finish the work" in the parent context — that would re-introduce the discipline-blur this architecture exists to resolve.
 
@@ -717,8 +819,9 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Nap** — fires multiple times per day at compaction boundaries; per-burst persistence + cross-compaction-scaffold prep. Sleep is once-daily, end-of-day.
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
-- **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count).
-- **Dream fairies 1-8** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners. Spec at `~/.claude/agents/engram-dream-fairy.md`.
+- **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
+- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
+- **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one of 9 categories per dispatch, the lottery-drawn subset each night (was all 9 nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## macOS auto-sleep timing

@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """check-claude-md-drift — rendered CLAUDE.md drift detector.
 
-Compares the RENDERED CLAUDE.md output between two git refs by folding
-compact-instructions.md into template.CLAUDE.md for each ref, then diffing
-the results.  Unlike diffing the raw template files, this catches changes to
-ANY source that contributes to the rendered CLAUDE.md (e.g. a
-compact-instructions.md-only change is invisible to a template-only diff).
+Compares the RENDERED CLAUDE.md output between two git refs by reading
+template.CLAUDE.md at each ref, then diffing the results.
+
+History: prior to engram-alpha#2067 the render folded a second file,
+compact-instructions.md, into template.CLAUDE.md, so this tool diffed the
+FOLDED output — catching a compact-instructions.md-only change that a
+template-only diff would have missed. #2067 removed the ``## Compact
+Instructions`` section from the Claude template entirely (see
+docs/compaction-continuity.md); compact-instructions.md is now Codex-only
+and no longer contributes to the Claude render, so
+``template_render.CLAUDE_RENDER_SOURCES`` is a single-file list. The
+render-via-source-list design is kept (rather than hardcoding
+template.CLAUDE.md here) so a future extraction of another fragment into
+the Claude render is caught by widening CLAUDE_RENDER_SOURCES, without
+touching this tool.
 
 Usage
 -----
@@ -25,7 +35,7 @@ Exit codes
 
 Source files checked
 --------------------
-The set of files folded into the render is declared in
+The set of files that make up the render is declared in
 ``src/engram/template_render.CLAUDE_RENDER_SOURCES`` (canonical SSoT).  A
 source file absent at the base ref is treated as empty (so an extraction
 commit correctly shows the extracted content as drift rather than an error).

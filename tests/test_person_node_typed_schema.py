@@ -7,7 +7,8 @@ Coverage:
   4. trust_tier update → elevated flag (review_required=True)
   5. Stage 1 auto-suggest: name-match fires suggestion, does NOT auto-wire about-edge
   6. Stage 2 auto-suggest: link_about response carries special_moment_suggestion
-  7. special_moments cap (7) + rotation: oldest removed from list, about-edge preserved
+  7. special_moments cap (100, #1948): below-cap add succeeds normally; at
+     cap, add fails LOUD with no silent eviction (existing moments untouched)
   8. engram_add_special_moment MCP tool — payload validation + happy path +
      round-trip with engram_link_about's special_moment_suggestion (#1705)
 """
@@ -566,25 +567,30 @@ def test_stage2_link_about_carries_suggestion():
 
 
 # ---------------------------------------------------------------------------
-# §3 — special_moments cap + rotation
+# §3 — special_moments cap (#1948: raised to 100, hard ceiling, no eviction)
 # ---------------------------------------------------------------------------
 
-def test_special_moments_cap_and_rotation():
-    """At 7 special_moments, adding an 8th removes the oldest from the list
-    but the about-edge from the oldest entry's node_id is preserved."""
+def test_special_moments_cap_value_is_100():
+    """#1948: _SPECIAL_MOMENTS_CAP is 100, not the pre-#1948 value of 7."""
+    import engram_trust
+    assert engram_trust._SPECIAL_MOMENTS_CAP == 100
+
+
+def test_special_moments_below_cap_succeeds_normally():
+    """Regression: adding moments well below the (now 100) cap is unaffected
+    by #1948 — same happy-path behavior as before the cap/eviction change."""
     server = fresh_server()
     rp = json.loads(server.engram_add_person(payload_json=json.dumps({
-        "name": "CapTest",
+        "name": "BelowCapTest",
         "relation": "family",
     })))
     pid = rp["person_id"]
 
-    # Add 7 special moments directly via _add_special_moment_impl
-    moment_node_ids = []
-    for i in range(7):
-        # Create a real observation to anchor each moment
+    import engram_trust
+    node_ids = []
+    for i in range(5):
         obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
-            "claim": f"Moment {i+1} for CapTest",
+            "claim": f"Moment {i+1} for BelowCapTest",
             "quoted_text": f"moment {i+1}",
             "interpretation": "a special event",
             "quote_type": "hard_data",
@@ -592,16 +598,65 @@ def test_special_moments_cap_and_rotation():
             "title": "test evidence",
         })))
         obs_id = obs["observation_id"]
-        moment_node_ids.append(obs_id)
-
-        # Wire about-edge first (as the normal workflow would)
+        node_ids.append(obs_id)
         server.engram_link_about(payload_json=json.dumps({
-            "node_id": obs_id,
-            "person_id": pid,
+            "node_id": obs_id, "person_id": pid,
         }))
+        result = json.loads(engram_trust._add_special_moment_impl(
+            person_id=pid,
+            description=f"Description for moment {i+1}",
+            node_id=obs_id,
+        ))
+        assert "error" not in result, result
+        assert result["slot_count"] == i + 1, result
+        assert result["cap"] == 100, result
 
-        # Add the special moment
-        import engram_trust
+    import engram_core as core
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (pid,)).fetchone()
+        meta = json.loads(row["metadata"])
+        assert len(meta["special_moments"]) == 5
+        assert [m["node_id"] for m in meta["special_moments"]] == node_ids
+    finally:
+        conn.close()
+
+
+def test_special_moments_at_cap_fails_loudly_no_eviction(monkeypatch):
+    """#1948: at the cap, adding another moment fails LOUD (returns
+    {"error": ...}) instead of silently evicting the oldest entry. The
+    existing moments must be byte-for-byte untouched after the failed
+    attempt — no pop(0), nothing destroyed.
+
+    Uses monkeypatch to lower _SPECIAL_MOMENTS_CAP to 3 for this test only
+    (the real cap is 100 — see test_special_moments_cap_value_is_100 — but
+    driving 100 real writes here would only slow the test down, not add
+    coverage: the cap-check codepath is identical at any threshold)."""
+    server = fresh_server()
+    import engram_trust
+    monkeypatch.setattr(engram_trust, "_SPECIAL_MOMENTS_CAP", 3)
+
+    rp = json.loads(server.engram_add_person(payload_json=json.dumps({
+        "name": "AtCapTest",
+        "relation": "family",
+    })))
+    pid = rp["person_id"]
+
+    node_ids = []
+    for i in range(3):
+        obs = json.loads(server.engram_add_observation(payload_json=json.dumps({
+            "claim": f"Moment {i+1} for AtCapTest",
+            "quoted_text": f"moment {i+1}",
+            "interpretation": "a special event",
+            "quote_type": "hard_data",
+            "url": "https://example.com/test-evidence",
+            "title": "test evidence",
+        })))
+        obs_id = obs["observation_id"]
+        node_ids.append(obs_id)
+        server.engram_link_about(payload_json=json.dumps({
+            "node_id": obs_id, "person_id": pid,
+        }))
         result = json.loads(engram_trust._add_special_moment_impl(
             person_id=pid,
             description=f"Description for moment {i+1}",
@@ -609,60 +664,55 @@ def test_special_moments_cap_and_rotation():
         ))
         assert "error" not in result, result
 
-    # Verify 7 moments in list
     import engram_core as core
     conn = core._get_db()
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (pid,)).fetchone()
-        meta = json.loads(row["metadata"])
-        assert len(meta["special_moments"]) == 7
-        first_node_id = meta["special_moments"][0]["node_id"]
+        meta_before = json.loads(row["metadata"])
+        assert len(meta_before["special_moments"]) == 3
     finally:
         conn.close()
 
-    # Add 8th moment — should rotate (oldest removed from list)
-    obs8 = json.loads(server.engram_add_observation(payload_json=json.dumps({
-        "claim": "Moment 8 for CapTest",
-        "quoted_text": "moment 8",
+    # 4th moment — at cap (3), must fail loud, no eviction.
+    obs4 = json.loads(server.engram_add_observation(payload_json=json.dumps({
+        "claim": "Moment 4 for AtCapTest",
+        "quoted_text": "moment 4",
         "interpretation": "another special event",
         "quote_type": "hard_data",
         "url": "https://example.com/test-evidence",
         "title": "test evidence",
     })))
-    obs8_id = obs8["observation_id"]
-    server.engram_link_about(payload_json=json.dumps({"node_id": obs8_id, "person_id": pid}))
+    obs4_id = obs4["observation_id"]
+    server.engram_link_about(payload_json=json.dumps({"node_id": obs4_id, "person_id": pid}))
 
-    import engram_trust
-    result8 = json.loads(engram_trust._add_special_moment_impl(
+    result4 = json.loads(engram_trust._add_special_moment_impl(
         person_id=pid,
-        description="Description for moment 8",
-        node_id=obs8_id,
+        description="Description for moment 4",
+        node_id=obs4_id,
     ))
-    assert "error" not in result8, result8
+    assert "error" in result4, (
+        f"Expected a loud error at cap, got a success result: {result4}"
+    )
+    assert "cap" in result4["error"].lower(), result4
+    assert "3" in result4["error"], (
+        f"Error should name the cap value (3): {result4}"
+    )
+    assert result4.get("cap") == 3, result4
+    assert result4.get("slot_count") == 3, result4
 
     conn = core._get_db()
     try:
         row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (pid,)).fetchone()
-        meta = json.loads(row["metadata"])
-        moments = meta["special_moments"]
-        # Still 7 slots (oldest rotated out)
-        assert len(moments) == 7, f"Expected 7 slots, got {len(moments)}"
-        # The oldest moment is no longer in the list
-        remaining_ids = [m["node_id"] for m in moments]
-        assert first_node_id not in remaining_ids, (
-            f"Oldest moment {first_node_id} should have been rotated out"
+        meta_after = json.loads(row["metadata"])
+        moments = meta_after["special_moments"]
+        # Still exactly 3 — nothing evicted, nothing appended.
+        assert len(moments) == 3, f"Expected 3 slots (unchanged), got {len(moments)}"
+        assert [m["node_id"] for m in moments] == node_ids, (
+            "The 3 pre-existing moments must be untouched (same order, same "
+            "entries) after the failed 4th add."
         )
-        # The newest moment is in the list
-        assert obs8_id in remaining_ids
-
-        # BUT the about-edge for the oldest moment is preserved
-        about_edge = conn.execute(
-            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? AND relation = 'about'",
-            (first_node_id, pid),
-        ).fetchone()
-        assert about_edge is not None, (
-            f"About-edge for rotated moment {first_node_id} should be preserved"
-        )
+        # The 4th moment's anchor was NOT added to the list.
+        assert obs4_id not in [m["node_id"] for m in moments]
     finally:
         conn.close()
 
@@ -864,11 +914,12 @@ def test_add_special_moment_tool_anchor_not_found_or_not_current():
 
 def test_add_special_moment_tool_cap_and_rotation_spot_check():
     """Lighter spot-check (3 calls) that the MCP wrapper doesn't break the
-    cap+rotation behavior already exhaustively tested in §3 for the
-    internal impl. Uses a cap smaller than 7 isn't available (cap is a
-    module constant), so this only confirms accumulation works through the
-    wrapper — full 7-then-8 rotation coverage stays in test_special_moments_
-    cap_and_rotation above."""
+    cap behavior already exhaustively tested in §3 for the internal impl
+    (#1948: cap is now 100 with a loud failure at the ceiling, no
+    eviction). This only confirms accumulation works through the wrapper —
+    full below-cap + at-cap-loud-failure coverage stays in
+    test_special_moments_below_cap_succeeds_normally and
+    test_special_moments_at_cap_fails_loudly_no_eviction above."""
     server = fresh_server()
     pid, _obs_id, _link = _make_person_and_anchor(server)
 

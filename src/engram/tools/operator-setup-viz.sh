@@ -30,7 +30,7 @@
 # What this script does:
 #   1. Resolves PLUGIN_ENGRAM_DIR from this script's own real path.
 #   2. Detects the Python interpreter (prefers plugin venv ~/.engram/venv;
-#      falls back to ~/.engram-venv / system python3 if import gate passes).
+#      falls back to system python3 if import gate passes).
 #   3. Runs an import-verification gate: refuses to install unless the canonical
 #      health-score formula and config schema can be imported with the chosen
 #      python + PLUGIN_ENGRAM_DIR on sys.path. Makes a silently-degraded viz
@@ -97,15 +97,11 @@ fi
 # Python interpreter — prefer plugin venv; fall back only if import gate passes
 # ---------------------------------------------------------------------------
 PLUGIN_VENV_PYTHON="$HOME/.engram/venv/bin/python3"
-HOME_VENV_PYTHON="$HOME/.engram-venv/bin/python3"
 
 # Ordered preference list
 PYTHON_CANDIDATES=()
 if [[ -x "$PLUGIN_VENV_PYTHON" ]]; then
   PYTHON_CANDIDATES+=("$PLUGIN_VENV_PYTHON")
-fi
-if [[ -x "$HOME_VENV_PYTHON" ]]; then
-  PYTHON_CANDIDATES+=("$HOME_VENV_PYTHON")
 fi
 # System python3 as last resort
 SYSTEM_PY="$(command -v python3 2>/dev/null || true)"

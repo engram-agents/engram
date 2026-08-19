@@ -13,6 +13,7 @@ House rules (reviewer-enforced this week):
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -103,11 +104,14 @@ def test_codex_c_d_combined_has_both_resume_and_bypass():
     assert "--dangerously-bypass-approvals-and-sandbox" in lines
 
 
-def test_codex_r_returns_nonzero_and_stderr_mentions_remote():
-    """codex -r must exit nonzero and mention remote control unavailability on stderr."""
+def test_codex_r_is_silently_consumed_for_compatibility():
+    """codex -r must not fail or reach Codex, because it has no equivalent remote-control flag."""
     rc, lines, stderr = _run("codex", "borges", "-r")
-    assert rc != 0
-    assert "remote control" in stderr.lower()
+    assert rc == 0
+    assert lines == ["codex"]
+    assert "-r" not in lines
+    assert "--remote-control" not in lines
+    assert not stderr
 
 
 # ---------------------------------------------------------------------------
@@ -202,35 +206,16 @@ def test_codex_d_d_dedup_emits_flag_once():
 
 
 # ---------------------------------------------------------------------------
-# Blocker regression: _expand_session_args exit-code propagation
-#
-# The blocker was that cmd_session used `mapfile < <(_expand_session_args ...)`
-# which discards the sub-shell exit code — codex -r would print its error but
-# execution would continue into a bare session.  The fix uses command
-# substitution (`expanded_raw=$(...)`) which DOES propagate the exit code.
-#
-# We cannot end-to-end test cmd_session without sudo (resolve_user requires a
-# real Linux user).  Instead we test the pure-function seam directly:
-#   agentctl __expand-session-args codex <name> -r
-# must exit 3 (the codex -r error path) with empty stdout.  This is the exact
-# sub-call that cmd_session now captures via command substitution, so if the
-# function exits nonzero the || { exit 2; } guard fires.
+# Boot compatibility regression: historical callers pass `-dr` to every
+# platform. Codex cannot use Claude's remote-control flag, so the expansion
+# must retain -d while consuming -r without an error.
 # ---------------------------------------------------------------------------
 
-def test_codex_r_pure_function_exits_nonzero_empty_stdout():
-    """codex -r via the pure __expand-session-args verb exits 3 with no stdout.
-
-    This is the regression test for the process-substitution exit-swallow blocker.
-    The plumbing guard (command-substitution + || exit 2) in cmd_session is
-    covered by code inspection + the named-trap comment; this test validates the
-    pure function's exit code so any mutation that makes it exit 0 is caught.
-    """
-    rc, lines, stderr = _run("codex", "borges", "-r")
-    assert rc != 0, f"codex -r must exit nonzero (got rc={rc})"
-    assert not lines, f"codex -r must produce no stdout (got: {lines})"
-    assert "remote control" in stderr.lower(), (
-        f"stderr must mention 'remote control' (got: {stderr!r})"
-    )
+def test_codex_dr_preserves_bypass_while_dropping_remote_control():
+    """The generic historic -dr boot alias must reach Codex as only its -d expansion."""
+    rc, lines, stderr = _run("codex", "borges", "-dr")
+    assert rc == 0, f"codex -dr must remain compatible (got rc={rc}, stderr={stderr!r})"
+    assert lines == ["codex", "--dangerously-bypass-approvals-and-sandbox"]
 
 
 # ---------------------------------------------------------------------------
@@ -387,39 +372,27 @@ def test_double_dash_flag_passes_through():
     assert "--debug" in lines, f"--debug must appear in output, got: {lines}"
 
 
-def test_codex_rc_bundle_exits_3_remote_control_error():
-    """-rc for codex must exit 3 (remote control unavailable) and mention 'remote control' on stderr.
-
-    -r in a bundle on codex is the same as standalone -r on codex: the platform
-    does not support remote control.  Exit 3 takes precedence over exit 6 when
-    both error conditions occur in a bundle.
-    """
+def test_codex_rc_bundle_resumes_while_dropping_remote_control():
+    """-rc keeps Codex's resume transform and silently consumes the Claude-only -r alias."""
     rc, lines, stderr = _run("codex", "borges", "-rc")
-    assert rc == 3, f"expected exit 3 for codex -rc, got rc={rc}"
-    assert not lines, f"expected no stdout on codex -r error path, got: {lines}"
-    assert "remote control" in stderr.lower(), (
-        f"stderr must mention 'remote control' (got: {stderr!r})"
-    )
+    assert rc == 0, f"expected compatible codex -rc, got rc={rc}, stderr={stderr!r}"
+    assert lines == ["codex", "resume", "--last"]
 
 
-def test_exit_3_takes_precedence_over_exit_6():
-    """Codex -rx: codex -r (exit 3) takes precedence over unrecognized alias -x (exit 6)."""
+def test_codex_rx_rejects_the_unrecognized_alias_after_consuming_r():
+    """Codex -rx consumes -r but still rejects unrecognized -x with exit 6."""
     rc, lines, stderr = _run("codex", "borges", "-rx")
-    assert rc == 3, f"expected exit 3 (codex -r precedence), got rc={rc}"
+    assert rc == 6, f"expected exit 6 for unrecognized -x, got rc={rc}"
     assert not lines, f"expected no stdout, got: {lines}"
-    assert "remote control" in stderr.lower(), (
-        f"stderr must mention 'remote control' (got: {stderr!r})"
-    )
+    assert "x" in stderr
 
 
-def test_exit_3_takes_precedence_over_exit_6_reversed():
-    """Codex -xr: codex -r (exit 3) takes precedence over unrecognized alias -x (exit 6)."""
+def test_codex_xr_rejects_the_unrecognized_alias_after_consuming_r():
+    """Codex -xr likewise rejects -x; bundle order does not hide the error."""
     rc, lines, stderr = _run("codex", "borges", "-xr")
-    assert rc == 3, f"expected exit 3 (codex -r precedence), got rc={rc}"
+    assert rc == 6, f"expected exit 6 for unrecognized -x, got rc={rc}"
     assert not lines, f"expected no stdout, got: {lines}"
-    assert "remote control" in stderr.lower(), (
-        f"stderr must mention 'remote control' (got: {stderr!r})"
-    )
+    assert "x" in stderr
 
 
 # ---------------------------------------------------------------------------
@@ -638,3 +611,215 @@ def test_detect_platform_no_override_falls_back_to_default_or_heuristic():
     rc, lines, _ = _detect_platform_as_self()
     assert rc == 0
     assert lines and lines[0] in ("claude", "codex"), f"got: {lines!r}"
+
+# ---------------------------------------------------------------------------
+# Codex daemon-managed tmux topology
+#
+# The Codex path has a no-sudo internal seam. These tests substitute only the
+# external codex/tmux binaries, then exercise the real shell helper end to end:
+# it must ensure and verify the managed daemon before creating the sole tmux
+# TUI, and it must never fall back to a direct local `codex` invocation.
+# ---------------------------------------------------------------------------
+
+
+def _write_daemon_stubs(tmp_path: Path, socket_path: Path) -> tuple[Path, Path, Path]:
+    """Create fake codex/tmux binaries and return (bin_dir, log, tmux_state)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    state = tmp_path / "tmux-running"
+    (bin_dir / "codex").write_text(
+        "#!/bin/bash\n"
+        "set -eu\n"
+        "{ printf 'codex'; printf ' %q' \"$@\"; printf '\\n'; } >> \"$FAKE_LOG\"\n"
+        "if [[ \"${1:-}\" == app-server && \"${2:-}\" == daemon && \"${3:-}\" == start ]]; then exit \"${FAKE_START_RC:-0}\"; fi\n"
+        "if [[ \"${1:-}\" == app-server && \"${2:-}\" == daemon && \"${3:-}\" == version ]]; then\n"
+        "  if [[ \"${FAKE_VERSION_RC:-0}\" != 0 ]]; then printf '%s\\n' \"${FAKE_VERSION_ERR:-Connection refused}\" >&2; exit \"$FAKE_VERSION_RC\"; fi\n"
+        "  if [[ -n \"${FAKE_VERSION_OUTPUT+x}\" ]]; then printf '%s\\n' \"$FAKE_VERSION_OUTPUT\"; else printf '{\\\"socketPath\\\": \\\"%s\\\"}\\n' \"$FAKE_SOCKET\"; fi; exit 0\n"
+        "fi\n"
+        "if [[ \"${1:-}\" == --remote ]]; then printf '%s\\n' \"$PWD\" > \"$FAKE_CODEX_CWD\"; exit 0; fi\n"
+        "printf 'unexpected fake codex invocation\\n' >&2; exit 99\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "tmux").write_text(
+        "#!/bin/bash\n"
+        "set -eu\n"
+        "{ printf 'tmux'; printf ' %q' \"$@\"; printf '\\n'; } >> \"$FAKE_LOG\"\n"
+        "case \"${1:-}\" in\n"
+        "  has-session) test -f \"$FAKE_TMUX_STATE\" ;;\n"
+        "  new-session) touch \"$FAKE_TMUX_STATE\" ;;\n"
+        "  set-option) exit 0 ;;\n"
+        "  attach) exit 0 ;;\n"
+        "  display-message) printf '%s\\n' \"${FAKE_TMUX_NAME:-other-session}\" ;;\n"
+        "  *) printf 'unexpected fake tmux invocation\\n' >&2; exit 98 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    for path in bin_dir.iterdir():
+        path.chmod(0o755)
+    return bin_dir, log, state
+
+
+def _make_unix_socket(path: Path):
+    """Bind a real UDS so the shell helper's -S validation is meaningful."""
+    import socket
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    return sock
+
+
+def _run_managed_codex(
+    tmp_path: Path,
+    *args: str,
+    session_exists: bool = False,
+    start_rc: int = 0,
+    version_rc: int = 0,
+    version_output: str | None = None,
+    socket_is_real: bool = True,
+    inside_managed_tmux: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    socket_path = tmp_path / "app-server-control.sock"
+    sock = _make_unix_socket(socket_path) if socket_is_real else None
+    if not socket_is_real:
+        socket_path.write_text("not a socket", encoding="utf-8")
+    try:
+        bin_dir, log, state = _write_daemon_stubs(tmp_path, socket_path)
+        if session_exists:
+            state.touch()
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_LOG": str(log),
+            "FAKE_SOCKET": str(socket_path),
+            "FAKE_TMUX_STATE": str(state),
+            "FAKE_START_RC": str(start_rc),
+            "FAKE_VERSION_RC": str(version_rc),
+            "FAKE_CODEX_CWD": str(tmp_path / "codex-process-cwd"),
+            **({"TMUX": "/tmp/fake", "FAKE_TMUX_NAME": "agent-mira"} if inside_managed_tmux else {}),
+        }
+        if version_output is not None:
+            env["FAKE_VERSION_OUTPUT"] = version_output
+        proc = subprocess.run(
+            ["bash", str(AGENTCTL), "__codex-managed-session", "mira", "--cwd", str(tmp_path), "--", *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return proc, log.read_text(encoding="utf-8") if log.exists() else ""
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def test_codex_managed_session_starts_daemon_then_one_remote_tmux_tui(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, "--dangerously-bypass-approvals-and-sandbox")
+    assert proc.returncode == 0, proc.stderr
+    lines = calls.splitlines()
+    assert lines[0] == "codex app-server daemon start"
+    assert lines[1] == "codex app-server daemon version"
+    new_session = next(line for line in lines if line.startswith("tmux new-session"))
+    assert "codex\\ --remote\\ unix://" in new_session
+    assert "--dangerously-bypass-approvals-and-sandbox" in new_session
+    assert "tmux set-option -t agent-mira mouse on" in lines
+    assert "tmux attach -t agent-mira" in lines
+    assert not any(line.startswith("codex --remote") for line in lines), calls
+
+
+def test_codex_managed_session_already_running_attaches_without_second_tui(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, session_exists=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "codex app-server daemon version" in calls
+    assert "tmux new-session" not in calls
+    assert "tmux set-option -t agent-mira mouse on" in calls
+    assert "tmux attach -t agent-mira" in calls
+
+
+def test_codex_managed_session_stale_or_unreachable_socket_fails_without_local_fallback(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, version_rc=1)
+    assert proc.returncode != 0
+    assert "managed Codex app-server is unreachable" in proc.stderr
+    assert "do not launch a local TUI" in proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "codex app-server daemon version" in calls
+    assert "tmux" not in calls
+
+
+def test_codex_managed_session_daemon_start_failure_has_no_local_fallback(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, start_rc=1)
+    assert proc.returncode != 0
+    assert "could not ensure the managed Codex app-server" in proc.stderr
+    assert "do not start a local Codex fallback" in proc.stderr
+    assert calls.splitlines() == ["codex app-server daemon start"]
+    assert "tmux" not in calls
+    assert "codex --remote" not in calls
+
+
+def test_codex_managed_session_malformed_or_missing_socket_path_has_no_local_fallback(tmp_path):
+    for index, version_output in enumerate(("not JSON", "{}")):
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        proc, calls = _run_managed_codex(case_dir, version_output=version_output)
+        assert proc.returncode != 0
+        assert "reported no usable socketPath" in proc.stderr
+        assert "codex app-server daemon start" in calls
+        assert "codex app-server daemon version" in calls
+        assert "tmux" not in calls
+        assert "codex --remote" not in calls
+
+
+def test_codex_managed_session_non_socket_path_has_no_local_fallback(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, socket_is_real=False)
+    assert proc.returncode != 0
+    assert "but it is not a Unix socket" in proc.stderr
+    assert "Refusing to launch a separate local Codex TUI" in proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "codex app-server daemon version" in calls
+    assert "tmux" not in calls
+    assert "codex --remote" not in calls
+
+
+def test_codex_managed_session_forwards_resume_arguments_into_remote_tui(tmp_path):
+    proc, calls = _run_managed_codex(
+        tmp_path,
+        "resume",
+        "--last",
+        "--dangerously-bypass-approvals-and-sandbox",
+    )
+    assert proc.returncode == 0, proc.stderr
+    new_session = next(line for line in calls.splitlines() if line.startswith("tmux new-session"))
+    assert "codex\\ --remote\\ unix://" in new_session
+    assert "resume\\ --last\\ --dangerously-bypass-approvals-and-sandbox" in new_session
+
+
+def test_codex_managed_session_rejects_an_explicit_remote_override(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, "--remote", "ws://127.0.0.1:9999")
+    assert proc.returncode == 2
+    assert "explicit --remote is not allowed" in proc.stderr
+    assert "codex app-server" not in calls
+    assert "tmux" not in calls
+
+
+def test_codex_autostart_pane_reuses_its_managed_tmux_without_nesting(tmp_path):
+    proc, calls = _run_managed_codex(
+        tmp_path,
+        "resume",
+        "--last",
+        inside_managed_tmux=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "tmux new-session" not in calls
+    assert "tmux attach" not in calls
+    assert "tmux display-message -p" in calls
+    assert "tmux set-option -t agent-mira mouse on" in calls
+    assert any(line.startswith("codex --remote unix://") and "resume --last" in line for line in calls.splitlines())
+    assert (tmp_path / "codex-process-cwd").read_text(encoding="utf-8").strip() == str(tmp_path)
+
+
+def test_codex_managed_session_rejects_new_resume_args_against_live_tui(tmp_path):
+    proc, calls = _run_managed_codex(tmp_path, "resume", "--last", session_exists=True)
+    assert proc.returncode != 0
+    assert "already running; cannot apply new session/resume arguments" in proc.stderr
+    assert "tmux new-session" not in calls
+    assert "tmux attach" not in calls

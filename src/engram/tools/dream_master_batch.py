@@ -354,17 +354,42 @@ def fetch_safety_row(conn: Any, node_id: str) -> "dict | None":
 
     Args:
         conn:    A sqlite3.Connection (or compatible) to the ENGRAM knowledge.db.
+                 Works regardless of the connection's ``row_factory`` — a
+                 default connection (rows as tuples) and a
+                 ``sqlite3.Row``-factory connection both return an equivalent
+                 dict.  The dict is built locally from the cursor's own
+                 ``description`` rather than relying on ``dict(row)``, which
+                 only works when the connection already uses
+                 ``sqlite3.Row`` and raises ``TypeError`` on a plain tuple.
         node_id: The node ID to look up.
 
     Returns:
         dict with keys ``is_current``, ``status``, ``superseded_by`` if the
-        node exists, or None if the node is not found.
+        node exists, or None if the node is not found. A missing node is a
+        distinct outcome from a fetch failure: any error from the query
+        itself (bad connection, missing table, …) propagates as an
+        exception rather than being folded into ``None`` — collapsing the
+        two would let a broken connection masquerade as a normal "node not
+        found" result, which is exactly the silent-on-the-dangerous-path
+        failure this helper exists to avoid feeding into
+        ``check_snapshot_divergence``.
     """
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT is_current, status, superseded_by FROM nodes WHERE id = ?",
         (node_id,),
-    ).fetchone()
-    return dict(row) if row else None
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        # An exotic dict-returning row_factory: tuple(row) would yield the
+        # KEYS, silently returning column names as pseudo-values — the exact
+        # silent-wrong-answer class this helper exists to avoid. Take the
+        # dict as-is instead. (No in-repo caller uses such a factory today;
+        # reviewer-constructed edge case, PR #2091.)
+        return dict(row)
+    columns = [col[0] for col in cursor.description]
+    return dict(zip(columns, tuple(row)))
 
 
 # ---------------------------------------------------------------------------

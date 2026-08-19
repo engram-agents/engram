@@ -1,7 +1,7 @@
 # Spawn-flow test harness
 
 Validates V1 §3.3 (Phase 5 spawn-flow real-world validation): runs
-`agentctl spawn` end-to-end inside a clean Ubuntu 22.04 container, then
+`agentctl spawn` end-to-end inside a clean Ubuntu 24.04 container, then
 verifies the newborn agent is correctly created, install.sh runs cleanly
 under the newborn uid, and `agentctl finalize-name` completes the rename.
 

@@ -1,6 +1,6 @@
 """Shared helpers for the ENGRAM prompt hooks (gh#1657).
 
-SSoT for two concerns genuinely duplicated, byte-for-byte, across hooks:
+SSoT for three concerns genuinely duplicated, byte-for-byte, across hooks:
 
 1. Resolving `tools/` across the two build topologies this repo ships in
    (baton + inter-agent + forum prompt hooks).
@@ -12,6 +12,12 @@ SSoT for two concerns genuinely duplicated, byte-for-byte, across hooks:
    made the liveness probe permanently report healthy on any multi-agent
    host: the bare "server.py" substring matches every agent's server process
    (and any unrelated *_server.py), not just this agent's own.
+3. Atomic JSON state writes for hook state files (gh#2035) -- see
+   atomic_write_json below. Hooks run under a 5s harness timeout and are
+   killed on overrun, and are also fail-soft by design, so a torn write is
+   read as an absent file and the hook silently reseeds rather than erroring.
+   See docs/DEVELOPMENT.md's "Writing JSON state in a hook" section for the
+   full convention text.
 
 Why this exists (CLAUDE.md "Plugin build restructures code paths"): the
 plugin build FLATTENS `hooks/claude/*` -> `hooks/*`, so a hook sees `tools/`
@@ -36,8 +42,10 @@ don't have -- exactly the "big bang" gh#1657 explicitly asks to avoid.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -144,9 +152,83 @@ def is_own_server_py_running(engram_home: str) -> bool:
 
     try:
         server_path = resolve_own_server_py_path(engram_home)
+        # #2029 inventory: could this match the invoking process? No -- the
+        # invoking process is a hook script, never a "server.py" path in its
+        # own argv. Could it match a co-tenant's process? server_path is an
+        # absolute path under THIS agent's own resolve_own_server_py_path
+        # result (per-home), so a co-tenant's equivalent process carries a
+        # different absolute path string, and pgrep -f's match is an
+        # unescaped-ERE substring search -- a co-tenant path that happened
+        # to differ from this one only at an ERE metachar position could in
+        # theory match. In practice, distinct agent-home paths (different
+        # usernames/directories) make that collision implausible, not
+        # impossible.
         result = subprocess.run(
             ["pgrep", "-f", server_path], capture_output=True, timeout=2
         )
         return result.returncode == 0
     except Exception:
         return False
+
+
+def atomic_write_json(path, data, *, indent=None, encoding=None):
+    """Write JSON atomically: build in a temp file in the SAME directory,
+    then os.replace() over the destination.
+
+    **Writing JSON state in a hook.** Hook state files are written
+    atomically: build the content in a temp file in the same directory, then
+    os.replace() it over the destination. Use this helper; do not hand-roll
+    it.
+
+    Why: hooks in `src/engram/hooks/claude/` run under a 5s harness timeout
+    and are killed on overrun, so a plain truncate-and-write can leave a
+    partial file. Hooks are also fail-soft by design, so the next run
+    treats a corrupt file as an ABSENT one and silently reseeds -- the hook
+    keeps running and quietly stops working. There is no error to notice.
+    Atomicity is what makes that failure impossible rather than merely
+    unlikely.
+
+    Same-directory temp matters: os.replace() is only atomic within one
+    filesystem.
+
+    Mode note: because os.replace() swaps in the temp file's inode, this
+    also changes the destination file's mode to 0600 (mkstemp's default)
+    regardless of what mode it had before -- for every call site, not only
+    the two excluded below. This is why those two exclusions exist, not a
+    coincidental detail about one of them.
+
+    Fails loud: exceptions propagate to the caller. Each hook already has
+    its own `except Exception: pass` discipline and its own view of what a
+    failed write means -- a helper that swallowed silently would make a
+    FAILED write indistinguishable from a successful one, which is the
+    exact class of silence this whole convention exists to prevent.
+
+    On any exception during the write, the temp file is cleaned up before
+    re-raising; the destination is never touched until the temp write has
+    fully succeeded.
+
+    `indent` and `encoding` are passed straight through to `json.dump` /
+    the temp file's `open` mode respectively -- extend the signature to fit
+    a call site's real need (e.g. an existing `encoding="utf-8"` write)
+    rather than working around a mismatch with a post-write patch.
+
+    NOT for every write in this codebase. Two documented exceptions exist
+    and must NOT be converted to this helper (see docs/DEVELOPMENT.md /
+    the module docstrings at their call sites for why):
+      - src/engram/viz_server.py's config.json write (os.replace() there
+        would strip the agent's ownership of its own config -- #372).
+      - forum/coordination/store_file.py (needs 0644, not mkstemp's 0600,
+        because the store is read by other agents).
+    """
+    d = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=d, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            json.dump(data, f, indent=indent)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise

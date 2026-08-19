@@ -11,10 +11,16 @@ Test categories:
 Follows the tmp_path + subprocess.run([sys.executable, str(CLI_PATH)] + args,
 capture_output=True, text=True, timeout=...) idiom used in test_ia_cli.py.
 
-The fixture builds a minimal throwaway git repo in tmp_path containing only the two
-template source files that check-claude-md-drift.py reads:
-  src/engram/templates/template.CLAUDE.md
+The fixture builds a minimal throwaway git repo in tmp_path containing both template
+files that used to feed the render:
+  src/engram/templates/template.CLAUDE.md   (the sole CLAUDE_RENDER_SOURCES entry now)
   src/engram/templates/compact-instructions.md
+
+compact-instructions.md is kept in the fixture (rather than dropped) specifically to
+back test_compact_instructions_change_exits_0 below — the positive regression guard
+that a compact-instructions.md-only change is now correctly invisible to this tool
+(engram-alpha#2067: it no longer feeds the Claude render; see
+docs/compaction-continuity.md).
 
 The script imports template_render from its own source tree (resolved from __file__),
 so the fixture only needs the template content at the git refs — the render logic
@@ -141,6 +147,34 @@ class TestNoDrift:
         assert rc == 0, f"Expected exit 0 (no drift); stderr: {stderr}"
         assert stdout == "", f"Expected empty stdout; got: {stdout!r}"
 
+    def test_compact_instructions_change_exits_0(self, git_repo: Path, tmp_path: Path):
+        """Changing compact-instructions.md alone → exit 0, no drift.
+
+        Retargeted from the old `TestDriftDetected.test_compact_instructions_change_exits_1`
+        (engram-alpha#2067): compact-instructions.md is no longer folded into the
+        Claude render — CLAUDE_RENDER_SOURCES is now just ["template.CLAUDE.md"]
+        (compact-instructions.md is Codex-only, see docs/compaction-continuity.md).
+        A compact-instructions.md-only change is therefore correctly invisible to
+        this tool now; this is a positive regression guard for that new invariant,
+        not just an "unrelated file" case like test_two_identical_commits_exits_0.
+        """
+        base_result = _git(git_repo, "rev-parse", "HEAD")
+        base_sha = base_result.stdout.strip()
+
+        # Mutate the compact-instructions file (no longer part of the Claude render)
+        templates_dir = git_repo / "src" / "engram" / "templates"
+        new_compact = _COMPACT_CONTENT + "\nAn additional compact instruction.\n"
+        (templates_dir / "compact-instructions.md").write_text(new_compact, encoding="utf-8")
+        _git(git_repo, "add", ".")
+        _git(git_repo, "commit", "-m", "add compact instruction")
+
+        rc, stdout, stderr = _run_drift(git_repo, base_sha, "HEAD")
+        assert rc == 0, (
+            f"Expected exit 0 (compact-instructions.md no longer feeds the Claude "
+            f"render); got rc={rc}. stdout: {stdout!r}, stderr: {stderr!r}"
+        )
+        assert stdout == "", f"Expected empty stdout; got: {stdout!r}"
+
 
 # ---------------------------------------------------------------------------
 # Tests: exit 1 — drift detected (this is the mutation guard)
@@ -173,30 +207,6 @@ class TestDriftDetected:
         # The changed text must appear in the diff
         assert "A new section added in head" in stdout, (
             f"Expected changed text in diff; got: {stdout!r}"
-        )
-
-    def test_compact_instructions_change_exits_1(self, git_repo: Path, tmp_path: Path):
-        """Changing compact-instructions.md in the head commit → exit 1, diff on stdout."""
-        base_result = _git(git_repo, "rev-parse", "HEAD")
-        base_sha = base_result.stdout.strip()
-
-        # Mutate the compact-instructions file (this is folded into the render)
-        templates_dir = git_repo / "src" / "engram" / "templates"
-        new_compact = _COMPACT_CONTENT + "\nAn additional compact instruction.\n"
-        (templates_dir / "compact-instructions.md").write_text(new_compact, encoding="utf-8")
-        _git(git_repo, "add", ".")
-        _git(git_repo, "commit", "-m", "add compact instruction")
-
-        rc, stdout, stderr = _run_drift(git_repo, base_sha, "HEAD")
-        assert rc == 1, (
-            f"Expected exit 1 (drift detected from compact change); got rc={rc}. "
-            f"stdout: {stdout!r}, stderr: {stderr!r}"
-        )
-        assert "---" in stdout or "+++" in stdout, (
-            f"Expected unified diff in stdout; got: {stdout!r}"
-        )
-        assert "An additional compact instruction" in stdout, (
-            f"Expected changed compact text in diff; got: {stdout!r}"
         )
 
 

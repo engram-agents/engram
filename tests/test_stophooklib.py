@@ -21,6 +21,10 @@ MODULE_PATH = (
     Path(__file__).parent.parent
     / "src" / "engram" / "hooks" / "claude" / "_stophooklib.py"
 )
+HOOKLIB_PATH = (
+    Path(__file__).parent.parent
+    / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+)
 
 
 def _load_module():
@@ -377,6 +381,11 @@ def test_stophooklib_importable_in_flattened_deployed_topology(tmp_path, monkeyp
     root = tmp_path / "engram"
     (root / "hooks").mkdir(parents=True)
     (root / "hooks" / "_stophooklib.py").write_text(MODULE_PATH.read_text())
+    # _stophooklib.py imports _hooklib.py (gh#2035's atomic_write_json) --
+    # the plugin build flattens BOTH into the same hooks/ dir alongside each
+    # other (see this repo's CLAUDE.md "Plugin build restructures code
+    # paths"), so the real deployed topology always has them co-located.
+    (root / "hooks" / "_hooklib.py").write_text(HOOKLIB_PATH.read_text())
 
     import subprocess
 

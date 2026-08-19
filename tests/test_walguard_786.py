@@ -1585,3 +1585,339 @@ class TestReadMarkStatementActuallyHoldsMark:
             f"constant-expression queries — re-evaluate whether 'SELECT 1' "
             f"now acquires a WAL read mark."
         )
+
+
+# ---------------------------------------------------------------------------
+# 13. #1947 slice A/B — recovery guidance: marker + banner share one source
+# ---------------------------------------------------------------------------
+
+class TestRecoveryGuidanceSharedSource:
+    """The marker's structured "recovery" block and the prose banner/log text
+    are built from the same module-level constants in engram_walguard, so
+    they can never drift out of sync (#1947 slices A/B).
+    """
+
+    def test_marker_carries_well_formed_recovery_block(self, tmp_path):
+        data_dir = str(tmp_path)
+        detection = {"reason": "shm_deleted", "fd": 1}
+        engram_walguard.write_degraded_marker(data_dir, detection)
+        marker = engram_walguard.read_degraded_marker(data_dir)
+
+        assert marker is not None
+        assert "recovery" in marker, f"'recovery' key missing from marker; keys={list(marker)}"
+        recovery = marker["recovery"]
+        assert isinstance(recovery, dict)
+
+        assert isinstance(recovery.get("condition"), str) and recovery["condition"], (
+            f"recovery.condition must be a non-empty string; got {recovery.get('condition')!r}"
+        )
+        assert isinstance(recovery.get("steps"), list) and recovery["steps"], (
+            f"recovery.steps must be a non-empty list; got {recovery.get('steps')!r}"
+        )
+        assert all(isinstance(s, str) and s for s in recovery["steps"]), (
+            f"every recovery.steps entry must be a non-empty string; got {recovery['steps']!r}"
+        )
+        assert isinstance(recovery.get("verify"), str) and recovery["verify"], (
+            f"recovery.verify must be a non-empty string; got {recovery.get('verify')!r}"
+        )
+        assert recovery.get("issue") == "https://github.com/engram-agents/engram/issues/786"
+
+    def test_banner_and_marker_recovery_share_one_constant_source(self, tmp_path):
+        """The banner/log prose (recovery_banner_text) and the marker's
+        structured block (recovery_block, embedded via write_degraded_marker)
+        are built from the identical _RECOVERY_STEPS / _RECOVERY_CONDITION /
+        _RECOVERY_VERIFY / _RECOVERY_ISSUE_URL constants — so every step listed
+        in the marker also appears, verbatim, in the prose banner text.
+        """
+        data_dir = str(tmp_path)
+        engram_walguard.write_degraded_marker(data_dir, {"reason": "shm_deleted", "fd": 1})
+        marker = engram_walguard.read_degraded_marker(data_dir)
+        recovery = marker["recovery"]
+
+        banner_text = engram_walguard.recovery_banner_text()
+
+        # Same condition / verify / issue constants back both surfaces.
+        assert recovery["condition"] == engram_walguard._RECOVERY_CONDITION
+        assert recovery["verify"] == engram_walguard._RECOVERY_VERIFY
+        assert recovery["issue"] == engram_walguard._RECOVERY_ISSUE_URL
+        assert recovery["steps"] == engram_walguard._RECOVERY_STEPS
+
+        # Every step in the structured block appears verbatim in the prose text.
+        for step in recovery["steps"]:
+            assert step in banner_text, (
+                f"recovery step {step!r} not found verbatim in recovery_banner_text() "
+                f"output: {banner_text!r} — banner and marker have drifted apart."
+            )
+
+    def test_banner_names_every_holder(self):
+        """recovery_banner_text() names BOTH long-lived holders (MCP server AND
+        the surface daemon), not just the MCP server — the #1947 regression:
+        the old wording named only the MCP server and the operator's restart
+        of it alone did not recover the seat.
+        """
+        text = engram_walguard.recovery_banner_text()
+        assert "mcp" in text.lower(), f"MCP server restart missing from recovery text: {text!r}"
+        assert "surface daemon" in text.lower() or "recall-daemon" in text.lower(), (
+            f"surface daemon not named in recovery text: {text!r}"
+        )
+        assert "verify" in text.lower() or "VERIFY" in text, (
+            f"no verify step in recovery text: {text!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 14. #1947 slice D — recovery dump re-fires at _walguard_startup_clear time
+# ---------------------------------------------------------------------------
+
+class TestRecoveryDumpAtStartupClear:
+    """_walguard_startup_clear commits a "recovery"-mode snapshot immediately
+    before clearing the marker, and never lets a dump failure block the clear
+    or escape as an exception (#1947 slice D).
+    """
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_walguard_recdump_"))
+        for key in list(sys.modules):
+            if key == "server" or (key.startswith("engram_") and key != "engram_walguard"):
+                del sys.modules[key]
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        os.environ["ENGRAM_NO_DB_GUARDS"] = "1"
+        import server
+        server._configure_paths(self.tmp)
+        server._ensure_data_dir()
+        self.server = server
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_healthy_db(self) -> sqlite3.Connection:
+        db_path = self.tmp / "knowledge.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS nodes ("
+            "id TEXT PRIMARY KEY, type TEXT NOT NULL, claim TEXT, "
+            "created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00', "
+            "is_current INTEGER DEFAULT 1, confidence REAL, "
+            "importance_base REAL DEFAULT 0.5, importance_score REAL DEFAULT 0.5, "
+            "recall_turn INTEGER DEFAULT 0, recall_count INTEGER DEFAULT 0, "
+            "memory_status TEXT DEFAULT 'active', utility_score REAL DEFAULT 0.0, "
+            "metadata TEXT DEFAULT '{}', embedding TEXT)"
+        )
+        conn.commit()
+        return conn
+
+    def test_recovery_dump_fires_with_mode_recovery_before_clear(self):
+        """A snapshot tagged mode="recovery" is committed before the marker is
+        cleared on a healthy restart."""
+        conn = self._make_healthy_db()
+        try:
+            engram_walguard.write_degraded_marker(
+                str(self.tmp), {"reason": "shm_deleted", "fd": 1}
+            )
+
+            calls = []
+
+            def spy_commit_snapshot(conn_arg, message, mode, skip_checkpoint=False):
+                calls.append({"mode": mode, "skip_checkpoint": skip_checkpoint})
+                return {"git_committed": True, "commit_sha": "recoverysha"}
+
+            with mock.patch("engram_walguard.detect_shm_displacement", return_value=None), \
+                 mock.patch.object(
+                     self.server.core, "_commit_snapshot", side_effect=spy_commit_snapshot
+                 ):
+                self.server._walguard_startup_clear(conn)
+
+            recovery_calls = [c for c in calls if c["mode"] == "recovery"]
+            assert len(recovery_calls) == 1, (
+                f"expected exactly one mode='recovery' _commit_snapshot call; "
+                f"got calls={calls}"
+            )
+            # Marker still present at dump time → the degraded-marker override
+            # forces skip_checkpoint regardless; matches the emergency call
+            # site's explicit skip_checkpoint=True.
+            assert recovery_calls[0]["skip_checkpoint"] is True
+
+            # Marker is still cleared afterwards.
+            assert engram_walguard.read_degraded_marker(str(self.tmp)) is None
+        finally:
+            conn.close()
+
+    def test_recovery_dump_raising_does_not_block_clear_or_escape(self):
+        """If the recovery-dump call raises, _walguard_startup_clear still
+        clears the marker and does not let the exception escape."""
+        conn = self._make_healthy_db()
+        try:
+            engram_walguard.write_degraded_marker(
+                str(self.tmp), {"reason": "shm_deleted", "fd": 1}
+            )
+
+            def raising_commit_snapshot(*args, **kwargs):
+                raise RuntimeError("simulated recovery-dump failure")
+
+            with mock.patch("engram_walguard.detect_shm_displacement", return_value=None), \
+                 mock.patch.object(
+                     self.server.core, "_commit_snapshot", side_effect=raising_commit_snapshot
+                 ):
+                try:
+                    self.server._walguard_startup_clear(conn)
+                except Exception as e:
+                    pytest.fail(
+                        f"_walguard_startup_clear raised despite its never-raises "
+                        f"contract: {e!r}"
+                    )
+
+            assert engram_walguard.read_degraded_marker(str(self.tmp)) is None, (
+                "marker must still be cleared even when the recovery dump raises"
+            )
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 15. #1947 slice E — write tools carry the degraded banner too
+# ---------------------------------------------------------------------------
+
+class TestWriteToolCarriesWalguardWarning:
+    """A write-tool response carries `_walguard_warning` when a degraded
+    marker is present, and does not when absent (#1947 slice E). Attaching
+    the banner does NOT change write behaviour — the write still succeeds;
+    this only ensures the caller is told.
+    """
+
+    def setup_method(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="engram_test_walguard_writetool_"))
+        for key in list(sys.modules):
+            if key == "server" or (key.startswith("engram_") and key != "engram_walguard"):
+                del sys.modules[key]
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        os.environ["ENGRAM_NO_DB_GUARDS"] = "1"
+        import server
+        server._configure_paths(self.tmp)
+        server._ensure_data_dir()
+        server.core._git_available = True
+        self.server = server
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_minimal_db(self) -> sqlite3.Connection:
+        db_path = self.tmp / "knowledge.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS nodes (
+                id TEXT PRIMARY KEY, type TEXT NOT NULL, claim TEXT,
+                created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00',
+                source_url TEXT, source_title TEXT, source_domain TEXT,
+                source_date TEXT, source_accessed TEXT, content_snippet TEXT,
+                evidence_id TEXT, quoted_text TEXT, interpretation TEXT, quote_type TEXT,
+                predicted_event TEXT, resolution_timeframe TEXT,
+                status TEXT DEFAULT 'active', resolved_by TEXT,
+                logical_chain TEXT, confidence REAL, confidence_history TEXT DEFAULT '[]',
+                supersedes TEXT, superseded_by TEXT, is_current INTEGER DEFAULT 1,
+                metadata TEXT DEFAULT '{}', importance_base REAL DEFAULT 0.5,
+                importance_score REAL DEFAULT 0.5, recall_turn INTEGER DEFAULT 0,
+                recall_count INTEGER DEFAULT 0, memory_status TEXT DEFAULT 'active',
+                utility_score REAL DEFAULT 0.0, embedding TEXT
+            );
+            CREATE TABLE IF NOT EXISTS edges (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT NOT NULL, target_id TEXT NOT NULL,
+                relation TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00',
+                UNIQUE(source_id, target_id, relation)
+            );
+            CREATE TABLE IF NOT EXISTS sequences (
+                node_type TEXT PRIMARY KEY, last_num INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        conn.execute(
+            "INSERT OR IGNORE INTO nodes (id, type, claim, created_at) "
+            "VALUES ('ax_0001', 'axiom', 'test axiom', '2026-01-01T00:00:00')"
+        )
+        conn.commit()
+        conn.close()
+        return self.server._get_db()
+
+    def _write_degraded_marker(self):
+        engram_walguard.write_degraded_marker(
+            str(self.tmp), {"reason": "shm_deleted", "fd": 42}
+        )
+
+    def test_add_goal_carries_warning_when_degraded(self):
+        """engram_add_goal (a write tool) carries _walguard_warning when a
+        degraded marker is present, and the write still succeeds."""
+        import json as _json
+        self._make_minimal_db()
+        self._write_degraded_marker()
+
+        raw = self.server.engram_add_goal(
+            _json.dumps({
+                "claim": "walguard slice-E test goal",
+                "motivation": "verifying the write-tool banner attaches under #1947 slice E",
+            })
+        )
+        parsed = _json.loads(raw)
+        assert "_walguard_warning" in parsed, (
+            f"_walguard_warning missing from engram_add_goal response; keys={list(parsed)}"
+        )
+        assert "SUBSTRATE DEGRADED" in parsed["_walguard_warning"]
+        # Scope limit: the write itself must still succeed (not refused/queued).
+        assert parsed.get("error") is None, (
+            f"write must not be refused/failed under a degraded marker; got {parsed}"
+        )
+
+    def test_add_goal_no_warning_when_healthy(self):
+        """Without a degraded marker, _walguard_warning is absent from the
+        same write tool's response."""
+        import json as _json
+        self._make_minimal_db()
+        # No marker written.
+
+        raw = self.server.engram_add_goal(
+            _json.dumps({"description": "walguard slice-E healthy-path test goal"})
+        )
+        parsed = _json.loads(raw)
+        assert "_walguard_warning" not in parsed, (
+            f"_walguard_warning should be absent with no degraded marker; got {parsed}"
+        )
+
+    def test_set_person_lineage_carries_warning_when_degraded(self):
+        """engram_set_person_lineage — a write tool whose `return` statement
+        spans multiple lines — also carries _walguard_warning. Regression
+        test: this tool (along with engram_update_person, engram_set_trust_tier,
+        engram_update_lesson) was initially missed because its call site is a
+        multiline `return _trust_mod._set_person_lineage_impl(...)` rather than
+        the single-line `return _xxx_impl(**params)` pattern most other write
+        tools use."""
+        import json as _json
+        self._make_minimal_db()
+        self._write_degraded_marker()
+
+        raw = self.server.engram_set_person_lineage(
+            _json.dumps({"model_id": "claude-sonnet-4-6"})
+        )
+        parsed = _json.loads(raw)
+        assert "_walguard_warning" in parsed, (
+            f"_walguard_warning missing from engram_set_person_lineage response; "
+            f"keys={list(parsed)}"
+        )
+        assert "SUBSTRATE DEGRADED" in parsed["_walguard_warning"]
+
+    def test_attach_walguard_banner_helper_is_idempotent_on_non_dict(self):
+        """_attach_walguard_banner() returns malformed/non-dict JSON unchanged
+        rather than raising — a defensive property of the shared helper."""
+        self._make_minimal_db()
+        self._write_degraded_marker()
+
+        # A JSON array (not a dict) — banner cannot be attached; must be
+        # returned unchanged, not raise.
+        import json as _json
+        arr = _json.dumps([1, 2, 3])
+        result = self.server._attach_walguard_banner(arr)
+        assert result == arr
+
+        # Malformed JSON — must be returned unchanged, not raise.
+        malformed = "{not valid json"
+        result2 = self.server._attach_walguard_banner(malformed)
+        assert result2 == malformed

@@ -12,6 +12,10 @@
 # Added v0.3 (spawn flow — multi-agent newborn lifecycle, v0.1 minimum):
 #   spawn    finalize-name
 #
+# os-harness-check: linux-only  (bash 4.3+ namerefs/mapfile/case-mod are
+#   intentional here and MUST NOT be "portability-fixed" — see the macOS note
+#   directly below. The macOS path is tools/agentctl-mac, which IS scanned.)
+#
 # macOS: this tool assumes a multi-agent Linux host (per-agent "agent-<name>"
 # users, sudo user-switch, ACL sharing) and does not run there. For a Mac
 # host running exactly one agent, see the sibling tools/agentctl-mac — a
@@ -23,13 +27,11 @@
 #   agentctl health                      # health table for all agents
 #   agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>]
 #                            [--as-self] [...]
-#                                        # interactive session as agent; executes
-#                                        # the platform binary (claude or codex)
-#                                        # directly. Platform auto-detected from
-#                                        # baked profile or binary heuristic.
-#                                        # --local is deprecated (no-op with notice).
-#                                        # tmux and other multiplexers are the
-#                                        # operator's own affair.
+#                                        # interactive session as agent. Claude executes
+#                                        # directly; Codex uses the agent's managed
+#                                        # app-server and one named tmux TUI.
+#                                        # Platform auto-detected from baked profile
+#                                        # or binary heuristic. --local is deprecated.
 #                                        # --as-self: skip the sudo/user-switch
 #                                        #   entirely — for use INSIDE a systemd
 #                                        #   unit (or any shell) that is already
@@ -47,17 +49,16 @@
 #                                        #   No single-dash arg ever passes through raw.
 #                                        #   Bare - (stdin) passes as a non-flag arg.
 #                                        # Recognized aliases:
-#                                        #   -c  claude:--continue  codex:subcommand transform
+#                                        #   -c  claude:--continue  codex:resume managed daemon's latest thread
 #                                        #   -d  claude:--dangerously-skip-permissions
 #                                        #       codex:--dangerously-bypass-approvals-and-sandbox
 #                                        #   -r  claude:--remote-control <agent>
-#                                        #       codex: error (remote control unavailable)
+#                                        #       codex: silently ignored (remote control unavailable)
 #                                        # Double-dash flags and non-flag args pass through verbatim.
-#   agentctl attach <agent> [-r]         # attach your terminal to the agent's tmux
-#                                        # session (agent-<name>, e.g. a boot-time
-#                                        # auto-start session) and interact with the
-#                                        # CLI normally. Detach: Ctrl-b d (session
-#                                        # keeps running). -r = read-only observe.
+#   agentctl attach <agent> [-r]         # attach your terminal to the agent's sole
+#                                        # tmux session (agent-<name>). Codex's TUI
+#                                        # there is connected to its managed daemon.
+#                                        # Detach: Ctrl-b d. -r = read-only observe.
 #   agentctl bash <agent>                # plain bash shell as agent (no CLI)
 #   sudo agentctl share <agent> <path> [--mode rw|ro] [--ttl <duration>]
 #                                        # grant agent ACL access to operator-side path;
@@ -301,7 +302,7 @@ _parse_session_flags() {
                 _psf_platform="$2"; shift 2 ;;
             --platform=*) _psf_platform="${1#--platform=}"; shift ;;
             --local)
-                echo "(--local is deprecated: sessions are always direct now)" >&2
+                echo "(--local is deprecated: agentctl selects the platform-managed session topology)" >&2
                 shift ;;
             --no-share) _psf_no_share=1; shift ;;
             --as-self) _psf_as_self=1; shift ;;
@@ -329,9 +330,6 @@ _parse_session_flags() {
 # per-line protocol cannot carry either (empty args are silently stripped by
 # command substitution; newline-args would split into multiple words on the
 # read side). Rejection is loud and early.
-# Returns exit 3 if codex -r is requested (remote control unavailable).
-#   Precedence: exit 3 takes priority over exit 6 when a bundle contains both
-#   an unrecognized char and -r on codex (codex -r is the more specific error).
 # Returns exit 6 if any single-dash arg contains an unrecognized alias char.
 #   Error names the offending char and the original arg on stderr.
 #
@@ -358,7 +356,7 @@ _parse_session_flags() {
 #   -d  claude → --dangerously-skip-permissions            (deduped)
 #       codex  → --dangerously-bypass-approvals-and-sandbox (deduped)
 #   -r  claude → --remote-control <agent_name>  (two words, deduped)
-#       codex  → error to stderr, return 3
+#       codex  → silently ignored (remote control unavailable)
 # Bundles are split first, then each char is expanded by the rules above.
 # Dedup across a bundle works identically to dedup across separate flags.
 #
@@ -396,7 +394,6 @@ _expand_session_args() {
     local base_cmd="$platform"
     local use_resume=0   # codex -c subcommand transform flag
     local extra_args=()
-    local has_error=0     # set to 1 on codex -r (exit 3)
     local has_bad_alias=0 # set to 1 on unrecognized single-char alias (exit 6)
 
     # First pass: collect flags, detect -c (anywhere, including inside bundles)
@@ -439,7 +436,7 @@ _expand_session_args() {
 
     _expand_one_alias() {
         # Expand a single alias char for the current platform/agent.
-        # Modifies outer-scope variables: extra_args, has_error, has_bad_alias,
+        # Modifies outer-scope variables: extra_args, has_bad_alias,
         # skip_c_done, seen_d, seen_r.  Takes: char, original_arg.
         local ch="$1" orig_arg="$2"
         case "$ch" in
@@ -471,8 +468,7 @@ _expand_session_args() {
                         seen_r=1
                     fi
                 else
-                    printf '%s\n' "remote control is not available for codex agents (drop -r)" >&2
-                    has_error=1
+                    : # Codex has no agentctl remote-control equivalent; consume -r for compatibility.
                 fi
                 ;;
             *)
@@ -501,10 +497,6 @@ _expand_session_args() {
         fi
     done
 
-    # Exit code precedence: codex -r (exit 3) > unrecognized alias (exit 6).
-    if [[ $has_error -eq 1 ]]; then
-        return 3
-    fi
     if [[ $has_bad_alias -eq 1 ]]; then
         return 6
     fi
@@ -531,19 +523,144 @@ _expand_session_args() {
     done
 }
 
+# _codex_daemon_socket: ensure the current user's *managed* Codex daemon is
+# running, then prove that its control socket is usable. `daemon start` is the
+# vendor's idempotent start operation; this wrapper never invokes restart,
+# stop, kill, or signal. A stale socket is deliberately fatal: falling back to
+# `codex` locally would create an unrelated app-server/thread and strand the
+# wake watcher on the old endpoint.
+_codex_daemon_socket() {
+    local start_output version_output socket_path
+    if ! start_output="$(codex app-server daemon start 2>&1)"; then
+        echo "ERROR: could not ensure the managed Codex app-server daemon is running." >&2
+        [[ -n "$start_output" ]] && printf '       %s\n' "$start_output" >&2
+        echo "       Run 'codex app-server daemon version' as this agent for details; do not start a local Codex fallback." >&2
+        return 1
+    fi
+
+    if ! version_output="$(codex app-server daemon version 2>&1)"; then
+        echo "ERROR: managed Codex app-server is unreachable after daemon start." >&2
+        [[ -n "$version_output" ]] && printf '       %s\n' "$version_output" >&2
+        echo "       The control socket may be stale. Inspect it with 'codex app-server daemon version'; do not launch a local TUI." >&2
+        return 1
+    fi
+
+    socket_path="$(python3 -c '
+import json, sys
+try:
+    value = json.loads(sys.stdin.read()).get("socketPath")
+except Exception:
+    value = None
+if isinstance(value, str) and value:
+    print(value)
+else:
+    raise SystemExit(1)
+' <<<"$version_output")" || {
+        echo "ERROR: managed Codex app-server reported no usable socketPath." >&2
+        echo "       Output: $version_output" >&2
+        return 1
+    }
+    if [[ ! -S "$socket_path" ]]; then
+        echo "ERROR: managed Codex app-server reported '$socket_path', but it is not a Unix socket." >&2
+        echo "       Refusing to launch a separate local Codex TUI." >&2
+        return 1
+    fi
+    printf '%s\n' "$socket_path"
+}
+
+# _codex_managed_session: run as the target agent user. There is exactly one
+# human-facing Codex TUI per agent: tmux `agent-<name>`, connected remotely to
+# that user's daemon control socket. This is also the topology consumed by the
+# autonomous wake bridge. If the tmux session already exists, attach instead of
+# creating another TUI; arguments are rejected because applying a new resume or
+# prompt to an already-live UI would be ambiguous and silently lossy.
+_codex_managed_session() {
+    local name="${1:-}"; shift || true
+    [[ -n "$name" ]] || { echo "Usage: agentctl __codex-managed-session <agent> [--cwd <dir>] -- [codex args...]" >&2; return 2; }
+
+    local cwd="$HOME"
+    if [[ "${1:-}" == "--cwd" ]]; then
+        [[ -n "${2:-}" ]] || { echo "ERROR: --cwd requires a directory" >&2; return 2; }
+        cwd="$2"; shift 2
+    fi
+    [[ "${1:-}" == "--" ]] || { echo "ERROR: internal Codex session arguments require -- separator" >&2; return 2; }
+    shift
+    [[ -d "$cwd" ]] || { echo "ERROR: Codex session cwd '$cwd' is not a directory" >&2; return 1; }
+    local requested_arg
+    for requested_arg in "$@"; do
+        case "$requested_arg" in
+            --remote|--remote=*)
+                echo "ERROR: explicit --remote is not allowed for managed Codex sessions." >&2
+                echo "       agentctl uses this agent's verified daemon socket; use 'agentctl attach $name' instead." >&2
+                return 2
+                ;;
+        esac
+    done
+
+    local socket_path
+    socket_path="$(_codex_daemon_socket)" || return 1
+    local tmux_session="agent-${name}"
+
+    # The boot runner already owns the intended tmux pane. Replace that pane's
+    # shell with the remote TUI rather than attaching tmux to itself.
+    if [[ -n "${TMUX:-}" ]] && [[ "$(tmux display-message -p '#S' 2>/dev/null || true)" == "$tmux_session" ]]; then
+        # Keep terminal-wheel scrolling on the TUI's output instead of
+        # forwarding wheel events to Codex's input-history navigation.
+        tmux set-option -t "$tmux_session" mouse on
+        # `--cwd` must apply here too: unlike the new-session path below,
+        # tmux cannot set it for an already-existing pane. The boot runner
+        # passes --cd explicitly, so execing without this cd would launch the
+        # remote TUI in the systemd unit's cwd rather than the requested
+        # project directory.
+        cd "$cwd" || {
+            echo "ERROR: Codex session cwd '$cwd' is not accessible." >&2
+            return 1
+        }
+        exec codex --remote "unix://${socket_path}" "$@"
+    fi
+
+    if tmux has-session -t "$tmux_session" 2>/dev/null; then
+        if [[ $# -gt 0 ]]; then
+            echo "ERROR: managed Codex TUI '$tmux_session' is already running; cannot apply new session/resume arguments." >&2
+            echo "       Use 'agentctl attach $name' to interact with the existing thread (or 'agentctl attach $name -r' to observe)." >&2
+            return 1
+        fi
+        tmux set-option -t "$tmux_session" mouse on
+        exec tmux attach -t "$tmux_session"
+    fi
+
+    # tmux accepts a shell command rather than an argv vector on all supported
+    # versions. Quote each word with printf %q, including prompts, so argument
+    # forwarding retains exact word boundaries.
+    local remote_command="exec"
+    local word quoted_word
+    for word in codex --remote "unix://${socket_path}" "$@"; do
+        printf -v quoted_word ' %q' "$word"
+        remote_command+="$quoted_word"
+    done
+    tmux new-session -d -s "$tmux_session" -c "$cwd" "$remote_command"
+    if ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+        echo "ERROR: failed to create managed Codex tmux session '$tmux_session'." >&2
+        echo "       Daemon remains untouched; inspect tmux and attach only after it exists." >&2
+        return 1
+    fi
+    tmux set-option -t "$tmux_session" mouse on
+    exec tmux attach -t "$tmux_session"
+}
+
 cmd_session() {
     local name="${1:-}"; shift || true
     [[ -z "$name" ]] && {
         echo "Usage: agentctl session <agent> [--platform <claude|codex>] [--no-share] [--cd <dir>] [--as-self] [--charge-file <file>] [...]" >&2
         echo >&2
-        echo "  Executes the platform binary (claude or codex) directly as the agent." >&2
+        echo "  Claude executes directly. Codex ensures its managed app-server, then" >&2
+        echo "  creates or attaches its one tmux TUI (agent-<name>) over that daemon." >&2
         echo "  Platform auto-detected from baked profile, then binary heuristic." >&2
-        echo "  tmux and other multiplexers are the operator's own affair." >&2
         echo >&2
         echo "  --platform <claude|codex>  override auto-detected platform" >&2
         echo "  --no-share                 skip auto-share of cwd (agent runs from its own home)" >&2
         echo "  --cd <dir>                 use <dir> as project folder instead of caller's cwd" >&2
-        echo "  --local                    (deprecated — no-op; sessions are always direct now)" >&2
+        echo "  --local                    (deprecated — no-op; agentctl selects the platform topology)" >&2
         echo "  --as-self                  skip the sudo/user-switch entirely; requires the" >&2
         echo "                             invoking user to already be the target agent (e.g." >&2
         echo "                             a systemd unit with User=agent-<name>, where sudo" >&2
@@ -568,11 +685,11 @@ cmd_session() {
         echo >&2
         echo "  Recognized single-char aliases:" >&2
         echo "    -c   claude: --continue" >&2
-        echo "         codex:  subcommand becomes 'codex resume --last'" >&2
+        echo "         codex:  resumes --last through the managed daemon" >&2
         echo "    -d   claude: --dangerously-skip-permissions" >&2
         echo "         codex:  --dangerously-bypass-approvals-and-sandbox" >&2
         echo "    -r   claude: --remote-control <agent>" >&2
-        echo "         codex:  error — remote control is not available for codex agents" >&2
+        echo "         codex:  ignored (no remote-control equivalent; use agentctl attach <agent>)" >&2
         exit 2
     }
     local user; user=$(resolve_user "$name")
@@ -693,8 +810,8 @@ cmd_session() {
 
     # Capture expansion via command substitution so the exit code propagates.
     # NOTE: process-substitution (`mapfile < <(cmd)`) always exits 0 — the
-    # sub-shell's exit code is discarded, so error paths (e.g. codex -r) would
-    # print their message but continue into a bare session.  Command substitution
+    # sub-shell's exit code is discarded, so an alias-expansion error would
+    # print its message but continue into a bare session. Command substitution
     # (`var=$(cmd)`) DOES propagate the exit code; split into two steps to
     # preserve the one-word-per-line contract.
     local expanded_raw
@@ -729,7 +846,25 @@ cmd_session() {
         tail_args+=("$charge_content")
     fi
 
-    # Launch: try direct binary exec first, then ~/.runtime/start.sh fallback.
+    # Codex always enters the managed daemon + tmux topology. This branch must
+    # stay before the direct launcher below: a local `codex` exec creates a
+    # separate TUI/app-server and breaks same-thread wake delivery.
+    if [[ "$platform" == "codex" ]]; then
+        local self
+        self="$(readlink -f "${BASH_SOURCE[0]:-$0}")"
+        local managed_args=(__codex-managed-session "$name")
+        if [[ ${#cwd_arg[@]} -gt 0 ]]; then
+            managed_args+=(--cwd "${cwd_arg[0]}")
+        fi
+        managed_args+=(-- "${tail_args[@]}")
+        if [[ "$as_self" -eq 1 ]]; then
+            exec "$self" "${managed_args[@]}"
+        fi
+        exec sudo -u "$user" -i "$self" "${managed_args[@]}"
+    fi
+
+    # Launch Claude directly. Codex returned above through its daemon-managed
+    # tmux topology, so it cannot accidentally make a second local app server.
     # Under --as-self, the invoking shell already IS $user (verified above) —
     # no sudo/user-switch, just `exec` the platform binary in place. Same
     # argv construction (binary + tail_args) as the sudo path; only the
@@ -1790,6 +1925,13 @@ cmd_help() {
     sed -n '3,/^# =====/p' "$0" | sed '$d'
 }
 
+# ---------- internal verb: __codex-managed-session ----------
+# Not listed in user-facing help. This is the target-user half of cmd_session's
+# Codex path and gives the regression suite a no-sudo seam with stub codex/tmux.
+cmd__codex_managed_session() {
+    _codex_managed_session "$@"
+}
+
 # ---------- internal verb: __expand-session-args ----------
 # Not listed in user-facing help (internal verb, invoked programmatically).
 # Usage: agentctl __expand-session-args <platform> <agent_name> [args...]
@@ -1874,6 +2016,7 @@ case "$SUBCMD" in
     unshare)       cmd_unshare       "$@" ;;
     share-status)  cmd_share_status  "$@" ;;
     help|--help|-h) cmd_help ;;
+    __codex-managed-session) cmd__codex_managed_session "$@" ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
     __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
     __as-self-check) cmd__as_self_check "$@" ;;

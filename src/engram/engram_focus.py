@@ -35,6 +35,31 @@ FOCUS_LIST_CAP = 15
 # No spaces (CLI-friendly), no uppercase (case-insensitive lookup without ambiguity).
 FOCUS_SET_NAME_PATTERN = re.compile(r"^[a-z0-9_-]{1,50}$")
 
+# Default cap on the NUMBER of saved focus sets (issue #1975 layer 4).
+# Overwrites of an existing name are always allowed — only NEW-set creation
+# refuses past the cap. Keeps engram_focus_sets / the session-start "saved
+# focus-sets" listing bounded so it stays skimmable, same rationale as
+# FOCUS_LIST_CAP above for the active list.
+DEFAULT_FOCUS_SETS_CAP = 10
+
+
+def _get_focus_sets_cap() -> int:
+    """Read `focus.focus_sets_cap` from config.json; default DEFAULT_FOCUS_SETS_CAP.
+
+    Read-on-demand (no caching), same pattern as the other family modules'
+    config helpers (e.g. engram_observation._get_polarity_config) — config
+    edits take effect on the next call without a server restart.
+    """
+    if core.CONFIG_PATH.exists():
+        try:
+            config = json.loads(core.CONFIG_PATH.read_text())
+            section = config.get("focus", {})
+            if isinstance(section, dict) and "focus_sets_cap" in section:
+                return int(section["focus_sets_cap"])
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
+            pass
+    return DEFAULT_FOCUS_SETS_CAP
+
 
 def _resolve_set_members(node_ids_json, conn):
     """Resolve a saved set's raw IDs into currently-loadable nodes.
@@ -427,6 +452,21 @@ def _focus_save_impl(name: str, description: str = "", overwrite: bool = False) 
                     "Pass overwrite=True to replace."
                 ),
             })
+
+        if not existing:
+            # Cap gate only refuses NEW sets — overwriting an existing name
+            # is always allowed, even at/over the cap (#1975 layer 4).
+            cap = _get_focus_sets_cap()
+            count_row = conn.execute("SELECT COUNT(*) AS c FROM focus_sets").fetchone()
+            if count_row["c"] >= cap:
+                return json.dumps({
+                    "status": "error",
+                    "error": (
+                        f"Focus-sets cap ({cap}) reached — delete or merge sets first "
+                        "(engram_focus_delete_set), or overwrite an existing set name "
+                        "(overwrite=True), before saving a new one."
+                    ),
+                })
 
         now = core._now()
         if existing:

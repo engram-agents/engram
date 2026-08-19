@@ -15,7 +15,7 @@
 # Run:
 #   docker run --rm -v "$(pwd):/alpha:ro" engram-spawn-test:latest
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -25,8 +25,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Same prereq stack as tests/install/Dockerfile, plus sudo + acl which the
 # spawn flow needs (agentctl uses setfacl/getfacl; finalize-name calls
 # pause which routes through cron — kept minimal for the test).
+# python3.12 pin follows the repo's 3.12 standardisation (#2082); the
+# 22.04 (jammy) base doesn't ship python3.12 in any suite, so the base
+# image was bumped to 24.04 (noble), which ships 3.12 natively (#2085).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 \
+        python3.12 \
         python3-pip \
         git \
         cron \
@@ -36,10 +39,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         sudo \
         acl \
         gawk \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install fastmcp sentence-transformers
+# noble marks the system env externally-managed (PEP 668); inside a throwaway
+# test container --break-system-packages is the standard escape (#2085).
+RUN pip3 install --break-system-packages fastmcp sentence-transformers
 
 # Stub claude. install.sh's MCP-add step uses it. Local copy (rather than
 # referencing tests/install/) so this harness is independent of PR #49's

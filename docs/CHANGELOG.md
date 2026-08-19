@@ -9,7 +9,241 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
-_Nothing yet — changes land here after the v0.3.2-rc1 cut._
+## [v0.4.0] - 2026-08-19
+
+**A reliability-and-hygiene release.** No single forcing incident drove this
+wave the way the loop-silence outage drove v0.3.2; instead it's the
+accumulation of a long `dev` stretch (107 commits since the `v0.3.2-rc1` cut,
+2026-08-04 through 2026-08-19) across sleep-cycle cost control,
+compaction-survival, test-suite hermeticity, and a lot of smaller
+robustness fixes. Two items are worth calling out because they change
+*process*, not just code: the dream-fairy lottery replaces the old
+all-8-nightly scan with weight-aging draws, and a local pre-push test gate
+was tried and then reverted in the same window — both are represented below
+by their net state, not their full back-and-forth.
+
+### Added — sleep & dream-lottery cost control
+
+- **Weight-aging dream-fairy lottery** (#1901, #1903) — the sleep cycle's
+  Phase B draws one scan category per night via a weight-aging lottery
+  (`tools/dream_lottery.py`) instead of dispatching all 9 categories nightly,
+  with an urgency interrupt that force-includes cascade-sensitive categories
+  when the day's retraction/supersede activity crosses a threshold.
+- **Append-only dream-lottery draw history + `history` subcommand**
+  (#1909, #1910) — every draw's before/after weights, drawn types,
+  interrupt-forced types, and cascade-marker count now persist to a JSONL
+  history file (`--history`, default `~/.engram/dream-lottery-history.jsonl`),
+  with a `history` subcommand to tally it (`--limit N`).
+- **Draw re-entrancy guard + integer-arg validation hardening**
+  (#1907, #1911, #1912) — `draw` refuses a second real draw for the same
+  `--turn` unless `--force` is passed; `--count` and `--interrupt-threshold`
+  are now rejected below 1 (both were silently exploitable — `--count 0`
+  defeated the re-entrancy guard, `--interrupt-threshold <= 0` forced every
+  interrupt-mapped category every night regardless of real activity).
+- **Person-node maintenance dream-fairy** (#1984, part of #1827) — lottery
+  category 10.
+
+### Fixed — sleep & dream-lottery
+
+- **Force-include set emptied by default** (#2137, part of #1992) — the
+  lottery's urgency interrupt force-included categories that scan
+  contradiction/taint *nodes*, not the day's stale/taint *markers* it was
+  meant to address (#1992's finding; measured 12-of-19 forced fairy runs over
+  the first 11 draws, all clean negatives). The default force-set is now
+  empty as the interim state until the cascade machine (#2013) gives dreams a
+  principled marker-resolution path; the marker count is still logged every
+  draw and `--interrupt-types` re-arms it.
+- **Shared-`/tmp` scratch collision fixed** (#2110, closes #2075) — inline
+  `--ids` default + owner-checked ids-file, replacing a shared scratch path
+  that could collide across concurrent sleep runs.
+
+### Fixed — compaction continuity (#2026 epic)
+
+A cluster of fixes around what survives a compaction and how a session
+resumes afterward: session-checkpoint fields + a WS1 node-injection block
+(#2034), a dedupe fix for repeated `focus_reason` text in the SessionStart
+focus block (#2032), a fix so the near-compaction capture nudge fires where
+it can actually still matter (#2031), simplifying Compact Instructions to a
+single copy-this-block instruction rather than six extraction steps (#2036),
+injecting the most-recent history arc post-compact (#2049), `engram_nap`
+appending a milestone line to today's history file (#2051), retiring the WS4
+Stop-path escalation now that the loop banner captures the past burst
+(#2058), and removing Compact Instructions from the Claude template while
+keeping it on the Codex path, since only Codex still needs it (#2068).
+
+### Added / Fixed — local pre-push test gate (net: reverted)
+
+A local pre-push test gate was added (#2095, part of #1597) with a
+fail-open subprocess timeout and its own first tests (#2101, closes #2096),
+then reverted in the same window (#2124) — the suite was found to write to
+the ambient repo, an unacceptable side effect for a pre-push hook. **Net
+state at this release: no local pre-push test gate.**
+
+### Fixed — write-path durability
+
+- **Durability read-back after commit** (#2141, closes #2074, closes
+  #2097) — a write that isn't actually durable now surfaces as
+  `failed_not_durable` instead of silently reporting `created: true`.
+
+### Added — test isolation & drift guards
+
+- **Git-mutating tests isolated from the ambient repo + session-scoped
+  regression gate** (#2144, closes #2126) — a uid-safe throwaway
+  `ENGRAM_HOME` default at collection time, `GIT_CONFIG_GLOBAL`/`SYSTEM`
+  pinned away from the real user config, and a before/after session guard on
+  the invoking checkout's identity-bearing git state — closing the #2122
+  incident's mechanism (the suite could commit into the repo it ran from).
+- **`ENGRAM_HOME` isolation sweep** (#2103, closes #2086) — 53 candidate
+  hazards checked, 2 real cross-test-run contamination hazards fixed;
+  follow-up patched the dormant-focus loader's env-patching order (#2109,
+  part of #2086).
+- **Hermetic `ENGRAM_HOME` for surface-ledger suppression tests** (#2084,
+  closes #2015, closes #2081).
+- **`sys.path` shadow hazards closed**: `tools/` directories never outrank
+  `src/` on `sys.path`, plus a durable shadow guard (#2088, closes #2037,
+  closes #2063); an unconditional `sys.path` insert that was itself killing
+  the `tools/forum.py` shadow test (#2064, part of #2063); an AST-based
+  syspath-shadow scan closing four demonstrated regex bypasses in the
+  previous check (#2102, closes #2089).
+- **Import-sync drift guard extended to the hooks/claude sibling tiers**
+  (#2107, closes #2043).
+- **Mechanical drift guard over the TOOL POLICY block's three surfaces**
+  (#2094).
+- **`pgrep` false-healthy inventory + synthetic-process-table guard**
+  (#2115, closes #2029).
+- Also: pin `history_arc_block`'s near-empty snapshot test distinctly from
+  the no-newline fallback (#2105, closes #2056); Dockerfile 3.11→3.12 on
+  `ubuntu:24.04` (#2104, closes #2085); CI drops the Python 3.11 matrix leg,
+  standardizing on 3.12 (#2082); a test asserting the cascade ⇒ `dag_check`
+  invariant over `EDGE_CLASSIFICATIONS` (#2014, part of #2013); the base
+  STANDPOINT example in `SKILL.md` bound to actual rendering (#2062, closes
+  #2022).
+
+### Changed — comms unification (`comms_surface` SSoT)
+
+- **`comms_surface` config key + forum-hook surface swap** (#2116, part of
+  #2019 slice A) and **`comms_surface` conditional wording unified across
+  template, boot charges, and skills** (#2117, closes #2019 slice B) — one
+  config key now governs which comms surface (forum vs. DM vs. baton) a
+  hook or doc assumes, replacing scattered per-surface conditionals.
+
+### Fixed — hooks & loop robustness
+
+- `pipe-exit-warn` now reaches mid-pipeline consequential commands (#2118,
+  closes #1899) and fires on backgrounded bare pipes (#2112, closes #2061).
+- Renamed `checkpoint_at` → `injected_through` for clarity (#2114, closes
+  #2044).
+- Unified atomic-write convention for hook state files (#2041, closes
+  #2035).
+- `history_arc_block` now tail-slices to keep the newest entries, not the
+  oldest (#2055, closes #2052).
+- Loop arm-last heartbeat + tool-call arm detection (#2002, closes #1973,
+  closes #1987).
+- Skip the sleep-status nudge on quiet days (#1996, closes #1995).
+- Corrected a false-universal claim in the loop-arm hook docstring (#2004).
+- `forum-prompt-hook` timeout margin fixed — internal timeouts used to equal
+  the hook budget exactly, leaving no margin (#1642, closes #1641).
+- The boot-charge monitor-verify `pgrep` could never fail because it
+  matched the session's own argv — fixed (#2028).
+
+### Fixed — backup, FTS & DB integrity
+
+- `rebuild_fts_index` preserves the incoming `user_version` (#2113, closes
+  #2087).
+- Single-sourced `nodes_fts` columns + repair for under-indexed tables
+  (#2080, closes #2077).
+- Snapshot pushes now ensure upstream tracking, so status can report a
+  backlog instead of silently drifting (#2092, closes #2046).
+- Stopped tracking local backup/archive dirs; `session_log.md` in the
+  `~/.engram` git backup is now append-only (#2048).
+
+### Fixed — monitors & daemon reliability
+
+- Reap all stray surface-daemon processes before restart (#1894, closes
+  #1874), ported to the collab monitors (#2120, closes #1935).
+- Monitors warn on suspected duplicate instances rather than killing them
+  (#1934, closes #1933).
+- `mention-monitor` ships `+x`; `updates-monitor` gains its missing `tools/`
+  symlink (#2128, closes #1861, closes #1663).
+- `fetch_safety_row` now works on any connection, with error direction
+  staying loud rather than silently swallowed (#2091, closes #2008).
+
+### Added — Codex / agentctl integration
+
+A run of Codex-wake and `agentctl` reliability fixes: preserving Codex
+delivery RPC notifications across calls, on teardown, and in-flight;
+preserving persisted and queued completion notifications; waking on
+self-addressed Umwelt crossings; and documenting the successful RPC
+notification drain path. Plus: `agentctl-mac` gains an `attach` subcommand
+(#2040, closes #2039); tmux mouse scrolling enabled in `agentctl` (#1982);
+Codex active cache paths preserved across upgrades (#1977); Codex sessions
+unified on the managed daemon TUI (#1976); the Codex daemon heartbeat pacer
+documented (#1985); repo-agnostic `git pull` in upgrade guidance (#1506);
+tier-aware venv provisioning, retiring the stale `~/.engram-venv` path
+(#1983, part of #576).
+
+### Added — standpoint & identity integrity
+
+- Write-time hard gate on `standpoint_author_id` — rejects display-names and
+  dangling `pn_` refs, with repair hints (#1979, part of #1827).
+- Base STANDPOINT line made verification-aware (#2020).
+- Standpoint columns exposed to `engram_list` + batch `engram_inspect`
+  (#1959, closes #1955, closes #1956).
+- Person-node metadata presentation + `special_moments` cap decoupling
+  (#1953, closes #1940, closes #1948).
+- `walguard` #786 recovery now names every holder, and the marker carries
+  the remedy so writes stop looking clean when they aren't (#1950, closes
+  #1947).
+
+### Fixed — server, query & lesson tooling
+
+- `engram_list` refuses an unrecognized `sort_by`/`node_type` instead of
+  silently falling back to a default (#2123, closes #1927).
+- `cornerstone_candidate` excludes nodes already anchored to a cornerstone
+  (#1917, closes #1913).
+- `engram_update_lesson` refreshes `error_incidents.json` when nudge/pattern
+  change (#2079, closes #2000).
+- `engram_update_lesson` backfills `situation_pattern` in-place (#1879,
+  #1826).
+- `verify_quote.py` exits 1 on a quote MISS, 2 on could-not-check —
+  previously both exit codes were conflated (#2078, closes #1990).
+- Functional lesson-pattern audit landed (#2021, closes #2018).
+
+### Added — focus mode & tooling
+
+- Focus-set surfacing + staleness gate: session-start listing, dormant-set
+  recall nudge, stale-pin marker, set cap (#1978, closes #1975).
+- Always-loaded tool-capability index (CAN vs. HOW) (#1961, closes #1958).
+
+### Fixed — baton & forum
+
+- Baton `init` warns when a PR anchor is unqualified (#1925, part of #1924).
+- Baton `flip`/`merge` refuse-and-count an unqualified GitHub anchor instead
+  of guessing a default repo (#1920, closes #1918).
+- Forum mutation routes return `{seq, turn, status}` for the board UI
+  (#1576, closes #1510).
+- Forum sweep recipes use `--sort hot`, not `--sort new` (#1994, closes
+  #1993).
+
+### Docs & misc
+
+CI adds an advisory check for stray `master` branch refs (#1893). Also:
+the OS/harness constraint matrix with a self-testing checker (#1928); the
+reviewer-fairy-judgement colleague-seat scope gate documented (#1939); the
+shared-`.git` stash hazard for fairy worktrees documented (#2053); the `gh`
+version bisect hazard documented (#2069); PR-inheritance discipline
+documented (#2016); the ask-user digest capped at three questions (#1986);
+the local-Row-connection invariant pinned at the `dict(row)` site (#2100,
+closes #2093); reply-first / arm-on-block guidance for reply-carrying loop
+turns (#2099, closes #2098); `scan-leaks.py`'s test-fixture gotcha
+documented (#1926); guidance to verify a counterparty is actually UNKNOWN
+before applying that trust tier (#2073); the action-time tripwire layer
+documented in `learn-from-error` (#1945); monitor paths glob-protected in
+SOURCE boot-charge templates (#2090, closes #1998); the Agent-tool standing
+request carried in `CLAUDE.md`, not only the boot charge (#1960); ENGRAM
+fairies allowed in the boot charge while native deep-research stays banned
+(#1946); self-contained output-style responses to the user — references
+supplement, never substitute (#2136).
 
 ## [v0.3.2] - 2026-08-03
 

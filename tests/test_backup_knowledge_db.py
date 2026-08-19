@@ -25,8 +25,13 @@ TOOLS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "src", "engram", "tools",
 )
+# append (not insert(0)) -- src/engram/tools/ also holds forum.py (the CLI
+# script tools/forum.py symlinks to); making it a sys.path *root* at
+# position 0 would outrank src/forum for the rest of the pytest run,
+# shadowing the real `forum` package for every test collected afterward
+# (#2037/#2063).
 if TOOLS_DIR not in sys.path:
-    sys.path.insert(0, TOOLS_DIR)
+    sys.path.append(TOOLS_DIR)
 
 import backup_knowledge_db  # noqa: E402
 

@@ -82,12 +82,12 @@ def test_standpoint_columns_written():
         "interpretation": "Empirical rate measure.",
         "claim": "Rate of X is 42%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_001",
+        "standpoint_author_id": "test:author_001",
         "standpoint_collection_id": "corpus_alpha",
     })
     assert r.get("status") == "created", f"Expected created, got: {r}"
     sp = _read_node_standpoint(client, r["observation_id"])
-    assert sp["standpoint_author_id"] == "author_001", f"Got: {sp}"
+    assert sp["standpoint_author_id"] == "test:author_001", f"Got: {sp}"
     assert sp["standpoint_collection_id"] == "corpus_alpha", f"Got: {sp}"
     assert sp["standpoint_override_tag"] is None
     print("  PASS: standpoint columns written to DB")
@@ -127,7 +127,7 @@ def test_same_standpoint_one_cluster_warning():
         "interpretation": "Gold price drop.",
         "claim": "Gold fell 9.6% this week",
         "quote_type": "hard_data",
-        "standpoint_author_id": "analyst_jones",
+        "standpoint_author_id": "test:analyst_jones",
         "standpoint_collection_id": "reuters_financial_desk",
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -139,7 +139,7 @@ def test_same_standpoint_one_cluster_warning():
         "interpretation": "Rate increase.",
         "claim": "Interest rates rose to 5.5%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "analyst_jones",
+        "standpoint_author_id": "test:analyst_jones",
         "standpoint_collection_id": "reuters_financial_desk",
     })
     assert r2.get("status") == "created", f"r2 failed: {r2}"
@@ -176,7 +176,7 @@ def test_different_standpoints_two_cluster_warning():
         "interpretation": "Gold price drop from Reuters.",
         "claim": "Gold fell 9.6% this week (Reuters)",
         "quote_type": "hard_data",
-        "standpoint_author_id": "analyst_jones",
+        "standpoint_author_id": "test:analyst_jones",
         "standpoint_collection_id": "reuters_desk",
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -188,7 +188,7 @@ def test_different_standpoints_two_cluster_warning():
         "interpretation": "Gold price drop from FT.",
         "claim": "Gold lost approximately 10% this week (FT)",
         "quote_type": "hard_data",
-        "standpoint_author_id": "analyst_smith",
+        "standpoint_author_id": "test:analyst_smith",
         "standpoint_collection_id": "ft_markets_desk",
     })
     assert r2.get("status") == "created", f"r2 failed: {r2}"
@@ -275,7 +275,7 @@ def test_batch_with_standpoint_fields():
             "interpretation": "Strong growth.",
             "claim": "Revenue grew 15%",
             "quote_type": "hard_data",
-            "standpoint_author_id": "author_alpha",
+            "standpoint_author_id": "test:author_alpha",
             "standpoint_collection_id": "corpus_q1",
         },
         {
@@ -283,7 +283,7 @@ def test_batch_with_standpoint_fields():
             "interpretation": "Efficiency gain.",
             "claim": "Costs decreased 5%",
             "quote_type": "hard_data",
-            "standpoint_author_id": "author_beta",
+            "standpoint_author_id": "test:author_beta",
             "standpoint_collection_id": "corpus_q2",
             "standpoint_override_tag": "cfo_report_override",
         },
@@ -299,14 +299,14 @@ def test_batch_with_standpoint_fields():
     # Check first observation's standpoint fields
     ob0_id = r["results"][0]["observation_id"]
     sp0 = _read_node_standpoint(client, ob0_id)
-    assert sp0["standpoint_author_id"] == "author_alpha", f"Got: {sp0}"
+    assert sp0["standpoint_author_id"] == "test:author_alpha", f"Got: {sp0}"
     assert sp0["standpoint_collection_id"] == "corpus_q1", f"Got: {sp0}"
     assert sp0["standpoint_override_tag"] is None
 
     # Check second observation's standpoint fields
     ob1_id = r["results"][1]["observation_id"]
     sp1 = _read_node_standpoint(client, ob1_id)
-    assert sp1["standpoint_author_id"] == "author_beta", f"Got: {sp1}"
+    assert sp1["standpoint_author_id"] == "test:author_beta", f"Got: {sp1}"
     assert sp1["standpoint_collection_id"] == "corpus_q2", f"Got: {sp1}"
     assert sp1["standpoint_override_tag"] == "cfo_report_override", f"Got: {sp1}"
 
@@ -334,7 +334,7 @@ def test_single_premise_triggers_standpoint_and_fs():
         "interpretation": "Color observation.",
         "claim": "The sky is blue",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_solo",
+        "standpoint_author_id": "test:author_solo",
         "standpoint_collection_id": "corpus_solo",
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -425,7 +425,7 @@ def test_author_diverse_collection_uniform_warning():
         "interpretation": "Growth in X.",
         "claim": "Metric X increased by 12%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_alpha",
+        "standpoint_author_id": "test:author_alpha",
         "standpoint_collection_id": "shared_corpus_Z",
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -437,7 +437,7 @@ def test_author_diverse_collection_uniform_warning():
         "interpretation": "Growth in X from beta source.",
         "claim": "Metric X rose by 11.8%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_beta",
+        "standpoint_author_id": "test:author_beta",
         "standpoint_collection_id": "shared_corpus_Z",
     })
     assert r2.get("status") == "created", f"r2 failed: {r2}"
@@ -483,7 +483,7 @@ def test_single_axis_author_only_warning():
         "interpretation": "Measurement of A.",
         "claim": "Value A is 20%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_one",
+        "standpoint_author_id": "test:author_one",
         # No standpoint_collection_id set
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -495,7 +495,7 @@ def test_single_axis_author_only_warning():
         "interpretation": "Measurement of A from second source.",
         "claim": "Value A is 21%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_two",
+        "standpoint_author_id": "test:author_two",
         # No standpoint_collection_id set
     })
     assert r2.get("status") == "created", f"r2 failed: {r2}"
@@ -547,7 +547,7 @@ def test_mixed_axis_collection_omitted_when_partial():
         "interpretation": "Measurement with full standpoint.",
         "claim": "Result X is 15%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_alpha",
+        "standpoint_author_id": "test:author_alpha",
         "standpoint_collection_id": "corpus_shared",
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"
@@ -559,7 +559,7 @@ def test_mixed_axis_collection_omitted_when_partial():
         "interpretation": "Measurement with author-only standpoint.",
         "claim": "Result X is 16%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "author_beta",
+        "standpoint_author_id": "test:author_beta",
         # No standpoint_collection_id — mixed axis
     })
     assert r2.get("status") == "created", f"r2 failed: {r2}"
@@ -815,7 +815,7 @@ def test_mixed_axis_fully_partial_unchecked_notice():
         "interpretation": "Rate measurement from author-attributed source.",
         "claim": "Rate of P is 30%",
         "quote_type": "hard_data",
-        "standpoint_author_id": "researcher_alpha",
+        "standpoint_author_id": "test:researcher_alpha",
         # No standpoint_collection_id — leaf 1 has author, no collection
     })
     assert r1.get("status") == "created", f"r1 failed: {r1}"

@@ -6,7 +6,7 @@
     "dev"
   ],
   "axes": {
-    "multi_agent": "orthogonal flag \u2014 composes with any depth tier"
+    "multi_agent": "orthogonal flag — composes with any depth tier"
   },
   "default_tier": "convenience",
   "source_root": "src/engram",
@@ -148,6 +148,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/dream_lottery.py",
+      "tier": "essential"
+    },
+    {
       "path": "tools/recall_summary_payload.py",
       "tier": "essential"
     },
@@ -191,6 +195,10 @@
     },
     {
       "path": "tools/engram-regenerate-embeddings.py",
+      "tier": "essential"
+    },
+    {
+      "path": "tool_capability_index.txt",
       "tier": "essential"
     },
     {
@@ -328,6 +336,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/os-harness-check.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/release-cutover.py",
       "tier": "dev"
     },
@@ -460,7 +472,7 @@
     },
     {
       "path": "hooks/claude/_hooklib.py",
-      "tier": "convenience"
+      "tier": "essential"
     },
     {
       "path": "hooks/claude/_prompthooklib.py",
@@ -627,6 +639,10 @@
       "tier": "essential"
     },
     {
+      "path": "agents/claude/engram-person-node-fairy.md",
+      "tier": "essential"
+    },
+    {
       "path": "agents/claude/engram-coder-fairy.md",
       "tier": "convenience"
     },
@@ -687,8 +703,12 @@
   ],
   "excluded": [
     {
+      "path": "tools/engram-generate-tool-capability-index.py",
+      "reason": "maintainer/CI-time regeneration tool for the #1958 tool-capability index: reads server.py's real TOOL_CAPABILITIES dict + FastMCP's registered tool set and writes the checked-in tool_capability_index.txt artifact (root-level, not a generated/ subdirectory). No install ever needs to run it — it's invoked by repo contributors when a tool's capability line changes or a new tool is added, and by the drift-guard test in CI. Same shape as tools/engram-backfill-special-moment-edges.py's excluded[] entry: idempotent, safe to re-run, but not a recurring shipped mechanism."
+    },
+    {
       "path": "tools/selftest.py",
-      "reason": "developer pre-deploy test runner \u2014 wraps pytest for quick confidence checks; not shipped in any install tier"
+      "reason": "developer pre-deploy test runner — wraps pytest for quick confidence checks; not shipped in any install tier"
     },
     {
       "path": "hooks/claude/context_tracker_hook.py",
@@ -704,7 +724,7 @@
     },
     {
       "path": "tools/agent-bootstrap",
-      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin \u2014 lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by the operator"
+      "reason": "operator-level host administration script for multi-agent Linux host setup (uid/group/home perms); not part of ENGRAM plugin — lives at /usr/local/sbin/agent-bootstrap on production hosts, installed separately by the operator"
     },
     {
       "path": "tools/agentctl",
@@ -720,7 +740,7 @@
     },
     {
       "path": "tools/test_backup_session_logs.py",
-      "reason": "test file for tools/backup_session_logs.py \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/backup_session_logs.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_backup_claude_projects.py",
@@ -728,71 +748,75 @@
     },
     {
       "path": "tools/test_forum_cli.py",
-      "reason": "test file for tools/forum.py \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/forum.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_tripwire.py",
-      "reason": "test file for tools/tripwire.py \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/tripwire.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_forum_backup.py",
-      "reason": "test file for tools/forum_backup.py \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/forum_backup.py — CI tooling only, never ships"
     },
     {
       "path": "tools/test_pr_body_close_keyword_gate.py",
-      "reason": "test file for the .github close-keyword trap-gate workflow \u2014 CI tooling only, never ships"
+      "reason": "test file for the .github close-keyword trap-gate workflow — CI tooling only, never ships"
     },
     {
       "path": "tools/test_baton_ci_guard.py",
-      "reason": "test file for tools/baton.py CI-green flip guard (#685) \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/baton.py CI-green flip guard (#685) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_baton_approval_guard.py",
-      "reason": "test file for tools/baton.py post-approval re-check flip guard (#1002) \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/baton.py post-approval re-check flip guard (#1002) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_baton_colleague_gate.py",
-      "reason": "test file for tools/baton.py colleague-gate enforcement (#1267) \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/baton.py colleague-gate enforcement (#1267) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_baton_merge_gate.py",
-      "reason": "test file for tools/baton.py merge verb (#999/#1000) \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/baton.py merge verb (#999/#1000) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_pre_dispatch_check.py",
-      "reason": "test file for tools/pre-dispatch-check.sh (#1006) \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/pre-dispatch-check.sh (#1006) — CI tooling only, never ships"
     },
     {
       "path": "tools/test_migrate_to_plugin.sh",
-      "reason": "test file for tools/migrate-to-plugin.sh \u2014 CI tooling only, never ships"
+      "reason": "test file for tools/migrate-to-plugin.sh — CI tooling only, never ships"
     },
     {
       "path": "tools/name_leak_warn.py",
       "reason": "repo-CI infrastructure consumed only by .github/workflows/name-leak-warn.yml (warn-only diff gate); runs in GitHub Actions, not shipped in any install tier"
     },
     {
+      "path": "tools/stray_master_ref_check.py",
+      "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's stray-master-ref-check step (#1884, warn-only whole-tree scan); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
       "path": "src/forum/",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
     },
     {
       "path": "tools/forum_backup.py",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
     },
     {
       "path": "tools/forum_backfill_embeddings.py",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
     },
     {
       "path": "tools/forum_regen_derived.py",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; server-host maintenance script, run from the repo on the forum host, not from the plugin (issue #868)"
     },
     {
       "path": "src/forum/deploy/engram-forum-backup.service",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; systemd service unit for the forum host, not part of the plugin bundle (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd service unit for the forum host, not part of the plugin bundle (issue #868)"
     },
     {
       "path": "src/forum/deploy/engram-forum-backup.timer",
-      "reason": "separately-deployed forum community service \u2014 second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
+      "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; systemd timer unit for the forum host, not part of the plugin bundle (issue #868)"
     },
     {
       "path": "src/engram/tools/baton-migrate-to-coord-store.py",
@@ -805,122 +829,134 @@
     {
       "path": "src/engram/tools/migrate_person_nodes.py",
       "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
+    },
+    {
+      "path": "tools/lesson-pattern-audit.py",
+      "reason": "maintainer-run functional audit of lesson situation_patterns against real transcript traffic (issue #2018); diagnostic tool run manually against an agent's own home directory to sanity-check pattern coverage, not a recurring shipped mechanism any install needs to run"
+    },
+    {
+      "path": "tools/engram-backfill-special-moment-edges.py",
+      "reason": "one-shot data-integrity repair: creates the missing 'about' edges every special_moments[].node_id should have had, for nodes written before this backfill existed (issue #1948); idempotent and safe to re-run, but not a recurring shipped mechanism any install needs to run regularly"
     }
   ],
   "repo_only": [
     {
       "path": "tests/",
-      "reason": "dev test suite \u2014 never shipped in any install tier; CI-only"
+      "reason": "dev test suite — never shipped in any install tier; CI-only"
     },
     {
       "path": ".github/",
-      "reason": "GitHub Actions CI configuration \u2014 runs in GitHub's cloud, never part of the plugin install"
+      "reason": "GitHub Actions CI configuration — runs in GitHub's cloud, never part of the plugin install"
     },
     {
       "path": "docs/",
-      "reason": "documentation files \u2014 developer reference, not shipped in any install tier"
+      "reason": "documentation files — developer reference, not shipped in any install tier"
     },
     {
       "path": "README.md",
-      "reason": "repository landing-page documentation \u2014 not shipped in the plugin bundle"
+      "reason": "repository landing-page documentation — not shipped in the plugin bundle"
     },
     {
       "path": "README.zh.md",
-      "reason": "Simplified Chinese translation of the repository landing page \u2014 rendered by the website's /zh/readme page; not shipped in the plugin bundle"
+      "reason": "Simplified Chinese translation of the repository landing page — rendered by the website's /zh/readme page; not shipped in the plugin bundle"
     },
     {
       "path": "README-AGENT.md",
-      "reason": "agent-facing install/orientation documentation \u2014 repository landing doc, not shipped in the plugin bundle"
+      "reason": "agent-facing install/orientation documentation — repository landing doc, not shipped in the plugin bundle"
     },
     {
       "path": "LICENSE",
-      "reason": "project license file \u2014 not shipped in the plugin bundle"
+      "reason": "project license file — not shipped in the plugin bundle"
     },
     {
       "path": "CLAUDE.md",
-      "reason": "developer-facing project conventions (project-level CLAUDE.md) \u2014 not shipped in the plugin bundle"
+      "reason": "developer-facing project conventions (project-level CLAUDE.md) — not shipped in the plugin bundle"
     },
     {
       "path": "USER_GUIDE.md",
-      "reason": "user guide documentation \u2014 not shipped in the plugin bundle"
+      "reason": "user guide documentation — not shipped in the plugin bundle"
     },
     {
       "path": "USER_GUIDE.zh.md",
-      "reason": "Simplified Chinese translation of the user guide \u2014 rendered by the website's /zh/user-guide page; not shipped in the plugin bundle"
+      "reason": "Simplified Chinese translation of the user guide — rendered by the website's /zh/user-guide page; not shipped in the plugin bundle"
     },
     {
       "path": "pytest.ini",
-      "reason": "pytest configuration \u2014 dev test config, never shipped"
+      "reason": "pytest configuration — dev test config, never shipped"
     },
     {
       "path": "requirements/",
-      "reason": "Python dependency pin files \u2014 installation tooling only, not shipped in the plugin bundle"
+      "reason": "Python dependency pin files — installation tooling only, not shipped in the plugin bundle"
     },
     {
       "path": ".gitignore",
-      "reason": "git ignore rules \u2014 repo configuration, not shipped in the plugin bundle"
+      "reason": "git ignore rules — repo configuration, not shipped in the plugin bundle"
     },
     {
       "path": "packaging/README.md",
-      "reason": "README for the packaging directory \u2014 documentation, not shipped inside the plugin bundle"
+      "reason": "README for the packaging directory — documentation, not shipped inside the plugin bundle"
     },
     {
       "path": "upgrade-guides/",
-      "reason": "operator upgrade guides \u2014 developer/operator reference documentation, not shipped in the plugin bundle"
+      "reason": "operator upgrade guides — developer/operator reference documentation, not shipped in the plugin bundle"
     },
     {
       "path": "docs/inter-agent/",
-      "reason": "inter-agent protocol design documents \u2014 developer reference, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
+      "reason": "inter-agent protocol design documents — developer reference, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
       "path": ".claude/",
-      "reason": "per-developer local Claude Code agent definitions (developer-local working files for Ariadne/Borges) \u2014 not part of the shared plugin bundle"
+      "reason": "per-developer local Claude Code agent definitions (developer-local working files for Ariadne/Borges) — not part of the shared plugin bundle"
     },
     {
       "path": "agents/claude/README.md",
-      "reason": "README for the agents/claude directory \u2014 documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
+      "reason": "README for the agents/claude directory — documentation only, not a shippable agent file (build-plugin.sh copies *.md files excluding README.md)"
     },
     {
       "path": "docs/cycle/",
-      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) \u2014 in-development research material, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
+      "reason": "epistemic research cycle design documents and artifacts (CHARTER, CHRONICLE, charter-inputs, mira-package, standpoint design) — in-development research material, not shipped in the plugin bundle (moved from root in Phase 4 of #1093)"
     },
     {
       "path": "docs/archive/",
-      "reason": "historical one-time migration artifacts preserved for reference \u2014 ran during early development and are not shipped in any install tier (moved from root in Phase 4 of #1093)"
+      "reason": "historical one-time migration artifacts preserved for reference — ran during early development and are not shipped in any install tier (moved from root in Phase 4 of #1093)"
     },
     {
       "path": "src/build/packaging/README.md",
-      "reason": "README for the src/build/packaging directory \u2014 documentation, not shipped inside the plugin bundle"
+      "reason": "README for the src/build/packaging directory — documentation, not shipped inside the plugin bundle"
     },
     {
       "path": "release-minus-set.txt",
-      "reason": "release-cutover exclude manifest \u2014 consumed by tools/release-cutover.py at cutover time; not shipped in any install tier"
+      "reason": "release-cutover exclude manifest — consumed by tools/release-cutover.py at cutover time; not shipped in any install tier"
     },
     {
       "path": "deploy/autostart/",
-      "reason": "boot-time agent auto-start deploy files (systemd template unit/timer/target, tmux launch wrapper, boot-charge templates, install README) \u2014 operator-installed host administration per README (copied to /etc/systemd/system + /usr/local/lib/agentctl/autostart by the host owner), not shipped in any plugin install tier; same class as tools/agent-bootstrap"
+      "reason": "boot-time agent auto-start deploy files (systemd template unit/timer/target, tmux launch wrapper, boot-charge templates, install README) — operator-installed host administration per README (copied to /etc/systemd/system + /usr/local/lib/agentctl/autostart by the host owner), not shipped in any plugin install tier; same class as tools/agent-bootstrap"
+    },
+    {
+      "path": "deploy/tool_policy_facts.py",
+      "reason": "canonical TOOL POLICY fact table consumed only by tests/test_tool_policy_sync.py (the three-surface drift guard) — CI-only, never shipped in any install tier"
     }
   ],
   "build_inputs": [
     {
       "path": "plugin.json",
-      "reason": "Claude Code plugin manifest \u2014 copied into the bundle root by the build engine (tools/engine/build.py) as the bundle's own manifest; structural build input, not a depth-tier-gated mechanism"
+      "reason": "Claude Code plugin manifest — copied into the bundle root by the build engine (tools/engine/build.py) as the bundle's own manifest; structural build input, not a depth-tier-gated mechanism"
     },
     {
       "path": "hooks/hooks.json",
-      "reason": "Hooks registration \u2014 the build engine writes a tier/identity-filtered copy into the bundle (hooks/hooks.json); structural build input, not itself a depth-tier-gated mechanism"
+      "reason": "Hooks registration — the build engine writes a tier/identity-filtered copy into the bundle (hooks/hooks.json); structural build input, not itself a depth-tier-gated mechanism"
     },
     {
       "path": "src/build/packaging/mcp.json",
-      "reason": "MCP server registration source \u2014 the build engine transforms it into the bundle's .mcp.json (renamed at the plugin root); build input, not a depth-tier-gated mechanism"
+      "reason": "MCP server registration source — the build engine transforms it into the bundle's .mcp.json (renamed at the plugin root); build input, not a depth-tier-gated mechanism"
     },
     {
       "path": "src/build/packaging/platforms/",
-      "reason": "Per-platform profile sources (claude-code.json, codex.json) \u2014 baked by the build engine into the bundle's platform.json; build input, not a depth-tier-gated mechanism"
+      "reason": "Per-platform profile sources (claude-code.json, codex.json) — baked by the build engine into the bundle's platform.json; build input, not a depth-tier-gated mechanism"
     },
     {
       "path": "src/build/packaging/tiers.json",
-      "reason": "The tier manifest itself \u2014 consumed by the build engine to select shippable mechanisms; build configuration input, not a depth-tier-gated mechanism"
+      "reason": "The tier manifest itself — consumed by the build engine to select shippable mechanisms; build configuration input, not a depth-tier-gated mechanism"
     }
   ]
 }

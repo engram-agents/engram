@@ -41,6 +41,11 @@ import sqlite3
 import sys
 from pathlib import Path
 
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
+
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
 
@@ -391,10 +396,7 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             state.pop("lock_degrade_reason", None)
         if flag_changed:
             try:
-                _tmp = str(STATE_PATH) + ".tmp"
-                with open(_tmp, "w") as f:
-                    json.dump(state, f)
-                os.replace(_tmp, str(STATE_PATH))
+                atomic_write_json(str(STATE_PATH), state)
             except OSError:
                 pass
         now = time.time()
@@ -453,14 +455,12 @@ def check_in_turn_recall(match_target: str, hook_input: dict | None = None) -> s
             return ""
 
         def _write_state() -> None:
-            """Best-effort atomic state write (tmp + os.replace so a concurrent
-            reader never sees a truncated file; a lost race only risks an early
-            re-fire, which is acceptable for this T2 channel)."""
+            """Best-effort atomic state write via _hooklib.atomic_write_json()
+            (tmp + os.replace so a concurrent reader never sees a truncated
+            file; a lost race only risks an early re-fire, which is
+            acceptable for this T2 channel)."""
             try:
-                tmp = str(STATE_PATH) + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(state, f)
-                os.replace(tmp, str(STATE_PATH))
+                atomic_write_json(str(STATE_PATH), state)
             except OSError:
                 pass
 

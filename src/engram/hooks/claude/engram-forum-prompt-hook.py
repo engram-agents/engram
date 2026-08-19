@@ -12,10 +12,10 @@ then injects a 🔔 mention line ABOVE the generic 📢 threads line when pendin
 clears the mention automatically — no local read-cursor involved.
 
 Also auto-publishes derived agent status to /api/agents/status on a throttled
-schedule (Q1–Q4 from spec #1077 part 1): synchronous POST with timeout=2,
-swallow-all-errors, throttle on max(cadence_seconds, 60), always-publish-on-
-state-change, mid-sleep guard. The publish never breaks the existing thread/
-mention surfacing.
+schedule (Q1–Q4 from spec #1077 part 1): synchronous POST with timeout=
+PUBLISH_TIMEOUT_SECONDS, swallow-all-errors, throttle on max(cadence_seconds,
+60), always-publish-on-state-change, mid-sleep guard. The publish never
+breaks the existing thread/mention surfacing.
 
 Two-cursor state for threads (surfaced cursor is still hook-owned):
   - forum-surfaced-cursor.txt: advances on every hook fire. Drives "new since
@@ -32,6 +32,20 @@ the hook chain if the forum is down).
 Publish state: separate ~/.engram/forum-status-publish.json tracks last-published
 status with its own throttle interval (never shares the 30s-TTL cache).
 
+comms_surface gate (alpha#2019 slice A): config.json["comms_surface"] ("umwelt"
+| "forum", resolved via _prompthooklib.get_comms_surface()) decides which lines
+this hook is allowed to emit. Under "forum" (the default -- absent key), the
+🔔/📢 lines above are unchanged. Under "umwelt", both are suppressed (the
+umwelt plugin's own hooks already surface world state) EXCEPT a single
+compact 📪 advisory line when pending ADDRESSED items (mentions) exist --
+the anti-black-hole clause: a world-preferring seat must never silently miss
+an addressed forum item pre-bridge (umwelt#599 slice 4 will bridge these).
+The guarantee is bounded by cache availability: a first-contact outage with
+no prior cache is still silent, matching the existing forum-mode outage
+contract above -- the advisory's absence is not proof of an empty inbox
+during an outage. Broadcast-only counts (new threads, no mention) are fully
+suppressed under "umwelt".
+
 Silent no-op conditions:
   - forum.url and agent_name not configured.
   - Server unreachable (uses cached data if available, else silent skip).
@@ -39,6 +53,8 @@ Silent no-op conditions:
   - Inbox endpoint absent / error -> no mention line; generic behavior unchanged.
   - Status publish failure (forum-status-publish.json) -> silently swallowed;
     existing output unaffected.
+  - comms_surface=umwelt with no pending addressed items -> fully silent
+    (broadcast-only new-thread counts are not surfaced under umwelt).
 
 Design doc: forum/spec.md
 """
@@ -78,6 +94,41 @@ CACHE_TTL_SECONDS = 30
 
 _DEFAULT_FORUM_URL = "http://localhost:5002"
 
+# hooks.json budgets this hook at 5s total. FETCH_TIMEOUT_SECONDS previously
+# matched that budget exactly (5s), leaving zero margin for process startup +
+# JSON parsing — on a genuinely unreachable forum the hook call itself would
+# often exceed the outer budget and the harness would report a hook timeout
+# instead of the intended graceful degrade-to-cache.
+#
+# Worst case per fire covered by THESE two constants is THREE calls, not two:
+# _fetch_threads, then (only if threads succeeded) _fetch_inbox, then the
+# unconditional publish POST. A prior version of this comment assumed at most
+# one fetch plus the publish — true for a dead host (inbox is skipped when
+# threads returns None) but false for a SLOW host: threads can succeed just
+# under its own ceiling, then inbox times out at its own full ceiling, then
+# publish still fires. FETCH_TIMEOUT_SECONDS covers both the threads and inbox
+# call sites, so the invariant for THIS three-call class is
+# 2*FETCH_TIMEOUT_SECONDS + PUBLISH_TIMEOUT_SECONDS must stay comfortably
+# under 5s (colleague catch, PR #1642 review, 2026-08-03 — see
+# test_worst_case_three_call_budget_under_hook_timeout for the regression
+# guard on this exact sum).
+#
+# KNOWN GAP (gh#1906, not closed by this fix): the auto-publish block below
+# also calls derive_own_status(), which unconditionally makes a FOURTH,
+# uncached HTTP call (_fetch_held_batons, in _status_derive.py) on its own
+# independent _FORUM_REQUEST_TIMEOUT_SECONDS=2.0 -- not derived from either
+# constant here, and not covered by this module's 30s threads/mentions cache.
+# The true worst case (threads + inbox + held-batons + publish) can still
+# exceed 5s on a slow-but-alive host even with the constants below. Left
+# open rather than shrinking these two constants further to compensate,
+# since that constant is shared with tools/forum.py's unconstrained
+# status-auto CLI path and squeezing these fetches much smaller trades away
+# real margin for legitimately-slow (not dead) hosts. See gh#1906 for the
+# candidate fixes (cache the held-batons call; a shared cross-call deadline;
+# or the connect-level reachability precheck already flagged in #1641).
+FETCH_TIMEOUT_SECONDS = 1.5
+PUBLISH_TIMEOUT_SECONDS = 1.0
+
 # ---------------------------------------------------------------------------
 # _status_derive import (spec §2, Q2)
 #
@@ -112,6 +163,7 @@ try:
     from _prompthooklib import (
         load_config as _load_config_impl,
         get_agent_name as _get_agent_name_impl,
+        get_comms_surface as _get_comms_surface_impl,
         bootstrap_tools_dir as _bootstrap_tools_dir,
     )
     _PROMPTHOOKLIB_OK = True
@@ -170,6 +222,15 @@ def _load_config() -> dict:
 def _get_agent_name(config: dict) -> str:
     """Resolve agent name from config. Returns '' if not set."""
     return _get_agent_name_impl(config, ENGRAM_HOME)
+
+
+def _get_comms_surface(config: dict) -> str:
+    """Resolve this agent's comms surface ('umwelt' or 'forum') from config.
+
+    See _prompthooklib.get_comms_surface() for the full semantics
+    (alpha#2019 slice A).
+    """
+    return _get_comms_surface_impl(config, ENGRAM_HOME)
 
 
 def _get_forum_url(config: dict) -> str:
@@ -401,7 +462,7 @@ def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Opt
     """GET /api/threads?since=<cursor>&agent=<name>.
 
     Returns thread list on success, None on any error (caller uses cache).
-    Timeout: 5 seconds (hard-coded; hook budget).
+    Timeout: FETCH_TIMEOUT_SECONDS (see module header for the budget math).
     """
     params = {}
     if since:
@@ -421,7 +482,7 @@ def _fetch_threads(forum_url: str, since: Optional[str], agent_name: str) -> Opt
             url,
             headers={"Accept": "application/json"},
         )
-        with _ipv4_only_urlopen(req, timeout=5) as resp:
+        with _ipv4_only_urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             return data.get("threads", [])
@@ -438,7 +499,7 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
     Returns a list of inbox items filtered to kind=at_mention on success,
     None on any error (advisory; never breaks the hook chain). Swallows ALL
     errors including 404 (old server without the inbox endpoint) — same
-    bare-except discipline as _fetch_threads. Timeout: 5 seconds.
+    bare-except discipline as _fetch_threads. Timeout: FETCH_TIMEOUT_SECONDS.
     URL-quotes the agent name for safety.
 
     Response shape: {"inbox": [...], "unread_all": N}
@@ -453,7 +514,7 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
             url,
             headers={"Accept": "application/json"},
         )
-        with _ipv4_only_urlopen(req, timeout=5) as resp:
+        with _ipv4_only_urlopen(req, timeout=FETCH_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8")
             data = json.loads(body)
             inbox = data.get("inbox", [])
@@ -508,6 +569,29 @@ def _format_mention_line(mentions: list) -> Optional[str]:
     )
 
 
+def _format_umwelt_advisory_line(mentions: list) -> Optional[str]:
+    """Format the 📪 comms_surface=umwelt anti-black-hole advisory line.
+
+    alpha#2019 slice A: under comms_surface=umwelt, the ordinary 🔔/📢
+    hook-surface lines are suppressed (the umwelt plugin's own hooks
+    already surface world state). But an ADDRESSED forum item (an
+    at_mention -- a broadcast-only new-thread has no addressee) must never
+    silently vanish pre-bridge (umwelt#599 slice 4), so this single
+    compact line fires whenever pending addressed items exist. Returns
+    None when there are none (broadcast-only counts are fully suppressed
+    under umwelt -- no line at all in that case).
+    """
+    if not mentions:
+        return None
+    total = len(mentions)
+    noun = "item" if total == 1 else "items"
+    return (
+        f"\U0001f4ea comms_surface=umwelt: {total} addressed forum {noun} exist; "
+        f"the mention bridge is not yet live — `forum read <id>` to collect "
+        f"(alpha#2019/umwelt#599 slice 4 will bridge these)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -530,6 +614,7 @@ def main() -> None:
 
     agent_name = _get_agent_name(config)
     forum_url = _get_forum_url(config)
+    comms_surface = _get_comms_surface(config)
 
     # ── Read surfaced cursor ──────────────────────────────────────────────────
     surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)
@@ -609,7 +694,7 @@ def main() -> None:
             # Step 5: decide whether to publish.
             current_tuple = (state, activity, tuple(queue), cadence)
             if _should_publish(last_pub, current_tuple, _now, throttle):
-                # Step 6: POST to /api/agents/status with timeout=2.
+                # Step 6: POST to /api/agents/status with timeout=PUBLISH_TIMEOUT_SECONDS.
                 # Only on success, write the publish state file.
                 payload: dict = {
                     "agent": agent_name,
@@ -633,7 +718,7 @@ def main() -> None:
                     method="POST",
                 )
                 try:
-                    with _ipv4_only_urlopen(req, timeout=2) as resp:
+                    with _ipv4_only_urlopen(req, timeout=PUBLISH_TIMEOUT_SECONDS) as resp:
                         resp.read()  # consume response body; discard result
                     # POST succeeded — advance the throttle timestamp.
                     _save_publish_state(state, activity, queue, cadence, _now)
@@ -646,29 +731,42 @@ def main() -> None:
         # thread/mention output is unaffected.
         pass
 
-    # ── Exit silently if nothing to report ────────────────────────────────────
-    if not threads and not mention_line:
-        sys.exit(0)
+    # ── comms_surface gate (alpha#2019 slice A) ───────────────────────────────
+    # Under "umwelt", the ordinary 🔔/📢 lines are suppressed (the umwelt
+    # plugin's own hooks already surface world state) EXCEPT a single
+    # compact advisory when pending ADDRESSED items (mentions) exist -- the
+    # anti-black-hole clause: a world-preferring seat must never silently
+    # miss an addressed forum item pre-bridge. Broadcast-only counts (new
+    # threads, no mention) are fully suppressed under umwelt.
+    if comms_surface == "umwelt":
+        advisory_line = _format_umwelt_advisory_line(mentions or [])
+        if advisory_line is None:
+            sys.exit(0)
+        lines = [advisory_line]
+    else:
+        # ── Exit silently if nothing to report ──────────────────────────────
+        if not threads and not mention_line:
+            sys.exit(0)
 
-    # ── Count new threads since the surfaced cursor ───────────────────────────
-    new_count = len(threads) if threads else 0
+        # ── Count new threads since the surfaced cursor ─────────────────────
+        new_count = len(threads) if threads else 0
 
-    lines = []
+        lines = []
 
-    # 🔔 mention line first (if any)
-    if mention_line:
-        lines.append(mention_line)
+        # 🔔 mention line first (if any)
+        if mention_line:
+            lines.append(mention_line)
 
-    # 📢 generic threads line (if any)
-    if new_count > 0:
-        post_word = "post" if new_count == 1 else "posts"
-        lines.append(
-            f"\U0001f4e2 {new_count} new forum {post_word} since last read"
-            f" — run `forum read <id>` or `forum status` to catch up."
-        )
+        # 📢 generic threads line (if any)
+        if new_count > 0:
+            post_word = "post" if new_count == 1 else "posts"
+            lines.append(
+                f"\U0001f4e2 {new_count} new forum {post_word} since last read"
+                f" — run `forum read <id>` or `forum status` to catch up."
+            )
 
-    if not lines:
-        sys.exit(0)
+        if not lines:
+            sys.exit(0)
 
     context = "\n".join(lines)
 

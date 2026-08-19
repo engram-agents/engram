@@ -58,8 +58,9 @@ class FakeWorld:
 
 
 class ScriptedRpc:
-    def __init__(self, *, method_responses=None):
+    def __init__(self, *, method_responses=None, notifications=None):
         self.method_responses = {k: list(v) for k, v in (method_responses or {}).items()}
+        self.notifications = list(notifications or [])
         self.calls = []
 
     def __enter__(self):
@@ -82,6 +83,15 @@ class ScriptedRpc:
         if method == "turn/start":
             return {"turn": {"id": "turn_123"}}
         raise AssertionError(f"unexpected method {method!r}")
+
+    def recv_notification(self, timeout):
+        self.calls.append(("recv_notification", timeout))
+        if not self.notifications:
+            raise TimeoutError("no notifications queued")
+        result = self.notifications.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class FakeIo(wake.StreamIo):
@@ -109,6 +119,39 @@ class FakeStreamRpc(wake.StreamWebSocketRpc):
 
     def _connect(self):
         return self.fake_io
+
+
+class FakeWebsocketConnection:
+    def __init__(self, messages):
+        self.messages = list(messages)
+        self.sent = []
+        self.timeouts = []
+        self.closed = False
+        self.socket = self
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def recv(self):
+        if not self.messages:
+            raise TimeoutError("no more fake websocket messages queued")
+        return self.messages.pop(0)
+
+    def send(self, message):
+        self.sent.append(message)
+
+    def close(self):
+        self.closed = True
+
+
+class FakeWebsocketRpc(wake.WebsocketRpc):
+    def __init__(self, fake_conn: FakeWebsocketConnection):
+        super().__init__("ws://fake")
+        self.fake_conn = fake_conn
+
+    def __enter__(self):
+        self.conn = self.fake_conn
+        return self
 
 
 @contextlib.contextmanager
@@ -143,10 +186,57 @@ def _event(ref: str, *, kind: str = "gong", place: str = "place_square"):
     return {
         "id": f"umwelt-crossing:{place}:{ref}",
         "kind": kind,
+        "source": "umwelt",
         "place_id": place,
         "sender": "sol",
         "crossing_ref": ref,
         "prompt_token": wake.stable_hash(f"{place}:{ref}", 12),
+    }
+
+
+def _collab_item(
+    *,
+    sender_thread_id: str = "thread-1",
+    item_status: str = "completed",
+    tool: str = "spawnAgent",
+    item_id: str = "collab-1",
+    agent_statuses: dict[str, str] | None = None,
+):
+    agent_statuses = agent_statuses or {"thread-child": "completed"}
+    return {
+        "type": "collabAgentToolCall",
+        "id": item_id,
+        "senderThreadId": sender_thread_id,
+        "receiverThreadIds": list(agent_statuses),
+        "agentsStates": {child_thread_id: {"status": status} for child_thread_id, status in agent_statuses.items()},
+        "status": item_status,
+        "tool": tool,
+    }
+
+
+def _collab_item_completed_notification(
+    *,
+    thread_id: str = "thread-1",
+    sender_thread_id: str = "thread-1",
+    item_status: str = "completed",
+    tool: str = "spawnAgent",
+    item_id: str = "collab-1",
+    agent_statuses: dict[str, str] | None = None,
+):
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": thread_id,
+            "turnId": "turn-123",
+            "completedAtMs": 1234567890,
+            "item": _collab_item(
+                sender_thread_id=sender_thread_id,
+                item_status=item_status,
+                tool=tool,
+                item_id=item_id,
+                agent_statuses=agent_statuses,
+            ),
+        },
     }
 
 
@@ -156,7 +246,10 @@ def _thread_read(
     client_id: str | None = None,
     turn_id: str | None = None,
     turn_status: str | None = None,
+    turns: list[dict] | None = None,
 ):
+    if turns is not None:
+        return {"thread": {"status": {"type": status}, "turns": turns}}
     items = []
     if client_id is not None:
         items = [{"type": "userMessage", "clientId": client_id, "content": [{"type": "text", "text": "wake"}]}]
@@ -265,6 +358,338 @@ def test_relevant_crossing_distinguishes_gong_message_and_irrelevant():
     assert wake.relevant_crossing(gong, "mira") == "gong"
     assert wake.relevant_crossing(msg, "mira") == "message"
     assert wake.relevant_crossing(nope, "mira") is None
+
+
+def test_relevant_crossing_treats_self_addressed_crossings_as_addressee():
+    self_gong = {
+        "viewer_relation": "sender",
+        "to_agent": "mira",
+        "wake_granted": True,
+    }
+    self_message = {
+        "viewer_relation": "sender",
+        "to_agent": "mira",
+        "wake_granted": False,
+    }
+    self_broadcast = {
+        "viewer_relation": "sender",
+        "wake_granted": True,
+    }
+    case_insensitive_self_message = {
+        "viewer_relation": "sender",
+        "to_agent": "MiRa",
+        "wake_granted": False,
+    }
+
+    assert wake.relevant_crossing(self_gong, "mira") == "gong"
+    assert wake.relevant_crossing(self_message, "mira") == "message"
+    assert wake.relevant_crossing(self_broadcast, "mira") is None
+    assert wake.relevant_crossing(case_insensitive_self_message, "mira") == "message"
+
+
+def test_parse_collab_item_completed_event_matches_target_thread():
+    notification = _collab_item_completed_notification(agent_statuses={"thread-child": "completed", "thread-child-2": "errored"})
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+
+    assert event is not None
+    assert event["source"] == "codex"
+    assert event["kind"] == "child-completed"
+    assert event["target_thread_id"] == "thread-1"
+    assert event["terminal_agent_count"] == 2
+    assert event["status_summary"] == "completed=1,errored=1"
+
+
+def test_parse_collab_item_completed_event_includes_schema_terminal_statuses_only():
+    notification = _collab_item_completed_notification(
+        agent_statuses={
+            "thread-child-a": "completed",
+            "thread-child-b": "shutdown",
+            "thread-child-c": "notFound",
+            "thread-child-d": "running",
+            "thread-child-e": "pendingInit",
+        }
+    )
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+
+    assert event is not None
+    assert event["terminal_agent_count"] == 3
+    assert event["status_summary"] == "completed=1,notFound=1,shutdown=1"
+
+
+def test_parse_collab_item_completed_event_rejects_irrelevant_sender():
+    notification = _collab_item_completed_notification(sender_thread_id="thread-else")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_parse_collab_item_completed_event_rejects_nonterminal_status():
+    notification = _collab_item_completed_notification(item_status="inProgress")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_parse_collab_item_completed_event_rejects_non_spawnagent_tool():
+    notification = _collab_item_completed_notification(tool="wait")
+
+    assert wake.parse_collab_item_completed_event(notification, "thread-1") is None
+
+
+def test_duplicate_codex_completion_event_is_not_requeued(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    notification = _collab_item_completed_notification()
+
+    event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert event is not None
+    assert wake.enqueue_event(state, event, logger) is True
+    assert wake.enqueue_event(state, event, logger) is False
+    assert [queued["id"] for queued in state["queue"]] == [event["id"]]
+
+
+def test_active_parent_defers_codex_completion_wake(tmp_path):
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(), "thread-1")
+    assert event is not None
+    state = wake.default_state()
+    state["queue"] = [event]
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    rpc = ScriptedRpc(method_responses={"thread/read": [_thread_read("active")]})
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=sessions_dir,
+        thread_override="thread-1",
+        logger=_logger(tmp_path),
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: rpc,
+    )
+
+    assert result.status == "waiting_for_idle"
+    assert result.thread_id == "thread-1"
+    assert state["queue"] == [event]
+    assert not [params for method, params in rpc.calls if method == "turn/start"]
+
+
+def test_monitor_drain_replays_latest_idle_completion_and_live_notification(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[_collab_item_completed_notification(item_id="live-1")],
+    )
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: rpc,
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    enqueued = monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1")
+
+    assert enqueued == 2
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1", "live-1"]
+    assert state["codex_monitor_recovery"]["armed"] is True
+    seen_ids = set(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+    assert len(seen_ids) == 3
+    assert {state["queue"][0]["id"], state["queue"][1]["id"]} <= seen_ids
+    monitor.close()
+
+
+def test_monitor_reconnect_recovers_completion_without_notification(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc_round_1 = ScriptedRpc(
+        method_responses={"thread/read": [_thread_read("idle", turns=[{"id": "turn-1", "status": "completed", "items": []}])]},
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [_collab_item(item_id="recover-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert state["queue"] == []
+
+    monitor.close()
+    recovered = monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1")
+
+    assert recovered == 1
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    assert state["codex_monitor_recovery"]["seen_terminal_event_ids"] == [state["queue"][0]["id"]]
+    monitor.close()
+
+
+def test_monitor_reconnect_recovers_same_item_index_status_mutation_once(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    running_item = _collab_item(item_id="recover-1", item_status="inProgress", agent_statuses={"thread-child": "running"})
+    completed_item = _collab_item(item_id="recover-1")
+    rpc_round_1 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "active",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "inProgress", "items": [running_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [completed_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_3 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-1", "status": "completed", "items": []},
+                        {"id": "turn-2", "status": "completed", "items": [completed_item]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2, rpc_round_3])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert state["queue"] == []
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 1
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    seen_after_recovery = list(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert [event["item_id"] for event in state["queue"]] == ["recover-1"]
+    assert state["codex_monitor_recovery"]["seen_terminal_event_ids"] == seen_after_recovery
+    monitor.close()
+
+
+def test_monitor_bootstrap_avoids_historical_flood_and_duplicate_replay(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    rpc_round_1 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpc_round_2 = ScriptedRpc(
+        method_responses={
+            "thread/read": [
+                _thread_read(
+                    "idle",
+                    turns=[
+                        {"id": "turn-old", "status": "completed", "items": [_collab_item(item_id="old-1")]},
+                        {"id": "turn-new", "status": "completed", "items": [_collab_item(item_id="latest-1")]},
+                    ],
+                )
+            ]
+        },
+        notifications=[],
+    )
+    rpcs = iter([rpc_round_1, rpc_round_2])
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://127.0.0.1:4500",
+        logger=logger,
+        transport_resolver=_transport,
+        rpc_opener=lambda _transport: next(rpcs),
+    )
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 1
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+    seen_after_bootstrap = set(state["codex_monitor_recovery"]["seen_terminal_event_ids"])
+    assert len(seen_after_bootstrap) == 2
+
+    monitor.close()
+    assert monitor.drain(state=state, sessions_dir=sessions_dir, thread_override="thread-1") == 0
+    assert [event["item_id"] for event in state["queue"]] == ["latest-1"]
+    assert set(state["codex_monitor_recovery"]["seen_terminal_event_ids"]) == seen_after_bootstrap
+    monitor.close()
+
+
+def test_monitor_recovery_raises_when_terminal_scan_exceeds_cap(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    items = [_collab_item(item_id=f"item-{i}") for i in range(wake.MAX_MONITOR_RECOVERY_ITEMS + 1)]
+
+    with pytest.raises(RuntimeError, match="exceeded bounded terminal-item scan"):
+        wake.recover_collab_completion_events(
+            _thread_read("idle", turns=[{"id": "turn-1", "status": "completed", "items": items}]),
+            target_thread_id="thread-1",
+            state=state,
+            logger=logger,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1430,96 @@ def test_run_cycle_waits_gracefully_when_umwelt_is_missing(tmp_path):
     assert on_disk["mode"] == "waiting_for_umwelt"
 
 
+def test_run_cycle_missing_umwelt_still_delivers_codex_queue(tmp_path, monkeypatch):
+    paths = wake.build_paths(tmp_path / "codex-wake")
+    logger = _logger(tmp_path)
+    state = wake.default_state()
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(item_id="codex-1"), "thread-1")
+    assert event is not None
+    state["queue"] = [event]
+    wake.atomic_write_json(paths.state_path, state)
+
+    def fake_attempt_delivery(current_state, **kwargs):
+        assert current_state["queue"] == [event]
+        wake.ack_event_ids(current_state, [event["id"]])
+        return wake.DeliveryResult(status="delivered", detail=event["item_id"], thread_id="thread-1")
+
+    monkeypatch.setattr(wake, "attempt_delivery", fake_attempt_delivery)
+
+    status = wake.run_cycle(
+        paths=paths,
+        umwelt_config=tmp_path / "missing-umwelt.json",
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=logger,
+        started_at="2026-07-22T12:00:00+00:00",
+    )
+
+    assert status["mode"] == "delivered"
+    assert status["thread_id"] == "thread-1"
+    persisted = json.loads(paths.state_path.read_text())
+    assert persisted["queue"] == []
+    assert event["id"] in persisted["delivered_event_ids"]
+
+
+def test_run_cycle_poll_failure_still_delivers_codex_queue_and_upgrades_legacy_state(tmp_path, monkeypatch):
+    paths = wake.build_paths(tmp_path / "codex-wake")
+    logger = _logger(tmp_path)
+    event = wake.parse_collab_item_completed_event(_collab_item_completed_notification(item_id="codex-legacy"), "thread-1")
+    assert event is not None
+    legacy_state = {
+        "state_version": 3,
+        "seeded": True,
+        "cursors": {"place_square": 7},
+        "queue": [event],
+        "delivered_event_ids": [],
+        "inflight_batch": None,
+        "active_wake": None,
+    }
+    wake.atomic_write_json(paths.state_path, legacy_state)
+    umwelt_config = tmp_path / "umwelt.json"
+    umwelt_config.write_text(json.dumps({"agent": "mira", "world_url": "http://world.test"}))
+
+    def fake_poll(_world, current_state, _logger):
+        assert current_state["state_version"] == wake.STATE_VERSION
+        assert current_state["codex_monitor_recovery"] == wake.default_monitor_recovery()
+        raise RuntimeError("umwelt offline")
+
+    def fake_attempt_delivery(current_state, **kwargs):
+        assert current_state["queue"] == [event]
+        assert current_state["state_version"] == wake.STATE_VERSION
+        assert current_state["codex_monitor_recovery"] == wake.default_monitor_recovery()
+        wake.ack_event_ids(current_state, [event["id"]])
+        return wake.DeliveryResult(status="delivered", detail=event["item_id"], thread_id="thread-1")
+
+    monkeypatch.setattr(wake, "poll_umwelt", fake_poll)
+    monkeypatch.setattr(wake, "attempt_delivery", fake_attempt_delivery)
+
+    status = wake.run_cycle(
+        paths=paths,
+        umwelt_config=umwelt_config,
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=logger,
+        started_at="2026-07-22T12:00:00+00:00",
+    )
+
+    assert status["mode"] == "delivered"
+    assert status["detail"] == "codex-legacy; umwelt degraded: poll failed: umwelt offline"
+    assert status["thread_id"] == "thread-1"
+    persisted = json.loads(paths.state_path.read_text())
+    assert persisted["state_version"] == wake.STATE_VERSION
+    assert persisted["queue"] == []
+    assert event["id"] in persisted["delivered_event_ids"]
+    assert persisted["codex_monitor_recovery"] == wake.default_monitor_recovery()
+    on_disk_status = json.loads(paths.status_path.read_text())
+    assert on_disk_status["mode"] == "delivered"
+    assert on_disk_status["detail"] == "codex-legacy; umwelt degraded: poll failed: umwelt offline"
+    assert "umwelt poll failed: umwelt offline" in (tmp_path / "watcher.log").read_text()
+
+
 # ---------------------------------------------------------------------------
 # thread discovery + transport selection + framing + pid identity
 # ---------------------------------------------------------------------------
@@ -1085,6 +1600,362 @@ def test_stream_websocket_rpc_handles_ping_and_masks_client_frames():
     assert json.loads(req_payload) == {"id": 1, "method": "thread/read", "params": {"threadId": "thread-1", "includeTurns": False}}
     pong_opcode, pong_masked, pong_payload = _parse_client_frame(fake_io.writes[2])
     assert pong_opcode == 0xA and pong_masked is True and pong_payload == b"ping"
+
+
+def test_websocket_rpc_preserves_completion_before_thread_read_response(tmp_path):
+    notification = _collab_item_completed_notification()
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+
+    try:
+        assert monitor.drain(state=state, sessions_dir=tmp_path / "sessions", thread_override="thread-1") == 1
+    finally:
+        monitor.close()
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert [json.loads(message)["method"] for message in fake_conn.sent] == [
+        "initialize", "initialized", "thread/read"
+    ]
+
+
+def test_stream_websocket_rpc_preserves_completion_before_thread_read_response(tmp_path, monkeypatch):
+    handshake_key = b"AAAAAAAAAAAAAAAAAAAAAA=="
+    accept = wake.base64.b64encode(wake.hashlib.sha1(handshake_key + wake.WS_GUID.encode("ascii")).digest())
+    handshake = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
+    notification = _collab_item_completed_notification()
+    fake_io = FakeIo([
+        handshake,
+        _server_frame(0x1, json.dumps({"id": 1, "result": {}}).encode("utf-8")),
+        _server_frame(0x1, json.dumps(notification).encode("utf-8")),
+        _server_frame(0x1, json.dumps({"id": 2, "result": _thread_read("idle")}).encode("utf-8")),
+    ])
+    monkeypatch.setattr(wake.os, "urandom", lambda n: b"\x00" * n)
+    rpc = FakeStreamRpc(fake_io)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="unix:///tmp/fake.sock",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="unix", value="/tmp/fake.sock"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+
+    try:
+        assert monitor.drain(state=state, sessions_dir=tmp_path / "sessions", thread_override="thread-1") == 1
+    finally:
+        monitor.close()
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    methods = [_parse_client_frame(frame)[2] for frame in fake_io.writes[1:4]]
+    assert [json.loads(payload)["method"] for payload in methods] == ["initialize", "initialized", "thread/read"]
+
+
+def test_monitor_initialize_error_salvages_buffered_completion_before_teardown(tmp_path):
+    notification = _collab_item_completed_notification(item_id="initialize-race")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    logger = _logger(tmp_path)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=logger,
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+    persisted = []
+
+    assert monitor.drain(
+        state=state,
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    ) == 1
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+    assert "unexpected response id while waiting for initialize" in (tmp_path / "watcher.log").read_text(encoding="utf-8")
+
+
+def test_monitor_initialize_error_salvages_persisted_inflight_completion_before_override(tmp_path):
+    notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="persisted-initialize-race",
+    )
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    monitor = wake.CodexItemCompletedMonitor(
+        app_server="ws://fake",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+    state = wake.default_state()
+    state["inflight_batch"] = wake.build_inflight_batch([_event("persisted-monitor")], "thread-A")
+    persisted = []
+
+    assert monitor.drain(
+        state=state,
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    ) == 1
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert expected_event is not None
+    assert state["queue"] == [expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+
+
+def test_delivery_preserves_buffered_completion_and_enqueues_it_once(tmp_path):
+    notification = _collab_item_completed_notification(item_id="during-delivery")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps(notification),
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+        json.dumps({"id": 3, "result": {"turn": {"id": "turn_123"}}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    state["queue"] = [_event("delivery-trigger")]
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-1",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert result.status == "delivered"
+    assert state["queue"] == [expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(
+        expected_event in snapshot["queue"] and not closed
+        for snapshot, closed in persisted
+    )
+    assert fake_conn.closed is True
+
+
+def test_delivery_initialize_error_salvages_persisted_inflight_thread_before_override(tmp_path):
+    notification = _collab_item_completed_notification(thread_id="thread-A", sender_thread_id="thread-A", item_id="inflight-race")
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+    state["inflight_batch"] = wake.build_inflight_batch([original_event], "thread-A")
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_conn.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert expected_event is not None
+    assert result.status == "wake_failed"
+    assert state["queue"] == [original_event, expected_event]
+    assert sum(event["id"] == expected_event["id"] for event in state["queue"]) == 1
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_conn.closed is True
+
+
+def test_delivery_queued_codex_completion_precedes_override_after_persisted_work_clears(tmp_path):
+    notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="salvaged-completion",
+    )
+    queued_completion = wake.parse_collab_item_completed_event(notification, "thread-A")
+    assert queued_completion is not None
+    fake_conn = FakeWebsocketConnection([
+        json.dumps({"id": 1, "result": {}}),
+        json.dumps({"id": 2, "result": _thread_read("idle")}),
+        json.dumps({"id": 3, "result": {"turn": {"id": "turn_A"}}}),
+    ])
+    state = wake.default_state()
+    # This is the post-recovery state: the persisted A interval has cleared,
+    # but its salvaged Codex completion is still queued for delivery.
+    state["queue"] = [queued_completion]
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: FakeWebsocketRpc(fake_conn),
+    )
+
+    assert result.status == "delivered"
+    assert result.thread_id == "thread-A"
+    requests = [json.loads(message) for message in fake_conn.sent]
+    assert [request["method"] for request in requests] == ["initialize", "initialized", "thread/read", "turn/start"]
+    assert requests[2]["params"]["threadId"] == "thread-A"
+    assert requests[3]["params"]["threadId"] == "thread-A"
+    assert state["active_wake"]["thread_id"] == "thread-A"
+
+
+def test_delivery_target_override_wins_when_queue_has_only_ordinary_event(tmp_path):
+    state = wake.default_state()
+    state["queue"] = [_event("ordinary-override")]
+
+    assert wake.delivery_target_thread_id(state, tmp_path / "sessions", "thread-B") == ("thread-B", None)
+
+
+def test_delivery_override_filters_unrelated_buffered_completion_without_persisted_work(tmp_path):
+    unrelated_notification = _collab_item_completed_notification(
+        thread_id="thread-A",
+        sender_thread_id="thread-A",
+        item_id="unrelated-race",
+    )
+    fake_conn = FakeWebsocketConnection([
+        json.dumps(unrelated_notification),
+        json.dumps({"id": 2, "result": {}}),
+    ])
+    rpc = FakeWebsocketRpc(fake_conn)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="ws://fake",
+        sessions_dir=tmp_path / "sessions",
+        thread_override="thread-B",
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="websocket", value="ws://fake"),
+        rpc_opener=lambda _: rpc,
+    )
+
+    assert result.status == "wake_failed"
+    assert state["queue"] == [original_event]
+    assert fake_conn.closed is True
+
+
+def test_stream_delivery_self_routes_buffered_completion_without_resolved_target(tmp_path, monkeypatch):
+    handshake_key = b"AAAAAAAAAAAAAAAAAAAAAA=="
+    accept = wake.base64.b64encode(wake.hashlib.sha1(handshake_key + wake.WS_GUID.encode("ascii")).digest())
+    handshake = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    )
+    notification = _collab_item_completed_notification(item_id="unresolved-target")
+    fake_io = FakeIo([
+        handshake,
+        _server_frame(0x1, json.dumps(notification).encode("utf-8")),
+        _server_frame(0x1, json.dumps({"id": 1, "result": {}}).encode("utf-8")),
+    ])
+    monkeypatch.setattr(wake.os, "urandom", lambda n: b"\x00" * n)
+    rpc = FakeStreamRpc(fake_io)
+    state = wake.default_state()
+    original_event = _event("delivery-trigger")
+    state["queue"] = [original_event]
+    persisted = []
+
+    result = wake.attempt_delivery(
+        state,
+        app_server="unix:///tmp/fake.sock",
+        sessions_dir=tmp_path / "sessions",
+        thread_override=None,
+        logger=_logger(tmp_path),
+        transport_resolver=lambda _: wake.TransportTarget(kind="unix", value="/tmp/fake.sock"),
+        rpc_opener=lambda _: rpc,
+        persist_state=lambda current_state: persisted.append((json.loads(json.dumps(current_state)), fake_io.closed)),
+    )
+
+    expected_event = wake.parse_collab_item_completed_event(notification, "thread-1")
+    assert expected_event is not None
+    assert result.status == "waiting_for_thread"
+    assert result.thread_id is None
+    assert state["queue"] == [original_event, expected_event]
+    assert any(expected_event in snapshot["queue"] and not closed for snapshot, closed in persisted)
+    assert fake_io.closed is True
+
+
+def test_rpc_rejects_mismatched_response_id():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"id": 2, "result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match=r"unexpected response id.*expected 1, got 2"):
+        rpc.call("thread/read", {"threadId": "thread-1"})
+
+
+def test_rpc_rejects_malformed_idless_response():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match="without a valid notification method"):
+        rpc.call("thread/read", {"threadId": "thread-1"})
+
+
+def test_recv_notification_rejects_id_bearing_response():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([json.dumps({"id": 1, "result": {}})]))
+
+    with rpc, pytest.raises(RuntimeError, match="unexpected response while waiting for RPC notification"):
+        rpc.recv_notification(1)
+
+
+def test_pending_rpc_notification_queue_capacity_and_overflow():
+    rpc = FakeWebsocketRpc(FakeWebsocketConnection([]))
+    notification = {"method": "item/completed", "params": {}}
+
+    for _ in range(wake.MAX_PENDING_RPC_NOTIFICATIONS):
+        rpc._preserve_notification(notification)
+
+    assert len(rpc._pending_notifications) == wake.MAX_PENDING_RPC_NOTIFICATIONS
+    with pytest.raises(RuntimeError, match="pending websocket notification queue exceeded limit"):
+        rpc._preserve_notification(notification)
+    assert rpc.drain_buffered_notifications() == [notification] * wake.MAX_PENDING_RPC_NOTIFICATIONS
+    assert rpc.drain_buffered_notifications() == []
 
 
 def test_current_status_requires_matching_watcher_cmdline(tmp_path, monkeypatch):

@@ -33,6 +33,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -101,16 +102,75 @@ def _make_result(*, special_nodes=None, top_claims=None, match_count=None,
 
 
 class LedgerTestBase(unittest.TestCase):
-    """Common setUp/tearDown: isolated ENGRAM_HOME per test."""
+    """Common setUp/tearDown: isolated ENGRAM_HOME per test.
+
+    #2015/#2081: `self.hook.ENGRAM_HOME = self.tmp` (the old approach, kept
+    below as a redundant belt-and-suspenders assignment) only rebinds the
+    module-level `ENGRAM_HOME` NAME after import. Path constants the module
+    computes ONCE at import time via `os.path.join(ENGRAM_HOME, ...)` --
+    e.g. `PRINCIPLE_TRIGGERS_PATH`, and critically `PRINCIPLE_TRIGGER_STATE_PATH`
+    (the lesson/cornerstone/axiom/goal cross-prompt cooldown state file) --
+    are plain strings baked in at that import, and reassigning the module
+    attribute afterward does not touch them. Those two constants therefore
+    kept resolving against the REAL `$ENGRAM_HOME` (default `~/.engram`),
+    reading and WRITING a live agent's actual cooldown state
+    (`principle-trigger-state.json`) from `TestTripwireExemptFromSuppression`
+    -- both the "fails on a real machine, green in CI" defect (#2015: a real
+    agent's `ls_0001` cooldown state suppresses the tripwire the test expects
+    to always fire) and the cross-run order-sensitivity (#2081: each
+    exec'd-fresh test module still shares that ONE real on-disk state file
+    across process runs, so an earlier run's write changes a later run's
+    read).
+
+    Fix: set `ENGRAM_HOME` in the environment BEFORE importing the module
+    (matching tests/test_principle_triggers_registry.py's
+    `monkeypatch.setenv("ENGRAM_HOME", ...)` convention for the same hook
+    file, translated to unittest via `mock.patch.dict`), so EVERY
+    import-time-computed path constant -- not just the ones an individual
+    test happens to know to override -- resolves against this test's own
+    scratch dir.
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="engram_ledger_test_")
+        self._env_patch = mock.patch.dict(os.environ, {"ENGRAM_HOME": self.tmp})
+        self._env_patch.start()
         self.hook = _load_hook_module()
+        # Redundant now that ENGRAM_HOME is set before import (every
+        # import-time constant already resolves against self.tmp), but kept
+        # as a harmless belt-and-suspenders assignment matching this
+        # suite's established `_surface_ledger_path()`-style dynamic-lookup
+        # pattern, and so any code that reads `hook.ENGRAM_HOME` directly at
+        # call time (rather than a frozen constant) still sees the same value.
         self.hook.ENGRAM_HOME = self.tmp
+        # Self-guarding assertion: if the env-patch-before-import fix above
+        # is ever reverted (e.g. ENGRAM_HOME patched only *after*
+        # `_load_hook_module()`, or the `mock.patch.dict` call moved/removed),
+        # the import-time-computed path constants silently fall back to
+        # resolving against the REAL `$ENGRAM_HOME` again -- exactly the
+        # "fails on a real machine, green in CI" defect this fix closes
+        # (#2015). Asserting here makes that regression fail LOUDLY, in CI,
+        # on every run -- not only on a real machine that happens to have
+        # live cooldown state to collide with.
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGER_STATE_PATH,
+            os.path.join(self.tmp, "principle-trigger-state.json"),
+            "PRINCIPLE_TRIGGER_STATE_PATH did not resolve against the "
+            "test's isolated ENGRAM_HOME -- the env-patch-before-import "
+            "fix for #2015/#2081 may have regressed.",
+        )
+        self.assertEqual(
+            self.hook.PRINCIPLE_TRIGGERS_PATH,
+            os.path.join(self.tmp, "principle_triggers.json"),
+            "PRINCIPLE_TRIGGERS_PATH did not resolve against the test's "
+            "isolated ENGRAM_HOME -- the env-patch-before-import fix for "
+            "#2015/#2081 may have regressed.",
+        )
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
+        self._env_patch.stop()
 
     def _ledger_path(self):
         return os.path.join(self.tmp, "surface-ledger.json")
@@ -426,6 +486,86 @@ class TestLedgerRetentionPruning(LedgerTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Person-moment cooldown bucket must not corrupt the general ledger
+#     (#1940 round-5 fast-follow — reviewer-fairy REQUEST_CHANGES repro)
+# ---------------------------------------------------------------------------
+
+
+class TestPersonMomentRenderDoesNotPruneOtherSessions(LedgerTestBase):
+    """Regression test for the reviewer-fairy's exact repro.
+
+    _record_person_moment_render used to reuse _append_surface_ledger_entry
+    (the general per-session ledger's append+prune helper) to write into the
+    reserved __person_moment_cooldown__ bucket. That helper's internal
+    _prune_surface_ledger call prunes the ENTIRE ledger dict — every session
+    key, not just the reserved bucket — using a retention size derived from
+    whatever k was passed in. The call site could only ever pass a
+    hardcoded k (this bucket has no session_id and thus no k of its own),
+    NOT the operator-configured recall_suppression.k — so firing a
+    person-moment render silently re-pruned every OTHER session's ledger
+    entries down to the hardcoded k's retention window.
+
+    Invisible at the default k=5 (the hardcoded fallback and a configured
+    k=5 both compute retention=20 via max(4*k, DEFAULT_LEDGER_RETENTION_ENTRIES)),
+    so this test deliberately configures recall_suppression.k above 5 (k=10,
+    matching the reviewer's own repro) to make the divergence observable:
+    intended retention at k=10 is max(4*10, 20) = 40, so an unrelated
+    session grown to 36 real entries must NOT be truncated by a
+    person-moment render.
+    """
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.tmp, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"recall_suppression": {"k": 10}}, f)
+
+    def test_unrelated_session_entries_survive_a_person_moment_render(self):
+        # Grow "other-session" past the OLD buggy retention (20, from the
+        # hardcoded k=5 fallback) but within the correctly-configured one
+        # (40, from k=10) — via the SAME real append pathway format_nudge
+        # itself uses for ordinary renders.
+        for i in range(36):
+            self.hook._append_surface_ledger_entry(
+                "other-session", {f"n{i}"}, k=10,
+            )
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            before = json.load(f)
+        self.assertEqual(len(before["other-session"]), 36)
+
+        # Fire a person-moment render — must touch ONLY the reserved bucket.
+        self.hook._record_person_moment_render("pn_unrelated_test")
+
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertEqual(
+            len(after["other-session"]), 36,
+            "person-moment render must not prune/truncate an unrelated "
+            "session's ledger entries (round-5 regression: it used to "
+            "silently collapse them to a hardcoded-k retention window)",
+        )
+        self.assertEqual(after["other-session"], before["other-session"])
+        # And the reserved bucket itself got the new entry, untouched by
+        # any other pruning pass.
+        bucket = after[self.hook._PERSON_MOMENT_LEDGER_KEY]
+        self.assertEqual(len(bucket), 1)
+        self.assertIn("pn_unrelated_test:moment", bucket[0]["ids"])
+
+    def test_person_moment_bucket_retention_capped_independently_of_k(self):
+        """The reserved bucket's own retention
+        (_PERSON_MOMENT_LEDGER_RETENTION) bounds ITS OWN growth regardless
+        of the configured recall_suppression.k — sanity check that the new
+        scoped read-modify-write still bounds this bucket's size at all
+        (not unbounded now that it no longer goes through the general
+        pruning helper)."""
+        for i in range(30):
+            self.hook._record_person_moment_render(f"pn_{i}")
+        with open(self._ledger_path(), "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+        bucket = ledger[self.hook._PERSON_MOMENT_LEDGER_KEY]
+        self.assertEqual(len(bucket), self.hook._PERSON_MOMENT_LEDGER_RETENTION)
+
+
+# ---------------------------------------------------------------------------
 # 7. Tripwire output is never suppressed
 # ---------------------------------------------------------------------------
 
@@ -447,6 +587,11 @@ class TestTripwireExemptFromSuppression(LedgerTestBase):
                     "nudge": "do the corrective action",
                 }
             }, f)
+        # No-op post-fix: PRINCIPLE_TRIGGERS_PATH already resolves to
+        # registry_path via the patched ENGRAM_HOME (see LedgerTestBase),
+        # since registry_path == os.path.join(self.tmp, "principle_triggers.json").
+        # Kept for explicitness/robustness rather than relying solely on
+        # that resolution.
         self.hook.PRINCIPLE_TRIGGERS_PATH = registry_path
 
         # Seed the surfaced ledger as if this id had already been suppressed

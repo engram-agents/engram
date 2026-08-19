@@ -451,10 +451,26 @@ def format_drowsiness(usage: dict) -> str:
     signal exactly when it's structurally warranted.
 
     In loop mode ($ENGRAM_HOME/loop-mode.json present), at urgent the agent
-    is instructed to nap ONCE (engram_nap) to stage the window for
-    auto-compaction, then keep working and ride auto-compaction — no manual
-    compaction wait, no re-nap before it fires. Below urgent, loop mode is
-    silent: the banner is identical to non-loop mode (calm level word only).
+    is instructed to capture the COMPLETED burst — the one that just ended,
+    not the one about to start — before beginning the next one: append its
+    arc to today's history file, write the nodes for anything decided or
+    found, then nap to checkpoint it. Below urgent, loop mode is silent: the
+    banner is identical to non-loop mode (calm level word only).
+
+    Past-burst capture, not current-burst protection (engram-alpha#2026 WS4,
+    revised per the maintainer 2026-08-16): the compaction summary carries
+    our custom instructions only ~12% of the time (16 of 135 since May,
+    measured — see the issue), so capture matters regardless of when
+    compaction lands. Firing once per loop wake is correct, not a
+    limitation — auto-compaction can land mid-burst, so the in-flight burst
+    is unsaveable either way; capturing at the end of burst N and capturing
+    at the start of burst N+1 cover identical content. An earlier revision
+    (WS4) added a per-turn Stop-path escalation to protect the in-flight
+    burst; it was retired because there is nothing in the in-flight burst
+    this banner doesn't already reach by covering the one before it, and the
+    Stop path carried a loop-risk defect (no stop_hook_active guard, plus a
+    lowered prose threshold that made re-fire more likely exactly when turns
+    are most expensive).
     """
     pct = usage["usage_pct"]
     est_tokens = usage["estimated_tokens"]
@@ -467,17 +483,24 @@ def format_drowsiness(usage: dict) -> str:
     loop_mode = os.path.exists(LOOP_MARKER_PATH)
 
     if loop_mode:
-        # Loop mode: at urgent, nap ONCE to stage the window for compaction,
-        # then keep pace and ride auto-compaction (don't wait for a manual
-        # compaction, don't re-nap each turn before it fires). Below urgent
-        # there's nothing loop-specific to say — render the calm level word
-        # exactly like non-loop mode, so the banner isn't a per-prompt alarm.
+        # Loop mode: at urgent, instruct capture of the COMPLETED burst (the
+        # one that just ended) — history arc + nodes — then nap to
+        # checkpoint, then keep working. The in-flight burst cannot be
+        # protected either way (compaction can land mid-burst), so firing
+        # once per wake and pointing at the past burst is correct, not a
+        # gap. Below urgent there's nothing loop-specific to say — render
+        # the calm level word exactly like non-loop mode, so the banner
+        # isn't a per-prompt alarm.
         if urgent:
             return (
-                f"[Drowsiness: {pct:.0%} — loop mode: nap ONCE (engram_nap) to "
-                f"stage this window for compaction (skip if you already napped "
-                f"this burst), then keep working and ride auto-compaction — "
-                f"don't slow down for a manual compaction.]"
+                f"[Drowsiness: {pct:.0%} — loop mode: compaction is near and the summary "
+                f"will not carry your work across it. BEFORE starting this burst, capture "
+                f"the LAST one: (1) append its arc to today's "
+                f"~/.engram/history/YYYY-MM-DD.md, (2) write the nodes for anything you "
+                f"decided or found, (3) nap to checkpoint it. Anything left only in "
+                f"context is lost at the boundary, not deferred. The in-flight burst "
+                f"cannot be saved either way — so capture the completed one and keep "
+                f"working; don't wait for a manual compaction.]"
             )
         return f"[Drowsiness: {drowsiness_level(pct, thresholds)}]"
 

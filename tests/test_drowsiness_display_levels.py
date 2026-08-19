@@ -166,17 +166,49 @@ class TestFormatDrowsinessOutput(unittest.TestCase):
 
     @patch("context_tracker.os.path.exists")
     def test_loop_mode_at_urgent_shows_percentage(self, exists_mock):
-        """Loop mode + urgent: percentage shown, nap-once directive, no 'compaction will auto-fire'."""
+        """Loop mode + urgent: percentage shown, past-burst-capture directive
+        (Lei's 2026-08-16 revision — capture the COMPLETED burst, not the
+        in-flight one), no 'compaction will auto-fire'.
+        """
         exists_mock.return_value = True
         defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
         with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
             out = ct.format_drowsiness(self._usage(0.93, mode="1m"))
         self.assertIn("93%", out)
         self.assertIn("loop mode", out)
-        self.assertIn("auto-compaction", out)
-        self.assertIn("engram_nap", out)
+        self.assertIn("compaction", out)
+        self.assertIn("capture the LAST one", out, msg="must instruct capture of the PAST/completed burst")
         self.assertNotIn("needs a nap", out)
         self.assertNotIn("compaction will auto-fire", out)
+
+    @patch("context_tracker.os.path.exists")
+    def test_loop_mode_urgent_banner_instructs_past_burst_capture(self, exists_mock):
+        """WS4 revision (Lei, 2026-08-16): the urgent loop-mode banner must
+        instruct capture of the PAST/completed burst, not the in-flight one —
+        assert on a distinctive marker string, not on length.
+        """
+        exists_mock.return_value = True
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.93, mode="1m"))
+        self.assertIn(
+            "BEFORE starting this burst, capture the LAST one", out,
+            msg="banner must point at the completed burst, not protect the in-flight one",
+        )
+        self.assertIn("lost at the boundary, not deferred", out)
+        self.assertNotIn("nap ONCE", out, msg="old current-burst-protection wording must be gone")
+
+    @patch("context_tracker.os.path.exists")
+    def test_loop_mode_below_urgent_is_bare_level_word(self, exists_mock):
+        """Below urgent in loop mode, the banner is exactly the bare level
+        word — identical to non-loop mode, no per-turn Stop-path enforcer to
+        defer to anymore (that escalation is retired).
+        """
+        exists_mock.return_value = True  # loop-mode marker exists
+        defaults_1m = ct.DEFAULT_DROWSINESS_THRESHOLDS_BY_MODE["1m"]
+        with patch.object(ct, "_load_drowsiness_thresholds", return_value=defaults_1m):
+            out = ct.format_drowsiness(self._usage(0.65, mode="1m"))
+        self.assertEqual(out, "[Drowsiness: energetic]")
 
     @patch("context_tracker.os.path.exists")
     def test_200k_a_little_drowsy_band(self, exists_mock):

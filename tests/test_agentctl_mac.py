@@ -15,9 +15,14 @@ discriminator, no `or True`, no asserts over self-constructed values.
 """
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import socket
 import subprocess
 from pathlib import Path
+
+import pytest
 
 AGENTCTL_MAC = Path(__file__).resolve().parent.parent / "tools" / "agentctl-mac"
 AGENTCTL_LINUX = Path(__file__).resolve().parent.parent / "tools" / "agentctl"
@@ -57,13 +62,73 @@ def test_missing_agent_name_errors():
 
 
 # ---------------------------------------------------------------------------
+# attach subcommand
+#
+# `claude agents --json` output is real, live, and not something these tests
+# control -- so only the parts that are deterministic regardless of what
+# background sessions happen to exist are exercised directly via subprocess
+# (argument validation). The zero-match error path is a real discriminator
+# IF `claude` is on PATH in this environment; if it is not, the equivalent
+# "claude CLI not found" path is exercised instead (equally real, equally
+# deterministic, and doesn't require fabricating a `claude agents --json`
+# fixture this suite doesn't control).
+# ---------------------------------------------------------------------------
+
+_CLAUDE_ON_PATH = shutil.which("claude") is not None
+
+# A name virtually guaranteed not to match any real background claude
+# session in any environment this test runs in.
+_ABSENT_AGENT_NAME = "test-agentctl-mac-attach-nonexistent-xyz123"
+
+
+def test_attach_missing_agent_name_errors():
+    rc, out, err = _run("attach")
+    assert rc == 2
+    assert not out
+    assert "agent name" in err.lower()
+
+
+def test_attach_unknown_extra_args_error():
+    rc, out, err = _run("attach", "luria", "--bogus-flag")
+    assert rc == 2
+    assert not out
+    assert "unknown extra args" in err.lower()
+
+
+def test_attach_unknown_extra_args_after_dry_run_error():
+    rc, out, err = _run("attach", "luria", "--dry-run", "--bogus-flag")
+    assert rc == 2
+    assert not out
+    assert "unknown extra args" in err.lower()
+
+
+@pytest.mark.skipif(not _CLAUDE_ON_PATH, reason="claude not on PATH in this environment")
+def test_attach_zero_match_errors_and_lists_active_sessions():
+    rc, out, err = _run("attach", _ABSENT_AGENT_NAME, "--dry-run")
+    assert rc == 1
+    assert not out
+    assert "no background claude session" in err.lower()
+    assert _ABSENT_AGENT_NAME in err
+    assert "active sessions" in err.lower()
+
+
+@pytest.mark.skipif(_CLAUDE_ON_PATH, reason="claude IS on PATH in this environment -- covered by the zero-match test instead")
+def test_attach_claude_not_on_path_errors():
+    rc, out, err = _run("attach", _ABSENT_AGENT_NAME, "--dry-run")
+    assert rc == 1
+    assert not out
+    assert "claude" in err.lower()
+    assert "not found" in err.lower()
+
+
+# ---------------------------------------------------------------------------
 # Dry-run: base command + platform default
 # ---------------------------------------------------------------------------
 
-def test_dry_run_no_flags_defaults_to_claude():
+def test_dry_run_no_flags_uses_a_detected_supported_platform():
     rc, out, _ = _run("session", "luria", "--dry-run")
     assert rc == 0
-    assert out.split()[0] == "claude"
+    assert out.split()[0] in ("claude", "codex")
 
 
 def test_dry_run_explicit_codex_platform():
@@ -92,7 +157,7 @@ def test_invalid_platform_override_errors():
 # ---------------------------------------------------------------------------
 
 def test_drc_bundle_expands_all_three():
-    rc, out, _ = _run("session", "luria", "-drc", "--dry-run")
+    rc, out, _ = _run("session", "luria", "-drc", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert "--dangerously-skip-permissions" in out
     assert "--remote-control" in out
@@ -101,7 +166,7 @@ def test_drc_bundle_expands_all_three():
 
 
 def test_agent_name_flows_into_remote_control():
-    rc, out, _ = _run("session", "clio", "-r", "--dry-run")
+    rc, out, _ = _run("session", "clio", "-r", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert "--remote-control" in out
     words = out.split()
@@ -116,11 +181,13 @@ def test_codex_d_expands_to_bypass_approvals():
     assert "--dangerously-skip-permissions" not in out
 
 
-def test_codex_r_errors_nonzero():
+def test_codex_r_is_silently_consumed_for_compatibility():
     rc, out, err = _run("session", "luria", "-r", "--platform", "codex", "--dry-run")
-    assert rc != 0
-    assert not out
-    assert "remote control" in err.lower()
+    assert rc == 0
+    assert out.split() == ["codex"]
+    assert "-r" not in out
+    assert "--remote-control" not in out
+    assert not err
 
 
 # ---------------------------------------------------------------------------
@@ -132,19 +199,19 @@ def test_codex_r_errors_nonzero():
 # ---------------------------------------------------------------------------
 
 def test_as_self_is_absorbed_not_forwarded():
-    rc, out, _ = _run("session", "luria", "--as-self", "--dry-run")
+    rc, out, _ = _run("session", "luria", "--as-self", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert out.split() == ["claude"]
 
 
 def test_no_share_is_absorbed_not_forwarded():
-    rc, out, _ = _run("session", "luria", "--no-share", "--dry-run")
+    rc, out, _ = _run("session", "luria", "--no-share", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert out.split() == ["claude"]
 
 
 def test_as_self_and_no_share_compose_with_real_flags():
-    rc, out, _ = _run("session", "luria", "--as-self", "-d", "--no-share", "--dry-run")
+    rc, out, _ = _run("session", "luria", "--as-self", "-d", "--no-share", "--platform", "claude", "--dry-run")
     assert rc == 0
     words = out.split()
     assert words == ["claude", "--dangerously-skip-permissions"]
@@ -159,14 +226,14 @@ def test_as_self_and_no_share_compose_with_real_flags():
 # ---------------------------------------------------------------------------
 
 def test_local_absorbed_with_deprecation_notice():
-    rc, out, err = _run("session", "luria", "--local", "--dry-run")
+    rc, out, err = _run("session", "luria", "--local", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert out.split() == ["claude"]
     assert "deprecated" in err.lower()
 
 
 def test_local_composes_with_real_flags():
-    rc, out, err = _run("session", "luria", "--local", "-d", "--dry-run")
+    rc, out, err = _run("session", "luria", "--local", "-d", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert out.split() == ["claude", "--dangerously-skip-permissions"]
     assert "deprecated" in err.lower()
@@ -209,7 +276,7 @@ def test_cd_nonexistent_dir_errors():
 
 
 def test_cd_real_dir_succeeds():
-    rc, out, _ = _run("session", "luria", "--cd", "/tmp", "--dry-run")
+    rc, out, _ = _run("session", "luria", "--cd", "/tmp", "--platform", "claude", "--dry-run")
     assert rc == 0
     assert out.split()[0] == "claude"
 
@@ -223,7 +290,7 @@ def test_cd_real_dir_succeeds():
 # ---------------------------------------------------------------------------
 
 def test_passthrough_args_after_dashdash_land_verbatim():
-    rc, out, _ = _run("session", "luria", "-d", "--dry-run", "--", "--resume", "abc123")
+    rc, out, _ = _run("session", "luria", "-d", "--platform", "claude", "--dry-run", "--", "--resume", "abc123")
     assert rc == 0
     words = out.split()
     assert "--dangerously-skip-permissions" in words
@@ -328,3 +395,145 @@ def test_agentctl_mac_covers_every_parse_session_flags_flag():
         "otherwise handle -- doesn't have to match tools/agentctl's own behavior "
         "exactly, just must not silently fall through)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex managed daemon + one-TUI topology
+#
+# The Mac wrapper is single-user but must not make a separate local Codex
+# app-server. These tests stub only Codex and tmux and exercise the wrapper's
+# real Codex hand-off to agentctl's portable managed-session core.
+# ---------------------------------------------------------------------------
+
+
+def _make_unix_socket(path: Path) -> socket.socket:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(str(path))
+    return sock
+
+
+def _write_mac_codex_stubs(tmp_path: Path) -> tuple[Path, Path, Path]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    tmux_state = tmp_path / "tmux-running"
+    (bin_dir / "codex").write_text(
+        "#!/bin/bash\n"
+        "set -eu\n"
+        "{ printf 'codex'; printf ' %q' \"$@\"; printf '\\n'; } >> \"$FAKE_LOG\"\n"
+        "if [[ \"${1:-}\" == app-server && \"${2:-}\" == daemon && \"${3:-}\" == start ]]; then exit \"${FAKE_START_RC:-0}\"; fi\n"
+        "if [[ \"${1:-}\" == app-server && \"${2:-}\" == daemon && \"${3:-}\" == version ]]; then\n"
+        "  if [[ \"${FAKE_VERSION_RC:-0}\" != 0 ]]; then exit \"$FAKE_VERSION_RC\"; fi\n"
+        "  if [[ -n \"${FAKE_VERSION_OUTPUT+x}\" ]]; then printf '%s\\n' \"$FAKE_VERSION_OUTPUT\"; else printf '{\\\"socketPath\\\": \\\"%s\\\"}\\n' \"$FAKE_SOCKET\"; fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf 'unexpected fake codex invocation\\n' >&2; exit 99\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "tmux").write_text(
+        "#!/bin/bash\n"
+        "set -eu\n"
+        "{ printf 'tmux'; printf ' %q' \"$@\"; printf '\\n'; } >> \"$FAKE_LOG\"\n"
+        "case \"${1:-}\" in\n"
+        "  has-session) test -f \"$FAKE_TMUX_STATE\" ;;\n"
+        "  new-session) touch \"$FAKE_TMUX_STATE\" ;;\n"
+        "  set-option) exit 0 ;;\n"
+        "  attach) exit 0 ;;\n"
+        "  display-message) printf '%s\\n' \"${FAKE_TMUX_NAME:-other-session}\" ;;\n"
+        "  *) printf 'unexpected fake tmux invocation\\n' >&2; exit 98 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    for path in bin_dir.iterdir():
+        path.chmod(0o755)
+    return bin_dir, log, tmux_state
+
+
+def _run_managed_mac_codex(
+    tmp_path: Path,
+    *args: str,
+    session_exists: bool = False,
+    start_rc: int = 0,
+    version_output: str | None = None,
+    socket_is_real: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], str, Path]:
+    socket_path = tmp_path / "app-server-control.sock"
+    sock = _make_unix_socket(socket_path) if socket_is_real else None
+    if not socket_is_real:
+        socket_path.write_text("not a socket", encoding="utf-8")
+    try:
+        bin_dir, log, tmux_state = _write_mac_codex_stubs(tmp_path)
+        if session_exists:
+            tmux_state.touch()
+        cwd = tmp_path / "project"
+        cwd.mkdir()
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_LOG": str(log),
+            "FAKE_SOCKET": str(socket_path),
+            "FAKE_TMUX_STATE": str(tmux_state),
+            "FAKE_START_RC": str(start_rc),
+        }
+        if version_output is not None:
+            env["FAKE_VERSION_OUTPUT"] = version_output
+        proc = subprocess.run(
+            ["bash", str(AGENTCTL_MAC), "session", "luria", "--platform", "codex", "--cd", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        return proc, log.read_text(encoding="utf-8") if log.exists() else "", cwd
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def test_mac_codex_ensures_verified_daemon_then_starts_remote_tui_in_cwd(tmp_path):
+    proc, calls, cwd = _run_managed_mac_codex(tmp_path, "-c")
+    assert proc.returncode == 0, proc.stderr
+    lines = calls.splitlines()
+    assert lines[:2] == ["codex app-server daemon start", "codex app-server daemon version"]
+    new_session = next(line for line in lines if line.startswith("tmux new-session"))
+    assert f"-c {cwd}" in new_session
+    assert "codex\\ --remote\\ unix://" in new_session
+    assert "resume\\ --last" in new_session
+    assert "tmux set-option -t agent-luria mouse on" in lines
+    assert "tmux attach -t agent-luria" in lines
+    assert not any(line.startswith("codex --remote") for line in lines)
+
+
+def test_mac_codex_reuses_existing_tui_by_attaching_without_second_session(tmp_path):
+    proc, calls, _ = _run_managed_mac_codex(tmp_path, session_exists=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "codex app-server daemon version" in calls
+    assert "tmux new-session" not in calls
+    assert "tmux set-option -t agent-luria mouse on" in calls
+    assert "tmux attach -t agent-luria" in calls
+
+
+def test_mac_codex_rejects_continue_against_existing_tui(tmp_path):
+    proc, calls, _ = _run_managed_mac_codex(tmp_path, "-c", session_exists=True)
+    assert proc.returncode != 0
+    assert "already running; cannot apply new session/resume arguments" in proc.stderr
+    assert "tmux new-session" not in calls
+    assert "tmux attach" not in calls
+
+
+def test_mac_codex_non_socket_daemon_report_fails_without_local_fallback(tmp_path):
+    proc, calls, _ = _run_managed_mac_codex(tmp_path, socket_is_real=False)
+    assert proc.returncode != 0
+    assert "but it is not a Unix socket" in proc.stderr
+    assert "codex app-server daemon start" in calls
+    assert "codex app-server daemon version" in calls
+    assert "tmux" not in calls
+    assert "codex --remote" not in calls
+
+
+def test_mac_codex_daemon_start_failure_never_launches_tui(tmp_path):
+    proc, calls, _ = _run_managed_mac_codex(tmp_path, start_rc=1)
+    assert proc.returncode != 0
+    assert "could not ensure the managed Codex app-server" in proc.stderr
+    assert calls.splitlines() == ["codex app-server daemon start"]
+    assert "tmux" not in calls

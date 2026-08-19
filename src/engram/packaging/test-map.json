@@ -270,6 +270,12 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/dream_lottery.py",
+      "test_globs": [
+        "tests/test_dream_lottery.py"
+      ]
+    },
+    {
       "path_prefix_or_glob": "tools/config_schema.py",
       "test_globs": [
         "tests/test_config_schema.py"
@@ -369,6 +375,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/os-harness-check.py",
+      "test_globs": [
+        "tests/test_os_harness_check.py"
+      ],
+      "note": "The checker reports an ABSENCE (no bash-4-only constructs in shipped shell scripts), and an absence-reporting tool is trustworthy only if its detector demonstrably fires on a positive. The mapped suite therefore weights the detector's falsifiability — every pattern matches a known-positive AND rejects the portable bash-3.2 equivalent — over its plumbing. The hyphenated filename means it is loaded by path, not imported, so it has no import-graph edge and would otherwise be layer-1-unreachable."
+    },
+    {
       "path_prefix_or_glob": "tools/release-cutover.py",
       "test_globs": [
         "tests/test_release_cutover.py"
@@ -432,6 +445,14 @@
       "note": "No test file found for forum-mention-monitor.sh"
     },
     {
+      "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
+      "test_globs": [
+        "tests/test_forum_monitor_duplicate_warn.py",
+        "tests/test_pgrep_liveness_reap_patterns.py"
+      ],
+      "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table."
+    },
+    {
       "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
       "test_globs": [
         "tests/test_codex_umwelt_wake.py"
@@ -489,6 +510,13 @@
         "tests/test_release_gates.py"
       ],
       "note": "scorecard config; consumed by release_gates tests"
+    },
+    {
+      "path_prefix_or_glob": "tools/verify_quote.py",
+      "test_globs": [
+        "tests/test_verify_quote_exit_codes.py"
+      ],
+      "note": "exit-code contract (#1990); subprocess-tested against the real entrypoint"
     }
   ],
   "unmapped": [
@@ -547,10 +575,6 @@
     {
       "path": "tools/session.py",
       "reason": "No dedicated test file found"
-    },
-    {
-      "path": "tools/verify_quote.py",
-      "reason": "No dedicated test file found (verify_quote is tested indirectly via server tests)"
     },
     {
       "path": "tools/write_sleep_marker.py",

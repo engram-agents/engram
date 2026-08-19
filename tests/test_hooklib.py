@@ -14,9 +14,16 @@ function completely (`monkeypatch.setattr(mod, "_is_any_server_py_running",
 lambda: True/False)`), so the real subprocess call never ran under CI -- the
 TestIsOwnServerPyRunningScoping tests below exercise it directly with a live
 decoy process instead of stubbing it away.
+
+Also covers atomic_write_json() (gh#2035 -- one atomic-write convention for
+hook state files): no temp file left behind on the success or exception
+path, and a failure mid-write leaves the original file intact -- the actual
+property atomicity buys.
 """
 
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 import time
@@ -252,3 +259,87 @@ class TestIsOwnServerPyRunningScoping:
         engram_home = tmp_path / "engram_home_nothing_running"
         engram_home.mkdir()
         assert mod.is_own_server_py_running(str(engram_home)) is False
+
+
+# ---------------------------------------------------------------------------
+# atomic_write_json() -- gh#2035
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicWriteJson:
+    def test_success_path_writes_content_and_leaves_no_temp_file(self, tmp_path):
+        mod = _load_module()
+        path = tmp_path / "state.json"
+        data = {"pending": True, "count": 3}
+
+        mod.atomic_write_json(str(path), data)
+
+        assert path.exists()
+        assert json.loads(path.read_text()) == data
+        # No stray *.tmp sibling of any name (mkstemp uses a random infix,
+        # so this checks the whole directory rather than one literal name).
+        leftovers = [p for p in tmp_path.iterdir() if p.name != "state.json"]
+        assert leftovers == []
+
+    def test_exception_path_leaves_no_temp_file(self, tmp_path, monkeypatch):
+        mod = _load_module()
+        path = tmp_path / "state.json"
+
+        monkeypatch.setattr(
+            mod.json, "dump", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
+        )
+
+        with pytest.raises(ValueError):
+            mod.atomic_write_json(str(path), {"x": 1})
+
+        assert not path.exists()
+        leftovers = list(tmp_path.iterdir())
+        assert leftovers == []
+
+    def test_failure_mid_write_leaves_original_file_intact(self, tmp_path, monkeypatch):
+        """The actual property atomicity buys: a write that fails partway
+        through must never corrupt or truncate the file that was already
+        there."""
+        mod = _load_module()
+        path = tmp_path / "state.json"
+        original_content = json.dumps({"transcript_path": "/a/b.jsonl", "byte_offset": 42})
+        path.write_text(original_content)
+
+        monkeypatch.setattr(
+            mod.json, "dump", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom"))
+        )
+
+        with pytest.raises(ValueError):
+            mod.atomic_write_json(str(path), {"transcript_path": "/other.jsonl", "byte_offset": 0})
+
+        # Byte-identical to the pre-failure content -- not merely "still
+        # valid JSON" or "still parseable".
+        assert path.read_text() == original_content
+
+    def test_writes_across_multiple_calls_replace_cleanly(self, tmp_path):
+        """Regression guard for the temp-file-cleanup path: repeated
+        successful writes to the same destination never accumulate stray
+        temp files (each write's mkstemp result is consumed by os.replace)."""
+        mod = _load_module()
+        path = tmp_path / "state.json"
+
+        for i in range(5):
+            mod.atomic_write_json(str(path), {"n": i})
+
+        assert json.loads(path.read_text()) == {"n": 4}
+        leftovers = [p for p in tmp_path.iterdir() if p.name != "state.json"]
+        assert leftovers == []
+
+    def test_indent_and_encoding_pass_through(self, tmp_path):
+        mod = _load_module()
+        path = tmp_path / "state.json"
+
+        mod.atomic_write_json(str(path), {"a": 1}, indent=2, encoding="utf-8")
+
+        text = path.read_text(encoding="utf-8")
+        assert json.loads(text) == {"a": 1}
+        assert "\n" in text  # indent=2 produces multi-line output
+
+    # Cross-filesystem behavior (os.replace() requires same filesystem as
+    # the destination) is not testable here -- see the docstring's "Same
+    # directory matters" note. No test for that case per this issue's spec.

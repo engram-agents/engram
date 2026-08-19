@@ -297,6 +297,32 @@ def _run_walguard_check(*args, **kwargs):
 def _walguard_degraded_banner(*args, **kwargs):
     return core._walguard_degraded_banner(*args, **kwargs)
 
+
+def _attach_walguard_banner(json_response: str) -> str:
+    """Attach the `_walguard_warning` banner (#786) to a write tool's JSON
+    response when the degraded marker is present, else return it unchanged.
+
+    Reuses _walguard_degraded_banner() — the same banner text the read/stat
+    surfaces already attach at engram_surface/engram_nap/engram_advance_turn
+    (and engram_stats._surface_stats_impl / _diagnose_impl). This is the
+    write-tool counterpart (#1947 slice E): without it, a write made during a
+    split-brain WAL-index window returns an ordinary success payload with no
+    signal that it may not be durable. Never raises; a malformed json_response
+    is returned unchanged.
+    """
+    banner = _walguard_degraded_banner()
+    if not banner:
+        return json_response
+    try:
+        result_dict = json.loads(json_response)
+    except (TypeError, ValueError):
+        return json_response
+    if isinstance(result_dict, dict):
+        result_dict["_walguard_warning"] = banner
+        return json.dumps(result_dict)
+    return json_response
+
+
 def _git(*args, **kwargs):
     return core._git(*args, **kwargs)
 
@@ -472,6 +498,9 @@ def _goal_tension_impl(*args, **kwargs):
 
 def _add_lesson_impl(*args, **kwargs):
     return _epistemic_mod._add_lesson_impl(*args, **kwargs)
+
+def _update_lesson_impl(*args, **kwargs):
+    return _epistemic_mod._update_lesson_impl(*args, **kwargs)
 
 def _register_exemplar_impl(*args, **kwargs):
     return _epistemic_mod._register_exemplar_impl(*args, **kwargs)
@@ -1390,14 +1419,71 @@ def _strip_similar_block(*args, **kwargs):
 _SIMILAR_STRIP_KEYS = core._SIMILAR_STRIP_KEYS
 
 
+# ---------------------------------------------------------------------------
+# Tool-capability index (issue #1958)
+# ---------------------------------------------------------------------------
+# Claude Code now defers MCP tool schemas: at decision time an agent sees
+# ~58 tool NAMES and nothing else — no descriptions, no parameter info.
+# Learning what a tool CAN do costs a full schema fetch via ToolSearch. This
+# splits CAN from HOW and only ships HOW, so agents reach for workarounds
+# (raw sqlite3 scripts, guessing) instead of the tool built for exactly
+# their question.
+#
+# capability=<str> is a REQUIRED kwarg on every @mcp.tool() call site — a
+# one-line, boundary-focused statement of what the tool can/cannot do (NOT
+# a restatement of the docstring's happy path). TOOL_CAPABILITIES collects
+# these at decoration time, keyed by the tool's registered name. This dict
+# is populated only inside a full server.py import (fastmcp available) —
+# tools/engram-generate-tool-capability-index.py reads it to produce the
+# checked-in static artifact (src/engram/tool_capability_index.txt — root-level,
+# not a generated/ subdirectory; see #1958's PR for why)
+# that the (deliberately fastmcp-free) SessionStart hook injects.
+TOOL_CAPABILITIES: dict[str, str] = {}
+
+
 _original_mcp_tool = mcp.tool
 
 
 def _timing_mcp_tool(*args, **kwargs):
-    """Drop-in replacement for mcp.tool that wraps the function in a timing shim."""
+    """Drop-in replacement for mcp.tool that wraps the function in a timing shim.
+
+    Also enforces + records the required `capability` kwarg (issue #1958 —
+    tool-capability index). capability is popped from kwargs before
+    delegating to the real mcp.tool decorator: FastMCP does not recognize
+    this kwarg and would reject the call if it saw it. A missing or
+    non-string/empty capability raises ValueError at decoration time (i.e.
+    at module-import time for every real tool) — fail loud, not a silently
+    incomplete index that a future tool addition could slip past unnoticed.
+    """
+    if "capability" not in kwargs:
+        raise ValueError(
+            f"@mcp.tool() call is missing the required capability= kwarg "
+            f"(args={args!r}, kwargs={kwargs!r}). Every ENGRAM tool must "
+            f"declare a one-line, boundary-focused capability statement for "
+            f"the tool-capability index (issue #1958) — see TOOL_CAPABILITIES "
+            f"and any existing @mcp.tool() call site for the shape."
+        )
+    capability = kwargs.pop("capability")
+    if not isinstance(capability, str) or not capability.strip():
+        raise ValueError(
+            f"@mcp.tool() capability= must be a non-empty string, got "
+            f"{capability!r} (args={args!r}, kwargs={kwargs!r})."
+        )
+
     inner_decorator = _original_mcp_tool(*args, **kwargs)
+    # Captured here (outer scope) rather than re-read from kwargs inside
+    # wrapper() below: kwargs is this call's dict, available for the whole
+    # closure regardless of decorator invocation order.
+    _registered_name = kwargs.get("name")
 
     def wrapper(func):
+        # Recorded at DECORATION time (module import), not call time — the
+        # index must be fully populated before any tool is ever invoked.
+        # name= kwarg takes priority when present (all 56 real ENGRAM tool
+        # call sites pass it); fall back to func.__name__ for the
+        # theoretical case of a bare @mcp.tool() with no name= override.
+        TOOL_CAPABILITIES[_registered_name or func.__name__] = capability
+
         @functools.wraps(func)
         def timed(*a, **kw):
             start = time.perf_counter()
@@ -1562,6 +1648,11 @@ _ADD_OBSERVATION_FIELDS = frozenset({
 # predicted) + a target (what was predicted). Use for falsifiable forecasts.
 @mcp.tool(
     name="engram_add_observation",
+    capability=(
+        "Files ONE claim with verified provenance (quote checked verbatim against the "
+        "source/session). Not for several claims from one source — use "
+        "engram_add_observation_batch."
+    ),
     annotations={
         "title": "Extract Observation from Source",
         "readOnlyHint": False,
@@ -1660,18 +1751,22 @@ def engram_add_observation(payload_json: str) -> str:
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
                 produced the source claim (the "who observes" axis). Used for provenance-uniformity
-                detection. Tiered convention (proposed-pending-Lei-ratification): for in-graph
-                entities (peer agents, anyone already a person node) use the pn_* node ID — it
-                carries trust-tier, bio, and about edges. For external one-off authors (a cited
-                journalist, paper author) use a canonical namespaced string such as
+                detection. Tiered convention: for in-graph entities (peer agents, anyone already a
+                person node) use the pn_* node ID — it carries trust-tier, bio, and about edges, and
+                MUST resolve to an existing, current person node. For external one-off authors (a
+                cited journalist, paper author) use a canonical namespaced string such as
                 orcid:0000-0001-2345-6789, doi-author:10.1000/xyz123, or domain:handle — NOT a raw
                 display name; the independence gate needs same-author → same-string and
                 different-author → different-string, and display names are bad join keys ('J. Smith'
                 ≠ 'John Smith'; homonym collisions). Promote a namespaced string to a pn_* node when
                 the author becomes load-bearing (cited ≥2 times or a reliability view forms) —
                 mirrors conjecture→derivation promotion. Non-goal: minting a person node for every
-                author; the independence gate needs only a stable equality key. A format warning is
-                emitted (but the write proceeds) if the value looks like a raw display name.
+                author; the independence gate needs only a stable equality key. Write-time hard gate
+                (#1827): a raw display-name shape, or a well-formed pn_* id that does not resolve to
+                an existing current person node, is REJECTED with a repair hint (a fuzzy-matched
+                existing person, or a mint-one pointer to engram_add_person). Config kill-switch
+                `standpoint.author_id_hard_gate` (default true) restores the pre-#1827 warn-not-reject
+                behavior when set false.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
@@ -1695,7 +1790,7 @@ def engram_add_observation(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_OBSERVATION_FIELDS)}"
         })
 
-    return _add_observation_impl(**params)
+    return _attach_walguard_banner(_add_observation_impl(**params))
 
 
 # _add_observation_impl body moved to engram_observation.py (family A, #872 wave 9).
@@ -1733,6 +1828,10 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # protection same as singleton add_observation.
 @mcp.tool(
     name="engram_add_observation_batch",
+    capability=(
+        "Bulk variant: files MULTIPLE observations sharing one source's evidence in one "
+        "call. Same verbatim-quote rules per item; not a multi-source batch."
+    ),
     annotations={
         "title": "Extract Multiple Observations from Source",
         "readOnlyHint": False,
@@ -1762,7 +1861,8 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id (see tiered-ID convention in
                 engram_add_observation — pn_* for in-graph entities, namespaced
-                string for external authors; display names emit a warning),
+                string for external authors; a display-name shape or a dangling
+                pn_* is REJECTED per-item, #1827),
                 standpoint_collection_id, standpoint_override_tag,
                 standpoint_lineage (format "provider:family", e.g. "anthropic:opus" —
                 the most load-bearing bias axis for AI-agent premises; format-validated;
@@ -1802,7 +1902,7 @@ def engram_add_observation_batch(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_OBSERVATION_BATCH_FIELDS)}"
         })
 
-    return _add_observation_batch_impl(**params)
+    return _attach_walguard_banner(_add_observation_batch_impl(**params))
 
 
 # _add_observation_batch_impl body moved to engram_observation.py (family A, #872 wave 9).
@@ -1837,6 +1937,10 @@ _SURFACE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_surface",
+    capability=(
+        "Lossy 'sounds familiar' scan — IDs + compact summary only, NO full content, NO "
+        "memory refresh. Use engram_query/inspect to actually read a hit."
+    ),
     annotations={
         "title": "Shallow Knowledge Surface",
         "readOnlyHint": True,
@@ -1927,12 +2031,24 @@ def engram_surface(payload_json: str) -> str:
 # (trace multi-hop chains). engram_inspect refreshes only the TARGET node's
 # recall, not neighbors — the chain itself is engram_get_subgraph's job.
 _INSPECT_FIELDS = frozenset({
-    "node_id", "view", "dream_mode", "include_superseded",
+    "node_id", "node_ids", "view", "dream_mode", "include_superseded",
 })
+
+# Cap on a single batch inspect. Refused loudly rather than truncated silently:
+# a batch read usually feeds a correctness check ("do these premises actually
+# support the claim citing them?"), and silently returning a subset of what was
+# asked for is the failure mode where the caller concludes from data they never
+# saw. See #1956.
+_INSPECT_BATCH_MAX = 25
 
 
 @mcp.tool(
     name="engram_inspect",
+    capability=(
+        "Full content + neighbours for one node id, OR a batch (node_ids, capped 25, "
+        "refused not truncated). Refreshes recall unless dream_mode=True. Does NOT search "
+        "— id(s) required."
+    ),
     annotations={
         "title": "Inspect Single Node",
         "readOnlyHint": True,
@@ -1961,7 +2077,19 @@ def engram_inspect(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            node_id (str, required): The node ID to inspect (e.g. 'dv_NNNN').
+            node_id (str): The node ID to inspect (e.g. 'dv_NNNN'). Required
+                unless node_ids is given; the two are mutually exclusive.
+            node_ids (list of str): Batch form — inspect several nodes in ONE
+                call, e.g. checking whether a derivation's premises actually
+                support the claim citing them. Returns
+                {"count": N, "nodes": [...]} with results in the order given,
+                duplicates removed (a repeated ID would refresh that node's
+                memory twice). A node that is missing or invalid yields a
+                per-entry {"error": ...} instead of failing the whole batch.
+                Capped at 25 and REFUSED — never silently truncated — above
+                that. Side effects are per node: a batch inspect is N
+                inspections, so memory refresh and importance boost apply to
+                each, and dream_mode opts all of them out.
             view (str, optional): One of "recall" (default), "deep", "edges".
             dream_mode (bool, optional): If True, skip memory refresh and
                 importance-score boost. Use during dream/audit cycles.
@@ -1989,9 +2117,54 @@ def engram_inspect(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_INSPECT_FIELDS)}"
         })
-    if "node_id" not in params:
-        return json.dumps({"error": "payload_json must include required field 'node_id'"})
-    return _inspect_impl(**params)
+    has_one = "node_id" in params
+    has_many = "node_ids" in params
+    if has_one and has_many:
+        return json.dumps({
+            "error": "Pass either 'node_id' (single) or 'node_ids' (batch), not both."
+        })
+    if not has_one and not has_many:
+        return json.dumps({
+            "error": "payload_json must include required field 'node_id' (or 'node_ids' for a batch)"
+        })
+    if has_one:
+        return _inspect_impl(**params)
+
+    # ---- batch path (#1956) ----
+    node_ids = params.pop("node_ids")
+    if not isinstance(node_ids, list):
+        return json.dumps({
+            "error": f"'node_ids' must be a list of node IDs, got {type(node_ids).__name__}"
+        })
+    if not node_ids:
+        return json.dumps({"error": "'node_ids' must not be empty (omit it to inspect a single node)"})
+    bad = [n for n in node_ids if not isinstance(n, str)]
+    if bad:
+        return json.dumps({"error": f"'node_ids' entries must be strings, got {bad[:3]!r}"})
+    if len(node_ids) > _INSPECT_BATCH_MAX:
+        return json.dumps({
+            "error": f"'node_ids' has {len(node_ids)} entries, over the {_INSPECT_BATCH_MAX} cap. "
+                     f"Refused rather than truncated — a partial result you did not ask for is "
+                     f"indistinguishable from a complete one. Split the batch."
+        })
+
+    # Dedupe preserving caller order. Inspecting the same node twice in one call
+    # would refresh its memory twice, which is a side effect the caller did not
+    # ask for and cannot see.
+    seen: set[str] = set()
+    ordered = [n for n in node_ids if not (n in seen or seen.add(n))]
+
+    # A missing or invalid node yields a per-entry error rather than failing the
+    # whole batch: the other nodes were legitimately requested and are still
+    # useful, and the caller can see exactly which one was bad.
+    results = []
+    for nid in ordered:
+        results.append(json.loads(_inspect_impl(node_id=nid, **params)))
+
+    out = {"count": len(results), "nodes": results}
+    if len(ordered) != len(node_ids):
+        out["deduped"] = len(node_ids) - len(ordered)
+    return json.dumps(out)
 
 
 # Set of legitimate field names for the engram_query payload.
@@ -2026,6 +2199,10 @@ _QUERY_FIELDS = frozenset({
 # preserves the full legacy shape for eval/harness contracts.
 @mcp.tool(
     name="engram_query",
+    capability=(
+        "Semantic+keyword search returning ranked (tiered) nodes; REFRESHES recall on "
+        "every hit. Use engram_surface for an ambient hint with no refresh."
+    ),
     annotations={
         "title": "Search Knowledge Graph",
         "readOnlyHint": True,
@@ -2125,6 +2302,10 @@ _SUBGRAPH_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_get_subgraph",
+    capability=(
+        "Browses topology N hops from a known node — adjacency + hop-graduated summaries, "
+        "not full content. view='deep' rejected; drill in with engram_inspect."
+    ),
     annotations={
         "title": "Inspect Node Neighborhood",
         "readOnlyHint": True,
@@ -2221,6 +2402,11 @@ _NAP_FIELDS = frozenset({
 # engram-nap skill §5b.
 @mcp.tool(
     name="engram_nap",
+    capability=(
+        "Lossless checkpoint usable ANY time — no turn advance, no forgetting-curve "
+        "effect. Use engram_advance_turn for the once-daily irreversible sleep "
+        "checkpoint."
+    ),
     annotations={
         "title": "Pre-compaction Nap (no turn advance)",
         "readOnlyHint": False,
@@ -2369,6 +2555,11 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # tonight?" before calling this.
 @mcp.tool(
     name="engram_advance_turn",
+    capability=(
+        "[Sleep/first-session only] IRREVERSIBLE turn-advance checkpoint — at most "
+        "once/24h, no self-guard against double-call. Mid-session saves should use "
+        "engram_nap instead."
+    ),
     annotations={
         "title": "[Sleep cycle / first session only — DO NOT call awake.] Session Checkpoint with Turn Advance (irreversible)",
         "readOnlyHint": False,
@@ -2510,6 +2701,10 @@ _REFLECT_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_reflect",
+    capability=(
+        "[Sleep-cycle] Heavyweight categorized self-audit that opens the dream cycle. "
+        "Awake-callable but wasteful — use engram_diagnose for awake-state health checks."
+    ),
     annotations={
         "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
         "readOnlyHint": True,
@@ -2610,6 +2805,10 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
 # wrong with the reasoning-type discount path).
 @mcp.tool(
     name="engram_stats",
+    capability=(
+        "Fixed graph-level sections (counts, confidence distribution, memory tiers) — NOT "
+        "arbitrary group-bys. mode= restricts to a recent creation-time window."
+    ),
     annotations={
         "title": "Knowledge Graph Statistics",
         "readOnlyHint": True,
@@ -2711,6 +2910,10 @@ def engram_stats(payload_json: str = "{}") -> str:
 # operational config audit — "what knobs is this install currently set to?"
 @mcp.tool(
     name="engram_diagnose",
+    capability=(
+        "Side-effect-free quantitative health audit across seven fixed dimensions plus a "
+        "composite health_score. No filtering args — always audits the whole graph."
+    ),
     annotations={
         "title": "Comprehensive Diagnostic Health Audit",
         "readOnlyHint": True,
@@ -2777,6 +2980,11 @@ _HISTORY_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_history",
+    capability=(
+        "Side-effect-free audit trail: 'edits' mode is the mutation log "
+        "(create/supersede/retract/resolve); 'diagnostics' mode is health-score snapshots "
+        "over time."
+    ),
     annotations={
         "title": "Browse Edit and Diagnostic History",
         "readOnlyHint": True,
@@ -2859,6 +3067,10 @@ _ADD_AXIOM_FIELDS = frozenset({"claim", "basis", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_axiom",
+    capability=(
+        "Records a TERMINAL principle (confidence always 1.0, no premises). "
+        "Identity-layer, discuss-first, use sparingly — not for ordinary claims."
+    ),
     annotations={
         "title": "Add Axiom",
         "readOnlyHint": False,
@@ -2897,7 +3109,7 @@ def engram_add_axiom(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_AXIOM_FIELDS)}"
         })
 
-    return _add_axiom_impl(**params)
+    return _attach_walguard_banner(_add_axiom_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_definition payload.
@@ -2924,6 +3136,10 @@ _ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_definition",
+    capability=(
+        "Anchors what a TERM means in this graph — vocabulary grounding, not a claim "
+        "about the world. Refine via engram_supersede, not re-filing."
+    ),
     annotations={
         "title": "Add Definition",
         "readOnlyHint": False,
@@ -2963,7 +3179,7 @@ def engram_add_definition(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_DEFINITION_FIELDS)}"
         })
 
-    return _add_definition_impl(**params)
+    return _attach_walguard_banner(_add_definition_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_conjecture payload.
@@ -2997,6 +3213,10 @@ _ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "con
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_conjecture",
+    capability=(
+        "Files a speculative hypothesis (confidence capped [0.10, 0.60]). Promote via "
+        "engram_resolve, NOT engram_supersede — cross-type promotion is rejected."
+    ),
     annotations={
         "title": "Add Conjecture",
         "readOnlyHint": False,
@@ -3042,7 +3262,7 @@ def engram_add_conjecture(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_CONJECTURE_FIELDS)}"
         })
 
-    return _add_conjecture_impl(**params)
+    return _attach_walguard_banner(_add_conjecture_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_goal payload.
@@ -3072,6 +3292,10 @@ _ADD_GOAL_FIELDS = frozenset({"claim", "motivation", "context_ids"})
 # Single-payload signature (Wave 2c of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_goal",
+    capability=(
+        "Records a directional aspiration — no completion state. motivation is REQUIRED. "
+        "Discuss-first; not a task (use engram_add_task)."
+    ),
     annotations={
         "title": "Add Goal",
         "readOnlyHint": False,
@@ -3112,7 +3336,7 @@ def engram_add_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_GOAL_FIELDS)}"
         })
 
-    return _add_goal_impl(**params)
+    return _attach_walguard_banner(_add_goal_impl(**params))
 
 
 # Set of legitimate field names for the engram_deactivate_goal payload.
@@ -3136,6 +3360,10 @@ _DEACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
 # Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
 @mcp.tool(
     name="engram_deactivate_goal",
+    capability=(
+        "Pauses a goal (hides it from engram_reflect) WITHOUT retracting — reversible via "
+        "engram_activate_goal. Not for a goal that was wrong."
+    ),
     annotations={
         "title": "Deactivate Goal",
         "readOnlyHint": False,
@@ -3180,7 +3408,7 @@ def engram_deactivate_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_DEACTIVATE_GOAL_FIELDS)}"
         })
 
-    return _deactivate_goal_impl(**params)
+    return _attach_walguard_banner(_deactivate_goal_impl(**params))
 
 
 # Set of legitimate field names for the engram_activate_goal payload.
@@ -3199,6 +3427,10 @@ _ACTIVATE_GOAL_FIELDS = frozenset({"goal_id", "reason"})
 # Single-payload signature (mandatory per CLAUDE.md MCP tool parameter style).
 @mcp.tool(
     name="engram_activate_goal",
+    capability=(
+        "Restores a goal paused by engram_deactivate_goal. Errors if already active — not "
+        "a general goal-status setter."
+    ),
     annotations={
         "title": "Activate Goal",
         "readOnlyHint": False,
@@ -3240,7 +3472,7 @@ def engram_activate_goal(payload_json: str) -> str:
                      f"Allowed: {sorted(_ACTIVATE_GOAL_FIELDS)}"
         })
 
-    return _activate_goal_impl(**params)
+    return _attach_walguard_banner(_activate_goal_impl(**params))
 
 
 _ADD_PERSON_FIELDS = frozenset({
@@ -3283,6 +3515,11 @@ _ADD_PERSON_FIELDS = frozenset({
 # Single-payload signature.
 @mcp.tool(
     name="engram_add_person",
+    capability=(
+        "Records a person node with typed relational fields only — NOT free-form facts "
+        "(those are observations via engram_link_about). At most one is_self=true node "
+        "per graph."
+    ),
     annotations={
         "title": "Record a Person",
         "readOnlyHint": False,
@@ -3346,7 +3583,7 @@ def engram_add_person(payload_json: str) -> str:
             "error": "is_self must be a JSON boolean (true/false), not a string or other type."
         })
 
-    return _trust_mod._add_person_impl(**params)
+    return _attach_walguard_banner(_trust_mod._add_person_impl(**params))
 
 
 _UPDATE_PERSON_FIELDS = frozenset({
@@ -3370,6 +3607,10 @@ _UPDATE_PERSON_FIELDS = frozenset({
 # (dismissible). Coarse-emit: node-scoped, not field-scoped.
 @mcp.tool(
     name="engram_update_person",
+    capability=(
+        "In-place edit of MUTABLE person fields only (relation, pronouns, trust_tier, "
+        "aliases, location_contact). Immutable fields rejected — use engram_supersede."
+    ),
     annotations={
         "title": "Update Mutable Fields on a Person Node",
         "readOnlyHint": False,
@@ -3421,11 +3662,11 @@ def engram_update_person(payload_json: str) -> str:
             )
         })
 
-    return _trust_mod._update_person_impl(
+    return _attach_walguard_banner(_trust_mod._update_person_impl(
         node_id=params.get("node_id", ""),
         updates=params.get("updates", {}),
         reason=params.get("reason", ""),
-    )
+    ))
 
 
 _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
@@ -3438,12 +3679,17 @@ _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
 # Confirm step for the special_moment_suggestion nudge that engram_link_about
 # emits after every new `about` edge (see _link_about_impl in
 # engram_cornerstone.py). PR #1604 shipped the curated special_moments
-# highlights field (max 7, oldest rotated out on cap) plus its write path
-# (_add_special_moment_impl in engram_trust.py) but deliberately left it
-# module-level only — "moments enter via Stage 2 workflow" — so there was no
-# way for an agent to act on the nudge. This tool closes that #1587/#1604 gap
-# by exposing the existing, already-tested impl as an MCP tool. No new write
-# logic here — purely a thin validating wrapper.
+# highlights field plus its write path (_add_special_moment_impl in
+# engram_trust.py) but deliberately left it module-level only — "moments
+# enter via Stage 2 workflow" — so there was no way for an agent to act on
+# the nudge. This tool closes that #1587/#1604 gap by exposing the existing,
+# already-tested impl as an MCP tool. No new write logic here — purely a
+# thin validating wrapper.
+#
+# #1948: the cap was originally 7 with silent-eviction-on-overflow (a
+# write-side render budget that #1940's rotating display made unnecessary).
+# It is now 100 with a loud, non-destructive failure at the ceiling — see
+# _SPECIAL_MOMENTS_CAP in engram_trust.py for the full reasoning.
 #
 # Single-payload signature (payload_json), per this repo's MCP tool
 # parameter-style convention (see project CLAUDE.md) — every @mcp.tool()
@@ -3451,6 +3697,10 @@ _ADD_SPECIAL_MOMENT_FIELDS = frozenset({
 # antml-prefix argument-swallow surface.
 @mcp.tool(
     name="engram_add_special_moment",
+    capability=(
+        "Appends a highlight to a person's special_moments list (cap 100, loud refusal at "
+        "cap, never silently evicts). Not idempotent — repeats append duplicates."
+    ),
     annotations={
         "title": "Add a Special Moment to a Person Node",
         "readOnlyHint": False,
@@ -3468,11 +3718,13 @@ def engram_add_special_moment(payload_json: str) -> str:
     letting the suggestion go unactioned.
 
     Appends {description, node_id, added_at} to the person node's
-    metadata.special_moments list. Max 7 slots: once at cap, the oldest
-    entry is rotated out of the list (its underlying `about` edge is NOT
-    removed — special_moments is a highlights reel over the full history,
-    not the history itself). Not idempotent: calling this twice with the
-    same arguments appends a second, separate entry.
+    metadata.special_moments list. Cap is 100 (#1948) — storage is
+    decoupled from display; the rotating recall/inspect surfaces show one
+    moment per surfacing regardless of how many are stored, so the write
+    side no longer needs a small render budget. At the cap, this returns
+    {"error": "..."} and does NOT modify special_moments — no silent
+    eviction, nothing destroyed. Not idempotent: calling this twice with the
+    same arguments appends a second, separate entry (below the cap).
 
     Args:
         payload_json: JSON object (as a string) with these REQUIRED fields:
@@ -3488,8 +3740,9 @@ def engram_add_special_moment(payload_json: str) -> str:
         JSON with status="added", person_id, the updated special_moments
         list, slot_count, and cap. On any validation failure (person not
         found / not type=person / not current; description or node_id
-        missing/blank; anchor node not found / not current) returns
-        {"error": "..."} instead.
+        missing/blank; anchor node not found / not current; cap reached)
+        returns {"error": "..."} instead — special_moments is left
+        untouched in every error case.
 
     See _add_special_moment_impl in engram_trust.py for full semantics.
     """
@@ -3504,7 +3757,7 @@ def engram_add_special_moment(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_SPECIAL_MOMENT_FIELDS)}"
         })
 
-    return _trust_mod._add_special_moment_impl(**params)
+    return _attach_walguard_banner(_trust_mod._add_special_moment_impl(**params))
 
 
 _SET_TRUST_TIER_FIELDS = frozenset({
@@ -3529,6 +3782,12 @@ _SET_TRUST_TIER_FIELDS = frozenset({
 # the discipline from friction, not from prompt context.
 @mcp.tool(
     name="engram_set_trust_tier",
+    capability=(
+        "Sets a person's persistent trust tier. primary_user/user_family/our_side are "
+        "approval-gated (requires justification + an attestation the server cannot "
+        "itself verify); tier='self' is exempt via its own is_self structural "
+        "attestation, not this gate."
+    ),
     annotations={
         "title": "Set Trust Tier for a Person",
         "readOnlyHint": False,
@@ -3584,12 +3843,12 @@ def engram_set_trust_tier(payload_json: str) -> str:
     tier = params.get("tier", "")
     justification_obs_id = params.get("justification_obs_id", "") or ""
     approval_flag = params.get("primary_user_approval_obtained", False)
-    return _trust_mod._set_trust_tier_impl(
+    return _attach_walguard_banner(_trust_mod._set_trust_tier_impl(
         target_pn=target_pn,
         tier=tier,
         justification_obs_id=justification_obs_id,
         primary_user_approval_obtained=approval_flag,
-    )
+    ))
 
 
 _SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
@@ -3613,6 +3872,10 @@ _SET_PERSON_LINEAGE_FIELDS = frozenset({"target_pn", "model_id"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_set_person_lineage",
+    capability=(
+        "Parses a model_id into provider/family/version onto a person node — a narrow "
+        "patch, not a general field updater (use engram_update_person)."
+    ),
     annotations={
         "title": "Record Model Lineage on a Person Node",
         "readOnlyHint": False,
@@ -3649,10 +3912,10 @@ def engram_set_person_lineage(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_SET_PERSON_LINEAGE_FIELDS)}"
         })
-    return _trust_mod._set_person_lineage_impl(
+    return _attach_walguard_banner(_trust_mod._set_person_lineage_impl(
         target_pn=params.get("target_pn", ""),
         model_id=params.get("model_id", ""),
-    )
+    ))
 
 
 _ADD_TRUST_SIGNAL_FIELDS = frozenset({
@@ -3676,6 +3939,10 @@ _ADD_TRUST_SIGNAL_FIELDS = frozenset({
 # superseded source ob_ stales the ts_. Standard cascade machinery applies.
 @mcp.tool(
     name="engram_add_trust_signal",
+    capability=(
+        "Records an INTERPRETIVE trust signal derived from an observation about a person "
+        "— non-claim-bearing, never usable as a derivation premise."
+    ),
     annotations={
         "title": "Record a Trust Signal",
         "readOnlyHint": False,
@@ -3742,7 +4009,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
                      f"Allowed: {sorted(_ADD_TRUST_SIGNAL_FIELDS)}"
         })
-    return _trust_mod._add_trust_signal_impl(**{k: params[k] for k in params})
+    return _attach_walguard_banner(_trust_mod._add_trust_signal_impl(**{k: params[k] for k in params}))
 
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
@@ -3776,6 +4043,10 @@ _ADD_CORNERSTONE_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_cornerstone",
+    capability=(
+        "Records an identity-forming dispositional pivot (prior_frame -> new_frame). "
+        "Distinct from axioms (terminal) and goals (directional)."
+    ),
     annotations={
         "title": "Record a Cornerstone",
         "readOnlyHint": False,
@@ -3818,7 +4089,7 @@ def engram_add_cornerstone(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_CORNERSTONE_FIELDS)}"
         })
 
-    return _add_cornerstone_impl(**params)
+    return _attach_walguard_banner(_add_cornerstone_impl(**params))
 
 
 _OUTGROW_CORNERSTONE_FIELDS = frozenset({
@@ -3847,6 +4118,10 @@ _OUTGROW_CORNERSTONE_FIELDS = frozenset({
 # multi-arg swallow risk.
 @mcp.tool(
     name="engram_outgrow_cornerstone",
+    capability=(
+        "Specialized supersede for a cornerstone ALONG ITS TAG AXIS — predecessor's "
+        "new_frame rolls into successor's prior_frame. Tag is always inherited."
+    ),
     annotations={
         "title": "Outgrow a Cornerstone (Reframe Along Same Axis)",
         "readOnlyHint": False,
@@ -3896,7 +4171,7 @@ def engram_outgrow_cornerstone(payload_json: str) -> str:
                      f"Allowed: {sorted(_OUTGROW_CORNERSTONE_FIELDS)}"
         })
 
-    return _outgrow_cornerstone_impl(**params)
+    return _attach_walguard_banner(_outgrow_cornerstone_impl(**params))
 
 
 # Set of legitimate field names for the engram_link_about payload.
@@ -3927,6 +4202,10 @@ _LINK_ABOUT_FIELDS = frozenset({"node_id", "person_id"})
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_link_about",
+    capability=(
+        "Wires a CONTEXTUAL 'about' edge (node -> person, default self-anchor) for recall "
+        "routing only — no effect on confidence/cascade. Idempotent."
+    ),
     annotations={
         "title": "Link Node About Person",
         "readOnlyHint": False,
@@ -3969,7 +4248,7 @@ def engram_link_about(payload_json: str) -> str:
                      f"Allowed: {sorted(_LINK_ABOUT_FIELDS)}"
         })
 
-    return _link_about_impl(**params)
+    return _attach_walguard_banner(_link_about_impl(**params))
 
 
 # Set of legitimate field names for the engram_remove_edge payload.
@@ -4016,6 +4295,11 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_remove_edge",
+    capability=(
+        "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
+        "serves, exemplifies, instantiates). Cascade/provenance edges blocked — use "
+        "engram-surgical."
+    ),
     annotations={
         "title": "Remove a Non-Cascade Edge Between Nodes",
         "readOnlyHint": False,
@@ -4057,7 +4341,7 @@ def engram_remove_edge(payload_json: str) -> str:
                      f"Allowed: {sorted(_REMOVE_EDGE_FIELDS)}"
         })
 
-    return _remove_edge_impl(**params)
+    return _attach_walguard_banner(_remove_edge_impl(**params))
 
 
 # Set of legitimate field names for the engram_add_edge payload.
@@ -4099,6 +4383,10 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Single-payload signature.
 @mcp.tool(
     name="engram_add_edge",
+    capability=(
+        "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
+        "exemplifies, serves, subtask_of, tensions, instantiates). Idempotent."
+    ),
     annotations={
         "title": "Add a Non-Cascade Edge Between Nodes",
         "readOnlyHint": False,
@@ -4157,7 +4445,7 @@ def engram_add_edge(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_EDGE_FIELDS)}"
         })
 
-    return _add_edge_impl(**params)
+    return _attach_walguard_banner(_add_edge_impl(**params))
 
 
 _SCAN_EMERGENCE_FIELDS = frozenset({
@@ -4168,6 +4456,10 @@ _SCAN_EMERGENCE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_scan_emergence",
+    capability=(
+        "[Sleep-cycle] Scans for clusters that could seed a new cornerstone — surfaces "
+        "candidates only, creates nothing. Wasteful awake, not destructive."
+    ),
     annotations={
         "title": "[Sleep cycle] Scan for Emergent Cornerstone Candidates",
         "readOnlyHint": True,
@@ -4270,6 +4562,10 @@ _GOAL_TENSION_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_goal_tension",
+    capability=(
+        "Records an explicit incompatibility between two goals — does not resolve or "
+        "auto-detect anything. Pair with engram_resolve."
+    ),
     annotations={
         "title": "Record Goal Tension",
         "readOnlyHint": False,
@@ -4313,7 +4609,7 @@ def engram_goal_tension(payload_json: str) -> str:
                      f"Allowed: {sorted(_GOAL_TENSION_FIELDS)}"
         })
 
-    return _goal_tension_impl(**params)
+    return _attach_walguard_banner(_goal_tension_impl(**params))
 
 
 # ---------------------------------------------------------------------------
@@ -4352,6 +4648,10 @@ _ADD_LESSON_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_lesson",
+    capability=(
+        "Creates a tripwire pattern generalized from incident observations, with a nudge "
+        "injected on situation-pattern match. Not for a one-off note."
+    ),
     annotations={
         "title": "Add Lesson from Error",
         "readOnlyHint": False,
@@ -4428,7 +4728,7 @@ def engram_add_lesson(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_LESSON_FIELDS)}"
         })
 
-    return _add_lesson_impl(**params)
+    return _attach_walguard_banner(_add_lesson_impl(**params))
 
 
 def _rebuild_incidents_cache(*args, **kwargs):
@@ -4464,6 +4764,10 @@ _LESSON_REGISTER_INCIDENT_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_lesson_register_incident",
+    capability=(
+        "Backward-compat alias of engram_register_exemplar scoped to lesson targets — new "
+        "code should call engram_register_exemplar directly."
+    ),
     annotations={
         "title": "Register Incident on Existing Lesson",
         "readOnlyHint": False,
@@ -4534,7 +4838,131 @@ def engram_lesson_register_incident(payload_json: str) -> str:
             raw = json.dumps(result)
     except (json.JSONDecodeError, TypeError):
         pass
-    return raw
+    return _attach_walguard_banner(raw)
+
+
+_UPDATE_LESSON_FIELDS = frozenset({
+    "node_id", "updates", "reason", "bypass_prose_check",
+})
+
+
+# DESIGN INTENT — engram_update_lesson
+# -------------------------------------
+# #1826 gap-2 fix: engram_add_lesson only accepts situation_pattern at
+# creation time, and no tool existed to backfill/correct it on an existing
+# lesson (dream cycles repeatedly found real lessons with dead or absent
+# situation_pattern on more than one graph). Mirrors
+# engram_update_person's in-place-metadata-update pattern exactly: no
+# supersede, no new node, prior values recorded in metadata.field_traces
+# (append-only), every call logged to edit_history via
+# core._log_edit(action="lesson_field_updated") — same shape as
+# engram_update_person's "person_field_updated" entries, so an in-place
+# lesson edit still surfaces as a graph-mutation event, not silently.
+#
+# Mutable-field set (widened 2026-08-03 per Lei): situation_pattern +
+# scaffolding_nudge — both mechanical/actionability metadata refinable from
+# real firing experience, never the lesson's epistemic content (claim,
+# logical_chain, confidence, reasoning_type stay supersede-only; the last
+# one specifically feeds confidence computation, so in-place editing it
+# would silently drift a derived value). No trust/security weight on either
+# mutable field, so no approval gate.
+#
+# situation_pattern updates run the SAME #1864 prose-shape gate
+# _add_lesson_impl runs at creation: a non-empty value must compile as a
+# regex and must not read as prose (_looks_like_prose) unless
+# bypass_prose_check=true is passed. Clearing to "" is always ungated —
+# falling back to locus-3 semantic-only recall is a legitimate correction.
+# scaffolding_nudge is free text with no analogous failure mode, so it has
+# no gate at all.
+#
+# Single-payload signature, per this repo's MCP tool parameter-style
+# convention.
+@mcp.tool(
+    name="engram_update_lesson",
+    capability=(
+        "In-place edit of ONLY situation_pattern + scaffolding_nudge — claim/confidence "
+        "stay supersede-only. Prose-shaped patterns rejected unless overridden."
+    ),
+    annotations={
+        "title": "Update Mutable Fields on a Lesson Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_update_lesson(payload_json: str) -> str:
+    """Update mutable fields on an existing lesson node in-place.
+
+    No supersede, no new node — modifies metadata directly. Records prior
+    values in metadata.field_traces (append-only), same structure as
+    engram_update_person. Also logged to the edit_history audit table
+    (action="lesson_field_updated") — an in-place update still shows up as
+    a graph-mutation event, distinct from creating a new node.
+
+    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
+    scaffolding_nudge — mechanical retrieval/actionability metadata you can
+    refine from real firing experience, never the lesson's epistemic content
+    (claim, logical_chain, confidence, reasoning_type stay supersede-only).
+
+    situation_pattern, set to a non-empty value, runs the SAME #1864
+    prose-shape gate engram_add_lesson runs at creation time — must compile
+    as a regex, and must not look like prose (over 8 literal spaces) unless
+    bypass_prose_check=true is passed. Clearing situation_pattern to "" is
+    always allowed, ungated — falling back to locus-3 semantic-only recall
+    is a legitimate correction, not a prose violation. scaffolding_nudge has
+    no such gate — it's free text, not a regex, so there's no prose-shape
+    failure mode to guard against. No approval gate on either field: neither
+    carries trust/security weight (#1826's own scoping call).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, required): Lesson node ID (ls_NNNN). Must be
+                type='lesson' and is_current=1.
+            updates (dict, required): Map of field → new_value. Mutable
+                fields: situation_pattern, scaffolding_nudge. Attempting to
+                update any other field returns an error.
+            reason (str, optional): Human-readable explanation for the change.
+            bypass_prose_check (bool, optional): Default False. Same
+                override semantics as engram_add_lesson's field of the same
+                name — only has an effect when the new situation_pattern
+                value looks like prose; the lesson's metadata is stamped
+                bypass_prose_check: true only when the gate actually fired
+                and was overridden, never merely because the flag was passed.
+                Has no effect on scaffolding_nudge.
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta. On
+        any validation failure (unknown field, node not found / wrong type /
+        not current, invalid regex, or prose-shaped pattern without
+        bypass_prose_check), returns {"error": "..."}.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+
+    unknown = set(params.keys()) - _UPDATE_LESSON_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_UPDATE_LESSON_FIELDS)}"
+        })
+
+    # Ensure updates is a dict, not a string or list.
+    if "updates" in params and not isinstance(params["updates"], dict):
+        return json.dumps({
+            "error": (
+                f"'updates' must be a JSON object (dict of field → value), "
+                f"got {type(params['updates']).__name__}."
+            )
+        })
+
+    return _attach_walguard_banner(_update_lesson_impl(
+        node_id=params.get("node_id", ""),
+        updates=params.get("updates", {}),
+        reason=params.get("reason", ""),
+        bypass_prose_check=params.get("bypass_prose_check", False),
+    ))
 
 
 _REGISTER_EXEMPLAR_FIELDS = frozenset({
@@ -4565,6 +4993,10 @@ _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 # Single-payload signature (per engram-alpha CLAUDE.md convention).
 @mcp.tool(
     name="engram_register_exemplar",
+    capability=(
+        "Wires ONE exemplifies edge (claim-bearing node -> lesson OR cornerstone); "
+        "refreshes the lesson tripwire cache. Doesn't create the exemplar node."
+    ),
     annotations={
         "title": "Register Exemplar on Lesson or Cornerstone",
         "readOnlyHint": False,
@@ -4608,7 +5040,7 @@ def engram_register_exemplar(payload_json: str) -> str:
                      f"Allowed: {sorted(_REGISTER_EXEMPLAR_FIELDS)}"
         })
 
-    return _register_exemplar_impl(**params)
+    return _attach_walguard_banner(_register_exemplar_impl(**params))
 
 
 
@@ -4646,6 +5078,10 @@ _ADD_TASK_FIELDS = frozenset({
 # Single-payload signature (Wave 2c-ii of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_add_task",
+    capability=(
+        "Records a concrete, completable work item — distinct from goals (no completion "
+        "state) and conjectures (hypotheses)."
+    ),
     annotations={
         "title": "Add Task",
         "readOnlyHint": False,
@@ -4688,7 +5124,7 @@ def engram_add_task(payload_json: str) -> str:
                      f"Allowed: {sorted(_ADD_TASK_FIELDS)}"
         })
 
-    return _add_task_impl(**params)
+    return _attach_walguard_banner(_add_task_impl(**params))
 
 
 
@@ -4722,6 +5158,10 @@ _UPDATE_TASK_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_update_task",
+    capability=(
+        "Transitions a task's status and auto-rebalances importance per a fixed status "
+        "map — not a free-form field editor."
+    ),
     annotations={
         "title": "Update Task Status",
         "readOnlyHint": False,
@@ -4763,7 +5203,7 @@ def engram_update_task(payload_json: str) -> str:
                      f"Allowed: {sorted(_UPDATE_TASK_FIELDS)}"
         })
 
-    return _update_task_impl(**params)
+    return _attach_walguard_banner(_update_task_impl(**params))
 
 
 
@@ -4800,6 +5240,10 @@ _REPORT_FEELING_FIELDS = frozenset({
 # hit this tool 2x on 2026-05-08 (a feeling-report instance + a feeling-report instance attempts).
 @mcp.tool(
     name="engram_report_feeling",
+    capability=(
+        "Non-claim-bearing first-person self-report (only reports, never verifies own "
+        "state) — dedup-exempt, always creates a new node."
+    ),
     annotations={
         "title": "Report a Self-Aware Internal State",
         "readOnlyHint": False,
@@ -4844,7 +5288,7 @@ def engram_report_feeling(payload_json: str) -> str:
                      f"Allowed: {sorted(_REPORT_FEELING_FIELDS)}"
         })
 
-    return _report_feeling_impl(**params)
+    return _attach_walguard_banner(_report_feeling_impl(**params))
 
 
 
@@ -4892,6 +5336,11 @@ _DERIVE_FIELDS = frozenset({
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
     name="engram_derive",
+    capability=(
+        "Creates a derivation from EXISTING claim-bearing premises with an explicit "
+        "logical_chain. Blocked if a premise is stale or contested (overridable via "
+        "use_stale/use_contested) or tainted (never overridable — no override path)."
+    ),
     annotations={
         "title": "Create Derived Claim",
         "readOnlyHint": False,
@@ -4961,7 +5410,7 @@ def engram_derive(payload_json: str) -> str:
                      f"Allowed: {sorted(_DERIVE_FIELDS)}"
         })
 
-    return _derive_impl(**params)
+    return _attach_walguard_banner(_derive_impl(**params))
 
 
 
@@ -4971,6 +5420,10 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 
 @mcp.tool(
     name="engram_contradict",
+    capability=(
+        "Explicitly flags a conflict between two CURRENT nodes — the substrate does NOT "
+        "auto-detect contradictions; this is the manual pin."
+    ),
     annotations={
         "title": "Flag Contradiction Between Claims",
         "readOnlyHint": False,
@@ -5034,7 +5487,7 @@ def engram_contradict(payload_json: str) -> str:
                      f"Allowed: {sorted(_CONTRADICT_FIELDS)}"
         })
 
-    return _contradict_impl(**params)
+    return _attach_walguard_banner(_contradict_impl(**params))
 
 
 
@@ -5063,6 +5516,10 @@ _ASK_FIELDS = frozenset({
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99).
 @mcp.tool(
     name="engram_ask",
+    capability=(
+        "Registers a persistent open question that survives across sessions via "
+        "recall/dream scans. Pair with engram_resolve for the answer."
+    ),
     annotations={
         "title": "Register Open Research Question",
         "readOnlyHint": False,
@@ -5107,7 +5564,7 @@ def engram_ask(payload_json: str) -> str:
                      f"Allowed: {sorted(_ASK_FIELDS)}"
         })
 
-    return _ask_impl(**params)
+    return _attach_walguard_banner(_ask_impl(**params))
 
 
 
@@ -5151,6 +5608,10 @@ _RESOLVE_FIELDS = frozenset({
 # default 0.70); otherwise "partially_resolved" with the resolver still wired.
 @mcp.tool(
     name="engram_resolve",
+    capability=(
+        "Pure-wire: wires a resolves edge from an EXISTING claim-bearing node to a target "
+        "and flips its status. Does NOT create the resolving derivation."
+    ),
     annotations={
         "title": "Resolve an Open Question, Contradiction, or Prediction",
         "readOnlyHint": False,
@@ -5202,7 +5663,7 @@ def engram_resolve(payload_json: str) -> str:
                      f"Allowed: {sorted(_RESOLVE_FIELDS)}"
         })
 
-    return _resolve_impl(**params)
+    return _attach_walguard_banner(_resolve_impl(**params))
 
 
 # _resolve_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5242,6 +5703,10 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_supersede",
+    capability=(
+        "Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create "
+        "the replacement node. Not error correction — use engram_retract."
+    ),
     annotations={
         "title": "Link a Replacement Node to the Node It Supersedes",
         "readOnlyHint": False,
@@ -5282,7 +5747,7 @@ def engram_supersede(payload_json: str) -> str:
                      f"Allowed: {sorted(_SUPERSEDE_FIELDS)}"
         })
 
-    return _supersede_impl(**params)
+    return _attach_walguard_banner(_supersede_impl(**params))
 
 
 # _supersede_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5337,6 +5802,10 @@ _RETRACT_FIELDS = frozenset({
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
     name="engram_retract",
+    capability=(
+        "Error correction (never-was-valid) — node preserved for audit, downstream "
+        "TAINTED not deleted. Not for a valid-then claim — use engram_supersede."
+    ),
     annotations={
         "title": "Retract Erroneous Node",
         "readOnlyHint": False,
@@ -5397,7 +5866,7 @@ def engram_retract(payload_json: str) -> str:
         or os.environ.get("ANTHROPIC_SESSION_ID")
         or ""
     )
-    return _retract_impl(**params, initiation_ref=_initiation_ref)
+    return _attach_walguard_banner(_retract_impl(**params, initiation_ref=_initiation_ref))
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
@@ -5418,6 +5887,12 @@ _FOCUS_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus",
+    capability=(
+        "Current workstream working set — parked threads go in focus_sets, standing "
+        "principles go in the warm briefing/cornerstones, NOT here. Pins node ids so "
+        "they MUST survive the next compaction (cap 15; over-cap fails loudly, no "
+        "eviction). Not a bookmark — use engram_focus_save."
+    ),
     annotations={
         "title": "Pin Nodes to Compaction Summary",
         "readOnlyHint": False,
@@ -5427,7 +5902,10 @@ _FOCUS_FIELDS = frozenset({
     },
 )
 def engram_focus(payload_json: str) -> str:
-    """Pin nodes as focused — they MUST appear in the next compaction summary.
+    """Current workstream working set — parked threads go in focus_sets,
+    standing principles go in the warm briefing/cornerstones, NOT here.
+
+    Pin nodes as focused — they MUST appear in the next compaction summary.
 
     Focus is the deterministic channel for load-bearing knowledge to cross
     compaction boundaries (normal recall is probabilistic; focus is "I cannot
@@ -5466,7 +5944,7 @@ def engram_focus(payload_json: str) -> str:
         return json.dumps({"error": "payload_json must include required field 'node_ids'"})
     if "reason" not in params:
         return json.dumps({"error": "payload_json must include required field 'reason'"})
-    return _focus_mod._focus_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_impl(**params))
 
 
 _UNFOCUS_FIELDS = frozenset({
@@ -5476,6 +5954,10 @@ _UNFOCUS_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_unfocus",
+    capability=(
+        "Releases node ids from the active focus list. Idempotent — already-unfocused ids "
+        "report success."
+    ),
     annotations={
         "title": "Release Pinned Nodes from Compaction Summary",
         "readOnlyHint": False,
@@ -5515,11 +5997,15 @@ def engram_unfocus(payload_json: str) -> str:
         })
     if "node_ids" not in params:
         return json.dumps({"error": "payload_json must include required field 'node_ids'"})
-    return _focus_mod._unfocus_impl(**params)
+    return _attach_walguard_banner(_focus_mod._unfocus_impl(**params))
 
 
 @mcp.tool(
     name="engram_list_focused",
+    capability=(
+        "Pure-read: returns the active focus list oldest-first. No recall refresh, no "
+        "other side effects."
+    ),
     annotations={
         "title": "List Focused Nodes",
         "readOnlyHint": True,
@@ -5550,6 +6036,12 @@ _FOCUS_SAVE_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_save",
+    capability=(
+        "Per-workstream swap semantics: snapshots the CURRENT active focus list under a "
+        "name — bookmark only, active list unchanged. Refuses NEW sets beyond the "
+        "focus_sets_cap (default 10; overwrites of existing names always allowed) — "
+        "delete/merge via engram_focus_delete_set first."
+    ),
     annotations={
         "title": "Snapshot Current Active Focus List Under a Name",
         "readOnlyHint": False,
@@ -5559,10 +6051,17 @@ _FOCUS_SAVE_FIELDS = frozenset({
     },
 )
 def engram_focus_save(payload_json: str) -> str:
-    """Snapshot the current active focus list under `name`.
+    """Per-workstream swap semantics: snapshot the current active focus list
+    under `name`, so it can be swapped back in whole later via
+    engram_focus_load / engram_focus_swap.
 
     Bookmark, not rotation: active list unchanged. Cascade resolution
     (supersede auto-follow, retract drop) happens at load time, not save time.
+
+    Refuses to create a NEW set once the number of saved sets reaches the
+    config `focus.focus_sets_cap` (default 10) — delete or merge sets first
+    via engram_focus_delete_set. Overwriting an existing set name
+    (overwrite=True) is always allowed, even at/over the cap.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -5592,7 +6091,7 @@ def engram_focus_save(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_save_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_save_impl(**params))
 
 
 _FOCUS_LOAD_FIELDS = frozenset({
@@ -5602,6 +6101,11 @@ _FOCUS_LOAD_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_load",
+    capability=(
+        "Per-workstream swap semantics: loads a saved focus set into active — errors if "
+        "active is non-empty unless if_active='overwrite'. Use engram_focus_swap for an "
+        "atomic pivot."
+    ),
     annotations={
         "title": "Load a Saved Focus Set Into Active",
         "readOnlyHint": False,
@@ -5611,7 +6115,8 @@ _FOCUS_LOAD_FIELDS = frozenset({
     },
 )
 def engram_focus_load(payload_json: str) -> str:
-    """Load a saved focus set into the active list.
+    """Per-workstream swap semantics: load a saved focus set into the active
+    list, swapping in that workstream's working knowledge whole.
 
     Default errors if active list is non-empty (use if_active="overwrite" or
     engram_focus_swap for atomic save-then-load). Cascade resolution at load
@@ -5644,7 +6149,7 @@ def engram_focus_load(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_load_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_load_impl(**params))
 
 
 _FOCUS_SWAP_FIELDS = frozenset({
@@ -5654,6 +6159,11 @@ _FOCUS_SWAP_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_swap",
+    capability=(
+        "Per-workstream swap semantics: atomic save-current-then-load-other in one "
+        "transaction — the canonical pivot, avoids engram_focus_load's non-empty-active "
+        "error."
+    ),
     annotations={
         "title": "Atomic Save-Current + Load-Other",
         "readOnlyHint": False,
@@ -5663,7 +6173,9 @@ _FOCUS_SWAP_FIELDS = frozenset({
     },
 )
 def engram_focus_swap(payload_json: str) -> str:
-    """Atomic save-current + optionally-load-other. The canonical pivot op.
+    """Per-workstream swap semantics: atomic save-current + optionally-
+    load-other, swapping one workstream's working knowledge out for another's
+    whole. The canonical pivot op.
 
     Both halves in one transaction: if the load target doesn't exist, the
     save rolls back too. save_as == load is a no-op (returns already_active).
@@ -5694,11 +6206,15 @@ def engram_focus_swap(payload_json: str) -> str:
         })
     if "save_as" not in params:
         return json.dumps({"error": "payload_json must include required field 'save_as'"})
-    return _focus_mod._focus_swap_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_swap_impl(**params))
 
 
 @mcp.tool(
     name="engram_focus_sets",
+    capability=(
+        "Pure-read: lists saved focus-set bookmarks with usage metadata, recently-used "
+        "first. Doesn't touch the active list."
+    ),
     annotations={
         "title": "List All Saved Focus Sets",
         "readOnlyHint": True,
@@ -5727,6 +6243,10 @@ _FOCUS_DELETE_SET_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_focus_delete_set",
+    capability=(
+        "Deletes a saved focus-set BOOKMARK only — nodes stay focused even if it was "
+        "active; active_set_name clears to NULL."
+    ),
     annotations={
         "title": "Delete a Saved Focus Set",
         "readOnlyHint": False,
@@ -5764,7 +6284,7 @@ def engram_focus_delete_set(payload_json: str) -> str:
         })
     if "name" not in params:
         return json.dumps({"error": "payload_json must include required field 'name'"})
-    return _focus_mod._focus_delete_set_impl(**params)
+    return _attach_walguard_banner(_focus_mod._focus_delete_set_impl(**params))
 
 
 # ---------------------------------------------------------------------------
@@ -5776,6 +6296,10 @@ def engram_focus_delete_set(payload_json: str) -> str:
 
 @mcp.tool(
     name="engram_set_recall_summaries",
+    capability=(
+        "Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, "
+        "partial failures don't roll back the batch."
+    ),
     annotations={
         "title": "Batch-Set Recall Summaries and Keywords",
         "readOnlyHint": False,
@@ -5808,7 +6332,7 @@ def engram_set_recall_summaries(payload_json: str) -> str:
             "failed": M
         }
     """
-    return _recall_summaries_mod._set_recall_summaries_impl(payload_json)
+    return _attach_walguard_banner(_recall_summaries_mod._set_recall_summaries_impl(payload_json))
 
 
 # ---------------------------------------------------------------------------
@@ -5849,6 +6373,10 @@ _LIST_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_list",
+    capability=(
+        "Mechanical filter/scan over node columns (AND/OR/NOT trees, field projection) — "
+        "NO aggregation, no recall refresh, unlike engram_query."
+    ),
     annotations={
         "title": "List Nodes by Type and Status",
         "readOnlyHint": True,
@@ -5917,13 +6445,16 @@ def engram_list(payload_json: str = "{}") -> str:
         payload_json: JSON object (as a string) with these fields (all optional):
             node_type (str, optional): Single-field filter by node type.
                 Empty = all types. Conflicts with a 'type' field in
-                filters_json (errors loudly).
+                filters_json (errors loudly). Unrecognized non-empty value
+                (not in core.VALID_NODE_TYPES) errors loudly rather than
+                silently returning zero rows.
             status (str, optional): Single-field filter by status.
                 Empty = all statuses. Conflicts with a 'status' field in
                 filters_json (errors loudly).
             sort_by (str, optional): Sort order — 'id' (default), 'created'
                 (newest first), 'importance' (highest first), 'recalls'
-                (most recalled first).
+                (most recalled first). Unrecognized non-empty value errors
+                loudly rather than silently falling back to 'id' order.
             limit (int, optional): Cap on rows returned. Default 100. Set to
                 0 for a metadata-only response (total_matched without rows).
                 Ignored if unlimited=True. Hard ceiling 500 in single-field
@@ -6000,6 +6531,10 @@ _QUERY_PATTERN_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_query_pattern",
+    capability=(
+        "Runs ONE of a fixed named library of graph-pattern scans (dream-fairy "
+        "primitives) — pattern_name must be a registered preset."
+    ),
     annotations={
         "title": "Run a Named Pattern Query",
         "readOnlyHint": True,
@@ -6086,6 +6621,10 @@ _EMBEDDING_CLUSTER_FIELDS = frozenset({
 
 @mcp.tool(
     name="engram_embedding_cluster",
+    capability=(
+        "Clusters up to 500 GIVEN node ids by stored-embedding cosine similarity — uses "
+        "EXISTING embeddings only, no on-the-fly model calls."
+    ),
     annotations={
         "title": "Cluster Nodes by Embedding Similarity",
         "readOnlyHint": True,

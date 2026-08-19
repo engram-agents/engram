@@ -238,7 +238,7 @@
 | `templates/template.CLAUDE.multi-agent.md` | shipped | convenience+MA | _?_ | _unswept_ |
 | `templates/template.CLAUDE.md` | shipped | essential | _?_ | _unswept_ |
 | `templates/agents.json.example` | shipped | convenience+MA | _?_ | _unswept_ |
-| `templates/compact-instructions.md` | shipped | essential | _?_ | _unswept_ |
+| `templates/compact-instructions.md` | shipped | essential (Codex-only, #2067) | _?_ | _unswept_ |
 | `templates/config.json.example` | shipped | essential | _?_ | _unswept_ |
 | `templates/engram-surface-daemon.service.template` | shipped | convenience | _?_ | _unswept_ |
 | `templates/engram-viz-user.service.template` | shipped | convenience | _?_ | _unswept_ |

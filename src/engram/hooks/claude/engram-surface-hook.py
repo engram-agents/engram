@@ -97,7 +97,10 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
 try:
-    from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
+    from _hooklib import (
+        is_own_server_py_running as _is_own_server_py_running_impl,
+        atomic_write_json,
+    )
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
@@ -514,8 +517,11 @@ def _write_surface_ledger(ledger: dict) -> None:
     try:
         path = _surface_ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(ledger, f)
+        if _HOOKLIB_OK:
+            atomic_write_json(path, ledger, encoding="utf-8")
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(ledger, f)
     except Exception:
         pass
 
@@ -705,6 +711,308 @@ def _classify_suppression(count: int, m: int) -> str:
     return "suppress"
 
 
+# ---------------------------------------------------------------------------
+# Person special-moment rotation + cooldown (#1940)
+# ---------------------------------------------------------------------------
+#
+# Reuses the SAME ledger file + read/write primitives above
+# (_read_surface_ledger / _write_surface_ledger) — per Kepler's design
+# comment on #1940 ("reuse, do not invent") — keyed by a fixed, non-session
+# bucket rather than the real per-prompt session_id.
+#
+# Deliberately does NOT reuse _append_surface_ledger_entry (round-5
+# fast-follow, post-review fix): that helper's internal _prune_surface_ledger
+# call prunes the ENTIRE ledger dict — every session key, not just the
+# reserved bucket — using a retention size derived from its `k` parameter.
+# The call site here can only ever pass a hardcoded k (this bucket has no
+# session_id and thus no natural k of its own), so reusing that helper meant
+# every person-moment render silently re-pruned every OTHER session's ledger
+# entries down to that hardcoded k's retention size — collapsing a
+# documented "safety margin over the configured k" (see the ledger-retention
+# comment above) the moment an operator tuned recall_suppression.k above the
+# hardcoded default. _record_person_moment_render below instead does a
+# scoped, self-contained read-modify-write on ONLY this bucket's own key,
+# capped at _PERSON_MOMENT_LEDGER_RETENTION — touching no other ledger key —
+# mirroring engram_query.py's own _record_person_moment_render exactly (see
+# that function's docstring for the server-side twin).
+#
+# TWO deliberate deviations from the general per-node ledger's model, both
+# documented here as judgment calls (see PR body for the full writeup):
+#
+# 1. Fixed bucket key, not the session's own entry. The general per-node
+#    ledger above is deliberately session-scoped (docs/recall-triggering-
+#    blueprint.md §3-P1) because the HOOK is the only surface that writes to
+#    it. The moment cooldown must ALSO be visible to engram_query and
+#    engram_inspect (render-contract requirement: "a moment rendered via
+#    engram_query this prompt should count against the SAME cooldown ... a
+#    subsequent auto-surface render in the same prompt would see") — but
+#    neither tool receives a session_id (confirmed: server.py's
+#    _QUERY_FIELDS / _INSPECT_FIELDS have no such field, and server.py's own
+#    comment on the event emitter states the MCP server process has no
+#    single session_id binding). A fixed reserved bucket key, written into
+#    the SAME on-disk ledger file by all three surfaces (this hook directly;
+#    engram_query.py's server-side twin — same function names, same shape,
+#    same file, same key, duplicated by value per this file's own
+#    established precedent of duplicating small primitives across the
+#    hook/server process boundary rather than importing across it, e.g.
+#    _cosine_similarity's docstring) — achieves genuine cross-surface
+#    sharing at the cost of no longer being literally "this session's own
+#    ledger entry."
+#
+# 2. Time-based cooldown, not the trailing-k-entries COUNT the general
+#    ledger uses. The general ledger gets an entry appended on EVERY prompt
+#    regardless of what rendered (see the ledger write at the end of
+#    format_nudge — even an empty rendered-ids set still appends), so its
+#    trailing-k window is naturally "the last k PROMPTS," and old
+#    suppressions decay as new prompts arrive whether or not the suppressed
+#    node itself renders again. This reserved bucket, by contrast, ONLY gets
+#    an entry when a moment ACTUALLY fires (moment-fire events are sparse,
+#    not one-per-prompt/one-per-call) — reusing the trailing-k-COUNT model
+#    here would be a real bug: once a person's moment is suppressed, no new
+#    entry for THAT person is ever appended (suppressed attempts don't
+#    write), so nothing ever pushes its one existing entry out of the
+#    trailing-k window and the suppression would never lift (PERMANENT
+#    LOCKOUT, found while implementing — not just a theoretical edge case;
+#    already documented in full in this file's own #1940 commit message —
+#    see there for the complete writeup, not repeated again here so the two
+#    explanations don't drift apart). A wall-clock cooldown ("suppress if
+#    this person's own last moment-fire was within the last N seconds,"
+#    independent of how many/few OTHER events happened meanwhile) decays
+#    correctly regardless of event sparsity.
+#
+#    Default duration (#1940 fast-follow, round 3): originally 600s
+#    (10 min), raised to 3600s (1 hour) per Kepler's explicit design ruling
+#    on the original spec: "10 minutes is too short — start at 1 hour,
+#    configurable. At 10 min a working day admits ~60 fires; with 7 entries
+#    rotating that cycles the whole list eight or nine times a day and the
+#    moments become wallpaper... Start on the recoverable side and let Lei
+#    retune from practice." The "configurable" half of that ruling is
+#    _get_person_moment_cooldown_config() below, which follows this same
+#    file's existing sectioned config.json read pattern (see
+#    _get_suppression_config / _get_echo_guard_config immediately above this
+#    block). Still matches engram_query.py's twin constant BY VALUE (must
+#    stay in sync manually; no shared import path across the hook/server
+#    process boundary — see the module comment above).
+_PERSON_MOMENT_LEDGER_KEY = "__person_moment_cooldown__"
+_PERSON_MOMENT_COOLDOWN_SECONDS = 3600  # 1 hour — see note 2 above
+
+# Bounds this one reserved bucket's own entry list (round-5 fast-follow) —
+# independent of, and never fed through, the general per-session ledger's
+# k-derived retention_entries formula (see _append_surface_ledger_entry /
+# _prune_surface_ledger above). Matches engram_query.py's twin constant BY
+# VALUE (same "duplicated by value across the process boundary" precedent as
+# every other primitive in this section).
+_PERSON_MOMENT_LEDGER_RETENTION = 20
+
+
+def _get_person_moment_cooldown_config() -> dict:
+    """Read person_moment_cooldown tunables from $ENGRAM_HOME/config.json.
+
+    Returns {seconds} with the default (_PERSON_MOMENT_COOLDOWN_SECONDS) if
+    config absent / malformed / section missing. Never raises. Same read
+    pattern as _get_suppression_config / _get_echo_guard_config above —
+    followed here so the hook (this file, its own process) and
+    engram_query.py's _get_person_moment_cooldown_seconds (the MCP server
+    process) read the same config.json shape independently — no import path
+    exists across the hook/server process boundary (see module comment
+    above), so both sides implement this read separately, same as every
+    other primitive shared only by value in this file.
+    """
+    config_path = os.path.join(ENGRAM_HOME, "config.json")
+    defaults = {"seconds": float(_PERSON_MOMENT_COOLDOWN_SECONDS)}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = config.get("person_moment_cooldown", {})
+        return {"seconds": float(section.get("seconds", defaults["seconds"]))}
+    except (OSError, ValueError, json.JSONDecodeError, TypeError):
+        return defaults
+
+
+def _person_moment_last_fired_at(person_id: str) -> "float | None":
+    """Timestamp of person_id's most recent moment-fire event anywhere in
+    the (already retention-bounded) reserved bucket, or None if it has never
+    fired (or the ledger is empty/unreadable — fail-open toward "not in
+    cooldown," same direction as every other advisory-cache read in this
+    file)."""
+    ledger = _read_surface_ledger()
+    entries = ledger.get(_PERSON_MOMENT_LEDGER_KEY, [])
+    if not isinstance(entries, list):
+        return None
+    marker = f"{person_id}:moment"
+    last_ts: "float | None" = None
+    for e in entries:  # stored oldest-first (append-only) — keep the LAST match
+        if not isinstance(e, dict):
+            continue
+        ids = e.get("ids")
+        if isinstance(ids, list) and marker in ids:
+            ts = e.get("ts")
+            if isinstance(ts, (int, float)):
+                last_ts = ts
+    return last_ts
+
+
+def _person_moment_in_cooldown(
+    person_id: str, cooldown_seconds: "float | None" = None,
+) -> bool:
+    """True iff person_id's special moment fired (from ANY of the three
+    render surfaces) within the last cooldown_seconds.
+
+    cooldown_seconds defaults to None, resolved via
+    _get_person_moment_cooldown_config() (config.json-driven, falling back
+    to _PERSON_MOMENT_COOLDOWN_SECONDS) rather than a fixed signature
+    default — a signature default is evaluated once at module-import time
+    and would freeze the value for the process lifetime, defeating the
+    point of making this configurable. Callers may still pass an explicit
+    value (tests do, to force known cooldown windows).
+
+    Boolean gate, not _classify_suppression's 3-tier full/others/suppress —
+    a single rotating prose sentence has no natural "demoted" form (you
+    either show it or you don't), so this deliberately does not reuse the
+    tiered classifier (a documented judgment call, see PR body).
+    """
+    if cooldown_seconds is None:
+        cooldown_seconds = _get_person_moment_cooldown_config()["seconds"]
+    last = _person_moment_last_fired_at(person_id)
+    if last is None:
+        return False
+    return (time.time() - last) < cooldown_seconds
+
+
+def _record_person_moment_render(person_id: str) -> None:
+    """Append a moment-fire event to the shared reserved bucket. Best-effort;
+    swallows all failures (advisory cooldown bookkeeping, never blocks a
+    render). Bounded retention so this one bucket key doesn't grow unbounded
+    across the install's lifetime.
+
+    Round-5 fast-follow fix: this used to reuse _append_surface_ledger_entry
+    (the general per-session ledger's own append+prune helper), which passed
+    a hardcoded k into that helper's whole-ledger _prune_surface_ledger call
+    — silently re-pruning every OTHER session's ledger entries down to that
+    hardcoded k's retention size on every person-moment render (see the
+    module comment above this section for the full incident writeup). This
+    version instead does a scoped, self-contained read-modify-write on ONLY
+    _PERSON_MOMENT_LEDGER_KEY — never touching any other key in the ledger
+    dict — mirroring engram_query.py's own _record_person_moment_render
+    exactly (same read-scope/write-scope/retention logic; genuinely
+    equivalent now, not just claimed-equivalent by a shared docstring).
+    """
+    try:
+        ledger = _read_surface_ledger()
+        entries = ledger.get(_PERSON_MOMENT_LEDGER_KEY, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"ts": time.time(), "ids": [f"{person_id}:moment"]})
+        entries = entries[-_PERSON_MOMENT_LEDGER_RETENTION:]
+        ledger[_PERSON_MOMENT_LEDGER_KEY] = entries
+        _write_surface_ledger(ledger)
+    except Exception:
+        pass
+
+
+def _select_person_moment_candidate(entry: dict) -> "tuple[str, int] | None":
+    """Read-only selection: given a full-tier person special entry (carrying
+    special_moments / special_moment_cursor from _surface_impl's response —
+    see engram_query.py), decide whether a moment is eligible to render this
+    prompt. Returns (description, new_cursor) on eligibility, else None.
+
+    Deliberately has NO side effects (no DB write, no cooldown record) —
+    those only commit once the caller confirms the rendered line actually
+    survives the injection budget (see format_nudge's specials loop and
+    _commit_person_moment_render below), so a budget-cut line never silently
+    advances the cursor or starts a cooldown for a moment the agent never
+    saw ("the cursor moves ONLY when the moment is ACTUALLY rendered" per
+    Kepler's design comment).
+    """
+    moments = entry.get("special_moments")
+    if not isinstance(moments, list) or not moments:
+        return None
+    person_id = entry.get("id")
+    if not person_id:
+        return None
+    if _person_moment_in_cooldown(person_id):
+        return None
+    cursor = entry.get("special_moment_cursor")
+    if not isinstance(cursor, int):
+        cursor = 0
+    idx = cursor % len(moments)
+    moment = moments[idx]
+    if not isinstance(moment, dict):
+        return None
+    description = moment.get("description")
+    if not description:
+        return None
+    return description, cursor + 1
+
+
+def _advance_person_moment_cursor(person_id: str, new_cursor: int) -> bool:
+    """Persist the advanced moment-rotation cursor for person_id.
+
+    This is a NEW capability for this hook process: every other DB access in
+    this file is read-only (mode=ro liveness probes — see
+    _check_db_liveness). This is a single narrow, targeted write (bump one
+    JSON key on one row), matching the pattern _add_special_moment_impl /
+    _update_person_impl already use server-side (read current metadata,
+    mutate one key, write back the full dict — never a partial dict, which
+    would silently clobber pronouns/relation/aliases/field_traces/etc).
+
+    Architectural precedent shift, named explicitly here for future readers
+    tracing this file's history: this is the FIRST write to knowledge.db
+    from the hook process (#1940). It's safe under the existing WAL mode +
+    this function's own best-effort/fail-open posture (any failure just
+    returns False, never raises past this function), but it establishes a
+    new capability class for this file — prior to this, "hook process" and
+    "DB writer" were mutually exclusive; they no longer are.
+
+    Re-reads metadata fresh right before writing (narrows, does not
+    eliminate, the read-modify-write race against a concurrent
+    engram_add_special_moment / engram_update_person call — same
+    non-atomic-write precedent as those functions themselves; see PR body).
+
+    Best-effort: True on success, False on ANY failure (missing row, locked
+    DB, malformed JSON, ...) — fail-open, since a persistence hiccup here
+    must never prevent the moment from being shown this once (the caller
+    still renders the line regardless of this return value; only the
+    cooldown record — _record_person_moment_render, called separately by the
+    caller — and the cursor advance are at risk, and both failing just means
+    the SAME moment may repeat sooner than intended, the safe direction).
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(KNOWLEDGE_DB_PATH, timeout=2.0)
+        row = conn.execute(
+            "SELECT metadata FROM nodes WHERE id = ?", (person_id,)
+        ).fetchone()
+        if not row or not row[0]:
+            return False
+        meta = json.loads(row[0])
+        meta["special_moment_cursor"] = new_cursor
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), person_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _commit_person_moment_render(person_id: str, new_cursor: int) -> None:
+    """Side effects for an ACTUALLY-rendered person moment: advance the
+    rotation cursor (DB write, best-effort) and record the cross-surface
+    cooldown event (ledger write, best-effort). Called only after the
+    caller's budget check confirms the line survives — see format_nudge.
+    """
+    _advance_person_moment_cursor(person_id, new_cursor)
+    _record_person_moment_render(person_id)
+
+
 def _decay_tier_for(
     nid, count: int, m: int,
     query_embedding: list | None,
@@ -862,6 +1170,111 @@ def _budget_try_spend(line_text: str, budget_state: dict) -> bool:
     budget_state["chars_rendered"] += cost
     budget_state["nodes_shown"] += 1
     return True
+
+
+def _budget_try_spend_extra(line_text: str, budget_state: dict) -> bool:
+    """Same char-budget accounting as _budget_try_spend, for auxiliary lines
+    that share the render's character budget (per #1975: "these lines count
+    against the #1692 injection budget like node lines") WITHOUT being
+    counted in nodes_shown / nodes_cut_budget — those two fields are pinned
+    by existing tests (tests/test_recall_injection_budget.py) as an exact
+    node-line-only invariant (nodes_shown + nodes_cut_budget == total
+    eligible node candidates). Auxiliary-line telemetry (e.g. layer 2's
+    set_lines_rendered) is tracked separately by the caller instead.
+
+    Same one-way-stop semantics as _budget_try_spend: once budget_state is
+    exhausted (by a node line OR a prior auxiliary line), every subsequent
+    call returns False.
+    """
+    if budget_state["exhausted"]:
+        return False
+    if budget_state["remaining"] is None:
+        budget_state["chars_rendered"] += len(line_text) + 1
+        return True
+    cost = len(line_text) + 1
+    if cost > budget_state["remaining"]:
+        budget_state["exhausted"] = True
+        return False
+    budget_state["remaining"] -= cost
+    budget_state["chars_rendered"] += cost
+    return True
+
+
+# #1975 layer 2 — at most this many dormant-set pointer lines per prompt.
+_DORMANT_FOCUS_SET_LINES_CAP = 2
+
+
+def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
+    """Layer 2 (#1975) — find saved, non-active focus_sets whose immutable
+    node_ids overlap `rendered_ids` (the ids that actually rendered in the
+    Specials/Top-claims full-summary tiers this prompt).
+
+    One SELECT for focus_state.active_set_name + one SELECT for
+    `name, node_ids, last_loaded_at FROM focus_sets` per prompt (fired
+    unconditionally, even when rendered_ids is empty — e.g. every candidate
+    that would've reached Specials/Top claims was budget-cut or suppressed
+    this prompt — so sets_checked/telemetry reflects the actual per-prompt
+    read, not a lucky-empty-set skip); each node_ids JSON blob is parsed
+    into a Python set once, then membership is tested per rendered id —
+    O(S) per id, S = number of saved sets (S is capped by
+    engram_focus_save's focus_sets_cap, default 10, so this stays
+    effectively constant). Never raises: any DB/parse failure returns
+    ([], 0), same never-fail discipline as the rest of this hook.
+
+    Returns (candidates, sets_checked). candidates is sorted by match-count
+    desc, ties broken by most-recent last_loaded_at desc (stable two-pass
+    sort — see implementation). sets_checked is the number of focus_sets
+    rows read (including the excluded active set, if any), for the
+    stats["sets_checked"] telemetry. The caller applies the
+    _DORMANT_FOCUS_SET_LINES_CAP top-N cut and the shared render budget.
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{KNOWLEDGE_DB_PATH}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        active_row = conn.execute(
+            "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+        ).fetchone()
+        active_name = active_row["active_set_name"] if active_row else None
+        rows = conn.execute(
+            "SELECT name, node_ids, last_loaded_at FROM focus_sets"
+        ).fetchall()
+    except Exception:
+        return [], 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    sets_checked = len(rows)
+    candidates: list[dict] = []
+    for row in rows:
+        name = row["name"]
+        if name == active_name:
+            continue
+        try:
+            ids = json.loads(row["node_ids"])
+            if not isinstance(ids, list):
+                continue
+        except (json.JSONDecodeError, TypeError):
+            continue
+        matched = sorted(rendered_ids & set(ids))
+        if not matched:
+            continue
+        candidates.append({
+            "name": name,
+            "matched": matched,
+            "last_loaded_at": row["last_loaded_at"] or "",
+        })
+
+    # Stable two-pass sort: secondary key (most-recent last_loaded_at) first,
+    # then primary key (match count desc) — Python's sort is stable, so ties
+    # on match count preserve the recency ordering from the first pass.
+    candidates.sort(key=lambda c: c["last_loaded_at"], reverse=True)
+    candidates.sort(key=lambda c: len(c["matched"]), reverse=True)
+    return candidates, sets_checked
 
 
 def _get_attached_packs() -> list[dict]:
@@ -1155,7 +1568,10 @@ def _compact_age(created_ago: str | None) -> str:
     return s
 
 
-def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> str:
+def render_one_node_line(
+    entry: dict, *, conf_prefix: bool, type_tag: bool,
+    moment_text: "str | None" = None,
+) -> str:
     """Render a single node as a compact line for the recall nudge.
 
     Format:
@@ -1172,6 +1588,13 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
             rendering it for axioms/conjectures (which carry epistemic weight).
         type_tag: if True, render ``[<type>]`` tag (for specials, so agent can
             scan what kind of anchor this is).
+        moment_text: (#1940) when entry is a type=="person" node and the
+            caller has already selected+committed a rotating special moment
+            for this render (see _select_person_moment_candidate /
+            _commit_person_moment_render in this file), the moment's prose
+            description. None (default) → no moment line, byte-identical to
+            pre-#1940 output for every non-person entry and for person
+            entries with no eligible moment this render.
     """
     nid = entry.get("id", "?")
     ntype = entry.get("type", "?")
@@ -1219,7 +1642,36 @@ def render_one_node_line(entry: dict, *, conf_prefix: bool, type_tag: bool) -> s
     else:
         body = claim
 
-    return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}"
+    # Person-node typed relational fields (#1940 — issue: "pronouns/trust_tier/
+    # relation render as nothing"). Only populated fields, never a default —
+    # rendered as a compact bracketed tag suffix (keyword-adjacent, cheap),
+    # kept distinct from the moment below (which is prose, not a tag).
+    person_suffix = ""
+    if ntype == "person":
+        tags = []
+        pronouns = entry.get("pronouns")
+        relation = entry.get("relation")
+        trust_tier = entry.get("trust_tier")
+        if pronouns:
+            tags.append(f"pronouns: {pronouns}")
+        if relation:
+            tags.append(f"relation: {relation}")
+        if trust_tier:
+            tags.append(f"trust_tier: {trust_tier}")
+        if tags:
+            person_suffix = f"  [{' · '.join(tags)}]"
+
+    # Special-moment continuation line (#1940) — rendered as prose on its own
+    # indented line rather than crammed onto the summary line: a 40-100 word
+    # relational moment at the density of this file's normal one-line-per-node
+    # format would be unreadable, and there's no existing "Others"-style
+    # keyword-only form that fits prose (a judgment call — flagged in PR body).
+    # The embedded "\n" is safe for every downstream consumer: _budget_try_spend
+    # only measures len(line_text), and the final "\n".join(lines) composition
+    # doesn't care whether an individual line is itself multi-line.
+    moment_suffix = f"\n      ↳ {moment_text}" if moment_text else ""
+
+    return f"- {warn_marker}[{nid}] {prefix}{age_tag}{kw_prefix}{body}{person_suffix}{moment_suffix}"
 
 
 def format_nudge(
@@ -1300,11 +1752,15 @@ def format_nudge(
     stats: optional caller-owned dict, mutated in place (out-parameter) with
     render telemetry for the engram.surface.render_size event (issue #1692):
     {budget_enabled, budget_total_chars, budget_exhausted, chars_rendered,
-    nodes_shown, nodes_suppressed, nodes_cut_budget}. Populated even on the
-    total==0 early-return (all zeroed / budget config echoed) so callers can
-    rely on the dict shape unconditionally. None (the default) skips
-    telemetry entirely — no behavior change, matches the pack_results /
-    session_id optional-param precedent above.
+    nodes_shown, nodes_suppressed, nodes_cut_budget, sets_checked,
+    set_lines_rendered}. sets_checked/set_lines_rendered are #1975 layer-2
+    telemetry (dormant focus-set surfacing) — sets_checked is the number of
+    focus_sets rows read this prompt, set_lines_rendered is how many
+    survived the top-2 cap + render budget. Populated even on the total==0
+    early-return (all zeroed / budget config echoed) so callers can rely on
+    the dict shape unconditionally. None (the default) skips telemetry
+    entirely — no behavior change, matches the pack_results / session_id
+    optional-param precedent above.
     """
     budget_cfg = _get_budget_config()
     if stats is not None:
@@ -1318,6 +1774,8 @@ def format_nudge(
             "nodes_suppressed": 0,
             "nodes_cut_budget": 0,
             "nodes_suppressed_echo": 0,
+            "sets_checked": 0,
+            "set_lines_rendered": 0,
         })
 
     total = result.get("match_count", 0)
@@ -1447,17 +1905,53 @@ def format_nudge(
                 # _tier_for.
                 pass
             elif tier == "full":
-                line = render_one_node_line(s, conf_prefix=True, type_tag=True)
+                # Person special-moment rotation + cooldown (#1940). Only
+                # attempted for full-tier person cards — a demoted/suppressed
+                # person card (tier "others"/"suppress") never reaches this
+                # branch at all and renders via the keyword-only Others path
+                # instead (see _others_candidate_from_full_entry below and
+                # the Others loop later in this function), which has no room
+                # for typed fields or a moment for ANY node type — so a
+                # heavily-repeated person's short fields (pronouns/relation/
+                # trust_tier) demote/suppress right along with the rest of
+                # the card, same as every other node type. This is the
+                # existing per-node ledger's architecture, unchanged; #1940
+                # only adds a SECOND, independent cooldown for the moment
+                # specifically, layered on top of full-tier renders — it does
+                # NOT make short fields survive node-level demotion/
+                # suppression (documented judgment call — see PR body for
+                # the full design-seam writeup Kepler's issue asked for).
+                moment_candidate = None
+                if s.get("type") == "person":
+                    try:
+                        moment_candidate = _select_person_moment_candidate(s)
+                    except Exception:
+                        moment_candidate = None
+                moment_text = moment_candidate[0] if moment_candidate else None
+                line = render_one_node_line(
+                    s, conf_prefix=True, type_tag=True, moment_text=moment_text,
+                )
                 rendered_line = f"    {line}"
                 if _budget_try_spend(rendered_line, budget_state):
                     special_lines.append(rendered_line)
                     rendered_ids_this_prompt.add(nid)
                     special_rendered_count += 1
+                    if moment_candidate is not None:
+                        # Cursor + cooldown only commit once the line
+                        # actually survives the budget check — see
+                        # _select_person_moment_candidate's docstring.
+                        try:
+                            _commit_person_moment_render(nid, moment_candidate[1])
+                        except Exception:
+                            pass
                 else:
                     # eligible (full-tier) but budget-cut — dropped, not
                     # demoted, not marked "seen" (agent never saw this
                     # line), but still excluded from Others below so it's
                     # not re-evaluated and double-counted as a second cut.
+                    # The moment (if any was selected) is correspondingly
+                    # NOT committed — no cursor advance, no cooldown record —
+                    # since the agent never saw it either.
                     budget_cut_ids.add(nid)
             elif tier == "others":
                 demoted_candidates.append(_others_candidate_from_full_entry(s))
@@ -1502,6 +1996,15 @@ def format_nudge(
         if top_claim_lines:
             lines.append("  Top claims:")
             lines.extend(top_claim_lines)
+
+    # Snapshot of the rendered full-summary tier ids (Specials + Top claims
+    # only — the top <=6 lines that actually made it to "full" tier) for
+    # layer-2 dormant focus-set surfacing (#1975) below. Taken here, before
+    # the reservation loop / Others pool add more ids to
+    # rendered_ids_this_prompt, per spec: "membership-check the rendered
+    # full-summary nodes only (Specials + Top claims tiers) — NOT
+    # Others/reservation lines".
+    specials_and_topclaims_ids = set(rendered_ids_this_prompt)
 
     matched_meta = result.get("matched_meta") or []
 
@@ -1704,6 +2207,54 @@ def format_nudge(
         if matched_ids:
             lines.append(f"  IDs: {', '.join(matched_ids[:15])}")
 
+    # --- Layer 2: dormant focus-set surfacing (#1975, the load-bearing layer)
+    # After the tier walk above has decided what actually rendered, check
+    # whether any of the rendered Specials/Top-claims ids (snapshotted into
+    # specials_and_topclaims_ids before the reservation/Others pools ran)
+    # belong to a saved, non-active focus_sets entry. Own-graph content only
+    # (appended here, after Others — before the attached-library section,
+    # which is external-pack content and stays last). Judgment call: the
+    # spec says "after Others, before the footer" without addressing where
+    # the (separate, optional) attached-library section falls between them —
+    # placed here to keep own-graph content grouped together.
+    if stats is not None:
+        stats["sets_checked"] = 0
+        stats["set_lines_rendered"] = 0
+    try:
+        set_candidates, _sets_checked = _dormant_focus_set_candidates(specials_and_topclaims_ids)
+    except Exception:
+        set_candidates, _sets_checked = [], 0
+    if stats is not None:
+        stats["sets_checked"] = _sets_checked
+    # Whole render block guarded, mirroring saved_focus_sets_block()'s
+    # whole-function guard: format_nudge() has no try/except at its only
+    # call site (main()), so an exception here would crash the prompt hook.
+    try:
+        if set_candidates:
+            set_lines = []
+            for cand in set_candidates[:_DORMANT_FOCUS_SET_LINES_CAP]:
+                ids_preview = cand["matched"][:3]
+                ids_str = ", ".join(ids_preview)
+                if len(cand["matched"]) > 3:
+                    ids_str += ", …"
+                set_line = (
+                    f"  💼 saved focus-set '{cand['name']}' holds {len(cand['matched'])} "
+                    f"node(s) matching this prompt ({ids_str}) — engram_focus_load to swap it in."
+                )
+                if not _budget_try_spend_extra(set_line, budget_state):
+                    # Budget exhaustion cuts set-lines too, same one-way stop as
+                    # node lines — NOT counted in nodes_shown/nodes_cut_budget
+                    # (those track actual node-line renders; set_lines_rendered
+                    # is this layer's own telemetry, see _budget_try_spend_extra).
+                    continue
+                set_lines.append(set_line)
+            if set_lines:
+                lines.extend(set_lines)
+                if stats is not None:
+                    stats["set_lines_rendered"] = len(set_lines)
+    except Exception:
+        pass
+
     # Attached-library section — appended AFTER all own-graph content.
     # Only rendered when pack results exist; zero packs → section omitted
     # entirely, preserving byte-identical output to current behavior. Pack
@@ -1780,8 +2331,11 @@ def read_prompt_counter() -> dict:
 def write_prompt_counter(state: dict):
     """Write the prompt counter state."""
     os.makedirs(os.path.dirname(COUNTER_PATH), exist_ok=True)
-    with open(COUNTER_PATH, "w") as f:
-        json.dump(state, f)
+    if _HOOKLIB_OK:
+        atomic_write_json(COUNTER_PATH, state)
+    else:
+        with open(COUNTER_PATH, "w") as f:
+            json.dump(state, f)
 
 
 def check_write_reminder() -> str:
@@ -1792,8 +2346,11 @@ def check_write_reminder() -> str:
         if marker.get("pending"):
             # Clear the marker so it doesn't repeat
             marker["pending"] = False
-            with open(WRITE_REMINDER_PATH, "w") as f:
-                json.dump(marker, f)
+            if _HOOKLIB_OK:
+                atomic_write_json(WRITE_REMINDER_PATH, marker)
+            else:
+                with open(WRITE_REMINDER_PATH, "w") as f:
+                    json.dump(marker, f)
             return (
                 "[ENGRAM Write Check: Did your last response contain a decision, insight, "
                 "or design choice worth recording? If so, write to ENGRAM now (observation, "
@@ -1852,8 +2409,11 @@ def check_repair_marker() -> str:
             return ""
         # Clear the marker so it doesn't repeat
         marker["pending"] = False
-        with open(REPAIR_MARKER_PATH, "w") as f:
-            json.dump(marker, f)
+        if _HOOKLIB_OK:
+            atomic_write_json(REPAIR_MARKER_PATH, marker)
+        else:
+            with open(REPAIR_MARKER_PATH, "w") as f:
+                json.dump(marker, f)
         tool_name = marker.get("tool_name", "?")
         repairs = marker.get("repairs", [])
         lines = [
@@ -2301,15 +2861,18 @@ def _check_principle_triggers_inner(matched_ids: list, prompt_count: int) -> tup
             # interleave, but a concurrent snapshot READ (the one at the top
             # of this function, which deliberately stays outside the lock)
             # could still observe a torn/truncated file mid-write and
-            # degrade to an empty state, risking a spurious re-fire. Switch
-            # to tmp+os.replace so a reader never sees a partial write,
-            # matching the convention already used by _reset_principle_
-            # enactments and by _write_state in the sibling in_turn_recall
-            # state file.
-            tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(fresh_state, f)
-            os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
+            # degrade to an empty state, risking a spurious re-fire. Now via
+            # the shared _hooklib.atomic_write_json() helper (gh#2035) so a
+            # reader never sees a partial write, matching the convention
+            # already used by _reset_principle_enactments and by
+            # _write_state in the sibling in_turn_recall state file.
+            if _HOOKLIB_OK:
+                atomic_write_json(str(PRINCIPLE_TRIGGER_STATE_PATH), fresh_state)
+            else:
+                tmp = str(PRINCIPLE_TRIGGER_STATE_PATH) + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(fresh_state, f)
+                os.replace(tmp, str(PRINCIPLE_TRIGGER_STATE_PATH))
         except OSError:
             pass  # state write failure -> worst case an early re-fire; never block
 

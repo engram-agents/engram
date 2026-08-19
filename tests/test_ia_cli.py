@@ -33,9 +33,14 @@ import pytest
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+# append (not insert(0)) -- src/engram/tools/ also holds forum.py (the CLI
+# script tools/forum.py symlinks to); making it a sys.path *root* at
+# position 0 would outrank src/forum for the rest of the pytest run,
+# shadowing the real `forum` package for every test collected afterward
+# (#2037/#2063).
 _TOOLS_DIR = str(_REPO_ROOT / "src" / "engram" / "tools")
 if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
+    sys.path.append(_TOOLS_DIR)
 
 import importlib.util as _ilu
 

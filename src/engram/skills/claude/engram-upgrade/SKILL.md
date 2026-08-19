@@ -90,11 +90,11 @@ git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH"
 - You may `gh pr view <N>` on at most ONE PR for depth. Do NOT loop over all PRs fetching bodies (token budget).
 - Write a ≤4-bullet summary: what surfaces are touched, anything deploy-fragile (`server.py` / hooks / migrations), anything user-facing. Surface it; pause on anything concerning.
 
-**Also note here** whether any CLAUDE.md render source appears in the change set — that pre-announces Step 7's gate. The rendered `~/.claude/CLAUDE.md` is assembled from **multiple** upstream sources: `templates/template.CLAUDE.md` + `templates/compact-instructions.md` (folded in by bootstrap at install-time). A change to either file produces rendered-CLAUDE.md drift. Check both:
+**Also note here** whether the CLAUDE.md render source appears in the change set — that pre-announces Step 7's gate. The rendered `~/.claude/CLAUDE.md` is assembled from a **single** upstream source: `templates/template.CLAUDE.md`. (`templates/compact-instructions.md` still ships but is Codex-only as of engram-alpha#2067 — it feeds `~/.engram/codex-compact-prompt.md` and `~/.codex/config.toml`'s `experimental_compact_prompt_file`, not the Claude render; see `docs/compaction-continuity.md`. On Codex, check it too — Step 7 below.) Check:
 
 ```bash
 UPSTREAM_BRANCH="$(git -C "$SOURCE_DIR" rev-parse --abbrev-ref HEAD)"
-git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md src/engram/templates/compact-instructions.md
+git -C "$SOURCE_DIR" log --oneline "$DEPLOYED..origin/$UPSTREAM_BRANCH" -- src/engram/templates/template.CLAUDE.md
 ```
 
 **Checkpoint**: change-set summary surfaced + user confirmed proceed (or concern resolved) + CLAUDE.md-template-changed noted yes/no + pre-upgrade SHA saved to `~/.engram/.upgrade-pre-sha`.
@@ -203,7 +203,7 @@ A `health_score` field in the response confirms the viz server is up. Step 8 als
 
 ## Step 7 — CLAUDE.md template inverse-merge (HARD GATE, the residual)
 
-If Step 2 found any CLAUDE.md render source changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from multiple upstream sources — `templates/template.CLAUDE.md` AND `templates/compact-instructions.md` — so a `compact-instructions.md`-only change is just as drift-producing as a template change. On Codex, also check `templates/template.AGENTS.md` and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
+If Step 2 found the CLAUDE.md render source (`templates/template.CLAUDE.md`) changed in the range, **do not skip this**. The rendered `~/.claude/CLAUDE.md` is assembled from that single upstream source now (engram-alpha#2067 — `templates/compact-instructions.md` no longer feeds it; see `docs/compaction-continuity.md`). On Codex, also check `templates/compact-instructions.md` (now Codex-only — feeds `codex-compact-prompt.md` / `experimental_compact_prompt_file`), `templates/template.AGENTS.md`, and any local first-person instructions in `~/.codex/config.toml`/project `AGENTS.md`. The plugin upgrade did not touch these user-scope identity surfaces, so source-side additions may NOT have reached the running agent.
 
 **The "I'll come back to it" failure mode is real** (2026-05-16: a template discipline-change was deferred post-deploy, never merged, and misfired for days before diagnosis). Resolve it now or track it explicitly — never silent-defer.
 

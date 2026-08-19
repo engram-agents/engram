@@ -10,8 +10,9 @@ name: pr-checks
 #   2. no-new-shipped-node-ids   (was check-no-new-shipped-node-ids.yml)
 #   3. pr-body-close-keyword     (was check-pr-body-close-keyword.yml)
 #   4. name-leak-warn            (was name-leak-warn.yml — advisory, never blocks job)
-#   5. invariant-checks          (was invariant-checks.yml — Python 3.11)
-#   6. manifest-gate             (was manifest-gate.yml — Python 3.12)
+#   5. stray-master-ref-check    (#1884 — advisory, never blocks job)
+#   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
+#   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
 
 on:
   pull_request:
@@ -387,7 +388,22 @@ jobs:
             gh pr comment "$PR_NUMBER" --body "$BODY"
           fi
 
-      # ── 5. invariant-checks ────────────────────────────────────────────
+      # ── 5. stray-master-ref-check ───────────────────────────────────────
+      # #1884 — the 2026-07-03 master->main rename (#1645) left three stray
+      # `master` references undetected for five weeks in live workflow/ops
+      # surfaces (one of them silent: a workflow branch filter that existed,
+      # looked armed, and simply never fired). Advisory, never blocks —
+      # same posture as name-leak-warn: a false positive on a legitimate
+      # historical reference should cost a glance, not a red X. Scoped to
+      # load-bearing surfaces only (workflows + ops shell); docs/** prose
+      # (which correctly narrates `master` as history) is out of scope by
+      # design — see tools/stray_master_ref_check.py's module docstring.
+      - name: stray-master-ref-check — scan workflows + ops shell for stray master refs
+        continue-on-error: true
+        run: |
+          python3 tools/stray_master_ref_check.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ── 6. invariant-checks ────────────────────────────────────────────
       # (from invariant-checks.yml)
       # Always-on whole-repo invariant gates: scan-leaks + frontmatter-lint.
       #
@@ -414,10 +430,10 @@ jobs:
       #
       # Split rationale mirrors manifest-gate.yml: cheap stdlib+pytest gates run on
       # every dev PR independently of the selective unit-test path in affected-tests.yml.
-      - name: Set up Python 3.11 (invariant-checks)
+      - name: Set up Python 3.12 (invariant-checks)
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: invariant-checks — install deps (pytest + pyyaml for frontmatter-lint)
         run: pip install pytest pyyaml
@@ -435,7 +451,7 @@ jobs:
         # frontmatter block.
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
 
-      # ── 6. manifest-gate ───────────────────────────────────────────────
+      # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
       # Cheap tag-once tiering gate — runs on EVERY dev PR (and main PRs).
       # This is the sub-second JSON+filesystem check that catches "forgot to
@@ -443,7 +459,7 @@ jobs:
       #
       # Split rationale (Lei 2026-06-01 CI-economics decision, documented in
       # tests.yml header): the expensive full pytest matrix suite (~5min wall,
-      # py3.11/3.12) is main-only; cheap scrub gates run on every dev PR.
+      # py3.12) is main-only; cheap scrub gates run on every dev PR.
       # test_tiers_manifest.py is a pure stdlib+pytest gate (0.02s); it runs
       # here.  test_tier_sizes.py imports server.py which requires fastmcp and
       # the full requirements-dev.txt stack — it stays in tests.yml (main-only

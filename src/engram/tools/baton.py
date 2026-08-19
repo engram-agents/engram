@@ -264,38 +264,39 @@ def _age_str(ts: Optional[datetime]) -> str:
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 # GitHub anchor value validation: pr/<N>, pr/<owner>/<repo>/<N> (repo-qualified,
-# #1715), or project/<N>. Repo-qualification is REQUIRED for any PR-baton
-# whose PR does not live in DEFAULT_GITHUB_REPO (#1715: bare pr/<N> anchors
-# are matched against gh's ambient cwd repo everywhere they're reconciled --
-# for a baton tracking a PR in a different repo, this silently matches the
-# wrong repo's PR of the same number).
+# #1715), or project/<N>. Repo-qualification is REQUIRED for any gh call this
+# file makes (#1918: there is no default repo) -- an unqualified pr/<N> is
+# refused-and-counted by cmd_gc/cmd_flip/cmd_merge rather than resolved
+# against a guess.
 _GITHUB_ANCHOR_RE = re.compile(
     r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?\d+|project/\d+)$"
 )
 
-# Historical default: nearly every PR-baton created before #1715 tracks a PR
-# in the installation's own home repo, and bare pr/<N> anchors relied on gh's
-# ambient-cwd resolution happening to land there. Pinning it explicitly
-# (rather than leaving gh to infer it from cwd) makes existing unqualified
-# anchors resolve correctly and DETERMINISTICALLY regardless of what
-# directory a reconciliation call happens to run from -- the ambient-cwd
-# dependence was itself part of the #1715 bug class, not just the missing
-# --repo flag.
+# #1918: there is NO default repo, deliberately -- do not revisit.
 #
-# Read from $ENGRAM_DEFAULT_GITHUB_REPO, NOT hardcoded as a private-repo
-# literal: this source tree is scanned pre-release (tools/scan-leaks.py) for
-# exactly this shape of leak (a private dev-repo name baked into shipped
-# code). The public-safe fallback below is what an actual OSS install wants
-# by default; a private dev repo (e.g. this one) sets the env var in its own
-# runtime environment, which is never scanned.
-DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
+# An earlier version of this file resolved an unqualified `pr/<N>` anchor
+# against $ENGRAM_DEFAULT_GITHUB_REPO (falling back to the public
+# engram-agents/engram repo). That was wrong in both directions: on a
+# private dev install it silently queried the WRONG repo (every gh call
+# in this file failed or, worse, matched an unrelated same-numbered PR --
+# gh pr merge --squash on that guess is the single most consequential call
+# in this file); on a fresh external install it resolved against the
+# ENGRAM project's OWN public repo, which is not the user's repo at all --
+# there is no value of a default that is correct for an external install.
+#
+# The fix (per umwelt's src/umwelt/gh_reconcile.py, ported here rather than
+# re-derived -- umwelt already solved this): every gh call requires an
+# explicit, repo-qualified anchor. A PR-baton without one is refused and
+# counted (never guessed at) by cmd_gc/cmd_flip/cmd_merge. See each
+# call site's own comment for how it surfaces the refusal.
 
 
 def _parse_github_anchor(value: str) -> Optional[tuple]:
     """Parse a github anchor value into (kind, repo, number).
 
     kind is 'pr' or 'project'. repo is 'owner/repo' if the anchor is
-    repo-qualified, else None (caller should apply DEFAULT_GITHUB_REPO).
+    repo-qualified, else None (#1918: there is no default repo -- callers
+    must refuse-and-count an unqualified PR anchor rather than guess one).
     number is the PR/project number as a string. Returns None if `value`
     doesn't match a known anchor shape (caller should treat as "no anchor").
     """
@@ -372,7 +373,7 @@ def _dedupe_checks_by_latest(checks: list) -> list:
     return list(latest.values())
 
 
-def _pr_ci_state(pr_number: str, repo: Optional[str] = None) -> tuple:
+def _pr_ci_state(pr_number: str, repo: str) -> tuple:
     """Query GitHub CI state for a pull request via `gh`.
 
     Returns (state, detail) where state is one of:
@@ -381,17 +382,23 @@ def _pr_ci_state(pr_number: str, repo: Optional[str] = None) -> tuple:
       "pending" — no failure, but at least one check still running
       "unknown" — could not obtain a verdict (degraded; advisory only)
 
-    #1715: pass `repo` (owner/repo) explicitly when the caller's anchor is
-    repo-qualified. Without it, the gh call falls back to cwd-based repo
-    inference — a failure here is expected when invoked outside the repo
-    tree and must NOT hard-block the caller, but for a genuinely
-    cross-repo PR-baton this means the CI-green gate is checking the
-    WRONG repo's PR entirely if cwd happens to resolve to some repo.
+    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. Every
+    caller resolves it from a repo-qualified anchor before calling this --
+    that guarantee used to be enforced only by caller discipline (`repo:
+    Optional[str] = None`, falling back to gh's cwd-based inference when
+    omitted). #1918 removed baton.py's DEFAULT_GITHUB_REPO precisely
+    because a silently-guessed repo is how a cross-repo PR-baton ends up
+    checking the WRONG repo's PR entirely -- cwd inference is that same
+    failure mode one function down, just unnamed. Making `repo` required
+    at the signature enforces the guarantee structurally rather than by
+    every caller remembering to pass it (all six production call sites
+    already did; this closes the latent re-entry point for a future one
+    that doesn't).
     """
+    if not repo:
+        return ("unknown", "repo argument is required and was empty")
     cmd = ["gh", "pr", "view", pr_number,
-           "--json", "statusCheckRollup,mergeStateStatus"]
-    if repo:
-        cmd += ["--repo", repo]
+           "--json", "statusCheckRollup,mergeStateStatus", "--repo", repo]
     try:
         result = subprocess.run(
             cmd,
@@ -469,7 +476,7 @@ def _pr_ci_state(pr_number: str, repo: Optional[str] = None) -> tuple:
 # Approval-staleness helper for the flip guard (#1002)
 # ---------------------------------------------------------------------------
 
-def _pr_approval_state(pr_number: str, repo: Optional[str] = None) -> tuple:
+def _pr_approval_state(pr_number: str, repo: str) -> tuple:
     """Query GitHub for post-approval tip movement on a pull request via `gh`.
 
     Companion to _pr_ci_state (#974): that guard checks CI is green NOW;
@@ -485,16 +492,16 @@ def _pr_approval_state(pr_number: str, repo: Optional[str] = None) -> tuple:
     reads stale BY DESIGN (conservative: a rebased tip was not the reviewed
     tip; the colleague must re-approve).
 
-    #1715: when `repo` (owner/repo) is given (a repo-qualified anchor),
-    it's used directly and the `gh repo view` cwd-inference step (below)
-    is skipped entirely — cwd-inference is exactly the mechanism that let
-    this guard silently check the wrong repo for a genuinely cross-repo
-    PR-baton. Without `repo`, falls back to the original cwd-inferred
-    lookup for bare/unqualified anchors.
+    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. This used
+    to fall back to a `gh repo view` cwd-inference call when `repo` was
+    omitted -- exactly the mechanism that let this guard silently check the
+    wrong repo for a genuinely cross-repo PR-baton, and exactly the failure
+    class #1918 removed baton.py's DEFAULT_GITHUB_REPO to prevent one layer
+    up. That fallback path is gone; a caller with no repo-qualified anchor
+    gets "unknown" (advisory, non-blocking) rather than a guess.
 
-    Two gh calls (only the first is skipped when `repo` is supplied):
-      1. gh repo view --json nameWithOwner  (cwd-inferred repo identity)
-      2. gh api graphql querying headRefOid and reviews(last:50){state,commit{oid}}
+    One gh call: gh api graphql querying headRefOid and
+    reviews(last:50){state,commit{oid}}.
 
     Returns (state, detail) where state is one of:
       "fresh"       — at least one APPROVED review has commit.oid == headRefOid
@@ -514,43 +521,13 @@ def _pr_approval_state(pr_number: str, repo: Optional[str] = None) -> tuple:
         return ("unknown", f"PR number {pr_number!r} is not numeric")
     pr_number = pr_str
 
-    if repo:
-        if "/" not in repo:
-            return ("unknown", f"repo {repo!r} is not owner/repo shaped")
-        owner, repo_name = repo.split("/", 1)
-    else:
-        # Step 1: resolve repo nameWithOwner (cwd-inferred from the working
-        # tree) — only reached for a bare/unqualified anchor.
-        try:
-            repo_result = subprocess.run(
-                ["gh", "repo", "view", "--json", "nameWithOwner"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except FileNotFoundError:
-            return ("unknown", "gh not found on PATH")
-        except subprocess.TimeoutExpired:
-            return ("unknown", "gh timed out after 15s")
-        except OSError as exc:
-            return ("unknown", f"gh exec error: {exc}")
+    if not repo:
+        return ("unknown", "repo argument is required and was empty")
+    if "/" not in repo:
+        return ("unknown", f"repo {repo!r} is not owner/repo shaped")
+    owner, repo_name = repo.split("/", 1)
 
-        if repo_result.returncode != 0:
-            detail = (repo_result.stderr or "").strip() or f"gh exit {repo_result.returncode}"
-            return ("unknown", detail)
-
-        raw_repo = (repo_result.stdout or "").strip()
-        if not raw_repo:
-            return ("unknown", "gh repo view returned empty output")
-
-        try:
-            repo_data = json.loads(raw_repo)
-            name_with_owner = repo_data["nameWithOwner"]
-            owner, repo_name = name_with_owner.split("/", 1)
-        except (json.JSONDecodeError, ValueError, KeyError):
-            return ("unknown", "gh repo view returned unparseable JSON or missing nameWithOwner")
-
-    # Step 2: GraphQL — fetch headRefOid and last 50 reviews with commit oid.
+    # GraphQL — fetch headRefOid and last 50 reviews with commit oid.
     query = (
         "{ repository(owner: \"%s\", name: \"%s\") {"
         " pullRequest(number: %s) {"
@@ -721,10 +698,9 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             github_anchor = f"pr/{_pr_from_id.group(1)}"
 
     # --repo qualifies a pr/<N> anchor to pr/<owner>/<repo>/<N> (#1715).
-    # Required for any PR-baton whose PR is NOT in DEFAULT_GITHUB_REPO --
-    # unqualified anchors reconcile against DEFAULT_GITHUB_REPO, which is
-    # correct for the historical majority but silently wrong for any other
-    # repo's PR that happens to share the number.
+    # Effectively REQUIRED for every PR-baton now (#1918: there is no
+    # default repo) -- an unqualified anchor is refused-and-counted by
+    # cmd_gc/cmd_flip/cmd_merge rather than reconciled against a guess.
     repo_arg = getattr(args, "repo", None)
     if repo_arg is not None:
         repo_arg = repo_arg.strip().lower()
@@ -758,6 +734,60 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             )
             sys.exit(EXIT_VALIDATION)
         github_anchor = f"pr/{repo_arg}/{parsed[2]}"
+
+    # #1924: the mint path must not produce what the consume paths refuse.
+    # #1918/#1920 made cmd_gc/cmd_flip/cmd_merge refuse-and-count an
+    # unqualified pr/<N> anchor (there is no default repo to guess against),
+    # but left cmd_init free to keep creating them -- including SILENTLY, via
+    # the auto-derive above, on the plainest possible invocation
+    # (`baton init PR-1234 --title ... --participants ...`). The result was a
+    # baton born unmergeable: `baton merge` hard-refuses it later with
+    # "run baton anchor first", and that refusal lands on whoever tries to
+    # merge, days or weeks after the person who could trivially have avoided
+    # it has moved on.
+    #
+    # WARN, deliberately, rather than refuse -- and the reason is worth
+    # recording because my first draft of this fix DID refuse:
+    #
+    #   * Refusing breaks the plainest invocation there is
+    #     (`baton init PR-1234 --title ... --participants ...`), which is what
+    #     every agent and script on this host actually types. Seven existing
+    #     tests failed on it.
+    #   * One of those, test_init_auto_derives_bare_anchor_from_pr_project_id,
+    #     exists specifically to PIN bare auto-derivation as intended #1715
+    #     behavior. Flipping a pinned contract is a team decision, not a
+    #     follow-up's to make unilaterally. #1924 carries that question.
+    #
+    # A creation-time warning is also better targeted than I first argued.
+    # I had reasoned by analogy to cmd_flip's stderr warning, which reaches
+    # the flipping agent while the consequence lands on the maintainer -- but
+    # that analogy is wrong here. At init the author IS the party who can fix
+    # it, holds the missing flag right now, and is the only one who knows
+    # which repo is meant. The displaced-consequence problem is precisely what
+    # warning HERE (rather than only refusing later, at merge) removes.
+    #
+    # Scope note: fires only when an anchor RESOLVES TO A PR and is
+    # unqualified. A baton with no github anchor at all (a DESIGN-* project,
+    # or a PR-shaped id the auto-derive regex doesn't match, e.g.
+    # UMWELT-PR-<N>) is untouched -- cmd_gc already counts those as ungauged,
+    # and widening this to cover them needs a broader notion of "is this a PR
+    # baton" than project_id shape alone. Tracked in #1924, not guessed at.
+    _final_anchor = _parse_github_anchor(github_anchor) if github_anchor else None
+    if _final_anchor is not None and _final_anchor[0] == "pr" and _final_anchor[1] is None:
+        _n = _final_anchor[2]
+        _derived = repo_arg is None and not getattr(args, "github", None)
+        print(
+            f"baton init: warning: '{project_id}' is being created with the "
+            f"unqualified PR anchor 'pr/{_n}'"
+            + (" (auto-derived from the project id)" if _derived else "")
+            + " -- there is no default repo (#1918), so gc/flip/merge will all "
+            "REFUSE this baton later. Qualify it now:\n"
+            f"    baton init {project_id} ... --repo <owner>/<repo>\n"
+            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}\n"
+            f"  or fix it after the fact:\n"
+            f"    baton anchor {project_id} --github pr/<owner>/<repo>/{_n}",
+            file=sys.stderr,
+        )
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
@@ -883,9 +913,25 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     _flip_force = args.force
     _parsed_anchor = _parse_github_anchor(github_anchor)
     _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
-    if _pr_anchor_match and _is_pool_sentinel(to_agent):
+    if _pr_anchor_match and _is_pool_sentinel(to_agent) and _parsed_anchor[1] is None:
+        # #1918: unqualified pr/<N> anchor -- there is no default repo to
+        # guess against. Skip CI/approval/colleague verification entirely
+        # rather than querying a possibly-wrong repo (the old
+        # DEFAULT_GITHUB_REPO fallback here could false-block a legitimate
+        # flip, or worse, false-pass one against an unrelated same-numbered
+        # PR). Same "cannot verify, proceed with a warning" shape already
+        # used below for a genuine gh-query failure, just triggered before
+        # any gh call is made at all.
+        print(
+            f"warning: baton flip: PR anchor 'pr/{_parsed_anchor[2]}' is not "
+            "repo-qualified — skipping CI/approval/colleague verification "
+            "(no default repo to guess against). Anchor it first: "
+            f"baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}",
+            file=sys.stderr,
+        )
+    elif _pr_anchor_match and _is_pool_sentinel(to_agent):
         _pr_num = _parsed_anchor[2]
-        _pr_repo = _parsed_anchor[1] or DEFAULT_GITHUB_REPO
+        _pr_repo = _parsed_anchor[1]
         _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
         if _ci_state in ("red", "pending"):
             if _flip_force:
@@ -1492,9 +1538,14 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     # come from the stored `github` anchor, NOT re-derived from project_id
     # via regex -- that re-derivation had NO repo awareness at all and
     # queried gh with a bare number, silently matching whatever repo gh's
-    # ambient cwd happened to resolve to. A PR-baton with no github anchor
-    # is skipped rather than guessed at (its project_id alone is not
-    # sufficient to safely identify a PR + repo pair).
+    # ambient cwd happened to resolve to.
+    #
+    # #1918: a PR-baton with no anchor at all, an unparseable one, OR an
+    # UNQUALIFIED pr/<N> anchor (no owner/repo) is skipped rather than
+    # guessed at -- there is no default repo to fall back to (see the
+    # DEFAULT_GITHUB_REPO removal note near the top of this file). Ported
+    # from umwelt's gh_reconcile.py: "skip and count, never resolve against
+    # a default or ambient repo."
     pr_batons = []
     ungauged = 0
     for p in all_projects:
@@ -1502,18 +1553,19 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
         if not pid.upper().startswith("PR-"):
             continue
         parsed = _parse_github_anchor((p.get("github") or "").strip().lower())
-        if parsed is None or parsed[0] != "pr":
+        if parsed is None or parsed[0] != "pr" or parsed[1] is None:
             ungauged += 1
             continue
         _, repo, pr_num = parsed
-        pr_batons.append((pid, repo or DEFAULT_GITHUB_REPO, pr_num))
+        pr_batons.append((pid, repo, pr_num))
         if len(pr_batons) >= limit:
             break
 
     if ungauged:
         print(
-            f"baton gc: skipped {ungauged} PR-baton(s) with no/invalid github "
-            "anchor -- run 'baton anchor <id> --github pr/<owner>/<repo>/<N>' "
+            f"baton gc: skipped {ungauged} PR-baton(s) with no/invalid/"
+            "unqualified github anchor -- run "
+            "'baton anchor <id> --github pr/<owner>/<repo>/<N>' "
             "to make them gc-eligible.",
             file=sys.stderr,
         )
@@ -1527,13 +1579,17 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode != 0:
+                # #1918: a query failure is a FAILURE, not a skip -- the old
+                # code bucketed this under `skipped`, so a run's own summary
+                # line could read "failed 0" immediately after printing 33
+                # of these lines, masking a completely inert sweep as clean.
                 print(f"baton gc: gh query failed for {project_id} (repo {repo}, pr #{pr_num})", file=sys.stderr)
-                skipped += 1
+                failed += 1
                 continue
             state = result.stdout.strip().upper()
         except Exception as e:
             print(f"baton gc: error querying {project_id}: {e!r}", file=sys.stderr)
-            skipped += 1
+            failed += 1
             continue
 
         if state == "MERGED":
@@ -1567,6 +1623,13 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
 
     action = "would close" if dry_run else "closed"
     print(f"baton gc: {action} {closed}, skipped {skipped}, failed {failed}")
+
+    # #1918: a non-zero exit when any lookup failed -- the prior all-exit-0
+    # behavior is what let "failed 0, 33 failure lines printed above it" go
+    # unnoticed for weeks. A cron/timer invocation (this command's own
+    # docstring recommends one) needs the exit code to reflect this.
+    if failed:
+        sys.exit(EXIT_IO)
 
 
 # ---------------------------------------------------------------------------
@@ -1850,27 +1913,42 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_VALIDATION)
 
-    # #1715 (reviewer-fairy-caught, round 2): resolve the repo from the
-    # baton's stored `github` anchor, the SAME pattern already used in
+    # #1715 (reviewer-fairy-caught, round 2) / #1918: resolve the repo from
+    # the baton's stored `github` anchor, the SAME pattern already used in
     # cmd_flip -- never trust gh's ambient-cwd inference for a genuinely
     # cross-repo PR-baton. This gate's stakes are higher than cmd_flip's:
     # gate 5 below performs an IRREVERSIBLE `gh pr merge --squash`, so
     # silently resolving the wrong repo here doesn't just misreport a
     # status, it can squash-merge an unrelated PR that happens to share
-    # this baton's PR number in whatever repo gh's cwd resolves to.
-    _merge_repo = DEFAULT_GITHUB_REPO
+    # this baton's PR number in whatever repo the resolution guessed.
+    #
+    # #1918: there is no default repo to fall back to, so this is now a
+    # hard, NEVER-forceable gate (same tier as gates 1-2 above) -- a baton
+    # with no anchor, an unparseable one, or an unqualified pr/<N> anchor
+    # refuses rather than merging on a guessed repo + a trusted CLI number.
+    # --force skips CI/approval quality gates (3-4); it has never meant
+    # "merge without knowing which repo," and this gate does not change
+    # that contract.
     _merge_anchor = _parse_github_anchor(fields.get("github", "").strip().lower())
-    if _merge_anchor is not None and _merge_anchor[0] == "pr":
-        _merge_repo = _merge_anchor[1] or DEFAULT_GITHUB_REPO
-        if _merge_anchor[2] != pr_number:
-            print(
-                f"baton merge: PR number mismatch -- '{args.pr}' resolves to "
-                f"#{pr_number}, but {project_id}'s stored github anchor "
-                f"points at #{_merge_anchor[2]}. Refusing rather than "
-                "guessing which is correct.",
-                file=sys.stderr,
-            )
-            sys.exit(EXIT_VALIDATION)
+    if _merge_anchor is None or _merge_anchor[0] != "pr" or _merge_anchor[1] is None:
+        print(
+            f"baton merge: '{project_id}' has no repo-qualified github anchor "
+            f"-- refusing to guess which repo's PR #{pr_number} to squash-merge. "
+            f"Run 'baton anchor {project_id} --github pr/<owner>/<repo>/{pr_number}' "
+            "first. This is not skippable with --force.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    _merge_repo = _merge_anchor[1]
+    if _merge_anchor[2] != pr_number:
+        print(
+            f"baton merge: PR number mismatch -- '{args.pr}' resolves to "
+            f"#{pr_number}, but {project_id}'s stored github anchor "
+            f"points at #{_merge_anchor[2]}. Refusing rather than "
+            "guessing which is correct.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
 
     # ---- Gate 3: CI green (skippable with --force) --------------------
     _ci_verdict = "green"
@@ -2083,11 +2161,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo", metavar="OWNER/REPO",
         help=(
             "Repo-qualify a PR anchor (e.g. engram-agents/engram-paper). "
-            "REQUIRED for any PR-baton whose PR is not in "
-            f"{DEFAULT_GITHUB_REPO} (#1715) -- an unqualified pr/<N> anchor "
-            "reconciles against that default repo, which silently matches "
-            "the wrong PR if the real one lives elsewhere and happens to "
-            "share the number."
+            "Effectively REQUIRED for every PR-baton (#1918: there is no "
+            "default repo) -- an unqualified pr/<N> anchor is refused and "
+            "counted (never guessed against) by gc/flip/merge."
         ),
     )
     p_init.add_argument(
@@ -2325,7 +2401,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "GitHub anchor value: pr/<N>, pr/<owner>/<repo>/<N>, or project/<N> "
             "(e.g. pr/490, pr/engram-agents/engram-paper/22, project/4). "
-            f"Repo-qualify (#1715) any PR not in {DEFAULT_GITHUB_REPO}."
+            "Repo-qualify (#1715, #1918) every PR anchor -- there is no "
+            "default repo, and gc/flip/merge refuse an unqualified one."
         ),
     )
 

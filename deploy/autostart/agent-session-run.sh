@@ -34,11 +34,30 @@ LOG_DIR="$HOME/.engram/logs"
 LOG="$LOG_DIR/autostart-launch.log"
 mkdir -p "$LOG_DIR"
 
-echo "[$(date -Is)] [$AGENT_NAME] launching: agentctl session $AGENT_NAME -dr --as-self --cd $CD_TARGET --charge-file $CHARGE_FILE" >> "$LOG"
+platform="$(agentctl __detect-platform-as-self)" || {
+    echo "[$(date -Is)] [$AGENT_NAME] ERROR: could not detect platform for boot session" >> "$LOG"
+    echo "[autostart] could not detect the agent platform; refusing to guess boot arguments" >&2
+    exit 1
+}
+
+# -r asks Claude to register remote control. Codex has one daemon-backed TUI
+# in this pane instead; agentctl accepts and silently consumes -r there. Keep
+# the Claude boot contract while omitting the unnecessary Codex alias.
+case "$platform" in
+    claude) session_aliases=(-d -r) ;;
+    codex) session_aliases=(-d) ;;
+    *)
+        echo "[$(date -Is)] [$AGENT_NAME] ERROR: unsupported boot platform '$platform'" >> "$LOG"
+        echo "[autostart] unsupported agent platform '$platform'; refusing to guess boot arguments" >&2
+        exit 1
+        ;;
+esac
+
+echo "[$(date -Is)] [$AGENT_NAME] launching: agentctl session $AGENT_NAME ${session_aliases[*]} --as-self --cd $CD_TARGET --charge-file $CHARGE_FILE" >> "$LOG"
 
 # stderr rides through tee into the log AND stays on the pane. stdout is left
 # alone — the platform CLI's interactive UI owns it.
-agentctl session "$AGENT_NAME" -dr --as-self \
+agentctl session "$AGENT_NAME" "${session_aliases[@]}" --as-self \
     --cd "$CD_TARGET" --charge-file "$CHARGE_FILE" \
     2> >(tee -a "$LOG" >&2)
 ec=$?

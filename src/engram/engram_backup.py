@@ -43,6 +43,34 @@ _DERIVED_TABLE_PREFIXES = ("nodes_fts",)
 _DERIVED_TABLE_NAMES = ("vec_nodes",)
 
 
+# Canonical nodes_fts column list — SINGLE SOURCE OF TRUTH (#2077).
+#
+# Before this fix, the column list was hand-written in TWO places that
+# drifted apart: engram_core.py's CREATE VIRTUAL TABLE nodes_fts carried all
+# five columns (added by #403 to cover feeling_report's reported_state /
+# trigger_text fields), while this module's rebuild_fts_index still had the
+# original three. Two independent consequences followed:
+#   1. rebuild_fts_index's delete-insert only touched 3 columns, so a
+#      retracted node stayed FTS-findable through reported_state/trigger_text.
+#   2. On restore, the dump strips nodes_fts and rebuild_fts_index recreated
+#      it with 3 columns; engram_core's `CREATE TABLE IF NOT EXISTS` then
+#      no-ops forever, leaving the graph permanently under-indexed.
+#
+# engram_core.py's CREATE VIRTUAL TABLE statement and every INSERT /
+# delete-insert in this module now derive their column list from this one
+# tuple. engram_backup.py is intentionally the home for it (not
+# engram_core.py): it is the leaner, stdlib-only module several call sites
+# (engram-regenerate-embeddings.py, the server's own restore path) already
+# import without pulling in engram_core's full dependency chain.
+NODES_FTS_COLUMNS: tuple = (
+    "claim",
+    "quoted_text",
+    "interpretation",
+    "reported_state",
+    "trigger_text",
+)
+
+
 def _derived_drop_plan(conn: sqlite3.Connection) -> tuple[list[str], list[str], list[str]]:
     """Return (fts_triggers, vocab_tables, base_virtual_tables) to drop, in safe order.
 
@@ -155,6 +183,23 @@ def dump_stripped(src_db_path: str, out_sql_path: str) -> dict:
     }
 
 
+def _existing_fts_columns(conn: sqlite3.Connection) -> list | None:
+    """Return the visible column names of an existing ``nodes_fts`` table, in
+    declared order, or None if the table doesn't exist.
+
+    PRAGMA table_info works on FTS5 virtual tables and reports exactly the
+    columns declared in the ``fts5(...)`` clause (excluding the content=/
+    content_rowid= key=value config, which aren't columns) — a more reliable
+    read than parsing the stored CREATE VIRTUAL TABLE SQL text by hand.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ).fetchone()
+    if not has_table:
+        return None
+    return [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+
+
 def rebuild_fts_index(db_path: str) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
 
@@ -162,12 +207,34 @@ def rebuild_fts_index(db_path: str) -> bool:
     rebuilds from all current ``nodes`` rows (so retracted rows are present in
     the index immediately after rebuild), then 'delete'-inserts each retracted
     row to exclude it from the index (this succeeds only because rebuild just
-    populated them — delete-on-empty is the crash).  Finally sets
-    PRAGMA user_version = 1 so the server's one-shot #274 migration gate is
-    satisfied and does not re-fire on the next _get_db call.
+    populated them — delete-on-empty is the crash).  Finally restores
+    PRAGMA user_version to the value it had on entry (#2087): the incoming
+    version is read before the rebuild and written back after, so a
+    already-migrated live DB (user_version 2 or 3) is not silently downgraded
+    to 1 — a downgrade that would make _run_db_one_time_setup's migration-2/3
+    blocks re-run on the next call, since #2080's startup self-heal invokes
+    this function mid-setup, before those later migration blocks are gated.
+    The one exception is an incoming version of 0 (a genuinely fresh/
+    pre-migration DB, or a legacy DB that predates the #274 migration gate):
+    there the original intent of this PRAGMA — marking FTS schema v1 present
+    so the server's one-shot #274 migration gate is satisfied and does not
+    re-fire — still applies, so the version is bumped to at least 1.
 
     Order is load-bearing: rebuild THEN delete (not delete THEN rebuild, which
     is the original crash path).
+
+    Column list is single-sourced from NODES_FTS_COLUMNS (#2077), intersected
+    with whatever columns ``nodes`` actually has — real ENGRAM DBs always carry
+    all five (engram_core's ALTER TABLE ADD COLUMN backfill guarantees it);
+    minimal/legacy test fixtures that only carry claim/quoted_text/
+    interpretation still get a 3-column index rather than failing outright.
+
+    Detect-and-repair (#2077 consequence 2): if a ``nodes_fts`` table already
+    exists with a column set that doesn't match the canonical target (e.g. a
+    stale 3-column table left behind by the pre-fix rebuild path), that stale
+    table is dropped and recreated from the canonical list before reindexing.
+    This is logged loudly — never a silent no-op — because `CREATE TABLE IF
+    NOT EXISTS` would otherwise leave the graph permanently under-indexed.
 
     Returns True if the rebuild ran, False if the ``nodes`` table does not
     exist (the DB is not ENGRAM-shaped — nothing to do).
@@ -186,10 +253,14 @@ def rebuild_fts_index(db_path: str) -> bool:
         if not has_nodes:
             return False
 
+        # #2087: capture the incoming user_version before the rebuild so it
+        # can be restored afterward instead of unconditionally overwritten.
+        incoming_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+
         # Create the FTS table if it was stripped from the dump (it always is).
-        # Guard: only create if nodes has the three columns the FTS table
-        # indexes (claim, quoted_text, interpretation).  Minimal test fixtures
-        # may have a stripped-down nodes schema; we skip creation for those.
+        # Guard: only create if nodes has the three original required columns
+        # (claim, quoted_text, interpretation).  Minimal test fixtures may
+        # have a stripped-down nodes schema; we skip creation for those.
         node_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
@@ -199,10 +270,26 @@ def rebuild_fts_index(db_path: str) -> bool:
         if not has_fts_cols:
             # nodes schema is incomplete — cannot create or rebuild FTS safely.
             return True  # Still report True: nodes exists, we just can't index.
+
+        # Canonical target columns: NODES_FTS_COLUMNS intersected with what
+        # `nodes` actually has, preserving declared order.
+        target_cols = [c for c in NODES_FTS_COLUMNS if c in node_cols]
+
+        existing_cols = _existing_fts_columns(conn)
+        if existing_cols is not None and existing_cols != target_cols:
+            print(
+                f"[rebuild_fts_index] repairing under-indexed nodes_fts on {db_path}: "
+                f"existing columns {existing_cols} != canonical {target_cols} "
+                "— dropping and rebuilding from the canonical column list."
+            )
+            conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
+            conn.execute("DROP TABLE IF EXISTS nodes_fts")
+
+        cols_sql = ", ".join(target_cols)
         conn.execute(
-            """
+            f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-                claim, quoted_text, interpretation,
+                {cols_sql},
                 content='nodes', content_rowid='rowid'
             )
             """
@@ -210,6 +297,12 @@ def rebuild_fts_index(db_path: str) -> bool:
 
         # Step 1: rebuild — populates the index from ALL nodes rows, including
         # retracted ones (external-content 'rebuild' mirrors the content table).
+        # Exception-path safety (verified by fault injection, #2113 review):
+        # this INSERT opens SQLite's implicit transaction; if anything below
+        # raises before the commit, conn.close() in the finally ROLLS BACK the
+        # rebuild AND the user_version restore together. Do not add an early
+        # conn.commit() between here and the version restore — that would
+        # split the transaction and let a mid-repair crash strand the version.
         conn.execute("INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild')")
 
         # Step 2: delete-insert retracted rows — succeeds because they were just
@@ -218,24 +311,34 @@ def rebuild_fts_index(db_path: str) -> bool:
         # crash that step 1 prevents.
         # Guard: only query status='retracted' if the status column exists
         # (minimal test fixtures may omit it; real ENGRAM DBs always have it).
-        col_names = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(nodes)").fetchall()
-        }
-        if "status" in col_names:
+        if "status" in node_cols:
+            select_cols_sql = ", ".join(f"COALESCE({c}, '')" for c in target_cols)
             retracted = conn.execute(
-                "SELECT rowid, COALESCE(claim,''), COALESCE(quoted_text,''), "
-                "COALESCE(interpretation,'') FROM nodes WHERE status='retracted'"
+                f"SELECT rowid, {select_cols_sql} FROM nodes WHERE status='retracted'"
             ).fetchall()
-            for rowid, claim, quoted_text, interpretation in retracted:
+            insert_cols_sql = ", ".join(target_cols)
+            placeholders_sql = ", ".join(["?"] * (len(target_cols) + 1))
+            for row in retracted:
                 conn.execute(
-                    "INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation) "
-                    "VALUES ('delete', ?, ?, ?, ?)",
-                    (rowid, claim, quoted_text, interpretation),
+                    f"INSERT INTO nodes_fts(nodes_fts, rowid, {insert_cols_sql}) "
+                    f"VALUES ('delete', {placeholders_sql})",
+                    row,
                 )
 
-        # Step 3: gate the server's #274 migration so it doesn't re-fire.
-        conn.execute("PRAGMA user_version = 1")
+        # Step 3: restore the incoming user_version rather than unconditionally
+        # overwriting it (#2087). PRAGMA statements do not accept bound
+        # parameters (SQL grammar), so the value is interpolated; it is a
+        # Python int read from this same DB via PRAGMA and is never
+        # caller-supplied. user_version is per-database state persisted in the
+        # file header — which is exactly why it must survive the rebuild
+        # rather than be overwritten.
+        # incoming_user_version == 0 means a genuinely fresh/pre-migration DB
+        # (or a legacy DB predating the #274 gate) — preserve the original
+        # intent of gating the server's #274 migration so it doesn't re-fire
+        # by bumping to at least 1. Any incoming version >= 1 passes through
+        # unchanged (max(...) is a no-op there).
+        restored_user_version = max(incoming_user_version, 1)
+        conn.execute(f"PRAGMA user_version = {restored_user_version}")
 
         conn.commit()
         return True

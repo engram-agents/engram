@@ -84,14 +84,14 @@ Nine well-supported categories you scan for, plus two heuristic categories you c
 
 5. **Tainted-but-still-valid derivations.** `engram_query_pattern(pattern_name='tainted_still_valid')` as primary; or inline: `engram_list(status='tainted')`, for each tainted derivation inspect the retraction-source it cites via `tainted_by`. Some tainted derivations may still be valid under the corrected/superseded version of their premises (the cascade fired correctly but the substantive claim survives). Flag candidates for the parent to either re-derive cleanly or supersede with a fresh statement.
 
-6. **Recent-resolution echoes.** `engram_query_pattern(pattern_name='recent_resolution_echo')` as primary; or inline: run `engram_history(action='resolved', since=<recent>)`. For each resolution, scan recently-active questions that share semantic content. If a resolution pattern has just emerged that should propagate to similar questions, flag it.
+6. **Recent-resolution echoes.** `engram_query_pattern(pattern_name='recent_resolution_echo')` as primary — **audited 2026-08-04 (#1901): the server-side pattern is NOT day-windowed.** It ranks the 30 most-recent `resolves` edges by `created_at DESC` regardless of how much wall-clock time separates them — a self-relative "last 30" window, not a "since last sleep" one, so it needs no per-type watermark and is already lottery-safe as-is. Only the inline fallback below carries an actual runs-every-day assumption: `engram_history(action='resolved', since=<recent>)` — if you fall back to this path, use the same `window_since` value the parent injected for Category 7 (or, if this fairy is running Category 6 without Category 7 also running, ask for one / default to the last 30 days as an approximation) rather than an undefined "recent." For each resolution, scan recently-active questions that share semantic content. If a resolution pattern has just emerged that should propagate to similar questions, flag it.
 
 7. **Missing principle-edges (instantiates/serves).** No server-side pattern — compose inline using read-only MCP tools.
 
    **Why this matters:** Nodes that realize a goal or cornerstone but have no `instantiates` or `serves` edge to it are invisible to the principle-coverage surface. The zero-incoming-citations gap (a goal heavily recalled yet with no wired realizations — the incident that motivated this category) means goals and cornerstones with no wired realizations look orphaned even when work-products and achievements exist that should connect to them. These wired edges are exactly the concrete trigger surface that `principle_triggers.json` (issue #931) matches on — unrecorded edges produce missed triggers.
 
    **Candidate set (scope-bounded; NOT O(N×M)):**
-   - **Fresh cohort**: nodes created since the last sleep (use `engram_list` with `filters_json` carrying a `created_at >= <prev-sleep-timestamp>` condition (there is no `since=` shorthand parameter)).
+   - **Fresh-since-last-run cohort**: nodes created since THIS CATEGORY's own previous run — NOT since last sleep. Under the weight-aging dream lottery (`dream_lottery.py`, issue #1901), Category 7 does not run every night, so "since last sleep" would silently narrow to almost nothing (or, worse, skip nodes entirely) if this fairy last ran a week ago and "last sleep" only means "yesterday." The parent injects the correct watermark into your dispatch prompt as an explicit `window_since` value (`dream_lottery.py`'s `window_params[7]`, the pre-update `last_run_at` for category 7 — `null` if this is category 7's first-ever run, meaning no watermark: scan the full graph, same as any other all-time category). Use `engram_list` with `filters_json` carrying a `created_at >= <window_since>` condition when `window_since` is non-null (there is no `since=` shorthand parameter); when `window_since` is null, do not filter by `created_at` at all — treat this exactly as if it were an all-time category for this scan.
    - **High-recall orphans**: nodes with `recall_count ≥ 3` that have zero outgoing `instantiates` or `serves` edges (check via `engram_inspect`).
    - **Principle set**: current active goals (`gl_*`), cornerstones (from `engram_list_focused()` + `engram_focus_sets()`), axioms (`ax_*`), and definitions (`df_*`).
 
@@ -175,9 +175,13 @@ is zero (the data is already in hand); the dream-cycle turn savings are large.
 ## Why this matters
 
 The dream-master currently re-calls `engram_inspect` on every finding before
-acting.  With snapshots pre-packed in each finding, it reads all 8 fairy reports
-and goes straight to bucketing + execution.  Estimated savings: ~50 turns → ~10
-turns per cycle.
+acting.  With snapshots pre-packed in each finding, it reads however many fairy
+reports this cycle drew (per the weight-aging lottery, #1901 — typically 1,
+occasionally a few more when the cascade interrupt fires) and goes straight to
+bucketing + execution.
+Estimated savings, at the pre-lottery all-9-nightly baseline: ~50 turns → ~10
+turns per cycle — now smaller still on a typical lottery night, since there are
+fewer reports to read in the first place.
 
 ## Snapshot shape (all suggestion types)
 

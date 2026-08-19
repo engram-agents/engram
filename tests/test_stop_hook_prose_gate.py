@@ -21,6 +21,7 @@ path. Invocation pattern mirrors test_stop_hook_maturity_gate.py.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -32,6 +33,23 @@ import pytest
 HOOKS_DIR = Path(__file__).parent.parent / "src" / "engram" / "hooks" / "claude"
 HOOK_PATH = HOOKS_DIR / "engram-stop-hook.py"
 PYTHON = sys.executable
+
+
+def _load_hook_module():
+    """Load engram-stop-hook.py as a fresh in-process module instance.
+
+    ENGRAM_HOME is read at module-import time (module-level constant), so the
+    caller must set it in os.environ (e.g. via monkeypatch.setenv) BEFORE
+    calling this -- mirrors tests/test_stophooklib.py's _load_module()
+    pattern for the sibling _stophooklib module, extended with the env-var
+    timing this module needs.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_engram_stop_hook_test_instance", HOOK_PATH
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 # The minimal CREATE TABLE statement matching the production schema.
 # We only need the columns the maturity gate queries: id, is_current.
@@ -667,3 +685,5 @@ def test_all_garbage_delta_emits(tmp_path):
         "Non-empty all-garbage delta must EMIT the nudge (all-garbage sentinel "
         f"path); stdout={stdout!r}"
     )
+
+

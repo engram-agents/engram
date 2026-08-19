@@ -4,11 +4,11 @@
 # per-instance ExecStartPre drop-ins on the individual instances, NOT here —
 # see deploy/autostart/README.md.
 #
-# Mira runs Codex, not Claude Code, and is deliberately NOT listed below —
-# her boot unit is the separate, UNTESTED mira-codex-session@.service.example
-# variant (codex app-server as a daemon; charge delivered via the app-server
-# API, not an initial-prompt argv). Wire her in only after a supervised
-# trial per that file's own header comment.
+# Mira runs Codex, not Claude Code, and is deliberately NOT listed below
+# pending a supervised trial. When enabled, use the ordinary
+# agent-session@mira.service launcher: agentctl detects the Codex platform,
+# ensures its managed daemon, and replaces that already-named tmux pane with a
+# remote TUI. Do NOT install the retired direct-app-server example.
 #
 # Luria is NOT listed: she is an off-host agent with no Linux user on this
 # machine. Found live at the 2026-07-24 08:15 rehearsal — her instance failed

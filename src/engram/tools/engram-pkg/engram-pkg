@@ -1210,6 +1210,7 @@ def _render_read_pkg_node(pkg_db_path: Path, node_id: str):
     conn.row_factory = sqlite3.Row
     try:
         row = conn.execute("SELECT * FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        # connection constructed locally with row_factory=Row; dict(row) is safe — see #2093
         return dict(row) if row else None
     finally:
         conn.close()

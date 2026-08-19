@@ -72,6 +72,7 @@ _obs_creator wiring (#918 predicted, wave 9 delivers):
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import logging
@@ -158,6 +159,94 @@ def _get_polarity_config() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return defaults
+
+
+def _get_standpoint_config() -> dict:
+    """Get standpoint write-gate config (config.json `standpoint` section).
+
+    Returns dict with key: author_id_hard_gate (bool). Falls back to the
+    default if config absent. Same read-with-fallback shape as
+    _get_polarity_config — read on demand (no caching) so config edits take
+    effect on the next call without a server restart.
+
+    `author_id_hard_gate` defaults to TRUE (#1827 layer 1): the #1348
+    warn-not-reject advisory was measured insufficient at n=4 seats (see the
+    measurements recorded on issue #1827) — the check exists, renders, and
+    the mis-stamps happen anyway. Approved ruling (recorded on #1827): hard
+    gate acceptable, cross-standpoint writes are rare, correctness dominates.
+    Set to false as a migration-era escape hatch to restore the pre-#1827
+    warn-only behavior byte-for-byte.
+    """
+    defaults = {"author_id_hard_gate": True}
+    if core.CONFIG_PATH.exists():
+        try:
+            config = json.loads(core.CONFIG_PATH.read_text())
+            user = config.get("standpoint", {})
+            if isinstance(user, dict):
+                merged = dict(defaults)
+                merged.update(user)
+                return merged
+        except (json.JSONDecodeError, OSError):
+            pass
+    return defaults
+
+
+def _find_person_repair_hint(conn: sqlite3.Connection, offending: str) -> Optional[str]:
+    """Fuzzy-match an offending standpoint_author_id string against current
+    person nodes' name + aliases, for the #1827 reject-message repair hint.
+
+    Reuses the same current-person-node scan _add_observation_impl already
+    runs for its Stage-1 person-mention suggestion (name/aliases from
+    metadata), but compares the WHOLE offending string against each
+    candidate name/alias (difflib.get_close_matches) rather than searching
+    for a name inside a longer claim — offending is a short standpoint-ID
+    string, not a sentence.
+
+    Returns a rendered hint string ("did you mean pn_XXXX (<name>)? Or mint
+    one: engram_add_person.") or None if no person node is current, or no
+    candidate is close enough to be worth suggesting.
+    """
+    try:
+        person_rows = conn.execute(
+            "SELECT id, metadata FROM nodes WHERE type = 'person' AND is_current = 1"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+
+    candidates: dict[str, str] = {}  # name/alias (lowercase) -> person_id
+    display: dict[str, str] = {}  # name/alias (lowercase) -> original-case name for display
+    for prow in person_rows:
+        try:
+            pmeta = json.loads(prow["metadata"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        pname = pmeta.get("name", "")
+        paliases = pmeta.get("aliases", [])
+        vocab = [pname] + (paliases if isinstance(paliases, list) else [])
+        for term in vocab:
+            # Non-string terms (legacy/hand-edited/migration-sourced metadata
+            # can carry ints/None/dicts in aliases) must degrade to the plain
+            # reject message, never crash the gate (PR #1979 review).
+            if not isinstance(term, str) or not term:
+                continue
+            candidates[term.lower()] = prow["id"]
+            display[term.lower()] = pname if isinstance(pname, str) else prow["id"]
+
+    if not candidates:
+        return None
+
+    matches = difflib.get_close_matches(
+        offending.lower(), candidates.keys(), n=1, cutoff=0.6
+    )
+    if not matches:
+        return (
+            "No existing person node's name/aliases resembles this ID. Mint "
+            "one: engram_add_person."
+        )
+    matched_term = matches[0]
+    person_id = candidates[matched_term]
+    person_name = display[matched_term]
+    return f"Did you mean {person_id} ({person_name})? Or mint one: engram_add_person."
 
 
 def _compute_polarity_alerts(
@@ -1105,21 +1194,67 @@ def _add_observation_impl(
             }
         )
 
-    # standpoint_author_id stable-ID check — warn-not-reject (#1348).
-    # A stable ID is either a pn_* node reference or a namespaced string of
-    # the form <prefix>:<value> where prefix matches [a-z][a-z0-9-]*.
-    # Raw display names (e.g. "John Smith", "Lei") fail both patterns; the
-    # independence gate needs same-author → same-string, and display names
-    # are unreliable join keys. The write always proceeds — this is advisory.
+    # standpoint_author_id stable-ID gate (#1827 layer 1 — upgraded from the
+    # #1348 warn-not-reject advisory). Runs HERE, before evidence resolution,
+    # so a reject leaves ZERO rows — the evidence auto-create below commits on
+    # its own connection, and a gate that fired after it persisted an orphan
+    # evidence node on every reject (PR #1979 review blocker). The existence
+    # lookup + repair hint need a DB read; they use a tightly-scoped early
+    # connection rather than the main `conn` (opened later). Two failure modes:
+    #   1. display-name shape (raw strings like "John Smith", "Lei").
+    #   2. dangling pn_* — well-formed pn_\d+ shape that does not resolve to
+    #      an existing, current person node: the same defect wearing a
+    #      valid-looking shape. This check is itself NEW (#1827) — pre-#1827
+    #      code never verified pn_* existence — so it only runs when the hard
+    #      gate is on; the kill-switch warn path stays byte-compatible with
+    #      pre-#1827 (no dangling check, no repair hint).
+    # Namespaced forms (orcid:…, domain:handle, …) pass both checks — they are
+    # deliberately out-of-graph. Absent field: gate no-ops, standpoint stays
+    # optional.
+    _author_id_bad_shape = bool(
+        standpoint_author_id and not _STABLE_ID_RE.match(standpoint_author_id)
+    )
+    _standpoint_cfg = _get_standpoint_config()
+    _hard_gate = _standpoint_cfg.get("author_id_hard_gate", True)
     _author_id_warning: Optional[str] = None
-    if standpoint_author_id:
-        if not _STABLE_ID_RE.match(standpoint_author_id):
+    if not _hard_gate:
+        # Legacy warn-not-reject (#1348), byte-compatible with pre-#1827:
+        # format check only, no dangling-pn lookup, no repair hint.
+        if _author_id_bad_shape:
             _author_id_warning = (
                 f"standpoint_author_id '{standpoint_author_id}' looks like a display name "
                 "rather than a stable ID. Use a pn_* node ID for in-graph entities, or a "
                 "namespaced string (orcid:…, doi-author:…, domain:handle) for external "
                 "authors. See #1348 convention."
             )
+    elif standpoint_author_id:
+        _gate_conn = core._get_db()
+        try:
+            if _author_id_bad_shape:
+                _author_id_msg = (
+                    f"standpoint_author_id '{standpoint_author_id}' looks like a display name "
+                    "rather than a stable ID. Use a pn_* node ID for in-graph entities, or a "
+                    "namespaced string (orcid:…, doi-author:…, domain:handle) for external "
+                    "authors. See #1348 convention."
+                )
+                _repair_hint = _find_person_repair_hint(_gate_conn, standpoint_author_id)
+                if _repair_hint:
+                    _author_id_msg = f"{_author_id_msg} {_repair_hint}"
+                return json.dumps({"error": _author_id_msg})
+            if re.match(r"^pn_\d+$", standpoint_author_id):
+                _pn_row = _gate_conn.execute(
+                    "SELECT id FROM nodes WHERE id = ? AND type = 'person' AND is_current = 1",
+                    (standpoint_author_id,),
+                ).fetchone()
+                if not _pn_row:
+                    return json.dumps({"error": (
+                        f"standpoint_author_id '{standpoint_author_id}' has the pn_* shape but does "
+                        "not resolve to an existing, current person node — a dangling reference. "
+                        "See #1827. No current person node has this ID. Check for a typo, or mint "
+                        "one: engram_add_person."
+                    )})
+        finally:
+            _gate_conn.close()
 
     # fs_class validation (Phase 2): accepted values only, per D1 filing-time contract.
     _VALID_FS_CLASSES = ("re-executable", "frozen")
@@ -1432,6 +1567,22 @@ def _add_observation_impl(
             result["warnings"] = result.get("warnings", []) + [_author_id_warning]
 
         conn.commit()
+
+        # Durability read-back guard (alpha#2074, #1947 incident) — verify the
+        # commit actually landed on THIS connection before reporting
+        # status:created. A fresh-connection read-back would only exercise
+        # the path that already works; see core._verify_durable_write.
+        if not core._verify_durable_write(conn, node_id):
+            return json.dumps({
+                "status": "failed_not_durable",
+                "observation_id": node_id,
+                "error": (
+                    "Write did not verify as durable on read-back after commit — "
+                    "the row is missing or its claim is empty. Do NOT retry "
+                    "automatically; a retry after a partial commit risks a "
+                    "double-write. See alpha#1947, #2074."
+                ),
+            })
 
         # --- Stage 1 auto-suggest: person-mention detection (§4 of person typed schema) ---
         # Scan the new claim text against name + aliases of every current person node.

@@ -508,10 +508,19 @@ def _apply_changeset_reviewed(ctx: dict[str, Any]) -> None:
         commits = _git_log_range(source_dir, deployed_sha, target_sha)
         ctx["_changeset_commits"] = commits
 
-        # Check whether template.CLAUDE.md changed (path from Phase 1 #1093;
+        # Check whether a CLAUDE.md template changed (path from Phase 1 #1093;
         # root compat symlink removed in Phase 4; renamed from CLAUDE.md.template).
+        # The multi-agent template is a per-seat CLAUDE.md carrier too — a gate
+        # watching only the single-agent file is blind to multi-agent rule
+        # changes like #2019 slice B (colleague catch on PR #2117).
         files = _files_in_range(source_dir, deployed_sha, target_sha)
-        ctx["_template_changed"] = "src/engram/templates/template.CLAUDE.md" in files
+        ctx["_template_changed"] = any(
+            t in files
+            for t in (
+                "src/engram/templates/template.CLAUDE.md",
+                "src/engram/templates/template.CLAUDE.multi-agent.md",
+            )
+        )
         ctx["_changed_files"] = files
 
     # Note: we do NOT set ack_changeset here — that requires explicit operator

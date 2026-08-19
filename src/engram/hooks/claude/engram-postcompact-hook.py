@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl
+from _hooklib import atomic_write_json
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -103,8 +104,7 @@ def main() -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        with open(MARKER_PATH, "w") as f:
-            json.dump(marker, f)
+        atomic_write_json(MARKER_PATH, marker)
     except OSError:
         pass
 

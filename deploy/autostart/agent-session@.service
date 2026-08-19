@@ -20,7 +20,7 @@
 #     one implementation, testable independent of systemd.
 
 [Unit]
-Description=Agent Claude Code session (boot-time auto-start) - %i
+Description=Agent platform session (boot-time auto-start) - %i
 After=network-online.target umwelt-world.service
 Wants=network-online.target
 

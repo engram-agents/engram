@@ -21,6 +21,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -31,12 +32,26 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # ---------------------------------------------------------------------------
 
 
-def _load_hook_module():
-    """Import the surface hook as a module despite the hyphenated filename."""
+def _load_hook_module(engram_home: str | None = None):
+    """Import the surface hook as a module despite the hyphenated filename.
+
+    #2086: when `engram_home` is given, ENGRAM_HOME is set in the environment
+    BEFORE exec_module so every import-time-computed path constant (not just
+    the `ENGRAM_HOME` name itself) resolves against it -- see
+    test_surface_ledger_suppression.py's LedgerTestBase for the reference
+    fix. Callers that only exercise format_nudge()'s pure-formatting path
+    without a session_id and without touching config.json may still omit
+    this (existing convention elsewhere in this file), but any test that
+    reads config.json or calls hook.main() must pass it.
+    """
     hook_path = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
     spec = importlib.util.spec_from_file_location("engram_surface_hook", hook_path)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    if engram_home is not None:
+        with mock.patch.dict(os.environ, {"ENGRAM_HOME": engram_home}):
+            spec.loader.exec_module(mod)
+    else:
+        spec.loader.exec_module(mod)
     return mod
 
 
@@ -479,7 +494,21 @@ class TestFormatNudgePackSection(unittest.TestCase):
     """Unit tests for the pack section in format_nudge."""
 
     def setUp(self):
-        self.hook = _load_hook_module()
+        # #2086: format_nudge() is called here without session_id, so it
+        # never touches the surfaced ledger -- but it still reads
+        # config.json (auto_surface / recall_budget tunables) via the
+        # module-global ENGRAM_HOME on every call. Isolate it to a tmp dir
+        # so these tests don't read (and become non-deterministic against)
+        # a real agent's actual config.json.
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="engram_pack_section_test_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.hook = _load_hook_module(self.tmp)
+        # Self-guard (parity with test_engram_surface_hook_critical_warning.py):
+        # the imported module must resolve ENGRAM_HOME to the tmp dir, not a
+        # real agent home — fail loudly here rather than nondeterministically later.
+        assert self.hook.ENGRAM_HOME == self.tmp, self.hook.ENGRAM_HOME
 
     def _base_result(self) -> dict:
         """Minimal own-graph result dict with one match (so total != 0)."""
@@ -942,7 +971,19 @@ class TestZeroPacksGoldenInvariant(unittest.TestCase):
     """
 
     def setUp(self):
-        self.hook = _load_hook_module()
+        # #2086: same isolation rationale as TestFormatNudgePackSection --
+        # format_nudge() reads config.json via the module-global ENGRAM_HOME
+        # on every call, even with pack_results=None; a byte-identical golden
+        # assertion must not depend on a real agent's actual config.json.
+        import shutil
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="engram_zero_packs_golden_test_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.hook = _load_hook_module(self.tmp)
+        # Self-guard (parity with test_engram_surface_hook_critical_warning.py):
+        # the imported module must resolve ENGRAM_HOME to the tmp dir, not a
+        # real agent home — fail loudly here rather than nondeterministically later.
+        assert self.hook.ENGRAM_HOME == self.tmp, self.hook.ENGRAM_HOME
 
     def test_none_pack_results_byte_identical_to_golden(self):
         """format_nudge with pack_results=None produces byte-identical golden output."""

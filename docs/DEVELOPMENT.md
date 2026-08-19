@@ -168,6 +168,37 @@ Three test surfaces, in order of preference:
    inside Claude Code and `/mcp` to reconnect the engram server so the new
    `server.py` loads. Hooks reload per-fire and don't need a restart.
 
+## Writing JSON state in a hook
+
+(gh#2035 — one atomic-write convention for hook state files.)
+
+> **Writing JSON state in a hook**
+>
+> Hook state files are written **atomically**: build the content in a temp file in the **same directory**, then `os.replace()` it over the destination. Use `_hooklib.atomic_write_json()`; do not hand-roll it.
+>
+> **Why.** Hooks run under a 5s harness timeout and are killed on overrun, so a plain truncate-and-write can leave a partial file. Hooks are also fail-soft by design, so the next run treats a corrupt file as an *absent* one and silently reseeds — the hook keeps running and quietly stops working. There is no error to notice. Atomicity is what makes that failure impossible rather than merely unlikely.
+>
+> **Same directory** matters: `os.replace()` is only atomic within a filesystem.
+>
+> **Mode note.** Because `os.replace()` swaps in the temp file's inode, `atomic_write_json` changes the destination file's mode to `0600` (mkstemp's default) regardless of what mode it had before — this holds for every call site, not only the two excluded below. It is the reason those two exclusions exist, not a coincidental detail about one of them.
+>
+> **Two cases this helper is deliberately WRONG for.** Both exist in this repo, both are correct as they stand, and unifying them would reintroduce a real incident:
+>
+> - **A writer that does not own the file.** `os.replace()` swaps in the temp file's inode, carrying the *writer's* UID and mkstemp's `0600`. `viz_server.py` writes an agent's `config.json` while possibly running as a different UID; renaming there strips the agent's ownership of its own config and locks it out (#372). It copies into the existing inode instead and covers the lost crash-atomicity with backup + read-after-write + rollback.
+> - **A file that must be readable by others.** `mkstemp` creates `0600`. `forum/coordination/store_file.py` chmods `0644` before the rename because the store is read by other agents.
+>
+> If your write matches either shape, do not use this helper — and say why at the call site, as those two do.
+
+`_hooklib.atomic_write_json(path, data, *, indent=None, encoding=None)` lives in
+`src/engram/hooks/claude/_hooklib.py`, alongside the hooks that call it in both
+build topologies (see "Plugin build restructures code paths" in this repo's
+`CLAUDE.md`). It has no `atomic=False` escape hatch — a flag would let a call
+site opt out silently, reintroducing the exact per-site inconsistency this
+convention exists to fix. Exceptions during the write propagate to the
+caller; each hook's own `except Exception: pass` discipline decides what a
+failed write means for it — a helper that swallowed silently would make a
+*failed* write indistinguishable from a successful one.
+
 ## PR merge style
 
 **Squash-merge into dev.** This collapses your feature branch's commits
