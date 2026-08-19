@@ -137,6 +137,69 @@ def test_get_agent_name_none_config_loads_via_engram_home(tmp_path, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
+# get_comms_surface() (alpha#2019 slice A)
+# ---------------------------------------------------------------------------
+
+
+def test_get_comms_surface_umwelt_value():
+    mod = _load_module()
+    result = mod.get_comms_surface({"comms_surface": "umwelt"})
+    assert result == "umwelt"
+
+
+def test_get_comms_surface_forum_value_explicit():
+    mod = _load_module()
+    result = mod.get_comms_surface({"comms_surface": "forum"})
+    assert result == "forum"
+
+
+def test_get_comms_surface_absent_key_defaults_forum_no_warning(capsys):
+    mod = _load_module()
+    result = mod.get_comms_surface({})
+    captured = capsys.readouterr()
+    assert result == "forum"
+    assert captured.err == "", (
+        "absent key is a TRUE optional (legitimate default) -- must not warn"
+    )
+
+
+def test_get_comms_surface_malformed_value_defaults_forum_with_warning(capsys):
+    mod = _load_module()
+    result = mod.get_comms_surface({"comms_surface": "email"})
+    captured = capsys.readouterr()
+    assert result == "forum"
+    assert "email" in captured.err
+    assert "comms_surface" in captured.err
+
+
+def test_get_comms_surface_unreadable_file_defaults_forum(tmp_path):
+    """A config.json that fails to load at all (here: missing) is
+    indistinguishable from an absent key -- load_config() already swallows
+    the failure into {} per its own documented contract."""
+    mod = _load_module()
+    result = mod.get_comms_surface(None, str(tmp_path / "does-not-exist"))
+    assert result == "forum"
+
+
+def test_get_comms_surface_malformed_json_file_defaults_forum(tmp_path, capsys):
+    (tmp_path / "config.json").write_text("{not valid json")
+    mod = _load_module()
+    result = mod.get_comms_surface(None, str(tmp_path))
+    captured = capsys.readouterr()
+    assert result == "forum"
+    # A whole-file parse failure is folded into the absent-key branch (see
+    # get_comms_surface's docstring) -- no per-value warning fires here.
+    assert captured.err == ""
+
+
+def test_get_comms_surface_none_config_loads_via_engram_home(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps({"comms_surface": "umwelt"}))
+    mod = _load_module()
+    result = mod.get_comms_surface(None, str(tmp_path))
+    assert result == "umwelt"
+
+
+# ---------------------------------------------------------------------------
 # emit_context()
 # ---------------------------------------------------------------------------
 

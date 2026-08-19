@@ -32,6 +32,20 @@ the hook chain if the forum is down).
 Publish state: separate ~/.engram/forum-status-publish.json tracks last-published
 status with its own throttle interval (never shares the 30s-TTL cache).
 
+comms_surface gate (alpha#2019 slice A): config.json["comms_surface"] ("umwelt"
+| "forum", resolved via _prompthooklib.get_comms_surface()) decides which lines
+this hook is allowed to emit. Under "forum" (the default -- absent key), the
+🔔/📢 lines above are unchanged. Under "umwelt", both are suppressed (the
+umwelt plugin's own hooks already surface world state) EXCEPT a single
+compact 📪 advisory line when pending ADDRESSED items (mentions) exist --
+the anti-black-hole clause: a world-preferring seat must never silently miss
+an addressed forum item pre-bridge (umwelt#599 slice 4 will bridge these).
+The guarantee is bounded by cache availability: a first-contact outage with
+no prior cache is still silent, matching the existing forum-mode outage
+contract above -- the advisory's absence is not proof of an empty inbox
+during an outage. Broadcast-only counts (new threads, no mention) are fully
+suppressed under "umwelt".
+
 Silent no-op conditions:
   - forum.url and agent_name not configured.
   - Server unreachable (uses cached data if available, else silent skip).
@@ -39,6 +53,8 @@ Silent no-op conditions:
   - Inbox endpoint absent / error -> no mention line; generic behavior unchanged.
   - Status publish failure (forum-status-publish.json) -> silently swallowed;
     existing output unaffected.
+  - comms_surface=umwelt with no pending addressed items -> fully silent
+    (broadcast-only new-thread counts are not surfaced under umwelt).
 
 Design doc: forum/spec.md
 """
@@ -147,6 +163,7 @@ try:
     from _prompthooklib import (
         load_config as _load_config_impl,
         get_agent_name as _get_agent_name_impl,
+        get_comms_surface as _get_comms_surface_impl,
         bootstrap_tools_dir as _bootstrap_tools_dir,
     )
     _PROMPTHOOKLIB_OK = True
@@ -205,6 +222,15 @@ def _load_config() -> dict:
 def _get_agent_name(config: dict) -> str:
     """Resolve agent name from config. Returns '' if not set."""
     return _get_agent_name_impl(config, ENGRAM_HOME)
+
+
+def _get_comms_surface(config: dict) -> str:
+    """Resolve this agent's comms surface ('umwelt' or 'forum') from config.
+
+    See _prompthooklib.get_comms_surface() for the full semantics
+    (alpha#2019 slice A).
+    """
+    return _get_comms_surface_impl(config, ENGRAM_HOME)
 
 
 def _get_forum_url(config: dict) -> str:
@@ -543,6 +569,29 @@ def _format_mention_line(mentions: list) -> Optional[str]:
     )
 
 
+def _format_umwelt_advisory_line(mentions: list) -> Optional[str]:
+    """Format the 📪 comms_surface=umwelt anti-black-hole advisory line.
+
+    alpha#2019 slice A: under comms_surface=umwelt, the ordinary 🔔/📢
+    hook-surface lines are suppressed (the umwelt plugin's own hooks
+    already surface world state). But an ADDRESSED forum item (an
+    at_mention -- a broadcast-only new-thread has no addressee) must never
+    silently vanish pre-bridge (umwelt#599 slice 4), so this single
+    compact line fires whenever pending addressed items exist. Returns
+    None when there are none (broadcast-only counts are fully suppressed
+    under umwelt -- no line at all in that case).
+    """
+    if not mentions:
+        return None
+    total = len(mentions)
+    noun = "item" if total == 1 else "items"
+    return (
+        f"\U0001f4ea comms_surface=umwelt: {total} addressed forum {noun} exist; "
+        f"the mention bridge is not yet live — `forum read <id>` to collect "
+        f"(alpha#2019/umwelt#599 slice 4 will bridge these)."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -565,6 +614,7 @@ def main() -> None:
 
     agent_name = _get_agent_name(config)
     forum_url = _get_forum_url(config)
+    comms_surface = _get_comms_surface(config)
 
     # ── Read surfaced cursor ──────────────────────────────────────────────────
     surfaced_cursor = _read_cursor(SURFACED_CURSOR_PATH)
@@ -681,29 +731,42 @@ def main() -> None:
         # thread/mention output is unaffected.
         pass
 
-    # ── Exit silently if nothing to report ────────────────────────────────────
-    if not threads and not mention_line:
-        sys.exit(0)
+    # ── comms_surface gate (alpha#2019 slice A) ───────────────────────────────
+    # Under "umwelt", the ordinary 🔔/📢 lines are suppressed (the umwelt
+    # plugin's own hooks already surface world state) EXCEPT a single
+    # compact advisory when pending ADDRESSED items (mentions) exist -- the
+    # anti-black-hole clause: a world-preferring seat must never silently
+    # miss an addressed forum item pre-bridge. Broadcast-only counts (new
+    # threads, no mention) are fully suppressed under umwelt.
+    if comms_surface == "umwelt":
+        advisory_line = _format_umwelt_advisory_line(mentions or [])
+        if advisory_line is None:
+            sys.exit(0)
+        lines = [advisory_line]
+    else:
+        # ── Exit silently if nothing to report ──────────────────────────────
+        if not threads and not mention_line:
+            sys.exit(0)
 
-    # ── Count new threads since the surfaced cursor ───────────────────────────
-    new_count = len(threads) if threads else 0
+        # ── Count new threads since the surfaced cursor ─────────────────────
+        new_count = len(threads) if threads else 0
 
-    lines = []
+        lines = []
 
-    # 🔔 mention line first (if any)
-    if mention_line:
-        lines.append(mention_line)
+        # 🔔 mention line first (if any)
+        if mention_line:
+            lines.append(mention_line)
 
-    # 📢 generic threads line (if any)
-    if new_count > 0:
-        post_word = "post" if new_count == 1 else "posts"
-        lines.append(
-            f"\U0001f4e2 {new_count} new forum {post_word} since last read"
-            f" — run `forum read <id>` or `forum status` to catch up."
-        )
+        # 📢 generic threads line (if any)
+        if new_count > 0:
+            post_word = "post" if new_count == 1 else "posts"
+            lines.append(
+                f"\U0001f4e2 {new_count} new forum {post_word} since last read"
+                f" — run `forum read <id>` or `forum status` to catch up."
+            )
 
-    if not lines:
-        sys.exit(0)
+        if not lines:
+            sys.exit(0)
 
     context = "\n".join(lines)
 

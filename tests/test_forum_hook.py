@@ -947,6 +947,170 @@ def test_same_second_post_not_excluded_by_cursor(
 
 
 # ---------------------------------------------------------------------------
+# E) comms_surface gate (alpha#2019 slice A)
+#
+#   1. forum mode (explicit comms_surface="forum") -> emissions byte-identical
+#      to the absent-key default (both pass through _stub_config unchanged).
+#   2. umwelt mode, mention-pending -> the 📪 advisory line (shape asserted).
+#   3. umwelt mode, broadcast-only (threads present, no mentions) -> no
+#      emission at all (fully suppressed).
+#   4. The advisory names the count and the `forum read <id>` remedy.
+# ---------------------------------------------------------------------------
+
+
+def _stub_config_with_comms_surface(hook, monkeypatch, comms_surface, agent_name="testbot"):
+    cfg = {
+        "agent_name": agent_name,
+        "forum": {"url": "http://localhost:5002"},
+    }
+    if comms_surface is not None:
+        cfg["comms_surface"] = comms_surface
+    monkeypatch.setattr(hook, "_load_config", lambda: cfg)
+
+
+def test_forum_mode_explicit_matches_absent_key_default(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Explicit comms_surface='forum' produces byte-identical output to the
+    absent-key default -- the forum-mode code path must be untouched by the
+    #2019 slice A gate."""
+    mention = _make_inbox_item(tid="21", title="Forum-mode parity", author="luria")
+
+    def _run(comms_surface):
+        hook = _load_hook()
+        _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+        _stub_config_with_comms_surface(hook, monkeypatch, comms_surface)
+        _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+        monkeypatch.setattr(
+            hook, "_fetch_threads",
+            lambda url, since, agent: [{"id": "2", "title": "new thread"}],
+        )
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [mention])
+        return _run_main(hook, capture_output=True)
+
+    output_absent = _run(None)
+    output_explicit_forum = _run("forum")
+
+    assert output_absent.strip(), "Expected non-empty output (absent-key default)"
+    assert output_explicit_forum.strip(), "Expected non-empty output (explicit forum)"
+    data_absent = json.loads(output_absent.strip())
+    data_explicit = json.loads(output_explicit_forum.strip())
+    assert data_absent == data_explicit, (
+        "explicit comms_surface='forum' must be byte-identical to the "
+        "absent-key default"
+    )
+
+
+def test_forum_mode_parity_holds_in_silent_state(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Parity's second state (#2116 review): with nothing to report, explicit
+    comms_surface='forum' and the absent-key default are both silent -- the
+    parity claim covers the empty path empirically, not just by code-reading."""
+    def _run(comms_surface):
+        hook = _load_hook()
+        _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+        _stub_config_with_comms_surface(hook, monkeypatch, comms_surface)
+        _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+        return _run_main(hook, capture_output=True)
+
+    output_absent = _run(None)
+    output_explicit_forum = _run("forum")
+
+    assert output_absent.strip() == "", "absent-key default must be silent with nothing to report"
+    assert output_explicit_forum.strip() == "", "explicit forum must be silent with nothing to report"
+
+
+def test_umwelt_mode_mention_pending_emits_advisory(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Under comms_surface=umwelt, a pending @mention emits the 📪 advisory
+    line instead of the ordinary 🔔/📢 lines."""
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config_with_comms_surface(hook, monkeypatch, "umwelt")
+
+    _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+
+    mention = _make_inbox_item(tid="33", title="World-preferring seat", author="borges")
+
+    monkeypatch.setattr(
+        hook, "_fetch_threads",
+        lambda url, since, agent: [{"id": "9", "title": "some new thread"}],
+    )
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [mention])
+
+    output = _run_main(hook, capture_output=True)
+
+    assert output.strip(), "Expected the umwelt advisory line to fire"
+    data = json.loads(output.strip())
+    ctx = data["hookSpecificOutput"]["additionalContext"]
+
+    # The ordinary 🔔/📢 lines must NOT appear under umwelt.
+    assert "\U0001f514" not in ctx, "🔔 mention line must be suppressed under umwelt"
+    assert "\U0001f4e2" not in ctx, "📢 threads line must be suppressed under umwelt"
+
+    # The 📪 advisory line must appear, naming the count and the remedy.
+    assert "\U0001f4ea" in ctx, "📪 advisory line must appear under umwelt"
+    assert "comms_surface=umwelt" in ctx
+    assert "1 addressed forum item" in ctx, "Advisory must name the pending count"
+    assert "forum read <id>" in ctx, "Advisory must name the `forum read <id>` remedy"
+    assert "not yet live" in ctx
+
+
+def test_umwelt_mode_broadcast_only_no_emission(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """Under comms_surface=umwelt, a broadcast-only new-thread count (no
+    pending mention) produces NO emission at all -- fully suppressed."""
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config_with_comms_surface(hook, monkeypatch, "umwelt")
+
+    _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(
+        hook, "_fetch_threads",
+        lambda url, since, agent: [{"id": "9", "title": "broadcast-only thread"}],
+    )
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+
+    output = _run_main(hook, capture_output=True)
+
+    assert output.strip() == "", (
+        "Broadcast-only counts must be fully suppressed under comms_surface=umwelt"
+    )
+
+
+def test_umwelt_mode_advisory_pluralizes_count(
+    tmp_cursor, tmp_read_cursor, tmp_cache, monkeypatch
+):
+    """The advisory line's count noun pluralizes correctly for N>1."""
+    hook = _load_hook()
+    _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
+    _stub_config_with_comms_surface(hook, monkeypatch, "umwelt")
+
+    _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
+
+    mentions = [
+        _make_inbox_item(tid="1", title="First", author="a"),
+        _make_inbox_item(tid="2", title="Second", author="b"),
+    ]
+
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: mentions)
+
+    output = _run_main(hook, capture_output=True)
+
+    assert output.strip(), "Expected the umwelt advisory line to fire"
+    data = json.loads(output.strip())
+    ctx = data["hookSpecificOutput"]["additionalContext"]
+    assert "2 addressed forum items" in ctx
+
+
+# ---------------------------------------------------------------------------
 # D) Flattened-topology regression (#1540)
 # ---------------------------------------------------------------------------
 
