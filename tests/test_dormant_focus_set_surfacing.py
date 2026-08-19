@@ -28,11 +28,24 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
-def _load_hook_module():
+def _load_hook_module(engram_home: str):
+    """Load the surface hook with ENGRAM_HOME patched BEFORE exec_module.
+
+    The hook's import-time client-locate probe os.path.exists()es
+    <ENGRAM_HOME>/engram_client.py at module scope, so an unpatched load
+    reads the real ~/.engram even when every test later reassigns the
+    module globals (read-only residue found by the #2103 colleague pass —
+    same class as the attached-packs fix in this PR, third instance).
+    """
+    from unittest import mock
     hook_path = PROJECT_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
     spec = importlib.util.spec_from_file_location("engram_surface_hook_dormant_set_test", str(hook_path))
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    with mock.patch.dict(os.environ, {"ENGRAM_HOME": engram_home}):
+        spec.loader.exec_module(mod)
+    # Self-guard: the imported module must resolve ENGRAM_HOME to the tmp
+    # dir, not a real agent home — fail loudly here, not nondeterministically.
+    assert mod.ENGRAM_HOME == engram_home, mod.ENGRAM_HOME
     return mod
 
 
@@ -98,7 +111,7 @@ def _make_focus_sets_db(db_path, sets, active_set_name=None):
 class DormantFocusSetTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="engram_dormant_set_test_")
-        self.hook = self.__class__._hook = _load_hook_module()
+        self.hook = self.__class__._hook = _load_hook_module(self.tmp)
         self.hook.ENGRAM_HOME = self.tmp
         self.hook.KNOWLEDGE_DB_PATH = os.path.join(self.tmp, "knowledge.db")
 
