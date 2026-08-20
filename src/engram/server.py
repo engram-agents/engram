@@ -1735,7 +1735,13 @@ def engram_add_observation(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
-            claim (str, required): The atomic, falsifiable claim this observation supports.
+            claim (str, required): The claim this observation supports. Semantic content
+                (knowledge, premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a compound claim
+                is fine. Exception: a live present-tense assertion embedded in an
+                episode (verdict, status claim, generalization) gets its own atomic
+                node - those are falsified piecewise and supersede is node-grained.
+                Detail + worked examples: the engram-observe skill.
             quote_type (str, required unless session_id is set): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial. When session_id is the source and quote_type is omitted, it defaults to 'personal_communication'.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
@@ -1857,7 +1863,15 @@ def engram_add_observation_batch(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             observations_json (str, required): Stringified JSON array of
                 observation objects. Each observation must have quoted_text,
-                interpretation, claim, quote_type; optional is_predictive,
+                interpretation, claim, quote_type. claim: the claim this
+                observation supports. Semantic content (knowledge,
+                premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a
+                compound claim is fine. Exception: a live present-tense
+                assertion embedded in an episode (verdict, status claim,
+                generalization) gets its own atomic node - those are
+                falsified piecewise and supersede is node-grained. Detail +
+                worked examples: the engram-observe skill. Optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id (see tiered-ID convention in
                 engram_add_observation — pn_* for in-graph entities, namespaced
@@ -3239,7 +3253,13 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            claim (str, required): The hypothesis.
+            claim (str, required): The claim this conjecture proposes. Semantic content
+                (knowledge, premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a compound claim
+                is fine. Exception: a live present-tense assertion embedded in an
+                episode (verdict, status claim, generalization) gets its own atomic
+                node - those are falsified piecewise and supersede is node-grained.
+                Detail + worked examples: the engram-observe skill.
             basis (str, required): Why this conjecture is worth investigating.
             initial_confidence (float, optional): Starting confidence in
                 [0.10, 0.60]. Default per CONJECTURE_CONFIDENCE_DEFAULT (0.40).
@@ -5358,7 +5378,10 @@ def engram_derive(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             claim (str, required): The atomic, falsifiable claim being derived.
             supporting_ids (str, required): Comma-separated claim-bearing node IDs
-                (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN').
+                (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN'). Citing one clause of a
+                compound node? Extract that clause as its own atomic node
+                first (evidence: the compound node), then derive from the
+                extract - premises and cascades are node-grained.
             logical_chain (str, required): Explicit reasoning connecting the cited
                 premises to the conclusion. Show your work.
             reasoning_type (str, optional): The type of logical argument. See
@@ -5467,6 +5490,9 @@ def engram_contradict(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             node_id_a (str, required): ID of the first conflicting node.
             node_id_b (str, required): ID of the second conflicting node.
+                Contesting one clause of a compound node (either side)?
+                Extract that clause as its own atomic node first, then
+                contradict the extract.
             description (str, required): Clear description of the contradiction.
             root_cause (str, optional): Analysis of the root cause.
 

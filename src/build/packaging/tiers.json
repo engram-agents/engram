@@ -528,6 +528,10 @@
       "tier": "essential"
     },
     {
+      "path": "skills/claude/engram-observe",
+      "tier": "essential"
+    },
+    {
       "path": "skills/claude/engram-retract",
       "tier": "essential"
     },
