@@ -24,6 +24,10 @@
       "tier": "essential"
     },
     {
+      "path": "template_component_render.py",
+      "tier": "dev"
+    },
+    {
       "path": "launch-engram-server.sh",
       "tier": "essential"
     },
@@ -665,6 +669,14 @@
     {
       "path": "templates/compact-instructions.md",
       "tier": "essential"
+    },
+    {
+      "path": "templates/components",
+      "tier": "dev"
+    },
+    {
+      "path": "templates/manifests",
+      "tier": "dev"
     },
     {
       "path": "templates/template.AGENTS.md",
