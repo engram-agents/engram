@@ -49,12 +49,16 @@ forum-updates-monitor.sh — watch the LAN coordination feed for new dm + baton 
 Usage: forum-updates-monitor.sh [--purpose <key>] [--kinds dm,baton]
 
   --purpose <key>  Purpose key for this instance (default: "default").
-                   Self-reap by purpose, with one asymmetry (matches
-                   forum-mention-monitor): a NAMED --purpose reaps only
-                   same-named instances, so two different named purposes (e.g. a
-                   smoke test) never cross-kill. The DEFAULT purpose (no
-                   --purpose) reaps ALL instances incl. named ones — it is the
-                   canonical last-arm-wins arm.
+                   Duplicate-instance DETECTION (not reap — see #1933) is
+                   purpose-scoped, with one asymmetry (matches
+                   forum-mention-monitor): a NAMED --purpose only flags
+                   same-named instances as suspects, so two different named
+                   purposes (e.g. a smoke test) never cross-flag. The DEFAULT
+                   purpose (no --purpose) flags ALL instances incl. named
+                   ones. This monitor never kills a suspected duplicate — it
+                   prints a warning naming the pid to stdout (the Monitor
+                   event stream) and lets the agent decide whether to `kill
+                   <pid>` by hand.
   --kinds <csv>    Comma-separated update kinds to watch (default: dm,baton).
 
 Resolves SELF and forum BASE URL from ~/.engram/config.json.
@@ -107,18 +111,98 @@ print(((c.get("forum") or {}).get("url") or os.environ.get("FORUM_URL") or "http
 URL_BASE="$BASE/api/updates?agent=$SELF&kinds=$KINDS"
 
 # ---------------------------------------------------------------------------
-# single-instance: last-arm-wins (purpose-scoped). A persistent Monitor's bash
-# process outlives its arming session; without this a post-compaction re-arm
-# would run ALONGSIDE the orphan and double-deliver every wake. Reap prior
-# instances of THIS monitor owned by THIS uid, excluding our own pid + wrapper.
-# Set $FORUM_UPDATES_NO_REAP to any non-empty value to disable.
+# duplicate-instance detection: WARN, never kill (#1933). A persistent
+# Monitor's bash process outlives its arming session; without SOME check for
+# a still-running prior instance, a post-compaction re-arm would run
+# ALONGSIDE the orphan and double-deliver every wake — that risk is real and
+# still worth flagging. But the old fix (SIGTERM every pgrep -f match)
+# assumed pgrep's unanchored substring match over the WHOLE cmdline could
+# never hit anything except a genuine prior monitor. It can: `agentctl
+# --charge-file` appends the boot charge to claude's own argv, #1865 put this
+# script's path INSIDE that charge text, and claude sits as this monitor's
+# GRANDPARENT — outside the $$/$PPID exemptions below — so every
+# charge-booted session was reaping (killing) itself four days running. A
+# substring match must never be an execution decision (Lei's ruling, #1933):
+# this block now only WARNS on stdout — the Monitor event stream, so the
+# warning reaches the agent as a notification — and leaves every matched
+# process alone. A true duplicate left alive double-delivers every event; the
+# agent inspects the flagged pid and kills it by hand if it really is stale.
+#
+# Detection is two-layered so the warning is worth reading: pgrep -f finds
+# loose CANDIDATES first (same substring pattern as the old reap — cheap, but
+# exactly the over-match above), then each candidate is re-verified against
+# /proc/<pid>/cmdline, requiring argv[0] (leading `-` stripped, since a
+# login-shell invocation like `exec -a "-bash" bash <script>` sets argv[0] to
+# "-bash") to be a bash-family interpreter AND a later argv token to BE the
+# script (exact match, or a ".../<script>" path suffix) — not merely present
+# anywhere in the cmdline. Mirrors umwelt-bell.py's _is_bell_process (umwelt
+# #205 — the same bug class: "matched editors/grep/review-shells/wrappers
+# whose cmdline merely contained the filename"). $$/$PPID exemptions are kept
+# as a cheap second layer on top of the identity check, not the only guard.
+#
+# Verification has THREE outcomes, not two — mirrors umwelt-bell.py's
+# proc_cmdline()'s ok/gone/unknown split, which the very first port of this
+# collapsed into a silent no-match. A process that vanishes mid-read (ENOENT/
+# ESRCH — the file or pid is simply gone) is correctly silent: it lost the
+# race, not a duplicate. But any OTHER read failure (e.g. EACCES — /proc read
+# denied) means verification could NOT be completed, which is a DIFFERENT
+# claim than "verified not a match" and must not be silently folded into it —
+# say so loudly so the agent knows this candidate needs a manual look.
+#
+# Set $FORUM_UPDATES_NO_REAP to any non-empty value to disable (now disables
+# the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
+_check_forum_updates_dup() {
+    # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
+    # argv). Exit codes:
+    #   0 = confirmed duplicate — stdout is the cmdline (argv joined on
+    #       spaces, truncated to ~100 chars — the boot charge alone runs
+    #       ~2.5KB and must not flood the Monitor event stream).
+    #   1 = not a duplicate, including "process gone mid-read" (a race, not
+    #       an error) — silent, nothing on stdout.
+    #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
+    #       denied) — stdout is a short reason string; caller must warn, not
+    #       silently skip.
+    python3 -c '
+import errno, os, sys
+pid, script = sys.argv[1], sys.argv[2]
+try:
+    with open("/proc/" + pid + "/cmdline", "rb") as f:
+        raw = f.read()
+except OSError as e:
+    if e.errno in (errno.ENOENT, errno.ESRCH):
+        sys.exit(1)  # process gone mid-read: not a match, not an error
+    print(str(e) or type(e).__name__)
+    sys.exit(2)  # could not verify — do not silently treat as "not a match"
+argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+if not argv:
+    sys.exit(1)
+interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
+if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
+    sys.exit(1)
+if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
+    sys.exit(1)
+cmd = " ".join(argv)
+print(cmd[:100])
+' "$1" "$2" 2>/dev/null
+}
+
 if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
-    # Asymmetry (matches forum-mention-monitor): the DEFAULT purpose matches the
-    # bare script name → reaps ALL instances incl. named ones (canonical
-    # last-arm-wins). A NAMED purpose matches script + that --purpose only → two
-    # different named purposes never cross-kill, but a default arm still reaps
-    # them. Doc'd in --help.
+    # Asymmetry (matches forum-mention-monitor): the DEFAULT purpose matches
+    # the bare script name → candidates include ALL instances incl. named
+    # ones. A NAMED purpose matches script + that --purpose only → two
+    # different named purposes never cross-flag, but a default arm still
+    # considers them candidates. Doc'd in --help.
+    #
+    # #2029 inventory answers: could this candidate pattern match the
+    # invoking process (a boot charge quoting this script's path, #1933)?
+    # YES, at the pgrep-candidate stage -- mitigated the same way as
+    # forum-mention-monitor.sh: -u "$(id -u)" excludes any co-tenant on a
+    # shared host from ever being a candidate, every candidate is
+    # re-verified against /proc/<pid>/cmdline before being reported
+    # (_check_forum_updates_dup), and the action is warn-not-kill
+    # regardless. See tests/test_pgrep_liveness_reap_patterns.py and
+    # tests/test_forum_monitor_duplicate_warn.py.
     if [ "$PURPOSE" = "default" ]; then
         _pgrep_pattern='forum-updates-monitor\.sh'
     else
@@ -127,7 +211,15 @@ if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
     for _pid in $(pgrep -u "$(id -u)" -f "$_pgrep_pattern" 2>/dev/null); do
         [ "$_pid" = "$$" ] && continue
         [ "$_pid" = "${PPID:-0}" ] && continue
-        kill "$_pid" 2>/dev/null || true
+        _out="$(_check_forum_updates_dup "$_pid" "forum-updates-monitor.sh")"
+        _rc=$?
+        if [ "$_rc" -eq 0 ]; then
+            echo "⚠️  forum-updates-monitor.sh: possible duplicate instance — pid $_pid cmdline: ${_out}"
+            echo "⚠️  forum-updates-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
+        elif [ "$_rc" -eq 2 ]; then
+            echo "⚠️  forum-updates-monitor.sh: could not verify candidate pid $_pid (${_out}) — NOT auto-flagged as a duplicate; check it by hand if you suspect a stale instance."
+        fi
+        # rc == 1: not a match (incl. "process gone mid-read") — silent.
     done
 fi
 

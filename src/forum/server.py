@@ -179,6 +179,23 @@ def _run_search(
     return results, mode_used
 
 
+def _read_project_state(store, pid: str) -> tuple[str, str]:
+    """Return (turn, status) from a project baton immediately after a mutation.
+
+    Reads the baton file via the store and parses its frontmatter. Returns
+    ("", "") if the file is absent (e.g. after merge moves it to archive/).
+    """
+    from forum.coordination.markdown import parse_frontmatter
+    raw = store.read_project(pid)
+    if raw is None:
+        return "", ""
+    fields, _ = parse_frontmatter(raw)
+    return (
+        fields.get("turn", "").strip().lower(),
+        fields.get("status", "").strip().lower(),
+    )
+
+
 def create_app(
     db_path: str,
     audit_path: str,
@@ -1680,7 +1697,7 @@ def create_app(
         """Flip a baton's turn.
 
         JSON body: {agent, to_agent, reason}
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import flip as _flip, ProjectNotFound
 
@@ -1707,14 +1724,15 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/claim", methods=["POST"])
     def api_project_claim(pid: str):
         """Claim a project baton from the pool.
 
         JSON body: {agent, pool_sentinel}
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import claim as _claim, ProjectNotFound
 
@@ -1740,7 +1758,8 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/release", methods=["POST"])
     def api_project_release(pid: str):
@@ -1748,7 +1767,7 @@ def create_app(
 
         JSON body: {agent, pool_sentinel, reason, done?}
         ``done`` (bool, default false) appends "(done)" to the project title.
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import release as _release, ProjectNotFound
 
@@ -1777,7 +1796,8 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/status", methods=["POST"])
     def api_project_status(pid: str):
@@ -1786,7 +1806,7 @@ def create_app(
         JSON body: {agent, new_status, reason}
         Dispatch: if new_status in (planning, in-progress, in-review) → reopen;
                   otherwise → close.
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import close as _close, reopen as _reopen, ProjectNotFound
 
@@ -1818,14 +1838,15 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/rename", methods=["POST"])
     def api_project_rename(pid: str):
         """Rename a project baton's title.
 
         JSON body: {agent, new_title}
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import rename as _rename, ProjectNotFound
 
@@ -1851,14 +1872,15 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/anchor", methods=["POST"])
     def api_project_anchor(pid: str):
         """Set or update the github anchor on a project baton.
 
         JSON body: {agent, github}
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import anchor as _anchor, ProjectNotFound
 
@@ -1884,7 +1906,8 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/participants", methods=["POST"])
     def api_project_add_participant(pid: str):
@@ -1939,7 +1962,7 @@ def create_app(
 
         JSON body: {agent, new_status, reason}
         ``new_status`` must be a closed status (merged or cancelled).
-        Response: {seq}, 201.
+        Response: {seq, turn, status}, 201.
         """
         from forum.coordination import close as _close, ProjectNotFound
 
@@ -1966,7 +1989,8 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        turn, status = _read_project_state(store, pid)
+        return jsonify({"seq": seq, "turn": turn, "status": status}), 201
 
     @app.route("/api/projects/<pid>/merge", methods=["POST"])
     def api_project_merge(pid: str):
@@ -1977,7 +2001,7 @@ def create_app(
 
         JSON body: {agent, forced?}
         ``forced`` (bool, default false) adds "(FORCED past gates 3-4)" to the log.
-        Response: {seq}, 201.
+        Response: {seq, status: "merged"}, 201. (turn omitted — file is in archive/).
         """
         from forum.coordination import merge as _merge, ProjectNotFound
 
@@ -2001,7 +2025,7 @@ def create_app(
         except ProjectNotFound:
             return jsonify({"error": f"project not found: {pid}"}), 404
 
-        return jsonify({"seq": seq}), 201
+        return jsonify({"seq": seq, "status": "merged"}), 201
 
     return app
 

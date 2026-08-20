@@ -9,6 +9,12 @@ description: "Decision rubric for whether to dispatch a reviewer-fairy at each P
 
 **Purpose**: deterministic heuristic for whether to spawn a reviewer-fairy or do the review directly.
 
+## Scope gate — check this BEFORE the heuristic below
+
+This heuristic governs only one decision: **an author's own dispatch choice on their own diff.** It does not transfer to the **colleague seat** in a multi-agent repo's reviewer-fairy → colleague → maintainer pipeline. If the PR under review is a counterpart's (not mine), and I am the colleague/counterpart reviewer, review it directly as the full agent — never dispatch a reviewer-fairy for that seat, regardless of size or test-touch. The colleague layer exists specifically to catch what a single-diff-isolated fairy structurally cannot (the diff's relationship to a moving target branch, cross-PR context, a fresh full-context read) — delegating it to a fairy skips the layer even when the fairy's findings turn out correct. (Caught live on engram-alpha PR-1904, 2026-08-06: a colleague dispatched a reviewer-fairy for their own colleague-review duty on a counterpart's PR, applying the author-side heuristic to the wrong seat.)
+
+So: first ask *whose diff is this, and which seat am I filling* — author or colleague. Only apply the heuristic below when the answer is "author, my own diff."
+
 ## Heuristic
 
 Spawn a reviewer-fairy when ANY of the following conditions hold:

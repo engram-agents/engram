@@ -70,7 +70,6 @@ CODEX_HOME = Path(os.environ["CODEX_HOME"]) if TARGET == "codex" else None
 # resolve DATA_DIR — that's a separate concern from where server.py lives.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
-from template_render import COMPACT_BREADCRUMB_LINE, fold_compact_instructions  # noqa: E402
 
 
 def _add(fn, **kwargs) -> str:
@@ -295,8 +294,10 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     The instructions= body is the full template.CLAUDE.md rendered with
     seed-IDs/ENGRAM_HOME, then adapted for Codex (CLAUDE_PLUGIN_ROOT →
     CODEX_PLUGIN_ROOT; ~/.claude/CLAUDE.md self-refs → ~/.codex/config.toml;
-    output-styles ref → personality/#816) with the ## Compact Instructions
-    section removed (that content lives in codex-compact-prompt.md).
+    output-styles ref → personality/#816). template.CLAUDE.md no longer
+    contains a ## Compact Instructions section (as of engram-alpha#2067),
+    so there is nothing left to remove here; the Codex compact prompt is
+    rendered separately, at step 1 above, from templates/compact-instructions.md.
 
     {{AGENT_NAME}}, {{USER_NAME}}, {{SELF_NODE_ID}}, {{TODAY}} are intentionally
     left for the first-session skill to resolve.
@@ -321,13 +322,20 @@ def _render_codex_target(substitutions: dict[str, str]) -> None:
     claude_template_path = TEMPLATES_DIR / "template.CLAUDE.md"
     raw = claude_template_path.read_text()
 
-    # Apply all substitutions (this folds {{COMPACT_INSTRUCTIONS}} back in,
-    # giving us the full rendered text before we strip the compact section)
+    # Apply all substitutions. template.CLAUDE.md no longer contains
+    # {{COMPACT_INSTRUCTIONS}} (as of engram-alpha#2067), so this loop no
+    # longer folds the compact instructions back in — the compact prompt was
+    # already rendered separately in step 1 above.
     rendered = raw
     for placeholder, value in substitutions.items():
         rendered = rendered.replace(placeholder, value)
 
-    # Remove the ## Compact Instructions section (lives in the separate file)
+    # Strip a ## Compact Instructions section if present. This is currently
+    # a no-op — the template no longer carries that section (engram-alpha#2067)
+    # — retained deliberately as a guard: docs/compaction-continuity.md
+    # anticipates the section being re-added to template.CLAUDE.md later, and
+    # if that happens this call makes the Codex path strip it automatically
+    # rather than relying on someone remembering to re-add the strip.
     rendered = _remove_compact_section(rendered)
 
     # Codex-specific textual adaptations
@@ -582,9 +590,11 @@ def main() -> None:
     substitutions["{{ENGRAM_HOME}}"] = str(ENGRAM_HOME)
     substitutions["{{PYTHON}}"] = os.environ.get("PYTHON_BIN", "python3")
 
-    # Load compact-instructions.md into substitutions so the Claude target
-    # can fold it back in (lossless) and the codex target can write it as a
-    # separate file.
+    # Load compact-instructions.md into substitutions. The CODEX target writes
+    # it as a separate file (codex-compact-prompt.md) and wires it into
+    # config.toml. The CLAUDE target no longer uses this key at all (#2067
+    # removed the ## Compact Instructions section from template.CLAUDE.md); it
+    # stays loaded here because both targets share this substitutions dict.
     compact_instructions_path = TEMPLATES_DIR / "compact-instructions.md"
     if compact_instructions_path.exists():
         substitutions["{{COMPACT_INSTRUCTIONS}}"] = (
@@ -599,17 +609,6 @@ def main() -> None:
             f"left unresolved",
             flush=True,
         )
-
-    # Strip the source-of-truth breadcrumb that sits above the marker in
-    # template.CLAUDE.md. It's a guide for whoever edits the template (the real
-    # Compact Instructions live in compact-instructions.md), not for the rendered
-    # install — so it must not leak into the agent's ~/.claude/CLAUDE.md or the
-    # Codex prompt. The codex target iterates substitutions and .replace(), so
-    # one empty-value entry removes the whole comment line there. The Claude
-    # target handles the breadcrumb via fold_compact_instructions() (see below).
-    # COMPACT_BREADCRUMB_LINE is the canonical string from template_render.py
-    # (SSoT); tests/test_bootstrap_codex.py asserts it matches the template.
-    substitutions[COMPACT_BREADCRUMB_LINE] = ""
 
     manifest = {
         "seed_ids": ids,
@@ -641,26 +640,15 @@ def main() -> None:
 
     # Target-specific identity doc + hook config
     if TARGET == "claude":
-        # Use the SSoT fold function for the compact-instructions fold (#1193) so
-        # bootstrap stays wired to template_render.fold_compact_instructions() and
-        # cannot diverge from the canonical fold logic via inline substitution drift.
-        _template_text = (TEMPLATES_DIR / "template.CLAUDE.md").read_text()
-        _compact_text = substitutions.get("{{COMPACT_INSTRUCTIONS}}")
-        if _compact_text is not None:
-            _claude_text = fold_compact_instructions(_template_text, _compact_text)
-        else:
-            # Compact file absent (fallback from above): strip breadcrumb only,
-            # leave {{COMPACT_INSTRUCTIONS}} unresolved so the gap is visible.
-            _claude_text = _template_text.replace(COMPACT_BREADCRUMB_LINE, "")
-        # Apply remaining (non-compact) substitutions. Exclude the two compact-fold
-        # keys — both are already handled above (by fold_compact_instructions or the
-        # fallback .replace call); re-applying them would be a harmless no-op but
-        # exclusion makes the intent explicit.
-        for _ph, _val in substitutions.items():
-            if _ph not in (COMPACT_BREADCRUMB_LINE, "{{COMPACT_INSTRUCTIONS}}"):
-                _claude_text = _claude_text.replace(_ph, _val)
-        CLAUDE_HOME.mkdir(parents=True, exist_ok=True)
-        (CLAUDE_HOME / "CLAUDE.md").write_text(_claude_text)
+        # #2067: the Claude template no longer folds in compact-instructions.md
+        # (removed the ## Compact Instructions section entirely — see
+        # docs/compaction-continuity.md). A plain single-file substitution is
+        # the whole render now (substitute_template() creates CLAUDE_HOME).
+        substitute_template(
+            TEMPLATES_DIR / "template.CLAUDE.md",
+            CLAUDE_HOME / "CLAUDE.md",
+            substitutions,
+        )
         print(f"  CLAUDE.md → {CLAUDE_HOME}/CLAUDE.md", flush=True)
 
         _set_cleanup_period_days(CLAUDE_HOME)

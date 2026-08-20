@@ -161,6 +161,7 @@ ENGRAM_HOME = (
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -571,11 +572,17 @@ def main() -> None:
     except Exception:
         pass
 
-    # Maturity-gate check (issue #845): cheaper than the delta-scan and checked
-    # first. A mature graph means the write-discipline fires from identity, not
-    # from this tripwire — suppress silently. Do NOT touch the state file on
-    # this path; the gate is stateless so crossing back under threshold (e.g.
-    # restore from backup) leaves the idle machinery undisturbed.
+    # Maturity-gate check (issue #845). engram-alpha#2026 WS4 had briefly
+    # bypassed this for an in-window near-compaction escalation; that
+    # escalation is retired (2026-08-16, see the maintainer's ruling in the
+    # module docstring history / commit message), so this is restored to its
+    # pre-WS4 form: an unconditional early return, no window carve-out.
+    # _maturity_muted() itself never raises (its own fail direction is baked
+    # in: any DB error returns False = not muted), so this call cannot throw
+    # and there is nothing further to guard here. Do NOT touch the #840 state
+    # file on the early-return path; the gate is stateless so crossing back
+    # under threshold (e.g. restore from backup) leaves the idle machinery
+    # undisturbed.
     if _maturity_muted():
         # Empty stdout is the canonical no-op per #824/#832 contract.
         return

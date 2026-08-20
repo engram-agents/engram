@@ -110,6 +110,11 @@ def _atomic_write(path: Path, content: str) -> None:
     The tempfile is created in the SAME directory so ``os.replace`` is a true
     rename (atomic on POSIX), never a cross-device copy. On any failure the
     tempfile is removed so a crash mid-write never leaves a partial sibling.
+
+    Deliberately NOT converted to the shared hooks/claude/_hooklib.py
+    atomic_write_json() helper introduced by gh#2035: this store is read by
+    OTHER agents, so the file must stay world-readable (0644) after rename,
+    not mkstemp's default 0600 -- see the os.chmod call below.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(

@@ -11,6 +11,16 @@ If not found, reports why (file empty, phrase absent, possible encoding issues).
 For JSONL session transcripts, user messages are JSON-encoded — this script
 searches the raw file content including JSON escaping, so straight quotes
 and escaped characters will match naturally.
+
+Exit codes:
+    0 — quote FOUND (verbatim substring match).
+    1 — quote NOT FOUND (including an empty/unflushed file) — the check ran,
+        the quote is absent.
+    2 — could not check at all (bad usage, file does not exist).
+
+Callers relying on the shell idiom `verify_quote.py f q && next_step` can
+trust exit 0 as "verified"; any nonzero exit means do not proceed as if
+verified.
 """
 import sys
 import os
@@ -19,14 +29,14 @@ def main():
     if len(sys.argv) < 3:
         print("Usage: verify_quote.py <file_path> <search_phrase>")
         print("Example: verify_quote.py ~/.claude/projects/.../session.jsonl 'lost of identity'")
-        sys.exit(1)
+        sys.exit(2)
 
     file_path = os.path.expanduser(sys.argv[1])
     search = sys.argv[2]
 
     if not os.path.exists(file_path):
         print(f"FILE NOT FOUND: {file_path}")
-        sys.exit(1)
+        sys.exit(2)
 
     with open(file_path, encoding="utf-8", errors="replace") as f:
         content = f.read()
@@ -47,6 +57,7 @@ def main():
         print(context)
         print(f"---")
         print(f"\nTip: Copy the exact text between the quotes for quoted_text.")
+        sys.exit(0)
     else:
         # Check file stats to help diagnose
         lines = content.strip().split('\n')
@@ -71,6 +82,8 @@ def main():
                 # Show last bit of file for orientation
                 print(f"\n  Last 200 chars of file:")
                 print(f"  {repr(content[-200:])}")
+
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

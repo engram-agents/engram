@@ -55,8 +55,21 @@ _PR_ANCHOR_RE = re.compile(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", re.IGNORECASE
 # Read from $ENGRAM_DEFAULT_GITHUB_REPO, NOT hardcoded as a private-repo
 # literal -- this source tree is scanned pre-release (tools/scan-leaks.py)
 # for exactly this shape of leak (a private dev-repo name baked into shipped
-# code). Must resolve to the SAME value as tools/baton.py's own default (see
-# that module's docstring) -- both processes reconcile the same anchors.
+# code).
+#
+# #1918 update: this constant no longer has a counterpart in tools/baton.py
+# -- that module removed its own default entirely (an unqualified pr/<N>
+# anchor there now refuses/skips rather than resolving a guessed repo; see
+# baton.py's own comment for why). This module's default is intentionally
+# left as-is here: board_projects.py is read-only/display-only (it renders
+# a computed status, never writes one back -- see umwelt's
+# src/umwelt/gh_reconcile.py docstring, which already supersedes this
+# module for write-back reconciliation), so the DEFAULT_GITHUB_REPO's
+# stakes here are lower than baton.py's -- baton.py's own gc/merge can
+# take a real, sometimes irreversible action on the resolved repo, this
+# module cannot. Porting the same refuse-and-count fix here is real
+# follow-up work, deliberately left as a sibling change (see #1918) rather
+# than folded into that fix to keep the diff reviewable.
 DEFAULT_GITHUB_REPO = os.environ.get("ENGRAM_DEFAULT_GITHUB_REPO", "engram-agents/engram")
 
 

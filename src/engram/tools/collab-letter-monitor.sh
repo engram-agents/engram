@@ -98,35 +98,123 @@ SELF="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.e
 [ -z "$SELF" ] && { echo "collab-letter-monitor: agent_name not set in ~/.engram/config.json — refusing to arm" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# single-instance: last-arm-wins. A persistent Monitor's bash process outlives
-# its arming session — it survives compaction and session-end. Without this, a
-# fresh arm after a compaction runs ALONGSIDE the surviving orphan and BOTH poll
-# the same dir, so every new letter fires the wake TWICE (double-delivery
-# incident, 2026-06-13). Reap any prior instance of THIS monitor owned by THIS
-# user, so the fresh arm cleanly takes over (and is the one that delivers to the
-# current session). Scoped to our own uid (never touches another agent's
-# monitor) and excludes our own pid and launching wrapper. NOTE: pgrep -f is a
-# substring match, so a process merely *mentioning* this script name (e.g. an
-# editor with the file open in a dev shell) could also match — harmless in
-# production (agents don't edit a running monitor; SIGTERM + reseed-on-restart
-# is recoverable). Set $COLLAB_MONITOR_NO_REAP to any non-empty value to disable.
+# duplicate-instance detection: WARN, never kill (#1933, ported to this
+# script by #1935). A persistent Monitor's bash process outlives its arming
+# session — it survives compaction and session-end. Without SOME check for a
+# still-running prior instance, a fresh arm after a compaction runs ALONGSIDE
+# the surviving orphan and BOTH poll the same dir, so every new letter fires
+# the wake TWICE (double-delivery incident, 2026-06-13). But the old fix here
+# (SIGTERM every pgrep -f match) assumed pgrep's unanchored substring match
+# over the WHOLE cmdline could only ever hit a genuine prior monitor. It
+# cannot be trusted that way: `agentctl --charge-file` appends the boot
+# charge to claude's own argv, and if a charge ever quotes this script's
+# launch line, claude sits as this monitor's GRANDPARENT — outside the
+# $$/$PPID exemptions below — so a charge-booted session would reap (kill)
+# itself (#1933's exact mechanism, applied here per #1935's finding). The old
+# comment here called the substring-match risk "harmless in production" (an
+# editor merely mentioning the filename) — #1933 is the counterexample: a
+# substring match must never be an execution decision (Lei's ruling). This
+# block now only WARNS on stdout — the Monitor event stream, so the warning
+# reaches the agent as a notification — and leaves every matched process
+# alone. A true duplicate left alive double-delivers every event; the agent
+# inspects the flagged pid and kills it by hand if it really is stale.
+#
+# Detection is two-layered so the warning is worth reading: pgrep -f finds
+# loose CANDIDATES first (an anchored process-name pattern — see below —
+# cheap, and already excludes the self-quoting-charge-text decoy at this
+# layer, unlike the forum monitors' looser candidate pattern), then each
+# candidate is re-verified against /proc/<pid>/cmdline, requiring argv[0]
+# (leading `-` stripped, since a login-shell invocation like `exec -a "-bash"
+# bash <script>` sets argv[0] to "-bash") to be a bash-family interpreter AND
+# a later argv token to BE the script (exact match, or a ".../<script>" path
+# suffix) — not merely present anywhere in the cmdline. Mirrors
+# umwelt-bell.py's _is_bell_process (umwelt #205) and forum-mention-monitor.sh
+# / forum-updates-monitor.sh's _check_*_dup (#1933).
+#
+# Verification has THREE outcomes, not two — mirrors the forum monitors'
+# ok/gone/unknown split. A process that vanishes mid-read (ENOENT/ESRCH — the
+# file or pid is simply gone) is correctly silent: it lost the race, not a
+# duplicate. But any OTHER read failure (e.g. EACCES — /proc read denied)
+# means verification could NOT be completed, which is a DIFFERENT claim than
+# "verified not a match" and must not be silently folded into it — say so
+# loudly so the agent knows this candidate needs a manual look.
+#
+# The candidate pattern itself is ALSO anchored on the process name
+# (`^(\S*/)?bash\s+...`, mirroring deploy/autostart/boot-charge-*.md's
+# #2028 monitor-verify fix) rather than the forum monitors' bare unanchored
+# script-name substring — belt-and-suspenders on top of the /proc layer:
+# even the loose candidate stage cannot mistake a charge-text decoy (whose
+# cmdline does not itself START with a bash-family interpreter) for a
+# genuine instance.
+#
+# Set $COLLAB_MONITOR_NO_REAP to any non-empty value to disable (now disables
+# the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
+_check_collab_letter_dup() {
+    # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
+    # argv). Exit codes:
+    #   0 = confirmed duplicate — stdout is the cmdline (argv joined on
+    #       spaces, truncated to ~100 chars — the boot charge alone runs
+    #       ~2.5KB and must not flood the Monitor event stream).
+    #   1 = not a duplicate, including "process gone mid-read" (a race, not
+    #       an error) — silent, nothing on stdout.
+    #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
+    #       denied) — stdout is a short reason string; caller must warn, not
+    #       silently skip.
+    python3 -c '
+import errno, os, sys
+pid, script = sys.argv[1], sys.argv[2]
+try:
+    with open("/proc/" + pid + "/cmdline", "rb") as f:
+        raw = f.read()
+except OSError as e:
+    if e.errno in (errno.ENOENT, errno.ESRCH):
+        sys.exit(1)  # process gone mid-read: not a match, not an error
+    print(str(e) or type(e).__name__)
+    sys.exit(2)  # could not verify — do not silently treat as "not a match"
+argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+if not argv:
+    sys.exit(1)
+interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
+if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
+    sys.exit(1)
+if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
+    sys.exit(1)
+cmd = " ".join(argv)
+print(cmd[:100])
+' "$1" "$2" 2>/dev/null
+}
+
 if [ -z "${COLLAB_MONITOR_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
-    # Purpose-scoped reap: only kill prior instances running with the SAME
-    # --purpose key. For the "default" purpose (no --purpose arg passed), match
-    # by script name only — identical to the pre-#1183 behaviour, ensuring
-    # last-arm-wins for default instances. For an explicit non-default purpose
-    # key, match by script name AND purpose so default instances (and instances
-    # of a different non-default purpose) are never cross-killed (#1183).
+    # Purpose-scoped detection: only flag prior instances running with the
+    # SAME --purpose key as suspects. For the "default" purpose (no --purpose
+    # arg passed), match by process-name + script name only — identical
+    # candidate SET semantics to the pre-#1183 behaviour (still scoped to
+    # default instances only). For an explicit non-default purpose key, match
+    # by process-name + script name AND purpose so default instances (and
+    # instances of a different non-default purpose) are never cross-flagged
+    # (#1183). See tests/test_pgrep_liveness_reap_patterns.py for the
+    # synthetic-table proof that this candidate pattern excludes the
+    # self-quoting decoy, and tests/test_forum_monitor_duplicate_warn.py for
+    # the end-to-end proof of the equivalent pattern on the sibling forum
+    # monitors.
     if [ "$PURPOSE" = "default" ]; then
-        _pgrep_pattern='collab-letter-monitor\.sh'
+        _pgrep_pattern='^(\S*/)?-?(bash|sh|dash|ksh|zsh|ash)\s+\S*collab-letter-monitor\.sh'
     else
-        _pgrep_pattern="collab-letter-monitor\.sh.*--purpose ${PURPOSE}"
+        _pgrep_pattern="^(\S*/)?-?(bash|sh|dash|ksh|zsh|ash)\s+\S*collab-letter-monitor\.sh.*--purpose ${PURPOSE}"
     fi
     for _pid in $(pgrep -u "$(id -u)" -f "$_pgrep_pattern" 2>/dev/null); do
         [ "$_pid" = "$$" ] && continue
         [ "$_pid" = "${PPID:-0}" ] && continue
-        kill "$_pid" 2>/dev/null || true
+        _out="$(_check_collab_letter_dup "$_pid" "collab-letter-monitor.sh")"
+        _rc=$?
+        if [ "$_rc" -eq 0 ]; then
+            echo "⚠️  collab-letter-monitor.sh: possible duplicate instance — pid $_pid cmdline: ${_out}"
+            echo "⚠️  collab-letter-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
+        elif [ "$_rc" -eq 2 ]; then
+            echo "⚠️  collab-letter-monitor.sh: could not verify candidate pid $_pid (${_out}) — NOT auto-flagged as a duplicate; check it by hand if you suspect a stale instance."
+        fi
+        # rc == 1: not a match (incl. "process gone mid-read") — silent.
     done
 fi
 

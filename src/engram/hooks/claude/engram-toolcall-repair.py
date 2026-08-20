@@ -48,6 +48,11 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import atomic_write_json
+
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or str(Path.home() / ".engram")
@@ -345,8 +350,7 @@ def write_marker(tool_name: str, repairs: list[str]) -> None:
         "repairs": repairs,
         "timestamp": datetime.now().isoformat(),
     }
-    with open(REPAIR_MARKER, "w") as f:
-        json.dump(marker, f)
+    atomic_write_json(REPAIR_MARKER, marker)
 
 
 def format_additional_context(tool_name: str, repairs: list[str]) -> str:

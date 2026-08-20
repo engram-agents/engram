@@ -3,8 +3,9 @@ name: engram-loop
 description: >
   Generic self-paced loop convention and the SINGLE SOURCE OF TRUTH for loop
   formality — the ~/.engram/loop-mode.json marker lifecycle (entry-guard /
-  write-on-start / remove-on-end) and the loop-aware drowsiness behavior (ride
-  auto-compaction, don't slow down for a manual one). Use this for a
+  write-on-start / remove-on-end) and the loop-aware drowsiness behavior
+  (capture what the summary won't carry, then ride auto-compaction — don't
+  slow down for a manual one). Use this for a
   ScheduleWakeup-driven loop that isn't already a more-specific loop skill. The
   specialized loops (engram-curiosity-loop, engram-meta-loop, engram-deep-research,
   engram-school-day) are KINDS of this — they reference this skill for the
@@ -19,8 +20,9 @@ load-bearing convention is a single marker file: **`~/.engram/loop-mode.json`**.
 
 Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
-("nap once to stage the window, then keep working and ride auto-compaction —
-don't slow down for a manual compaction"). No marker → the hook serves the
+("compaction is near and the summary will not carry your work across it —
+capture the LAST burst (history arc + nodes), nap to checkpoint, then keep
+working and ride auto-compaction"). No marker → the hook serves the
 non-loop "stop and nap" path, and the loop wastes a whole session napping
 against compaction it should be riding through (the gap that motivated #483 —
 a `ScheduleWakeup` work-loop that never wrote the marker (the loop-without-marker silent-skip failure mode)).
@@ -150,7 +152,7 @@ pending-work — not just an "I'm looping" flag:
 ```bash
 cat > ~/.engram/loop-mode.json <<JSON
 {
-  "FIRST_ACTION": "RE-ARM THE NEXT WAKEUP NOW — before reading anything else in this file, before any work, before any tool call. (1) CronList: if a pending wake already exists, do NOT re-arm. (2) If none: ScheduleWakeup at cadence_seconds, and for the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. (3) CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue. Only then continue.",
+  "FIRST_ACTION": "THE RE-ARM NOW HAPPENS LAST, NOT FIRST — see Step 2 item 3 (arm-last ritual; if the turn carries a reply the human must see, item 3's reply-carrying split applies: batch the arm with a sibling tool call in one parallel block, reply as the turn's final text, #2098). Do the iteration's actual work first, using this marker's 'state' + 'instructions' fields. At the END of the turn — the FINAL action, after the work is done AND this marker's 'state' field is rewritten to reflect it: ScheduleWakeup at cadence_seconds, unconditionally (no CronList-before-arm check — replacement is unconditional, so a redundant arm is free, never stacks). For the prompt COPY THIS FILE'S OWN loop_prompt FIELD VERBATIM — copy-paste it; never hand-type or paraphrase it, and note that the word 'stub' invites paraphrasing, so don't. Then CronList again and confirm the armed prompt actually LEADS with the <loop-wake> marker — an ABSENT marker, or one that is present but not leading, makes the wake self-stamp as user activity and the loop defers perpetually. An escaped &lt;loop-wake&gt; is fine: the classifiers HTML-unescape before matching, so a mangled marker still classifies correctly; absence and position are what they cannot rescue.",
   "activated": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "kind": "work|research|autonomous|heartbeat",
   "topic": "<one-line loop topic>",
@@ -163,23 +165,27 @@ cat > ~/.engram/loop-mode.json <<JSON
 JSON
 ```
 
-- `FIRST_ACTION` — the arm-first instruction, kept as field #1 deliberately.
-  **This is the BACKSTOP; the wake prompt (Step 2 §2) is the primary channel** —
-  the marker gets rewritten wholesale each iteration, so an invariant living
-  here can be silently lost, whereas the prompt cannot. Keep both: they fail
-  differently (a hand-armed wake missing the stub is caught by this field; a
-  first arm that omitted the line propagates through every later arm and is
-  caught only here). Never reorder it below `state` — a reader who reaches
-  `state` first starts working, and the arm degrades into something to
-  remember. The text is fixed; copy it verbatim.
+- `FIRST_ACTION` — kept as field #1 deliberately so it's the first thing a
+  reader sees, even though (as of 2026-08-12, #1973/#1987) the ARM ITSELF
+  now happens LAST in the iteration (Step 2 item 3, arm-last ritual) — the
+  field name marks *reading* order, not *execution* order: read this first
+  so the end-of-turn arm invariant is in view before diving into `state` and
+  letting it degrade into something to remember. **This is the BACKSTOP; the
+  wake prompt (Step 2 §2) is the primary channel** — the marker gets
+  rewritten wholesale each iteration, so an invariant living here can be
+  silently lost, whereas the prompt cannot. Keep both: they fail differently
+  (a hand-armed wake missing the stub is caught by this field; a first arm
+  that omitted the line propagates through every later arm and is caught
+  only here). Never reorder it below `state`. The text is fixed; copy it
+  verbatim.
 - `kind` — informational; the drowsiness hook only checks the marker's existence.
   `"heartbeat"` is the standard token for the quiet on-call cache-warm loop the
   boot charge enters (grep target for reachability audits — write exactly this
   value for that case, per the 2026-08-02 fleet-silence follow-up).
 - `topic` / `instructions` — the standing brief, written once at start.
-- `state` — the live handoff, **rewritten each iteration** (Step 2.3) so the
-  marker always reflects where the loop is. This is what a post-compaction self
-  (or a teammate) reads to resume.
+- `state` — the live handoff, **rewritten each iteration** (Step 2 item 3b) so
+  the marker always reflects where the loop is. This is what a post-compaction
+  self (or a teammate) reads to resume.
 - `loop_prompt` — the exact text passed to `ScheduleWakeup`'s `prompt` parameter.
   The deference-detector cooldown hook uses this to distinguish cron heartbeats
   from real user messages.
@@ -200,23 +206,27 @@ loop-mode.
 (not a fresh START — START goes through Step 1's write, skip this step)**,
 spot-check its `state` field against your in-context understanding of where
 the work is. If they diverge — the marker is stale FROM the PREVIOUS
-iteration's failure to run the arm-first ritual's marker-update half
-(Step 2.3 d/e) — fix it now before proceeding so this iteration's actions get
-recorded properly.
+iteration's failure to run the arm-last ritual's marker-update step
+(Step 2 item 3b) — fix it now before proceeding so this iteration's actions
+get recorded properly.
 
-**A stale marker is the TOLERATED failure under arm-first** (Step 2.3) — the
-ordering guarantees that if something has to be dropped, it is this and not the
-wake. That is a fallback, **not a licence to skip Step 2.3 d/e**, which remains
-required. Reconcile and move on; don't treat it as evidence something went badly
-wrong, and don't treat it as normal either.
+**A stale marker remains a TOLERATED, recoverable failure** (Step 2 item 3)
+— if an iteration forgets the marker `state` rewrite (b) but still arms (c),
+this staleness check catches and reconciles it next time; if it forgets to
+arm (c) entirely, the Stop hook's loop-arm nudge (#1973) is now the safety
+net for THAT (see "Why arm-LAST is correct now" under Step 2 item 3 below).
+Neither failure is a licence to skip **Step 2 item 3(b)**, which remains
+required every iteration. Reconcile and move on; don't treat it as evidence
+something went badly wrong, and don't treat it as normal either.
 
 ```bash
 cat ~/.engram/loop-mode.json | jq -r .state | head -20
 ```
 
-The most likely cause of staleness is the previous iteration skipped Step 2.3.
-Investigate briefly: is the wake prompt carrying state the marker doesn't have?
-That's the failure mode. Reconcile by moving that state into the marker's
+The most likely cause of staleness is the previous iteration skipped Step 2
+item 3(b). Investigate briefly: is the wake prompt carrying state the marker
+doesn't have? That's the failure mode. Reconcile by moving that state into
+the marker's
 `state` field before doing any iteration work.
 
 **Two kinds of staleness — the check above is the *within-loop* case; there is also a *cross-boundary* case.** The check above catches a marker that fell behind the *previous iteration*. But a marker can also be stale because a **sleep cycle or a long idle gap** happened since it was last written: the loop went dormant across a boundary and the marker is a frozen pre-boundary snapshot. An actively-running loop rewrites its `state` within its cadence (max idle ≈ 1h), so a marker whose mtime is much older than that means the loop has been dormant across a boundary:
@@ -234,6 +244,158 @@ Calibrate the threshold to the loop's *own* cadence, not a fixed number: read `c
 cannot be stale.)*
 
 ---
+
+## Codex pacer — managed daemon + self-addressed Umwelt heartbeat
+
+This is a complete alternate arming flow. **On Codex, follow this section and
+skip Step 2 items 1–3 below** (all `ScheduleWakeup`, `CronList`, loop-prompt,
+and Monitor operations). Resume the shared loop body at Step 2 item 4.
+
+Codex has no `ScheduleWakeup`, `CronList`, or `Monitor` tools. Its equivalent is
+the persistent `codex-umwelt-wake.py` bridge plus a systemd timer that sends a
+self-addressed Umwelt wake.
+
+### C1. Arm the provisioned host in one fail-fast transaction
+
+This is a **pre-provisioned-host workaround**, not a fresh-install provisioner.
+The tracked plugin ships the wake bridge but does not yet ship the private
+heartbeat script/units. Preflight both managed units BEFORE creating live loop
+state; absence is a hard start failure that leaves no marker.
+
+Run the whole arming transaction in **one Bash invocation**. Do not split these
+snippets across Codex shell calls: shell variables do not persist between calls.
+Fill the seven inputs first; the canonical cadence is 1800 unless the user
+explicitly named another value.
+
+```bash
+cat > /tmp/arm-codex-loop.sh <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
+CADENCE_SECONDS=${CADENCE_SECONDS:-1800}
+root="$HOME/.engram/codex-wake/loop-host-state"
+pending="$HOME/.engram/loop-mode.json.pending"
+marker="$HOME/.engram/loop-mode.json"
+test ! -e "$marker" || { echo "an active loop marker already exists" >&2; exit 1; }
+wake_unit=$(systemctl --user list-unit-files --type=service --no-legend | awk '$1 ~ /codex-umwelt-wake\.service$/ {print $1; exit}')
+unit=$(systemctl --user list-unit-files --type=timer --no-legend | awk '$1 ~ /codex-loop-heartbeat\.timer$/ {print $1; exit}')
+test -n "$wake_unit" && test -n "$unit" || { echo "Codex loop host is not provisioned" >&2; exit 1; }
+systemctl --user cat "$wake_unit" | grep -q 'codex-umwelt-wake.py' || { echo "wrong wake service" >&2; exit 1; }
+
+dropin_dir="$HOME/.config/systemd/user/$wake_unit.d"
+thread_dropin="$dropin_dir/thread.conf"
+cadence_dir="$HOME/.config/systemd/user/$unit.d"
+cadence_dropin="$cadence_dir/cadence.conf"
+rm -rf "$root"; mkdir -p "$root" "$dropin_dir" "$cadence_dir"
+test -e "$thread_dropin" && cp "$thread_dropin" "$root/thread.conf" || : > "$root/thread.absent"
+test -e "$cadence_dropin" && cp "$cadence_dropin" "$root/cadence.conf" || : > "$root/cadence.absent"
+systemctl --user is-enabled --quiet "$unit" && : > "$root/timer.enabled" || : > "$root/timer.disabled"
+systemctl --user is-active --quiet "$unit" && : > "$root/timer.active" || : > "$root/timer.inactive"
+printf '%s\n' "$wake_unit" > "$root/wake-unit"; printf '%s\n' "$unit" > "$root/timer-unit"
+
+restore() {
+  rm -f "$pending" "$marker"
+  test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
+  test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
+  systemctl --user daemon-reload || true
+  systemctl --user restart "$wake_unit" || true
+  if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null || true; else systemctl --user disable "$unit" >/dev/null || true; fi
+  if test -e "$root/timer.active"; then systemctl --user restart "$unit" || true; else systemctl --user stop "$unit" || true; fi
+}
+trap 'rc=$?; restore; exit $rc' ERR INT TERM
+
+cat > "$thread_dropin" <<EOF
+[Service]
+Environment=CODEX_THREAD_ID=$CURRENT_THREAD
+EOF
+cat > "$cadence_dropin" <<EOF
+[Timer]
+OnActiveSec=
+OnUnitActiveSec=
+OnUnitActiveSec=${CADENCE_SECONDS}s
+EOF
+agent=$(jq -er .agent "$HOME/.umwelt/config.json")
+jq -n --arg activated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg end_at "$END_AT" \
+  --arg kind "$LOOP_KIND" --arg topic "$TOPIC" --arg instructions "$INSTRUCTIONS" --arg state "$STATE" \
+  --arg prompt "@$agent Loop heartbeat: read ~/.engram/loop-mode.json and continue the active bounded loop; remove the marker when end_at has passed." \
+  --argjson cadence "$CADENCE_SECONDS" '{FIRST_ACTION:"FIRST: verify exact bridge thread and one timer trigger; check end_at; then work and update state.",activated:$activated,end_at:$end_at,kind:$kind,topic:$topic,instructions:$instructions,state:$state,cadence_seconds:$cadence,pacer:"codex-systemd-umwelt-self-wake",loop_prompt:$prompt}' > "$pending"
+
+systemctl --user daemon-reload
+systemctl --user restart "$wake_unit"
+systemctl --user enable --now "$unit"
+systemctl --user restart "$unit"
+WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+status=$("$HOME/.engram/venv/bin/python" "$WAKE" status)
+test "$(jq -r .running <<<"$status")" = true
+test "$(jq -r .thread_id <<<"$status")" = "$CURRENT_THREAD"
+systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
+mv "$pending" "$marker"
+trap - ERR INT TERM
+echo "armed $unit for thread $CURRENT_THREAD"
+BASH
+chmod +x /tmp/arm-codex-loop.sh
+
+CURRENT_THREAD='<Active session id>' END_AT='<ISO-8601 UTC bound>' \
+LOOP_KIND='<kind>' TOPIC='<topic>' INSTRUCTIONS='<instructions>' STATE='<state>' \
+CADENCE_SECONDS=1800 /tmp/arm-codex-loop.sh
+```
+
+If the user named only a cadence and not an end time, use today's documented
+sleep boundary; do not create an unbounded recurring marker. At every wake,
+check `end_at` first and remove the marker when it has passed.
+
+### C2. Verify continuations
+
+The transaction binds the current injected session ID explicitly; the bridge's
+normal newest-session discovery is not sufficient for a bounded loop. On every
+wake, rederive unit names from the persisted host-state (never from old shell
+variables) and verify the shipped bridge plus timer:
+
+```bash
+WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+PY="$HOME/.engram/venv/bin/python"
+root="$HOME/.engram/codex-wake/loop-host-state"
+wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
+current_thread='<session id from the Active session banner>'
+status=$("$PY" "$WAKE" status)
+echo "$status"
+test "$(jq -r .running <<<"$status")" = true
+test "$(jq -r .thread_id <<<"$status")" = "$current_thread"
+systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
+```
+
+A mismatch is a hard start failure. Do not open a second local TUI or run a
+detached `umwelt-bell.py`; the watcher and visible TUI must share the managed
+app-server. Use `agentctl session` / `agentctl attach` to repair the topology.
+
+### C3. End and restore exact prior host state
+
+On each continuation, first verify the bridge's `running` + exact `thread_id`
+and the timer's next trigger, then check `end_at`, work, and update marker
+`state`. A marker alone is not an armed loop. Ending removes the marker; the
+timer may remain enabled because its service exits silently without a marker.
+On normal end, use one fresh fail-fast invocation. It restores both prior
+drop-ins and the timer's prior enabled **and active** states:
+
+```bash
+set -Eeuo pipefail
+root="$HOME/.engram/codex-wake/loop-host-state"
+wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
+thread_dropin="$HOME/.config/systemd/user/$wake_unit.d/thread.conf"
+cadence_dropin="$HOME/.config/systemd/user/$unit.d/cadence.conf"
+rm -f "$HOME/.engram/loop-mode.json" "$HOME/.engram/loop-mode.json.pending"
+test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
+test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
+systemctl --user daemon-reload
+systemctl --user restart "$wake_unit"
+if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null; else systemctl --user disable "$unit" >/dev/null; fi
+if test -e "$root/timer.active"; then systemctl --user restart "$unit"; else systemctl --user stop "$unit"; fi
+rm -rf "$root"
+```
+
+This removes the per-loop thread pin and returns cadence and timer state to
+exactly what preceded the loop; it never leaves a completed loop bound to a
+dead thread.
 
 ## Step 2 — The loop body (per iteration)
 
@@ -276,22 +438,22 @@ cannot be stale.)*
 
    **Arm loop-wakes via `format_loop_prompt`, never a raw prompt string.** When arming a ScheduleWakeup for a loop, run `$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py` on your core message (e.g. `echo "<core>" | python3 "$CLAUDE_PLUGIN_ROOT/tools/loop_prompt.py"`, or call `format_loop_prompt(core)`) and pass ITS output as the ScheduleWakeup `prompt`. This prepends the `<loop-wake>` SSoT marker so the time-bar hook classifies the wake as non-human — otherwise the loop stamps itself as user-activity and self-suspends (#1592). The marker is added by the tool, never hand-typed.
 
-   **Check before arm — end-of-iteration invariant: exactly ONE pending wake.**
-   `ScheduleWakeup` is additive (each call adds a new pending wake; it does NOT
-   replace existing ones). Without a guard, user-typed `/loop` continuations +
-   natural wake fires both re-arm, growing the queue. At the end of every
-   iteration, BEFORE calling `ScheduleWakeup`:
-
-   1. `CronList` first.
-   2. If a pending wake (one-shot, /loop body) already exists → DON'T re-arm.
-      The existing wake IS the heartbeat; lifeline rule satisfied.
-   3. If no pending wake exists → arm one (per the 1800s default above).
-
-   Lifeline rule + check-before-arm compose to: "exactly one pending wake at
-   iteration end." Achieve via check-then-arm, not blind-arm. Verified
-   empirically 2026-05-30 — without the check, `CronList` showed 2-3 pending
-   wakes at peak during rapid user-continuation patterns, with stale fires
-   every 30-60s instead of the calibrated cadence.
+   **Check-before-arm is gone — removed 2026-08-12 (#1973, #1987). Do NOT
+   restore it.** This step used to read: `CronList` first, and if a pending
+   wake already existed, DON'T re-arm — justified by #525's premise that
+   `ScheduleWakeup` is additive (each call stacks a new pending wake on top
+   of existing ones, so an unguarded re-arm would grow the queue). That
+   premise is now known FALSE: Borges's 2026-07-31 direct probe established
+   that `ScheduleWakeup` replacement is UNCONDITIONAL — with an 1800s wake
+   already pending, he armed a 3600s wake carrying entirely different prompt
+   text, and `CronList` returned exactly one job, not two. Stacking is
+   structurally unreachable, so a redundant arm is free — and
+   check-before-arm was not just unnecessary but **actively harmful**:
+   declining to re-arm because a wake was already pending is precisely what
+   pins the deadline to when the loop STARTED rather than sliding it to when
+   the loop actually went QUIET, which is backwards from the sliding-window
+   heartbeat semantics Lei ruled on 2026-08-09 (see "Why arm-LAST is correct
+   now" below). Arm unconditionally instead — Step 2 item 3.
 2. **The armed prompt is a minimal, formalized STUB — the marker carries the
    state.** Don't pack the loop's brief into the `ScheduleWakeup` prompt; point
    at the marker. Arm every wakeup with the same self-declaring stub:
@@ -300,14 +462,20 @@ cannot be stale.)*
    > (your context was just reset — you'll see a `[source=compact]` or
    > `[source=startup]` session banner, or a compaction summary in your prior
    > context), **read `~/.engram/warm-briefing.md` first** before proceeding.
-   > **FIRST, before anything else: re-arm the next wakeup.** `CronList`; if no
-   > pending wake, `ScheduleWakeup` at this loop's cadence with this same stub.
-   > Do it before reading any file, before any other tool call.
    >
    > Then: read `~/.engram/loop-mode.json` for the loop topic, instructions, and
    > current state. **If the file is absent → the loop already ended; STOP, do
-   > not execute** (and cancel the wake you just armed). If present → continue
-   > per its contents.*
+   > not execute.** If present → continue per its contents: do the iteration's
+   > work, rewrite the marker's `state` to reflect what the burst produced,
+   > and **at the END of the turn — the FINAL action, only after the work and
+   > the state-rewrite are done — `ScheduleWakeup` at this loop's cadence with
+   > this same stub** (unconditionally; no check-before-arm). Then `CronList`
+   > to confirm the armed prompt leads with `<loop-wake>`. **If this turn's
+   > work includes a reply the human must see: batch the arm WITH a sibling
+   > tool call (the marker `state` rewrite is the natural one) in a single
+   > parallel block, then put the reply after it as the turn's FINAL text —
+   > a solo arm ends the turn and a trailing arm swallows the reply (Step 2
+   > item 3's reply-carrying split, #2098).***
 
    **The re-arm line lives in the PROMPT, and that is the primary channel —
    not the marker.** Two reasons, and the first is the load-bearing one:
@@ -317,9 +485,9 @@ cannot be stale.)*
      heredoc away from vanishing, and its absence is silent. The prompt is
      written once per arm and consumed immediately — nothing rewrites it.
    - **The prompt ARRIVES; the marker must be FETCHED.** The stub *is* the wake:
-     it is in context before any tool call. Reaching the marker already requires
-     doing something, and "do this before doing anything" cannot live behind a
-     step that is itself doing something.
+     it is in context the moment the turn starts, with no read required to
+     see it. Keeping the arm-at-end instruction here means it can't be missed
+     by an agent that never gets around to opening the marker at all.
 
    Keep `FIRST_ACTION` in the marker too, as a **backstop** — the two channels
    fail differently, which is exactly why both are worth having. If someone
@@ -331,50 +499,75 @@ cannot be stale.)*
    doesn't apply.
 
    *(Credit: Lei, 2026-07-31 — "make it part of the wake-up prompt itself, not
-   the marker, which may be rewritten and accidentally overwritten.")*
+   the marker, which may be rewritten and accidentally overwritten." That
+   redundant-delivery argument is independent of arm-first-vs-last — only the
+   CONTENT of what's delivered changed on 2026-08-12, per #1973/#1987.)*
 
    The warm-briefing step is conditional — only when context was just reset
    (post-compaction `[source=compact]`, or fresh-terminal/cross-day
    `[source=startup]`). Same-session wakes skip it (warm-briefing is already in
    context). (Rationale: Step 0 CONTINUATION incident note above.)
-3. **ARM-FIRST ritual — arm at the TOP of the iteration, not the end.**
+3. **Arm-last ritual — arm at the END of the iteration, not the top.**
 
-   The re-arm is the **first action after a wake**, before any work, and
-   certainly before composing state:
+   The re-arm is the **final action of the turn**, after the work is done and
+   the marker's `state` is rewritten:
 
-   a. **`CronList`** — if a pending wake already exists, DON'T re-arm
-      (check-before-arm; the lifeline rule still holds).
-   b. **If the queue is empty**, `ScheduleWakeup` at `cadence_seconds` with the
-      MINIMAL STUB prompt (per §2 above). Do NOT stuff state into the prompt —
-      the marker carries it.
-   c. *…then do the iteration's actual work…*
-   d. **At iteration end, rewrite the marker's `state`** via
-      `cat > ~/.engram/loop-mode.json` or a `jq` patch: pending work, in-flight
-      fairies, key node IDs, next step. The marker is the CANONICAL HANDOFF;
-      the wake prompt is just a pointer.
-   e. **Verify it reflects reality**: `cat ~/.engram/loop-mode.json | jq -r .state | head -20`.
+   a. *…do the iteration's actual work…*
+   b. **Rewrite the marker's `state`** via `cat > ~/.engram/loop-mode.json` or
+      a `jq` patch: pending work, in-flight fairies, key node IDs, next step.
+      The marker is the CANONICAL HANDOFF; the wake prompt is just a pointer.
+   c. **`ScheduleWakeup` at `cadence_seconds`**, unconditionally — no
+      check-before-arm (removed above; a redundant arm replaces, never
+      stacks, and is free) — with the MINIMAL STUB prompt (per §2 above). Do
+      NOT stuff state into the prompt — the marker carries it.
+   d. **Verify**: `CronList` and confirm the armed prompt actually LEADS with
+      the `<loop-wake>` marker. The Stop hook now also checks this
+      (`engram-loop-arm-stop-hook.py` gates on a `ScheduleWakeup` tool_CALL
+      appearing in this turn's transcript, per #1973) — but verify here too,
+      belt and suspenders.
 
-   **The end-of-iteration marker update (d/e) is still REQUIRED, not optional.**
-   It stays at the end on purpose: only there do you know what the burst
-   actually produced, so only there can the handoff be complete. Arming can
-   move to the top precisely *because* it needs none of that — the armed prompt
-   is a stub pointing at the marker, so it carries no burst detail and can be
-   fired before you know anything about the iteration. Two steps, two natural
-   homes: **arm early because it's contentless; write state late because it
-   isn't.**
+   **The end-of-iteration marker update (b) and the arm (c) are BOTH
+   required, every iteration.** Both live at the end because both need the
+   same thing: only there do you know what the burst actually produced, so
+   only there can the handoff (`state`) be complete and the arm cover the
+   ground actually just travelled (the cadence resets from *now*, not from
+   when the burst started).
 
-   **Why that order, and it is the whole point of the step.** The two ways to
-   fail here have wildly asymmetric costs, so the cheap-to-fail one goes last:
+   **Why arm-LAST is correct now, and it is the whole point of the step.**
+   The 2026-07-31 incident below is real, and it's still the reason the
+   Stop-hook loop-arm nudge exists — but the reasoning that used to justify
+   ARM-FIRST from that incident is superseded (#1973, #1987, 2026-08-12):
+
+   1. **The Stop hook is now the actual safety net for a forgotten re-arm**
+      — not ritual ordering. `engram-loop-arm-stop-hook.py` gates on a
+      `ScheduleWakeup` tool_CALL appearing in this turn's transcript delta
+      (not a `CronList` result showing a pending job, which a wake armed an
+      hour ago satisfies just as well as one armed this second) — so a turn
+      that ends without arming is caught and nudged, closing the gap the
+      44-minute incident exposed.
+   2. **Arming unconditionally at the end** (not gated on the work being
+      "done" in some judged sense, and not gated on a pending-wake check —
+      see "Check-before-arm is gone" above) means the only way to lose a
+      wake now is skipping the Stop hook's nudge entirely — a hook-liveness
+      question, not a within-turn-ordering one.
+   3. **Arm-last gives the correct idle-floor semantics.** The cadence is a
+      floor on how long the agent may go unreachable — Lei's 2026-08-09
+      ruling is that it should reset from when the burst actually went
+      quiet, not from when it started. Borges's worked example: he armed at
+      13:13Z for a 14:09 wake (55 min), then worked until ~13:35 before the
+      turn ended — arm-FIRST would have fired the wake 34 minutes after he
+      actually went quiet, not 55; arm-first UNDER-counts the idle floor,
+      which is backwards from the intended "floor of frequency to keep the
+      cache warm" semantics.
+
+   Because the rule is simply "arm at the end of every burst," a Monitor/DM/
+   peer wake's turn also ends with an arm, so the idle floor refreshes on
+   every real wake automatically, with no monitor-specific re-arm rule needed.
 
    | forgotten | consequence | recoverable? |
    |---|---|---|
-   | marker `state` update (d/e) | next iteration reads a slightly stale progress note | **yes** — Step 1.5's staleness check catches and reconciles it |
-   | the re-arm (a/b) | **the loop goes dark** | **no** — a heartbeat's absence produces no event, so nothing inside the process can notice; only an external observer can |
-
-   Arming last means every interruption between wake and end-of-turn — a
-   compaction, a user message, a long sub-task, or simply a turn that *felt*
-   finished — silently costs the loop its next wake. Arming first means the
-   worst case is a stale note.
+   | marker `state` update (b) | next iteration reads a slightly stale progress note | **yes** — Step 1.5's staleness check catches and reconciles it |
+   | the re-arm (c) | the loop goes dark for this burst | **yes, now** — the Stop hook's loop-arm nudge (#1973) catches a turn that ends with no `ScheduleWakeup` call and nudges the agent to arm before the turn truly stops |
 
    *(Origin: 2026-07-31. A wake fired, the iteration's work and a nap ran, and
    the turn ended without re-arming — 44 minutes dark. The bell Monitor stayed
@@ -382,13 +575,64 @@ cannot be stale.)*
    was exactly the layer covering "nothing addressed to me, but work waiting,"
    which was the live state — a counterpart's letter and two forum mentions sat
    unread the whole window. Caught by the user noticing the silence, because
-   there was no other available detector. Lei's ruling: make the re-arm the
-   rigid first step, and accept a stale marker as the acceptable failure.)*
+   there was no other available detector at the time. Lei's ruling then was to
+   make the re-arm the rigid first step, and accept a stale marker as the
+   acceptable failure — the right call given the tools available that day. The
+   Stop-hook mechanism built since (Part A of #1973) is what actually closes
+   the forgotten-re-arm gap now, which is why arm-last is safe today in a way
+   it would not have been on 2026-07-31.)*
+
+   **REPLY-CARRYING TURNS: batch the arm with a sibling call, reply last
+   (added 2026-08-18, #2098 — measured on Claude Code 2.1.235, two seats).**
+   Two harness behaviors, established by live discriminating tests with Lei
+   watching the rendered output:
+
+   - (i) On Kepler's seat a **SOLO** `ScheduleWakeup` call — the only tool
+     call in its message — **ends the turn at its result** (n=2, under
+     explicit stated intent to continue; the planned follow-up calls never
+     ran), while the same call **batched with a sibling in one parallel
+     block lets the turn continue normally**, with rendered output
+     confirmed by the user. **NOT reproduced on Borges's seat at the same
+     version: 69/69 solo arms there continued, with a following tool call
+     that executed, and Stop-hook mediation excluded. The divergence is
+     unexplained.** The batched shape is the recommendation because it is
+     the one measured working on both seats — not because the solo failure
+     is universal.
+   - (ii) Only the **final text** of a turn renders to the user — text
+     followed by a trailing tool call is silently not shown. So a
+     reply-then-arm ordering swallows the reply.
+
+   Lei lost five replies to the combination on 2026-08-18 before a
+   controlled no-arm turn isolated (ii) and the batched-arm test isolated
+   (i). Treat the solo-arm termination as measured on 2.1.235, not asserted
+   universal.
+
+   The rule, split by what the turn carries:
+
+   - **Quiet iteration (nothing said to a human):** arm-last exactly as
+     above — (a) work, (b) marker `state` rewrite, (c) arm, (d) verify.
+     A solo arm ending the turn is harmless here.
+   - **Reply-carrying turn:** (a) work, then **(b)+(c) in ONE parallel
+     block** — the marker `state` rewrite (a Bash call, so it is the
+     natural sibling) batched together with the `ScheduleWakeup` — then
+     **(d) the reply as the turn's final text, nothing after it.** The
+     pending sibling call is what carries the turn past the arm; the
+     reply-in-final-position is what makes it render.
+
+   Do NOT end a reply-carrying turn on a solo arm (reply swallowed, per
+   (ii)+(i)), and do not suppress the reply to satisfy the arm ritual:
+   silently dropping the conversation is the worse failure (Lei, verbatim:
+   "concise answer, not too long, but not silently dropping the
+   conversation either"). The loop-arm Stop hook keeps its ordinary role as
+   the safety net for a genuinely forgotten arm — if it blocks after your
+   reply already rendered, just arm in the re-invocation and add nothing
+   after.
 
    **Drift signal**: if you find yourself writing more than 1-2 lines in the wake prompt, you're drifting — the state belongs in the marker. Stop, move it to the marker's `state` field, re-arm with the minimal stub.
 4. **ENGRAM-write findings as they happen** — the loop crosses compaction
    boundaries; an unwritten finding is lost.
-5. **Drowsiness in loop-mode** (Step 4) — nap ONCE, then keep working.
+5. **Drowsiness in loop-mode** (Step 4) — capture the COMPLETED burst
+   (history arc + nodes), nap to checkpoint, then keep working.
 6. **Don't manufacture work.** When the queue genuinely drains, hold for the
    user rather than invent tasks; the loop's steady state is a quiet
    heartbeat (idle re-arms, no fake work), not perpetual grinding. The loop
@@ -416,18 +660,42 @@ in doubt whether the user is ending the loop, ask — but never strand the marke
 
 ---
 
-## Step 4 — Drowsiness behavior in loop-mode
+## Step 4 — Drowsiness behavior in loop-mode: capture, then ride
 
 With the marker present, the hook tells you the right thing; the discipline is:
 
-- **At urgent drowsiness: nap ONCE** (`engram_nap`) to stage the window for
-  compaction — UNLESS you already napped this burst, then skip.
+- **At urgent drowsiness: capture the COMPLETED burst, before you start the
+  next one.** Append the burst that just ended to today's
+  `~/.engram/history/YYYY-MM-DD.md`, and write the nodes for anything it
+  decided or found. The compaction summary carries our custom instructions
+  only ~12% of the time (engram-alpha#2026, measured: 16 of 135 summaries
+  since May), so what crosses the boundary is whatever is already plain text
+  in a file. **Anything left only in context is lost at the boundary, not
+  deferred.**
+- **Then nap to checkpoint it** (`engram_nap`) — after the writes, not
+  instead of them. A nap checkpoints what is *already* in the graph and
+  commits a snapshot; napping with nothing newly written saves nothing.
+  Repeated writes are the protection; repeated naps are not.
+- **Why the PAST burst, not the current one** (maintainer's ruling,
+  2026-08-16): compaction can land mid-burst, so the in-flight burst cannot
+  be protected whenever you capture. Capturing at the end of burst N and at
+  the start of burst N+1 therefore cover exactly the same content — there is
+  nothing in between. That is why the banner fires once per wake and points
+  backwards, and why once-per-wake is correct rather than a gap.
 - **Then keep working and ride the auto-compaction.** Do NOT slow down, hold,
   or wait for a manual compaction. The `ScheduleWakeup` you armed re-invokes the
   post-compaction self with the loop prompt, so the loop continues seamlessly
   through compaction — that's the whole point of the loop-aware path.
 - **Below urgent:** nothing loop-specific — the banner renders the calm level
   word with no per-prompt alarm.
+- **There is no per-turn Stop-path enforcer for this window, by design.**
+  An earlier revision of engram-alpha#2026 WS4 put one in
+  `engram-stop-hook.py`; it was retired on 2026-08-16 because it emitted
+  `decision: block` with no `stop_hook_active` guard and a *lowered* prose
+  threshold inside the window, so it could re-fire exactly when turns are
+  most expensive — and because it bought no coverage the once-per-wake
+  banner does not already have. Do not reintroduce one without revisiting
+  that reasoning.
 
 ---
 

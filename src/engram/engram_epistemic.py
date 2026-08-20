@@ -45,6 +45,50 @@ def _looks_like_prose(pattern: str) -> bool:
     return pattern.count(" ") > 8
 
 
+def _validate_situation_pattern(pattern: str, bypass_prose_check: bool) -> tuple:
+    """Shared #1864 gate for a non-empty situation_pattern value.
+
+    Used by both _add_lesson_impl (creation) and _update_lesson_impl (#1826,
+    in-place correction) so the compile-check + prose-shape check + bypass
+    contract can't drift between the two call sites — #1864 itself shipped
+    with a threshold bug found only because two independent colleagues ran
+    the real predicate against real data; a second, un-synced copy of this
+    logic is exactly the kind of surface a future fix could land in only one
+    of. Caller is responsible for the empty-string skip (clearing a pattern
+    is always ungated, by design, at both call sites) — this function assumes
+    a non-empty pattern.
+
+    Returns (error_response, prose_bypass_exercised): error_response is a
+    dict ready for json.dumps() on failure, or None on success.
+    """
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        return ({
+            "error": f"situation_pattern is not a valid regex: {e}. "
+                     f"Pattern: {pattern!r}",
+        }, False)
+    # mutation-tested: see test_prose_situation_pattern_blocked_by_default
+    # and test_mutation_check_prose_gate_actually_blocks
+    if _looks_like_prose(pattern):
+        if not bypass_prose_check:
+            n_spaces = pattern.count(" ")
+            return ({
+                "error": (
+                    f"`situation_pattern` looks like prose, not a regex: "
+                    f"{n_spaces} literal space(s), over the 8-space "
+                    f"threshold (#1864: live patterns run 0-5, prose "
+                    f"runs 16-70). It is a valid regex but will never "
+                    f"match a real command, so the tripwire would be "
+                    f"silently dead. A command-shape pattern looks like "
+                    f"`(?:gh\\s+pr\\s+create|ia\\s+write)`. If this is "
+                    f"intentional, pass bypass_prose_check=true."
+                ),
+            }, False)
+        return (None, True)
+    return (None, False)
+
+
 # ---------------------------------------------------------------------------
 # K-local helpers
 # ---------------------------------------------------------------------------
@@ -315,6 +359,22 @@ def _add_conjecture_impl(
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability read-back guard (alpha#2097, #1947 incident) — verify the
+        # commit actually landed on THIS connection before reporting
+        # status:created. See core._verify_durable_write.
+        if not core._verify_durable_write(conn, node_id):
+            return json.dumps({
+                "status": "failed_not_durable",
+                "conjecture_id": node_id,
+                "error": (
+                    "Write did not verify as durable on read-back after commit — "
+                    "the row is missing or its claim is empty. Do NOT retry "
+                    "automatically; a retry after a partial commit risks a "
+                    "double-write. See alpha#1947, #2097."
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "conjecture_id": node_id,
@@ -762,31 +822,11 @@ def _add_lesson_impl(
     # lets a malformed regex through.
     prose_bypass_exercised = False
     if situation_pattern:
-        try:
-            re.compile(situation_pattern)
-        except re.error as e:
-            return json.dumps({
-                "error": f"situation_pattern is not a valid regex: {e}. "
-                         f"Pattern: {situation_pattern!r}",
-            })
-        # mutation-tested: see test_prose_situation_pattern_blocked_by_default
-        # and test_mutation_check_prose_gate_actually_blocks
-        if _looks_like_prose(situation_pattern):
-            if not bypass_prose_check:
-                n_spaces = situation_pattern.count(" ")
-                return json.dumps({
-                    "error": (
-                        f"`situation_pattern` looks like prose, not a regex: "
-                        f"{n_spaces} literal space(s), over the 8-space "
-                        f"threshold (#1864: live patterns run 0-5, prose "
-                        f"runs 16-70). It is a valid regex but will never "
-                        f"match a real command, so the tripwire would be "
-                        f"silently dead. A command-shape pattern looks like "
-                        f"`(?:gh\\s+pr\\s+create|ia\\s+write)`. If this is "
-                        f"intentional, pass bypass_prose_check=true."
-                    ),
-                })
-            prose_bypass_exercised = True
+        error, prose_bypass_exercised = _validate_situation_pattern(
+            situation_pattern, bypass_prose_check
+        )
+        if error is not None:
+            return json.dumps(error)
 
     ids = [s.strip() for s in core._as_csv(incident_ids).split(",") if s.strip()]
     if not ids:
@@ -924,6 +964,224 @@ def _add_lesson_impl(
         return json.dumps(core._strip_agent_facing(result))
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Lesson update impl (engram_update_lesson, #1826)
+# ---------------------------------------------------------------------------
+
+# Fields that may be changed in-place via engram_update_lesson — mechanical
+# retrieval/actionability metadata that can be refined from real firing
+# experience without touching the lesson's epistemic content (#1826, widened
+# 2026-08-03 per Lei: situation_pattern is a tunable machine-matching cue;
+# scaffolding_nudge is the paired "what to do when it fires" text, same
+# non-epistemic class). Do not widen further without a fresh issue: claim,
+# logical_chain, confidence, reasoning_type remain supersede-only — those ARE
+# the load-bearing content, and reasoning_type specifically feeds confidence
+# computation, so editing it in-place would silently drift a derived value.
+_LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
+
+# #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
+# actually carries a copy of (see core._rebuild_incidents_cache: it stores
+# scaffolding_nudge per incident, keyed via exemplifies edges off the
+# lesson; situation_pattern drives the surface-hook's pattern matching
+# against that same cache). Currently identical to _LESSON_MUTABLE_FIELDS,
+# but named separately since the two sets answer different questions
+# (what's editable vs. what the cache needs refreshed for) and could
+# diverge if a future mutable field doesn't touch the cache.
+_LESSON_CACHE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
+
+
+def _update_lesson_impl(
+    node_id: str = "",
+    updates: dict = None,
+    reason: str = "",
+    bypass_prose_check: bool = False,
+) -> str:
+    """Internal implementation — see engram_update_lesson MCP tool.
+
+    Update mutable fields on an existing lesson node in-place (no supersede,
+    no new node). Records prior values in metadata.field_traces (append-only,
+    same structure as _update_person_impl). Every call is also logged to the
+    edit_history audit table via core._log_edit(action="lesson_field_updated"),
+    same as engram_update_person's "person_field_updated" entries — a mutation
+    to an existing node still shows up as a graph-mutation event, distinct
+    from node creation, without minting a new node.
+
+    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
+    scaffolding_nudge — both mechanical/actionability metadata tunable from
+    real firing experience, not the lesson's epistemic content (claim,
+    logical_chain, confidence, reasoning_type stay supersede-only).
+
+    situation_pattern, when set to a non-empty value, runs the SAME #1864
+    validation _add_lesson_impl runs at creation time — must compile as a
+    regex, and must not look like prose (per _looks_like_prose) unless
+    bypass_prose_check=True. Clearing it to "" is always allowed, ungated —
+    falling back to locus-3 semantic-only recall is a legitimate correction,
+    not a prose violation. scaffolding_nudge has no such gate — it's free text,
+    not a regex, so there's no prose-shape failure mode to guard against.
+
+    Args:
+        node_id: Lesson node ID (ls_NNNN). Must be type='lesson', is_current=1.
+        updates: Dict of field → new_value. Mutable fields: situation_pattern,
+                 scaffolding_nudge. Unknown-field updates are rejected with a
+                 clear error.
+        reason: Optional human-readable explanation for the change.
+        bypass_prose_check: Default False. Overrides the prose-shape gate on
+            a new situation_pattern value — see engram_add_lesson's docstring
+            for the discriminator + audit-stamp contract. Only stamped into
+            metadata when the gate actually fired and was overridden. Has no
+            effect on scaffolding_nudge (nothing to bypass).
+
+    Returns:
+        JSON with status, node_id, updated_fields, field_traces_delta. When
+        the update touches situation_pattern or scaffolding_nudge (#2000),
+        also includes cache_rebuild — the error_incidents.json refresh
+        result, same shape _register_exemplar_impl returns for lesson
+        targets — so the caller can see the file-backed tripwire cache was
+        resynced rather than assume it. Omitted when neither field is
+        touched. Returns {"error": "..."} on any validation failure (unknown
+        field, node not found / wrong type / not current, invalid regex, or
+        prose-shaped pattern without bypass_prose_check).
+    """
+    if updates is None:
+        updates = {}
+    if not node_id or not node_id.strip():
+        return json.dumps({"error": "node_id is required and cannot be empty."})
+    if not updates:
+        return json.dumps({"error": "updates must be a non-empty dict of field → new_value."})
+
+    unknown_fields = set(updates.keys()) - _LESSON_MUTABLE_FIELDS
+    if unknown_fields:
+        return json.dumps({
+            "error": (
+                f"Unknown lesson field(s): {sorted(unknown_fields)}. "
+                f"Mutable (updatable): {sorted(_LESSON_MUTABLE_FIELDS)}."
+            )
+        })
+
+    # Per the bool-string-truthy trap (same guard _add_lesson_impl uses): a
+    # JSON-string "false" is truthy in Python; without this check, a
+    # bypass_prose_check: "false" payload would silently bypass the #1864
+    # prose-shape guard.
+    if not isinstance(bypass_prose_check, bool):
+        return json.dumps({
+            "error": (
+                f"bypass_prose_check must be a JSON boolean (true/false), got "
+                f"{type(bypass_prose_check).__name__}: {bypass_prose_check!r}. "
+                "Some MCP clients emit booleans as strings — make sure your "
+                "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
+            )
+        })
+
+    # #1826 — situation_pattern updates get the same #1864 gate as creation.
+    # Compile check runs BEFORE the prose-shape check regardless of
+    # bypass_prose_check: the bypass only overrides the prose gate, never
+    # lets a malformed regex through. Empty string always skips both checks —
+    # clearing the field back to locus-3-only recall is ungated by design.
+    prose_bypass_exercised = False
+    if "situation_pattern" in updates:
+        new_pattern = updates["situation_pattern"]
+        if new_pattern:
+            error, prose_bypass_exercised = _validate_situation_pattern(
+                new_pattern, bypass_prose_check
+            )
+            if error is not None:
+                return json.dumps(error)
+
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, type, is_current, metadata FROM nodes WHERE id = ?",
+            (node_id.strip(),),
+        ).fetchone()
+        if not row:
+            return json.dumps({"error": f"Node '{node_id}' not found."})
+        if row["type"] != "lesson":
+            return json.dumps({
+                "error": (
+                    f"Node '{node_id}' is type '{row['type']}', not 'lesson'. "
+                    f"engram_update_lesson only operates on lesson nodes."
+                )
+            })
+        if not row["is_current"]:
+            return json.dumps({
+                "error": (
+                    f"Node '{node_id}' is not current (retracted or superseded). "
+                    f"Use engram_inspect('{node_id}') to find the current successor."
+                )
+            })
+
+        meta = json.loads(row["metadata"] or "{}")
+        if "field_traces" not in meta:
+            meta["field_traces"] = {}
+
+        now = core._now()
+        updated_fields = {}
+        field_traces_delta = {}
+
+        for field, new_value in updates.items():
+            current_value = meta.get(field)
+
+            # Append prior value to trace (append-only — never mutate existing entries).
+            if field not in meta["field_traces"]:
+                meta["field_traces"][field] = []
+            meta["field_traces"][field].append({
+                "prior_value": current_value,
+                "changed_at": now,
+            })
+            field_traces_delta[field] = {"prior_value": current_value, "changed_at": now}
+
+            # Apply the new value.
+            meta[field] = new_value
+            updated_fields[field] = new_value
+
+        if prose_bypass_exercised:
+            # Auto-stamped only when _looks_like_prose actually fired AND
+            # bypass_prose_check=True let it through — never merely because
+            # the caller passed the flag. Mirrors _add_lesson_impl's
+            # prose_bypass_exercised contract (#1864, #1826).
+            meta["bypass_prose_check"] = True
+
+        conn.execute(
+            "UPDATE nodes SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), node_id.strip()),
+        )
+
+        core._log_edit(conn, "lesson_field_updated", node_id.strip(), "lesson", {
+            "updated_fields": updated_fields,
+            "reason": reason or None,
+        })
+
+        conn.commit()
+
+        result = {
+            "status": "updated",
+            "node_id": node_id.strip(),
+            "updated_fields": updated_fields,
+            "field_traces_delta": field_traces_delta,
+        }
+        if prose_bypass_exercised:
+            result["prose_bypass_exercised"] = True
+    finally:
+        conn.close()
+
+    # #2000 — the incidents cache (error_incidents.json) carries a copy of
+    # scaffolding_nudge (and is keyed off situation_pattern-driven matching
+    # at the surface-hook layer); a correction to either field must refresh
+    # it or the file-backed tripwire surface keeps serving the pre-correction
+    # text indefinitely. Mirrors _register_exemplar_impl's lesson-target
+    # cache_rebuild shape so callers can see the refresh happened. Cheap
+    # symmetry, not a blanket rebuild — skipped when the update touches
+    # neither cache-relevant field.
+    if _LESSON_CACHE_FIELDS & set(updated_fields.keys()):
+        try:
+            cache_result = core._rebuild_incidents_cache()
+        except Exception as exc:
+            cache_result = {"status": "error", "detail": str(exc)}
+        result["cache_rebuild"] = cache_result
+
+    return json.dumps(result)
 
 
 def _register_exemplar_impl(

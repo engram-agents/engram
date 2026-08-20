@@ -45,12 +45,13 @@ The standpoint check for any axis fires ONLY when ALL observation-leaf premises 
 
 `engram_derive` returns warnings like:
 ```
-STANDPOINT: author: 2 clusters (diverse); lineage: 1 cluster (⚠ uniform — shared training lineage; zero independent corroboration on substrate-prior bias); others unchecked. (load skill `engram-standpoint` for the calibration theory)
+STANDPOINT: author: 2 clusters / 2 leaves (diverse); lineage: 1 cluster / 2 leaves (⚠ uniform — shared training lineage; zero independent corroboration on substrate-prior bias); others unchecked. · 2/2 premises reality-verified (load skill `engram-standpoint` for the calibration theory)
 ```
 
 - **`diverse`** — good, the axis has multiple distinct clusters across premises
 - **`⚠ uniform`** — warning: all premises share the same cluster on this axis. The finding may carry systematic bias from that shared viewpoint.
 - **`others unchecked`** — some axes had partial or no coverage; those axes were not assessed
+- **`· N/M premises reality-verified`** — of the `M` observation-leaf premises, `N` reached state-3 (reality-verified: `quote_type` is `hard_data` or `official_statement`, and any predictive claim has resolved). A low count means the reported clusters rest on testimony rather than grounded measurement — see the `⚠⚠ unverified + uniform` composite, which escalates specifically when this count is zero on a uniform-lineage derivation.
 
 The `⚠ uniform` is advisory, not a block. A uniform derivation may still be sound — but you should flag it as a potential calibration limit.
 

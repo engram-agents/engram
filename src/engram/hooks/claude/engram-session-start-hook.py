@@ -3,12 +3,30 @@
 clear sticky user identity, and inject session info into the conversation.
 
 Reading-reminder injection is source-conditional:
-  - source=="startup" (fresh terminal): warm-briefing + newest history file +
-    Piece C git log (last 2 days of commits from both repos).
-  - source=="compact"/"resume" (or anything else): warm-briefing only. The
-    history file is skipped because the compaction summary carries
-    work-thread continuity, and re-reading today's active-day log mid-day
-    introduces "yesterday/today" framing confusion (ob_NNNN, 2026-04-24).
+  - source=="startup" (fresh terminal): warm-briefing + newest history file
+    (the agent's own reading-list discipline resolves "newest", unchanged
+    and out of scope for this hook) + Piece C git log (last 2 days of
+    commits from both repos).
+  - source=="compact"/"resume" (or anything else): warm-briefing +
+    newest-BY-FILENAME history file, injected directly by this hook
+    (#2026 WS2), NOT skipped. Two reasons originally justified skipping
+    this file post-compact; only one survives:
+      1. "the compaction summary carries work-thread continuity" —
+         MEASURED FALSE (16/135 sessions, ~12%, gh#2026). No longer live
+         rationale for anything in this hook.
+      2. "re-reading today's active-day log mid-day introduces
+         yesterday/today framing confusion" (ob_NNNN, 2026-04-24) — STILL
+         TRUE, and the reason WS2 injects with explicit framing rather than
+         merely un-skipping: the same file read fresh (source=="startup",
+         newest file is YESTERDAY's — a handover) and read mid-day
+         (source=="compact", newest file is TODAY's — an already-lived
+         arc) means opposite things, and nothing in the file itself says
+         which. history_arc_block() discharges this by building the
+         "already lived, not a to-do list" framing into the injected block
+         itself, rather than leaving the reading agent to infer the speech
+         act — see that function's docstring for the full design,
+         including why "today" is resolved by filename (not mtime) on this
+         path specifically, and why the rendered label never asserts a day.
 
 The history/git-log bundle is Piece C of the three-piece session-handover
 fix: on startup the agent cross-checks pending-status claims
@@ -54,6 +72,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
+from _hooklib import atomic_write_json
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -202,6 +221,11 @@ def _check_mcp_health(engram_home: str) -> tuple[bool | None, str | None]:
 
     try:
         server_path = _resolve_mcp_server_path(engram_home)
+        # #2029 inventory: could this match the invoking process? No -- a
+        # SessionStart hook's own argv never contains a "server.py" path.
+        # Could it match a co-tenant's process? No -- server_path is this
+        # agent's own resolved absolute path (per-home), so a co-tenant's
+        # equivalent process carries a different absolute-path string.
         result = subprocess.run(
             ["pgrep", "-f", server_path],
             capture_output=True,
@@ -725,6 +749,51 @@ def peer_topology_block(agent_name: str) -> str:
         return ""
 
 
+# Staleness gate (#1975 layer 3): a focus pin older than this many days
+# renders with a trailing ⚠ marker in focus_block(). Config-overridable via
+# config.json `focus.focus_staleness_days`. Default 7 mirrors Lei's original
+# "~7 days" proposal in issue #1975.
+FOCUS_STALENESS_DAYS_DEFAULT = 7
+
+
+def _get_focus_staleness_days(engram_home: str) -> int:
+    """Read `focus.focus_staleness_days` from config.json; default 7.
+
+    Same inline read-with-fallback pattern as the backup staleness threshold
+    above (this hook is standalone and does not import engram_core).
+    """
+    try:
+        config_path = os.path.join(engram_home, "config.json")
+        with open(config_path) as _f:
+            _cfg = json.load(_f)
+        return int(_cfg.get("focus", {}).get("focus_staleness_days", FOCUS_STALENESS_DAYS_DEFAULT))
+    except Exception:
+        return FOCUS_STALENESS_DAYS_DEFAULT
+
+
+def _parse_iso_timestamp(ts: str):
+    """Parse an ISO-8601 timestamp (with 'Z' or '+00:00' offset, with or
+    without microseconds) into a tz-aware UTC datetime. Returns None on any
+    parse failure — callers treat that as "age unknown, don't mark stale".
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def _humanize_age_days(age_days: int) -> str:
+    """Compact age string: '<7d' as '<N>d', '>=7d' as '<N>w' (whole weeks)."""
+    if age_days < 7:
+        return f"{age_days}d"
+    return f"{age_days // 7}w"
+
+
 def focus_block(engram_home: str) -> str:
     """Render the live focus list as a deterministic, verbatim continuity block.
 
@@ -740,6 +809,44 @@ def focus_block(engram_home: str) -> str:
         - [<id>] (<focus_reason>) <claim>
         - [<id>] <claim>                (when focus_reason is empty/NULL)
 
+    Repeated-reason dedup: a sleep/nap focus rotation typically stamps one
+    shared rationale across every node pinned in that batch, so the naive
+    render duplicates the same reason text once per node (measured 2026-08-15
+    on a real graph: 15 focused nodes carrying only 10 distinct reasons, 39%
+    of focus_reason bytes duplicated, 44,222 -> 30,139 chars). On the SECOND
+    and later appearance of a focus_reason string BYTE-IDENTICAL to one
+    already rendered earlier IN THIS BLOCK, the inline reason is replaced
+    with a back-reference to the FIRST node id that carried it:
+
+        - [<id-A>] (<full reason text>) <claim>           (first occurrence)
+        - [<id-B>] (reason: same as <id-A>) <claim>       (later occurrence)
+
+    Exact-match only — no normalization, no whitespace-stripping, no
+    fuzzy/prefix matching; a single differing byte is a different reason and
+    renders in full. Dedup is computed over the DISPLAYED rows only (i.e.
+    after the FOCUS_LIST_CAP slice is applied), so a back-reference can never
+    dangle by pointing at a first-occurrence row that got cut by the cap.
+    Order is untouched — rows are still emitted in `focused_at` order; dedup
+    only changes what's inlined at a given row, never the row sequence.
+
+    NOT a size guarantee. The back-reference costs ~24 bytes plus the anchor
+    id, so a shared reason SHORTER than that renders slightly larger than
+    simply repeating it. Real rotation rationales are long descriptive
+    passages (the measured case above), which is what makes the trade
+    overwhelmingly favourable in practice — but "always smaller" is not a
+    promise this function makes, and a caller must not rely on one.
+
+    Staleness gate (#1975 layer 3): a pin whose focused_at is older than
+    config `focus.focus_staleness_days` (default 7) gets a trailing
+    "  ⚠ pinned <age> ago — rotate out or re-pin with a current reason"
+    marker, and the block ends with one summary line
+    "⚠ N pin(s) stale — focus is CURRENT work; park threads with
+    engram_focus_save, drop the rest." when N >= 1. Age is computed against
+    ALL rows (not just the ones inside the FOCUS_LIST_CAP display window),
+    so the summary count reflects the true stale total. A pin whose
+    focused_at can't be parsed is treated as fresh (no marker) rather than
+    erroring the whole block.
+
     Returns "" when the DB is missing, the focus list is empty, or any read
     error occurs. Never raises — hook must not block session start.
     """
@@ -753,7 +860,7 @@ def focus_block(engram_home: str) -> str:
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, claim, focus_reason FROM nodes "
+                "SELECT id, claim, focus_reason, focused_at FROM nodes "
                 "WHERE focused_at IS NOT NULL AND is_current = 1 "
                 "ORDER BY focused_at"
             ).fetchall()
@@ -767,27 +874,158 @@ def focus_block(engram_home: str) -> str:
         if not rows:
             return ""
 
-        lines = []
+        staleness_days = _get_focus_staleness_days(engram_home)
+        now = datetime.now(timezone.utc)
+        stale_count = 0
+
+        # Pass 1: compute per-row fields (id, claim, reason, stale marker) for
+        # ALL rows — staleness counting must cover every pin, not just the
+        # displayed window (see docstring). Row order is preserved throughout.
+        row_infos = []
         for row in rows:
             node_id = row["id"]
             claim = row["claim"]
             focus_reason = row["focus_reason"]
-            if focus_reason:
-                lines.append(f"  - [{node_id}] ({focus_reason}) {claim}")
-            else:
-                lines.append(f"  - [{node_id}] {claim}")
+            stale_marker = ""
+            focused_dt = _parse_iso_timestamp(row["focused_at"])
+            if focused_dt is not None:
+                age_days = (now - focused_dt).days
+                if age_days > staleness_days:
+                    stale_count += 1
+                    stale_marker = (
+                        f"  ⚠ pinned {_humanize_age_days(age_days)} ago — "
+                        "rotate out or re-pin with a current reason"
+                    )
+            row_infos.append((node_id, claim, focus_reason, stale_marker))
 
-        total = len(lines)
-        display_lines = lines[:FOCUS_LIST_CAP]
-        remaining = total - len(display_lines)
+        total = len(row_infos)
+        display_infos = row_infos[:FOCUS_LIST_CAP]
+        remaining = total - len(display_infos)
+
+        # Pass 2: render only the DISPLAYED rows, deduping repeated
+        # focus_reason text against the first occurrence WITHIN THIS PASS.
+        #
+        # LOAD-BEARING, and it is this line rather than the pass order: the
+        # anchor is drawn from `display_infos`, i.e. from the rows that will
+        # actually be rendered. That alone makes a dangling back-reference
+        # impossible, for ANY cap shape — you cannot reference a row that was
+        # not a candidate.
+        #
+        # What is NOT load-bearing, measured rather than assumed (2026-08-15):
+        # moving dedup BEFORE the cap slice does not by itself break this,
+        # because a prefix cap over the ascending `focused_at` sort always
+        # keeps the earliest occurrence. Dangling needs pre-cap dedup AND a
+        # cap that can drop the anchor (e.g. a suffix cap) — constructed and
+        # confirmed. So if you change where the anchor is drawn from, do not
+        # expect tests/test_focus_block.py to catch it; that test is a smoke
+        # check and says so in its own docstring.
+        first_reason_id = {}  # exact focus_reason string -> first node_id
+        display_lines = []
+        for node_id, claim, focus_reason, stale_marker in display_infos:
+            if focus_reason:
+                if focus_reason in first_reason_id:
+                    anchor_id = first_reason_id[focus_reason]
+                    display_lines.append(
+                        f"  - [{node_id}] (reason: same as {anchor_id}) {claim}{stale_marker}"
+                    )
+                else:
+                    first_reason_id[focus_reason] = node_id
+                    display_lines.append(f"  - [{node_id}] ({focus_reason}) {claim}{stale_marker}")
+            else:
+                display_lines.append(f"  - [{node_id}] {claim}{stale_marker}")
 
         header = "📌 Focused nodes — the deterministic focus channel (verbatim, must survive compaction):"
         block_lines = [header] + display_lines
         if remaining > 0:
             block_lines.append(f"  ... +{remaining} more")
+        if stale_count > 0:
+            block_lines.append(
+                f"⚠ {stale_count} pin(s) stale — focus is CURRENT work; "
+                "park threads with engram_focus_save, drop the rest."
+            )
         return "\n".join(block_lines)
     except Exception:
         # Hook discipline: never surface focus-block errors at session start.
+        return ""
+
+
+def saved_focus_sets_block(engram_home: str) -> str:
+    """Render saved, non-active focus_sets as a compact pointer listing
+    (#1975 layer 1) — the noetic "these exist" signal every session,
+    directly after the live 📌 focus block.
+
+    Compact single line when <= 3 sets:
+        💼 Saved focus-sets: name-a (1 node, saved 2026-08-10) · name-b (...)
+    One line per set (with description appended) when > 3:
+        💼 Saved focus-sets:
+          - name-a (1 node, saved 2026-08-10) — description text
+          - name-b (2 nodes, saved 2026-08-09)
+
+    The currently-active set (focus_state.active_set_name) is excluded —
+    it's already fully rendered by focus_block() above; listing it again
+    here would be redundant. Sets are ordered by name (deterministic,
+    byte-stable across renders). Pure read of focus_sets/focus_state; same
+    never-fail discipline as focus_block() — any exception, a missing DB,
+    or an empty table all render "".
+    """
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            active_row = conn.execute(
+                "SELECT active_set_name FROM focus_state WHERE singleton_key = 1"
+            ).fetchone()
+            active_name = active_row["active_set_name"] if active_row else None
+            rows = conn.execute(
+                "SELECT name, node_ids, description, created_at FROM focus_sets "
+                "ORDER BY name ASC"
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        entries = []
+        for row in rows:
+            if row["name"] == active_name:
+                continue
+            try:
+                node_ids = json.loads(row["node_ids"])
+                node_count = len(node_ids) if isinstance(node_ids, list) else 0
+            except (json.JSONDecodeError, TypeError):
+                node_count = 0
+            saved_date = (row["created_at"] or "")[:10]
+            entries.append({
+                "name": row["name"],
+                "node_count": node_count,
+                "saved_date": saved_date,
+                "description": (row["description"] or "").strip(),
+            })
+
+        if not entries:
+            return ""
+
+        def _summary(e: dict) -> str:
+            unit = "node" if e["node_count"] == 1 else "nodes"
+            return f"{e['name']} ({e['node_count']} {unit}, saved {e['saved_date']})"
+
+        if len(entries) <= 3:
+            return "💼 Saved focus-sets: " + " · ".join(_summary(e) for e in entries)
+
+        block_lines = ["💼 Saved focus-sets:"]
+        for e in entries:
+            desc_part = f" — {e['description']}" if e["description"] else ""
+            block_lines.append(f"  - {_summary(e)}{desc_part}")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface saved-focus-sets errors at session start.
         return ""
 
 
@@ -863,6 +1101,491 @@ def starred_block(engram_home: str) -> str:
         return ""
 
 
+# Cap for the per-session node-injection block (#2026 WS1). This is a SAFETY
+# NET for a pathological window (e.g. injected_through stuck at a very old value
+# after a long-unused session), NOT a budget control -- so it must sit clear
+# of every window shape we actually expect, or it starts eliding real work on
+# an ordinary busy day.
+#
+# Measured 2026-08-15 on a real graph: ~121 chars/node; a per-burst window is
+# ~15-20 nodes (~2 KB); the heaviest single DAY observed was 87 nodes
+# (~10.5 KB). An earlier draft used 100, which is only ~15% clear of that 87
+# -- close enough that a slightly busier day than any yet recorded would trip
+# it, which is exactly the wrong place for a net to sit. 200 puts the net
+# roughly 2.3x clear of the busiest observed day while still bounding the
+# pathological case at ~24 KB.
+#
+# The elision is never silent (an explicit "... +N more" line renders), so the
+# failure mode if this is still too low is visible rather than quiet. DATE any
+# number you revise this against; the sibling caps in this file went stale
+# once already for want of one.
+CHECKPOINT_LIST_CAP = 200
+
+
+def _liveness_tag(row) -> str:
+    """Return " [superseded]" / " [retracted]" for a node no longer current.
+
+    The window deliberately includes non-current nodes — a claim I filed and
+    then replaced inside the same burst is part of what happened, and hiding
+    it would erase exactly the self-correction the post-compaction self most
+    needs to know about. But rendering it UNMARKED would present a dead claim
+    as a live one, so the tag carries both facts at four characters' cost.
+
+    Keys on `is_current`, NOT on `status`, and that is the whole subtlety:
+    a superseded node keeps `status='active'` while its `is_current` drops
+    to 0 — measured on a real graph, 175 nodes in that state — so `status`
+    positively asserts liveness on a replaced claim (the same root cause
+    tracked in engram-alpha#2003). A reader keying on `status` alone would
+    label every superseded node "active". Retraction is the one case that
+    does move `status`, so it is distinguished by that; anything else
+    non-current is reported as superseded.
+
+    Fail-soft like everything else in this block: a row missing either
+    column returns "" rather than raising.
+    """
+    try:
+        if row["is_current"]:
+            return ""
+        if (row["status"] or "").strip().lower() == "retracted":
+            return " [retracted]"
+        return " [superseded]"
+    except Exception:
+        return ""
+
+
+def session_checkpoint_block(engram_home: str, injected_through: str | None) -> str:
+    """Render nodes created since injected_through — the per-session "nodes
+    created this session" list (#2026 WS1).
+
+    injected_through is "the start of the window the hook's own channel has
+    not yet injected" (Kepler's wording, #5506, quoted verbatim). Its full
+    lifecycle — seeded once, advanced only on source=="compact", never on
+    nap, and only strictly AFTER this function's return value has been
+    appended to additionalContext — is documented on write_marker(), which
+    owns the field. This function is a PURE READ of it: it never writes the
+    marker file itself, matching focus_block()/starred_block()'s discipline
+    (pure read, fail-soft, returns "" on anything unexpected, never raises
+    — hook must never block session start).
+
+    injected_through is None ⇒ returns "" immediately, covering two cases this
+    function treats identically (the caller distinguishes them for its own
+    seeding step — see write_marker()'s docstring): a legacy marker written
+    before this field existed, and a genuinely first-ever SessionStart for
+    this session_id. Neither case falls back to "beginning of time" — that
+    would dump the whole graph on the very first render, which is exactly
+    the failure this guard exists to prevent.
+
+    Window: nodes with created_at >= injected_through, no upper bound. A node
+    created between this query and the caller's advance-after-inject write
+    is safe to double-report in the NEXT window — an overlap is the safe
+    direction of error, never a gap (same principle as advance-after-inject
+    itself: never claim coverage that wasn't actually rendered).
+
+    Exclusion is by PROPERTY, not by type: a node is skipped when
+    `not (claim or recall_summary)` — i.e. it would render blank either
+    way. Do NOT special-case type == 'evidence' — that is a proxy for the
+    property actually measured (Borges, #5504) and goes stale silently the
+    day an 'ev_' node starts carrying its own claim text. Measured: this
+    drops 64/310 (~21%) of a real week's nodes, all of which render blank;
+    every dropped 'ev_' node stays reachable from the observation citing it.
+
+    Per node: `id`, `type`, and `recall_summary` falling back to
+    `claim[:100]` (recall_summary is present on 214/310 = 69% of a recent
+    week — the #1952 degrade path is already partly live and this fallback
+    covers the rest). No further truncation is applied to recall_summary
+    itself — unlike the unrelated _reflect_rs_or_claim helper in
+    engram_core.py (200-char cap), which this hook deliberately does not
+    import (fastmcp-free discipline, same as the tool-capability-index
+    block above).
+
+    Capped at CHECKPOINT_LIST_CAP with an explicit "... +N more" line —
+    never truncated silently.
+
+    Placement (see main()): this function's call site sits BEFORE the
+    #1819 ordering-invariant comment, in the same cheap tier as
+    focus_block(). Measured 2026-08-15: the underlying query is a FULL
+    TABLE SCAN — there is no index on created_at — and costs 1.2ms over
+    2957 nodes. Cheap today; at 30k+ nodes this will be the first thing
+    someone wants to speed up, and by then this number will be stale —
+    that is the whole reason this spec exists: an undated in-file
+    measurement on this same hook (focus_block's SIZE figure) already went
+    stale once. DATE every number you add here.
+
+    Returns "" when the DB is missing, injected_through is None, the window is
+    empty (before or after exclusion), or on any read error. Never raises.
+    """
+    if not injected_through:
+        return ""
+    try:
+        db_path = os.path.join(engram_home, "knowledge.db")
+        if not os.path.exists(db_path):
+            return ""
+
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, type, claim, recall_summary, created_at, "
+                "is_current, status FROM nodes "
+                "WHERE created_at >= ? ORDER BY created_at ASC",
+                (injected_through,),
+            ).fetchall()
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        if not rows:
+            return ""
+
+        entries = []
+        for row in rows:
+            claim = (row["claim"] or "").strip()
+            recall_summary = (row["recall_summary"] or "").strip()
+            # Property-based exclusion (not type-based) — see docstring.
+            if not (claim or recall_summary):
+                continue
+            text = recall_summary if recall_summary else claim[:100]
+            entries.append((row["id"], row["type"], text, _liveness_tag(row)))
+
+        if not entries:
+            return ""
+
+        total = len(entries)
+        display_entries = entries[:CHECKPOINT_LIST_CAP]
+        remaining = total - len(display_entries)
+
+        header = f"[Nodes created since checkpoint ({injected_through}) — {total} node(s)]:"
+        block_lines = [header]
+        for node_id, node_type, text, liveness in display_entries:
+            block_lines.append(f"  - [{node_id}] ({node_type}){liveness} {text}")
+        if remaining > 0:
+            block_lines.append(f"  ... +{remaining} more")
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface checkpoint-block errors at session start.
+        return ""
+
+
+HISTORY_ARC_CHAR_CAP = 32000
+# 2026-08-15: now a two-seat sample, not a single-seat one — the original
+# 16000 was reasoned from this seat's own history files alone (largest
+# observed 8413 bytes, 2026-06-21) and Ariadne's review measured against her
+# own seat's files found it too small: her heaviest single day is 42,760
+# bytes (2026-08-08), median around 5.4KB, but with a long, asymmetric tail
+# — the heavy days are exactly the days worth reading after a compaction.
+# 16000 would have elided roughly two-thirds of her heaviest day. Both
+# samples are anthropic:opus lineage, dated 2026-08-15 — noted here as a
+# confound (Ariadne's own request): the two seats sharing a model family
+# means this is still not evidence the number holds across model families,
+# only that it holds across two same-family seats. Same discipline as
+# CHECKPOINT_LIST_CAP's in-file numbers above: date it, and say plainly
+# what kind of evidence backs it — an undated in-file measurement on this
+# same hook (a #1819 comment) already went stale once and misled a reader
+# earlier today; don't repeat that here.
+
+_HISTORY_FILE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
+
+
+def _history_arc_header(filename: str, timestamp: str) -> str:
+    """Build the arc-block header for a resolved, non-empty history file,
+    naming the file rather than asserting a day (Ariadne's correction,
+    gh#2026 WS2): "today" can be WRONG at the exact boundary this
+    workstream exists to handle correctly (a post-midnight compact), while
+    the filename -- whichever one newest-by-filename resolution picked --
+    is always right. The framing clause ("already lived, not a to-do
+    list") is what discharges the yesterday/today speech-act confusion
+    this workstream exists to fix -- that part is unchanged and
+    load-bearing; only the day-claiming word is gone.
+    """
+    return (
+        f"📅 Most recent arc — {filename}, last entry {timestamp}. "
+        "Already lived, not a to-do list:"
+    )
+
+
+def history_arc_block(engram_home: str) -> str:
+    """Render today's history-file arc for post-compact SessionStart (#2026 WS2).
+
+    Design context (Ariadne's doc, gh#2026 "Design: WS2"; this function
+    builds §5 of it):
+
+    Today's history file means two different things depending on WHEN it is
+    read. On a fresh terminal (source=="startup") the newest history file is
+    YESTERDAY's — a handover, things already done, some implying work still
+    outstanding. On a mid-day post-compact wake (source=="compact") the
+    newest history file is TODAY's — an arc already lived, nothing left to
+    do about it. Same file, same content, opposite speech act, and nothing
+    in the file itself says which. Injecting the content without fixing
+    this would just relocate the framing-confusion bug from "the agent
+    decides whether to read it" to "the agent decides how to read it" — so
+    the header text below ("already lived, not a to-do list") is not
+    decoration, it is the fix. It is deliberately built into the rendered
+    block itself, never left to the reading agent's own interpretation.
+
+    "Today" resolution — newest-by-filename, not mtime (corrected 2026-08-15,
+    Ariadne's review, gh#2026 WS2; this function originally resolved by
+    mtime instead, and that was wrong). The builder's original reasoning
+    for mtime was the midnight-rollover case: resolving "today" by filename
+    match (YYYY-MM-DD.md == today's wall-clock date) breaks exactly when a
+    session runs past midnight, because the burst that was just compacted
+    may live in YESTERDAY's file by wall-clock-today. But mtime turns out
+    to fail on a DIFFERENT, more common case than the one it was chosen to
+    handle: a maintenance process (a dream-cycle backfill, a consolidation
+    pass) touching an OLDER history file's mtime bumps it later than
+    today's own file's mtime, so mtime-selection picks the wrong file —
+    and this is a real, currently-occurring pattern, not a hypothetical
+    edge case. Newest-by-filename (the highest-sorting YYYY-MM-DD.md that
+    exists) resolves the midnight-rollover case it was originally chosen to
+    handle just as well, with no special case needed — it falls back to
+    yesterday's file naturally, purely because the glob won't find today's
+    file until it exists — while also being immune to the backfill-mtime
+    trap that plain mtime is not. It is the one rule that is right in both
+    windows.
+
+    Boundary timestamp — computed fresh, never stored (design §4, Kepler's
+    argument, quoted because it is the argument someone needs when they
+    re-open the question): "a stored gap is wrong by exactly the age of the
+    marker; a stored timestamp never is." So this function persists nothing
+    of its own; it reads the resolved file's own os.path.getmtime() at
+    render time, every call, and reports that raw signal rather than a
+    precomputed "N minutes ago" derivation that would go stale the moment
+    it was written.
+
+    No shared header with session_checkpoint_block()'s WS1 block (builder
+    decision, matching Ariadne's own stated lean in §7 of her doc: "a
+    shared header implies a shared boundary, which is exactly the coupling
+    we are avoiding"). This block states its own boundary and is rendered
+    immediately adjacent to WS1's, in main() — neither function knows the
+    other exists.
+
+    Sizing: injects the file's own content (the "digest" per design §5.5),
+    capped at HISTORY_ARC_CHAR_CAP with an explicit elision line — never
+    silent truncation. Where a same-basename `-details.md` sidecar exists,
+    the elision line points at it rather than inlining its content (mirrors
+    the checkpoint-node-list's recall_summary-over-full-claim preference:
+    point at the fuller record rather than dumping it into every render).
+
+    Distinguishing "nothing written yet" from "read failed" (design §5.4):
+    an absent history file, an empty (but existing) one, and a HISTORY_DIR
+    that doesn't exist yet at all are all legitimate "no history entries"
+    states and render an explicit line saying so — never "". "" is reserved
+    for a GENUINE read error (permission denied, a broken-symlink
+    HISTORY_DIR that exists-as-a-link but resolves to nothing): an absent
+    block must never be mistaken for a failed one, matching the same
+    principle session_checkpoint_block() states for the checkpoint list.
+
+    Fail-soft like every other block in this file: never raises. Pure read
+    — never writes any file, including its own boundary marker (there is
+    none to write, per the store-nothing rule above).
+    """
+    try:
+        history_dir = os.path.join(engram_home, "history")
+
+        # A HISTORY_DIR that is itself a dangling symlink is a genuine read
+        # error (the link exists but resolves to nothing) — distinct from a
+        # HISTORY_DIR that simply does not exist yet. os.path.isdir() alone
+        # cannot tell these apart (it follows the link, fails, and returns
+        # False either way), so the broken-symlink case is checked first.
+        if os.path.islink(history_dir) and not os.path.exists(history_dir):
+            return ""
+
+        if not os.path.isdir(history_dir):
+            return _history_no_entries_block(filename=None, mtime=None)
+
+        try:
+            names = os.listdir(history_dir)
+        except OSError:
+            # Genuine read error (e.g. permission denied on HISTORY_DIR
+            # itself) — distinct from "nothing written yet".
+            return ""
+
+        candidates = []
+        for name in names:
+            if not _HISTORY_FILE_RE.match(name):
+                continue
+            full = os.path.join(history_dir, name)
+            if not os.path.isfile(full):
+                continue
+            candidates.append(full)
+
+        if not candidates:
+            return _history_no_entries_block(filename=None, mtime=None)
+
+        try:
+            resolved = max(candidates)
+            mtime = os.path.getmtime(resolved)
+        except OSError:
+            return ""
+
+        try:
+            with open(resolved, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            return ""
+
+        stripped = content.strip()
+        if not stripped:
+            return _history_no_entries_block(
+                filename=os.path.basename(resolved), mtime=mtime
+            )
+
+        timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        header = _history_arc_header(os.path.basename(resolved), timestamp)
+
+        sidecar_path = resolved[: -len(".md")] + "-details.md"
+        has_sidecar = os.path.isfile(sidecar_path)
+        pointer_path = sidecar_path if has_sidecar else resolved
+
+        if len(stripped) <= HISTORY_ARC_CHAR_CAP:
+            return f"{header}\n{stripped}"
+
+        # Tail-slice, not head-slice: history files are chronological
+        # ascending (oldest entry first, newest last), and the header above
+        # advertises "Most recent arc" — so an over-cap file must keep the
+        # NEWEST HISTORY_ARC_CHAR_CAP chars and drop the oldest, never the
+        # reverse (gh#2052).
+        # start_idx > 0 is guaranteed by the `len(stripped) <= CAP` guard
+        # just above (this branch only runs when len(stripped) > CAP), so
+        # `stripped[start_idx - 1]` below never wraps to stripped[-1].
+        start_idx = len(stripped) - HISTORY_ARC_CHAR_CAP
+        tail = stripped[start_idx:]
+        if start_idx > 0 and stripped[start_idx - 1] != "\n":
+            # The raw tail slice lands mid-line; advance to the start of
+            # the next complete line so the kept content never opens on a
+            # fragment. This can only shrink the kept text, never grow it
+            # past the cap. If the tail contains no newline at all (one
+            # pathologically long line at least CAP chars long), there is
+            # no clean boundary to advance to -- fall back to the raw,
+            # possibly-ragged tail rather than returning nothing: a
+            # slightly ragged first line still shows the newest content,
+            # while an empty kept region would silently look like a
+            # normal trim and hide a real read failure behind the elision
+            # line's ordinary-looking wording.
+            newline_idx = tail.find("\n")
+            kept = tail[newline_idx + 1 :] if newline_idx != -1 else tail
+        else:
+            # The slice boundary already falls right after a newline, so
+            # the tail already starts on a complete line.
+            kept = tail
+        cut_chars = len(stripped) - len(kept)
+        elision = f"... [+{cut_chars} earlier chars elided — see {pointer_path}]"
+        return f"{header}\n{elision}\n{kept}"
+    except Exception:
+        # Hook discipline: never surface history-arc-block errors at session
+        # start.
+        return ""
+
+
+def _history_no_entries_block(filename: str | None, mtime: float | None) -> str:
+    """Render the explicit "no history entries" line for history_arc_block().
+
+    Two callers, two shades of "nothing yet": an EXISTING file whose content
+    is blank (filename + mtime are both real — the file's own name and
+    last-touch time) vs. no history file existing at all (filename and
+    mtime are both None — there is nothing to name or date). The first
+    still names the file and carries a boundary timestamp per design §4 ("a
+    coverage claim must name its own boundary"); the second has no file to
+    name a boundary FROM, so both the filename and the "(as of ...)" wording
+    are simply omitted rather than substituting a fabricated value (e.g.
+    "today", "now") that would misrepresent what the block actually covers.
+    This split is a builder judgment call not spelled out in the design
+    doc — flagged as such in the PR body.
+
+    Naming the file rather than claiming "today" is Ariadne's WS2
+    correction (gh#2026): whichever file newest-by-filename resolution
+    picked is always right, "today" is provably wrong at exactly the
+    post-midnight boundary this workstream exists to handle correctly.
+    """
+    if mtime is None:
+        return "📅 No history entries — no history files exist yet."
+    timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    return f"📅 No history entries — newest file is {filename}, empty (as of {timestamp})."
+
+
+def _resolve_tool_capability_index_path() -> str:
+    """Locate the generated tool-capability-index artifact (issue #1958).
+
+    The artifact is checked-in repo content that travels with server.py, not
+    engram_home data — so resolution mirrors _resolve_mcp_server_path's
+    colocation-first strategy rather than the engram_home-based lookups the
+    focus/starred blocks use. It ships as a ROOT-LEVEL file directly beside
+    server.py (not in a generated/ subdirectory) — build.py's plugin copier
+    only has prefix-specific sections for tools/, templates/, hooks/,
+    skills/, agents/, and output-styles/; a generated/ subdirectory would
+    fall through every one of them silently despite being declared in
+    packaging/tiers.json (the manifest test only checks that a role is
+    DECLARED, not that the copier actually implements it — see #1958's
+    PR discussion). Root-level (no "/" in the manifest path) is the one
+    category build.py's copier derives automatically from the manifest with
+    no hardcoded list, so that's where this artifact lives:
+
+      1. Plugin/flat layout: this hook lives at <runtime_dir>/hooks/<hook>.py
+         and server.py is colocated at <runtime_dir>/server.py, so the
+         artifact is expected at <runtime_dir>/tool_capability_index.txt.
+      2. Dev-repo layout: this hook lives at
+         src/engram/hooks/claude/<hook>.py, so the checked-in artifact is at
+         src/engram/tool_capability_index.txt — two directories up from the
+         hook's own directory.
+
+    Returns the first candidate that exists on disk, or the plugin-layout
+    candidate (unchecked) if neither exists — the caller's own
+    os.path.exists / read-failure handling degrades gracefully either way.
+    """
+    hook_dir = os.path.dirname(os.path.abspath(__file__))
+    runtime_dir = os.path.dirname(hook_dir)
+    candidates = [
+        os.path.join(runtime_dir, "tool_capability_index.txt"),
+        os.path.join(os.path.dirname(runtime_dir), "tool_capability_index.txt"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def tool_capability_index_block() -> str:
+    """Render the generated tool-capability index as a short prefixed section.
+
+    Reads the checked-in STATIC artifact produced by
+    tools/engram-generate-tool-capability-index.py (issue #1958) — this hook
+    is deliberately fastmcp-free (matches the existing engram-surface-hook.py
+    precedent of duplicating logic rather than importing server.py, which
+    would pull in fastmcp's ~150-package dependency chain) and never imports
+    server.py or TOOL_CAPABILITIES directly.
+
+    Each artifact line is "<tool_name>: <capability text>", one line per
+    registered tool, sorted by name. Rendered near-verbatim with a 2-space
+    indent under a short header.
+
+    Returns "" when the artifact is missing, unreadable, or empty — never
+    raises. SessionStart hooks must never crash the session over an optional
+    context surface; a missing/stale artifact just means the agent falls
+    back to ToolSearch schema fetches for capability discovery, same as
+    before this feature existed.
+    """
+    try:
+        path = _resolve_tool_capability_index_path()
+        if not os.path.exists(path):
+            return ""
+        with open(path, encoding="utf-8") as f:
+            raw_lines = [ln.rstrip("\n") for ln in f]
+        entries = [ln for ln in raw_lines if ln.strip()]
+        if not entries:
+            return ""
+
+        header = "ENGRAM tools — what each CAN do (fetch the schema for HOW):"
+        block_lines = [header] + [f"  {entry}" for entry in entries]
+        return "\n".join(block_lines)
+    except Exception:
+        # Hook discipline: never surface tool-capability-index errors at
+        # session start — this block is optional context, not load-bearing.
+        return ""
+
+
 SESSION_ROLE = os.environ.get("ENGRAM_SESSION_ROLE", "interactive").strip().lower()
 # Effective session role — updated by main() after write_marker() resolves CWD.
 # Starts equal to SESSION_ROLE (env-var), may be promoted to "fairy" by CWD detection.
@@ -901,6 +1624,10 @@ PIECE_C_MAX_LINE_CHARS = 140
 LAST_SLEEP_MARKER_PATH = os.path.join(SESSIONS_DIR, "last-sleep-success.json")
 ENGRAM_DB_PATH = os.path.join(ENGRAM_HOME, "knowledge.db")
 SLEEP_DEBT_HOURS_THRESHOLD = 28
+# Below this many new nodes since the last coordinated sleep, skip the
+# nudge even if hours_since exceeds the threshold above — a quiet day
+# (host was off, or genuinely idle) doesn't need a catch-up cycle.
+SLEEP_DEBT_MIN_NODES_THRESHOLD = 10
 # Node-count above which a missing marker is treated as a real anomaly
 # (mechanism-just-shipped, or marker accidentally deleted) rather than a
 # genuine first-ever boot. A fresh install has only a handful of seed
@@ -972,6 +1699,72 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
 
 
 def write_marker(hook_input: dict) -> dict | None:
+    """Write/refresh the per-session marker; also owns two checkpoint fields
+    consumed by session_checkpoint_block() (#2026 WS1).
+
+    `session_started_at` — written ONCE, on the first SessionStart for a
+    given session_id. Never clobbered thereafter, unlike `started_at`
+    below (still overwritten with now() on every SessionStart including
+    source=="compact" — that overwrite already destroys the pre-compaction
+    burst's start time for anything reading `started_at` alone; it's why
+    this field exists as a second, protected value). If an existing marker
+    for this session_id already carries `session_started_at`, it is carried
+    forward VERBATIM; otherwise it adopts this call's own `started_at`.
+
+    `injected_through` — "the start of the window the hook's own channel has
+    not yet injected" (Kepler's wording, #5506, quoted verbatim). (Renamed
+    from `checkpoint_at`, #2044 — Lei read the old name as a backup
+    timestamp; grep either name to find historical discussion.) This
+    function NEVER advances injected_through — it only ever carries forward
+    whatever value (possibly absent) the prior marker held. The only writer
+    of a NEW injected_through value is main()'s advance-after-inject step (see
+    main() and _persist_injected_through()), which runs strictly AFTER
+    session_checkpoint_block() has rendered for this turn — never before.
+    If the order inverted, a failed or partial render would leave a
+    boundary claiming coverage it never actually delivered, and the next
+    window would silently start too late (same discipline as the
+    forum/letter cursors' seed-on-successful-poll-only).
+
+    injected_through moves ONLY on SessionStart with source=="compact" — NOT
+    on nap. This was a genuinely contested design question (two senior
+    colleagues reached opposite answers) settled by measurement, not
+    intuition: advancing on nap would couple WS1's *floor* mechanism (this
+    field — a mechanical, always-fires guarantee) to WS3's *discipline*
+    mechanism (the nap routine — an authored, sometimes-thorough summary),
+    giving both the same blind spot, which is the one thing WS1 exists not
+    to have. Measured 2026-08-14: across a single real nap, a graph took 74
+    nodes that day, and 40 of them (54%) were created BEFORE the nap ran.
+    Naps run about once a day, so the rare-nap case makes the hidden window
+    LARGER if nap were allowed to advance it, not smaller. If a future
+    workstream (WS3) wants a nap-updatable arc pointer, that is a THIRD
+    field with its own name — never a repurposing of this one.
+
+    Pre-empting the post-WS2 version of the same argument: once WS2 ships
+    (history-file injection), the day's history arc IS present in the
+    post-compaction reader too, and someone will notice that and re-argue
+    that nap can advance injected_through after all, now that "the content is
+    covered elsewhere." The answer stays no. The history arc is AUTHORED
+    coverage — as complete as the nap chose to write it, no more. The node
+    list this field gates is MECHANICAL coverage — every node, regardless
+    of whether anyone thought to mention it. Letting the mechanical
+    channel's window depend on the authored channel's quality re-couples
+    the floor to the discipline — the exact independence this workstream
+    exists to provide. The two channels are allowed to overlap in content;
+    neither's BOUNDARY may depend on the other's content.
+
+    Backward compatibility: existing marker files predating this field pair
+    have neither. Both are treated as absent-not-error, never as reason to
+    fail the write:
+      - missing session_started_at -> adopt this call's own started_at.
+      - missing injected_through -> carried forward as absent (still None) by
+        THIS function; session_checkpoint_block() renders nothing for that
+        turn (see its own docstring — it never falls back to "beginning of
+        time"), and main()'s advance-after-inject step seeds a fresh value
+        after that empty render completes — on ANY source, not just
+        source=="compact", because a field that could only ever be seeded
+        on a compact event might go unseeded indefinitely for a session
+        that never compacts before ending.
+    """
     session_id = hook_input.get("session_id")
     transcript_path = hook_input.get("transcript_path")
     if not session_id or not transcript_path:
@@ -983,14 +1776,45 @@ def write_marker(hook_input: dict) -> dict | None:
     _cwd_val = hook_input.get("cwd") or ""
     if _effective_role == "interactive" and _FAIRY_CWD_RE.search(_cwd_val):
         _effective_role = "fairy"
+
+    session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+    # Carry forward session_started_at + injected_through from any existing
+    # marker for this session_id (see docstring above). Absence of a prior
+    # marker (first-ever SessionStart) and an unreadable/corrupt prior
+    # marker are both treated the same way: nothing to carry forward.
+    _existing_session_started_at = None
+    _existing_injected_through = None
+    _existing_started_at = None
+    try:
+        with open(session_marker_path) as _existing_f:
+            _existing_marker = json.load(_existing_f)
+        if isinstance(_existing_marker, dict):
+            _existing_session_started_at = _existing_marker.get("session_started_at")
+            _existing_injected_through = _existing_marker.get("injected_through")
+            _existing_started_at = _existing_marker.get("started_at")
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+
+    _started_at = datetime.now(timezone.utc).isoformat()
     marker = {
         "session_id": session_id,
         "transcript_path": transcript_path,
         "source": hook_input.get("source"),
         "cwd": hook_input.get("cwd"),
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": _started_at,
         "role": _effective_role,
         "purpose": SESSION_PURPOSE or DEFAULT_PURPOSES.get(_effective_role, _effective_role),
+        # Legacy-upgrade order matters and is not cosmetic: a marker predating
+        # this field still holds a `started_at` written at the PREVIOUS
+        # SessionStart, which for a session that has not yet compacted IS its
+        # true start. Adopting now() there would discard the one piece of real
+        # history the old marker carries, so the prior `started_at` is
+        # preferred over now() and only a wholly-absent marker falls through.
+        "session_started_at": (
+            _existing_session_started_at or _existing_started_at or _started_at
+        ),
+        "injected_through": _existing_injected_through,
     }
     try:
         # Per-session marker keyed by session_id. Concurrent sessions own
@@ -1008,12 +1832,58 @@ def write_marker(hook_input: dict) -> dict | None:
             prune_stale_session_markers(session_id)
         except Exception as exc:
             print(f"[engram-session-start] prune: unexpected error, skipped: {exc}", file=sys.stderr)
-        session_marker_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
-        with open(session_marker_path, "w") as f:
-            json.dump(marker, f)
+        atomic_write_json(session_marker_path, marker)
     except OSError:
         return None
     return marker
+
+
+def _persist_injected_through(engram_home: str, session_id: str, new_injected_through: str) -> None:
+    """Persist an advanced injected_through to the per-session marker file.
+
+    Called ONLY from main(), strictly AFTER session_checkpoint_block() has
+    already rendered for this SessionStart (advance-after-inject invariant
+    — see write_marker()'s docstring). If the file can't be read back, the
+    checkpoint simply doesn't move this turn — an unadvanced boundary
+    under-covers less badly than a falsely-advanced one that claims
+    coverage it never actually rendered.
+
+    Re-reading the marker rather than patching an in-memory copy avoids
+    clobbering with THIS invocation's already-stale `marker` dict. Stated
+    precisely because it is easy to over-claim: it does NOT close the
+    read-modify-write race against a genuinely concurrent writer to the
+    same path — two processes can still interleave read/read/write/write
+    and the later write wins. That residual race is accepted; per-session
+    markers are keyed by session_id and a second writer to the same
+    session_id is not a case this hook is designed around.
+
+    The write itself IS atomic, via `_hooklib.atomic_write_json` (temp file
+    in the same directory + os.replace), matching the registry and
+    config.json writes elsewhere in this file, and that part is not
+    optional. This hook runs under a 5s harness timeout and is KILLED on
+    overrun — see main()'s ordering invariant — so a plain truncate-and-write
+    can leave a torn marker. A torn marker reads as corrupt, write_marker()
+    then treats it as absent, and injected_through silently reseeds to now(): a
+    GAP in the continuity window, which is the one direction this whole
+    workstream exists to rule out. Overlap is the safe error; a gap is not.
+
+    Fail-soft: any exception is swallowed. Must never raise — called from
+    the cheap tier of SessionStart, same discipline as every other block
+    there.
+    """
+    try:
+        marker_path = os.path.join(engram_home, "sessions", f"{session_id}.json")
+        with open(marker_path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        data["injected_through"] = new_injected_through
+        # Atomic write via the shared helper (gh#2035) -- same guarantee as
+        # before (temp file in same dir + os.replace), now via the single
+        # named convention instead of a hand-rolled copy of it.
+        atomic_write_json(marker_path, data)
+    except Exception:
+        pass
 
 
 def piece_c_git_log() -> str:
@@ -1065,9 +1935,18 @@ def sleep_status_block() -> str:
     The decision to run /engram-sleep stays with the user — this just
     surfaces the data so the user can choose case-by-case.
 
-    Three paths:
+    Four paths:
       - Marker fresh (≤ threshold): silent.
       - Marker stale (> threshold): banner with hours-since and nodes-added.
+      - Marker stale but nodes_since below SLEEP_DEBT_MIN_NODES_THRESHOLD:
+        silent (quiet day, no catch-up needed). Note nodes_since is a
+        creation-count proxy for consolidation debt, not a mutation-count
+        one — a day with few new nodes but heavy supersede/retract/cascade
+        activity (what dream_lottery.py's edit_history-based urgency
+        measures) is not distinguished by this guard. Measured against one
+        real graph across 9 days (PR #1996 review) and creation tracked
+        cascade-edit volume closely with no false-suppression case found,
+        but a correction-heavy, low-filing day is the untested edge.
       - Marker missing on established DB (> SLEEP_BASELINE_NODE_THRESHOLD):
         banner asking the user to run /engram-sleep to establish a baseline.
         Genuine first-ever boot (DB below threshold) stays silent.
@@ -1127,6 +2006,8 @@ def sleep_status_block() -> str:
         conn.close()
     except sqlite3.Error:
         pass
+    if nodes_since is not None and nodes_since < SLEEP_DEBT_MIN_NODES_THRESHOLD:
+        return ""
     nodes_part = (
         f"{nodes_since} nodes added since"
         if nodes_since is not None
@@ -1371,8 +2252,10 @@ def forum_monitor_block() -> str:
         "session-scoped and must be re-armed each startup):\n"
         f'  Call Monitor(command="bash {script_path}", persistent=true)\n'
         "  This wakes you within ~30s on direct @-mentions to your agent name. "
-        "The script self-guards against duplicate instances (last-arm-wins). "
-        "See engram-collaborating-loop skill §Mechanism 3a."
+        "The script never kills (#1933): it WARNS on arm — either naming a "
+        "confirmed duplicate's pid, which you hand-kill if genuinely stale, or "
+        "saying it could NOT verify a pid, which means investigate rather than "
+        "assume. See engram-collaborating-loop skill §Mechanism 3a."
     )
 
 
@@ -1421,9 +2304,11 @@ def forum_updates_monitor_block() -> str:
         "session-scoped and must be re-armed each startup):\n"
         f'  Call Monitor(command="bash {script_path} --kinds dm,baton", persistent=true)\n'
         "  This wakes you within ~30s on new DM + baton-turn-flip events over "
-        "the /api/updates coordination feed. The script self-guards against "
-        "duplicate instances (last-arm-wins). See engram-collaborating-loop "
-        "skill §Mechanism 3a."
+        "the /api/updates coordination feed. The script never kills (#1933): "
+        "it WARNS on arm — either naming a confirmed duplicate's pid, which "
+        "you hand-kill if genuinely stale, or saying it could NOT verify a "
+        "pid, which means investigate rather than assume. "
+        "See engram-collaborating-loop skill §Mechanism 3a."
     )
 
 
@@ -1634,15 +2519,71 @@ def main() -> None:
     else:
         lines.append(
             f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
-            "responding (relational context post-compact, per Compact "
-            "Instructions). Other Session Start Reading items can be skipped; "
-            "the compaction summary carries work-thread continuity.]"
+            "responding (relational context post-compact). The compaction "
+            "summary is a table-of-contents index into what happened, not a "
+            "full record — useful for navigating back to specifics, not as "
+            "your sole source of continuity. Today's arc below (if present) "
+            "is the fuller picture; ENGRAM nodes below that are the raw "
+            "claims.]"
         )
         lines.append(
             "⚡ A compaction just completed — your context window is fresh and your "
             "energy is refreshed. Any drowsiness figure carried in the summary is "
             "stale-on-arrival; disregard it. You have a full window to work."
         )
+        # History-arc injection (#2026 WS2) — pure filesystem read, does NOT
+        # depend on `marker` (unlike the WS1 checkpoint block below), so it
+        # is called unconditionally here. Rendered adjacent to WS1's
+        # checkpoint block by design (no shared header — see
+        # history_arc_block()'s docstring); both stay in the cheap tier,
+        # before the #1819 ordering-invariant divider, since recovering
+        # session context is the point of this epic and must not be at the
+        # mercy of blocks that are conveniences layered on top of it.
+        try:
+            _history_text = history_arc_block(ENGRAM_HOME)
+        except Exception:
+            _history_text = ""
+        if _history_text:
+            lines.append(_history_text)
+
+    # ── Session checkpoint / node-injection block (#2026 WS1) — placed
+    # BEFORE the #1819 ordering-invariant comment below, not merely early
+    # within its cheap tier: recovering session context across compaction
+    # is the entire point of this workstream, so its render must not be at
+    # the mercy of blocks that exist only as conveniences layered on top of
+    # it. It is nonetheless cheap by the same measure the divider cares
+    # about — a single indexed-free full-table-scan read, 1.2ms @ 2957
+    # nodes (2026-08-15, see session_checkpoint_block()'s docstring).
+    # injected_through's full lifecycle (definition, why nap must never
+    # advance it, why advance happens strictly after render) is documented
+    # on write_marker(); this is only the render-then-advance call site.
+    _checkpoint_advance_now = datetime.now(timezone.utc).isoformat()
+    if marker:
+        _injected_through_before = marker.get("injected_through")
+        try:
+            _checkpoint_text = session_checkpoint_block(ENGRAM_HOME, _injected_through_before)
+        except Exception:
+            _checkpoint_text = ""
+        if _checkpoint_text:
+            lines.append(_checkpoint_text)
+
+        # Advance-after-inject, strictly: persist a new injected_through ONLY
+        # after the render above has completed — whether or not it produced
+        # any text (an empty window is still a completed render, not a
+        # failed one; the guard below is about ORDER, not about the render
+        # succeeding non-emptily). Two distinct triggers:
+        #   - seed: injected_through was absent (legacy marker, or genuinely
+        #     first SessionStart for this session) — fires on ANY source.
+        #     A field that could only ever be seeded on source=="compact"
+        #     might go unseeded indefinitely for a session that never
+        #     compacts; "renders nothing this once" (session_checkpoint_
+        #     block's None-guard) already makes the no-window case safe.
+        #   - advance: injected_through was already present — fires ONLY on
+        #     source=="compact". NEVER on nap — nap is a different routine
+        #     entirely and never invokes this hook; see write_marker()'s
+        #     docstring for the measured 54% figure behind this gate.
+        if not _injected_through_before or source == "compact":
+            _persist_injected_through(ENGRAM_HOME, marker["session_id"], _checkpoint_advance_now)
 
     # ══ ORDERING INVARIANT (#1819) ═════════════════════════════════════════
     # This hook runs under a 5s harness timeout. If it overruns, the process is
@@ -1654,8 +2595,25 @@ def main() -> None:
     # that are expensive or depend on runtime state come LAST. A timeout then
     # costs only the optional tail instead of everything.
     #
-    # Measured on a real install (2026-07-25):
-    #     focus_block()              0.002s   (19,958 chars — free)
+    # Measured on a real install:
+    #     focus_block() TIME         ~0.002s   (2026-07-25 — still free; this
+    #                                invariant is about TIME, and TIME is
+    #                                what stays cheap as the graph grows)
+    #     focus_block() SIZE         19,958 chars (2026-07-25) -> 44,222 chars
+    #                                pre-dedup -> 30,139 chars post-dedup
+    #                                (2026-08-15, real graph, 15 focused nodes
+    #                                carrying only 10 distinct reasons) —
+    #                                SIZE is a token-budget concern, NOT what
+    #                                this invariant guards; tracked separately
+    #                                at engram-alpha#127. Repeated-reason
+    #                                dedup (this function, see docstring)
+    #                                cuts the duplicated-reason bytes but
+    #                                does not cap SIZE outright.
+    #                                Note the 3-week 19,958 -> 44,222 drift:
+    #                                nothing reports this block's growth, so
+    #                                DATE every number you add here. The
+    #                                stale figure above read as current for
+    #                                three weeks because it carried no date.
     #     starred_block()            local DB read
     #     calibration block          0.61s warm  (~79% of the hook's warm total
     #                                of 0.81s; dominated by EngramClient()
@@ -1690,6 +2648,17 @@ def main() -> None:
     except Exception:
         pass
 
+    # ── Saved focus-sets listing (cheap: single local DB read) ─────────────
+    # #1975 layer 1 — noetic "these exist" signal every session, directly
+    # after the live focus block. Pure read; same never-fail discipline as
+    # focus_block(). Empty table / DB-missing / any exception → nothing.
+    try:
+        _saved_sets = saved_focus_sets_block(ENGRAM_HOME)
+        if _saved_sets:
+            lines.append(_saved_sets)
+    except Exception:
+        pass
+
     # ── Starred letters surface (cheap: local read) ────────────────────────
     # Inject starred-letter pointers at both fresh-session (startup) and
     # post-compaction (compact/resume) so load-bearing cross-session agreements
@@ -1700,6 +2669,22 @@ def main() -> None:
         _starred = starred_block(ENGRAM_HOME)
         if _starred:
             lines.append(_starred)
+    except Exception:
+        pass
+
+    # ── Tool-capability index (cheap: single local static-file read) ───────
+    # Issue #1958: Claude Code defers MCP tool schemas, so an agent sees tool
+    # NAMES only at decision time — learning what a tool CAN do costs a full
+    # schema fetch. This block injects a checked-in, generated one-liner per
+    # tool (CAN, not HOW) so the agent can pick the right tool without a
+    # ToolSearch round trip. Reads a static text file only — no DB, no
+    # subprocess, no server.py/fastmcp import — so it belongs with the cheap
+    # local blocks per the #1819 ordering invariant. Silent skip on any
+    # failure or missing artifact — hook must not block session start.
+    try:
+        _tool_caps = tool_capability_index_block()
+        if _tool_caps:
+            lines.append(_tool_caps)
     except Exception:
         pass
 

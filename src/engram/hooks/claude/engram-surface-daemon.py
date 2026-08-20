@@ -252,24 +252,88 @@ def idle_watchdog(idle_timeout: int):
 
 
 def cleanup(*args):
-    """Remove socket and PID files on exit."""
+    """Remove socket and PID files on exit -- but only if PID_PATH still
+    names THIS process (#1874 colleague-review suggestion).
+
+    Without this guard, a delayed SIGTERM (this process was already
+    superseded -- e.g. start-engram-daemon.sh's reap loop killed it, but
+    it was slow to actually exit) could fire its cleanup AFTER a newer
+    instance already wrote its own fresh PID file and bound its socket,
+    deleting the NEW instance's files out from under it and reproducing
+    the exact "unreachable-but-alive" shape #1874 reported, via a
+    different mechanism than the one that PR actually fixes.
+    """
     _shutdown.set()
+    still_ours = False
     try:
-        os.unlink(SOCKET_PATH)
-    except FileNotFoundError:
-        pass
-    try:
-        os.unlink(PID_PATH)
-    except FileNotFoundError:
-        pass
+        with open(PID_PATH) as f:
+            still_ours = int(f.read().strip()) == os.getpid()
+    except (OSError, ValueError):
+        # No pidfile, or unreadable/garbage content -- nothing to protect,
+        # proceed with cleanup (matches the prior unconditional behavior
+        # for this case).
+        still_ours = True
+    if still_ours:
+        try:
+            os.unlink(SOCKET_PATH)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(PID_PATH)
+        except FileNotFoundError:
+            pass
     sys.exit(0)
+
+
+def _recorded_pid_is_alive() -> bool:
+    """Return True if PID_PATH names a process that is still running.
+
+    False for: PID_PATH absent, unreadable, non-integer content, or a PID
+    that signal 0 confirms is dead. Best-effort -- any error means "assume
+    dead" so a corrupt pidfile never blocks a fresh daemon from starting.
+    """
+    try:
+        with open(PID_PATH) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        # Any other errno (e.g. EPERM on a reused PID owned by someone
+        # else) -- treat as "not confirmably ours", same as dead.
+        return False
+    return True
 
 
 def main():
     global _client
 
-    # Remove stale socket
+    # #1874: only remove the socket if the PID it was bound by is
+    # confirmably dead. The prior unconditional unlink let a fresh daemon
+    # silently steal the path out from under a still-alive prior instance
+    # -- that instance keeps running (holding its open, now-unlinked file
+    # descriptor and any resources it owns) but is no longer reachable via
+    # the well-known path, which is exactly the "orphaned-but-alive"
+    # shape #1874 found (9 simultaneous processes, only one ever actually
+    # serving requests). start-engram-daemon.sh's own reap (same issue)
+    # is the primary defense; this is the second, independent layer for
+    # any other launch path that skips that script.
     if os.path.exists(SOCKET_PATH):
+        if _recorded_pid_is_alive():
+            # A confirmably-live prior instance still owns this socket.
+            # start-engram-daemon.sh's reap should have killed it before
+            # ever launching us, so reaching this path means a DIFFERENT
+            # launcher started this process directly. Back off rather
+            # than steal the path out from under a working daemon.
+            print(
+                "[engram-daemon] a live daemon already owns "
+                f"{SOCKET_PATH} -- exiting rather than steal it",
+                file=sys.stderr,
+            )
+            sys.exit(0)
         try:
             os.unlink(SOCKET_PATH)
         except OSError:

@@ -87,6 +87,55 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
         # Question-specific
         "question_category",
         "question_lacks",
+        # Question-sweep bookkeeping — when a question was last deliberately
+        # assessed for resolvability. Distinct from recall_turn (any access).
+        "last_assessed_turn",
+        "last_assessed_at",
+        # Focus mode — which nodes are pinned to survive compaction, and why.
+        "focused_at",
+        "focus_reason",
+        # Standpoint (provenance-uniformity) axes. These exist precisely to be
+        # reasoned about in AGGREGATE ("how diverse is the evidence under this
+        # claim?"), which is a population question — so leaving them
+        # unfilterable made the whole axis reachable only by raw SQL. See #1955.
+        "standpoint_author_id",
+        "standpoint_collection_id",
+        "standpoint_override_tag",
+        "standpoint_lineage",
+        "standpoint_architecture",
+        # Falsification-sensitivity class (re-executable | frozen).
+        "fs_class",
+    }
+)
+
+
+# Real `nodes` columns that are DELIBERATELY not filterable, each with the
+# reason. This set exists so that "internal on purpose" and "somebody forgot"
+# stop being indistinguishable — the drift test (tests/test_filter_field_
+# coverage.py) asserts every real column is in exactly one of these two sets,
+# so a newly-added column fails CI until someone decides which it is.
+#
+# The standpoint columns were added by the standpoint-v3 work and silently
+# missed here for months, while the trust-tier columns added around the same
+# time WERE remembered — same discipline, opposite outcomes, which is the
+# signature of a hand-maintained allowlist rather than a one-off oversight.
+DELIBERATELY_NOT_FILTERABLE: frozenset[str] = frozenset(
+    {
+        # Binary vector blob — not meaningfully comparable via SQL scalar ops.
+        "embedding",
+        # JSON blobs. Filtering their raw serialized text would match on
+        # incidental key ordering and escaping rather than on meaning; proper
+        # support needs JSON-path operators, which is a separate change.
+        "metadata",
+        "confidence_history",
+        # Context-provenance instrumentation captured at write time for the
+        # accumulation-hypothesis study. Internal measurement, not a claim
+        # property agents query by.
+        "ctx_claude_md_sha",
+        "ctx_skill_md_sha",
+        "ctx_turn",
+        "ctx_session_id",
+        "ctx_had_prior_summary",
     }
 )
 

@@ -15,11 +15,26 @@ connections saw a stale snapshot (split-brain WAL-index).  At session teardown
 the dying server's final checkpoint truncated the main DB 31 pages short of its
 header — total corruption, recovered only via the per-checkpoint SQL dump.
 
+That framing is read-side only, and it is incomplete: the same window is also a
+**write-durability** hazard.  On 2026-08-07 (alpha#1947) two observations filed
+through the degraded server returned full success payloads — status `created`,
+node id, evidence id, computed confidence, dedup neighbours — the same as any
+other successful write.  Both were silently lost when the server was replaced:
+the graph's max observation id rolled back on restart, and the emergency dump
+predated the writes, so it did not rescue them either.  A caller filing during
+split-brain has no way to tell a durable write from a doomed one — the "6 hours"
+figure should be read as write exposure, not merely stale-read exposure.
+
 This module:
   - detect_shm_displacement()  — inode-compare check via /proc/self/fd/
   - write_degraded_marker()    — atomic marker write
   - read_degraded_marker()     — read the marker (returns None when absent)
   - clear_degraded_marker()    — remove the marker
+  - recovery_block()           — structured recovery guidance (#1947), also
+                                  embedded in write_degraded_marker()'s output
+  - recovery_banner_text()     — compact prose form of the same guidance, used
+                                  by engram_core's CRITICAL log line and the
+                                  SUBSTRATE DEGRADED banner
 """
 
 from __future__ import annotations
@@ -30,6 +45,67 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Recovery guidance (#1947)
+# ---------------------------------------------------------------------------
+# Single source of truth for the recovery instruction, shared by:
+#   - engram_core._walguard_startup_clear's "[walguard] CRITICAL: ..." log line
+#   - engram_core._walguard_degraded_banner's "SUBSTRATE DEGRADED" banner
+#   - write_degraded_marker()'s structured "recovery" key
+# so the three can never drift out of sync (alpha#1947 slice A/B — the prior
+# "request a clean MCP restart" wording named only one of the two long-lived
+# holders of knowledge.db; the surface daemon is the other, and recovery
+# requires BOTH to release the DB).
+
+_RECOVERY_ISSUE_URL = "https://github.com/engram-agents/engram/issues/786"
+
+_RECOVERY_CONDITION = (
+    "every process holding knowledge.db must release it; a displaced "
+    "WAL-index cannot be rebuilt while any connection is open"
+)
+
+_RECOVERY_STEPS: list[str] = [
+    "restart the MCP server (/mcp reconnect)",
+    "stop the surface daemon: kill -TERM $(cat ~/.engram/recall-daemon.pid)",
+    'restart it: bash "$CLAUDE_PLUGIN_ROOT/hooks/start-engram-daemon.sh"',
+    'VERIFY before believing it worked: sqlite3 ~/.engram/knowledge.db '
+    '"select count(*) from nodes" must succeed -- a reconnect that reports '
+    'success is NOT evidence the index recovered',
+]
+
+_RECOVERY_VERIFY = 'sqlite3 <db_path> "select count(*) from nodes"'
+
+
+def recovery_block() -> dict:
+    """Structured recovery guidance (#1947), embedded verbatim in the degraded
+    marker's "recovery" key.  Built from the same constants as
+    recovery_banner_text() so the marker and the log/banner text can never
+    drift out of sync.
+    """
+    return {
+        "condition": _RECOVERY_CONDITION,
+        "steps": list(_RECOVERY_STEPS),
+        "verify": _RECOVERY_VERIFY,
+        "issue": _RECOVERY_ISSUE_URL,
+    }
+
+
+def recovery_banner_text() -> str:
+    """Compact prose form of the same recovery guidance as recovery_block(),
+    for the CRITICAL stderr log line and the SUBSTRATE DEGRADED banner.
+
+    Names every long-lived holder (MCP server AND the surface daemon) and
+    ends with a verify step — the two gaps that cost ~20 extra minutes on
+    2026-08-07 (alpha#1947): the operator restarted only the MCP server and
+    had no stated way to check whether the remedy actually worked.
+    """
+    numbered = "; ".join(f"({i}) {step}" for i, step in enumerate(_RECOVERY_STEPS, 1))
+    return (
+        f"Recovery requires EVERY holder to release the DB, not just the MCP "
+        f"server: {numbered}. (#786)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +237,9 @@ def write_degraded_marker(
           "dump_sha":            str | null,   # git SHA of the emergency dump commit
           "last_emergency_dump": str | null,   # UTC ISO-8601 of most recent dump attempt
           "details":             dict,         # full detection dict + any dump_info
+          "recovery":            dict,         # recovery_block() (#1947) — condition,
+                                                # steps, verify, issue; same source as
+                                                # the CRITICAL log line / degraded banner
         }
 
     Uses write-tmp + os.replace for atomicity (no partial-read window).
@@ -192,6 +271,7 @@ def write_degraded_marker(
         # touching detected_at (which must remain the original detection time).
         "last_emergency_dump": now_iso if dump_info is not None else None,
         "details": {**detection, **(dump_info or {})},
+        "recovery": recovery_block(),
     }
 
     # Atomic write: write to a sibling tmp file, then os.replace

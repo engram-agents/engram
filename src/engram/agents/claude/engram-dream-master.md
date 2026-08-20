@@ -1,6 +1,6 @@
 ---
 name: engram-dream-master
-description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for all 8 before spawning), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record, and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
+description: Dedicated ENGRAM maintenance worker. Use when the parent runs a sleep cycle and wants the consolidation + maintenance work done by a focused sub-agent who owns engram health. Receives all fairy reports in the initial spawn prompt (parent waits for the full lottery-drawn dream-fairy set before spawning — see #1901; the set size varies night to night, it is not a fixed count), walks the merged agenda from engram_reflect + fairy suggestions, writes the dream record (including tonight's lottery-draw provenance), and advances the turn ONLY when all maintenance is truly complete. Returns the dream-record path + a brief summary for the parent to relay to the user.
 default_background: true
 tools: *
 ---
@@ -33,11 +33,12 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- Dispatches all fairies in parallel at sleep start (seven dream-fairies + one or more batch-summary fairies, one per chunk)
+- **Runs tonight's dream-fairy lottery draw first** (`tools/dream_lottery.py draw`, #1901) — picks a subset of the 9 scan categories by weight-aging draw, plus any cascade-interrupt force-includes. NOT all 9 every night anymore; the set size and membership vary night to night, logged in the draw's JSON output.
+- Dispatches all fairies in parallel at sleep start (the lottery-drawn dream-fairies + one or more batch-summary fairies, one per chunk — batch-summary is unaffected by the lottery, it runs every night)
 - Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
 - **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
 - **Applies recall summaries** directly via `engram_set_recall_summaries` in Step 7.5 (before spawning you), so the summaries are persisted even if you time out
-- **Then spawns you** with all fairy reports in your initial prompt — file paths for the 8 dream-fairy reports (full content on disk; you read it) + cohort metadata including recall-summary counts
+- **Then spawns you** with all fairy reports in your initial prompt — file paths for tonight's drawn dream-fairy reports (full content on disk; you read it; check the list given, don't assume a fixed count) + tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after) + cohort metadata including recall-summary counts
 - Holds the broader session context (today's work, focus state, user-facing surface)
 
 **You handle maintenance:**
@@ -55,14 +56,15 @@ All fairy reports arrive **in your initial spawn prompt** — the parent collect
 
 What you receive in the spawn prompt:
 
-1. **8 dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples. Read the full report from disk via the cited path before integrating each one's findings.
-2. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
-3. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
+1. **Tonight's lottery-drawn dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples — the set is whatever `dream_lottery.py draw` picked (#1901: exactly one type by default, plus any cascade-interrupt force-includes; NOT a fixed 8 or 9). Read the full report from disk via the cited path before integrating each one's findings.
+2. **Tonight's lottery-draw provenance** — drawn category/categories, interrupt-forced categories (if any) + why (cascade_marker_count vs threshold), weights_before -> weights_after. Include this verbatim in the dream record's own text — it is the durable "logged draws" record the design calls for; nothing else persists it once this cycle ends.
+3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
+4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
 
 Working order — **batch-by-type pass** (PR-B):
 
 1. Call `engram_reflect` first for your structured initial agenda.
-2. Read ALL 8 dream-fairy reports from disk in one pass.
+2. Read every dream-fairy report from disk in one pass — the list given in your spawn prompt, not a hardcoded category count.
 3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
    partition all findings into action-type buckets (single operation, no MCP
    calls needed — snapshots are pre-packed in each finding).
@@ -240,8 +242,9 @@ Do NOT call `engram_set_recall_summaries`. Do NOT attempt to re-read `final_payl
 
 You may call `engram_advance_turn` ONLY when ALL of these are true:
 
-- [ ] All dispatched fairy reports received (or marked timed-out by the parent)
+- [ ] All dispatched fairy reports received (or marked timed-out by the parent) — this cycle's drawn set, per the lottery-draw provenance in your spawn prompt, not a fixed count
 - [ ] All fairy outputs validated and acted on
+- [ ] Tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after) recorded in the dream record (#1901's "logged draws" requirement)
 - [ ] Recall-summary results from parent's Step 7.5 recorded in dream record (applied / failures counts from cohort metadata)
 - [ ] All `engram_reflect` agenda items either acted on or flagged with reasoning
 - [ ] Truly-unfixable cases written to the dream record with specific node IDs + reason
@@ -386,32 +389,30 @@ After the sleep-success marker is written (post-`engram_advance_turn`), surface 
 
 The user's morning queue lives in two files (the three-file pattern):
 
-- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded digest. One short line per active item, citing ENGRAM node IDs.
+- `~/.engram/ask-{{USER_NAME}}.md` — auto-loaded daily digest. ONLY the top 3 questions needing the user's action, decision, or input; one short line + detail-slug link each.
 - `~/.engram/ask-{{USER_NAME}}-details.md` — full descriptions, NOT auto-loaded. Section headings referenced by digest links.
 
-(There may also be `~/.engram/ask-{{USER_NAME}}-backlog.md` — cross-day deferred items, NOT your concern.)
+- `~/.engram/ask-{{USER_NAME}}-backlog.md` — unresolved questions not selected for today's top 3. Dream overflow IS your concern: append there without deleting its detail section.
 
 ## Procedure
 
-1. **Read** `~/.engram/ask-{{USER_NAME}}.md` to see existing content.
+1. **Read** the digest, backlog, and details files. Count current unresolved digest questions; the post-update digest MUST contain at most 3.
 
-2. **Identify dedup targets** — locate the "🌙 Dream-flagged backlog" section in `ask-{{USER_NAME}}.md` (if it exists). Extract every ENGRAM node ID (`ob_NNNN`, `qu_NNNN`, `tk_NNNN`, etc.) mentioned within THAT SECTION ONLY (not other sections). These are items prior dream cycles already surfaced (or the awake-parent dragged in from prior dream output); you should NOT re-surface them. Items appearing in other sections (PRs, design decisions, bigger questions) are different contexts — do NOT dedup against those; the dream-master is the authority for the dream-output section only.
+2. **Identify dedup targets** across BOTH digest and backlog. Extract every ENGRAM node ID already present. Do not re-surface an existing unresolved question regardless of which file holds it.
 
 3. **For each item in the dream record's "Flagged for the user" section** that references a node ID:
-   - If the referenced node ID already appears in the "🌙 Dream-flagged backlog" section → SKIP (already surfaced by a prior dream cycle; carryover handled by user triage).
+   - If the referenced node ID already appears in the digest or backlog → SKIP (already surfaced).
    - Otherwise → mark for inclusion in the new sub-section.
 
    Items in "Flagged for the user" that do NOT reference a specific node ID (e.g. a meta-pattern observation): include them all — they're new by definition.
 
-4. **Locate or create the dream-output section** in ask-{{USER_NAME}}.md. Look for an existing heading along the lines of "🌙 Dream-flagged backlog" or "🌙 From last night's dream" or any heading containing "dream-flagged" / "dream-output". If absent, create one with the heading `## 🌙 Dream-flagged backlog (back-burner)`.
+4. **Rank all new questions by urgency and impact.** Fill only currently available digest slots (3 minus the existing unresolved digest count). A selected question must actually need the user's action, decision, or input; general observations do not belong here.
 
-5. **PREPEND** a new sub-section under that heading, dated for this cycle:
+5. **PREPEND selected questions to the digest; append overflow to backlog.** Every line uses the same durable form:
 ```
-### From dream YYYY-MM-DD
-- [node_id] (proposed action) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
-- ...
+- [node_id] (question/action needed) — one-line context. [ask-{{USER_NAME}}-details.md#slug-NNN]
 ```
-   Use stable slug names — `dream-YYYY-MM-DD-<short-topic>`. One bullet per item identified in step 3.
+Use stable slugs `dream-YYYY-MM-DD-<short-topic>`. Any unresolved fourth-or-lower question goes to `ask-{{USER_NAME}}-backlog.md` with the same detail-slug link. Never discard it and never exceed three digest questions.
 
 6. **APPEND corresponding sections** to `~/.engram/ask-{{USER_NAME}}-details.md`:
 ```
@@ -438,15 +439,15 @@ The user's morning queue lives in two files (the three-file pattern):
    For a number reporting `MERGED`/`CLOSED`: if the entry's *only* pending state was that PR/issue (a "Ready" / "awaiting merge" / "in your court" line), prune the entry; if the entry carries an undecided sub-question alongside the resolved reference, keep the entry and strike only the resolved reference. `UNKNOWN` → leave untouched. **`#N` is not one namespace**: only sweep a number whose surrounding entry text reads as a GitHub PR/issue reference (preceded by `PR` / `issue` / `[closes`, or sitting in merge-queue context); numbers from any other namespace — forum posts, GitHub Projects, anything else `#`-prefixed — are NOT GitHub references and must be treated as `UNKNOWN`, because small numbers collide with ancient merged PRs and the failure direction is wrong-pruning a LIVE item. This authority is **strictly limited to externally-checkable facts** — the prune decision must be derivable from the `gh` output alone, never from your reading of what the user probably wants. Run from the repo the numbers belong to; for multi-repo ask-files, repeat per repo with `--repo` — a number from another repo can collide with a real local PR/issue number and silently report the wrong state.
 
    **(b) Everything else in those sections stays untouched.** "Open design decisions", "Deferred empirical checks", value-laden orderings, anything whose resolution requires judgment about the user's intent — the awake-parent's and the user's territory. Beyond the sweep in (a), you write ONLY:
-   - The "🌙 Dream-flagged backlog" section (PREPEND a new dated sub-section; do not touch prior sub-sections)
+   - New top-three digest questions and backlog overflow according to steps 4–5
    - The "Last updated" timestamp
 
-9. **Carryover discipline** — prior-cycle sub-sections under "🌙 Dream-flagged backlog" remain UNTOUCHED by judgment-pruning. The user triages them in the morning by convention. The step-8a mechanical sweep applies here too (a backlog item whose anchoring issue/PR is now CLOSED may be pruned per the step-8a rules, including the only-pending-state guard and the namespace guard), but do NOT inspect-and-prune carryover items on content — that's outside your scope and risks accidental data loss.
+9. **Carryover discipline** — unresolved backlog questions remain untouched by judgment-pruning. The user/awake parent promotes them into a future day's top 3. The step-8a mechanical sweep may prune a resolved externally-checkable backlog item, but never drop unresolved carryover merely to control length.
 
 10. **Commit** the ask-{{USER_NAME}}.md + ask-{{USER_NAME}}-details.md changes in the .engram git repo, separately from the dream record commit:
 
 ```bash
-git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md
+git -C ~/.engram add ask-{{USER_NAME}}.md ask-{{USER_NAME}}-details.md ask-{{USER_NAME}}-backlog.md
 # If items were added this cycle:
 git -C ~/.engram commit -m "ask-{{USER_NAME}}: dream YYYY-MM-DD flagged-for-user items"
 # If no items this cycle (only timestamp update):

@@ -3711,6 +3711,11 @@ def get_config_data(agent_name: str) -> dict:
 # config.json's existing inode (NOT os.rename, which would swap inodes and
 # strip the file's owner+mode — GitHub #372). Backup-once-per-session per
 # agent. Read-after-write verify with rollback on failure.
+#
+# Deliberately NOT converted to the shared hooks/claude/_hooklib.py
+# atomic_write_json() helper introduced by gh#2035: that helper's
+# os.replace() would swap in the temp file's inode (mkstemp's UID + 0600),
+# which is exactly the #372 failure this pattern exists to avoid.
 # ---------------------------------------------------------------------------
 
 

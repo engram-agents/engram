@@ -81,6 +81,46 @@ DEFAULT_DB = Path.home() / ".engram" / "knowledge.db"
 _NODE_COLUMNS = "id, type, claim, quoted_text, interpretation"
 
 
+class ForeignOwnedFileError(RuntimeError):
+    """Raised when a scratch file communicated between steps is owned by a
+    different uid than the current process.
+
+    On a shared multi-agent host, a fixed/predictable scratch path (bare
+    `/tmp/<generic-name>`) can be written by one agent, denied to a second
+    (mode 644 -> write forbidden, read permitted), and then silently *read*
+    by that second agent -- feeding one agent's node-ID cohort into another
+    agent's dispatch with no error at all (see #2075). Refusing to read a
+    file this process does not own converts that silent cross-agent read
+    into a loud, immediate failure instead.
+    """
+
+
+def _check_file_owner(path: Path) -> None:
+    """Fail loudly if `path` is not owned by the current process's uid.
+
+    Only meaningful on POSIX; `os.stat` is unavailable/meaningless on
+    platforms without a uid concept (e.g. Windows), so the check is skipped
+    there rather than raising a spurious error. NOTE (#2110 review): this
+    skip fails OPEN on such platforms — acceptable only because no Windows
+    install path exists today (Linux/macOS matrix); revisit toward
+    fail-closed if that ever changes.
+    """
+    if not hasattr(os, "getuid"):
+        return
+    st = os.stat(path)
+    file_uid = st.st_uid
+    my_uid = os.getuid()
+    if file_uid != my_uid:
+        raise ForeignOwnedFileError(
+            f"refusing to read {path}: owned by uid {file_uid}, "
+            f"this process is uid {my_uid}. This looks like a shared-/tmp "
+            f"scratch-filename collision with another agent (see #2075) -- "
+            f"the file may contain another agent's data, not yours. "
+            f"Use a per-agent path under $HOME/.engram/tmp/ instead of a "
+            f"shared, predictable /tmp path."
+        )
+
+
 def _fetch_nodes(db_path: Path, node_ids: list[str]) -> list[dict]:
     """Read node content from ENGRAM SQLite. Read-only; no MCP access."""
     if not db_path.exists():
@@ -210,6 +250,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         node_ids = [i.strip() for i in args.ids.split(",") if i.strip()]
     elif args.ids_file:
         ids_path = Path(args.ids_file)
+        # Guard against a shared/predictable scratch path silently handing
+        # us another agent's cohort (#2075) -- refuse a foreign-owned file
+        # rather than reading it.
+        _check_file_owner(ids_path)
         node_ids = [ln.strip() for ln in ids_path.read_text().splitlines() if ln.strip()]
     else:
         # Read from stdin
@@ -1097,7 +1141,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "prepare":
-        return cmd_prepare(args)
+        try:
+            return cmd_prepare(args)
+        except ForeignOwnedFileError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     elif args.command == "verify-in":
         return cmd_verify_in(args)
     elif args.command == "validate":

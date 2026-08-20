@@ -157,7 +157,7 @@ def _add_person_impl(
         meta_dict = {
             "name": name.strip(),
             "aliases": alias_list,
-            "special_moments": [],  # §3: initialized empty, max 7, rotate on cap
+            "special_moments": [],  # §3: initialized empty; see _SPECIAL_MOMENTS_CAP
             "field_traces": {},     # §2: mutable-field prior-value audit trail
         }
         if resolved_relation:
@@ -250,7 +250,25 @@ _PERSON_IMMUTABLE_FIELDS = frozenset({
 })
 
 # Max special_moments slots per person node (§3).
-_SPECIAL_MOMENTS_CAP = 7
+#
+# #1948: raised from 7 to 100 and decoupled from display. The original 7 was
+# a *render* budget enforced at the *write* layer — but #1940's rotating
+# display shows one moment per surfacing regardless of how many are stored,
+# so the write-side cap no longer buys anything for display purposes. The
+# remaining real cost is metadata blob size: the whole JSON is parsed on
+# every person-node read, and 100 entries x ~70 words is roughly 30-50KB per
+# read — worth bounding, not worth bounding at 7. 100 is the issue's own
+# suggested ceiling; nothing in the storage/read-cost analysis argues for a
+# different nearby number.
+#
+# At the ceiling, _add_special_moment_impl fails LOUD (returns {"error":...},
+# no DB write) rather than silently evicting the oldest entry — see #1948.
+# The old pop(0)-on-cap behavior discarded hand-written relational text with
+# no warning and (per #1948's own audit) frequently no about-edge either,
+# since the "about-edge preserved" comment that used to justify silent
+# eviction was empirically false for entries added without a prior
+# engram_link_about call.
+_SPECIAL_MOMENTS_CAP = 100
 
 
 def _update_person_impl(
@@ -451,9 +469,11 @@ def _add_special_moment_impl(
     """Add a special moment to a person node (§3 — called from link_about Stage 2).
 
     Appends {description, node_id, added_at} to metadata.special_moments.
-    Max 7 slots: when beyond cap, the oldest entry is removed from the list
-    (but the about-edge from that entry's node_id remains — the edge IS the
-    full history; special_moments is the highlights reel).
+    Cap is _SPECIAL_MOMENTS_CAP (100 as of #1948). At the cap, this returns
+    an error and does NOT modify special_moments — no silent eviction. The
+    caller must prune deliberately before retrying; see the error message
+    for details (as of #1948, no removal tool exists yet — see #1948's own
+    flagged gap).
 
     Validates that node_id references a real current node.
 
@@ -463,7 +483,9 @@ def _add_special_moment_impl(
         node_id: The observation or other node this moment is anchored to.
 
     Returns:
-        JSON with status and the updated special_moments list.
+        JSON with status and the updated special_moments list. On cap
+        failure, JSON with {"error": "..."} instead — special_moments is
+        left untouched.
     """
     if not person_id or not person_id.strip():
         return json.dumps({"error": "person_id is required."})
@@ -506,16 +528,35 @@ def _add_special_moment_impl(
         meta = json.loads(pn_row["metadata"] or "{}")
         moments = meta.get("special_moments", [])
 
+        # Hard ceiling — fail loud, no silent eviction (#1948). The prior
+        # behavior (moments.pop(0) on overflow) discarded hand-written
+        # relational text with no warning; this is the wrong failure mode
+        # at any cap value. Return before touching `moments` or `meta` so
+        # existing entries are guaranteed untouched on this path.
+        if len(moments) >= _SPECIAL_MOMENTS_CAP:
+            return json.dumps({
+                "error": (
+                    f"special_moments cap reached ({_SPECIAL_MOMENTS_CAP}) for "
+                    f"person '{person_id.strip()}'. No moment was added — the "
+                    f"existing {len(moments)} moments are unchanged (no silent "
+                    f"eviction; see #1948). To free a slot, prune deliberately. "
+                    f"NOTE: as of #1948, no engram tool exists to remove a "
+                    f"special_moments entry — this is a known gap. In the "
+                    f"meantime, review the person's special_moments (e.g. via "
+                    f"engram_inspect(view='deep')) and use direct graph-repair "
+                    f"access if a moment truly needs to be dropped."
+                ),
+                "person_id": person_id.strip(),
+                "cap": _SPECIAL_MOMENTS_CAP,
+                "slot_count": len(moments),
+            })
+
         now = core._now()
         new_entry = {
             "description": description.strip(),
             "node_id": node_id.strip(),
             "added_at": now,
         }
-
-        # Rotation: when at or above cap, remove oldest (about-edge stays).
-        if len(moments) >= _SPECIAL_MOMENTS_CAP:
-            moments.pop(0)  # oldest entry removed from highlights; about-edge preserved
 
         moments.append(new_entry)
         meta["special_moments"] = moments
@@ -539,6 +580,104 @@ def _add_special_moment_impl(
     finally:
         conn.close()
 
+
+# ---------------------------------------------------------------------------
+# special_moments about-edge backfill (#1948 item 4)
+# ---------------------------------------------------------------------------
+
+def _backfill_special_moment_about_edges(conn: sqlite3.Connection) -> int:
+    """One-time pass: create missing `about` edges for special_moments entries.
+
+    Every metadata.special_moments[].node_id on every live (type='person',
+    is_current=1) person node is supposed to have an `about` edge to its
+    person — but the historical write path (_add_special_moment_impl) never
+    guaranteed this. Entries added without a prior engram_link_about call
+    (or whose about-edge creation otherwise never happened) are silently
+    missing the edge. #1948's own audit found this true for 4 of 7 real
+    moments on a live graph — the "about-edge preserved" comment that used
+    to sit above the old rotation logic was empirically false for those.
+
+    For each qualifying (node_id, person_id) pair, creates an `about` edge
+    using the SAME insert SQL + idempotency mechanism as
+    engram_cornerstone.py's _link_about_impl (INSERT INTO edges ... VALUES
+    (?, ?, 'about', ?), guarded by both an explicit existence check and an
+    IntegrityError catch against the edges table's own
+    UNIQUE(source_id, target_id, relation) constraint) — the same
+    edge-creation path, not a second parallel one.
+
+    Skips moment entries whose node_id no longer exists in nodes at all
+    (dangling reference — cannot create an edge with a nonexistent source,
+    edges.source_id has a REFERENCES nodes(id) constraint). Deliberately
+    does NOT require the anchor to be is_current: a moment's anchor may
+    have been superseded since the moment was recorded, but the historical
+    about-edge should still be backfilled to the node id that was actually
+    cited at moment-creation time — is_current gating belongs to write-time
+    validation (_add_special_moment_impl), not to this historical-repair
+    pass.
+
+    Idempotent: running this twice creates zero additional edges the second
+    time (checked via existence-check + IntegrityError, either one alone
+    would suffice; both together made the intent explicit for reviewers).
+
+    Args:
+        conn: An open sqlite3.Connection (caller manages open/close).
+
+    Returns:
+        The count of `about` edges newly created. Commits only if any edges
+        were created (mirrors _backfill_resolved_by / _backfill_source_type
+        in engram_core.py).
+    """
+    person_rows = conn.execute(
+        "SELECT id, metadata FROM nodes WHERE type = 'person' AND is_current = 1"
+    ).fetchall()
+    if not person_rows:
+        return 0
+
+    now = core._now()
+    created = 0
+    for prow in person_rows:
+        person_id = prow["id"]
+        try:
+            meta = json.loads(prow["metadata"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        moments = meta.get("special_moments") or []
+        if not isinstance(moments, list):
+            continue
+        for moment in moments:
+            if not isinstance(moment, dict):
+                continue
+            anchor_id = moment.get("node_id")
+            if not anchor_id:
+                continue
+
+            anchor_exists = conn.execute(
+                "SELECT 1 FROM nodes WHERE id = ?", (anchor_id,)
+            ).fetchone()
+            if not anchor_exists:
+                continue  # dangling reference — cannot satisfy the FK
+
+            already = conn.execute(
+                "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+                "AND relation = 'about'",
+                (anchor_id, person_id),
+            ).fetchone()
+            if already:
+                continue
+
+            try:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) "
+                    "VALUES (?, ?, 'about', ?)",
+                    (anchor_id, person_id, now),
+                )
+                created += 1
+            except sqlite3.IntegrityError:
+                pass  # edge already exists (race / already-checked) — no-op
+
+    if created:
+        conn.commit()
+    return created
 
 
 # ---------------------------------------------------------------------------

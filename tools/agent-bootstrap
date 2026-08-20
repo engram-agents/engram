@@ -181,7 +181,7 @@ fi
 # ---------- 4.5. Python venv + ENGRAM dependencies ----------
 # Modern Debian/Ubuntu hosts enforce PEP 668 on system python3, so
 # pip-installing engram's requirements globally is rejected. Create a
-# per-newborn venv at ~/.engram-venv, install requirements there, and
+# per-newborn venv at ~/.engram/venv, install requirements there, and
 # wire .bashrc to auto-activate it so interactive shells and the
 # install.sh wrapper find the right python.
 
@@ -199,12 +199,13 @@ fi
 
 VENV_CREATED=0
 if [[ -n "$ALPHA_SOURCE" && -f "$ALPHA_SOURCE/requirements/requirements.txt" && "${SKIP_VENV}" != "1" ]]; then
-    echo "Creating Python venv at $USER_HOME/.engram-venv..."
-    sudo -u "$USER_NAME" python3 -m venv "$USER_HOME/.engram-venv"
+    echo "Creating Python venv at $USER_HOME/.engram/venv..."
+    sudo -u "$USER_NAME" mkdir -p "$USER_HOME/.engram"
+    sudo -u "$USER_NAME" python3 -m venv "$USER_HOME/.engram/venv"
     echo "Installing ENGRAM Python dependencies into venv..."
-    sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
+    sudo -u "$USER_NAME" "$USER_HOME/.engram/venv/bin/pip" install \
         --quiet --upgrade pip
-    sudo -u "$USER_NAME" "$USER_HOME/.engram-venv/bin/pip" install \
+    sudo -u "$USER_NAME" "$USER_HOME/.engram/venv/bin/pip" install \
         --quiet -r "$ALPHA_SOURCE/requirements/requirements.txt"
     VENV_CREATED=1
 
@@ -215,10 +216,10 @@ if [[ -n "$ALPHA_SOURCE" && -f "$ALPHA_SOURCE/requirements/requirements.txt" && 
     cat >>"$USER_HOME/.bashrc" <<'VENV'
 
 # Auto-activate ENGRAM venv (added by agent-bootstrap).
-# Per-newborn venv at ~/.engram-venv carries the alpha requirements;
+# Per-newborn venv at ~/.engram/venv carries the alpha requirements;
 # system python3 is PEP-668-locked on modern Debian/Ubuntu.
-if [[ -f "$HOME/.engram-venv/bin/activate" ]]; then
-    . "$HOME/.engram-venv/bin/activate"
+if [[ -f "$HOME/.engram/venv/bin/activate" ]]; then
+    . "$HOME/.engram/venv/bin/activate"
 fi
 VENV
 
@@ -236,8 +237,8 @@ p = pathlib.Path(sys.argv[1])
 txt = p.read_text()
 venv_block = (
     '# Auto-activate per-newborn ENGRAM venv if present.\n'
-    'if [[ -f "$HOME/.engram-venv/bin/activate" ]]; then\n'
-    '    . "$HOME/.engram-venv/bin/activate"\n'
+    'if [[ -f "$HOME/.engram/venv/bin/activate" ]]; then\n'
+    '    . "$HOME/.engram/venv/bin/activate"\n'
     'fi\n'
 )
 # Insert before the `INSTALLER=` line.
@@ -387,7 +388,7 @@ fi
 
 VENV_LINE="Python venv: (not created — ALPHA_SOURCE or requirements/requirements.txt missing)"
 if [[ "${VENV_CREATED:-0}" == "1" ]]; then
-    VENV_LINE="Python venv: $USER_HOME/.engram-venv (auto-activated via .bashrc)"
+    VENV_LINE="Python venv: $USER_HOME/.engram/venv (auto-activated via .bashrc)"
 fi
 
 cat <<NEXT

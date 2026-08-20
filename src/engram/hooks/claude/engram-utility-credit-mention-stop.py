@@ -102,6 +102,11 @@ _RUNTIME_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 if _RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _RUNTIME_DIR)
 
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _hooklib import atomic_write_json
+
 KNOWLEDGE_DB = os.path.join(ENGRAM_HOME, "knowledge.db")
 LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")
 
@@ -279,16 +284,13 @@ def _read_prompt_count(path: str = PROMPT_COUNTER_PATH) -> int:
 
 
 def _write_state_atomic(path: str, state: dict) -> None:
-    """tmp + os.replace write, matching the hooks' own atomic-write pattern
-    (#1698 slice 3 §2/§3) so a concurrent reader never sees a partial write.
-    Raises on failure — callers (here, `_check_enactments`'s own caller in
-    `credit_mentions`) wrap this in a best-effort try/except, per this file's
-    house rule that behavioral hooks must never block the session.
+    """Delegates to _hooklib.atomic_write_json() (tmp + os.replace) so a
+    concurrent reader never sees a partial write. Raises on failure —
+    callers (here, `_check_enactments`'s own caller in `credit_mentions`)
+    wrap this in a best-effort try/except, per this file's house rule that
+    behavioral hooks must never block the session.
     """
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, path)
+    atomic_write_json(path, state)
 
 
 def _emit_enactment(

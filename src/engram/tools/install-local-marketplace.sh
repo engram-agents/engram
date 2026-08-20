@@ -57,6 +57,27 @@ set -euo pipefail
 log() { printf '[install-local-marketplace] %s\n' "$*"; }
 die() { printf '[install-local-marketplace] ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Venv-provisioning failure flag + EXIT-trap surfacing. The installer has
+# several early `exit 0` short-circuits (--skip-add, codex-not-found, the
+# codex plugin path) that fire BEFORE the end of the script, so an end-of-
+# script check would be unreachable from those paths. A runtime-requirements
+# install failure (see the tier-aware venv block) must surface as a non-zero
+# exit on EVERY path — a successful exit over a venv that can't start the
+# server is the silent-broken-venv failure mode this PR exists to prevent
+# (Lei, 2026-08-10). The trap catches all exits; it is a no-op when the
+# venv block never flagged (the normal case).
+_venv_fail=0
+_venv_fail_trap() {
+  if [[ "${_venv_fail:-0}" == "1" ]]; then
+    log ""
+    log "ERROR: venv runtime-requirements provisioning failed."
+    log "       The MCP server may not start until the venv is repaired."
+    log "       Re-run this installer to retry, or inspect the pip output above."
+    exit 1
+  fi
+}
+trap _venv_fail_trap EXIT
+
 usage() {
   cat <<'EOF'
 Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch]
@@ -88,7 +109,7 @@ Or for Codex:
 
 To upgrade later:
   cd path/to/engram
-  git pull origin main
+  git pull
   bash tools/install-local-marketplace.sh    # builds + re-assembles, idempotent
   # then in Claude Code:
   /plugin marketplace update engram-local
@@ -298,6 +319,60 @@ if changed:
 PY
 fi
 
+# ── Tier-aware venv provisioning (Lei 2026-08-10, #576/#578) ──────────────────
+# Keep the runtime venv's installed packages in sync with the chosen install
+# tier on EVERY install/upgrade, so a new release that adds a dependency
+# auto-installs it instead of leaving the user's venv broken after upgrade
+# (Lei, 2026-08-10: "making the venv updated with the tier config in every
+# upgrade is actually the desired behavior").
+#
+# The venv lives at ~/.engram/venv/ — canonical since #578's plugin port
+# colocated all engram state under ENGRAM_HOME=~/.engram (per #576). The
+# pre-plugin ~/.engram-venv hyphen path was retired then; agent-bootstrap now
+# creates the venv at the same slash path.
+#
+# All tiers need the runtime requirements (fastmcp etc.) to run the server;
+# the dev tier additionally installs requirements-dev.txt (runtime + pytest)
+# so the local test runner (tools/run-all-tests.sh --engram-only) works out
+# of the box. `pip install -r` is a no-op when the installed versions already
+# satisfy the spec, so re-running on every upgrade is cheap and safe. Runs
+# for --skip-build callers too: a venv kept in sync is independent of whether
+# this run rebuilt the plugin tree.
+_ENGRAM_VENV_PY="$ENGRAM_HOME/venv/bin/python"
+if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
+  _eff_tier="$(python3 -c "import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get('install_tier','convenience'))
+except Exception:
+    print('convenience')
+" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+  [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
+  _runtime_req="$REPO_ROOT/requirements/requirements.txt"
+  if [[ -f "$_runtime_req" ]]; then
+    log "Provisioning venv at $ENGRAM_HOME/venv (tier: $_eff_tier)"
+    # A failed RUNTIME-requirements install leaves the MCP server unable to
+    # start — the exact "broken venv after upgrade" this block exists to
+    # prevent. We let the rest of the install complete (marketplace + hooks
+    # are already assembled) but flag it so the script exits non-zero at the
+    # end — unattended/cron upgrades key on exit code and would otherwise
+    # report success over a broken server (Lei, 2026-08-10).
+    "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_runtime_req" \
+      || { log "WARN: venv runtime-requirements install failed (continuing install; will exit non-zero)"; _venv_fail=1; }
+  fi
+  if [[ "$_eff_tier" == "dev" ]]; then
+    _dev_req="$REPO_ROOT/requirements/requirements-dev.txt"
+    if [[ -f "$_dev_req" ]]; then
+      log "Dev tier: installing test dependencies into $ENGRAM_HOME/venv"
+      # A failed DEV-requirements install (pytest etc.) only breaks the local
+      # test runner — the server still runs on the runtime reqs above. Failing
+      # the whole install over a missing test dep would block a working
+      # server update, so this is WARN-and-continue only (NOT flagged).
+      "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_dev_req" \
+        || log "WARN: venv dev-requirements install failed (continuing; server still runs)"
+    fi
+  fi
+fi
+
 # ── Hook-registration-change detection ────────────────────────────────────────
 # Claude Code only reloads the hook set on a FULL restart — /mcp reconnect
 # reloads the MCP server but NOT the hook registration.  If
@@ -330,17 +405,75 @@ if [[ "$TARGET" == "codex" ]]; then
     log "      Run manually in Codex: codex plugin add engram@engram-local"
     exit 0
   fi
-  log "Installing/updating plugin with Codex"
-  codex plugin add engram@engram-local
 
   CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+  # Normalize lexically (rather than resolving symlinks) before trusting the
+  # hook-provided cache root.  The compat cleanup below may remove and replace
+  # OLD_CODEX_PLUGIN_CACHE_DIR, so it must only ever receive a direct child of
+  # this plugin's versioned cache directory.
+  CODEX_CACHE_PARENT="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
+import os
+import sys
+print(os.path.abspath(os.path.normpath(sys.argv[1])))
+PY
+)"
+
+  # Resolve the active cache path BEFORE `codex plugin add`.  Codex may remove
+  # that directory while replacing its versioned cache, so discovering only
+  # after the add leaves no path to preserve for hooks in this live session.
+  # Prefer the hook-provided root when it is a direct child of this plugin's
+  # cache; otherwise, fall back to the newest development cache directory.
+  # A raw prefix check would accept traversal or nested paths and let the
+  # compat cleanup modify paths outside that set.  Plain release caches are
+  # not eligible fallbacks because this cleanup replaces its selected path.
+  OLD_CODEX_PLUGIN_CACHE_DIR=""
+  if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    NORMALIZED_CLAUDE_PLUGIN_ROOT="$(python3 - "$CLAUDE_PLUGIN_ROOT" <<'PY'
+import os
+import sys
+print(os.path.abspath(os.path.normpath(sys.argv[1])))
+PY
+)"
+    if [[ "$(dirname "$NORMALIZED_CLAUDE_PLUGIN_ROOT")" == "$CODEX_CACHE_PARENT" ]] && [[ -d "$NORMALIZED_CLAUDE_PLUGIN_ROOT" ]]; then
+      OLD_CODEX_PLUGIN_CACHE_DIR="$NORMALIZED_CLAUDE_PLUGIN_ROOT"
+    fi
+  fi
+  if [[ -z "$OLD_CODEX_PLUGIN_CACHE_DIR" && -d "$CODEX_CACHE_PARENT" ]]; then
+    OLD_CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+
+def version_key(name: str) -> tuple[int, ...]:
+    parts = re.split(r"[^0-9]+", name)
+    return tuple(int(part) for part in parts if part)
+
+candidates = [
+    os.path.join(root, name)
+    for name in os.listdir(root)
+    if re.fullmatch(r".+-dev\..+", name) and os.path.isdir(os.path.join(root, name))
+]
+if candidates:
+    candidates.sort(key=lambda path: (version_key(os.path.basename(path)), os.path.basename(path)))
+    print(candidates[-1])
+PY
+)"
+  fi
+  if [[ -n "$OLD_CODEX_PLUGIN_CACHE_DIR" ]]; then
+    log "Capturing active Codex cache path for in-session compat: $OLD_CODEX_PLUGIN_CACHE_DIR"
+  fi
+
+  log "Installing/updating plugin with Codex"
+  codex plugin add engram@engram-local
 
   # Codex 0.137.0 does not expand ${CLAUDE_PLUGIN_ROOT} in plugin .mcp.json
   # command strings at MCP startup.  Patch the installed cache entry to the
   # absolute cache path so the next session can spawn ENGRAM reliably.
   CODEX_PLUGIN_CACHE_DIR=""
-  if [[ -d "$CODEX_HOME/plugins/cache/engram-local/engram" ]]; then
-    CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
+  if [[ -d "$CODEX_CACHE_PARENT" ]]; then
+    CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re
 import sys
@@ -380,11 +513,22 @@ PY
       for old_dir in "$CACHE_PARENT"/*-dev.*; do
         [[ -e "$old_dir" || -L "$old_dir" ]] || continue
         [[ "$(basename "$old_dir")" == "$NEW_BASE" ]] && continue
+        [[ "$old_dir" == "$OLD_CODEX_PLUGIN_CACHE_DIR" ]] && continue
         log "Symlinking stale cache dir for in-session compat: $(basename "$old_dir") -> $NEW_BASE"
         rm -rf "$old_dir"
         ln -s "$CODEX_PLUGIN_CACHE_DIR" "$old_dir"
       done
       shopt -u nullglob
+
+      # The immediately preceding live cache can have been removed by `codex
+      # plugin add`, so it will not appear in the stale-dir scan above. Restore
+      # that exact path only after the new cache exists, including across
+      # consecutive dev upgrades where the prior compatibility link was gone.
+      if [[ -n "$OLD_CODEX_PLUGIN_CACHE_DIR" && "$OLD_CODEX_PLUGIN_CACHE_DIR" != "$CODEX_PLUGIN_CACHE_DIR" ]]; then
+        log "Symlinking prior live cache for in-session compat: $(basename "$OLD_CODEX_PLUGIN_CACHE_DIR") -> $NEW_BASE"
+        rm -rf "$OLD_CODEX_PLUGIN_CACHE_DIR"
+        ln -s "$CODEX_PLUGIN_CACHE_DIR" "$OLD_CODEX_PLUGIN_CACHE_DIR"
+      fi
     fi
   fi
 
@@ -452,7 +596,7 @@ if [[ "$TARGET" == "codex" ]]; then
   log ""
   log " To upgrade later in Codex:"
   log "   cd path/to/engram"
-  log "   git pull origin main"
+  log "   git pull"
   log "   bash tools/install-local-marketplace.sh --target codex"
 else
   log " Marketplace registered. Next steps (in a Claude Code session):"
@@ -474,7 +618,7 @@ else
   log ""
   log " To upgrade later:"
   log "   cd path/to/engram"
-  log "   git pull origin main"
+  log "   git pull"
   log "   bash tools/install-local-marketplace.sh"
   log "   # then in Claude Code:"
   log "   1. /plugin marketplace update engram-local"

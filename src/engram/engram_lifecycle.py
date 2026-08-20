@@ -22,8 +22,10 @@ Wave-3 structural note — diagnostic snapshot and calibration snapshot:
   the wrapper appends it.
 """
 
+import datetime
 import json
 import os
+import zoneinfo
 from pathlib import Path
 
 import engram_core as core
@@ -75,6 +77,140 @@ _REFLECT_LIST_ORDER = [
 # ---------------------------------------------------------------------------
 # Checkpoint logic (shared by nap + advance_turn)
 # ---------------------------------------------------------------------------
+
+def _append_nap_to_history(message: str) -> dict:
+    """Append a nap-cycle milestone line to today's history file (#2026 WS3).
+
+    Returns {"written": bool, "reason": str | None} -- never raises (see
+    clause (b) below for why this is a dict, not None).
+
+    (a) Additive-only, and orthogonal to hand-editing. This does NOT replace
+    the existing hand-written discipline for `~/.engram/history/YYYY-MM-DD.md`
+    (per each agent's own CLAUDE.md) — an agent can still hand-edit the file
+    for touch-ups, corrections, or richer entries either before or after this
+    call runs. This function only guarantees that *something* concise lands
+    for every nap, even if the agent forgets to hand-edit; it never reads,
+    parses, or reconciles against hand-written content, so there is no
+    interaction to get wrong.
+
+    Every auto-appended line is tagged `[auto-nap]` (Borges's amendment,
+    2026-08-15, empirically grounded — a day-long hand-writing trial showed
+    hand-written entries carry reasoning/corrections a nap `message` never
+    does, since `message` is composed at burst-end for a different purpose:
+    labelling a checkpoint, not narrating a day). Without the tag, a file
+    mixing hand-written and mechanical lines reads as uniformly "the day
+    was written down" when it may not have been — the exact class of
+    silently-reassuring surface this epic exists to eliminate, not
+    reintroduce. The tag makes the mechanical floor visually distinct from
+    the authored record at a glance, cheap now and unrecoverable once a
+    month of unmarked mixed entries exists.
+
+    (b) Fail-soft, but NOT silent (Ariadne's colleague-pass suggestion,
+    2026-08-15). A history-write failure (missing dir, unwritable disk,
+    lock failure, anything) must never fail the engram_nap call it's
+    attached to — nap's job is the checkpoint (session log, stats, snapshot
+    commit); this is a best-effort side effect layered on top. But
+    "guarantees that something concise lands for every nap" (clause (a))
+    is not actually true if a failed attempt is indistinguishable from a
+    successful one to the caller — a guaranteed side effect that can
+    silently not happen is worse than an unguaranteed one, because callers
+    stop checking. So this function returns `{"written": bool, "reason":
+    str | None}` rather than `None`; the caller (`_checkpoint_internal`)
+    attaches it to the checkpoint result as `result["history_write"]`,
+    mirroring how `_commit_snapshot`'s best-effort outcome is already
+    surfaced as `result["version_control"]`. The nap CONTRACT doesn't
+    change (never raises, never blocks the checkpoint) — only observability
+    does.
+
+    (c) Atomic write + flock. Reuses `core._with_state_lock` (see that
+    function's docstring) rather than reinventing a lock — this mirrors
+    `_reset_principle_enactments`'s exact pattern in engram_core.py: a
+    blocking flock around a read-modify-write closure, with a temp-file +
+    os.replace() swap so a concurrent hook-subprocess read of the history
+    file never observes a partial write, and a process-level lock so two
+    concurrent nap calls don't silently drop one side's line (lost-update).
+    This does NOT protect against a nap racing an agent's own hand-edit —
+    a hand-edit via a normal file-write tool never touches `lock_path` or
+    goes through this function, so flock provides no coverage for that
+    case (caught in reviewer-fairy round; an earlier draft of this
+    docstring overclaimed it did). `_with_state_lock` degrades to running
+    unlocked (never crashes, never skips the write) on a locking failure,
+    with a stderr tell. One deliberate hardening over the precedent: a
+    failure between the tmp write and os.replace() also removes the
+    now-orphaned .tmp file before re-raising (the precedent leaves it
+    behind on OSError), so a mid-write failure never leaves stray
+    .tmp litter in the history directory.
+
+    (d) Nap-only, deliberately. This is called only from the mode == "nap"
+    branch of `_checkpoint_internal`, never from the advance_turn/sleep path.
+    Sleep has its own separate end-of-day history rollup (hand-driven, per
+    `engram-sleep` Phase A Step 4) — that rollup is a full day-arc
+    reconciliation pass, not a mechanical per-call append, and is out of
+    scope for this change.
+
+    (e) Day boundary is America/New_York, not UTC (Ariadne's colleague-pass
+    blocker on this PR, 2026-08-15). UTC stamping composed with WS2's
+    filename-sort resolution (`max(candidates)`, deliberately not mtime-
+    based -- see that function's own docstring) to silently pick the wrong
+    day's file: measured on a real graph, 58/76 history files (76%) were
+    last written at or after 20:00 local, which for a UTC-4 seat is already
+    "tomorrow" in UTC -- an evening nap would write into a fresh
+    almost-empty file that then wins the filename sort over the file
+    holding the actual day. This mirrors the ALREADY-established convention
+    in `engram-sleep`'s dream-report naming ("today's NYC-local date",
+    SKILL.md), not a new one -- kept consistent with that sibling file's
+    day-boundary rather than inventing a second, different definition of
+    "today" for `~/.engram/`. Naive host-OS local time was rejected
+    deliberately: a server host's OS timezone is not guaranteed to match
+    any particular agent's operational rhythm (frequently UTC by default),
+    so `datetime.now()` without an explicit zone would silently reproduce
+    this exact bug under a different name. `zoneinfo.ZoneInfo` (stdlib,
+    Python 3.9+) is used rather than a third-party dependency.
+    """
+    try:
+        history_dir = core.DATA_DIR / "history"
+        history_dir.mkdir(parents=True, exist_ok=True)
+        today = datetime.datetime.now(
+            zoneinfo.ZoneInfo("America/New_York")
+        ).strftime("%Y-%m-%d")
+        path = history_dir / f"{today}.md"
+        lock_path = str(path) + ".lock"
+
+        # Collapse ALL whitespace, including embedded newlines -- .strip()
+        # alone only trims the ends, so a multi-line message would break
+        # the one-bullet-per-nap invariant the [auto-nap] tag and this
+        # PR's own tests are built to guarantee (reviewer-fairy round).
+        clean_message = " ".join(message.split())
+
+        def _do_append():
+            try:
+                existing = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                existing = f"# {today}\n\n"
+            line = f"- [auto-nap] {clean_message}\n"
+            new_content = existing.rstrip("\n") + "\n" + line
+            tmp = str(path) + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                os.replace(tmp, str(path))
+            except Exception:
+                # Don't leave a stray .tmp behind on a mid-write failure
+                # (e.g. os.replace itself raising) -- the original file (if
+                # any) is untouched either way since os.replace is the only
+                # step that mutates it. Re-raise so the outer fail-soft
+                # try/except in _append_nap_to_history still swallows this.
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+
+        core._with_state_lock(lock_path, _do_append)
+        return {"written": True, "reason": None}
+    except Exception as exc:
+        return {"written": False, "reason": f"{type(exc).__name__}: {exc}"}
+
 
 def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
@@ -205,6 +341,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "no output is how you record it."
             )
             core._write_feeling_nudge("nap_checkpoint")
+            result["history_write"] = _append_nap_to_history(message)
 
         return json.dumps(result)
     finally:
