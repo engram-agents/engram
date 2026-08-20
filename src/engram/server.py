@@ -1622,6 +1622,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "source_repo",
     "repo_path",
     "session_id",
+    "recall_summary",
+    "recall_keywords",
 })
 
 
@@ -1780,6 +1782,8 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
@@ -1888,7 +1892,14 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 fs_class ("re-executable" for Class 1 claims that can be re-tested by
                 re-running the measurement, or "frozen" for Class 2 claims recording a
                 past event that cannot be re-executed; omit to let the Phase-1 proxy from
-                quote_type apply — hesitation is the correct signal to omit).
+                quote_type apply — hesitation is the correct signal to omit),
+                recall_summary (always provide when you can — ≤140-char recall-scent
+                string compressing this item's interpretation/claim; omission clean-accepts
+                but is flagged summary_missing (distinct from needs_tightening — a
+                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged); an excessively long summary
+                hard-rejects that item only — other items in the batch are unaffected), recall_keywords (always provide
+                when you can — array of 3-6 short keyword strings; never rejected
+                regardless of count).
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
@@ -3127,7 +3138,9 @@ def engram_add_axiom(payload_json: str) -> str:
 
 
 # Set of legitimate field names for the engram_add_definition payload.
-_ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
+_ADD_DEFINITION_FIELDS = frozenset({
+    "term", "definition", "context_ids", "recall_summary", "recall_keywords",
+})
 
 
 # DESIGN INTENT — engram_add_definition
@@ -3175,6 +3188,16 @@ def engram_add_definition(payload_json: str) -> str:
             term (str, required): The term being defined.
             definition (str, required): What the term means.
             context_ids (str, optional): Comma-separated node IDs cited.
+            recall_summary (str, optional, always provide when you can): Compress
+                the term/definition into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new definition node ID. On payload-parsing failure,
@@ -3197,7 +3220,10 @@ def engram_add_definition(payload_json: str) -> str:
 
 
 # Set of legitimate field names for the engram_add_conjecture payload.
-_ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "context_ids"})
+_ADD_CONJECTURE_FIELDS = frozenset({
+    "claim", "basis", "initial_confidence", "context_ids",
+    "recall_summary", "recall_keywords",
+})
 
 
 # DESIGN INTENT — engram_add_conjecture
@@ -3264,6 +3290,16 @@ def engram_add_conjecture(payload_json: str) -> str:
             initial_confidence (float, optional): Starting confidence in
                 [0.10, 0.60]. Default per CONJECTURE_CONFIDENCE_DEFAULT (0.40).
             context_ids (str, optional): Comma-separated node IDs cited.
+            recall_summary (str, optional, always provide when you can): Compress
+                the claim into a ≤140-char recall-scent string — don't start from
+                a blank line. Not content preservation (the full claim renders on
+                inspect). Omitting it clean-accepts but is flagged summary_missing
+                (distinct from needs_tightening — a fail-loud-surface flag, not an
+                error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new conjecture node ID and confidence. On payload-
@@ -4641,6 +4677,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
+    "recall_summary", "recall_keywords",
 })
 
 
@@ -4729,6 +4766,16 @@ def engram_add_lesson(payload_json: str) -> str:
                 bypass_prose_check: true so the graph can audit how often this
                 override was actually exercised. Has no effect when situation_pattern
                 doesn't look like prose, or is empty.
+            recall_summary (str, optional, always provide when you can): Compress
+                the corrective pattern into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
@@ -5321,6 +5368,7 @@ def engram_report_feeling(payload_json: str) -> str:
 _DERIVE_FIELDS = frozenset({
     "claim", "supporting_ids", "logical_chain", "reasoning_type",
     "derivation_mode", "context_ids", "use_stale", "use_contested", "warrant",
+    "recall_summary", "recall_keywords",
 })
 
 
@@ -5412,6 +5460,16 @@ def engram_derive(payload_json: str) -> str:
                 the moment of discovery retain the thought-construction, not just
                 the recall." Leave blank if the bridging principle is fully
                 captured in logical_chain.
+            recall_summary (str, optional, always provide when you can): Compress
+                the derived claim into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning

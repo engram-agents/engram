@@ -206,6 +206,8 @@ def _add_definition_impl(
     term: str = "",
     definition: str = "",
     context_ids: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_definition MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server callers.
@@ -221,6 +223,11 @@ def _add_definition_impl(
         term: The term being defined (e.g. "recession").
         definition: What the term means (e.g. "Two consecutive quarters of negative GDP growth").
         context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new definition node ID.
@@ -229,6 +236,12 @@ def _add_definition_impl(
         return json.dumps({"error": "term is required and cannot be empty."})
     if not definition or not definition.strip():
         return json.dumps({"error": "definition is required and cannot be empty."})
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     conn = core._get_db()
     try:
@@ -239,9 +252,16 @@ def _add_definition_impl(
         meta = json.dumps({"term": term, "definition": definition})
 
         conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
-               VALUES (?, 'definition', ?, ?, 'active', ?)""",
-            (node_id, combined_claim, now, meta),
+            """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
+               recall_summary, recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'definition', ?, ?, 'active', ?, ?, ?, ?, ?)""",
+            (
+                node_id, combined_claim, now, meta,
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
+            ),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -280,6 +300,8 @@ def _add_conjecture_impl(
     basis: str = "",
     initial_confidence: float = core.CONJECTURE_CONFIDENCE_DEFAULT,
     context_ids: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_conjecture MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server callers.
@@ -307,6 +329,11 @@ def _add_conjecture_impl(
         basis: Why this conjecture is worth investigating.
         initial_confidence: Starting confidence, default 0.40, range [0.10, 0.60].
         context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new conjecture node ID and confidence.
@@ -315,6 +342,12 @@ def _add_conjecture_impl(
         return json.dumps({"error": "claim is required and cannot be empty."})
     if not basis or not basis.strip():
         return json.dumps({"error": "basis is required and cannot be empty."})
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     # Type-coerce initial_confidence — payload_json may deliver it as a string
     # (e.g. "0.55" instead of 0.55), and the float type hint isn't enforced
@@ -337,10 +370,15 @@ def _add_conjecture_impl(
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, status, metadata)
-               VALUES (?, 'conjecture', ?, ?, ?, ?, ?, 'active', '{}')""",
+               confidence, confidence_history, status, metadata, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'conjecture', ?, ?, ?, ?, ?, 'active', '{}', ?, ?, ?, ?)""",
             (node_id, claim, now, basis, conf,
-             json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}])),
+             json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}]),
+             _recall_summary or None,
+             json.dumps(_recall_keywords) if _recall_keywords else None,
+             1 if _needs_tightening else 0,
+             1 if _summary_missing else 0),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -729,6 +767,8 @@ def _add_lesson_impl(
     context_ids: str = "",
     situation_pattern: str = "",
     bypass_prose_check: bool = False,
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_lesson MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -782,6 +822,11 @@ def _add_lesson_impl(
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             situation_pattern — see engram_add_lesson's docstring for the
             discriminator + audit-stamp contract.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar existing
@@ -802,6 +847,13 @@ def _add_lesson_impl(
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
             "valid_types": sorted(core.REASONING_TYPES),
         })
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
+
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python; without this check, a bypass_prose_check: "false"
     # payload would silently bypass the #1864 prose-shape guard.
@@ -890,8 +942,9 @@ def _add_lesson_impl(
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, metadata)
-               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?)""",
+               confidence, confidence_history, metadata, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 claim,
@@ -901,6 +954,10 @@ def _add_lesson_impl(
                 json.dumps([{"timestamp": now, "value": confidence,
                              "reason": f"Lesson ({reasoning_type}, discount={discount}) from {len(ids)} incident(s)"}]),
                 json.dumps(meta),
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
             ),
         )
 

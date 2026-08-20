@@ -1069,6 +1069,8 @@ def _add_observation_impl(
     source_repo: str = "",
     repo_path: str = "",
     session_id: str = "",
+    recall_summary: str = "",
+    recall_keywords: Optional[list] = None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1099,6 +1101,18 @@ def _add_observation_impl(
                 "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
             )
         })
+
+    # Write-time recall_summary/recall_keywords validation (#1952 PR1) — runs
+    # early, before any DB/network work, so an over-long recall_summary
+    # hard-rejects with zero side effects (no evidence node, no observation
+    # row). Presence is soft (Resolution 1): omission normalizes to 0 chars /
+    # empty list and clean-accepts; only an explicitly-provided recall_summary
+    # >= 280 chars errors.
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     # session_id resolution — precedence evidence_id > url > session_id.
     # Runs BEFORE the required-field check below because it may supply
@@ -1357,8 +1371,9 @@ def _add_observation_impl(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
                interpretation, quote_type, confidence, confidence_history, metadata,
                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-               standpoint_lineage, standpoint_architecture, fs_class)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               standpoint_lineage, standpoint_architecture, fs_class, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 node_type,
@@ -1377,6 +1392,10 @@ def _add_observation_impl(
                 standpoint_lineage or None,
                 standpoint_architecture or None,
                 fs_class if fs_class in ("re-executable", "frozen") else None,
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
             ),
         )
 
@@ -1710,6 +1729,8 @@ def _add_observation_batch_impl(
             - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
             - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes; lineage differs only when citing another agent's or a human's evidence.
             - standpoint_architecture (optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure.
+            - recall_summary (optional but always provide when you can): ≤140-char agent-facing recall scent — compress interpretation/claim, don't start from a blank line. Not content preservation (the full claim renders on inspect); for a multi-fact observation, name the load-bearing fact or file separate observations instead. Soft-accepted up to 279 chars (flagged needs_tightening for later cleanup); rejected at 280+ chars for that one item (other items in the batch are unaffected).
+            - recall_keywords (optional but always provide when you can): JSON array of 3-6 short content keywords (never rejected regardless of count).
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -1781,6 +1802,8 @@ def _add_observation_batch_impl(
             fs_class=obs.get("fs_class"),
             source_repo=source_repo,
             repo_path=repo_path,
+            recall_summary=obs.get("recall_summary", ""),
+            recall_keywords=obs.get("recall_keywords"),
         ))
         r["index"] = i
         results.append(r)

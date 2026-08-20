@@ -107,6 +107,8 @@ def _derive_impl(
     use_stale: bool = False,
     use_contested: bool = False,
     warrant: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_derive MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -167,6 +169,11 @@ def _derive_impl(
             inference (why do these premises support this claim?). Stored in derive_meta
             for audit. Leave blank if the bridging principle is fully captured in
             logical_chain.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning type, and supporting nodes.
@@ -199,6 +206,12 @@ def _derive_impl(
         })
     if warrant and not isinstance(warrant, str):
         return json.dumps({"error": f"warrant must be a string, got {type(warrant).__name__}"})
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
@@ -253,6 +266,10 @@ def _derive_impl(
             use_stale=use_stale,
             use_contested=use_contested,
             extra_meta={"warrant": warrant} if warrant else None,
+            recall_summary=_recall_summary,
+            recall_keywords=_recall_keywords,
+            needs_tightening=_needs_tightening,
+            summary_missing=_summary_missing,
         )
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---

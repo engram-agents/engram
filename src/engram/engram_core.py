@@ -1804,6 +1804,19 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         # cues and future-leverage for facet listing / keyword search / clustering.
         # Format: '["kw1", "kw2", "kw3"]'. NULL on existing rows.
         ("recall_keywords", "TEXT"),
+        # needs_tightening: set true when a write-time recall_summary was soft-accepted
+        # (over the 140-char target but under the 280-char hard cap). Non-blocking
+        # quality flag for the summary-fairy to review/tighten during sleep (#1952 PR1).
+        # NULL/0 on existing rows and on every node created before this field existed.
+        ("needs_tightening", "INTEGER"),
+        # summary_missing: set true when recall_summary was entirely absent/omitted
+        # at write time (distinct from needs_tightening, which means "present but
+        # over the soft limit" — different remediation). Fail-loud-surface flag
+        # (Kepler's ruling, #1952 PR1 round 4): without this, a node with no
+        # summary is silently indistinguishable from one with a fine short
+        # summary, and nothing ever surfaces the gap for the backfill sweep.
+        # NULL/0 on existing rows and on every node created before this field existed.
+        ("summary_missing", "INTEGER"),
         # ── trust tier columns (Layer-1 trust-tier mechanism) ──
         # trust_tier: persisted tier for person (pn_*) nodes. One of:
         #   user_family, our_side, known_external, unknown, suspect.
@@ -5278,6 +5291,94 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     return [r["id"] for r in rows]
 
 
+# RECALL_SUMMARY_TARGET / _SOFT_CAP: the write-time recall_summary contract
+# (#1952 PR1). Distinct from RECALL_SUMMARY_HARD_CAP (200) in
+# tools/recall_summary_validator.py, which governs the OLDER
+# engram_set_recall_summaries batch tool on a separate path — the two are
+# deliberately not unified (see #1952 comment 5-6). Target: agents should aim
+# for ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
+# 280+.
+RECALL_SUMMARY_TARGET = 140
+RECALL_SUMMARY_HARD_REJECT_AT = 280
+
+# Write-time recall_keywords bounds (#1952 PR1) — distinct from the older
+# engram_set_recall_summaries RECALL_KEYWORDS_MIN/MAX (3-5) in
+# tools/recall_summary_validator.py. Never rejects regardless of count —
+# normalization only (trim, dedupe, cap).
+RECALL_KEYWORDS_WRITE_TIME_MAX = 6
+
+
+def _validate_recall_fields(recall_summary: str, recall_keywords) -> tuple:
+    """Validate + normalize write-time recall_summary/recall_keywords (#1952 PR1).
+
+    Returns (validated_summary, validated_keywords, needs_tightening,
+    summary_missing, error).
+
+    Resolution 1 (presence is soft, not a hard gate): an absent/omitted
+    recall_summary is treated as 0 characters, which clean-accepts through
+    the normal length check (0 < 140, no needs_tightening). The input is
+    .strip()'d before any length/absence check, so a whitespace-only summary
+    ("   ") is also treated as absent rather than dodging summary_missing by
+    virtue of a nonzero raw length (Kepler's colleague-review catch on
+    engram-alpha#2157). An absent/omitted recall_keywords normalizes to an
+    empty list — recall_keywords NEVER rejects, regardless of count, even 0
+    after normalization.
+
+    Only case that returns a non-None error: an explicitly-provided
+    recall_summary >= 280 chars (RECALL_SUMMARY_HARD_REJECT_AT) — a real hard
+    gate, unlike the presence question. On error, validated_summary and
+    validated_keywords are both None and the caller must create no node.
+
+    Round 4 (Kepler's ruling, #1952 PR1): absent is NOT clean-equivalent to a
+    fine short summary — it gets its own distinct summary_missing flag so the
+    gap is queryable (a worklist for the dream/backfill pass), the same role
+    needs_tightening plays for over-limit. summary_missing and
+    needs_tightening are mutually exclusive by construction (absence vs.
+    over-limit are different remediations for different states).
+
+    recall_summary three states (mutually exclusive):
+      absent/omitted (0 chars)               -> clean accept, summary_missing=True,  needs_tightening=False
+      1-140 (RECALL_SUMMARY_TARGET)           -> clean accept, summary_missing=False, needs_tightening=False
+      141-279                                 -> soft accept,  summary_missing=False, needs_tightening=True
+      >= 280 (RECALL_SUMMARY_HARD_REJECT_AT)  -> hard reject, error set
+
+    recall_keywords normalization: trim whitespace, drop empties, dedupe
+    (case-sensitive, first-occurrence-wins), cap at 6
+    (RECALL_KEYWORDS_WRITE_TIME_MAX). Non-string elements are dropped rather
+    than rejected (never-rejects contract). A non-list input (including None)
+    normalizes to []. recall_keywords behavior is unchanged from round 3 —
+    no distinct flag for absence; keywords are additive/asymmetric.
+    """
+    summary = (recall_summary if isinstance(recall_summary, str) else "").strip()
+    summary_len = len(summary)
+    needs_tightening = False
+    if summary_len >= RECALL_SUMMARY_HARD_REJECT_AT:
+        return (
+            None, None, False, False,
+            f"recall_summary is {summary_len} chars — the limit is "
+            f"{RECALL_SUMMARY_TARGET}: \"{summary}\""
+        )
+    summary_missing = summary_len == 0
+    if summary_len > RECALL_SUMMARY_TARGET:
+        needs_tightening = True
+
+    raw_keywords = recall_keywords if isinstance(recall_keywords, list) else []
+    keywords: list = []
+    seen: set = set()
+    for kw in raw_keywords:
+        if not isinstance(kw, str):
+            continue
+        trimmed = kw.strip()
+        if not trimmed or trimmed in seen:
+            continue
+        seen.add(trimmed)
+        keywords.append(trimmed)
+        if len(keywords) >= RECALL_KEYWORDS_WRITE_TIME_MAX:
+            break
+
+    return (summary, keywords, needs_tightening, summary_missing, None)
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,
@@ -6198,6 +6299,10 @@ def _create_derivation(
     use_contested: bool = False,
     extra_meta: Optional[dict] = None,
     history_reason: Optional[str] = None,
+    recall_summary: str = "",
+    recall_keywords: Optional[list] = None,
+    needs_tightening: bool = False,
+    summary_missing: bool = False,
 ) -> tuple:
     """Shared derivation-creation core for engram_derive and engram_resolve.
 
@@ -6229,6 +6334,17 @@ def _create_derivation(
             resolution_status)
         history_reason: optional confidence_history reason string;
             defaults to a generic "Derived (reasoning_type, ...)" line
+        recall_summary: pre-validated write-time recall summary (#1952 PR1) —
+            caller must run it through _validate_recall_fields first; this
+            function does not re-validate, only persists.
+        recall_keywords: pre-validated write-time recall keywords (list),
+            same caveat as recall_summary.
+        needs_tightening: pre-computed soft-accept flag from
+            _validate_recall_fields (140 < len(recall_summary) < 280).
+        summary_missing: pre-computed absent-summary flag from
+            _validate_recall_fields (recall_summary was 0 chars at write
+            time) — mutually exclusive with needs_tightening (#1952 PR1
+            round 4, Kepler's ruling).
 
     Returns:
         (block, success) — exactly one is non-None.
@@ -6282,8 +6398,9 @@ def _create_derivation(
 
     conn.execute(
         """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-           confidence, confidence_history, metadata)
-           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
+           confidence, confidence_history, metadata, recall_summary,
+           recall_keywords, needs_tightening, summary_missing)
+           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             node_id,
             claim,
@@ -6292,6 +6409,10 @@ def _create_derivation(
             confidence,
             json.dumps([{"timestamp": now, "value": confidence, "reason": reason_line}]),
             json.dumps(derive_meta),
+            recall_summary or None,
+            json.dumps(recall_keywords) if recall_keywords else None,
+            1 if needs_tightening else 0,
+            1 if summary_missing else 0,
         ),
     )
 
