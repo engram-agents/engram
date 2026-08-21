@@ -638,3 +638,133 @@ def test_bootstrap_does_not_override_existing_cleanup_period_days():
         )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the plugin-mode tools/hooks symlink step and its skip flag
+# ---------------------------------------------------------------------------
+#
+# None of the tests above exercise this code path at all: they all run
+# bootstrap.py directly from REPO_ROOT/src/engram/, which has no plugin.json
+# alongside it, so `plugin_marker.is_file()` is already False there — the
+# symlink block is dead code from this suite's own point of view. To
+# exercise it for real (both the existing default AND the new skip flag),
+# these tests build a throwaway "plugin tree": a copy of bootstrap.py plus
+# a plugin.json marker and dummy tools/ + hooks/ dirs, mirroring what
+# build-plugin.sh actually assembles.
+
+
+def _make_plugin_tree_env(workdir: Path) -> tuple[Path, Path, dict]:
+    """Build a throwaway plugin-tree dir (bootstrap.py + plugin.json +
+    tools/ + hooks/) and matching env vars. Returns (plugin_tree_dir,
+    engram_home, env)."""
+    # A copy of the WHOLE src/engram/ tree, not an enumerated file list --
+    # server.py's own import chain (engram_core, engram_focus,
+    # engram_recall_summaries, tools.recall_summary_validator, and more)
+    # is long, changes over time, and none of it needs restating here: the
+    # other tests in this file run bootstrap.py IN PLACE at
+    # REPO_ROOT/src/engram/, where every dependency already lives
+    # alongside it, so their own `runtime_files` copy list was always a
+    # silent no-op (src = REPO_ROOT / fname, a path that doesn't exist in
+    # this repo layout) -- it never needed to work. This test copies
+    # bootstrap.py OUT to a separate plugin-tree dir specifically to make
+    # `plugin.json` presence controllable, so it genuinely needs the real
+    # tree alongside it.
+    plugin_tree = workdir / "plugin-tree"
+    shutil.copytree(
+        REPO_ROOT / "src" / "engram", plugin_tree,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    (plugin_tree / "plugin.json").write_text('{"name": "engram-test-plugin"}')
+    # Overwrite the copied tools/hooks with per-test throwaway markers so
+    # the symlink-target assertions below check something written by this
+    # test, not merely "some file happens to exist".
+    shutil.rmtree(plugin_tree / "tools" / "__pycache__", ignore_errors=True)
+    (plugin_tree / "tools" / "test-marker.txt").write_text("plugin tools content")
+    (plugin_tree / "hooks" / "test-marker.txt").write_text("plugin hooks content")
+
+    engram_home = workdir / ".engram"
+    claude_home = workdir / ".claude"
+    env = os.environ.copy()
+    env.update({
+        "ALPHA_DIR": str(REPO_ROOT),
+        "ALPHA_TEMPLATES_DIR": str(REPO_ROOT / "src" / "engram" / "templates"),
+        "ENGRAM_HOME": str(engram_home),
+        "CLAUDE_HOME": str(claude_home),
+        "PYTHON_BIN": sys.executable,
+        "TARGET": "claude",
+    })
+    env.pop("ENGRAM_BOOTSTRAP_SKIP_SYMLINKS", None)
+    return plugin_tree, engram_home, env
+
+
+def test_bootstrap_creates_plugin_symlinks_by_default():
+    """Baseline this suite was missing: a real plugin-tree layout (plugin.json
+    present) gets ~/.engram/tools and ~/.engram/hooks symlinked to the
+    plugin's bundled copies, exactly as documented, when the new skip flag
+    is NOT set."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_symlink_default_"))
+    try:
+        plugin_tree, engram_home, env = _make_plugin_tree_env(workdir)
+
+        result = subprocess.run(
+            [sys.executable, str(plugin_tree / "bootstrap.py")],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"bootstrap.py failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
+        )
+
+        tools_link = engram_home / "tools"
+        hooks_link = engram_home / "hooks"
+        assert tools_link.is_symlink(), "expected ~/.engram/tools to be a symlink by default"
+        assert hooks_link.is_symlink(), "expected ~/.engram/hooks to be a symlink by default"
+        assert tools_link.resolve() == (plugin_tree / "tools").resolve()
+        assert hooks_link.resolve() == (plugin_tree / "hooks").resolve()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_skip_symlinks_env_var_skips_both_links():
+    """ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 skips the tools/hooks symlink step
+    entirely, even with a real plugin.json present -- added for a per-run
+    isolated ENGRAM_HOME build (e.g. a benchmark harness) that must never
+    link outside its own sandboxed directory. Seeding must still succeed;
+    only the symlinks are skipped."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_symlink_skip_"))
+    try:
+        plugin_tree, engram_home, env = _make_plugin_tree_env(workdir)
+        env["ENGRAM_BOOTSTRAP_SKIP_SYMLINKS"] = "1"
+
+        result = subprocess.run(
+            [sys.executable, str(plugin_tree / "bootstrap.py")],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"bootstrap.py failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
+        )
+        assert "SKIP_SYMLINKS" in result.stdout, (
+            "expected the skip to announce itself in stdout, got:\n" + result.stdout
+        )
+
+        assert not (engram_home / "tools").exists(), (
+            "ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 must not create ~/.engram/tools at all"
+        )
+        assert not (engram_home / "hooks").exists(), (
+            "ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 must not create ~/.engram/hooks at all"
+        )
+
+        # Seeding itself must still have succeeded -- the flag skips only
+        # the symlinks, not the rest of bootstrap.
+        db_path = engram_home / "knowledge.db"
+        assert db_path.exists(), "knowledge.db should still be created with symlinks skipped"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            axiom_count = conn.execute(
+                "SELECT COUNT(*) FROM nodes WHERE type='axiom'"
+            ).fetchone()[0]
+            assert axiom_count == 3, f"expected 3 seed axioms, got {axiom_count}"
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
