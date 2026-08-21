@@ -2885,8 +2885,11 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     took literally (nap-only). That was an accidental scope gap, not the
     intent — "every nap" was shorthand for "every checkpoint." The sleep
     boundary is in fact the SINGLE MOST MEANINGFUL measurement point:
-    turn-advance triggers forgetting (decay -> tier demotion) PLUS
-    consolidation (retract/supersede/dream), so the Jaccard ACROSS sleep
+    a full day of new writes has displaced older nodes in the importance rank
+    (forgetting is driven by new writes and recalled reads outranking untouched
+    old ones, not by the turn counter itself — verified 2026-08-21:
+    advance_turn only sets the counter and mutates no node row), PLUS the day's
+    consolidation (retract/supersede/dream) — so the Jaccard ACROSS sleep
     directly answers whether a day's consolidation preserved mental
     continuity — exactly the question the metric exists to watch. Excluding
     it would blind the metric to its own primary use case, and it would

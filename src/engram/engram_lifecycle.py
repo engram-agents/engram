@@ -216,9 +216,10 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
 
     Computes graph stats, appends to session_log, snapshots + commits.
-    If advance_turn is True, increments the global turn counter (driving the
-    forgetting mechanism). If False, leaves the turn counter alone (nap mode)
-    and arms a nap_checkpoint feeling nudge.
+    If advance_turn is True, increments the global turn counter (subsequent
+    writes/recalls are then stamped at a correspondingly higher
+    importance_score). If False, leaves the turn counter alone (nap mode) and
+    arms a nap_checkpoint feeling nudge.
 
     The two public tools (engram_nap and engram_advance_turn) exist as
     distinct MCP entry points so a missed kwarg cannot accidentally promote
