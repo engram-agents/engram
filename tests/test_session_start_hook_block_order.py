@@ -1,4 +1,5 @@
-"""Ordering invariant for SessionStart's additionalContext (issue #1819).
+"""Ordering invariant for SessionStart's additionalContext (issue #1819,
+extended #2150).
 
 The hook runs under a 5s harness timeout. On overrun the process is KILLED and
 the ENTIRE additionalContext is lost — no partial delivery, no error surfaced.
@@ -13,6 +14,16 @@ runtime, dominated by EngramClient() construction — ran FIRST and consumed the
 whole budget, so focus_block() (0.002s, free) was never reached and the
 "deterministic focus channel" the identity layer depends on across compaction
 silently delivered nothing for multiple sessions.
+
+A second, distinct axis (#2150): nothing caps this hook's TOTAL emission
+size, so a downstream reader that truncates (a harness preview, a context
+budget) takes from the END, not the front. Measured live 2026-08-19: a
+62,859-byte injection, a ~2KB harness preview, the focus block starting at
+line 164 of 264 — well past the cut, because it was emitted after the
+32,000-char-capped history arc. #1819's TIME-axis rule (cheap before
+expensive) does not by itself say anything about focus-vs-history — both are
+cheap — so this file's original tests left that ordering completely
+unlocked; the tests below close that gap.
 
 These tests lock the order so the fix cannot drift back. Complements
 tests/test_session_start_hook_focus_render.py (focus renders at all) and
@@ -92,6 +103,18 @@ def _make_focused_db(engram_home: Path) -> None:
     conn.close()
 
 
+def _write_history_file(history_dir: Path, name: str, content: str) -> Path:
+    """Seed a history-arc file (mirrors test_session_start_hook_history_arc.py's
+    helper of the same name/shape) so history_arc_block() has real content to
+    render instead of the "no history entries" placeholder — needed to
+    exercise the #2150 focus-vs-history ordering, distinct from #1819's
+    focus-vs-calibration ordering the rest of this file locks."""
+    history_dir.mkdir(parents=True, exist_ok=True)
+    path = history_dir / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
 def _make_mock_engram_client():
     mock_client = MagicMock()
 
@@ -144,6 +167,71 @@ def _context_with_both_blocks(tmp_path, engram_home, source="startup") -> str:
             },
         )
     return result["hookSpecificOutput"]["additionalContext"]
+
+
+def _context_with_focus_and_history(tmp_path, engram_home, source) -> str:
+    """Like _context_with_both_blocks, plus a real history-arc file so
+    history_arc_block() renders actual content (not the "no history
+    entries" placeholder, which never contains "Most recent arc —")."""
+    _make_focused_db(engram_home)
+    _write_history_file(
+        engram_home / "history",
+        "2026-08-15.md",
+        "Order-invariant guard history-arc content.",
+    )
+    mod = _load_hook_module(engram_home)
+    mock_client_class = MagicMock(return_value=_make_mock_engram_client())
+    with patch.dict("sys.modules", {"engram_client": MagicMock(EngramClient=mock_client_class)}):
+        result = _run_hook_main(
+            mod,
+            {
+                "session_id": f"order-test-history-{source}",
+                "transcript_path": str(tmp_path / "transcript.jsonl"),
+                "source": source,
+            },
+        )
+    return result["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.parametrize("source", ["compact", "resume"])
+def test_focus_block_precedes_history_arc(tmp_path, engram_home, source):
+    """#2150: the must-survive focus channel must be emitted before the
+    history arc, which caps at 32,000 chars and is itself explicitly
+    "already lived, not a to-do list" — the block a truncating reader
+    (harness preview, context budget) can afford to lose first. Covers the
+    SIZE axis; test_focus_block_precedes_calibration_block above covers the
+    pre-existing TIME axis (#1819). Neither subsumes the other."""
+    ctx = _context_with_focus_and_history(tmp_path, engram_home, source)
+
+    focus_at = ctx.find("Focused nodes")
+    history_at = ctx.find("Most recent arc —")
+
+    assert focus_at != -1, f"source={source}: focus block missing entirely: {ctx!r}"
+    assert history_at != -1, f"source={source}: history arc missing entirely: {ctx!r}"
+    assert focus_at < history_at, (
+        f"source={source}: ORDERING REGRESSION (#2150) — the history arc is "
+        f"emitted before the focus list. The history arc caps at 32,000 chars "
+        f"and focus_block() has measured as large as 30,139 chars post-dedup, "
+        f"so a truncating reader that takes from the tail loses the "
+        f"must-survive focus channel first. "
+        f"focus at {focus_at}, history at {history_at}."
+    )
+
+
+def test_history_arc_absent_on_startup_focus_present(tmp_path, engram_home):
+    """#2150's control-flow change: history_arc_block() was pulled out of the
+    source if/else's `else:` arm into its own `if source != "startup":`
+    block so it could be repositioned after focus/saved-sets/starred. This
+    pins that the non-startup-only gating survived the move — without it, a
+    future edit could silently restore history on startup and nothing here
+    would fail."""
+    ctx = _context_with_focus_and_history(tmp_path, engram_home, "startup")
+
+    assert "Focused nodes" in ctx, f"focus block missing on startup: {ctx!r}"
+    assert "Most recent arc —" not in ctx, (
+        f"ORDERING REGRESSION (#2150) — the history arc rendered on "
+        f"source=='startup'; it must only render on compact/resume. {ctx!r}"
+    )
 
 
 @pytest.mark.parametrize("source", ["startup", "compact", "resume"])
