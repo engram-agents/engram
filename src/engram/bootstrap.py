@@ -508,7 +508,31 @@ def main() -> None:
     # which is the caller's job, not bootstrap.py's -- this flag only
     # removes the wrong-for-that-context default, it does not replace it
     # with anything.
-    skip_symlinks = os.environ.get("ENGRAM_BOOTSTRAP_SKIP_SYMLINKS", "0") == "1"
+    _skip_symlinks_raw = os.environ.get("ENGRAM_BOOTSTRAP_SKIP_SYMLINKS", "0")
+    skip_symlinks = _skip_symlinks_raw == "1"
+    if _skip_symlinks_raw not in ("0", "1"):
+        # Ariadne's colleague-pass finding on PR#2171: a strict `== "1"`
+        # check means a near-miss value (e.g. "true", "yes") silently falls
+        # through as unset -- no skip AND no announcement, indistinguishable
+        # from a caller who never set the var at all. A guard whose whole
+        # purpose is a safety suppression must fail VISIBLE when
+        # misconfigured, not silently do the opposite of what was asked.
+        #
+        # Reviewer-fairy nit on THIS PR: this WARN is deliberately NOT
+        # gated on `plugin_marker.is_file()`, unlike the skip-announcement
+        # below. That asymmetry is intentional, not an oversight to copy
+        # the other gate onto: the skip-announcement would be misleading
+        # in a non-plugin context because the flag had zero effect there
+        # (nothing to skip). This WARN flags a misconfigured *intent* (a
+        # typo'd env var) -- worth surfacing regardless of whether this
+        # particular run's context would have made the flag consequential,
+        # since the caller's mistake is the same either way.
+        print(
+            f"  WARN: ENGRAM_BOOTSTRAP_SKIP_SYMLINKS={_skip_symlinks_raw!r} is "
+            "not '0' or '1' -- treating as unset (symlinks will NOT be "
+            "skipped). Set it to exactly '1' to skip.",
+            flush=True,
+        )
     bootstrap_dir = Path(__file__).resolve().parent
     plugin_marker = bootstrap_dir / "plugin.json"
     if skip_symlinks and plugin_marker.is_file():

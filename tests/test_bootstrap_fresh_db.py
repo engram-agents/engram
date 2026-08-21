@@ -768,3 +768,34 @@ def test_bootstrap_skip_symlinks_env_var_skips_both_links():
             conn.close()
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+def test_bootstrap_skip_symlinks_near_miss_value_warns_and_does_not_skip():
+    """Ariadne's colleague-pass finding on PR#2171: a near-miss value like
+    'true' must not silently fall through as unset -- it must warn AND
+    leave symlinks in place (the safe, unskipped default), not silently do
+    the opposite of what the caller likely intended."""
+    workdir = Path(tempfile.mkdtemp(prefix="engram_bootstrap_symlink_nearmiss_"))
+    try:
+        plugin_tree, engram_home, env = _make_plugin_tree_env(workdir)
+        env["ENGRAM_BOOTSTRAP_SKIP_SYMLINKS"] = "true"
+
+        result = subprocess.run(
+            [sys.executable, str(plugin_tree / "bootstrap.py")],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, (
+            f"bootstrap.py failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
+        )
+        assert "WARN" in result.stdout and "not '0' or '1'" in result.stdout, (
+            "expected a visible warning for a near-miss value, got:\n" + result.stdout
+        )
+        # Near-miss treated as unset -- the SAFE default (symlinks created),
+        # not the requested-but-misspelled skip.
+        assert (engram_home / "tools").is_symlink(), (
+            "a near-miss value should fall back to the safe default "
+            "(symlinks created), not silently skip them too"
+        )
+        assert (engram_home / "hooks").is_symlink()
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
