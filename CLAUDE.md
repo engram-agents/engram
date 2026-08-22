@@ -612,7 +612,12 @@ confirm it rather than treating it as an auto-close risk.
 
 ### Verification before pushing the PR
 
-Two checks, run in order:
+Three checks, run in order — and know their standing: checks 1–3 are text
+checks over enumerated close forms, i.e. **conveniences**; the **gate** is the
+post-merge completeness read at the end of this section, which is downstream
+of GitHub's parser and cannot be blindsided by a form nobody enumerated
+(Borges's framing, 2026-08-22, adopted as the rule after the umwelt#674/#632
+incident below).
 
 1. **Auto-close intent fires** (when the PR DOES close an issue): the body
    must contain a close-keyword referencing the target.
@@ -622,7 +627,9 @@ Two checks, run in order:
    The full API envelope is `{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[...]}}}}}` —
    look for `nodes: [{number: <N>}]` where N matches the title's `[closes #N]`.
    `"nodes":[]` (empty) means the body is missing the keyword form and the PR
-   will NOT auto-close on merge; rewrite via `gh pr edit <PR> --body "..."`.
+   will NOT auto-close **via the body** on merge; rewrite via
+   `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
+   messages — see check 3, which covers the path this query cannot see.**
 
 2. **No trap-shape auto-close** (always): every body match must reference the
    SAME `#N` the title carries.
@@ -633,6 +640,42 @@ Two checks, run in order:
    — rewrite via `gh pr edit <PR> --body "..."` with the trap shape removed
    (use the safe-paraphrase table above).
 
+3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
+   the PR BODY only — a merge commit's own message is a THIRD close surface
+   GitHub's parser reads independently, invisible to checks 1 and 2. **This
+   repo's exposure is currently LOWER than umwelt's, and say so precisely:**
+   engram-alpha's `squash_merge_commit_message` is `BLANK` (measured
+   2026-08-22 — three real recent squash merges carry no branch-commit
+   content, only PR title + co-author lines), so branch commit messages do
+   NOT ride into the merge commit here today. The check stays anyway, as
+   defense-in-depth against the three ways the exposure appears without any
+   code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
+   exactly what makes umwelt exposed), a merger hand-editing the squash
+   message at merge time, and copy-paste of commit text into a PR body.
+   The incident that makes this real is umwelt#674/#632 (2026-08-22): empty
+   array there, merge concluded safe, the issue closed **by the commit**,
+   silently retiring the half of a two-defect issue the PR didn't fix
+   (umwelt#675 is the recovery). The three-surface diagnosis and this remedy
+   were first specified in Ariadne's graph on 2026-08-05.
+   ```
+   git log origin/dev..HEAD --format='%B' | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?) +([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+'
+   ```
+   Every match must reference the SAME `#N` the PR intends to close — anything
+   else gets the commit reworded (rebase) or accepted deliberately, never
+   discovered post-merge. The pattern covers the `owner/repo#N` cross-repo
+   close form (the first draft missed it — exercised five ways by Ariadne,
+   2026-08-22); bare `reponame#N` stays unflagged because it never closes
+   anything. Two things are deliberately unasserted rather than claimed:
+   `Closes: #N` with a colon (unmeasured), and **whether a close keyword in
+   the squash-commit SUBJECT fires the parser** — relevant here because this
+   repo's `squash_merge_commit_title: PR_TITLE` puts the PR title into the
+   subject, a path the commit-range grep cannot see. The 2026-05-31
+   measurement (7/7 title-only PRs did not auto-close) suggests subjects
+   don't fire, but it predates verification of the current setting — exactly
+   one of "the setting changed since May" / "subject keywords don't fire" is
+   true, and nobody has separated them. Measure on the next real
+   `[closes #N]` merge before claiming either way.
+
 **When reviewing a PR** (reviewer-fairy or counterpart colleague):
 - Title missing `[closes #N]` on a PR that addresses an issue → blocker.
 - Title `[closes #N]` present but body missing the matching close-keyword →
@@ -640,10 +683,20 @@ Two checks, run in order:
   edits body via `gh pr edit <PR> --body "..."` before merge.
 - Body contains close-keyword referencing an issue OTHER than the title's `#N`
   → blocker (trap). Author rewrites the trap-shape via safe-paraphrase table.
+- A branch commit message carries a close-keyword referencing any issue other
+  than the PR's intended `#N` (check 3's grep) → flag it: reworded via rebase,
+  or accepted deliberately with the exposure noted — never left undiscussed.
 
-This double-gate is mechanical; checking is cheap; the cost of missing it is
+This triple check is mechanical; checking is cheap; the cost of missing it is
 either a stale-issue backlog (missed auto-close) or a silently-closed-wrong-issue
 (trap firing).
+
+**THE GATE, at the merge seat, after merging: list which issues actually
+closed and confirm each one is FULLY done.** A close link's existence is not
+the issue's completion, and this step is mechanism-independent — it catches
+body links, commit links, and whatever close path ships next. A regex miss
+before merge is silent and permanent; a completeness-read catch after merge
+is loud and recoverable (umwelt#675 is the live proof).
 
 **GitHub recognized closing keywords (case-insensitive):** `close`, `closes`,
 `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`. This repo
