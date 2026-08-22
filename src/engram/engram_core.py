@@ -1719,6 +1719,165 @@ def _recreate_fts_sync_triggers(
             pass
 
 
+# ── #2181: pre-migration backup ─────────────────────────────────────────────
+# A migration-keyed binary copy taken because a migration is ABOUT TO RUN —
+# not merely whenever the agent last napped. Migration rung 4 (#2170)
+# rewrites row data in place (claim UPDATE on every feeling_report,
+# drop+rebuild of nodes_fts, full re-embed of every node — measured
+# 5919/7769 blobs changed on a real 7769-node graph), and the existing
+# daily binary ladder (_write_binary_backup, called only from the nap/
+# sleep paths) can be hours stale by the time a migration actually fires.
+def _take_pre_migration_backup_if_pending(
+    conn: sqlite3.Connection,
+    current_user_version: int,
+    latest_version: int,
+) -> bool:
+    """Take a migration-keyed binary backup if `conn` is about to be
+    migrated and has data worth protecting; return whether the caller may
+    proceed with the rungs gated on `current_user_version < latest_version`.
+
+    Contract (the return value IS the guard — callers consult it, they do
+    not re-derive it):
+    - Returns True when it is safe to proceed with the rungs gated on
+      `current_user_version < latest_version` this call: no migration is
+      pending, there is no data yet worth protecting (fresh/empty `nodes`),
+      the backup succeeded, the backup was deliberately skipped via the
+      ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1 escape hatch, or `conn` is an
+      in-memory connection with nothing on disk to copy.
+    - Returns False ONLY when a REQUIRED pre-migration backup was attempted
+      and FAILED. The caller MUST then skip every rung gated on
+      `current_user_version < latest_version` this call (add
+      `and _pre_migration_backup_ok` to each `if current_user_version < N:`
+      rung check) and must NOT advance PRAGMA user_version, so the whole
+      migration retries on the next process startup — current_user_version
+      itself is never mutated by this function; only the caller's own rung
+      bodies ever write PRAGMA user_version, and this return value is what
+      keeps them from doing so on a failed backup.
+
+    This deliberately INVERTS _write_binary_backup's own contract: that
+    function never raises because it must never block a nap. A
+    pre-migration copy is the opposite — the irreversible rewrite the
+    caller is about to run must not proceed without a restore point. A
+    guard placed upstream of an irreversible effect, which the effect can
+    proceed past anyway, is not a guard — it is false assurance.
+    """
+    # Local import (matches this file's established pattern of function-
+    # local `import sys` -- see e.g. lines 174/779/833). No top-of-file
+    # `import sys` exists in this module.
+    import sys
+
+    backup_ok = True
+
+    if current_user_version >= latest_version:
+        return backup_ok
+
+    # Fresh-DB gate: only take the copy when there is data worth
+    # protecting. Every new install, every test fixture, and every CI
+    # run starts at user_version 0 with an empty `nodes` table — taking
+    # a copy on every one of those is pure noise, not safety, and would
+    # fire on every install and every CI run. The `nodes` table is
+    # guaranteed to already exist here: the caller's own CREATE TABLE IF
+    # NOT EXISTS executescript runs before this point, on every call.
+    #
+    # Unknown-therefore-protect: a FAILED read (e.g. a transient
+    # SQLITE_BUSY that would have cleared a moment later) must NOT be
+    # treated as "empty graph" -- that maps a read failure to "nothing
+    # worth protecting" and lets the irreversible rewrite proceed with no
+    # restore point, on exactly the populated graph this function exists
+    # to protect. So an exception here leaves the count unknown (None,
+    # never 0) and falls through to the backup attempt below rather than
+    # to the skip. This composes safely with the rest of the function: if
+    # the DB is genuinely broken (not just transiently locked), the
+    # backup attempt fails too, and the existing failure path
+    # (backup_ok=False -> caller skips its rungs -> user_version
+    # untouched -> clean retry next startup) is what actually protects
+    # the graph -- this is this function's designed safe path, not a new
+    # one. A deliberate override for a truly unreadable/read-only DB
+    # already exists: ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1.
+    try:
+        _pre_mig_row_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes"
+        ).fetchone()[0]
+    except sqlite3.DatabaseError:
+        _pre_mig_row_count = None  # unknown, not "empty" -- see above
+
+    if _pre_mig_row_count == 0:
+        return backup_ok
+
+    if os.environ.get("ENGRAM_SKIP_PRE_MIGRATION_BACKUP") == "1":
+        print(
+            "[_take_pre_migration_backup_if_pending] ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1 "
+            "is set — proceeding with migration from "
+            f"user_version={current_user_version} WITHOUT a "
+            "pre-migration backup. This is a deliberate escape hatch "
+            "(read-only disk / CI); if this was not intentional, "
+            "unset the env var before the next migration attempt.",
+            file=sys.stderr,
+        )
+        return backup_ok
+
+    # Derive the backup SOURCE from `conn` itself, not the module-global
+    # DB_PATH -- `conn` is not guaranteed to be attached to DB_PATH (a
+    # caller may open its own connection to a different file, e.g. a test
+    # fixture). Backing up DB_PATH while migrating a DIFFERENT database
+    # produces a restore point for the wrong graph while the real one gets
+    # rewritten -- false assurance is worse than no assurance at all.
+    # Same idiom the #2080 self-heal above already uses for this exact
+    # reason (PRAGMA database_list, column index 2 = the file path of the
+    # 'main' database).
+    _pre_mig_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+
+    if not _pre_mig_db_path:
+        # Empty path = an in-memory database (":memory:" or a temp DB
+        # never attached to a file). Nothing on disk to copy, nothing to
+        # restore -- skip the backup and let the migration proceed. Do
+        # NOT fall back to DB_PATH here: that would silently reintroduce
+        # the exact bug this branch exists to close, for the one caller
+        # (an in-memory conn) most likely to hit it.
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup "
+            "SKIPPED — the connection being migrated is "
+            "in-memory (no on-disk file to copy). Proceeding "
+            f"with migration from user_version={current_user_version} "
+            "without a restore point; nothing durable is at risk.",
+            file=sys.stderr,
+        )
+        return backup_ok
+
+    _pre_mig_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    _pre_mig_filename = f"pre-migration-v{current_user_version}-{_pre_mig_ts}.db"
+    _pre_mig_result = _write_binary_backup(
+        _pre_mig_db_path,
+        DATA_DIR / "db-backup",
+        max_keep=3,
+        filename=_pre_mig_filename,
+        glob_pattern="pre-migration-*.db",
+    )
+    if "error" in _pre_mig_result:
+        backup_ok = False
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup FAILED "
+            f"({_pre_mig_result['error']!r}) — SKIPPING migration "
+            "rungs this startup, PRAGMA user_version stays at "
+            f"{current_user_version}. The migration will retry "
+            "automatically on the next startup once the backup "
+            "can succeed. To proceed anyway (e.g. read-only "
+            "disk, deliberate CI run), set "
+            "ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup "
+            f"written: {_pre_mig_result.get('path')} "
+            f"({_pre_mig_result.get('bytes')} bytes) before "
+            f"migrating from user_version={current_user_version}.",
+            file=sys.stderr,
+        )
+
+    return backup_ok
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -1737,6 +1896,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     unmarked so the next _get_db() call retries the whole block
     (guard-after-success, not guard-after-attempt).
     """
+    # Local import (matches this file's established pattern of function-local
+    # `import sys` — see e.g. lines 174/779/833). Unconditional at the top of
+    # the function, not nested inside a rung's own `if` block below, because
+    # `sys.stderr` is also used by migration rung 4's own except handlers
+    # further down, which can run on a path (e.g. a fresh, zero-row DB) that
+    # never enters the pre-migration-backup branch that would otherwise be
+    # the only place binding it.
+    import sys
+
     # Create tables
     conn.executescript(
         """
@@ -2129,7 +2297,31 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # 'integrity-check' command always reports "malformed" on a graph that has
     # retractions — this is expected by design, not a sign of corruption (#781).
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if current_user_version < 1:
+
+    # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
+    # below (currently rung 4 -> PRAGMA user_version = 4). No single named
+    # constant exists elsewhere in this function for "the latest schema
+    # version" — each rung below hardcodes its own target inline — so this
+    # local mirrors that existing convention rather than inventing a new
+    # module-level constant this PR would be the only user of. Bump this
+    # alongside adding any future rung 5. (Mechanically checked against the
+    # rungs' own PRAGMA user_version = N literals by
+    # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
+    # — forgetting the bump fails loudly at test time instead of silently
+    # skipping the new rung's backup.)
+    _PRE_MIGRATION_LATEST_VERSION = 4
+
+    # See _take_pre_migration_backup_if_pending's docstring for the full
+    # contract (what True/False mean, why the failure posture is inverted
+    # from _write_binary_backup's own never-raise contract).
+    # `and _pre_migration_backup_ok` on every `if current_user_version < N:`
+    # rung check below is what makes a failed backup actually block the
+    # rungs it guards.
+    _pre_migration_backup_ok = _take_pre_migration_backup_if_pending(
+        conn, current_user_version, _PRE_MIGRATION_LATEST_VERSION
+    )
+
+    if current_user_version < 1 and _pre_migration_backup_ok:
         try:
             conn.execute(
                 """
@@ -2163,7 +2355,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Strategy: drop vocab↔fts dependency chain, rebuild both, backfill all
     # non-retracted nodes into the new 5-column schema, recreate triggers.
     # Gated by user_version so it runs exactly once.
-    if current_user_version < 2:
+    if current_user_version < 2 and _pre_migration_backup_ok:
         try:
             # Drop in dependency order: vocab depends on FTS, FTS is the target.
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
@@ -2250,7 +2442,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     #   b. Trigger: nodes_fts_supersede_remove is created at setup time (above)
     #      via CREATE TRIGGER IF NOT EXISTS; the CREATE here is a no-op safety net
     #      for the path where setup ran before this migration block was added.
-    if current_user_version < 3:
+    if current_user_version < 3 and _pre_migration_backup_ok:
         try:
             conn.execute(
                 """
@@ -2326,7 +2518,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     #      corrected claim (step 1) and the new FTS-adjacent columns.
     #      Expect real wall-clock time on a large graph; that is expected
     #      and correct, not a bug to route around.
-    if current_user_version < 4:
+    if current_user_version < 4 and _pre_migration_backup_ok:
         try:
             import engram_backup
 
@@ -2473,13 +2665,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         except sqlite3.DatabaseError as _migration4_err:
             print(
                 f"[_run_db_one_time_setup] migration 4 (#1952 PR2/#1817/#1875) "
-                f"FAILED, will retry on next startup: {_migration4_err!r}"
+                f"FAILED, will retry on next startup: {_migration4_err!r}",
+                file=sys.stderr,
             )
         except ImportError as _migration4_import_err:
             print(
                 f"[_run_db_one_time_setup] migration 4 FAILED — could not "
                 f"import engram_backup, will retry on next startup: "
-                f"{_migration4_import_err!r}"
+                f"{_migration4_import_err!r}",
+                file=sys.stderr,
             )
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
@@ -3993,21 +4187,36 @@ def _write_binary_backup(
     src_db_path: str,
     backup_dir: Path,
     max_keep: int = 7,
+    filename: str | None = None,
+    glob_pattern: str = "knowledge-*.db",
 ) -> dict:
     """Write a timestamped binary hot-copy of knowledge.db to backup_dir.
 
     Uses sqlite3.Connection.backup() — the same WAL-safe hot-copy approach as
     engram_backup.dump_stripped — so the live database is never locked hard.
 
-    Naming: knowledge-YYYYMMDD.db (one file per calendar day). Idempotent: if a
-    file for today already exists, the write is skipped.
+    Naming: knowledge-YYYYMMDD.db (one file per calendar day) by default. Pass
+    `filename` to write under a caller-chosen name instead (e.g. a
+    migration-keyed pre-migration copy) — defaults to None, i.e. every
+    existing caller is byte-equivalent to before this parameter existed.
 
-    Rotation: after a successful write, all but the max_keep newest files (sorted
-    by mtime) are deleted.
+    Idempotent skip: when `filename` is None, a file for today already
+    existing skips the write. This same-day skip does NOT apply when
+    `filename` is supplied — a caller-supplied name carries its own
+    timestamp and is unique per run by construction, so an exists() skip
+    there could only ever fire on a pathological collision, not a
+    legitimate same-day repeat.
+
+    Rotation: after a successful write, all but the max_keep newest files
+    matching `glob_pattern` (sorted by mtime) are deleted. `glob_pattern`
+    defaults to the daily-ladder pattern; pass a caller-specific pattern
+    (with its own `max_keep`) to give a copy family its own rotation,
+    isolated from the daily ladder's.
 
     Returns:
         {"path": str, "bytes": int, "pruned": int}  — successful write
         {"skipped": "same-day copy exists", "path": str}  — idempotent skip
+            (default-naming mode only; never returned when `filename` is set)
         {"error": str}  — any failure (best-effort: never raises, never blocks nap)
 
     Note: backup_dir (DATA_DIR / "db-backup") should be listed in
@@ -4018,11 +4227,14 @@ def _write_binary_backup(
     dest_path: Path | None = None
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
-        today_str = date.today().strftime("%Y%m%d")
-        dest_path = backup_dir / f"knowledge-{today_str}.db"
+        if filename is not None:
+            dest_path = backup_dir / filename
+        else:
+            today_str = date.today().strftime("%Y%m%d")
+            dest_path = backup_dir / f"knowledge-{today_str}.db"
 
-        if dest_path.exists():
-            return {"skipped": "same-day copy exists", "path": str(dest_path)}
+            if dest_path.exists():
+                return {"skipped": "same-day copy exists", "path": str(dest_path)}
 
         src_conn = sqlite3.connect(src_db_path)
         try:
@@ -4036,9 +4248,9 @@ def _write_binary_backup(
 
         backup_bytes = dest_path.stat().st_size
 
-        # Prune: keep only the max_keep newest files by mtime.
+        # Prune: keep only the max_keep newest files matching glob_pattern, by mtime.
         all_backups = sorted(
-            backup_dir.glob("knowledge-*.db"),
+            backup_dir.glob(glob_pattern),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
