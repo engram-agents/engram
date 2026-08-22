@@ -715,6 +715,48 @@
       "path": "templates/agents.json.example",
       "tier": "convenience",
       "multi_agent": true
+    },
+    {
+      "path": "src/build/instruction_manifestation/__init__.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/__init__.py",
+      "note": "instruction-manifestation engine PR2 (#2140): package init. Lives directly under src/build/ (not source_root=src/engram), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above). Developer (T3): a build-time schema/lint/generator system for authoring instruction templates, not something that runs at agent session time -- removing it doesn't break epistemic identity or continuity."
+    },
+    {
+      "path": "src/build/instruction_manifestation/schema.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/schema.py",
+      "note": "instruction-manifestation engine PR2 (#2140): component-file + harness-contract schema parsing and validator. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/builder.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/builder.py",
+      "note": "instruction-manifestation engine PR2 (#2140): flat-composition render/build logic. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/lints.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/lints.py",
+      "note": "instruction-manifestation engine PR2 (#2140): the three PR2-scope build-time lints (base-never-names-a-tool, unresolved-variable, extension_required coverage). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "note": "instruction-manifestation engine PR2 (#2140): generator for the GENERATED tool-policy pilot component, sourced from deploy/tool_policy_facts.py. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/components",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/components",
+      "note": "instruction-manifestation engine PR2 (#2140): the two new-schema pilot components (identity-self-reference-example, tool-policy + its claude extension) in a fresh location, entirely separate from and additive to #2145's untouched src/engram/templates/components/ (different schema, different directory). Directory-level entry, same granularity precedent as the templates/components entry above. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3): build-time authoring content, not shipped/consumed at session time."
+    },
+    {
+      "path": "src/build/instruction_manifestation/harnesses",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/harnesses",
+      "note": "instruction-manifestation engine PR2 (#2140): harness-contract directory (claude.yaml pilot only -- codex/dsh contracts are PR3's job). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
     }
   ],
   "excluded": [

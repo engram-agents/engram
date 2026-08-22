@@ -1,0 +1,36 @@
+# Harness contract for Claude Code (PR2 pilot; codex/dsh are PR3's job --
+# see the PR2 spec sec. 3 and #2140's design-of-record).
+#
+# tool_names is lint (a)'s registry -- the union of concrete Claude-Code
+# session/orchestration tool names that must never appear literally in a
+# BASE component's body. Verified against this repo's own docs (template.
+# CLAUDE.md, deploy/autostart/boot-charge-*.md name ScheduleWakeup, Agent,
+# Monitor, Workflow, CronList directly) and this session's own available
+# fairy-orchestration tool surface (EnterWorktree/ExitWorktree/TaskCreate/
+# TaskUpdate/TaskGet/TaskList/TaskOutput/TaskStop/SendMessage/CronCreate) --
+# not an invented list.
+name: claude
+tool_names:
+  - ScheduleWakeup
+  - CronList
+  - CronCreate
+  - Agent
+  - Monitor
+  - EnterWorktree
+  - ExitWorktree
+  - TaskCreate
+  - TaskUpdate
+  - TaskGet
+  - TaskList
+  - TaskOutput
+  - TaskStop
+  - SendMessage
+  - Workflow
+variables:
+  IDENTITY_FILE_NAME: "~/.claude/CLAUDE.md"
+  SESSION_START_MECHANISM: "the SessionStart hook injects"
+components:
+  - id: identity-self-reference-example
+    extension: auto
+  - id: tool-policy
+    extension: auto
