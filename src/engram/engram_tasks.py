@@ -599,9 +599,13 @@ def _report_feeling_impl(
     tag = categorical_tag.strip() if categorical_tag else None
 
     # Auto-format the claim — schema-level enforcement of "I reported" framing.
+    # #1952 PR2 / #1875: no truncation — claim is the FULL report text. The
+    # hedge prefix below is a structural honesty guarantee (per Lei's
+    # feeling-schema ruling (#1875, 2026-08-19) — never let a feeling node
+    # read as an unhedged truth-claim) and is mechanically applied here; no
+    # caller can omit or shorten it.
     state_clean = reported_state.strip()
-    summary = state_clean if len(state_clean) <= 80 else state_clean[:80].rstrip() + "..."
-    formatted_claim = f"I reported feeling: {summary}"
+    formatted_claim = f"I reported feeling: {state_clean}"
 
     # Mechanical nudge_source determination — read-and-clear the marker.
     # Done BEFORE any DB writes so a corrupt marker can't half-create a node.

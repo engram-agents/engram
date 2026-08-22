@@ -4,7 +4,7 @@ Tests for feeling_report node type (fl_).
 Covers:
 1. Creation with fl_ prefix and no confidence
 2. Claim auto-formatting ("I reported feeling: ...")
-3. Claim summary truncation at 80 chars
+3. Claim is the full untruncated report text (#1952 PR2 / #1875)
 4. Non-claim-bearing (rejected in derive/contradict/resolve)
 5. Importance anchoring (importance_base = 2.0)
 6. Dedup exemption (feeling reports never appear in add_observation hints)
@@ -97,16 +97,21 @@ def test_feeling_claim_auto_formatted():
     assert node["node"]["claim"] == f"I reported feeling: {state}"
 
 
-def test_feeling_claim_summary_truncation():
-    """Long reported_state should truncate to 80 chars + '...' in the claim."""
+def test_feeling_claim_summary_no_truncation():
+    """Long reported_state is NOT truncated in the claim (#1952 PR2 / #1875).
+
+    Pre-PR2 this asserted 80-char + "..." truncation; #1875 removed that
+    truncation (291/354 fl_ nodes were being cut mid-word, and claim is what
+    gets embedded) so the claim is now the full report text with the
+    mechanical hedge prefix, no length cap.
+    """
     client, _ = fresh_client()
     long_state = "a" * 200
     r = client.call("engram_report_feeling", {
         "reported_state": long_state,
         "trigger": "Long state test.",
     })
-    # First 80 chars (stripped) + "..."
-    expected = f"I reported feeling: {('a' * 80).rstrip()}..."
+    expected = f"I reported feeling: {long_state}"
     assert r["claim"] == expected, f"Got: {r['claim']}"
 
 

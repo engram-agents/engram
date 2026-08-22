@@ -1621,6 +1621,104 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
+# The four nodes_fts sync-trigger names, single-sourced so
+# _recreate_fts_sync_triggers and any standalone DROP-before-rebuild step
+# (migration rung 4, below) can't drift apart on the name list itself.
+_FTS_SYNC_TRIGGER_NAMES = (
+    "nodes_fts_insert",
+    "nodes_fts_delete",
+    "nodes_retract_remove_from_fts",
+    "nodes_fts_supersede_remove",
+)
+
+
+def _recreate_fts_sync_triggers(
+    conn: sqlite3.Connection, cols: list[str], drop_first: bool
+) -> None:
+    """Build and (re)create the four nodes_fts sync triggers for `cols`.
+
+    Shared by two call sites that used to carry independently-written copies
+    of these four CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
+    reviewer-flagged duplication):
+
+      - the always-run setup block above (`drop_first=False` — no DROP here;
+        uses `CREATE TRIGGER IF NOT EXISTS` so a trigger already created by a
+        prior call/process is left alone rather than being blindly recreated).
+      - migration rung 4 below (`drop_first=True` — the caller has ALREADY
+        dropped the four triggers via `_FTS_SYNC_TRIGGER_NAMES` before
+        delegating to `engram_backup.rebuild_fts_index` — see the ordering
+        comment at that call site for why the drop must happen before, not
+        during, this function's own call, which runs only after the FTS
+        table has actually been rebuilt to `cols`' shape. `drop_first=True`
+        here re-drops (idempotent no-op — the triggers are already gone) and
+        then issues a plain, non-`IF NOT EXISTS` `CREATE TRIGGER`, so a stale
+        trigger body from an earlier, differently-shaped `cols` cannot survive
+        under an `IF NOT EXISTS` no-op the way it could at the always-run
+        site.
+
+    Every OperationalError from an individual CREATE TRIGGER call is
+    swallowed, matching the always-run block's pre-existing per-trigger
+    try/except (a trigger that already exists in the exact target shape is
+    not an error worth surfacing here).
+    """
+    trig_cols_sql = ", ".join(cols)
+    new_vals_sql = ", ".join(f"new.{c}" for c in cols)
+    old_vals_sql = ", ".join(f"old.{c}" for c in cols)
+    old_coalesce_sql = ", ".join(f"COALESCE(OLD.{c}, '')" for c in cols)
+
+    if drop_first:
+        for _trig_name in _FTS_SYNC_TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER IF EXISTS {_trig_name}")
+
+    create_clause = "CREATE TRIGGER" if drop_first else "CREATE TRIGGER IF NOT EXISTS"
+
+    trigger_sqls = [
+        f"""
+        {create_clause} nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, {trig_cols_sql})
+            VALUES (new.rowid, {new_vals_sql});
+        END
+        """,
+        f"""
+        {create_clause} nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', old.rowid, {old_vals_sql});
+        END
+        """,
+        # Retract trigger (#274, round-2 #280; design rev 2026-07-02 #195 adds
+        # the OLD.is_current=1 guard — see the always-run block's own comment
+        # above for the full rationale, kept there rather than duplicated here).
+        f"""
+        {create_clause} nodes_retract_remove_from_fts
+        AFTER UPDATE OF status ON nodes
+        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+          AND OLD.is_current = 1
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+        # Supersede trigger (#195, design rev 2026-07-02) — see the
+        # always-run block's own comment above for the full rationale.
+        f"""
+        {create_clause} nodes_fts_supersede_remove
+        AFTER UPDATE OF is_current ON nodes
+        WHEN NEW.is_current = 0 AND OLD.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+    ]
+
+    for trigger_sql in trigger_sqls:
+        try:
+            conn.execute(trigger_sql)
+        except sqlite3.OperationalError:
+            pass
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -1899,7 +1997,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         import engram_backup
         _fts_cols_sql = ", ".join(engram_backup.NODES_FTS_COLUMNS)
     except ImportError:
-        _fts_cols_sql = "claim, quoted_text, interpretation, reported_state, trigger_text"
+        _fts_cols_sql = "claim, quoted_text, interpretation, trigger_text, recall_summary, recall_keywords"
     try:
         conn.execute(
             f"""
@@ -1992,81 +2090,27 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             pass  # creation failed — fall back to Python cosine
 
     # Rebuild FTS triggers — safe to run multiple times
-    for trigger_sql in [
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
-        END
-        """,
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
-        END
-        """,
-        # Retract trigger (#274, round-2 #280): remove retracted nodes from FTS.
-        # Fires on AFTER UPDATE OF status when status transitions INTO 'retracted',
-        # regardless of whether the node was current or already-superseded at the
-        # time of retraction. The COALESCE guard prevents double-delete on idempotent
-        # re-retracts (FTS5 'delete' magic-insert is NOT idempotent — double-delete
-        # raises "database disk image is malformed").
-        #
-        # Design rev 2026-07-02 (#195): add AND OLD.is_current = 1.
-        # In the new design nodes_fts_supersede_remove handles FTS eviction when
-        # is_current flips 1→0; by the time a superseded node (is_current already 0)
-        # is retracted, it is already absent from nodes_fts.  Without this guard the
-        # retract trigger would attempt a second FTS 'delete' on an absent rowid,
-        # raising "database disk image is malformed".
-        #
-        # FTS5 contentless-table mechanic: the 'delete' magic-insert requires
-        # OLD column values because the contentless table doesn't store them.
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_retract_remove_from_fts
-        AFTER UPDATE OF status ON nodes
-        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
-          AND OLD.is_current = 1
-        BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', OLD.rowid,
-                    COALESCE(OLD.claim, ''),
-                    COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''),
-                    COALESCE(OLD.reported_state, ''),
-                    COALESCE(OLD.trigger_text, ''));
-        END
-        """,
-        # Supersede trigger (#195, design rev 2026-07-02): remove superseded nodes
-        # from the FTS search index when is_current flips to 0.  FTS is a search
-        # index for active recall; superseded nodes remain in the graph and are
-        # reachable via graph traversal and engram_list, but should not surface in
-        # text search results.
-        #
-        # The extra AND COALESCE(NEW.status, '') != 'retracted' prevents a
-        # double-delete when retraction does a combined UPDATE with both
-        # status='retracted' and is_current=0 in one statement: without the guard
-        # both this trigger and nodes_retract_remove_from_fts would fire, and
-        # the second FTS 'delete' raises "database disk image is malformed".
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
-        AFTER UPDATE OF is_current ON nodes
-        WHEN NEW.is_current = 0 AND OLD.is_current = 1
-          AND COALESCE(NEW.status, '') != 'retracted'
-        BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', OLD.rowid,
-                    COALESCE(OLD.claim, ''),
-                    COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''),
-                    COALESCE(OLD.reported_state, ''),
-                    COALESCE(OLD.trigger_text, ''));
-        END
-        """,
-    ]:
-        try:
-            conn.execute(trigger_sql)
-        except sqlite3.OperationalError:
-            pass
+    #
+    # Column list is single-sourced from engram_backup.NODES_FTS_COLUMNS
+    # (#2077), same as the CREATE VIRTUAL TABLE block above — reuses the
+    # already-computed `_fts_cols_sql` string (split back into a list) rather
+    # than re-importing engram_backup, so this stays correct even on the
+    # (never-expected) import-failure fallback path above. Every nodes_fts
+    # column name is also a `nodes` column name, so new.<col>/old.<col>
+    # references resolve directly without a lookup table.
+    #
+    # Trigger bodies themselves (retract/supersede guards, the FTS5
+    # contentless-table 'delete' magic-insert mechanic, etc.) are built by
+    # the shared _recreate_fts_sync_triggers helper (round-3 fix; #2077's
+    # own duplication flag) — see that function's docstring for the full
+    # per-trigger rationale, previously inlined here and independently
+    # inlined again at migration rung 4 below, ~370 lines apart, with no
+    # guard against the two copies drifting on the next column-set change.
+    # drop_first=False here: no DROP precedes this call, so CREATE TRIGGER
+    # IF NOT EXISTS is used, matching this block's pre-existing idempotent,
+    # safe-to-run-every-startup behavior.
+    _fts_trig_cols = [c.strip() for c in _fts_cols_sql.split(",")]
+    _recreate_fts_sync_triggers(conn, _fts_trig_cols, drop_first=False)
 
     # One-shot migration (#274): remove existing retracted nodes from the FTS
     # index. Pre-existing retracted nodes were indexed before the trigger above
@@ -2243,6 +2287,200 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             conn.execute("PRAGMA user_version = 3")
         except sqlite3.DatabaseError:
             pass
+
+    # Migration version 4 (#1952 PR2 / #1817, #1875): fold recall_summary +
+    # recall_keywords into the FTS index and the embedding text (#1817), and
+    # backfill the full (untruncated) claim for feeling_report nodes (#1875).
+    # Paired schema+data rung per the team's migration contract (a schema
+    # change and its data migration ship on the SAME PRAGMA user_version
+    # rung, never separately).
+    #
+    # Three pieces, in dependency order — NOTE the order is claim-backfill
+    # THEN fts-reindex THEN re-embed, not the "a/b/c" issue-numbering order
+    # above: nodes_fts is an external-content FTS5 table (content='nodes')
+    # kept in sync only by the four sync triggers below, and NONE of them
+    # fire on a plain UPDATE OF claim — so if the FTS reindex below ran
+    # BEFORE the claim backfill, it would index the OLD (still-truncated)
+    # claim text and there is no later trigger to re-sync it. Caught by this
+    # rung's own migration-check script during implementation (see PR
+    # handoff), not by any pre-existing test.
+    #   1. Claim backfill (#1875) — recompute claim for every feeling_report
+    #      node from its (still-present, deliberately-kept — see #1952 PR2's
+    #      PR description) reported_state column: full text + hedge prefix,
+    #      no truncation. Must run BEFORE the FTS reindex below, or the
+    #      reindex captures stale (truncated) claim text with nothing to
+    #      correct it later.
+    #   2. FTS schema — drop+rebuild nodes_fts to the new 6-column canonical
+    #      set (claim, quoted_text, interpretation, trigger_text,
+    #      recall_summary, recall_keywords — reported_state dropped; see
+    #      NODES_FTS_COLUMNS in engram_backup.py) + recreate the four sync
+    #      triggers with the new column list. Runs against the
+    #      already-corrected claim text from step 1.
+    #   3. Full re-embed (#1817) — every existing embedding was computed
+    #      under the old claim-only formula and is now stale (recall_summary/
+    #      recall_keywords fold in as of this rung; feeling_report nodes
+    #      strip the hedge prefix before embedding). Kepler's design note: a
+    #      graph where some nodes embed summaries and others don't is harder
+    #      to reason about than either uniform state — so this re-embeds
+    #      EVERY node, not just NULL ones. Runs last so it sees both the
+    #      corrected claim (step 1) and the new FTS-adjacent columns.
+    #      Expect real wall-clock time on a large graph; that is expected
+    #      and correct, not a bug to route around.
+    if current_user_version < 4:
+        try:
+            import engram_backup
+
+            # 1. #1875 claim backfill — full untruncated text + hedge
+            # prefix, using the SAME formatting _report_feeling_impl now
+            # writes at insert time (engram_tasks.py). reported_state
+            # already stores the stripped text (state_clean was written
+            # into it at insert time), so no additional trimming is needed
+            # here. Must run BEFORE the FTS reindex in step 2 — see the
+            # ordering note above.
+            conn.execute(
+                """
+                UPDATE nodes
+                SET claim = 'I reported feeling: ' || COALESCE(reported_state, '')
+                WHERE type = 'feeling_report'
+                """
+            )
+
+            # Drop the four FTS-sync triggers BEFORE delegating to
+            # rebuild_fts_index below (round-3 fix; reviewer-fairy
+            # fault-injection finding). rebuild_fts_index's own DROP
+            # TABLE/CREATE VIRTUAL TABLE is DDL — SQLite auto-commits DDL
+            # immediately, independent of any surrounding transaction, so it
+            # takes effect even if this rung later raises and the
+            # except-handler below leaves PRAGMA user_version at 3 for
+            # retry. Previously this drop happened AFTER rebuild_fts_index
+            # returned (at the trigger-recreation step further down): if
+            # rebuild_fts_index itself raised — or anything raised between
+            # its return and the old drop site — nodes_fts already had the
+            # new 6-column shape (auto-committed, can't be rolled back)
+            # while these triggers were still the OLD 5-column versions
+            # referencing `reported_state`, a column the rebuilt table no
+            # longer has, so EVERY subsequent node write in that process
+            # raised `OperationalError: table nodes_fts has no column named
+            # reported_state` — only a genuine process restart (which
+            # re-runs this whole rung from scratch against user_version=3)
+            # recovered. Mirrors migration rung 2 above, which already drops
+            # its old triggers before recreating the FTS table with the new
+            # schema: with no triggers active, a mid-rebuild failure leaves
+            # writes silently under-indexed until the retry succeeds — same
+            # failure profile as migration 2 — instead of hard-crashing on a
+            # stale-column reference.
+            for _fts4_trig in _FTS_SYNC_TRIGGER_NAMES:
+                conn.execute(f"DROP TRIGGER IF EXISTS {_fts4_trig}")
+
+            # 2. FTS schema — delegate the drop/detect-mismatch/rebuild/
+            # reindex to rebuild_fts_index, which is already
+            # NODES_FTS_COLUMNS-aware (#2077) and already used by the #2080
+            # startup self-heal above (same calling convention: flush
+            # `conn`'s own pending writes first, since rebuild_fts_index
+            # opens its OWN connection to the same file and the two would
+            # otherwise collide over WAL's single-writer lock — safe to
+            # commit early here for the same reason the self-heal block
+            # above is: every statement `conn` has issued so far this call,
+            # including the claim backfill just above, is independently
+            # idempotent).
+            conn.commit()
+            _fts4_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+            # Swallow rebuild_fts_index's own stdout print here — from THIS
+            # call site a "repairing under-indexed nodes_fts" mismatch is
+            # ROUTINE and expected (fixing exactly that mismatch is this
+            # rung's entire job), not an anomaly worth alarming callers
+            # about. Left loud for the #2080 self-heal above, where the same
+            # mismatch surfacing on an already-running server IS unexpected
+            # drift worth reporting. Concretely: on a from-scratch install,
+            # rungs 1-4 all fire in a single pass (current_user_version
+            # starts at 0), and rung 2's own frozen, hardcoded 5-column
+            # nodes_fts recreate (do not touch — see hard scope bounds)
+            # means THIS step legitimately finds a mismatch on every fresh
+            # install, not just real upgrades — an unsuppressed print here
+            # broke every caller that treats stdout as a clean
+            # machine-readable channel (e.g. the SessionStart hook's
+            # subprocess-style JSON contract — caught by
+            # tests/test_session_start_hook_mcp_health.py during
+            # implementation, not by any test named in the spec).
+            import contextlib
+            import io as _io
+            with contextlib.redirect_stdout(_io.StringIO()):
+                engram_backup.rebuild_fts_index(_fts4_db_path)
+
+            _fts4_cols = list(engram_backup.NODES_FTS_COLUMNS)
+            _fts4_cols_sql = ", ".join(_fts4_cols)
+
+            # rebuild_fts_index's 'rebuild' step repopulates FTS from every
+            # row in `nodes` (including is_current=0 ones) and its own
+            # cleanup only excludes status='retracted' rows — it has no
+            # is_current awareness. Migration 3 above additionally excludes
+            # superseded (is_current=0, non-retracted) rows from FTS, and
+            # that exclusion does not survive a rebuild_fts_index call
+            # untouched. Reassert it here with the same delete-insert
+            # migration 3 uses (now over the new column set) so this rung
+            # doesn't regress migration 3's guarantee. Safe to run every
+            # time this rung executes, including on a retry after an
+            # earlier failed attempt, because rebuild_fts_index's own
+            # 'rebuild' step, immediately above, unconditionally repopulates
+            # every row first — so the rows targeted below are always
+            # present in the index at this point, never already-absent (the
+            # specific condition that makes FTS5's 'delete' magic-insert
+            # raise "database disk image is malformed").
+            _fts4_select_sql = ", ".join(f"COALESCE({c}, '')" for c in _fts4_cols)
+            conn.execute(
+                f"""
+                INSERT INTO nodes_fts(nodes_fts, rowid, {_fts4_cols_sql})
+                SELECT 'delete', rowid, {_fts4_select_sql}
+                FROM nodes
+                WHERE is_current = 0 AND status != 'retracted'
+                """
+            )
+
+            # Triggers — rebuild_fts_index doesn't touch these, and they
+            # were already dropped above (BEFORE the rebuild, to close the
+            # crash window described there). Recreate them now, after the
+            # reindex work, with the new column set. Shared with the
+            # always-run block via _recreate_fts_sync_triggers (round-3 fix;
+            # was ~370 lines of independently-written duplicate CREATE
+            # TRIGGER bodies) so the two copies cannot drift apart on a
+            # future column-set change. drop_first=True here re-issues the
+            # (already-idempotent, already-no-op) DROP from the loop above,
+            # then a plain CREATE TRIGGER — not IF NOT EXISTS — so a stale
+            # trigger body cannot survive the way it could under the
+            # always-run block's idempotent IF-NOT-EXISTS semantics.
+            _recreate_fts_sync_triggers(conn, _fts4_cols, drop_first=True)
+
+            conn.commit()
+
+            # 3. #1817 full re-embed — must run after steps 1 and 2 so the
+            # embedding text reflects the corrected claim and the new
+            # recall_summary/recall_keywords folding.
+            _reembed_all_nodes(conn)
+
+            # Bump version INSIDE the try block, after every step above has
+            # completed, so a crash partway (e.g. mid re-embed on a large
+            # graph) leaves the gate at 3 and the whole rung retries next
+            # startup rather than being permanently half-applied — matches
+            # rungs 1-3's own retry-safety convention. Every step above is
+            # independently safe to re-run: rebuild_fts_index is idempotent;
+            # DROP+CREATE TRIGGER is idempotent; the claim backfill UPDATE
+            # recomputes the same value; the supersede-cleanup delete-insert
+            # is safe to re-run because rebuild_fts_index's own rebuild step
+            # always runs immediately before it (see above); re-embedding is
+            # idempotent by construction (it overwrites, never appends).
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration4_err:
+            print(
+                f"[_run_db_one_time_setup] migration 4 (#1952 PR2/#1817/#1875) "
+                f"FAILED, will retry on next startup: {_migration4_err!r}"
+            )
+        except ImportError as _migration4_import_err:
+            print(
+                f"[_run_db_one_time_setup] migration 4 FAILED — could not "
+                f"import engram_backup, will retry on next startup: "
+                f"{_migration4_import_err!r}"
+            )
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
     # edit_history: chronological audit trail of every graph mutation.
@@ -3185,27 +3423,65 @@ def _get_embedding_config() -> dict:
     return {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True}
 
 
+# Mechanical hedge prefix _report_feeling_impl (engram_tasks.py) writes onto
+# every feeling_report claim ("I reported feeling: " + full state text, no
+# truncation as of #1952 PR2/#1875). Duplicated here (not imported from
+# engram_tasks.py — engram_core.py must not depend on engram_tasks.py) so the
+# embedding-text special case below can strip it before embedding; if
+# _report_feeling_impl's prefix ever changes, this literal must change with
+# it in lockstep.
+_FEELING_REPORT_HEDGE_PREFIX = "I reported feeling: "
+
+
 def _embedding_text_for_node(conn: sqlite3.Connection, node_id: str) -> str:
     """Determine the best text to embed for a node.
-    
+
     For observations/derivations/questions: the claim text.
     For evidence: the source title.
     For predictions: the predicted event.
+    For feeling_report: the claim with the mechanical hedge prefix
+        ("I reported feeling: ") stripped — #1817/#1875: the claim is now the
+        FULL untruncated report text, and embedding it WITH the hedge prefix
+        would cluster every feeling_report node on the boilerplate phrase
+        instead of their actual content (Kepler's design note, engram-alpha
+        #1875 comment 2026-08-19T21:52:16Z).
     For contradictions: the description.
+
+    #1817: recall_summary (and, if present, recall_keywords) are folded into
+    the base text computed above — a curated one-line summary/keyword set
+    written specifically to bridge vocabulary gaps previously had ZERO effect
+    on embedding-based retrieval; this makes it load-bearing. recall_keywords
+    is optional/weaker signal per #1817 but cheap to include, so it's folded
+    in whenever present.
     """
     row = conn.execute(
-        "SELECT type, claim, source_title, predicted_event FROM nodes WHERE id = ?",
+        "SELECT type, claim, source_title, predicted_event, "
+        "recall_summary, recall_keywords FROM nodes WHERE id = ?",
         (node_id,),
     ).fetchone()
     if not row:
         return ""
 
     if row["type"] == "evidence":
-        return row["source_title"] or ""
+        base = row["source_title"] or ""
     elif row["type"] == "prediction":
-        return row["predicted_event"] or row["claim"] or ""
+        base = row["predicted_event"] or row["claim"] or ""
+    elif row["type"] == "feeling_report":
+        base = (row["claim"] or "").removeprefix(_FEELING_REPORT_HEDGE_PREFIX)
     else:
-        return row["claim"] or ""
+        base = row["claim"] or ""
+
+    summary = row["recall_summary"]
+    if summary:
+        base = f"{base}\n{summary}" if base else summary
+
+    keywords = _reflect_keywords(row)
+    if keywords:
+        keywords_str = " ".join(str(kw) for kw in keywords if kw)
+        if keywords_str:
+            base = f"{base} {keywords_str}" if base else keywords_str
+
+    return base
 
 
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
@@ -3247,7 +3523,40 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
         pass  # Embedding computation failed — node works fine without it
 
 
-DEDUP_TOP_K = 15                          # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
+def _reembed_all_nodes(conn: sqlite3.Connection) -> int:
+    """One-time full re-embed pass: recompute the embedding for EVERY node.
+
+    Used by migration rung 4 (#1952 PR2 / #1817): _embedding_text_for_node's
+    formula changed (recall_summary/recall_keywords now fold in, and
+    feeling_report nodes strip the hedge prefix before embedding), so every
+    embedding computed under the old claim-only formula is stale. Kepler's
+    design note: a graph where some nodes embed summaries and others don't is
+    harder to reason about than either uniform state — so this touches EVERY
+    row in `nodes`, not just embedding IS NULL ones (unlike
+    tools/engram-regenerate-embeddings.py's restore-path backfill, which is
+    intentionally NULL-only and is_current=1-only).
+
+    Reuses _compute_and_store_embedding per node on the SAME connection (no
+    cross-connection WAL concern here, unlike the FTS rebuild delegation in
+    the migration rung above) rather than batching
+    (tools/engram-regenerate-embeddings.py batches embed_batch calls) —
+    expected to be slower on a large graph but simpler and already-tested.
+    Best-effort per node — silently a no-op when embeddings are disabled/
+    unavailable (ENGRAM_NO_EMBEDDINGS, missing sentence-transformers),
+    matching every other embedding call site.
+
+    Returns the number of node IDs processed (not the number successfully
+    embedded — _compute_and_store_embedding never raises and never reports
+    success/failure back to the caller).
+    """
+    node_ids = [r[0] for r in conn.execute("SELECT id FROM nodes").fetchall()]
+    for node_id in node_ids:
+        _compute_and_store_embedding(conn, node_id)
+    conn.commit()
+    return len(node_ids)
+
+
+DEDUP_TOP_K = 15                        # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
 
 
 DEDUP_MIN_SIMILARITY = 0.40               # was 0.50; tight-group recall lifts 65% → 86% at this threshold (precision still 83%)

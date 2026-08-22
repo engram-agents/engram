@@ -62,12 +62,24 @@ _DERIVED_TABLE_NAMES = ("vec_nodes",)
 # engram_core.py): it is the leaner, stdlib-only module several call sites
 # (engram-regenerate-embeddings.py, the server's own restore path) already
 # import without pulling in engram_core's full dependency chain.
+#
+# #1952 PR2 (engram-alpha#1817 / #1875): reported_state dropped, recall_summary
+# + recall_keywords added. reported_state is now redundant with the untruncated
+# claim (#1875 removes claim's 80-char cap for feeling_report nodes) plus
+# recall_summary — indexing it separately just duplicates content in the FTS
+# table. The column itself is NOT dropped from `nodes` (deliberately
+# conservative scoping, see #1952 PR2's PR description) — only removed from
+# the FTS column set. recall_summary/recall_keywords participate in FTS so a
+# curated summary/keyword set actually affects retrieval (#1817 — before this
+# they were write-only/display-only fields with zero effect on search hits).
+# See PRAGMA user_version rung 4 in engram_core.py for the paired migration.
 NODES_FTS_COLUMNS: tuple = (
     "claim",
     "quoted_text",
     "interpretation",
-    "reported_state",
     "trigger_text",
+    "recall_summary",
+    "recall_keywords",
 )
 
 
