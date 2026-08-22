@@ -249,6 +249,17 @@ def _resolve_impl(
         target previously resolved by a high-confidence resolver).
       - Idempotent on duplicate (resolving_node_id, target_id, 'resolves')
         — returns no_op without re-writing.
+      - Flags target.needs_tightening=1 when a real status change occurs and
+        the target already carries a recall_summary (#1777, #1952 PR3): a
+        summary authored while the node was open ("Open: ...") goes stale the
+        moment status flips, and nothing previously re-derived it. This is
+        the interim/invalidate fix (an on-demand LLM regenerate inside a
+        synchronous MCP handler has no precedent in this codebase) — the
+        flagged node then surfaces in the batch-summary fairy's
+        reviewer-of-outliers cohort so a correct summary gets authored on
+        the next sleep cycle. A target with no recall_summary yet
+        (recall_summary IS NULL — already summary_missing) is left alone;
+        there is nothing stale to flag.
 
     Why pure-wire (#229 design):
       The old combo create-and-wire made it cheap to wrap prior weak
@@ -282,7 +293,7 @@ def _resolve_impl(
     conn = core._get_db()
     try:
         target = conn.execute(
-            "SELECT id, type, claim, status, is_current FROM nodes WHERE id = ?",
+            "SELECT id, type, claim, status, is_current, recall_summary FROM nodes WHERE id = ?",
             (target_id,),
         ).fetchone()
         if not target:
@@ -431,9 +442,17 @@ def _resolve_impl(
             else:
                 resolution_status = "partially_resolved"
 
+        # #1777: a status flip makes any existing recall_summary potentially
+        # stale (it may have been authored while the node was still open —
+        # "Open: ..." — and nothing re-derives it here). Flag needs_tightening
+        # so the batch-summary fairy's reviewer-of-outliers cohort picks it up
+        # next sleep cycle. Only meaningful when a summary actually exists;
+        # a target with recall_summary IS NULL is already correctly tracked
+        # via summary_missing and needs no additional flag.
+        target_needs_tightening = 1 if target["recall_summary"] else 0
         conn.execute(
-            "UPDATE nodes SET status = ?, resolved_by = ? WHERE id = ?",
-            (resolution_status, best_resolver_id, target_id),
+            "UPDATE nodes SET status = ?, resolved_by = ?, needs_tightening = ? WHERE id = ?",
+            (resolution_status, best_resolver_id, target_needs_tightening, target_id),
         )
         core._log_edit(conn, "resolved", target_id, target["type"],
                   {"resolved_by": best_resolver_id, "resolution_status": resolution_status})
@@ -528,6 +547,17 @@ def _supersede_impl(
          relationship: old is marked is_current=0, new.supersedes = old,
          a supersedes edge is inserted, and downstream dependents of old
          are flagged stale.
+
+    recall_summary staleness (#1777, #1952 PR3 — checked, not assumed): unlike
+    engram_resolve, supersede needs no recall_summary/needs_tightening
+    handling here. old.is_current flips to 0, and every recall/surface/FTS
+    path that renders recall_summary already gates on is_current=1 (see
+    render_one_node_line, the nodes_fts sync triggers, _embedding_text_for_node
+    callers) — a superseded node's stale summary is simply never surfaced
+    again. new_node_id is a freshly-created node under its own creation
+    tool's write-time recall_summary contract (#1952 PR1), so it already
+    carries a current summary (or is correctly flagged summary_missing if its
+    author omitted one). Confirmed empirically, not by symmetry with resolve.
 
     Validation:
       - Both nodes must exist and be is_current=1 (no resurrecting

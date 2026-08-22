@@ -8,6 +8,9 @@ Covers:
     3. Manifest JSON lists both chunks with correct metadata (including attempt_count=0).
     4. Nodes not found in DB are silently skipped with a warning.
     15. Duplicate IDs in input are deduplicated with a warning.
+    29. #1952 PR3: a node with an existing recall_summary carries it into the
+        payload (TIGHTEN-mode signal); a summary-absent node omits the key
+        (AUTHOR mode) — both coexist in one chunk.
 
   verify-in subcommand:
     18. Happy path: valid cohort → exit 0, JSON output {"passed": true}.
@@ -184,13 +187,58 @@ def test_prepare_chunk_dirs_and_files_exist():
         assert len(payload_0) == 15, f"chunk-0 payload should have 15 entries, got {len(payload_0)}"
         assert len(payload_1) == 15, f"chunk-1 payload should have 15 entries, got {len(payload_1)}"
 
-        # Each payload entry must have id, type, claim; no recall_summary/recall_keywords
+        # Each payload entry must have id, type, claim; recall_keywords is
+        # never included (fresh keywords are always generated); recall_summary
+        # is included only when the DB row has one (#1952 PR3 tighten-mode
+        # signal — see test_prepare_needs_tightening_node_includes_recall_summary
+        # below). None of these fixture nodes have a recall_summary set, so it
+        # is absent here too.
         for entry in payload_0 + payload_1:
             assert "id" in entry, f"payload entry missing 'id': {entry}"
             assert "type" in entry, f"payload entry missing 'type': {entry}"
             assert "claim" in entry, f"payload entry missing 'claim': {entry}"
-            assert "recall_summary" not in entry, "recall_summary must not be in payload"
+            assert "recall_summary" not in entry, "recall_summary must not be in payload for a summary-absent node"
             assert "recall_keywords" not in entry, "recall_keywords must not be in payload"
+
+
+def test_prepare_needs_tightening_node_includes_recall_summary():
+    """#1952 PR3: a node with an existing recall_summary gets it in the payload —
+    this is the TIGHTEN-mode signal to the fairy (see engram-batch-summary-fairy.md
+    "Reviewing vs authoring"). A node with no recall_summary still omits the key
+    entirely (AUTHOR mode), confirming the two modes coexist correctly in one chunk.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001", "ob_0002"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        # ob_0001 is a needs_tightening review node — give it an existing
+        # over-limit summary. ob_0002 stays summary-absent (author mode).
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE nodes SET recall_summary = ? WHERE id = ?",
+            ("Open: this over-long stale summary needs tightening or correcting.", "ob_0001"),
+        )
+        conn.commit()
+        conn.close()
+
+        out_dir = tmp_dir / "out"
+        exit_code = _run([
+            "prepare",
+            "--ids", ",".join(node_ids),
+            "--out", str(out_dir),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+        ])
+        assert exit_code == 0, f"prepare exited {exit_code}"
+
+        payload = json.loads((out_dir / "chunk-0" / "payload.json").read_text())
+        by_id = {e["id"]: e for e in payload}
+
+        assert by_id["ob_0001"].get("recall_summary") == (
+            "Open: this over-long stale summary needs tightening or correcting."
+        ), by_id["ob_0001"]
+        assert "recall_summary" not in by_id["ob_0002"], by_id["ob_0002"]
 
 
 def test_prepare_manifest_has_attempt_count_and_no_prompt_path():

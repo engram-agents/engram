@@ -5733,6 +5733,13 @@ def engram_resolve(payload_json: str) -> str:
         When partial_resolution is due to threshold gate, includes
         discipline_hint advising against chain dilution.
 
+    Side effect (#1777, #1952 PR3): if target already carries a
+    recall_summary, a real status change (not the idempotent no_op path)
+    flags it needs_tightening=1 — a summary authored while the target was
+    open can no longer be trusted after resolution, and this queues it for
+    the batch-summary fairy's next reviewer-of-outliers pass rather than
+    leaving it silently stale.
+
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """

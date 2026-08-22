@@ -472,24 +472,56 @@ fi
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
-Build the cohort from today's new nodes (since last sleep) + backfill from legacy NULL-summary candidates, capped at 50 total.
+**As of #1952 PR3, the batch-summary fairy is reviewer of outliers, not
+author of record.** Write-time `recall_summary`/`recall_keywords` (#1952 PR1)
+means most new nodes already carry a fine summary by the time sleep runs —
+the fairy's cohort is now the union of two outlier classes, capped at 50
+total, and should be near-zero most nights:
+
+1. **`needs_tightening`-flagged** — a write-time summary was soft-accepted
+   over the 140-char target (under the 280-char hard-reject gate), OR a
+   status-changing mutation (`engram_resolve`, #1777) flagged an existing
+   summary as potentially stale. These need an existing summary *tightened
+   or corrected*, not authored from scratch.
+2. **Legacy / summary-absent stragglers** — `recall_summary IS NULL`,
+   whether the node predates the #1952 PR1 write-time contract entirely, or
+   a post-PR1 write omitted the summary (flagged `summary_missing`). These
+   need a *first* summary authored, same as before PR1.
+
+A cohort that's non-trivial night after night is itself a signal (fairies or
+agents inflating past the presented 140 target, or an unusually
+resolve-heavy day) — not something to silently keep absorbing.
 
 ```bash
 # Previous sleep's cohort_end_at (your install's marker path may vary):
 PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$HOME/.engram/sessions/last-sleep-success.json'))['cohort_end_at'])" 2>/dev/null || echo "")
 ```
 
-Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'` and `is_current = 1` (skip superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute).
+Use `engram_list` in structured-filter mode to enumerate today's-cohort node IDs directly: `created_at >= PREV_SLEEP` AND `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) (the `is_current` guard skips superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute). Example `filters_json`:
 
-If today's-cohort count < 50, top up from legacy NULLs:
+```json
+{
+  "logic": "AND",
+  "conditions": [
+    {"field": "created_at", "op": "gte", "value": "<PREV_SLEEP>"},
+    {"field": "is_current", "op": "eq", "value": 1},
+    {"field": "type", "op": "ne", "value": "evidence"},
+    {"logic": "OR", "conditions": [
+      {"field": "needs_tightening", "op": "eq", "value": 1},
+      {"field": "recall_summary", "op": "is_null"}
+    ]}
+  ]
+}
+```
 
-- Use `engram_list` with a status filter for active (`is_current = 1`), sort by `created_at` ascending (oldest first), limit to fill to 50
-- Exclude `type='evidence'` from the topup (same rationale as the today's-new filter)
-- This is the attrition pattern: every cycle drains the oldest NULL-summary nodes
+If today's-cohort count < 50, top up from the backlog:
+
+- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter — DROP the `created_at` lower bound — sort by `created_at` ascending (oldest first), limit to fill to 50
+- This is the attrition pattern: every cycle drains the oldest outlier nodes, `needs_tightening` and legacy-NULL alike
 
 > Evidence nodes (`ev_*`) are URL + verbatim-quote citations, not claim-bearing — they don't render via `engram_surface` and don't benefit from a recall_summary. Excluding them from the cohort prevents wasted summary-fairy compute and lets the real backfill drain faster. The exclusion is applied client-side on the returned set — `ev_*` IDs are prefix-typed, so `type != 'evidence'` works even if a tool's return doesn't surface a `type` field.
 
-Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy NULL pool over many cycles.
+Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy-NULL pool over many cycles; the `needs_tightening` pool should stay small night-to-night by design (a growing one is worth investigating, not just draining).
 
 **If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
@@ -765,9 +797,10 @@ Agent(
     - ... (one entry per category in tonight's types_to_run) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
-    COHORT METADATA:
-    - Today's new nodes since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
-    - Backfill from legacy NULL-summary: <L> IDs
+    COHORT METADATA (reviewer-of-outliers cohort, #1952 PR3 — needs_tightening
+    ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
+    - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
+    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
     - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle

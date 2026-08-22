@@ -78,7 +78,11 @@ DEFAULT_DB = Path.home() / ".engram" / "knowledge.db"
 # Node fields fetched from SQLite (read-only)
 # ---------------------------------------------------------------------------
 
-_NODE_COLUMNS = "id, type, claim, quoted_text, interpretation"
+# recall_summary added (#1952 PR3): the cohort now includes needs_tightening
+# nodes (an existing over-limit summary flagged for review), not just
+# summary-absent stragglers — the fairy needs to SEE the existing summary to
+# tighten it rather than regenerate blind. See _build_payload_entry below.
+_NODE_COLUMNS = "id, type, claim, quoted_text, interpretation, recall_summary"
 
 
 class ForeignOwnedFileError(RuntimeError):
@@ -141,7 +145,19 @@ def _fetch_nodes(db_path: Path, node_ids: list[str]) -> list[dict]:
 
 
 def _build_payload_entry(node: dict) -> dict:
-    """Strip fields the fairy must not see (recall_summary, recall_keywords)."""
+    """Build one payload entry, signaling review-mode vs author-mode (#1952 PR3).
+
+    recall_keywords is never included — the fairy always generates fresh
+    keywords regardless of cohort reason.
+
+    recall_summary is included ONLY when the node already has one (a
+    needs_tightening node: an existing over-limit summary flagged for
+    review). Its presence in the payload IS the signal to the fairy: TIGHTEN
+    this existing summary rather than author a fresh one from scratch (see
+    the fairy's agent spec, "Reviewing vs authoring"). A legacy-straggler /
+    summary_missing node (recall_summary IS NULL) gets no recall_summary key
+    at all — author-mode, same as pre-#1952-PR3 behavior.
+    """
     entry: dict = {
         "id": node["id"],
         "type": node["type"],
@@ -151,6 +167,8 @@ def _build_payload_entry(node: dict) -> dict:
         entry["quoted_text"] = node["quoted_text"]
     if node.get("interpretation"):
         entry["interpretation"] = node["interpretation"]
+    if node.get("recall_summary"):
+        entry["recall_summary"] = node["recall_summary"]
     return entry
 
 
