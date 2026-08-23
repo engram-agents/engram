@@ -10,7 +10,8 @@ git-ancestry is the wrong prune signal — GitHub PR state is the right one.)
 
 This tool classifies each worktree and removes the safely-finished ones:
 
-  PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean
+  PRUNE   branch worktree whose PR is MERGED or CLOSED (gh), worktree clean,
+          AND no live process has its CWD inside it (fairy not still running)
   PRUNE   detached-HEAD worktree, clean (reviewer-fairy leftover; nothing to lose)
   PRUNE   `worktree-agent-*` / `review-*` tmp-branch worktree, clean
   KEEP    branch worktree whose PR is OPEN (active work)
@@ -25,7 +26,13 @@ execute (`git worktree remove` + delete the now-merged local branch, then
 Safety invariants:
   * The main checkout is never touched.
   * A dirty worktree is never removed (clean-status gate), even if its PR merged.
-  * An in-use worktree is never removed (in-use guard: /proc/*/cwd scan).
+  * An in-use worktree is never removed (in-use guard: /proc/*/cwd scan) — this
+    is checked for EVERY prune path, including the PR-state (MERGED/CLOSED)
+    path, not just the detached-HEAD and worktree-agent-*/review-* branch
+    cases. Without it, a worktree whose PR just merged while its fairy is
+    still writing to disk could be reaped out from under it — see
+    classify() below, where the check runs before the MERGED/CLOSED PRUNE
+    return.
   * An OPEN-PR worktree is never removed.
   * A no-PR branch is never auto-removed (could be unpushed/abandoned work) —
     only reported, so a human decides.
@@ -154,6 +161,13 @@ def classify(t: dict, root: str) -> tuple[str, str]:
         return "PRUNE", f"tmp review branch '{branch}', clean"
     state = _pr_state(branch, root)
     if state in ("MERGED", "CLOSED"):
+        # A merged/closed PR does not mean the fairy that owned this worktree
+        # has finished with it — post-merge cleanup or a follow-up commit on a
+        # closed PR's branch can still be running here, so the in-use guard
+        # applies to this path too, exactly as it does for the detached-HEAD
+        # and worktree-agent-*/review-* cases above.
+        if _is_in_use(path):
+            return "SKIP", f"PR {state.lower()} ({branch}) but process active (fairy still running)"
         return "PRUNE", f"PR {state.lower()} ({branch})"
     if state == "OPEN":
         return "KEEP", f"PR OPEN ({branch}) — active work"
