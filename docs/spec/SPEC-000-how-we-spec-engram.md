@@ -193,6 +193,7 @@ system, not designed beside it**.
 | SPEC-002 | L1 verb contract | live MCP schemas via `dump_mcp_schema.py`, handbook 02 | generate skeleton, annotate semantics + error contracts |
 | SPEC-003 | L2 epistemic dynamics | handbook 01/09, `src/engram/engram_query.py`, `src/engram/engram_confidence.py`, decay/drowsiness/dream code, the paper's memory chapter | one four-block entry per mechanism (start: confidence computation, forgetting curve, utility bump, recall ranking, dream consolidation) |
 | SPEC-004 | L3 bindings (Claude Code; Codex) | handbook 03/04, hooks.json, plugin docs | inventory the binding points the L2 entries referenced |
+| SPEC-005 | Protocol versioning (cross-layer) | SPEC-001 §V design round (PR #2206) | ratify scheme + first suite delta |
 
 Sequencing: 001 → 002 are mostly extraction (fairy-assistable once 000 is
 ratified); 003 is the judgment-laden one and the reason 000 exists; 004 is
@@ -203,8 +204,25 @@ cheap and mostly already written in `docs/claude-code-plugin-system.md`.
 - **Versioning — RESOLVED: required (Lei, 2026-08-21).** The protocol carries versions so that
   changes name what moved and why, and implementations have a clear contract
   (Lei, verbatim intent). Scheme detail (whole-protocol semver vs per-layer)
-  stays with the rev-1 leaning — per-layer, since L3 churns while L0 should
-  almost never move — and gets fixed in SPEC-001's first ratified rev.
+  stays with the rev-1 leaning — **per-layer** — and gets fixed in SPEC-001's
+  first ratified rev.
+
+  **Correction, 2026-08-23 (Borges).** This bullet previously justified per-layer
+  versioning "since L3 churns while L0 should almost never move." **That reason is
+  wrong by this document's own §2**, which states L3 is *"Informative only …
+  they can change without a protocol version bump."* A layer that never bumps the
+  protocol cannot be the argument for splitting the version. The **conclusion**
+  survives on a different and better warrant: the three *normative* layers have
+  different **conformance consequences** — an L0 change can make an existing,
+  untouched graph stop being an ENGRAM; an L1 change can break a working agent
+  while every stored graph stays valid; an L2 change moves a behavioral guarantee
+  with graphs and verbs both still valid. One number cannot say which of those
+  happened, and that is the only thing an implementer needs from a version.
+  Full treatment, including the scheme, in **SPEC-005** (`docs/spec/SPEC-005-versioning-DRAFT.md`)
+  — its own document rather than a section of SPEC-001, settled by Kepler as §6's
+  owner in the #2206 colleague pass: the scheme is cross-layer by construction, so no
+  single-layer document can own it, and SPEC-000 deliberately carries no
+  implementation-facing MUST.
 - **Multi-tenancy — RESOLVED: one engram DEFINES one agent (L0-normative).**
   This is the identity principle, not a deployment choice. Multiple
   concurrent sessions (echoes) reading and writing ONE shared graph are, by
