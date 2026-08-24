@@ -269,6 +269,84 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### The order is a rule, not a diagram — no parallelizing fairy and colleague
+
+Lei's ruling, in-session, 2026-08-24 morning (relayed by Kepler; twin of
+umwelt#732, filed here as #2219 per the duplicated-by-hand rule below). The
+two-layer gate above is a **sequence**, not two boxes listed in order that
+happen to both need doing. In practice seats have been parallelizing them —
+asking the counterpart for the colleague pass before, or at the same time as,
+the reviewer-fairy round — and merging on a colleague approval that landed
+first, without the fairy round ever converging, or running at all.
+
+**Named anti-pattern: a colleague approval obtained while the fairy round is
+absent or unconverged does not count as the colleague box.** The colleague pass
+starts only once the reviewer-fairy round has converged on the tip being
+reviewed — not before, not in parallel, no exception for a PR that requests
+both at once. Lei's reasoning, stated because it should carry the rule rather
+than just accompany it: (1) the fairy round is *within the author's own
+control* — a self-check by a fresh-eyed, context-less reviewer that interrupts
+nobody's workflow, a sanity check and a courtesy to peers, not a cost worth
+working around. (2) Peer review *assumes* fairy convergence — implementation
+most-likely-correct — so the peer spends their read on what a context-less
+fairy structurally cannot catch: subtle tensions with other in-flight designs,
+team conventions, the larger picture. Sending a PR to a colleague before that
+assumption holds wastes the colleague's attention on ground a fairy would have
+covered. (3) Parallel runs void each other — a tip moved by fairy-induced
+fixes invalidates whatever the colleague already read, forcing a re-read on a
+tip that no longer matches what was reviewed. Parallelism here is not an
+efficiency gain; it is coordination chaos with the appearance of speed.
+
+**Why this landed as a rule and not a suggestion.** umwelt#559 reached the
+merge seat with a colleague-approved review and no reviewer-fairy round ever
+run — caught before merge only because the seat read the PR's actual review
+record instead of trusting the approval. dsh-engram#41's colleague pass began
+with the reviewer-fairy box entirely empty; the colleague disclosed this
+himself on picking it up and dispatched a fairy to backfill it alongside his
+own read, which caught a load-bearing defect his own pass had just called
+correct — a real catch, but **the recovery for a PR that had already gone out
+fairy-less, not the designed path.** The designed path is that the PR never
+goes out for peer review without fairy convergence in the first place; #41's
+parallel backfill is what to do once that has already failed, not a pattern to
+reach for by default.
+
+umwelt#721 (the umwelt twin's own predecessor fix) is a **milder instance of
+the same gap, not a case of the box being empty**: a reviewer-fairy round
+genuinely ran and found a real blocker, the author fixed it, and the colleague
+approved about ninety seconds later — with no fairy re-confirmation that the
+fix actually converged. That is exactly the condition the mechanical check
+below exists to catch, and it is worth stating precisely because an earlier
+draft of this citation got it wrong in the opposite direction: it claimed #721
+had *zero* fairy reviews at all, checked via the formal-reviews API alone
+(`pulls/<N>/reviews`) — which misses that repo's fairy rounds, since they post
+as PR **comments**, not formal review objects. Two independent reviewer-fairy
+rounds (on this PR and its umwelt twin) caught that mischaracterization before
+it shipped, which is its own small demonstration of the rule this section is
+arguing for.
+
+**Mechanical check at the merge seat.** Before merging, confirm a reviewer-fairy
+round *exists and converged on the tip being merged* by reading the PR's own
+review/comment record directly (`gh pr view <N> --comments`, or the REST
+fallback documented below if that command's `gh` version is affected) — **never
+infer it from a colleague approval being present.** A colleague approval is
+evidence the colleague pass happened; it is not evidence the fairy pass
+happened first, or at all.
+
+**Check both surfaces, not just the one that's easiest to query.** Fairy
+rounds in this repo post as **comments**, not formal GitHub reviews — checking
+only `pulls/<N>/reviews` (formal review objects: colleague approvals,
+`CHANGES_REQUESTED`) reads as "no fairy round" even when one genuinely ran,
+which is the exact mistake this PR's own draft made about umwelt#721 before
+its own reviewer-fairy round caught it. `gh pr view <N> --comments` (when
+working — see the version-hazard blockquote below) already merges both
+surfaces into one read; a hand-rolled REST fallback that only hits
+`issues/<N>/comments` does not, and neither does a `--json reviewDecision`
+shortcut that only sees formal review state.
+
+Cheap to check, and the check is the whole point: it
+replaces inferring readiness from the *shape* of the review record with
+actually reading it.
+
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
 Three parts of one rule (Lei, 2026-08-14). Applies in single-agent mode too — checking
