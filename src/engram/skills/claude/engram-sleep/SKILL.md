@@ -322,7 +322,14 @@ visible, not silent:
 Silence is never health on the identity substrate — a backup that fails quietly is
 only discovered when you reach for it and find it three days stale.
 
-**Skip if today's archive already exists** (the tool handles this automatically).
+**Skip is content-aware, not filename-aware** (the tool handles this automatically,
+#2151/#2235): it compares a live content watermark — row count + newest
+timestamp for `nodes`, `edges`, AND `edit_history` — against the last successful
+backup's sidecar, and additionally checks that the sidecar's named archive is
+still on disk. Only a genuine match on all counts skips; a same-day archive
+alone (no matching watermark, or a watermark match whose archive went missing)
+is never trusted as "already covers this state" and a fresh archive is written
+instead.
 
 **Backup layers**: `db-backup/` lives *inside* `~/.engram/` — git-independent
 (survives `.git` corruption, works without git) but **not off-disk** (a full
