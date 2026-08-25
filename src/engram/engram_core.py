@@ -4009,9 +4009,52 @@ def verify_write_durability(
     every write indeterminate. This reads the connection's configured
     FILENAME, not its page data, so a displaced mapping does not taint it.
 
-    OPEN QUESTION (alpha#2193, unresolved): a fourth state in which both
-    reads agree and both are wrong is not excluded by any evidence we have.
-    Two states are measured; exhaustiveness is not established.
+    OPEN QUESTION (alpha#2193, unresolved) -- AND THE MECHANISM IS NAMED
+    rather than merely conceded. A fourth state in which both reads agree and
+    both are wrong is not excluded, and it is not exotic, because THE TWO
+    READS ARE NOT INDEPENDENT INSTRUMENTS. In WAL mode both resolve through
+    the shared wal-index in the -shm file. Two halves, kept apart on purpose
+    because this docstring's whole subject is not overstating evidence:
+
+      MEASURED (the effect) -- 2026-08-25: a second connection saw the
+      first connection's UNCHECKPOINTED commit -- a row VERIFIABLY PRESENT
+      in the raw bytes of the -wal file and VERIFIABLY ABSENT from the raw
+      bytes of the main database file, with a -shm of the expected
+      wal-index size present when the second connection read it.
+      Re-runnable in about twenty lines against a scratch database; it
+      depends on nothing in this codebase's own schema.
+
+      INFERRED (the mechanism) -- from SQLite's documented WAL-index
+      architecture, not instrumented at the shared-memory level: resolving
+      that row is only possible through the shared index. The one competing
+      explanation, SQLite shared-cache mode, is ruled out by measurement
+      rather than by argument: no connection in this codebase sets
+      shared_cache or locking_mode=EXCLUSIVE anywhere.
+
+    The failure class this guard exists to catch is displacement of that very
+    shared component, so the two probes overlap exactly where the failure
+    lives. "The shared index lies to both readers identically" is therefore
+    the EXPECTED mode of a guard whose probes share a dependency, not a
+    strange residual -- where EXPECTED means STRUCTURALLY PREDICTABLE FROM
+    THE DEPENDENCY GRAPH, and explicitly NOT frequently-observed: this state
+    has never been observed at all. Two states ARE measured in which the
+    index misleads exactly one side; misleading both is a difference of
+    degree, not of kind.
+
+    THIS DOES NOT WEAKEN THE DESIGN, and the distinction is the point: the
+    dual read demonstrably discriminates both failure states anyone has
+    measured, so partial independence was sufficient for both real cases.
+    What is not established is EXHAUSTIVENESS. A reader who knows why the
+    hole exists can reason about whether their own situation is inside it; a
+    reader told only "not excluded by any evidence" cannot -- which is the
+    whole reason this paragraph is longer than the one it replaces.
+
+    ONE GENUINELY ORTHOGONAL PROBE EXISTS, recorded so it is not re-derived:
+    integrity_check does not route through the wal-index, and in the
+    alpha#2193 incident it returned ok while the writer's mapping was
+    corrupt. That makes it a candidate TIEBREAK ON THE INDETERMINATE BRANCH
+    ONLY. It is far too expensive for the write path and is not proposed for
+    one.
 
     Returns:
         (verdict, detail) where verdict is one of DURABILITY_DURABLE,
