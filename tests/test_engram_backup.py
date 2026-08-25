@@ -2101,20 +2101,31 @@ def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
     than silently falling back to DB_PATH -- which would reintroduce the
     wrong-source bug for the one caller most likely to hit it.
 
-    Does NOT assert the migration reaches v4: confirmed by direct repro
-    against the UNMODIFIED base commit (cae464e) that migration rung 4
+    Both calls below now raise ValueError out of migration rung 4 -- updated
+    for #2186 (rebuild_fts_index now refuses an empty db_path instead of
+    silently opening an unrelated scratch database). Confirmed by direct
+    repro against the UNMODIFIED base commit (cae464e) that migration rung 4
     itself cannot complete against a genuinely in-memory connection --
     rebuild_fts_index re-opens its OWN connection via a
-    PRAGMA-database_list-derived path, which is empty for ":memory:", so it
-    silently operates on an unrelated scratch database instead of the real
-    one. This is a real, pre-existing, orthogonal limitation in rung 4
-    (predates this PR entirely -- reproduced identically on cae464e before
-    any of this PR's changes), not something this PR introduces or is
-    scoped to fix. What THIS test asserts is only what this PR's own code
-    is responsible for: the backup step does not crash, does not write a
+    PRAGMA-database_list-derived path, which is empty for ":memory:". Before
+    #2186 that silently operated on an unrelated scratch database instead of
+    the real one and rung 4 quietly gave up (caught by its own
+    sqlite3.DatabaseError handler, printed "FAILED, will retry", never
+    raised); after #2186 the same empty path is a refused ValueError, which
+    is NOT a sqlite3.DatabaseError/ImportError so rung 4's existing except
+    clauses do not catch it and it propagates out of
+    _run_db_one_time_setup instead -- the exact "fails LOUDLY instead of
+    silently stalling" behavior #2186 is about. This is a real, pre-existing,
+    orthogonal limitation in rung 4 (predates this PR entirely -- reproduced
+    identically on cae464e before any of #2181's changes), not something
+    #2181 or #2186 is scoped to fix (#2186 deliberately fixes only
+    rebuild_fts_index itself and the #2080 startup self-heal call site, not
+    rung 4). What THIS test asserts is only what #2181's own code is
+    responsible for: the backup step does not crash, does not write a
     backup file, and does not fall back to DB_PATH -- it correctly skips
-    and lets the (separately, pre-existingly limited) migration attempt
-    proceed on its own terms.
+    (visible on stderr before rung 4's later, unrelated raise) and lets the
+    (separately, pre-existingly limited) migration attempt proceed on its
+    own terms.
     """
     import shutil
 
@@ -2123,7 +2134,10 @@ def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
         mem_conn = sqlite3.connect(":memory:")
         mem_conn.row_factory = sqlite3.Row
         capsys.readouterr()
-        core._run_db_one_time_setup(mem_conn)  # bootstrap pass, 0 rows
+        with pytest.raises(ValueError, match="db_path is empty"):
+            core._run_db_one_time_setup(mem_conn)  # bootstrap pass, 0 rows;
+            # reaches rung 4 (out of #2186's scope) and raises there -- see
+            # docstring.
 
         backup_dir = core.DATA_DIR / "db-backup"
         pre_mig_files = (
@@ -2137,7 +2151,9 @@ def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
         # Force a pending-migration precondition without going through
         # rung 4's own re-open path a second time: rewind user_version and
         # insert a marker row directly, then re-invoke and confirm the
-        # SKIP branch (not a crash, not a DB_PATH fallback) is what fires.
+        # SKIP branch (not a crash, not a DB_PATH fallback) is what fires
+        # for the pre-migration-backup step -- before rung 4 (unmodified,
+        # out of #2186's scope) raises again.
         mem_conn.execute(
             "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
             "('zz_MEM_MARKER', 'observation', '2026-08-22T00:00:02Z', "
@@ -2147,7 +2163,8 @@ def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
         mem_conn.commit()
 
         capsys.readouterr()
-        core._run_db_one_time_setup(mem_conn)  # must not raise
+        with pytest.raises(ValueError, match="db_path is empty"):
+            core._run_db_one_time_setup(mem_conn)
         mem_conn.close()
 
         captured = capsys.readouterr()
@@ -2300,6 +2317,199 @@ def test_2181_row_count_read_failure_does_not_skip_the_backup():
             f"row-count read must fall through to a real backup attempt, "
             f"not skip it as if the graph were empty. Found: "
             f"{[p.name for p in pre_mig_files]}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+# ── #2186: rebuild_fts_index("") silently rebuilt the WRONG (an implicit
+# SQLite scratch) database for an in-memory connection, because SQLite
+# treats an empty-string path as "open a private temp DB", not an error.
+# Every caller that derives db_path from
+# conn.execute("PRAGMA database_list").fetchone()[2] gets an empty string
+# for an in-memory connection, so this silently corrupted the intended
+# repair instead of failing. Fixed at the layer closest to the effect: one
+# guard inside rebuild_fts_index itself, covering every call site.
+
+def test_2186_rebuild_fts_index_rejects_empty_db_path():
+    """The most direct regression guard for the actual library-level fix,
+    independent of the migration-ladder integration test below:
+    rebuild_fts_index must reject a falsy db_path with a loud ValueError
+    rather than silently opening an implicit SQLite scratch database.
+    """
+    with pytest.raises(ValueError, match="db_path is empty"):
+        engram_backup.rebuild_fts_index("")
+
+    with pytest.raises(ValueError, match="db_path is empty"):
+        engram_backup.rebuild_fts_index(None)
+
+
+def test_2186_migration_ladder_against_in_memory_reaches_v4_or_fails_loudly():
+    """#2186's own required test (from the issue): run
+    _run_db_one_time_setup against a fresh, genuinely in-memory (":memory:")
+    connection and assert the migration ladder either reaches the latest
+    PRAGMA user_version (4) or fails LOUDLY -- it must never silently
+    stall while returning normally.
+
+    Pre-#2186, this genuinely DID silently stall: rung 4 delegated to
+    rebuild_fts_index("") -- an empty PRAGMA-database_list-derived path --
+    which silently opened an unrelated scratch database, leaving the real
+    connection's nodes_fts stuck at a stale column set. Rung 4's own
+    subsequent write against that stale table then raised
+    OperationalError('table nodes_fts has no column named recall_summary'),
+    which rung 4's `except sqlite3.DatabaseError` handler caught, printed
+    "FAILED, will retry on next startup" for, and swallowed --
+    _run_db_one_time_setup returned normally with user_version stuck at 3,
+    with no exception ever surfacing to the caller (see
+    test_2181_pre_migration_backup_skips_for_in_memory_connection's
+    docstring for the same repro, confirmed directly against the
+    unmodified base commit).
+
+    As of #2186, rebuild_fts_index refuses an empty db_path outright
+    (raises ValueError). Migration rung 4 itself is deliberately NOT
+    modified by #2186 (out of scope -- see the #2080 startup self-heal
+    fix in engram_core.py, which IS in scope, versus rung 4's own
+    version-gated block, which is not), so it still cannot complete
+    against a genuinely in-memory connection: the ValueError it now gets
+    from rebuild_fts_index is not a sqlite3.DatabaseError/ImportError, so
+    rung 4's existing except clauses do not catch it and it propagates
+    out of _run_db_one_time_setup uncaught instead. That satisfies this
+    test's actual requirement -- fails LOUDLY rather than silently
+    stalling -- even though it does not reach v4. The except clause below
+    is narrowed to ValueError specifically (today's actual failure mode,
+    documented above) rather than a bare Exception, so an unrelated bug
+    elsewhere is not silently absorbed as "loud failure, that counts";
+    if rung 4 is ever fixed to complete against an in-memory connection,
+    the `else` branch below already covers that outcome without needing
+    to touch this test.
+    """
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2186_ladder_")
+    try:
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+        try:
+            core._run_db_one_time_setup(mem_conn)
+        except ValueError as exc:
+            assert "db_path is empty" in str(exc) or "rebuild_fts_index" in str(exc), (
+                f"expected the #2186 empty-db_path guard's ValueError, got "
+                f"a differently-worded ValueError: {exc!r}"
+            )
+        else:
+            version = mem_conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == 4, (
+                f"_run_db_one_time_setup returned without raising, so the "
+                f"migration ladder must have reached the latest version "
+                f"(4) -- silently stalling at an intermediate version "
+                f"while returning normally is exactly the #2186 bug. Got "
+                f"user_version={version}"
+            )
+        mem_conn.close()
+    finally:
+        import shutil
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2186_self_heal_skip_branch_fires_on_stale_in_memory_nodes_fts():
+    """Direct exercise of the new SKIP branch inside the #2080 self-heal
+    block (reviewer-fairy suggestion on PR #2230) -- neither
+    test_2181_pre_migration_backup_skips_for_in_memory_connection nor
+    test_2186_migration_ladder_against_in_memory_reaches_v4_or_fails_loudly
+    reaches it: both hit rung 4's raise before nodes_fts could ever have a
+    stale schema, because a freshly-bootstrapped in-memory connection gets a
+    canonical nodes_fts from the CREATE VIRTUAL TABLE IF NOT EXISTS earlier
+    in _run_db_one_time_setup, so `_existing_fts_cols != _canonical_fts_cols`
+    (the self-heal's own trigger condition) is never true on either of their
+    calls.
+
+    This test manufactures that condition directly: bootstrap a `:memory:`
+    connection once (canonical nodes_fts), then corrupt nodes_fts to a stale
+    3-column shape on that SAME connection object (mirroring
+    test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db's
+    file-backed technique, adapted for in-memory -- there is no file to
+    reopen, so the corruption happens directly on the live connection), then
+    re-invoke _run_db_one_time_setup and confirm the SKIP branch actually
+    ran (the "in-memory ... SKIPPED" diagnostic on stderr) rather than
+    silently falling through some other path.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2186_selfheal_skip_")
+    try:
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+
+        # First call: bootstrap. Reaches rung 4 and raises (established by
+        # test_2186_migration_ladder_...) -- irrelevant here, the self-heal
+        # block (which runs BEFORE the version-gated rungs) has already done
+        # its job by then, creating a canonical nodes_fts.
+        try:
+            core._run_db_one_time_setup(mem_conn)
+        except ValueError:
+            pass
+
+        canonical_cols = [
+            row[1] for row in mem_conn.execute("PRAGMA table_info(nodes_fts)").fetchall()
+        ]
+        assert canonical_cols, (
+            "test setup must produce a real nodes_fts table on the first "
+            "bootstrap call before it can be corrupted"
+        )
+
+        # Corrupt nodes_fts to a stale 3-column shape directly on the live
+        # connection -- same technique as test_2077, adapted: no file to
+        # reopen for an in-memory DB, so the DROP/CREATE runs on mem_conn
+        # itself rather than a second sqlite3.connect(path).
+        mem_conn.executescript(
+            """
+            DROP TABLE IF EXISTS nodes_fts;
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                claim, quoted_text, interpretation,
+                content='nodes', content_rowid='rowid'
+            );
+            INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild');
+            """
+        )
+        mem_conn.commit()
+
+        stale_cols = [
+            row[1] for row in mem_conn.execute("PRAGMA table_info(nodes_fts)").fetchall()
+        ]
+        assert stale_cols == ["claim", "quoted_text", "interpretation"], (
+            f"test setup must actually produce the stale 3-column shape, got {stale_cols}"
+        )
+        assert stale_cols != canonical_cols, (
+            "the corrupted shape must actually differ from the canonical one, "
+            "or the self-heal's own trigger condition won't fire"
+        )
+
+        import io
+        import contextlib
+
+        # The self-heal block's SKIP diagnostic is a plain print() (stdout),
+        # matching its own sibling "repairing..." branch in the same
+        # if/else -- NOT the file=sys.stderr convention
+        # _take_pre_migration_backup_if_pending uses for its own, differently
+        # worded in-memory-skip message. Capture stdout accordingly; an
+        # earlier draft of this test wrongly assumed stderr by analogy with
+        # that other function and failed against the real code, which is
+        # exactly the kind of assumption this test exists to catch rather
+        # than make.
+        stdout_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf):
+            try:
+                core._run_db_one_time_setup(mem_conn)
+            except ValueError:
+                pass  # rung 4, same as every other #2186 in-memory test -- irrelevant here
+        mem_conn.close()
+
+        captured_out = stdout_buf.getvalue()
+        assert "in-memory" in captured_out and "SKIPPED" in captured_out, (
+            f"expected the #2186 self-heal SKIP diagnostic on stdout (the "
+            f"branch this test exists to exercise), got stdout={captured_out!r}"
+        )
+        assert "#2186" in captured_out, (
+            f"expected the SKIP diagnostic to cite #2186 (matching the "
+            f"engram_core.py source), got stdout={captured_out!r}"
         )
     finally:
         shutil.rmtree(core_test_dir, ignore_errors=True)

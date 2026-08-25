@@ -2198,25 +2198,47 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         _canonical_fts_cols = list(engram_backup.NODES_FTS_COLUMNS)
         if _existing_fts_cols is not None and _existing_fts_cols != _canonical_fts_cols:
             _fts_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-            print(
-                f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
-                f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
-                f"canonical {_canonical_fts_cols} — delegating to "
-                "engram_backup.rebuild_fts_index."
-            )
-            # rebuild_fts_index opens its OWN connection to the same file, so
-            # `conn`'s own pending writes (the trust-tier backfill UPDATE
-            # above, and any ALTER TABLE ADD COLUMN backfills before it) must
-            # be flushed first — otherwise the two connections collide over
-            # WAL's single-writer lock and rebuild_fts_index's DROP/CREATE
-            # raises "database is locked", which would silently no-op the
-            # repair under this block's own except-Exception fallback below.
-            # Safe to commit early here: every statement `conn` has issued so
-            # far this call is independently idempotent (see this function's
-            # own docstring), so an early flush changes nothing about retry
-            # safety on a later failure.
-            conn.commit()
-            engram_backup.rebuild_fts_index(_fts_db_path)
+            if not _fts_db_path:
+                # #2186: an in-memory connection (:memory:, or a temp DB
+                # never attached to a file) reports an empty path here.
+                # rebuild_fts_index now refuses an empty path outright
+                # (rather than silently opening an unrelated scratch DB), so
+                # delegating would just raise. That's also the right call on
+                # the merits: this self-heal's whole purpose is repairing a
+                # stale ON-DISK nodes_fts table, which is meaningless for an
+                # in-memory DB — there is nothing to persist-repair; it
+                # either already has the right schema from the CREATE
+                # VIRTUAL TABLE IF NOT EXISTS above, or it doesn't and the
+                # next attempt against this same connection starts fresh
+                # anyway. Skip the delegation cleanly instead of calling
+                # into a guard that would only raise.
+                print(
+                    "[_run_db_one_time_setup] nodes_fts startup self-heal "
+                    "SKIPPED — in-memory or unattached-temp connection "
+                    f"(empty PRAGMA database_list path); existing columns "
+                    f"{_existing_fts_cols} != canonical {_canonical_fts_cols}, "
+                    "but there is no on-disk nodes_fts to repair. #2186."
+                )
+            else:
+                print(
+                    f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
+                    f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
+                    f"canonical {_canonical_fts_cols} — delegating to "
+                    "engram_backup.rebuild_fts_index."
+                )
+                # rebuild_fts_index opens its OWN connection to the same file, so
+                # `conn`'s own pending writes (the trust-tier backfill UPDATE
+                # above, and any ALTER TABLE ADD COLUMN backfills before it) must
+                # be flushed first — otherwise the two connections collide over
+                # WAL's single-writer lock and rebuild_fts_index's DROP/CREATE
+                # raises "database is locked", which would silently no-op the
+                # repair under this block's own except-Exception fallback below.
+                # Safe to commit early here: every statement `conn` has issued so
+                # far this call is independently idempotent (see this function's
+                # own docstring), so an early flush changes nothing about retry
+                # safety on a later failure.
+                conn.commit()
+                engram_backup.rebuild_fts_index(_fts_db_path)
     except Exception as _fts_selfheal_err:
         # engram_backup unavailable, or the repair itself failed — non-fatal
         # (a startup self-heal must never block server startup), but LOUD:

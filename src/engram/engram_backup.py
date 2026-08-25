@@ -255,7 +255,27 @@ def rebuild_fts_index(db_path: str) -> bool:
     deliberate index-side deletion of retracted rows.  FTS5's 'integrity-check'
     therefore always reports "malformed" on a graph with retractions — this is
     expected by design (#781).
+
+    Guard (#2186): SQLite treats an empty string ``db_path`` as "open a
+    private temporary scratch database" rather than an error — it does not
+    raise. Callers that derive ``db_path`` from
+    ``conn.execute("PRAGMA database_list").fetchone()[2]`` get an empty
+    string for an in-memory connection (``:memory:``, or a temp DB never
+    attached to a file), so an unguarded ``rebuild_fts_index("")`` would
+    silently rebuild an unrelated scratch database while the real
+    connection stays under-indexed. Reject a falsy ``db_path`` up front,
+    loudly, so this is a named refusal rather than a silent no-op against
+    the wrong database.
     """
+    if not db_path:
+        raise ValueError(
+            "rebuild_fts_index: db_path is empty — refusing to open an "
+            "implicit SQLite scratch database. This usually means the "
+            "caller derived the path from PRAGMA database_list on an "
+            "in-memory connection (empty string for :memory: / an "
+            "unattached temp DB). Pass a real file path, or skip the "
+            "rebuild entirely for in-memory connections."
+        )
     conn = sqlite3.connect(db_path)
     try:
         # Bail early if this isn't an ENGRAM-shaped DB.
