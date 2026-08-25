@@ -291,6 +291,42 @@ def _derive_impl(
 
         conn.commit()
 
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, success["node_id"])
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "derivation_id": success["node_id"],
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         result = {
             "status": "created",
             "derivation_id": success["node_id"],
@@ -438,6 +474,42 @@ def _contradict_impl(
         core._utility_reward(conn, [node_id_a, node_id_b], action="contradict")
         conn.commit()
 
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "contradiction_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         # target_id captures both conflicting nodes; the new contradiction node
         # id is emitted as result_node_id. Includes both node IDs since
@@ -549,6 +621,42 @@ def _ask_impl(
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "question_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         result = {
             "status": "created",
