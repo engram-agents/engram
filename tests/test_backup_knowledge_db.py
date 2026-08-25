@@ -94,6 +94,19 @@ def _build_minimal_db(path: str, created_at: str = "2026-01-01T00:00:00Z") -> No
     conn.close()
 
 
+def _build_nodes_only_db(path: str, created_at: str = "2026-01-01T00:00:00Z") -> None:
+    """Like _build_minimal_db, but WITHOUT the edges/edit_history tables --
+    simulates a DB never opened by a current-version ENGRAM server, or a
+    non-ENGRAM SQLite file (#2244)."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE nodes (id TEXT PRIMARY KEY, claim TEXT, embedding TEXT, created_at TEXT)"
+    )
+    conn.execute("INSERT INTO nodes VALUES ('ob_1', 'hello', NULL, ?)", (created_at,))
+    conn.commit()
+    conn.close()
+
+
 def _insert_row(db_path: str, node_id: str, created_at: str) -> None:
     """Insert an additional node row into an existing db.
 
@@ -817,6 +830,102 @@ class TestOldFormatWatermarkTreatedAsAbsent(unittest.TestCase):
             self.assertTrue(
                 os.path.exists(suffixed),
                 "a round-1-format (nodes+edges, no history) watermark must not be trusted as a match",
+            )
+
+
+class TestOptionalTablesMissingDegradesGracefully(unittest.TestCase):
+    """#2244: a DB lacking `edges`/`edit_history` entirely must not make the
+    tool refuse to back up -- it should degrade to a weaker watermark, the
+    same fail-toward-backing-up direction as every other decision in this
+    file."""
+
+    def test_db_with_only_nodes_table_still_backs_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_nodes_only_db(db)
+
+            rc = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+
+            self.assertEqual(rc, 0, "a nodes-only DB must still produce a real backup, not exit 1")
+            archive = os.path.join(out_dir, f"knowledge-{_today()}.sql")
+            self.assertTrue(os.path.exists(archive))
+
+    def test_second_run_no_changes_on_nodes_only_db_is_still_a_genuine_skip(self):
+        """The graceful degrade must not become a permanent no-skip-ever --
+        two runs against the SAME unchanged nodes-only DB should still skip
+        the second time (the persisted watermark's (None, None) for the
+        missing tables matches the live (None, None))."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_nodes_only_db(db)
+
+            rc1 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc1, 0)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc2 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc2, 0)
+
+            suffixed = os.path.join(out_dir, f"knowledge-{_today()}-2.sql")
+            self.assertFalse(os.path.exists(suffixed), "unchanged nodes-only DB should still genuinely skip")
+            self.assertIn("skipping", buf.getvalue())
+
+    def test_skip_message_on_nodes_only_db_reads_na_not_none(self):
+        """Reviewer-fairy suggestion (#2245): the skip message must not
+        print a bare 'None' for an absent table's count/timestamp -- that
+        reads as a leaked value, not an intentional 'not applicable'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_nodes_only_db(db)
+
+            rc1 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc1, 0)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc2 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc2, 0)
+
+            output = buf.getvalue()
+            self.assertIn("skipping", output)
+            self.assertIn("n/a edges", output)
+            self.assertIn("n/a edit_history rows", output)
+            self.assertNotIn("None", output)
+
+    def test_edges_table_appearing_later_forces_a_real_backup_not_a_false_skip(self):
+        """Safety check: if a DB starts nodes-only (watermark has edge_count
+        None) and LATER gains an edges table with real rows, the mismatch
+        (None vs an actual count) must force a real backup -- not be
+        mistaken for 'still nothing new'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "knowledge.db")
+            out_dir = os.path.join(tmp, "db-backup")
+            _build_nodes_only_db(db)
+
+            rc1 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc1, 0)
+
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE edges (id INTEGER PRIMARY KEY, source_id TEXT, target_id TEXT, "
+                "relation TEXT, created_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO edges VALUES (1, 'ob_1', 'ob_1', 'self_test', '2026-01-02T00:00:00Z')"
+            )
+            conn.commit()
+            conn.close()
+
+            rc2 = backup_knowledge_db.main(["--db", db, "--out-dir", out_dir])
+            self.assertEqual(rc2, 0)
+            suffixed = os.path.join(out_dir, f"knowledge-{_today()}-2.sql")
+            self.assertTrue(
+                os.path.exists(suffixed),
+                "edges table appearing with real content must force a real backup, not a false skip",
             )
 
 

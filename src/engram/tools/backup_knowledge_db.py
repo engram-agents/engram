@@ -6,19 +6,22 @@ SAME local day — a same-day file is never overwritten and never causes a lost
 snapshot.
 
 Skip decisions are content-aware, not filename-aware (#2151): before backing
-up, the tool reads a content watermark (row count + newest timestamp, for
-`nodes`, `edges`, AND `edit_history`) from the live DB via a read-only
-connection — WAL-safe, never a file mtime — and compares it against a small
-`.watermark.json` sidecar left by the last successful backup. A skip
-requires ALL of: a persisted watermark exists, it matches the live
-watermark, AND the archive file it names is still present on disk (a
-watermark match alone is not enough — see #2235 review, below). A same-day
-file that predates the current DB state, has no matching watermark, or
-whose named archive was deleted, is never trusted as "already covers this
-state" and a fresh archive is written instead. Pass --force to always take
-a real backup regardless of the watermark. Optionally prunes archives older
-than DAYS days (suffixed archives prune by the same date as their
-unsuffixed sibling).
+up, the tool reads a content watermark (row count + newest timestamp) for
+`nodes` (REQUIRED — a DB without it isn't a valid backup target, and reading
+it errors loud) plus `edges` and `edit_history` (OPTIONAL/opportunistic — a
+DB missing either just degrades to a weaker watermark, #2244, never a
+refusal to back up) from the live DB via a read-only connection — WAL-safe,
+never a file mtime — and compares it against a small `.watermark.json`
+sidecar left by the last successful backup. A skip requires ALL of: a
+persisted watermark exists, it matches the live watermark, AND the archive
+file it names is still present on disk (a watermark match alone is not
+enough — see #2235 review, below). A same-day file that predates the
+current DB state, has no matching watermark, or whose named archive was
+deleted, is never trusted as "already covers this state" and a fresh
+archive is written instead. Pass --force to always take a real backup
+regardless of the watermark. Optionally prunes archives older than DAYS
+days (suffixed archives prune by the same date as their unsuffixed
+sibling).
 
 Watermark coverage is deliberately partial, not a full-database fingerprint
 — know its blind spots before trusting a "skipping" line:
@@ -36,6 +39,12 @@ Watermark coverage is deliberately partial, not a full-database fingerprint
   DB surgery) leaves no edit_history row either and is still invisible.
   Direct-DB-surgery workflows take their own backup by protocol; this tool
   is not meant to substitute for that discipline.
+- A DB lacking `edges` or `edit_history` entirely (any DB not opened by a
+  current-version ENGRAM server, or a non-ENGRAM SQLite file) degrades to a
+  weaker watermark covering only what's actually present — it never makes
+  the tool refuse to back up (#2244; every other decision in this file
+  fails toward backing up, and this is that same direction applied to
+  optional-table absence).
 --force is the escape hatch for any of the above: it bypasses the watermark
 entirely and always takes a real backup.
 
@@ -135,10 +144,40 @@ def _watermark_path(out_dir: str) -> str:
     return os.path.join(out_dir, _WATERMARK_FILENAME)
 
 
+def _probe_optional_table_watermark(conn: sqlite3.Connection, table: str, timestamp_col: str) -> tuple:
+    """COUNT(*)/MAX(<timestamp_col>) for an OPTIONAL watermark table, or
+    (None, None) if the table doesn't exist.
+
+    `table`/`timestamp_col` are always this file's own hardcoded literals
+    (see the two call sites below) -- never user/CLI input -- so the f-string
+    SQL construction here is not an injection surface.
+
+    #2244: a DB that has never had `table` created (any DB not opened by a
+    current-version ENGRAM server, or a non-ENGRAM SQLite file passed via
+    --db) must not make the whole watermark read -- and therefore the whole
+    backup -- fail. (None, None) degrades gracefully rather than raising:
+    _watermarks_match compares it structurally like any other value, so a
+    persisted watermark that also has (None, None) for this table still
+    matches (as much confidence as is available), while a live (None, None)
+    against a persisted REAL count correctly mismatches and forces a real
+    backup -- the same fail-toward-backing-up direction as every other
+    watermark decision in this file, never fail-closed.
+    """
+    try:
+        return conn.execute(f"SELECT COUNT(*), MAX({timestamp_col}) FROM {table}").fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+        return (None, None)
+
+
 def _read_live_watermark(db_path: str) -> dict:
     """Read-only content watermark from the live DB: {row_count,
-    max_created_at} for `nodes`, {edge_count, edge_max_created_at} for
-    `edges`, and {history_count, history_max_timestamp} for `edit_history`.
+    max_created_at} for `nodes` (REQUIRED -- a DB without it isn't a valid
+    target and the read fails loud), plus {edge_count, edge_max_created_at}
+    for `edges` and {history_count, history_max_timestamp} for
+    `edit_history` (both OPTIONAL/opportunistic -- see
+    _probe_optional_table_watermark).
 
     Opens a read-only URI connection (never a write lock, never interferes
     with a live server) and queries through SQLite's own reader, which
@@ -152,19 +191,20 @@ def _read_live_watermark(db_path: str) -> dict:
     ENGRAM's own append-only audit log of tool-mediated mutations, which
     gets a new row on every supersede/retract even when that mutation is a
     pure in-place UPDATE with no new node or edge row -- closing the last
-    gap `nodes`+`edges` alone left open for tool-mediated writes.
+    gap `nodes`+`edges` alone left open for tool-mediated writes. `edges`
+    and `edit_history` are probed independently rather than in one query,
+    so a DB missing one (or both) degrades to a weaker watermark instead of
+    the tool refusing to back up at all (#2244 -- every other decision in
+    this file fails toward backing up; querying an absent auxiliary table
+    unconditionally was the one that failed closed).
     """
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         row_count, max_created_at = conn.execute(
             "SELECT COUNT(*), MAX(created_at) FROM nodes"
         ).fetchone()
-        edge_count, edge_max_created_at = conn.execute(
-            "SELECT COUNT(*), MAX(created_at) FROM edges"
-        ).fetchone()
-        history_count, history_max_timestamp = conn.execute(
-            "SELECT COUNT(*), MAX(timestamp) FROM edit_history"
-        ).fetchone()
+        edge_count, edge_max_created_at = _probe_optional_table_watermark(conn, "edges", "created_at")
+        history_count, history_max_timestamp = _probe_optional_table_watermark(conn, "edit_history", "timestamp")
     finally:
         conn.close()
     return {
@@ -315,13 +355,19 @@ def main(argv: list[str] | None = None) -> int:
         persisted_watermark = _load_persisted_watermark(out_dir)
         if persisted_watermark is not None and _watermarks_match(persisted_watermark, live_watermark):
             if _persisted_archive_exists(out_dir, persisted_watermark):
+                # reviewer-fairy suggestion (#2245): a table absent from the
+                # live DB (e.g. edit_history on a DB that predates it) reads
+                # as bare "None" in this human-facing line otherwise --
+                # "n/a" reads as intentional, not as a value that leaked in.
+                def fmt(v):
+                    return "n/a" if v is None else v
                 print(
                     f"backup up to date ({live_watermark['row_count']} nodes, "
-                    f"{live_watermark['edge_count']} edges, "
-                    f"{live_watermark['history_count']} edit_history rows, latest node "
+                    f"{fmt(live_watermark['edge_count'])} edges, "
+                    f"{fmt(live_watermark['history_count'])} edit_history rows, latest node "
                     f"{live_watermark['max_created_at']}, latest edge "
-                    f"{live_watermark['edge_max_created_at']}, latest history "
-                    f"{live_watermark['history_max_timestamp']}) — matches "
+                    f"{fmt(live_watermark['edge_max_created_at'])}, latest history "
+                    f"{fmt(live_watermark['history_max_timestamp'])}) — matches "
                     f"{out_dir}/{persisted_watermark.get('archive')}, skipping"
                 )
                 # Still run retention pruning even when skipping the backup.
