@@ -22,6 +22,19 @@
 #     forum-unreachable; skip the cycle and preserve $SEEN. Otherwise the next
 #     recovery would flood every historical mention as "new" (#743 / 2026-06-03
 #     forum cutover incident).
+#   - "failed poll" is BROADER than curl (#2225). curl --fail only rejects HTTP
+#     >= 400, so a maintenance page / truncated body reaches ids() intact; and a
+#     body can parse cleanly and still never REPORT a mentions list (`{}`, an
+#     error envelope, a JSON array, `"mentions"` set to a non-list). Both look
+#     identical to "zero mentions" and would overwrite $SEEN empty. ids() signals
+#     both by EXIT STATUS and the callers skip the cycle.
+#     `{"mentions":[]}` is the ONE that is genuinely empty — it parses AND it
+#     reports, it just reports nothing — so it still rewrites $SEEN as it always
+#     has. That is the whole boundary: reported-zero rewrites, failed-to-report
+#     preserves. Note `{}` sits on the PRESERVE side, matching as_of()'s reading
+#     of the same body in the sibling script; a healthy forum cannot send it on a
+#     200 anyway (src/forum/server.py returns {"mentions": ...} on 200 and 400 on
+#     both error paths, which curl --fail already rejects).
 #   - engaged-suppression (#1077 part 2): while last-user-activity is within
 #     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
 #     mentions accumulate as unseen and are emitted after the window expires.
@@ -247,20 +260,66 @@ fi
 SEEN="${FORUM_MENTION_SEEN_FILE:-$HOME/.engram/.forum-mention-seen.$(printf '%s' "$URL" | cksum | cut -d' ' -f1)}"
 
 # helper: extract "post_id\tthread_title" lines from JSON stdin
+#
+# EXIT STATUS answers "did this body REPORT a mentions list?" (#2225) — the
+# same shape as as_of()'s "did I obtain a usable watermark", and deliberately
+# NOT the weaker "did the body parse".
+#   - exit 0: `mentions` is present and is a list. An EMPTY list is a real
+#     answer — the forum is telling us there are none right now — so it still
+#     rewrites $SEEN, which is what keeps the seen-set a true snapshot.
+#   - exit non-zero: the body did not parse, OR it parsed without reporting
+#     (`{}`, `{"error":...}`, a top-level array, `"mentions"` set to a string
+#     or null). A body with no `mentions` key has not reported zero mentions;
+#     it has FAILED TO REPORT, and writing an empty seen-set from it hands the
+#     next good poll every historical mention as new.
+# The distinction between those two is exactly the distinction as_of() draws
+# between a served `as_of: 0` and a missing one. `{}` must not mean "authoritative
+# zero" here while meaning "we never learned" there — one changeset cannot read
+# the same body two opposite ways.
+# Everything AFTER that check keeps its old blanket-except,
+# degrade-to-fewer-lines behaviour and exits 0.
 ids() {
     python3 -c 'import json,sys
 try:
-    for m in json.load(sys.stdin).get("mentions",[]): print(str(m.get("post_id"))+"\t"+m.get("thread_title","?"))
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or not isinstance(d.get("mentions"), list):
+    sys.exit(1)
+try:
+    for m in d["mentions"]: print(str(m.get("post_id"))+"\t"+m.get("thread_title","?"))
 except Exception: pass'
 }
 
+# Poll cadence override — tests only (mirrors $FORUM_MENTION_SEEN_FILE's
+# test-only role above); default of 30 is unchanged for real arms. Defined
+# ABOVE the seed (not with COALESCE_SECONDS below) because the seed-retry sleep
+# uses it too.
+POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
+
 # ---------------------------------------------------------------------------
-# seed — retry until first SUCCESSFUL poll
+# seed — retry until the first poll that both SUCCEEDS and PARSES
 # Handles: arm-while-forum-down (waits), arm-while-up (seeds now), and
 # genuine-zero-mentions (empty baseline on a *successful* poll).
+#
+# The parse half is the seed-side twin of the poll-path guard below (#2225): a
+# 200 whose body does not parse passes curl --fail, yields no id lines, and
+# would seed an EMPTY baseline — so the first good poll then reports every
+# historical mention as new, the same clobber-replay the poll path guards
+# against, just arriving at arm time. An empty seen-set from a body we could
+# not read is not "genuine zero mentions"; wait for a body we can read.
 # ---------------------------------------------------------------------------
-until RESP="$(curl -s --fail "$URL" 2>/dev/null)"; do sleep 30; done
-printf '%s' "$RESP" | ids | sort > "$SEEN"
+while true; do
+    # Stage through $SEEN.now and mv, exactly as the poll loop does, so a
+    # retrying seed never truncates a prior run's baseline on its way past.
+    if RESP="$(curl -s --fail "$URL" 2>/dev/null)" \
+       && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+        mv "$SEEN.now" "$SEEN"
+        break
+    fi
+    rm -f "$SEEN.now"
+    sleep "$POLL_SECONDS"
+done
 
 # ---------------------------------------------------------------------------
 # cross-cycle coalesce window (#1616 / UCS rc2 F10)
@@ -280,9 +339,7 @@ printf '%s' "$RESP" | ids | sort > "$SEEN"
 # loses nothing.
 # ---------------------------------------------------------------------------
 COALESCE_SECONDS="${FORUM_MENTION_COALESCE_SECONDS:-120}"
-# Poll cadence override — tests only (mirrors $FORUM_MENTION_SEEN_FILE's
-# test-only role above); default of 30 is unchanged for real arms.
-POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
+# ($POLL_SECONDS is defined above the seed, which needs it for its retry sleep.)
 BUF="$SEEN.buf"
 : > "$BUF"          # fresh arm — no pending burst carried over from a prior run
 _WINDOW_OPEN_TS=""  # empty = no window currently open
@@ -340,7 +397,18 @@ while true; do
     # PRESERVE $SEEN (the fix for the seed-clobber flood, #743) AND the
     # coalesce buffer/window (nothing below this line runs).
     RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
-    printf '%s' "$RESP" | ids | sort > "$SEEN.now"
+    # A 200 whose body does not parse is NOT "zero mentions" (#2225). Left
+    # alone it produces an empty $SEEN.now, and the unconditional mv below
+    # overwrites $SEEN empty — after which the next GOOD poll marks every
+    # historical mention new. ids() exits non-zero there; run it under a
+    # pipefail SUBSHELL so that status survives the `| sort` (a plain
+    # pipeline reports sort's status, which is always 0), then skip the cycle
+    # exactly as a failed curl does. Remove $SEEN.now so no half-written
+    # scratch file is left for a later cycle to pick up.
+    if ! ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+        rm -f "$SEEN.now"
+        continue
+    fi
     _new_pids="$(comm -13 "$SEEN" "$SEEN.now" | cut -f1)"
     mv "$SEEN.now" "$SEEN"
     if [ -n "$_new_pids" ]; then
