@@ -400,18 +400,11 @@ def _add_conjecture_impl(
 
         # Durability read-back guard (alpha#2097, #1947 incident) — verify the
         # commit actually landed on THIS connection before reporting
-        # status:created. See core._verify_durable_write.
-        if not core._verify_durable_write(conn, node_id):
-            return json.dumps({
-                "status": "failed_not_durable",
-                "conjecture_id": node_id,
-                "error": (
-                    "Write did not verify as durable on read-back after commit — "
-                    "the row is missing or its claim is empty. Do NOT retry "
-                    "automatically; a retry after a partial commit risks a "
-                    "double-write. See alpha#1947, #2097."
-                ),
-            })
+        # status:created. See core.verify_write_durability (dual read, alpha#2193).
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            return json.dumps(core.durability_failure_response(
+                _verdict, _durability, "conjecture_id", node_id, "#2097"))
 
         return json.dumps({
             "status": "created",

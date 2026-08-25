@@ -3941,38 +3941,190 @@ def _next_id(conn: sqlite3.Connection, node_type: str) -> str:
     return f"{prefix}_{num:04d}"
 
 
-def _verify_durable_write(conn: sqlite3.Connection, node_id: str, claim_field: str = "claim") -> bool:
-    """Post-commit read-back guard (alpha#2074 / #2097, gating v0.4.0-rc1).
+# Durability verdicts returned by verify_write_durability().
+DURABILITY_DURABLE = "durable"
+DURABILITY_NOT_DURABLE = "not_durable"
+DURABILITY_INDETERMINATE = "indeterminate"
 
-    Motivating incident: alpha#1947 (2026-08-07) — during a WAL/shm
-    split-brain window, two observations filed through the degraded server
-    returned full `status: created` success payloads (node id, evidence id,
-    confidence, dedup neighbours) and were then silently lost when the
-    server was replaced. A caller had no way to tell a durable write from a
-    doomed one purely from the returned payload.
 
-    This helper closes that gap: call it on the SAME connection, AFTER
-    conn.commit() returns, to confirm the just-written row is actually
-    readable back and carries real content — not merely that INSERT/commit
-    did not raise. A fresh connection would test the ordinary path (which
-    already works); the guard only matters read back through the connection
-    that did the write.
+def verify_write_durability(
+    conn: sqlite3.Connection, node_id: str, claim_field: str = "claim"
+) -> tuple:
+    """Post-commit dual read-back. Returns (verdict, detail).
 
-    Asserts content, not just existence: a row with an empty claim is what
-    the alpha#1947-class displacement bug produces, so an empty/whitespace
-    claim_field counts as MISSING, same as no row at all.
+    Replaces the boolean `_verify_durable_write` (alpha#2074 / #2097).
+    RENAMED DELIBERATELY: the old name returned a bool, and a caller written
+    as `if not _verify_durable_write(...)` would silently stop firing if this
+    returned a verdict string instead (every non-empty string is truthy). A
+    rename makes any un-updated caller raise AttributeError instead of
+    quietly losing its guard.
+
+    WHY TWO READS (alpha#2193). The single same-connection read this replaces
+    proves the row is VISIBLE to the connection that wrote it -- not that it
+    is DURABLE. Measured, two failure states exist and they are mirror
+    images, so neither read alone is honest:
+
+        state                     same-conn read      fresh-conn read
+        healthy                   sees it             sees it
+        writer-side displaced     sees it  (BLIND)    absent   (correct)
+        reader-side corrupt       sees it  (correct)  raises   (FALSE ALARM)
+
+    The writer-side row is the alpha#2193 incident: a full `status: created`
+    payload for a write that was rolled back, because the guard read back
+    through the one view that was displaced. The reader-side row is the
+    mirror measured on a long-lived connection with churned WAL/shm state:
+    225 consecutive genuinely-durable writes for which a fresh-connection
+    guard would have reported failure.
+
+    Every cell one read gets wrong, the other gets right, so the information
+    needed lives in whether they AGREE -- which a boolean cannot express.
+    Hence three verdicts, and INDETERMINATE is an honest answer rather than a
+    hedge: it means the two views conflict and nothing available at this
+    moment says which is lying. A caller can act on it (re-read after a
+    checkpoint, escalate, refuse to hand back an id it cannot vouch for);
+    it cannot act on a confident wrong answer.
+
+    DO NOT POOL OR CACHE THE SECOND CONNECTION. It is opened fresh per call
+    on purpose. A long-lived second connection is free to develop its own
+    displaced mapping over time -- which is precisely the failure the second
+    read exists to detect. The per-call connect is the mechanism, not an
+    unoptimised implementation detail. Measured cost is +0.139 ms per write
+    against a trivial harness write (5.13x of a 0.034 ms baseline); against a
+    real observation write, which also does embedding, dedup-neighbour search
+    and FTS work, it is noise.
+
+    REJECTED ALTERNATIVE, so it is not re-proposed as an obvious saving:
+    `PRAGMA data_version` is cheaper and does not work. Measured, it does not
+    move at all in the writer-side-displaced state (the incident), and in the
+    reader-side state it reads the same as a healthy write. It answers "has
+    another connection committed since I last looked" -- a foreign-commit
+    detector. The divergence we need to see happens when nobody else has
+    committed, which is exactly where the two questions come apart.
+
+    IN-MEMORY CONNECTIONS degrade to the same-conn read alone, and say so in
+    the detail payload. The path comes from the connection's own
+    `PRAGMA database_list` (column 2), the same idiom the pre-migration
+    backup uses, with the same reasoning: an empty path means in-memory, and
+    falling back to DB_PATH there would open a DIFFERENT database and report
+    every write indeterminate. This reads the connection's configured
+    FILENAME, not its page data, so a displaced mapping does not taint it.
+
+    OPEN QUESTION (alpha#2193, unresolved): a fourth state in which both
+    reads agree and both are wrong is not excluded by any evidence we have.
+    Two states are measured; exhaustiveness is not established.
 
     Returns:
-        True if the row exists and its claim_field is non-empty after
-        stripping whitespace. False otherwise (row missing OR empty claim).
+        (verdict, detail) where verdict is one of DURABILITY_DURABLE,
+        DURABILITY_NOT_DURABLE, DURABILITY_INDETERMINATE, and detail carries
+        `same_conn` / `fresh_conn` (True | False | None-with-error) plus
+        `fresh_conn_error` and `in_memory` when they apply.
     """
-    row = conn.execute(
-        f"SELECT {claim_field} FROM nodes WHERE id = ?", (node_id,)
-    ).fetchone()
-    if row is None:
-        return False
-    value = row[claim_field]
-    return bool(value and str(value).strip())
+
+    def _row_present(c) -> bool:
+        row = c.execute(
+            f"SELECT {claim_field} FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        value = row[claim_field] if isinstance(row, sqlite3.Row) else row[0]
+        return bool(value and str(value).strip())
+
+    detail = {}
+
+    # --- read 1: the connection that did the write ---
+    try:
+        same = _row_present(conn)
+    except Exception as exc:  # a writing connection too broken to read itself
+        detail["same_conn"] = None
+        detail["same_conn_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+    detail["same_conn"] = same
+
+    # --- resolve the on-disk path WITHOUT trusting the suspect connection's data ---
+    try:
+        _row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = _row[2] if _row else ""
+    except Exception as exc:
+        # Path resolution FAILED -- which is NOT the same as "the path is
+        # empty because this is in-memory". Falling through to the in-memory
+        # branch here would return a verdict computed from `same` alone while
+        # flagging it `in_memory: True`, i.e. a silent guess wearing a
+        # confident label -- the exact failure this function exists to close.
+        # Found in review of alpha#2236; unreachable in practice (the
+        # same-conn read above already succeeded, so the connection answers
+        # queries), which is why it must be recorded rather than trusted.
+        detail["fresh_conn"] = None
+        detail["db_path_resolution_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+
+    if not db_file:
+        # In-memory: there is no second view to open. Report the degraded
+        # coverage rather than inventing one against the wrong database.
+        detail["in_memory"] = True
+        detail["fresh_conn"] = None
+        return (DURABILITY_DURABLE if same else DURABILITY_NOT_DURABLE), detail
+
+    # --- read 2: a connection that has never seen this write ---
+    fresh_conn = None
+    try:
+        fresh_conn = sqlite3.connect(db_file)
+        fresh_conn.row_factory = sqlite3.Row
+        fresh = _row_present(fresh_conn)
+        detail["fresh_conn"] = fresh
+    except Exception as exc:
+        detail["fresh_conn"] = None
+        detail["fresh_conn_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+    finally:
+        if fresh_conn is not None:
+            try:
+                fresh_conn.close()
+            except Exception:
+                pass
+
+    if same and fresh:
+        return DURABILITY_DURABLE, detail
+    if not same and not fresh:
+        return DURABILITY_NOT_DURABLE, detail
+    return DURABILITY_INDETERMINATE, detail
+
+
+def durability_failure_response(verdict: str, detail: dict, id_field: str,
+                                node_id: str, refs: str) -> dict:
+    """Build the caller-facing dict for a non-durable verdict.
+
+    Extracted in review of alpha#2236: the three-way branch and its two long
+    error strings were near-identical copies in _add_observation_impl and
+    _add_conjecture_impl, differing only in the id field name and the issue
+    numbers cited. The PR that introduced the third verdict grew that
+    duplicated surface from a one-line boolean check to a full branch, which
+    is where the next wording tweak would silently drift one copy from the
+    other.
+    """
+    indeterminate = verdict == DURABILITY_INDETERMINATE
+    if indeterminate:
+        error = (
+            "Write COMMITTED but its durability cannot be confirmed: the "
+            "writing connection and a fresh connection DISAGREE about "
+            "whether the row is present, and nothing available here says "
+            "which view is correct. The node id above may or may not "
+            "resolve. Do NOT cite it until re-verified, and do NOT retry "
+            "automatically -- a retry risks a double-write if the row did "
+            "land. Re-read after a checkpoint, or escalate. See alpha#2193."
+        )
+    else:
+        error = (
+            "Write did not verify as durable on read-back after commit -- "
+            "the row is missing or its claim is empty on BOTH the writing "
+            "connection and a fresh one. Do NOT retry automatically; a retry "
+            f"after a partial commit risks a double-write. See alpha#1947, {refs}."
+        )
+    return {
+        "status": "durability_indeterminate" if indeterminate else "failed_not_durable",
+        id_field: node_id,
+        "durability": detail,
+        "error": error,
+    }
 
 
 def _node_to_dict(row: sqlite3.Row) -> dict:
