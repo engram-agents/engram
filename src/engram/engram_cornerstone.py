@@ -123,6 +123,11 @@ def _add_cornerstone_impl(
                 except sqlite3.IntegrityError:
                     pass
 
+        # confidence= here feeds ONLY the importance formula, not the stored
+        # confidence — cornerstones are deliberately not claim-bearing and
+        # store confidence = NULL. 0.5 is a neutral importance prior, and
+        # this importance_base write is itself superseded immediately
+        # below by the fixed cornerstone anchor (importance_base = 2.0).
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
         conn.execute(
@@ -343,6 +348,11 @@ def _outgrow_cornerstone_impl(
             (new_id, old_cornerstone_id),
         )
 
+        # confidence= here feeds ONLY the importance formula, not the stored
+        # confidence — cornerstones are deliberately not claim-bearing and
+        # store confidence = NULL. 0.5 is a neutral importance prior, and
+        # this importance_base write is itself superseded immediately
+        # below by the fixed cornerstone anchor (importance_base = 2.0).
         core._stamp_new_node(conn, new_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
         conn.execute(
