@@ -5,10 +5,13 @@
 > boundary from the dispatcher's spot-check, sharper than prior layers:
 >
 > **RELIABLE (mechanically derived + independently corroborated):**
-> - Tool count 49; single-payload_json migration 49/49 (wave-3 completion CONFIRMED).
-> - readOnlyHint split 13 read / 36 write — independently corroborated: the 36 write
->   verbs match the stop-hook write-verb set verified during the PR #857 colleague
->   review by a separate derivation.
+> - Tool count 56; single-payload_json migration 56/56 (wave-3 completion CONFIRMED).
+> - readOnlyHint split 13 read / 43 write. The correspondence to the stop-hook
+>   write-verb set — established during the PR #857 colleague review by a
+>   separate derivation — no longer holds as of 2026-08-26: the hook's
+>   `_ENGRAM_WRITE_VERBS` still holds 36 entries while the server now has 43
+>   write-capable tools, a strict subset missing seven. Tracked as #2273; do not
+>   cite this as a corroborated match until it is re-closed.
 > - Doc-drift finding verified: `engram_add_evidence` appears in SKILL.md but is an
 >   internal function, not an MCP-registered tool.
 >
@@ -40,12 +43,20 @@
 
 ## Mechanical Enumeration
 
-**Total tool count: 49** *(verified current 2026-06-10: `grep -cE '^@mcp\.tool' server.py` = 49; readOnly 13 / write 36 / destructive 4 all confirmed)* — all @mcp.tool decorated functions in `server.py`. The `@mcp.tool` wrappers remain in server.py post-#872 (the `_impl` logic moved to the `engram_*.py` modules), so the decorator registry is still server.py-local; the old `lines 5325–18639` range is #872-stale and dropped.
+**Total tool count: 56** — all @mcp.tool decorated functions in `server.py`. The `@mcp.tool` wrappers remain in server.py post-#872 (the `_impl` logic moved to the `engram_*.py` modules), so the decorator registry is still server.py-local; the old `lines 5325–18639` range is #872-stale and dropped.
+
+*(Verify, don't trust the number above — `total` and `write` grow with every new tool merged, while `readOnly` and `destructive` are bounded categories that rarely move, so re-derive the first two rather than the last two:*
+- *total: `grep -cE '^@mcp\.tool' src/engram/server.py`*
+- *readOnly: `grep -c 'readOnlyHint": True' src/engram/server.py`*
+- *destructive: `grep -c 'destructiveHint": True' src/engram/server.py`*
+- *write = total − readOnly (derived; do not count it independently)*
+
+*As of 2026-08-26, dev `76a4de1`: total 56, readOnly 13, destructive 4, write 43.)*
 
 ### readOnlyHint Distribution
 
 - **readOnlyHint=True: 13 tools**
-- **readOnlyHint=False: 36 tools** (write-capable)
+- **readOnlyHint=False: 43 tools** (write-capable)
 
 Breakdown:
 - Query/inspection read-only: `engram_surface`, `engram_inspect`, `engram_query`, `engram_get_subgraph`, `engram_stats`, `engram_diagnose`, `engram_history`, `engram_list`, `engram_list_focused`, `engram_query_pattern`
@@ -387,7 +398,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - (c) guard bypass params: TWO — `use_stale` and `use_contested` (#1654) in engram_derive; both intentional, bool-type-gated, audit-marked (`metadata.built_on_stale` / `metadata.built_on_contested` respectively; the latter auto-stamped by the override path only, never author-supplied).
 - (d) undiscoverable tools: NONE claimed (all 49 in SKILL.md).
 - (e) success-shaped error paths: NONE claimed (uniform `{"error": ...}` shape).
-- (f) multi-arg stragglers: NONE — 49/49 on payload_json (or no-arg). **Wave-3 migration complete** (mechanical, trustworthy).
+- (f) multi-arg stragglers: NONE — 56/56 on payload_json (or no-arg). **Wave-3 migration complete** (mechanical, trustworthy).
 
 ## Status Summary *(fairy-assigned; pending accuracy pass)*
 
@@ -401,8 +412,8 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 | Metric | Value |
 |--------|-------|
-| Total MCP tools | 49 |
-| readOnlyHint True/False | 13 / 36 *(corroborated)* |
+| Total MCP tools | 56 |
+| readOnlyHint True/False | 13 / 43 |
 | destructiveHint True | 4 |
 | Test coverage claim | **VOID — fabricated filenames found; re-derive mechanically** |
 | Multi-arg regressed tools | 0 *(mechanical)* |
