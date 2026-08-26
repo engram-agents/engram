@@ -1484,6 +1484,30 @@ def _register_exemplar_impl(
 
         # Live count via SSoT helper — no cached field needed (closes #442).
         exemplar_count = core._count_live_exemplars(conn, target_id, target_row["type"])
+
+        # #2252 Stage 1.1 Part 3 — cheap write-time discharge: registering
+        # this exemplar IS a re-wire event against target_id, so clear a
+        # stale support_lost marker right here instead of waiting for the
+        # next reflect run. Convenience only, same as engram_revision's
+        # Part 2 hook — engram_lifecycle._reflect_impl's state-based
+        # recompute (Part 1) is the load-bearing discharge and covers this
+        # target even if this hook is ever skipped or bypassed. It IS
+        # bypassable: engram_add_edge can create an 'exemplifies' edge
+        # directly without going through this function (the relation is in
+        # core._ADDABLE_AFTER_CREATION_RELATIONS, gated only for
+        # 'instantiates'->lesson) — a third exemplar-creation surface
+        # alongside this one and the initial-creation path in
+        # _add_lesson_impl, neither of which routes through this hook.
+        target_meta = json.loads(target_row["metadata"] or "{}")
+        if target_meta.get("support_lost") and exemplar_count > 0:
+            target_meta.pop("support_lost", None)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(target_meta), target_id),
+            )
+            core._log_edit(conn, "support_lost_cleared", target_id, target_row["type"],
+                      {"trigger": exemplar_id})
+            conn.commit()
     finally:
         conn.close()
 

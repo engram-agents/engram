@@ -240,7 +240,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_reflect": {
-        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
+        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. NOT purely a read (#2252 Stage 1.1): recomputes each support_lost-marked cornerstone/lesson's live-exemplar count and clears the marker (writing metadata + edit_history) where support turns out to be non-zero; discharges are reported under support_lost_cleared. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
         "parameters": {
             "payload_json": {"type": "string", "description": "Optional JSON object (as a string) with reflect fields. Optional: summary_top_k (int — how many top-importance entries in each high-volume category receive summary-style rendering; remainder get keyword-style; default 5; clamped to >= 0; set 0 for all keyword-style; set high e.g. 50 for all summary-style). Empty payload '{}' or omitted payload runs the default reflect."},
         },
@@ -312,11 +312,19 @@ TOOL_SCHEMAS = {
 }
 
 # Tools that only read from the graph (no mutations).
-# Note: engram_reflect is listed here because it is non-mutating, but it is
-# sleep-cycle-only at the workflow level — see its [Sleep cycle] description.
+# This is a DECLARATIVE inventory, not an enforced guarantee: nothing in
+# src, tests, or tools reads READ_ONLY_TOOLS today, so membership gates no
+# call path. It is documentation that must be kept accurate by hand — a
+# tool that starts writing has to be removed from here manually, and no
+# mechanism will catch a miss if that removal doesn't happen.
+# engram_reflect is NOT in this set (#2252 Stage 1.1): as of Stage 1.1 it
+# recomputes and clears stale support_lost markers on cornerstones/lessons as
+# part of its audit — writing node metadata + edit_history — so it no longer
+# belongs in a read-only inventory. It was listed here before that change;
+# removed rather than left stale.
 # READ_ONLY membership does NOT imply awake-safe; check the description.
 READ_ONLY_TOOLS = {
-    "engram_query", "engram_get_subgraph", "engram_stats", "engram_reflect",
+    "engram_query", "engram_get_subgraph", "engram_stats",
 }
 
 

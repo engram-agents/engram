@@ -151,13 +151,28 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
 # ---------------------------------------------------------------------------
 
 
-def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> list[dict]:
-    """Find cornerstones/lessons that lost all live support due to a cascade operation.
+def _detect_zero_support(
+    conn: sqlite3.Connection, affected_node_id: str
+) -> "tuple[list[dict], list[dict]]":
+    """Find cornerstones/lessons whose live-support state changed due to a
+    cascade operation settling (retract or supersede).
 
     After a retract or supersede settles (affected node is already is_current=0),
-    check each cs/ls that had an edge to/from the affected node. If the total count
-    of live supporting nodes (via supported_by TARGET or exemplifies SOURCE) is zero,
-    mark the cs/ls as support_lost in metadata and log the event.
+    check each cs/ls that had an edge to/from the affected node and recount its
+    total live support (via supported_by TARGET or exemplifies SOURCE):
+      - count == 0 and not already marked → mark support_lost, log 'support_lost'.
+      - count > 0 and currently marked → clear support_lost, log
+        'support_lost_cleared' (#2252 Stage 1.1 Part 2).
+
+    This write-time clear is a CONVENIENCE, not the load-bearing discharge —
+    it only fires when a retract/supersede happens to touch this cs/ls's
+    immediate neighborhood again. The state-based recompute in
+    engram_lifecycle._reflect_impl (Stage 1.1 Part 1) is what actually
+    guarantees discharge: it re-evaluates every marked node's live-support
+    count on every reflect run regardless of whether any event fired here,
+    which is also the only way to repair a marker whose setting event
+    predates this code (e.g. a marker set before Stage 1.1 existed at all).
+    Do not treat this hook as sufficient by itself.
 
     Edge direction (§3):
       - supported_by: cs/ls ─[supported_by]→ premise. COUNT where TARGET is_current=1.
@@ -168,7 +183,8 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
         affected_node_id: The node that was retracted or superseded (already is_current=0).
 
     Returns:
-        List of dicts [{id, type, claim}] for each cs/ls newly marked support_lost.
+        Tuple (newly_support_lost, newly_support_restored) — each a list of
+        dicts [{id, type, claim}].
     """
     # Step 1: find all cs/ls that may be affected.
     # Case 1: affected node was the TARGET of a supported_by edge (cs/ls → affected).
@@ -200,10 +216,11 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
         affected_cs_ls_ids.add(row["target_id"])
 
     if not affected_cs_ls_ids:
-        return []
+        return [], []
 
     # Step 2: for each affected cs/ls, recount live support.
     newly_support_lost = []
+    newly_support_restored = []
     for cs_ls_id in affected_cs_ls_ids:
         cs_ls_node = conn.execute(
             "SELECT id, type, claim, metadata, is_current FROM nodes WHERE id = ?",
@@ -213,10 +230,10 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
             continue  # Only count live cs/ls nodes
 
         total_live = core._count_live_exemplars(conn, cs_ls_id, cs_ls_node["type"])
+        meta = json.loads(cs_ls_node["metadata"] or "{}")
 
         if total_live == 0:
             # Mark support_lost in metadata.
-            meta = json.loads(cs_ls_node["metadata"] or "{}")
             if not meta.get("support_lost"):
                 meta["support_lost"] = True
                 conn.execute(
@@ -230,8 +247,26 @@ def _detect_zero_support(conn: sqlite3.Connection, affected_node_id: str) -> lis
                     "type": cs_ls_node["type"],
                     "claim": cs_ls_node["claim"],
                 })
+        elif meta.get("support_lost"):
+            # #2252 Stage 1.1 Part 2 — cheap write-time clear: this retract/
+            # supersede settling happened to touch cs_ls_id's neighborhood
+            # again and support is live again. See the module-level note in
+            # this function's docstring for why this is a convenience, not
+            # the load-bearing discharge.
+            meta.pop("support_lost", None)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), cs_ls_id),
+            )
+            core._log_edit(conn, "support_lost_cleared", cs_ls_id, cs_ls_node["type"],
+                      {"trigger": affected_node_id})
+            newly_support_restored.append({
+                "id": cs_ls_id,
+                "type": cs_ls_node["type"],
+                "claim": cs_ls_node["claim"],
+            })
 
-    return newly_support_lost
+    return newly_support_lost, newly_support_restored
 
 
 # ---------------------------------------------------------------------------
@@ -876,9 +911,12 @@ def _supersede_impl(
                        "cascade_via": "contradicts_edge"})
 
         # §2.3 Zero-support detection: after cascade settles, check cs/ls
-        # nodes that lost a supporting edge. If total live support = 0, mark
-        # support_lost (distinct from stale — audit signal, not cascade).
-        support_lost_cs_ls = _detect_zero_support(conn, old_node_id)
+        # nodes that lost or regained a supporting edge (distinct from
+        # stale — audit signal, not cascade). #2252 Stage 1.1 Part 2 adds
+        # the restore side; see _detect_zero_support's docstring for why
+        # this write-time check is a convenience and not the load-bearing
+        # discharge (that's engram_lifecycle._reflect_impl, Part 1).
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, old_node_id)
 
         core._log_edit(conn, "superseded", old_node_id, old["type"],
                   {"replaced_by": new_node_id, "reason": supersede_reason or None})
@@ -915,6 +953,9 @@ def _supersede_impl(
         if support_lost_cs_ls:
             result["support_lost"] = support_lost_cs_ls
             result["support_lost_count"] = len(support_lost_cs_ls)
+        if support_restored_cs_ls:
+            result["support_restored"] = support_restored_cs_ls
+            result["support_restored_count"] = len(support_restored_cs_ls)
         return json.dumps(result)
     finally:
         conn.close()
@@ -1209,9 +1250,12 @@ def _retract_impl(
                       {"tainted_by": node_id, "cascade_via": "contradicts_edge"})
 
         # §2.3 Zero-support detection: after cascade settles, check cs/ls
-        # nodes that lost a supporting edge. If total live support = 0, mark
-        # support_lost (distinct from tainted — audit signal, not cascade).
-        support_lost_cs_ls = _detect_zero_support(conn, node_id)
+        # nodes that lost or regained a supporting edge (distinct from
+        # tainted — audit signal, not cascade). #2252 Stage 1.1 Part 2 adds
+        # the restore side; see _detect_zero_support's docstring for why
+        # this write-time check is a convenience and not the load-bearing
+        # discharge (that's engram_lifecycle._reflect_impl, Part 1).
+        support_lost_cs_ls, support_restored_cs_ls = _detect_zero_support(conn, node_id)
 
         # Log retraction and taint events
         core._log_edit(conn, "retracted", node_id, node["type"],
@@ -1293,6 +1337,9 @@ def _retract_impl(
         if support_lost_cs_ls:
             result["support_lost"] = support_lost_cs_ls
             result["support_lost_count"] = len(support_lost_cs_ls)
+        if support_restored_cs_ls:
+            result["support_restored"] = support_restored_cs_ls
+            result["support_restored_count"] = len(support_restored_cs_ls)
         if reopened_targets:
             result["reopened_targets"] = reopened_targets
             result["reopened_count"] = len(reopened_targets)

@@ -53,6 +53,7 @@ _REFLECT_TOP_N = {
     "tainted_nodes": 5,
     "stale_nodes": 5,
     "support_lost_nodes": 5,
+    "support_lost_cleared": 5,
     "overdue_predictions": 5,
     "open_conjectures": 5,
     "recent_feeling_reports": 5,
@@ -73,7 +74,7 @@ _REFLECT_TRUNC_FIELDS = {
 _REFLECT_LIST_ORDER = [
     "active_goals", "active_tasks", "active_lessons",
     "unresolved_goal_tensions", "unresolved_contradictions",
-    "tainted_nodes", "stale_nodes", "support_lost_nodes",
+    "tainted_nodes", "stale_nodes", "support_lost_nodes", "support_lost_cleared",
     "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
@@ -886,17 +887,57 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # dream-master to find cs/ls that lost all live empirical support.
         # Trivial rewires handled inside the dream; non-trivial cases surface
         # to awake state via the flagged-for-user mechanism.
+        #
+        # #2252 Stage 1.1 Part 1 (LOAD-BEARING — do not reduce this to a
+        # write-time hook). The marker above is set by an event
+        # (retract/supersede settling in engram_revision._detect_zero_support,
+        # or historically by code that predates this discharge entirely).
+        # A hook keyed on that event cannot repair a marker whose setting
+        # event is already in the past — the one lesson in this graph
+        # currently carrying the marker is exactly that case, re-wired
+        # 2026-08-16/17, before any discharge code existed. Worse,
+        # event-keyed discharge would need every edge-writing surface
+        # enumerated correctly, and that enumeration was already wrong:
+        # engram_add_edge can create a live-support 'exemplifies' edge
+        # directly (relation is in core._ADDABLE_AFTER_CREATION_RELATIONS,
+        # gated only for 'instantiates'->lesson, not for 'exemplifies') —
+        # a third surface alongside supported_by wiring — with no hook on
+        # that path at all. So: recompute state on every reflect run instead
+        # of trusting the flag. This is a state-based recompute, not a
+        # backfill migration — it needs no one-time pass because every run
+        # re-evaluates state from scratch, and it stays correct as new
+        # edge-writing surfaces get added without anyone updating a list.
         support_lost_rows = conn.execute(
             # Anchor to serialized boolean — metadata written with default json.dumps separators.
-            """SELECT id, type, claim FROM nodes
+            """SELECT id, type, claim, metadata FROM nodes
                WHERE is_current = 1
                  AND type IN ('cornerstone', 'lesson')
                  AND metadata LIKE '%"support_lost": true%'"""
         ).fetchall()
-        report["support_lost_nodes"] = [
-            {"id": r["id"], "type": r["type"], "claim": r["claim"]}
-            for r in support_lost_rows
-        ]
+        report["support_lost_nodes"] = []
+        report["support_lost_cleared"] = []
+        support_lost_discharged_any = False
+        for r in support_lost_rows:
+            live_count = core._count_live_exemplars(conn, r["id"], r["type"])
+            if live_count > 0:
+                meta = json.loads(r["metadata"] or "{}")
+                meta.pop("support_lost", None)
+                conn.execute(
+                    "UPDATE nodes SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta), r["id"]),
+                )
+                core._log_edit(conn, "support_lost_cleared", r["id"], r["type"],
+                          {"live_exemplars": live_count, "trigger": "reflect_recompute"})
+                report["support_lost_cleared"].append(
+                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+                )
+                support_lost_discharged_any = True
+            else:
+                report["support_lost_nodes"].append(
+                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+                )
+        if support_lost_discharged_any:
+            conn.commit()
 
         # Summary counts (two-tier: queryable vs faded; tier-1 retired)
         total_current = conn.execute(
@@ -922,6 +963,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "stale_nodes": len(report["stale_nodes"]),
             "retracted_nodes": len(report["retracted_nodes"]),
             "support_lost_nodes": len(report["support_lost_nodes"]),
+            "support_lost_cleared": len(report["support_lost_cleared"]),
             "recent_feeling_reports": len(report["recent_feeling_reports"]),
         }
         report["memory_tiers"] = {

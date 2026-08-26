@@ -2730,6 +2730,11 @@ def _advance_turn_impl(message: str) -> str:
 # calibration_snapshot field: corpus + this_turn confidence distributions, added by
 # the wrapper (calls engram_stats() which is server-resident; cannot be called from
 # the family module impl — wave-3 structural split).
+#
+# NOT purely a read (#2252 Stage 1.1): the support_lost recompute below writes
+# node metadata + edit_history when it discharges a stale marker. See the
+# tool docstring and its Returns: support_lost_cleared entry for what that
+# means from the caller's side.
 _REFLECT_FIELDS = frozenset({
     "summary_top_k",
 })
@@ -2743,7 +2748,9 @@ _REFLECT_FIELDS = frozenset({
     ),
     annotations={
         "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
-        "readOnlyHint": True,
+        # #2252 Stage 1.1: reflect now recomputes + discharges stale
+        # support_lost markers as it audits — this is no longer a pure read.
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -2757,6 +2764,15 @@ def engram_reflect(payload_json: str = "{}") -> str:
     unresolved contradictions, weakly-grounded claims, open questions,
     overdue predictions, same-source observation tensions, uncited observations,
     single-source derivations, plus active goals/tasks/lessons context.
+
+    NOT purely a read (#2252 Stage 1.1): while building the support_lost_nodes
+    category, this call recomputes each currently-marked cornerstone/lesson's
+    live-exemplar count against current graph state. Where that recount is
+    non-zero, it clears the stale support_lost marker — writing the node's
+    metadata and an edit_history entry ('support_lost_cleared') — rather than
+    leaving a false positive in place until some future retract/supersede
+    happens to touch that node again. Discharged nodes are reported under
+    support_lost_cleared, not silently dropped from the response.
 
     Read the report, then decide which issues to address — strengthen weak
     claims, resolve contradictions, investigate open questions, etc.
@@ -2773,6 +2789,9 @@ def engram_reflect(payload_json: str = "{}") -> str:
 
     Returns:
         JSON report with categorized issues and recommended actions.
+        - support_lost_cleared: cornerstones/lessons whose support_lost marker
+          was just discharged by this call's recount (see above — this is the
+          write this call makes).
         - calibration_snapshot: Two-key dict with `corpus` (mode=all) and `this_turn`
           (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
           see filing-pattern shape alongside topic-selection candidates.

@@ -949,3 +949,223 @@ def test_supersede_stops_at_superseded_downstream_node():
         f"dv_B {dv_b} must NOT be in stale_downstream — cascade must not recurse through "
         f"superseded dv_A"
     )
+
+
+# ---------------------------------------------------------------------------
+# §5.6 #2252 Stage 1.1 — support_lost discharge (state-based, reflect-time)
+# ---------------------------------------------------------------------------
+
+
+def _set_support_lost(core, node_id, value=True):
+    """Directly stamp a support_lost marker via SQL, bypassing any hook.
+
+    Used to simulate a marker whose setting event predates this fix (the
+    shape of the graph's real specimen: a lesson re-wired before any
+    discharge code existed) — no retract/supersede/register_exemplar call
+    is made, only a direct metadata write, matching how a marker set before
+    this code existed would look today.
+    """
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        meta = json.loads(row["metadata"] or "{}")
+        if value:
+            meta["support_lost"] = True
+        else:
+            meta.pop("support_lost", None)
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_reflect_discharges_backlog_marker_with_no_triggering_event():
+    """Part 1 — the backlog test that matters.
+
+    A node carries support_lost:true in metadata AND has live exemplars,
+    with NO retract/supersede/register_exemplar event anywhere in this test.
+    This is the shape of the graph's one real specimen: a lesson whose
+    marker's setting event is already in the past by the time any discharge
+    code exists.
+
+    A hook keyed on retract/supersede/register-exemplar events CANNOT pass
+    this test — there is no event here for a hook to fire on. Only a
+    state-based recount at reflect time (Part 1) can discharge it.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_id = _seed_ob(obs, "Live supporter — never touched by any mutation.")
+    cs_id = _seed_cs(cs, ob_id, tag="backlog-marker-cs")
+
+    # Stamp a false-positive marker with no triggering event.
+    _set_support_lost(core, cs_id, True)
+    assert _get_meta(core, cs_id).get("support_lost") is True, "precondition: marker set"
+
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    assert "error" not in reflect_result, reflect_result
+
+    support_lost_ids = [n["id"] for n in reflect_result.get("support_lost_nodes", [])]
+    assert cs_id not in support_lost_ids, (
+        f"{cs_id} must be discharged (has live exemplars via ob_id) — a "
+        f"hook-only fix would leave it marked forever because no event ever "
+        f"fires on it. Got support_lost_nodes: {support_lost_ids}"
+    )
+
+    cleared_ids = [n["id"] for n in reflect_result.get("support_lost_cleared", [])]
+    assert cs_id in cleared_ids, (
+        f"Expected {cs_id} in support_lost_cleared, got: {cleared_ids}"
+    )
+
+    meta = _get_meta(core, cs_id)
+    assert not meta.get("support_lost"), f"metadata marker should be cleared, got: {meta}"
+
+    summary = reflect_result.get("summary", {})
+    assert summary.get("support_lost_cleared", 0) >= 1, (
+        f"Expected summary.support_lost_cleared >= 1, got: {summary}"
+    )
+
+
+def test_support_lost_mark_restore_remark_round_trip_idempotent():
+    """Part 2 — mark -> restore -> re-mark via the write-time hook.
+
+    Also asserts idempotency: exactly one edit_history row per real state
+    transition, no duplicates from repeated _detect_zero_support triggers.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob1 = _seed_ob(obs, "Supporter 1 — retracted first.", url="https://example.com/rt1")
+    cs_id = _seed_cs(cs, ob1, tag="round-trip-cs")
+
+    # 1. Mark: retract the sole supporter.
+    ret1 = json.loads(rev._retract_impl(
+        node_id=ob1, error_type="hallucinated_claim", reason="fabricated 1",
+    ))
+    assert ret1.get("support_lost_count", 0) == 1, ret1
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # 2. Wire two more supporters directly (bypasses any hook on cs itself):
+    # ob2 stays live, ob3 will be retracted to re-trigger _detect_zero_support
+    # against cs's neighborhood.
+    ob2 = _seed_ob(obs, "Supporter 2 — added post-hoc, stays live.", url="https://example.com/rt2")
+    ob3 = _seed_ob(obs, "Supporter 3 — added then retracted to re-trigger.", url="https://example.com/rt3")
+    conn = core._get_db()
+    try:
+        now = core._now()
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+            (cs_id, ob2, now),
+        )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+            (cs_id, ob3, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 3. Restore: retracting ob3 re-triggers _detect_zero_support against
+    # cs; ob2 is still live, so this should CLEAR support_lost (Part 2).
+    ret2 = json.loads(rev._retract_impl(
+        node_id=ob3, error_type="hallucinated_claim", reason="fabricated 3",
+    ))
+    assert "error" not in ret2, ret2
+    assert _get_meta(core, cs_id).get("support_lost") is not True, (
+        f"cs {cs_id} should be restored (ob2 still live), meta: {_get_meta(core, cs_id)}"
+    )
+    restored_ids = [n["id"] for n in ret2.get("support_restored", [])]
+    assert cs_id in restored_ids, f"Expected {cs_id} in support_restored, got: {restored_ids}"
+
+    # 4. Re-mark: retract the last live supporter ob2.
+    ret3 = json.loads(rev._retract_impl(
+        node_id=ob2, error_type="hallucinated_claim", reason="fabricated 2",
+    ))
+    assert ret3.get("support_lost_count", 0) == 1, ret3
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # 5. Idempotency: exactly 2 'support_lost' rows (steps 1 and 4) and
+    # exactly 1 'support_lost_cleared' row (step 3) for cs_id.
+    conn = core._get_db()
+    try:
+        lost_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM edit_history WHERE node_id = ? AND action = 'support_lost'",
+            (cs_id,),
+        ).fetchone()["c"]
+        cleared_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM edit_history WHERE node_id = ? AND action = 'support_lost_cleared'",
+            (cs_id,),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert lost_rows == 2, f"Expected exactly 2 support_lost rows, got {lost_rows}"
+    assert cleared_rows == 1, f"Expected exactly 1 support_lost_cleared row, got {cleared_rows}"
+
+
+def test_register_exemplar_clears_support_lost_marker():
+    """Part 3 — registering a new exemplar on a marked lesson clears it."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_incident = _seed_ob(obs, "Sole incident — will be retracted.")
+    ls_id = _seed_ls(obs, epistemic, "Lesson losing its only incident.", supporting_ids=ob_incident)
+
+    ret = json.loads(rev._retract_impl(
+        node_id=ob_incident, error_type="hallucinated_claim", reason="fabricated incident",
+    ))
+    assert ret.get("support_lost_count", 0) == 1, ret
+    assert _get_meta(core, ls_id).get("support_lost") is True
+
+    ob_new = _seed_ob(obs, "New incident registered post-hoc.", url="https://example.com/new-incident")
+    reg = json.loads(epistemic._register_exemplar_impl(target_id=ls_id, exemplar_id=ob_new))
+    assert "error" not in reg, reg
+
+    meta = _get_meta(core, ls_id)
+    assert not meta.get("support_lost"), (
+        f"lesson {ls_id} support_lost should clear on new exemplar registration, got: {meta}"
+    )
+
+
+def test_genuinely_unsupported_node_stays_marked_through_all_paths():
+    """A node with zero live support must NOT be discharged by any path —
+    the discharge machinery must not become a way to lose the warning."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_id = _seed_ob(obs, "Sole supporter — retracted, nothing replaces it.")
+    cs_id = _seed_cs(cs, ob_id, tag="genuinely-unsupported-cs")
+
+    ret = json.loads(rev._retract_impl(
+        node_id=ob_id, error_type="hallucinated_claim", reason="fabricated",
+    ))
+    assert ret.get("support_lost_count", 0) == 1, ret
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # Part 1: reflect must NOT discharge a genuinely-unsupported node.
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    support_lost_ids = [n["id"] for n in reflect_result.get("support_lost_nodes", [])]
+    cleared_ids = [n["id"] for n in reflect_result.get("support_lost_cleared", [])]
+    assert cs_id in support_lost_ids, (
+        f"Expected {cs_id} to remain in support_lost_nodes, got: {support_lost_ids}"
+    )
+    assert cs_id not in cleared_ids, (
+        f"{cs_id} has zero live support and must NOT appear in support_lost_cleared, "
+        f"got: {cleared_ids}"
+    )
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+
+def test_reflect_summary_reports_support_lost_cleared_count():
+    """support_lost_cleared appears in the reflect report with a correct count."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob1 = _seed_ob(obs, "Live supporter for backlog cs 1.", url="https://example.com/sc1")
+    cs1 = _seed_cs(cs, ob1, tag="summary-cleared-cs-1")
+    ob2 = _seed_ob(obs, "Live supporter for backlog cs 2.", url="https://example.com/sc2")
+    cs2 = _seed_cs(cs, ob2, tag="summary-cleared-cs-2")
+
+    _set_support_lost(core, cs1, True)
+    _set_support_lost(core, cs2, True)
+
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    assert "error" not in reflect_result, reflect_result
+
+    cleared_ids = {n["id"] for n in reflect_result.get("support_lost_cleared", [])}
+    assert {cs1, cs2} <= cleared_ids, (
+        f"Expected both {cs1} and {cs2} in support_lost_cleared, got: {cleared_ids}"
+    )
+    summary = reflect_result.get("summary", {})
+    assert summary.get("support_lost_cleared", 0) == len(reflect_result.get("support_lost_cleared", [])), (
+        f"summary.support_lost_cleared must match list length, got: {summary}"
+    )
