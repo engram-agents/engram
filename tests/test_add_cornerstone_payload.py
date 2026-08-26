@@ -8,12 +8,17 @@ Coverage:
   5. Internal helper — _add_cornerstone_impl works with named kwargs.
   6. is_current guard — retracted supporting_id skipped, non_current_supporting_ids populated (#1019).
   7. is_current guard — superseded supporting_id skipped, non_current_supporting_ids populated (#1019).
+  8. importance_base anchor (#2250) — the interim confidence=0.5/surprise=0.0
+     write is gone; the final importance_base/importance_score are unchanged
+     from the pre-fix behavior (the actual correctness invariant, not an
+     implementation-detail assertion on the removed dead write itself).
 """
 
 import atexit
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -189,3 +194,52 @@ def test_superseded_supporting_id_skipped_with_warning():
     assert r.get("status") == "created", r
     assert obs_id not in r.get("supporting_nodes", []), r
     assert obs_id in r.get("non_current_supporting_ids", []), r
+
+
+# ── 8. importance_base anchor (#2250 dead-write cleanup) ────────────────────
+
+
+def _read_importance(node_id):
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT importance_base, importance_score FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        return row
+    finally:
+        conn.close()
+
+
+def test_create_importance_base_anchored_at_2_0():
+    """Cornerstone creation still ends at importance_base=2.0 with the
+    matching decay-anchored importance_score, even though the interim
+    confidence=0.5/surprise=0.0 write (#2250) is no longer performed.
+
+    This is the correctness invariant that actually matters — the final
+    stored values are unchanged from before the cleanup, not an assertion
+    on the removed dead write itself.
+    """
+    server = fresh_server()
+    import engram_core as core
+
+    r = json.loads(server.engram_add_cornerstone(payload_json=json.dumps({
+        "tag": "importance-anchor-test",
+        "title": "Anchor invariant check",
+        "new_frame": "New frame for the anchor invariant test.",
+    })))
+    assert "error" not in r, r
+    cs_id = r["cornerstone_id"]
+
+    importance_base, importance_score = _read_importance(cs_id)
+    assert importance_base == 2.0, (
+        f"Expected importance_base=2.0 (unchanged anchor value), got {importance_base}"
+    )
+    expected_score = core._compute_importance(2.0, core._get_current_turn())
+    assert importance_score == expected_score, (
+        f"Expected importance_score={expected_score} (2.0 decayed to current "
+        f"turn), got {importance_score}"
+    )
+    # Never left at the interim confidence=0.5/surprise=0.0 value.
+    assert importance_base != 0.5

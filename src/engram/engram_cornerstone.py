@@ -123,19 +123,13 @@ def _add_cornerstone_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # confidence= here feeds ONLY the importance formula, not the stored
-        # confidence — cornerstones are deliberately not claim-bearing and
-        # store confidence = NULL. 0.5 is a neutral importance prior, and
-        # this importance_base write is itself superseded immediately
-        # below by the fixed cornerstone anchor (importance_base = 2.0).
-        # The 0.5 is therefore inert — a formality to satisfy the helper's
-        # signature, with no downstream effect on any stored value.
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Cornerstones are importance-anchored at a fixed value (2.0) rather
+        # than derived from confidence/surprise — identity structures are as
+        # durable as goals and axioms. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence=0.5 and then overwriting it
+        # [alpha#2250].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if linked:
             core._utility_reward(conn, linked, action="citation")
         conn.commit()
@@ -350,19 +344,13 @@ def _outgrow_cornerstone_impl(
             (new_id, old_cornerstone_id),
         )
 
-        # confidence= here feeds ONLY the importance formula, not the stored
-        # confidence — cornerstones are deliberately not claim-bearing and
-        # store confidence = NULL. 0.5 is a neutral importance prior, and
-        # this importance_base write is itself superseded immediately
-        # below by the fixed cornerstone anchor (importance_base = 2.0).
-        # The 0.5 is therefore inert — a formality to satisfy the helper's
-        # signature, with no downstream effect on any stored value.
-        core._stamp_new_node(conn, new_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, new_id),
-        )
+        # Cornerstones are importance-anchored at a fixed value (2.0) rather
+        # than derived from confidence/surprise — identity structures are as
+        # durable as goals and axioms. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence=0.5 and then overwriting it
+        # [alpha#2250].
+        core._stamp_new_node(conn, new_id, importance_base=2.0)
 
         core._log_edit(conn, "superseded", old_cornerstone_id, "cornerstone",
                   {"replaced_by": new_id, "via": "engram_outgrow_cornerstone",

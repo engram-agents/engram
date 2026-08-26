@@ -17,6 +17,11 @@ Coverage:
      PR #1713): the lesson-kind counterpart of the direct-ID test, since
      unification widened the by_principle reverse lookup to all four kinds,
      not cornerstone-only as it was pre-#1698.
+  §3 _stamp_new_node importance_base override (#2250) — the explicit
+     override parameter added to skip the confidence/surprise-derived
+     interim computation entirely (implementation-detail companion to the
+     end-to-end anchor-invariant tests in test_add_cornerstone_payload.py /
+     test_outgrow_cornerstone_payload.py).
 """
 
 from __future__ import annotations
@@ -279,3 +284,59 @@ def test_generic_edge_tools_resync_anchor_cache():
     with open(core.CORNERSTONE_ANCHORS_PATH) as f:
         index = json.load(f)
     assert exemplar not in index, "remove_edge left a stale anchor entry"
+
+
+# ---------------------------------------------------------------------------
+# §3 _stamp_new_node importance_base override (#2250)
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_new_node_importance_base_override():
+    """importance_base override bypasses the confidence/surprise-derived
+    computation entirely — the override value lands directly (#2250)."""
+    server = fresh_server()
+    import engram_core as core
+
+    node_id = _seed_axiom(server, "Axiom for the stamp_new_node override test.")
+    conn = core._get_db()
+    try:
+        # confidence=0.9/surprise=0.9 would compute base = 0.9*1.9 = 1.71
+        # via _importance_base_for_node if it were used — it must NOT be,
+        # since importance_base is explicitly overridden below.
+        core._stamp_new_node(conn, node_id, confidence=0.9, surprise=0.9,
+                              importance_base=3.3)
+        conn.commit()
+        row = conn.execute(
+            "SELECT importance_base, importance_score FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["importance_base"] == 3.3
+    expected_score = core._compute_importance(3.3, core._get_current_turn())
+    assert row["importance_score"] == expected_score
+
+
+def test_stamp_new_node_default_behavior_unchanged():
+    """No importance_base override: behavior matches the pre-#2250 path
+    exactly — confidence/surprise still derive importance_base via
+    _importance_base_for_node, identical to every other _stamp_new_node
+    caller that doesn't pass the new parameter."""
+    server = fresh_server()
+    import engram_core as core
+
+    node_id = _seed_axiom(server, "Axiom for the stamp_new_node default-path test.")
+    conn = core._get_db()
+    try:
+        core._stamp_new_node(conn, node_id, confidence=0.7, surprise=0.5)
+        conn.commit()
+        row = conn.execute(
+            "SELECT importance_base, importance_score FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    expected_base = core._importance_base_for_node(0.7, 0.5)
+    assert row["importance_base"] == expected_base
+    expected_score = core._compute_importance(expected_base, core._get_current_turn())
+    assert row["importance_score"] == expected_score

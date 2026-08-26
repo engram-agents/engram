@@ -3533,9 +3533,19 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
 
 
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
-                     confidence: float = 0.5, surprise: float = 0.0):
-    """Set importance and compute embedding on a freshly created node."""
-    base = _importance_base_for_node(confidence, surprise)
+                     confidence: float = 0.5, surprise: float = 0.0,
+                     importance_base: float = None):
+    """Set importance and compute embedding on a freshly created node.
+
+    By default, importance_base is derived from confidence/surprise via
+    _importance_base_for_node. Pass importance_base explicitly to anchor a
+    node at a fixed value instead (e.g. cornerstones anchor at 2.0) --
+    confidence/surprise are then ignored for the importance computation,
+    which avoids computing a throwaway interim value the caller would
+    otherwise immediately overwrite [alpha#2250].
+    """
+    base = (importance_base if importance_base is not None
+            else _importance_base_for_node(confidence, surprise))
     turn = _get_current_turn()
     score = _compute_importance(base, turn)
     conn.execute(
