@@ -253,7 +253,18 @@ def _pattern_open_question_answerable(
             type_filter={"derivation"},
             importance_threshold=0.0,
         )
-        matches = [m for m in matches if (m.get("confidence") or 0) >= min_conf]
+        # min_confidence is a CB-only predicate (#2252 stage 1.7): ask "is
+        # this claim-bearing" before applying the threshold, rather than
+        # letting absent-confidence collapse to zero. NCB nodes and CB
+        # nodes with a NULL confidence always pass.
+        filtered_matches = []
+        for m in matches:
+            is_cb = core._is_claim_bearing(m.get("type"))
+            conf = m.get("confidence")
+            if is_cb and conf is not None and conf < min_conf:
+                continue  # drop: claim-bearing and genuinely below threshold
+            filtered_matches.append(m)
+        matches = filtered_matches
         if not matches:
             continue
         best = matches[0]
@@ -631,9 +642,14 @@ def _pattern_tainted_still_valid(
 
     candidates: list[dict] = []
     for nid, ntype, claim, conf, metadata in rows:
-        conf = conf or 0
-        if conf < min_conf:
-            continue
+        # min_confidence is a CB-only predicate (#2252 stage 1.7): ask "is
+        # this claim-bearing" before applying the threshold, rather than
+        # letting absent-confidence collapse to zero. NCB nodes and CB
+        # nodes with a NULL confidence always pass.
+        is_cb = core._is_claim_bearing(ntype)
+        if is_cb and conf is not None and conf < min_conf:
+            continue  # drop: claim-bearing and genuinely below threshold
+        conf = conf or 0  # display/score coercion, applied only after the filter decision
         try:
             md = json.loads(metadata or "{}")
         except (ValueError, json.JSONDecodeError):
@@ -1623,7 +1639,12 @@ def _search_nodes(
                 continue
             if not include_superseded and not r["is_current"]:
                 continue
-            if r["confidence"] is not None and r["confidence"] < min_confidence:
+            # min_confidence is a CB-only predicate (#2252 stage 1.7): ask
+            # "is this claim-bearing" before applying the threshold, rather
+            # than treating NULL confidence as a number. NCB nodes and CB
+            # nodes with a NULL confidence always pass.
+            is_cb = core._is_claim_bearing(r["type"])
+            if is_cb and r["confidence"] is not None and r["confidence"] < min_confidence:
                 continue
             if tier2_threshold > 0 and (r["importance_score"] or 0) < tier2_threshold:
                 continue
@@ -1674,7 +1695,9 @@ def _search_nodes(
         for s in sem_results:
             sim_lookup[s["id"]] = s["similarity"]
             if s["id"] not in fts_ids:
-                if s["confidence"] is not None and s["confidence"] < min_confidence:
+                # Same CB-only predicate as the FTS branch above (#2252 stage 1.7).
+                is_cb = core._is_claim_bearing(s["type"])
+                if is_cb and s["confidence"] is not None and s["confidence"] < min_confidence:
                     continue
                 semantic_only.append(s)
 

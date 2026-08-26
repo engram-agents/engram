@@ -500,6 +500,21 @@ CLAIM_BEARING_TYPES = {
     "lesson",
 }
 
+
+def _is_claim_bearing(node_type: str) -> bool:
+    """Is `node_type` claim-bearing (asserts something truth-evaluable)?
+
+    Canonical home for the #2252 "derive from the classification, never
+    re-enumerate it" check — callers that need to know whether a node's
+    confidence is meaningful (e.g. whether a `min_confidence` predicate
+    should apply to it at all) call this instead of re-deriving the
+    membership test inline. (Sol Montaigne, stage 1.6/1.6a reconciliation
+    — offered during PR #2261's colleague review after independently
+    building the same helper for the mirror-image case.)
+    """
+    return node_type in CLAIM_BEARING_TYPES
+
+
 # Valid TARGET types for the `instantiates` relation (#530): the principle-family
 # nodes a claim-bearing source can realize. Lessons are deliberately ABSENT —
 # incident → lesson membership is `exemplifies` territory (engine-coupled to the
