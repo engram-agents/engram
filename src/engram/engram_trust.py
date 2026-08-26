@@ -443,10 +443,16 @@ def _update_person_impl(
         })
 
         # Emit field-value-changed cascade flags to all nodes that cite this person.
-        # Coarse-emit: node-scoped — any node with a cites or about edge to this
-        # person gets flagged. Carries field + prior_value in each flag entry.
-        # trust_tier changes → elevated (review_required=True, non-dismissible).
-        # All other changes → cheap (dismissible on prior→new triage).
+        # Coarse-emit: node-scoped — any node with a cites, about, or
+        # derives_from edge to this person gets flagged. Carries field +
+        # prior_value in each flag entry. trust_tier changes → elevated
+        # (review_required=True, non-dismissible). All other changes → cheap
+        # (dismissible on prior→new triage).
+        # #2255 colleague-review fix: this three-relation set is deliberately
+        # its own, distinct from core.CITATION_SUPPORT_RELATIONS
+        # ({derives_from, supported_by}) — do not unify the two. This asks a
+        # person-citation question ("what cites this person") that legitimately
+        # includes 'about' and excludes 'supported_by'.
         flagged_nodes = []
         citing_rows = conn.execute(
             "SELECT DISTINCT source_id FROM edges "

@@ -186,7 +186,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_remove_edge": {
-        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: derives_from, supports, supersedes, retracts, contradicts, resolves, cites (cascade-bearing, structural-commitment, or provenance). Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
+        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: derives_from, supported_by, supersedes, retracts, contradicts, resolves, cites — derives_from/supported_by are cascade-bearing, supersedes/retracts are structural mutations, contradicts/resolves are structural commitments, cites is provenance-load-bearing. Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with remove_edge fields. Required: source_id (source node of the edge), target_id (target node of the edge), relation (one of: about, tensions, subtask_of, serves, exemplifies).", "required": True},
         },

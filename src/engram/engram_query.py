@@ -555,6 +555,21 @@ def _pattern_cornerstone_candidate(
         ).fetchone()[0]
         if already_anchored:
             continue
+        # #2255 colleague-review fix: this is a THIRD, deliberately distinct
+        # relation set from core.CITATION_SUPPORT_RELATIONS ({derives_from,
+        # supported_by}) — do not unify the two. This is cornerstone-candidate
+        # SCORING, not the uncited-observation check: it includes 'cites',
+        # which CITATION_SUPPORT_RELATIONS excludes on purpose (see that
+        # constant's own comment in engram_core.py). Unifying onto
+        # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
+        # entirely. Measured on two independent ENGRAM graphs, that removes
+        # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
+        # scoring would silently lose most of its citation signal and
+        # min_citations would filter a different population. Do not state
+        # absolute edge counts here: they are install-specific (every ENGRAM
+        # graph has a different edge population) and would be wrong for
+        # every other reader — the two-graph agreement in direction is the
+        # portable fact, not either graph's number.
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supported_by', 'cites', 'derives_from')",
@@ -922,6 +937,12 @@ def _build_inspect_recall_view(
     downstream: list[dict] = []
     lateral: list[dict] = []
 
+    # #2252 Stage 1.0b: DELIBERATELY LEFT ENUMERATED, not derived from
+    # CASCADE_RELATIONS or any EDGE_CLASSIFICATIONS flag. This set is a
+    # display-directionality decision (which relations read as "upstream" in
+    # engram_inspect) — a deliberate UX choice, not a computable property.
+    # A new cascade relation does not thereby deserve to render upstream, so
+    # do not "fix" this to derive from `cascade`.
     _UPSTREAM_OUTGOING = frozenset({
         "derives_from", "supported_by", "supersedes", "resolves", "subtask_of"
     })

@@ -4313,9 +4313,14 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist of edge relations that engram_remove_edge can delete.
 #
 # Excluded by design:
-#   - Cascade-bearing edges (derives_from, supported_by, supersedes, retracts) —
-#     removing them would silently undo retraction taint walks, supersede
-#     stale walks, or confidence-propagation that already cascaded.
+#   - Cascade-bearing edges (derives_from, supported_by) — removing them
+#     would silently undo taint walks, stale walks, or confidence-
+#     propagation that already cascaded.
+#   - Structural mutations (supersedes, retracts) — #2255 round-2 review
+#     fix: these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
+#     would still corrupt the revision audit trail, which is why they stay
+#     excluded — the reason is structural mutation, not cascade.
 #   - Structural commitments (contradicts, resolves) — they record a stance
 #     in the graph; un-recording is rewriting history, not correction.
 #   - cites — carries provenance (observations cite their evidence node,
@@ -4335,10 +4340,14 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
-#   - cascade-bearing: derives_from, supported_by, supersedes, retracts, resolves
+#   - cascade-bearing: derives_from, supported_by
 #     (removing would break chain-cascade semantics — taint/stale propagation
 #     depends on these)
-#   - structural commitments: contradicts, retracts (removing alters epistemic
+#   - structural mutations: supersedes, retracts — #2255 round-2 review fix:
+#     these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
+#     would still corrupt the revision audit trail, not just topology.
+#   - structural commitments: contradicts, resolves (removing alters epistemic
 #     stance, not just topology)
 #   - provenance: cites (evidence linkage is load-bearing for honesty axiom)
 #
@@ -4415,9 +4424,14 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # All are non-cascade, non-structural-commitment, non-provenance relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
-#   - Cascade-bearing: derives_from, supported_by, supersedes, retracts
-#     (adding after creation would silently re-trigger or contradict cascades
-#     that already propagated at creation time)
+#   - Cascade-bearing: derives_from, supported_by (adding after creation
+#     would silently re-trigger or contradict cascades that already
+#     propagated at creation time)
+#   - Structural mutations: supersedes, retracts — #2255 round-2 review
+#     fix: these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); a post-hoc
+#     add would still re-write revision history established at creation
+#     time, which is why they stay blocked.
 #   - Structural commitments: contradicts, resolves (record an epistemic
 #     stance; the stance must be established through the node's payload)
 #   - Provenance: cites (evidence linkage must exist at creation time; a

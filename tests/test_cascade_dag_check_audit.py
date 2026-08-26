@@ -63,8 +63,15 @@ from engram_core import EDGE_CLASSIFICATIONS
 # catch anything) and deliberately not silently updated by test code —
 # adding a cascade relation is a real, deliberate design decision and
 # should require touching this test.
+#
+# #2252 Stage 1.0a corrected the declaration: `retracts` and `supersedes`
+# were found to be mis-declared cascade:True (they mark revision history —
+# correction of / supersession by — not evidential dependency; walking them
+# is actively wrong, see engram_core.py's EDGE_CLASSIFICATIONS comments on
+# those two relations). This is the authorising decision for the set
+# narrowing from four members to two.
 _EXPECTED_CASCADE_RELATIONS = frozenset(
-    {"derives_from", "retracts", "supersedes", "supported_by"}
+    {"derives_from", "supported_by"}
 )
 
 
@@ -112,7 +119,12 @@ def test_cascade_implies_dag_check():
 
 def test_cascade_relation_set_is_known():
     """Change-detector: the current cascade=True relation set is exactly
-    {derives_from, retracts, supersedes, supported_by}.
+    {derives_from, supported_by}.
+
+    #2252 Stage 1.0a narrowed this from the prior four-member set
+    {derives_from, retracts, supersedes, supported_by} — retracts and
+    supersedes were mis-declared cascade:True; see the EDGE_CLASSIFICATIONS
+    comments on those two relations in engram_core.py.
 
     THIS TEST IS A CHANGE-DETECTOR, NOT A DESIGN CONSTRAINT. If it fails
     because a relation's cascade flag was deliberately added or removed,

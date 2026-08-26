@@ -10,7 +10,7 @@ Coverage:
      duplicate edge in DB.
   3. Whitelist enforcement — `cites` blocked (returns "not addable" error).
   4. Whitelist enforcement — `derives_from` blocked (cascade-bearing).
-  5. Whitelist enforcement — `supersedes` blocked (cascade-bearing).
+  5. Whitelist enforcement — `supersedes` blocked (structural mutation).
   6. Source-node-missing — nonexistent source_id returns error.
   7. Target-node-missing — nonexistent target_id returns error.
   8. Payload validation — unknown field returns error listing allowed fields.
@@ -191,11 +191,14 @@ def test_add_derives_from_edge_rejected():
     assert "not addable via engram_add_edge" in r["error"], r
 
 
-# ── 5. Whitelist enforcement: `supersedes` blocked (cascade-bearing) ────────
+# ── 5. Whitelist enforcement: `supersedes` blocked (structural mutation) ──
 
 
 def test_add_supersedes_edge_rejected():
-    """Relation 'supersedes' is cascade-bearing and must be blocked."""
+    """Relation 'supersedes' is a structural-mutation edge (revision
+    history), not cascade-bearing (#2255 round-3 review fix — see
+    EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a), and must be
+    blocked regardless."""
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
     r = json.loads(server.engram_add_edge(payload_json=json.dumps({

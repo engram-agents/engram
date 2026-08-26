@@ -31,6 +31,14 @@ from pathlib import Path
 import engram_core as core
 
 
+# #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
+# engram_core.CITATION_SUPPORT_RELATIONS's own comment for why this is
+# deliberately its own enumerated constant rather than derived from
+# `cascade`). Stable sorted() order for the SQL IN-clause placeholders below.
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(core.CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_PLACEHOLDERS = ",".join("?" * len(_CITATION_SUPPORT_RELATIONS_SORTED))
+
+
 # ---------------------------------------------------------------------------
 # Reflect-output shaping constants (family-local — single consumer: _reflect_impl
 # / _slim_reflect_briefing)
@@ -765,7 +773,11 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style; remainder get keyword-style.
         uncited = conn.execute(
-            """SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
+            # #2252 Stage 1.0b: relation set here is citation-coverage
+            # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
+            # enumerated, not derived from `cascade`. See the constant's
+            # comment in engram_core.py.
+            f"""SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
                       n.confidence, COALESCE(n.importance_score, 0) AS imp
                FROM nodes n
                WHERE n.type IN ('observation_factual', 'observation_predictive')
@@ -773,7 +785,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                AND COALESCE(n.importance_score, 0) >= ?
                AND NOT EXISTS (
                    SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation IN ('derives_from', 'supported_by')
+                   WHERE e.target_id = n.id AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                    AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
                )
                AND NOT EXISTS (
@@ -783,7 +795,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                )
                ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
-            (t2,),
+            (t2, *_CITATION_SUPPORT_RELATIONS_SORTED),
         ).fetchall()
         uncited_observations = []
         for i, u in enumerate(uncited):

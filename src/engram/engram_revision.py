@@ -41,6 +41,16 @@ import engram_core as core
 from engram_log_emitter import emit_if_initialized
 
 
+# #2252 Stage 1.0b: the cascade walk's walked-relation set, DERIVED from
+# EDGE_CLASSIFICATIONS's `cascade` flag (engram_core.CASCADE_RELATIONS)
+# instead of hardcoded as a SQL literal — flipping a relation's `cascade`
+# flag now changes which edges the three walkers below traverse.
+# sorted() gives a stable placeholder order; set iteration order must never
+# leak into generated SQL.
+_CASCADE_RELATIONS_SORTED = sorted(core.CASCADE_RELATIONS)
+_CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
+
+
 # ---------------------------------------------------------------------------
 # Family-E constants (moved from server.py — originals deleted same-commit)
 # ---------------------------------------------------------------------------
@@ -128,8 +138,8 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
 
     dependents = conn.execute(
         "SELECT source_id FROM edges "
-        "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
-        (node_id,),
+        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+        (node_id, *_CASCADE_RELATIONS_SORTED),
     ).fetchall()
     for d in dependents:
         _walk_cascade_downstream(conn, d["source_id"],
@@ -807,8 +817,8 @@ def _supersede_impl(
         # Walk direct dependents of the superseded node.
         direct = conn.execute(
             "SELECT source_id FROM edges "
-            "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
-            (old_node_id,),
+            f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+            (old_node_id, *_CASCADE_RELATIONS_SORTED),
         ).fetchall()
         for d in direct:
             _walk_cascade_downstream(conn, d["source_id"],
@@ -1147,8 +1157,8 @@ def _retract_impl(
         # Walk direct dependents of the retracted node.
         direct = conn.execute(
             "SELECT source_id FROM edges "
-            "WHERE target_id = ? AND relation IN ('derives_from', 'supported_by')",
-            (node_id,),
+            f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+            (node_id, *_CASCADE_RELATIONS_SORTED),
         ).fetchall()
         for d in direct:
             _walk_cascade_downstream(conn, d["source_id"],

@@ -34,6 +34,14 @@ from typing import Optional
 import engram_core as core
 
 
+# #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
+# engram_core.CITATION_SUPPORT_RELATIONS's own comment for why this is
+# deliberately its own enumerated constant rather than derived from
+# `cascade`). Stable sorted() order for the SQL IN-clause placeholders below.
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(core.CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_PLACEHOLDERS = ",".join("?" * len(_CITATION_SUPPORT_RELATIONS_SORTED))
+
+
 # ---------------------------------------------------------------------------
 # _compute_confidence_distribution — shared helper used by both _stats_impl
 # and _diagnose_impl
@@ -748,15 +756,19 @@ def _diagnose_impl() -> str:
         ).fetchone()["c"]
         epistemic["retracted_nodes"] = retracted_count
 
-        # Uncited observations (not referenced by any derivation)
-        uncited = conn.execute("""
+        # Uncited observations (not referenced by any derivation).
+        # #2252 Stage 1.0b: relation set here is citation-coverage
+        # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
+        # enumerated, not derived from `cascade`. See the constant's
+        # comment in engram_core.py.
+        uncited = conn.execute(f"""
             SELECT COUNT(*) as c FROM nodes n
             WHERE n.type IN ('observation_factual', 'observation_predictive')
               AND n.is_current = 1
               AND NOT EXISTS (
                   SELECT 1 FROM edges e
                   WHERE e.target_id = n.id
-                    AND e.relation IN ('derives_from', 'supported_by')
+                    AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                     AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
               )
               AND NOT EXISTS (
@@ -764,7 +776,7 @@ def _diagnose_impl() -> str:
                   WHERE e.target_id = n.id AND e.relation = 'supported_by'
                     AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
               )
-        """).fetchone()["c"]
+        """, tuple(_CITATION_SUPPORT_RELATIONS_SORTED)).fetchone()["c"]
         epistemic["uncited_observations"] = uncited
 
         # Resolution rates

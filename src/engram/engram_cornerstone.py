@@ -573,10 +573,20 @@ def _remove_edge_impl(
             "error": (
                 f"Relation '{relation}' is not removable via engram_remove_edge. "
                 f"Allowed: {sorted(core._REMOVABLE_EDGE_RELATIONS)}. "
-                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
-                f"retracts), structural commitments (contradicts, resolves), "
-                f"and provenance (cites) are blocked. Use engram-surgical if "
-                f"removal is truly required."
+                # #2255 round-2 review fix: retracts/supersedes are structural
+                # mutations (revision history), not cascade-bearing — see
+                # EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a.
+                # #2255 round-4 review fix: this message used to lump
+                # supersedes/retracts in with contradicts/resolves under
+                # "structural commitments", contradicting the comment above
+                # — split into the two-bucket vocabulary (structural
+                # mutations vs. structural commitments) server.py's Round-3
+                # comments established.
+                f"Cascade-bearing edges (derives_from, supported_by), "
+                f"structural mutations (supersedes, retracts), structural "
+                f"commitments (contradicts, resolves), and provenance "
+                f"(cites) are blocked. Use engram-surgical if removal is "
+                f"truly required."
             )
         })
 
@@ -679,10 +689,20 @@ def _add_edge_impl(
             "error": (
                 f"Relation '{relation}' is not addable via engram_add_edge. "
                 f"Allowed: {sorted(core._ADDABLE_AFTER_CREATION_RELATIONS)}. "
-                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
-                f"retracts), structural commitments (contradicts, resolves), "
-                f"and provenance (cites) are blocked from after-creation addition. "
-                f"Edges that participate in cascade semantics or carry structural "
+                # #2255 round-2 review fix: retracts/supersedes are structural
+                # mutations (revision history), not cascade-bearing — see
+                # EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a.
+                # #2255 round-4 review fix: this message used to lump
+                # supersedes/retracts in with contradicts/resolves under
+                # "structural commitments", contradicting the comment above
+                # — split into the two-bucket vocabulary (structural
+                # mutations vs. structural commitments) server.py's Round-3
+                # comments established.
+                f"Cascade-bearing edges (derives_from, supported_by), "
+                f"structural mutations (supersedes, retracts), structural "
+                f"commitments (contradicts, resolves), and provenance "
+                f"(cites) are blocked from after-creation addition. Edges "
+                f"that participate in cascade semantics or carry structural "
                 f"epistemic stance must be created at node-add time via the "
                 f"source node's payload, or via the dedicated mutation tool."
             )

@@ -575,7 +575,7 @@ EDGE_CLASSIFICATIONS = {
         "dag_check": True,
         "removable": False,    # cascade-bearing
         "addable_after_creation": False,
-        "provenance": False,
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
     "exemplifies": {
         "cascade": False,
@@ -602,7 +602,13 @@ EDGE_CLASSIFICATIONS = {
         "provenance": False,
     },
     "retracts": {
-        "cascade": True,       # cascade marker for downstream taint
+        "cascade": False,      # #2252 Stage 1.0a: a retracts edge marks the CORRECTION of a
+                                # wrong node, not a dependency on it — its source exists BECAUSE
+                                # the target was found wrong. The retract-with-replacement path in
+                                # `_retract_impl` (engram_revision.py) inserts
+                                # `replacement —retracts→ retracted_node`; walking this relation
+                                # would make a retract cascade's first taint target the
+                                # replacement that same retract just created.
         "dag_check": True,
         "removable": False,
         "addable_after_creation": False,
@@ -625,7 +631,12 @@ EDGE_CLASSIFICATIONS = {
         "provenance": False,
     },
     "supersedes": {
-        "cascade": True,
+        "cascade": False,      # #2252 Stage 1.0a: same family as retracts — revision history,
+                                # not evidential dependency. The widening this correction
+                                # prevents is latent rather than loud: a current node cannot
+                                # carry an incoming supersedes edge, and the cascade walk stops
+                                # at non-current nodes, so a stale cascade:True here would only
+                                # ever fire on invariant-violating data.
         "dag_check": True,
         "removable": False,    # structural mutation; use engram-surgical for emergencies
         "addable_after_creation": False,
@@ -636,7 +647,7 @@ EDGE_CLASSIFICATIONS = {
         "dag_check": True,
         "removable": False,
         "addable_after_creation": False,
-        "provenance": False,
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
     "tensions": {
         "cascade": False,
@@ -649,6 +660,29 @@ EDGE_CLASSIFICATIONS = {
         "provenance": False,
     },
 }
+
+
+# Derived from EDGE_CLASSIFICATIONS above — #2252 Stage 1.0b makes `cascade`
+# and `provenance` load-bearing by deriving the walked-relation sets from the
+# declaration instead of hardcoding them as SQL literals at each call site.
+CASCADE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["cascade"])
+PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["provenance"])
+
+# Stable, sorted SQL IN-clause placeholder sets — parameterised (never
+# string-interpolated), and sorted so set iteration order never leaks into
+# generated SQL. Used by the provenance-root walk (engram_core.py, below).
+_PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
+_PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
+
+# Relations by which a claim-bearing node CONSUMES another as support. Used for
+# citation-coverage ("is this observation cited by anything?"), NOT for cascade.
+# DELIBERATELY ENUMERATED, NOT DERIVED FROM `cascade` — see #2252 Stage 1.0b.
+# These two sites (engram_lifecycle.py, engram_stats.py) ask a citation-coverage
+# question that only coincidentally shares today's cascade tuple; #2252 Stage 1.3
+# will remove `cascade` from `supported_by`, and if this constant were derived
+# from CASCADE_RELATIONS instead, the uncited-observation metric would silently
+# change meaning that day with no test to catch it.
+CITATION_SUPPORT_RELATIONS = frozenset({"derives_from", "supported_by"})
 
 
 # ── Edge tier taxonomy ───────────────────────────────────────────────────────
@@ -6343,10 +6377,13 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
             roots.add(current)
             continue
 
-        # Follow citation edges backward
+        # Follow citation edges backward. #2252 Stage 1.0b: walked-relation
+        # set DERIVED from PROVENANCE_RELATIONS (the `provenance` flag in
+        # EDGE_CLASSIFICATIONS) instead of hardcoded.
         edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'derives_from', 'supported_by')",
-            (current,),
+            "SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND relation IN ({_PROVENANCE_RELATION_PLACEHOLDERS})",
+            (current, *_PROVENANCE_RELATIONS_SORTED),
         ).fetchall()
         for e in edges:
             queue.append(e["target_id"])
@@ -6402,6 +6439,15 @@ def _trace_observation_leaves(
         # Non-observation (derivation / goal / etc.): follow the premise spine
         # only — NOT 'cites' (an observation's cites→evidence is the layer we
         # stop above; a derivation's cites→context is not a premise).
+        # #2252 Stage 1.0b / #2255 colleague-review fix: DELIBERATELY LEFT
+        # ENUMERATED, not derived from CASCADE_RELATIONS. The reason is
+        # semantic, not a cost tradeoff: this walk's exclusion of 'cites' is a
+        # commitment about what counts as a PREMISE, and today's cascade set
+        # happening to equal {derives_from, supported_by} is coincidence, not
+        # cause. Deriving this from `cascade` would make "premise spine" track
+        # a flag that means "taint propagates here" — a different question
+        # that merely agrees with this one today. Do not "fix" this to
+        # CASCADE_RELATIONS.
         edges = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supported_by')",
             (current,),

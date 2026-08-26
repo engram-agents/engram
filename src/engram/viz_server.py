@@ -2343,8 +2343,12 @@ async function fetchSchema() {
     });
     EDGE_STYLE = {};
     Object.entries(EDGE_COLOR_OVERRIDE).forEach(([rel, color]) => {
-      // Fallback dash: use the cascade/provenance heuristic based on known types
-      const solidRels = new Set(['cites', 'derives_from', 'retracts', 'supersedes', 'supported_by']);
+      // Fallback dash: hand-maintained mirror of EDGE_CLASSIFICATIONS'
+      // cascade/provenance flags, used only when /api/schema is unreachable.
+      // Must be kept in sync by hand with EDGE_CLASSIFICATIONS whenever the
+      // cascade/provenance flags change — it is not derived dynamically on
+      // purpose, since it exists precisely for when the dynamic path failed.
+      const solidRels = new Set(['cites', 'derives_from', 'supported_by']);
       EDGE_STYLE[rel] = { color, dash: solidRels.has(rel) ? '' : '4,3' };
     });
     activeTypes = new Set(Object.keys(NODE_STYLE));
