@@ -21,7 +21,11 @@ on:
   workflow_dispatch:
 
 permissions:
+  # declaring permissions zeroes every unlisted scope; the on-failure/on-success
+  # steps below need issues:write to open/comment/close the ci-nightly issue
+  # (umwelt#738 round 3 measured this).
   contents: read
+  issues: write
 
 jobs:
   pytest:
@@ -59,4 +63,80 @@ jobs:
       - name: Run full pytest suite
         # Same explicit paths as tests.yml (pytest.ini sets no testpaths):
         # the main suite AND src/forum/tests/.
-        run: pytest tests/ src/forum/tests/ -v --tb=short
+        id: suite
+        shell: bash
+        run: |
+          # set -o pipefail: without it, the step's status is tee's (0) even
+          # when pytest fails, so `if: failure()` never fires and `if:
+          # success()` closes any open ci-nightly issue on a red suite
+          # (umwelt#738 round 1 / CLAUDE.md's umwelt#558 pipe-exit note).
+          set -o pipefail
+          pytest tests/ src/forum/tests/ -v --tb=short 2>&1 | tee /tmp/nightly-output.log
+
+      - name: ensure the ci-nightly label exists
+        # gh label create --force is idempotent, so this is safe to run every
+        # night; unlike umwelt's origin repo the label doesn't pre-exist here.
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh label create ci-nightly --description "nightly full-suite failure tracking" --color B60205 --force
+
+      # GitHub docs: "A default status check of `success()` is applied unless
+      # you include one of these functions." The carve-out functions are
+      # success(), failure(), always(), cancelled(); a plain expression such
+      # as `steps.suite.outcome == 'success'` gets success() ANDed in, and
+      # !cancelled() opts out of that default. !cancelled() means a cancelled
+      # job — including a job TIMEOUT (a hung pytest hitting the default
+      # 360-minute limit is reported as cancelled) — notifies nothing; the
+      # promise these two steps make is "notify steps cannot be masked by a
+      # label-step failure", not "cannot be masked" (alpha#2275 round 4).
+      - name: on failure — open or update the ci-nightly issue
+        # Fires when the suite step did not succeed (red, or skipped because
+        # install failed) and the job was not cancelled. The bare failure()
+        # it replaces was too broad — true on any prior step's failure, so a
+        # failed label step on a green night filed a false issue with a
+        # passing log tail.
+        if: ${{ !cancelled() && steps.suite.outcome != 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -e
+          DATE="$(date -u +%Y-%m-%d)"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TAIL="$(tail -n 40 /tmp/nightly-output.log 2>/dev/null || echo '(log unavailable — the job failed before the pytest step ran)')"
+          BODY="Nightly full-suite run failed: ${RUN_URL}
+
+          \`\`\`
+          ${TAIL}
+          \`\`\`"
+          EXISTING="$(gh issue list --label ci-nightly --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create \
+              --title "nightly CI failure — ${DATE}" \
+              --label ci-nightly \
+              --body "$BODY"
+          fi
+
+      - name: on success — close any open ci-nightly issue
+        # Fires when the suite succeeded and the job was not cancelled. A
+        # bare `steps.suite.outcome == 'success'` would inherit the default
+        # success() and be skipped whenever the label step failed.
+        if: ${{ !cancelled() && steps.suite.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -e
+          DATE="$(date -u +%Y-%m-%d)"
+          EXISTING="$(gh issue list --label ci-nightly --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body "green on ${DATE}"
+            gh issue close "$EXISTING"
+          fi
