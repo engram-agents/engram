@@ -315,18 +315,34 @@ and it currently **passes** (see the membership-section note above: `prediction`
 `_walk_cascade_downstream`'s skip tuple, same gap as `trust_signal`). Under the settled NCB
 ruling this assertion is stale and the test should eventually go red.
 
-**But the replacement is not simply "assert the inverse" — that presupposes the inverse is
-writable, and it currently is not.** Once the pairing edge stops carrying cascade (Stage 1.3's
+**The replacement is not simply "assert the inverse" — that presupposes the inverse is
+writable, and until now it was not.** Once the pairing edge stops carrying cascade (Stage 1.3's
 `supported_by` change), a `prediction` whose paired observation is later retracted gets no marker
 at all: none of the four `VALID_PREDICTION_OUTCOMES` values (`confirmed`, `partially_confirmed`,
 `refuted`, `partially_refuted`) represents "the observation this was minted from was retracted."
 Such a prediction would sit open and unmarked, permanently, with no outcome to assert against —
 today's cascade taint is quietly doing orphan-detection work for this case, not confidence
 propagation, and that's the one job Stage 1.3's `supported_by` change removes without naming a
-replacement. **Flagged as an open item, not resolved by this doc** — whether that job is
-preserved via a new outcome value, a retract-side branch in `_retract_impl`, or dropped
-deliberately is one of Borges's own outstanding design calls to Kepler; this doc's author has no
-independent basis to settle it from the epic body and code alone.
+replacement.
+
+**Answered, tracked separately: engram-alpha#2281** (filed after this doc's tip; Borges's design
+read). **Not a fifth `VALID_PREDICTION_OUTCOMES` value** — the four existing members all answer
+*did the predicted event happen*, a different question from *was the prediction's basis ever
+valid*, and the predicted event may still be genuinely pending when the basis is gone. **The
+mechanism already exists: retraction.** Retract means never-valid/error; supersede means
+was-valid-then-updated. A prediction minted from an observation that turns out fabricated was
+never validly grounded — void ab initio, not refuted — so the fix is a `prediction` branch in
+`_retract_impl` (propagating the parent's `error_type`), or a broader NCB-orphan sweep, not new
+enum vocabulary.
+
+**Load-bearing constraint for whoever writes the inverse test, preserved from #2281 because the
+wrong version of this test erases the gap it should be guarding:** write it NARROWLY — assert
+only that the prediction is not cascade-tainted. Do **not** write it as "nothing happens to the
+prediction," and this doc does **not** say the prediction is *correctly* left alone — a test
+asserting a gap is intended behavior is the hardest kind to ever remove, because the next reader
+sees a green test and closes their own investigation before #2281's proposed fix ever lands.
+#2281 is filed under the still-open umbrella epic (#2252); implementing its proposed fix remains
+open work.
 
 ## Lesson confidence (Q2, settled) — confidence dropped; maturity preserved by a different mechanism
 
