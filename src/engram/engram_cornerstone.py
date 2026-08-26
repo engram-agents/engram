@@ -128,6 +128,8 @@ def _add_cornerstone_impl(
         # store confidence = NULL. 0.5 is a neutral importance prior, and
         # this importance_base write is itself superseded immediately
         # below by the fixed cornerstone anchor (importance_base = 2.0).
+        # The 0.5 is therefore inert — a formality to satisfy the helper's
+        # signature, with no downstream effect on any stored value.
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
         conn.execute(
@@ -353,6 +355,8 @@ def _outgrow_cornerstone_impl(
         # store confidence = NULL. 0.5 is a neutral importance prior, and
         # this importance_base write is itself superseded immediately
         # below by the fixed cornerstone anchor (importance_base = 2.0).
+        # The 0.5 is therefore inert — a formality to satisfy the helper's
+        # signature, with no downstream effect on any stored value.
         core._stamp_new_node(conn, new_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
         conn.execute(
