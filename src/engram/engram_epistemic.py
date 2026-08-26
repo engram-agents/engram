@@ -894,9 +894,11 @@ def _add_lesson_impl(
       the matching surface area grows — each new incident is another way
       the lesson can fire.
 
-    Lessons are CLAIM-BEARING and IMPORTANCE-ANCHORED (base 2.0, like goals).
-    They participate in derivations, can be superseded (consolidation), and
-    can serve as premises for higher-order reasoning about error patterns.
+    Lessons are NON-CLAIM-BEARING and IMPORTANCE-ANCHORED (base 2.0, like
+    goals) (alpha#2252). They carry no confidence score and cannot serve as
+    derivation premises or exemplar sources — the honest maturity signal is
+    `core._count_live_exemplars`, not a numeric confidence. They can still
+    be superseded (consolidation).
 
     Consolidation: When creating a new lesson, the tool checks for similar
     existing lessons. If a match is found, consider superseding the old lesson
@@ -933,7 +935,7 @@ def _add_lesson_impl(
             Never rejected regardless of count.
 
     Returns:
-        JSON with lesson ID, confidence, linked incidents, and similar existing
+        JSON with lesson ID, linked incidents, and similar existing
         lessons for consolidation hints. Returns {"error": "..."} if
         situation_pattern fails to compile as a regex, or looks like prose and
         bypass_prose_check is not set.
@@ -1018,16 +1020,21 @@ def _add_lesson_impl(
             extra_metadata_keys=("scaffolding_nudge",),
         )
 
-        # Compute confidence (same as derivation)
-        confidence = core._compute_confidence(
-            conn, "derivation", supporting_ids=ids,
-            reasoning_type=reasoning_type,
-        )
+        # Lessons are non-claim-bearing (alpha#2252) — no confidence is
+        # computed or stored. confidence/confidence_history are omitted from
+        # the INSERT below, matching the house convention for NCB types
+        # (cornerstone/goal): confidence defaults to NULL (no column
+        # DEFAULT), confidence_history defaults to '[]' (schema DEFAULT).
+        # The honest maturity signal for a lesson is
+        # core._count_live_exemplars, not a numeric confidence — see Q2 in
+        # the epic's design doc.
         node_id = core._next_id(conn, "lesson")
         now = core._now()
 
+        # reasoning_type/reasoning_class are unrelated metadata (still worth
+        # keeping) — only the confidence computation that used to consume
+        # reasoning_type + the discount table is dead now.
         rclass = core.REASONING_CLASS.get(reasoning_type, "unknown")
-        discount = core.REASONING_DISCOUNT.get(reasoning_type, 0.95)
 
         meta = {
             "reasoning_type": reasoning_type,
@@ -1046,17 +1053,14 @@ def _add_lesson_impl(
 
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, metadata, recall_summary,
+               metadata, recall_summary,
                recall_keywords, needs_tightening, summary_missing)
-               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 claim,
                 now,
                 logical_chain,
-                confidence,
-                json.dumps([{"timestamp": now, "value": confidence,
-                             "reason": f"Lesson ({reasoning_type}, discount={discount}) from {len(ids)} incident(s)"}]),
                 json.dumps(meta),
                 _recall_summary or None,
                 json.dumps(_recall_keywords) if _recall_keywords else None,
@@ -1089,8 +1093,14 @@ def _add_lesson_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # Stamp importance, then anchor (like goals — lessons persist)
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
+        # Stamp importance, then anchor (like goals — lessons persist).
+        # confidence= here feeds ONLY the importance formula, not the stored
+        # confidence — lessons are non-claim-bearing and store confidence =
+        # NULL (see the INSERT above). 0.5 is a neutral importance prior,
+        # matching the goal/cornerstone convention for NCB types, and this
+        # importance_base write is itself superseded immediately below by
+        # the fixed lesson anchor (importance_base = 2.0).
+        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         anchored_score = core._compute_importance(2.0, core._get_current_turn())
         conn.execute(
             "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
@@ -1141,7 +1151,6 @@ def _add_lesson_impl(
             "status": "created",
             "lesson_id": node_id,
             "claim": claim,
-            "confidence": confidence,
             "reasoning_type": reasoning_type,
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
@@ -1173,9 +1182,11 @@ def _add_lesson_impl(
 # 2026-08-03 per Lei: situation_pattern is a tunable machine-matching cue;
 # scaffolding_nudge is the paired "what to do when it fires" text, same
 # non-epistemic class). Do not widen further without a fresh issue: claim,
-# logical_chain, confidence, reasoning_type remain supersede-only — those ARE
-# the load-bearing content, and reasoning_type specifically feeds confidence
-# computation, so editing it in-place would silently drift a derived value.
+# logical_chain, reasoning_type remain supersede-only — those ARE the
+# load-bearing content. (Pre-alpha#2252, reasoning_type also fed a
+# now-removed confidence computation; lessons are non-claim-bearing and
+# store no confidence, so that no longer applies — the supersede-only
+# rule stands on the load-bearing-content rationale alone.)
 _LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
@@ -1208,7 +1219,7 @@ def _update_lesson_impl(
     Mutable fields (#1826, widened 2026-08-03): situation_pattern and
     scaffolding_nudge — both mechanical/actionability metadata tunable from
     real firing experience, not the lesson's epistemic content (claim,
-    logical_chain, confidence, reasoning_type stay supersede-only).
+    logical_chain, reasoning_type stay supersede-only).
 
     situation_pattern, when set to a non-empty value, runs the SAME #1864
     validation _add_lesson_impl runs at creation time — must compile as a

@@ -27,7 +27,7 @@ Confidence is structurally determined, not free-form. Labels are type-relative b
 - `0.45` inductive_analogy — structural similarity only
 - `0.25` speculative / open-question recommendation
 
-**Other types**: conjectures cap ~0.85 → promote to derivation when stronger; lessons bimodal (0.95 battle-tested · 0.30-0.55 proposed); axioms always 1.0 by type.
+**Other types**: conjectures cap [0.10, 0.60], default 0.40, hard-clamped at creation → promote to derivation when stronger; axioms always 1.0 by type. Lessons/cornerstones carry no confidence (non-claim-bearing types, per engram-alpha#2252).
 
 These numbers are **computed, not assigned** — an observation maps from its `quote_type`, a derivation propagates from its `reasoning_type` + premises. So when a *returned* confidence feels wrong against these anchors (too high for a speculative claim, too low for a strongly-supported one), read it as a signal to re-check the **inputs I chose**, not to override the output: almost always it's the wrong `reasoning_type` or a weak / mis-cited premise (derivations especially — observations are a near-mechanical `quote_type` map). The friction is the calibration mechanism working; the fix is upstream, in the inputs, not the number.
 

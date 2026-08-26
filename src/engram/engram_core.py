@@ -497,7 +497,6 @@ CLAIM_BEARING_TYPES = {
     "theory",
     "axiom",
     "conjecture",
-    "lesson",
 }
 
 
@@ -2177,6 +2176,26 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Idempotent — WHERE trust_tier IS NULL skips already-backfilled rows.
     conn.execute(
         "UPDATE nodes SET trust_tier = 'unknown' WHERE type = 'person' AND trust_tier IS NULL"
+    )
+
+    # Lesson-confidence backfill (alpha#2252): lessons are non-claim-bearing
+    # going forward — _add_lesson_impl no longer computes or writes a
+    # confidence value (Q2 in the epic: the honest maturity signal is
+    # core._count_live_exemplars, not a numeric confidence). State-based,
+    # not event-keyed: this runs against every EXISTING lesson row on every
+    # startup, not just newly-created ones, so it actually repairs rows
+    # written before this change — a forward-only write-time-hook fix would
+    # leave pre-existing lesson rows with a stale non-NULL confidence
+    # forever. Idempotent — the WHERE clause skips rows already backfilled,
+    # so re-running is a no-op. Gated on confidence alone, NOT
+    # confidence_history: _add_lesson_impl's INSERT omits confidence_history,
+    # leaving freshly-created rows at the schema default '[]' (NOT NULL) —
+    # gating on either column would re-touch every new lesson on the next
+    # startup, flipping '[]' to NULL for no reason and making "idempotent"
+    # false for the steady state (reviewer-fairy finding on PR #2263).
+    conn.execute(
+        "UPDATE nodes SET confidence = NULL, confidence_history = NULL "
+        "WHERE type = 'lesson' AND confidence IS NOT NULL"
     )
 
     # Edges migration: add metadata column for optional per-edge annotations
