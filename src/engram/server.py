@@ -1678,6 +1678,17 @@ def engram_add_observation(payload_json: str) -> str:
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
 
+    Advisory predictive_hint (#2252 Stage 1.4): when is_predictive is falsy,
+    the result may carry a "predictive_hint" key because
+    predicted_event/resolution_timeframe were passed without is_predictive.
+    This is advisory only: it never blocks or alters node creation, and is
+    suppressed whenever is_predictive is true. It exists because the
+    pairing invariant (a claim-bearing predictive observation paired with a
+    non-claim-bearing prediction node) protects nothing if nobody is
+    prompted to use it. (A claim-text keyword/regex trigger was evaluated
+    and removed pre-merge on measured zero precision; redesign tracked in
+    #2264.)
+
     Simplest — citing the CURRENT chat (pass your injected session_id; the
     server resolves the transcript, defaults quote_type=personal_communication
     + source_class=user_stated; a wrong or stale session_id fails loud via the

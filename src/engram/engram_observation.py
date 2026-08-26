@@ -1044,6 +1044,37 @@ def _resolve_session_transcript(session_id: str) -> dict:
     }
 
 
+# Stage 1.4 (#2252) — predictive-hint affordance. Trigger A only
+# (predicted_event / resolution_timeframe present without is_predictive).
+# Deliberately small and boring: this is a discoverability nudge for the
+# pairing invariant (SETTLED Q1), not an NLP classifier. Err toward
+# silence — a missed hint costs nothing (the observation still files
+# normally); a false-positive hint on every other claim would train agents
+# to ignore it. The claim-text regex trigger (Trigger B) was removed
+# pre-merge on measured zero precision (0/22 sampled fires were genuine
+# predictions — Ariadne's #2260 colleague pass); redesign tracked in #2264.
+
+
+def _predictive_hint(is_predictive: bool,
+                      predicted_event: str, resolution_timeframe: str) -> Optional[str]:
+    """Advisory-only nudge toward the pairing invariant (#2252 Q1) — never
+    blocks, never changes what gets written. Returns the hint string when
+    warranted, else None. Trigger A only: fires when predicted_event or
+    resolution_timeframe is present without is_predictive=true.
+    """
+    if is_predictive:
+        return None
+    if not (predicted_event or resolution_timeframe):
+        return None
+    return (
+        "You passed predicted_event/resolution_timeframe without "
+        "is_predictive=true. If this claim predicts a checkable event, "
+        "refile or follow up with is_predictive=true + predicted_event — "
+        "the paired prediction node is what joins the calibration ledger "
+        "(pairing invariant, #2252 Q1)."
+    )
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1584,6 +1615,14 @@ def _add_observation_impl(
 
         if _author_id_warning:
             result["warnings"] = result.get("warnings", []) + [_author_id_warning]
+
+        # Stage 1.4 (#2252) — predictive-hint affordance. Advisory only:
+        # never blocks node creation, never changes any existing key.
+        # Suppressed whenever is_predictive is true (the caller already used
+        # the pairing path). See _predictive_hint for trigger definitions.
+        _pred_hint = _predictive_hint(is_predictive, predicted_event, resolution_timeframe)
+        if _pred_hint:
+            result["predictive_hint"] = _pred_hint
 
         conn.commit()
 
