@@ -166,23 +166,34 @@ rather than falling into one:
 Per the practice axiom (实践出真知): this spec is **extracted from the running
 system, not designed beside it**.
 
-1. Every normative sentence must cite the place in the reference
-   implementation that embodies it **and** the test that would catch its
-   violation. A sentence that can cite neither is a proposal, and goes to an
-   "Unratified" appendix until it has both.
-2. The **handbook** (`docs/handbook/00–09`, the 2026-06 survey) is the
-   quarry: it already inventories the mechanisms layer by layer. The specs
-   mine it; they do not duplicate it. The paper's technical chapter is a
-   *consumer* of the spec (prose over the same claims), never a second
-   source of truth.
-3. The **conformance suite is the executable half of the spec.** L0/L1 get
-   contract tests; L2 gets the measurement harness + goldens. A future
-   second backend is accepted when the suite passes — the suite, not a
-   review, is the arbiter (the second implementation is the test of the
-   abstraction).
-4. Spec changes ship as PRs touching spec + implementation + conformance
-   together, under the normal review pipeline; L0/L1 changes are
-   substrate-policy (Lei reads before merge).
+### 5.1 No test, no ratification
+
+Every normative sentence must cite the place in the reference
+implementation that embodies it **and** the test that would catch its
+violation. A sentence that can cite neither is a proposal, and goes to an
+"Unratified" appendix until it has both.
+
+### 5.2 The handbook is the quarry
+
+The **handbook** (`docs/handbook/00–09`, the 2026-06 survey) is the
+quarry: it already inventories the mechanisms layer by layer. The specs
+mine it; they do not duplicate it. The paper's technical chapter is a
+*consumer* of the spec (prose over the same claims), never a second
+source of truth.
+
+### 5.3 The conformance suite is the executable half of the spec
+
+The **conformance suite is the executable half of the spec.** L0/L1 get
+contract tests; L2 gets the measurement harness + goldens. A future
+second backend is accepted when the suite passes — the suite, not a
+review, is the arbiter (the second implementation is the test of the
+abstraction).
+
+### 5.4 Spec changes ship with implementation and conformance
+
+Spec changes ship as PRs touching spec + implementation + conformance
+together, under the normal review pipeline; L0/L1 changes are
+substrate-policy (Lei reads before merge).
 
 ## 6. Document plan
 
