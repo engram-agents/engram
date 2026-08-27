@@ -2054,8 +2054,8 @@ def engram_surface(payload_json: str) -> str:
 #
 # Edge classification (recall view):
 #   Logical-substrate (shown with recall_summary):
-#     derives_from, supported_by, supersedes, contradicts, resolves,
-#     retracts, exemplifies, subtask_of, tensions
+#     derives_from, supported_by, predicted_by, supersedes, contradicts,
+#     resolves, retracts, exemplifies, subtask_of, tensions
 #   Contextual (shown with keywords only):
 #     cites, about, serves
 #
@@ -2107,8 +2107,8 @@ def engram_inspect(payload_json: str) -> str:
     For multi-hop evidence chains, use engram_get_subgraph instead.
 
     Neighbor grouping in recall view:
-      upstream   — outgoing derives_from, supported_by, supersedes, resolves, subtask_of
-      downstream — incoming derives_from, supported_by, supersedes, resolves, subtask_of
+      upstream   — outgoing derives_from, supported_by, predicted_by, supersedes, resolves, subtask_of
+      downstream — incoming derives_from, supported_by, predicted_by, supersedes, resolves, subtask_of
       lateral    — contradicts, tensions, exemplifies, retracts
 
     Args:
@@ -4343,9 +4343,23 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist of edge relations that engram_remove_edge can delete.
 #
 # Excluded by design:
-#   - Cascade-bearing edges (derives_from, supported_by) — removing them
-#     would silently undo taint walks, stale walks, or confidence-
-#     propagation that already cascaded.
+#   - Provenance-bearing edges — every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — removing one would
+#     silently orphan evidence roots or, for `derives_from` specifically,
+#     undo taint/stale walks (it is the only one of the four that still
+#     carries cascade — #2252 Stage 1.3 flipped `supported_by`'s cascade
+#     flag to False, and `predicted_by` was minted cascade:False from the
+#     start, W6). #2252 W6 colleague review, round 5: this bucket was
+#     mislabeled TWICE before landing here — first "cascade-bearing" (false
+#     for supported_by/predicted_by), then a hand-listed "provenance/
+#     dependency-bearing (derives_from, supported_by, predicted_by)" that
+#     excluded `cites` even though `cites` is IDENTICAL to the other three
+#     on every EDGE_CLASSIFICATIONS field. No field separates a
+#     premise-dependency edge from an evidence-citation edge — the split
+#     was unencoded semantics, not a real boundary — so state the property
+#     (`provenance: True`) and point at PROVENANCE_RELATIONS, never
+#     hand-list membership again.
 #   - Structural mutations (supersedes, retracts) — #2255 round-2 review
 #     fix: these are revision-history edges, not cascade-bearing (see
 #     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
@@ -4353,8 +4367,6 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 #     excluded — the reason is structural mutation, not cascade.
 #   - Structural commitments (contradicts, resolves) — they record a stance
 #     in the graph; un-recording is rewriting history, not correction.
-#   - cites — carries provenance (observations cite their evidence node,
-#     derivations cite context). Removal would orphan a claim from its source.
 #
 # If you truly need to remove one of the excluded relations, engram-surgical
 # is the correct (heavyweight, audited) path.
@@ -4370,16 +4382,25 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
-#   - cascade-bearing: derives_from, supported_by
-#     (removing would break chain-cascade semantics — taint/stale propagation
-#     depends on these)
+#   - provenance-bearing: every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — removing one would orphan
+#     evidence roots, or break chain-cascade semantics for `derives_from`
+#     specifically — the only one of the four that still carries cascade;
+#     #2252 Stage 1.3 flipped `supported_by`'s cascade flag to False, and
+#     `predicted_by` was minted cascade:False from the start, W6. NOTE
+#     (#2252 W6 colleague review, round 5): this bucket used to hand-list
+#     "derives_from, supported_by, predicted_by" as its own bucket with
+#     `cites` split into a separate one-line "provenance: cites" bullet
+#     below — but `cites` is IDENTICAL to the other three on every
+#     EDGE_CLASSIFICATIONS field, so the split encoded nothing. Folded in;
+#     name the property and point at PROVENANCE_RELATIONS, don't hand-list.
 #   - structural mutations: supersedes, retracts — #2255 round-2 review fix:
 #     these are revision-history edges, not cascade-bearing (see
 #     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
 #     would still corrupt the revision audit trail, not just topology.
 #   - structural commitments: contradicts, resolves (removing alters epistemic
 #     stance, not just topology)
-#   - provenance: cites (evidence linkage is load-bearing for honesty axiom)
 #
 # Idempotency: no_op_not_found is a successful return (not an error). Safe to
 # call defensively without a pre-check (ob_NNNN).
@@ -4454,9 +4475,21 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # All are non-cascade, non-structural-commitment, non-provenance relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
-#   - Cascade-bearing: derives_from, supported_by (adding after creation
-#     would silently re-trigger or contradict cascades that already
-#     propagated at creation time)
+#   - Provenance-bearing: every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — adding one after creation
+#     would either silently re-trigger or contradict cascades (`derives_from`
+#     is the only one of the four that still carries cascade — #2252 Stage
+#     1.3 flipped `supported_by`'s cascade flag to False, and `predicted_by`
+#     was minted cascade:False from the start, W6), or bypass the
+#     node-add-time provenance guarantee the others rely on: `cites`/
+#     evidence linkage must exist at creation time, and `predicted_by` is
+#     minted once at node-add time only (see engram_observation.py). NOTE
+#     (#2252 W6 colleague review, round 5): this bucket used to hand-list
+#     "derives_from, supported_by, predicted_by" with `cites` split into a
+#     separate "Provenance: cites" bullet below — but `cites` is IDENTICAL
+#     to the other three on every EDGE_CLASSIFICATIONS field, so the split
+#     encoded nothing. Folded in; name the property, don't hand-list.
 #   - Structural mutations: supersedes, retracts — #2255 round-2 review
 #     fix: these are revision-history edges, not cascade-bearing (see
 #     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); a post-hoc
@@ -4464,9 +4497,6 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 #     time, which is why they stay blocked.
 #   - Structural commitments: contradicts, resolves (record an epistemic
 #     stance; the stance must be established through the node's payload)
-#   - Provenance: cites (evidence linkage must exist at creation time; a
-#     post-hoc cites edge would orphan the provenance chain from its
-#     temporal context)
 #
 # Idempotency: no_op_already_exists is a successful return (not an error).
 # Safe to call defensively without a pre-check.

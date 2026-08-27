@@ -107,8 +107,12 @@ def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> No
 
 
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
-    """Walk downstream from node_id following derives_from / supported_by
-    edges. Visits each downstream node at most once. For each live
+    """Walk downstream from node_id following CASCADE_RELATIONS edges
+    (engram_core.EDGE_CLASSIFICATIONS' cascade flag — today just
+    derives_from; supported_by lost its cascade flag in #2252 Stage 1.3,
+    and the W6 pairing edge predicted_by was minted cascade:False from the
+    start, so neither ever reaches this walk). Visits each downstream node
+    at most once. For each live
     claim-bearing node visited, calls on_live_node(node) — the caller
     decides what to write. Stops cascade at retracted/superseded nodes
     (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
@@ -572,9 +576,11 @@ def _supersede_impl(
 
     Cascade behavior (parallel cascades for derivation and contradiction
     dependents):
-      - Derivation cascade: every node that derives_from / supported_by the
-        old node gets marked stale_by_premise (metadata.stale_by includes
-        old_node_id, metadata.stale_replacement[old_node_id] = new_node_id).
+      - Derivation cascade: every node reachable via CASCADE_RELATIONS
+        edges (today just derives_from — supported_by lost its cascade
+        flag in #2252 Stage 1.3) gets marked stale_by_premise
+        (metadata.stale_by includes old_node_id,
+        metadata.stale_replacement[old_node_id] = new_node_id).
       - Contradiction cascade (issue #229): every contradiction node that
         has old as a contradicting side gets marked stale_by_premise too.
         Dream-fairy-2 reviews each stale contradiction and decides whether
@@ -985,9 +991,10 @@ def _retract_impl(
     tainted so they can be reviewed and corrected.
 
     Cascade behavior:
-      - Derivation cascade: every node that derives_from / supported_by the
-        retracted node gets marked tainted_by (metadata.tainted_by includes
-        the retracted node id).
+      - Derivation cascade: every node reachable via CASCADE_RELATIONS
+        edges (today just derives_from — supported_by lost its cascade
+        flag in #2252 Stage 1.3) gets marked tainted_by
+        (metadata.tainted_by includes the retracted node id).
       - Contradiction cascade (issue #229): every contradiction node that
         has the retracted node as a contradicting side gets marked
         tainted_by. Dream-fairy-2 reviews tainted contradictions —
@@ -1000,7 +1007,8 @@ def _retract_impl(
         valid resolution is set back to status='open'.
       - Prediction basis retraction (issue #2281): if the retracted node
         is an observation_predictive, any prediction paired to it via a
-        supported_by edge (prediction -> observation) gets RETRACTED
+        predicted_by edge (prediction -> observation; #2252 W6 renamed
+        this from supported_by, direction unchanged) gets RETRACTED
         (not merely tainted) unless another live observation_predictive
         still supports it — a voided evidential basis means the
         prediction was never validly grounded. Independent of the
@@ -1189,8 +1197,9 @@ def _retract_impl(
         # 1c. If the retracted node is an observation_predictive, retract any
         # prediction whose sole live evidential basis it was (issue #2281).
         # A prediction is minted paired to an observation_predictive via a
-        # `supported_by` edge (prediction --supported_by--> observation,
-        # engram_observation.py's decomposition step). If that basis is
+        # `predicted_by` edge (prediction --predicted_by--> observation,
+        # engram_observation.py's decomposition step; #2252 W6 renamed this
+        # from `supported_by`, direction unchanged). If that basis is
         # retracted and no OTHER live observation_predictive still supports
         # the same prediction, the prediction was never validly grounded —
         # void ab initio, not merely tainted. `retract` (not `supersede`) is
@@ -1211,11 +1220,18 @@ def _retract_impl(
         # prediction gets.
         retracted_predictions = []
         if node["type"] == "observation_predictive":
+            # #2252 W6: pairing relation read from the derived constant
+            # (core.PREDICTION_PAIRING_RELATIONS), never a hand-listed
+            # 'supported_by' literal — the pairing edge was split to
+            # `predicted_by` and this query is the regression signal for a
+            # missed rename (a prediction whose sole basis was retracted
+            # would silently stop getting retracted in turn).
+            _pred_pairing_placeholders = ",".join("?" * len(core.PREDICTION_PAIRING_RELATIONS))
             supporting_predictions = conn.execute(
-                "SELECT source_id FROM edges "
-                "WHERE target_id = ? AND relation = 'supported_by' "
-                "AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
-                (node_id,),
+                f"SELECT source_id FROM edges "
+                f"WHERE target_id = ? AND relation IN ({_pred_pairing_placeholders}) "
+                f"AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
+                (node_id, *sorted(core.PREDICTION_PAIRING_RELATIONS)),
             ).fetchall()
             for sp in supporting_predictions:
                 pred_id = sp["source_id"]
@@ -1226,7 +1242,7 @@ def _retract_impl(
                 # "linked_to_existing" path). Type-filtered on the target
                 # to match the outer supporting_predictions query's own
                 # type filter — unreachable by any non-observation_predictive
-                # target today (supported_by edges onto a prediction are
+                # target today (predicted_by edges onto a prediction are
                 # only ever minted by that one decomposition path), but the
                 # filter keeps the query honest against what the comment
                 # claims rather than relying on that invariant holding
@@ -1237,19 +1253,22 @@ def _retract_impl(
                 # supported_by-edge migration being restricted to
                 # cornerstones/lessons (see the migration site elsewhere in
                 # this module): a supersede's replacement observation mints
-                # its OWN supported_by edge via this same linked_to_existing
+                # its OWN predicted_by edge via this same linked_to_existing
                 # path, so the prediction always re-acquires a live basis
                 # from the replacement rather than depending on the old
                 # edge being migrated (verified, Borges, PR #2292 colleague
                 # review — a hypothesized false-positive here was built and
                 # then disproved empirically).
+                # #2252 W6: same derived-constant discipline as the
+                # supporting_predictions query above — never a hand-listed
+                # 'supported_by' literal.
                 other_basis = conn.execute(
-                    """SELECT 1 FROM edges e JOIN nodes n ON e.target_id = n.id
-                       WHERE e.source_id = ? AND e.relation = 'supported_by'
+                    f"""SELECT 1 FROM edges e JOIN nodes n ON e.target_id = n.id
+                       WHERE e.source_id = ? AND e.relation IN ({_pred_pairing_placeholders})
                        AND e.target_id != ? AND n.is_current = 1
                        AND n.type = 'observation_predictive'
                        LIMIT 1""",
-                    (pred_id, node_id),
+                    (pred_id, *sorted(core.PREDICTION_PAIRING_RELATIONS), node_id),
                 ).fetchone()
                 if other_basis:
                     continue
@@ -1289,7 +1308,9 @@ def _retract_impl(
                            "cascade_via": "prediction_basis_retraction"})
                 retracted_predictions.append({"id": pred_id, "type": "prediction"})
 
-        # 2. Find all downstream nodes (anything that derives_from or is supported_by this node)
+        # 2. Find all downstream nodes via CASCADE_RELATIONS (today just
+        #    derives_from — supported_by lost its cascade flag in #2252
+        #    Stage 1.3, so it no longer reaches anything through this walk).
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         tainted = []
         visited = {node_id}  # seed retracted node so walker won't process it

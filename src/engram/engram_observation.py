@@ -1484,10 +1484,13 @@ def _add_observation_impl(
                 core._log_edit(conn, "created", prediction_id, "prediction",
                           {"predicted_event": predicted_event[:200]})
 
-            # Edge: prediction supported_by observation
+            # Edge: prediction predicted_by observation (#2252 W6 — split
+            # out of supported_by; prediction is still the SOURCE, the
+            # predictive observation is still the TARGET, same direction
+            # supported_by used for this pairing).
             try:
                 conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'predicted_by', ?)",
                     (prediction_id, node_id, now),
                 )
             except sqlite3.IntegrityError:

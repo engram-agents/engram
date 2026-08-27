@@ -597,6 +597,13 @@ VALID_RELATIONS = {
                      # that realizes it). The dream-master's post-hoc wiring
                      # tool; also the axiom-grounding shape for practice
                      # observations ("ob_X instantiates ax_Y").
+    "predicted_by",  # #2252 W6: prediction <-predicted_by- observation_predictive
+                     # pairing edge, split out of `supported_by`. Prediction is
+                     # the SOURCE (the dependent claim), the predictive
+                     # observation is the TARGET (the premise) — same direction
+                     # `supported_by` used for this pairing. Minted once, at
+                     # node-add time (engram_observation.py); never hand-addable
+                     # (see _ADDABLE_AFTER_CREATION_RELATIONS below).
 }
 
 
@@ -642,6 +649,19 @@ EDGE_CLASSIFICATIONS = {
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
+    },
+    "predicted_by": {
+        "cascade": False,      # #2252 W6: settled, not a judgement call — Q1 FINAL on
+                                # #2252 settles predictions as non-claim-bearing, so
+                                # cascade reaching one has nothing to re-adjudicate.
+                                # An earlier cascade:True clause was withdrawn by its
+                                # own author; do not restore it.
+        "dag_check": True,      # same provenance-chain shape as supported_by, which
+                                # this edge is split out of.
+        "removable": False,    # provenance load-bearing, mirrors supported_by.
+        "addable_after_creation": False,  # minted once at node-add time
+                                           # (engram_observation.py); never hand-addable.
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
     "resolves": {
         "cascade": False,      # not a confidence-propagating edge
@@ -735,11 +755,75 @@ _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SOR
 # citation-coverage ("is this observation cited by anything?"), NOT for cascade.
 # DELIBERATELY ENUMERATED, NOT DERIVED FROM `cascade` — see #2252 Stage 1.0b.
 # These two sites (engram_lifecycle.py, engram_stats.py) ask a citation-coverage
-# question that only coincidentally shares today's cascade tuple; #2252 Stage 1.3
-# will remove `cascade` from `supported_by`, and if this constant were derived
-# from CASCADE_RELATIONS instead, the uncited-observation metric would silently
-# change meaning that day with no test to catch it.
+# question that ONLY COINCIDENTALLY SHARED, pre-#2252-Stage-1.3, the same tuple
+# as CASCADE_RELATIONS. #2252 Stage 1.3 (now landed) removed `cascade` from
+# `supported_by`, so the two sets are no longer even numerically equal —
+# CASCADE_RELATIONS is now the strict subset {derives_from}, while this
+# constant deliberately still includes `supported_by` for citation-coverage
+# purposes. Had this constant been derived from CASCADE_RELATIONS instead of
+# hand-enumerated, the uncited-observation metric would have silently changed
+# meaning on the day Stage 1.3 landed, with no test to catch it — the
+# now-realized divergence is exactly why it stays hand-enumerated.
 CITATION_SUPPORT_RELATIONS = frozenset({"derives_from", "supported_by"})
+
+
+# Relation minted for the prediction -> observation_predictive pairing edge
+# (#2252 W6, split out of supported_by). Single-relation frozenset, defined
+# here so the string 'predicted_by' has exactly one home — consumers read
+# this constant (or the helper below), never a hand-listed literal.
+PREDICTION_PAIRING_RELATIONS = frozenset({"predicted_by"})
+_PREDICTION_PAIRING_RELATIONS_SORTED = sorted(PREDICTION_PAIRING_RELATIONS)
+_PREDICTION_PAIRING_PLACEHOLDERS = ",".join("?" * len(_PREDICTION_PAIRING_RELATIONS_SORTED))
+
+
+def prediction_pairing_exemption_sql(target_col: str = "n.id") -> "tuple[str, tuple[str, ...]]":
+    """NOT-EXISTS SQL fragment + params: is `target_col` prediction-paired?
+
+    Shared by the citation-coverage checks in engram_stats.py
+    (``uncited_observations``) and engram_lifecycle.py (weak-grounding
+    sweep) — #2252 W6. A prediction-paired observation counts as cited even
+    though nothing points at it via CITATION_SUPPORT_RELATIONS (predictions
+    are non-claim-bearing and never derive_from / cite anything back). This
+    exemption clause was verbatim-duplicated across both modules with a
+    hardcoded ``relation = 'supported_by'`` literal before the W6 split;
+    unified here on PREDICTION_PAIRING_RELATIONS so a future rename of the
+    pairing relation cannot silently break either site.
+
+    Args:
+        target_col: the column reference for the observation node's id in
+            the caller's query (both current callers alias the node table
+            as ``n``, so the default ``"n.id"`` covers both). A column
+            reference cannot be a bound SQL parameter, so it is interpolated
+            via f-string rather than passed as data — the identifier-shape
+            guard below is the substitute for parameterization on this one
+            argument (colleague review, #2252 W6): both current callers pass
+            a constant and the default is a literal, so there is no live
+            exposure today, but the guard closes the door on a future caller
+            passing something dynamic that would look ordinary at the call
+            site.
+
+    Returns:
+        (sql_fragment, params) — embed the fragment (already-parenthesized
+        ``NOT EXISTS (...)``) into the caller's larger query via an f-string,
+        and append `params` to the caller's own params tuple in the position
+        the fragment appears.
+
+    Raises:
+        ValueError: if `target_col` is not a bare SQL identifier or
+            `table.column` reference.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", target_col):
+        raise ValueError(
+            f"target_col must be a bare SQL identifier or table.column, got {target_col!r}"
+        )
+    sql = (
+        "NOT EXISTS (\n"
+        "                  SELECT 1 FROM edges e\n"
+        f"                  WHERE e.target_id = {target_col} AND e.relation IN ({_PREDICTION_PAIRING_PLACEHOLDERS})\n"
+        "                  AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')\n"
+        "              )"
+    )
+    return sql, tuple(_PREDICTION_PAIRING_RELATIONS_SORTED)
 
 
 # ── Edge tier taxonomy ───────────────────────────────────────────────────────
@@ -774,6 +858,8 @@ EDGE_TIERS: dict[str, str] = {
     "supersedes":   "dependency",
     "supported_by": "dependency",
     "subtask_of":   "dependency",
+    "predicted_by": "dependency",  # #2252 W6: same provenance-chain shape as
+                                    # supported_by, which it is split out of.
     # relational tier: symmetric / cross-temporal; dag_check=False expected
     "contradicts":  "relational",
     "tensions":     "relational",
@@ -4406,12 +4492,20 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 quote_preview = (n["quoted_text"] or "")[:120]
                 lines.append(f"Source: {n['evidence_id']} | Quote: \"{quote_preview}\"")
                 # Show predictions that depend on this observation (incoming
-                # supported_by; post-direction-fix, observations are targets of
-                # supported_by edges sourced from the predictions they ground).
+                # predicted_by; post-direction-fix, observations are targets of
+                # predicted_by edges sourced from the predictions they ground).
+                # #2252 W6: reads PREDICTION_PAIRING_RELATIONS directly (same
+                # module, no need for the NOT-EXISTS-shaped
+                # prediction_pairing_exemption_sql helper — this is a plain
+                # SELECT, a different call shape) so a future rename of the
+                # pairing relation cannot silently break this display site
+                # the way the pre-W6 hardcoded 'supported_by' literal did
+                # (site missed by the original W6 spec's four-site list; see #2252).
                 edges = conn.execute(
-                    "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'supported_by' "
-                    "AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
-                    (n["id"],),
+                    f"SELECT source_id FROM edges WHERE target_id = ? "
+                    f"AND relation IN ({_PREDICTION_PAIRING_PLACEHOLDERS}) "
+                    f"AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
+                    (n["id"], *_PREDICTION_PAIRING_RELATIONS_SORTED),
                 ).fetchall()
                 for e in edges:
                     lines.append(f"Depended on by: {e['source_id']}")
@@ -6529,11 +6623,15 @@ def _trace_observation_leaves(
         # #2252 Stage 1.0b / #2255 colleague-review fix: DELIBERATELY LEFT
         # ENUMERATED, not derived from CASCADE_RELATIONS. The reason is
         # semantic, not a cost tradeoff: this walk's exclusion of 'cites' is a
-        # commitment about what counts as a PREMISE, and today's cascade set
-        # happening to equal {derives_from, supported_by} is coincidence, not
-        # cause. Deriving this from `cascade` would make "premise spine" track
-        # a flag that means "taint propagates here" — a different question
-        # that merely agrees with this one today. Do not "fix" this to
+        # commitment about what counts as a PREMISE. {derives_from,
+        # supported_by} used to coincidentally EQUAL CASCADE_RELATIONS before
+        # #2252 Stage 1.3 flipped supported_by's cascade flag to False; they
+        # no longer even numerically coincide (CASCADE_RELATIONS is now the
+        # strict subset {derives_from}), which makes the case for keeping
+        # this hand-enumerated STRONGER, not weaker — deriving "premise
+        # spine" from `cascade` was never correct even when the two sets
+        # agreed, since they answer different questions ("what's a premise"
+        # vs "does taint propagate here"). Do not "fix" this to
         # CASCADE_RELATIONS.
         edges = conn.execute(
             "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supported_by')",

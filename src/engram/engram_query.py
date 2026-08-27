@@ -52,6 +52,9 @@ _TYPE_ALIASES: dict[str, str] = {
 _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
     "derives_from",
     "supported_by",
+    "predicted_by",  # #2252 W6: prediction pairing edge, split out of
+                     # supported_by — same dependency tier, same
+                     # logical/epistemic weight, so classified alongside it.
     "supersedes",
     "contradicts",
     "resolves",
@@ -581,6 +584,27 @@ def _pattern_cornerstone_candidate(
         # graph has a different edge population) and would be wrong for
         # every other reader — the two-graph agreement in direction is the
         # portable fact, not either graph's number.
+        #
+        # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
+        # from this tuple — do not add it back. Cornerstone candidacy asks
+        # whether an observation is LOAD-BEARING: whether other CLAIMS rest
+        # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
+        # prediction attached to an observation is a tracker, not a
+        # dependent claim, so it should never have counted as a load-bearing
+        # citation. The pre-split behaviour — where the pairing edge's
+        # `supported_by` name made it count here by accident, because it
+        # shared a literal with the real citation relations — was the bug;
+        # excluding `predicted_by` is the correction, not a regression.
+        #
+        # Known transient inconsistency, owned by W3: because the W6
+        # migration is additive (old `supported_by` pairing edges are never
+        # deleted, only paralleled with a new `predicted_by` edge), a
+        # migrated pre-W6 prediction's stale `supported_by` edge STILL
+        # counts toward its observation's cite_count here, while a
+        # newly-minted post-W6 prediction (predicted_by only) does not.
+        # This is a known artifact of the additive migration, not an
+        # oversight — it resolves when W3 retires the stale `supported_by`
+        # pairing edges.
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supported_by', 'cites', 'derives_from')",
@@ -944,11 +968,18 @@ def _build_inspect_recall_view(
 
     # Sort logical neighbors into upstream / downstream / lateral.
     # Upstream: outgoing edges — the inspected node uses/cites/resolves/supersedes
-    #   the neighbor (outgoing derives_from, supported_by, supersedes, resolves, subtask_of).
+    #   the neighbor (outgoing members of _UPSTREAM_OUTGOING, defined below --
+    #   named here rather than re-enumerated, since the prior hand-listed
+    #   enumeration went stale the moment predicted_by was added to the set
+    #   without this comment being touched, #2252 W6; a specific line-count
+    #   claim would only repeat the same mistake under a different name).
     # Downstream: incoming edges — the neighbor uses/cites/resolves/supersedes the
     #   inspected node (incoming versions of the same relations, including incoming
     #   subtask_of children).
-    # Lateral: contradicts (both dirs), tensions, exemplifies, retracts.
+    # Lateral: contradicts (both dirs), tensions, exemplifies, retracts
+    #   (== _LATERAL_RELATIONS, defined below; verified live to still match,
+    #   #2252 W6 -- this one recites members and is accurate today, left
+    #   as-is rather than converted for its own sake).
     upstream: list[dict] = []
     downstream: list[dict] = []
     lateral: list[dict] = []
@@ -960,7 +991,14 @@ def _build_inspect_recall_view(
     # A new cascade relation does not thereby deserve to render upstream, so
     # do not "fix" this to derive from `cascade`.
     _UPSTREAM_OUTGOING = frozenset({
-        "derives_from", "supported_by", "supersedes", "resolves", "subtask_of"
+        "derives_from", "supported_by", "predicted_by", "supersedes", "resolves", "subtask_of"
+        # predicted_by (#2252 W6, blocker 1): the prediction-pairing edge
+        # split out of supported_by keeps supported_by's own directionality
+        # here — prediction is still the outgoing source, so an outgoing
+        # predicted_by edge still reads as upstream (the paired observation
+        # is the prediction's evidential basis). Missing this made
+        # engram_inspect report the pairing edge under downstream — the
+        # exact inversion of the direction this PR's own commit asserts.
     })
     _LATERAL_RELATIONS = frozenset({
         "contradicts", "tensions", "exemplifies", "retracts"

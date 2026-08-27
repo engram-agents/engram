@@ -773,6 +773,11 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # 8. Uncited observations (in queryable memory, not referenced by any derivation)
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style; remainder get keyword-style.
+        # #2252 W6: prediction-pairing exemption unified into a shared helper
+        # (core.prediction_pairing_exemption_sql) — was verbatim-duplicated
+        # here and in engram_stats.py with a hardcoded 'supported_by' literal
+        # before the pairing edge split to `predicted_by`.
+        _pred_pairing_sql, _pred_pairing_params = core.prediction_pairing_exemption_sql("n.id")
         uncited = conn.execute(
             # #2252 Stage 1.0b: relation set here is citation-coverage
             # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
@@ -789,14 +794,10 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                    WHERE e.target_id = n.id AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                    AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
                )
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation = 'supported_by'
-                   AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
-               )
+               AND {_pred_pairing_sql}
                ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
-            (t2, *_CITATION_SUPPORT_RELATIONS_SORTED),
+            (t2, *_CITATION_SUPPORT_RELATIONS_SORTED, *_pred_pairing_params),
         ).fetchall()
         uncited_observations = []
         for i, u in enumerate(uncited):

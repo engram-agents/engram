@@ -965,6 +965,8 @@ const NODE_LABEL_OVERRIDE = {
 const EDGE_COLOR_OVERRIDE = {
   cites:         '#7799bb',
   supported_by:  '#5cb85c',
+  predicted_by:  '#5cb85c', // #2252 W6: mirrors supported_by -- the pairing
+                            // edge split out of it, same visual family.
   contradicts:   '#e05252',
   resolves:      '#4a90d9',
   derives_from:  '#b05ce6',
@@ -2054,6 +2056,9 @@ function edgeDirectionLabel(relation, isOutgoing) {
     derives_from: ['derives from', 'derived by'],
     cites:        ['cites', 'cited by'],
     supported_by: ['supported by', 'supports'],
+    predicted_by: ['predicted by', 'predicts'], // #2252 W6: pairing edge
+                                                 // split out of supported_by,
+                                                 // same direction/shape.
     contradicts:  ['contradicts', 'contradicted by'],
     resolves:     ['resolves', 'resolved by'],
     supersedes:   ['supersedes', 'superseded by'],
@@ -2348,7 +2353,7 @@ async function fetchSchema() {
       // Must be kept in sync by hand with EDGE_CLASSIFICATIONS whenever the
       // cascade/provenance flags change — it is not derived dynamically on
       // purpose, since it exists precisely for when the dynamic path failed.
-      const solidRels = new Set(['cites', 'derives_from', 'supported_by']);
+      const solidRels = new Set(['cites', 'derives_from', 'supported_by', 'predicted_by']); // #2252 W6: predicted_by carries provenance:True, same as supported_by
       EDGE_STYLE[rel] = { color, dash: solidRels.has(rel) ? '' : '4,3' };
     });
     activeTypes = new Set(Object.keys(NODE_STYLE));

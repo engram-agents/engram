@@ -105,11 +105,18 @@ def test_cascade_relations_equals_the_stage_1_0a_set():
 
 
 def test_provenance_relations_equals_the_stage_1_0a_set():
-    """PROVENANCE_RELATIONS == {cites, derives_from, supported_by} — matches
-    what engram_core.py's _trace_evidence_roots (the provenance walk)
-    actually traces."""
+    """PROVENANCE_RELATIONS == {cites, derives_from, supported_by, predicted_by}
+    — matches what engram_core.py's _trace_evidence_roots (the provenance
+    walk) actually traces.
+
+    #2252 W6 added `predicted_by`, provenance:True, matching the
+    `supported_by` pairing edge it was split out of — a trace starting from a
+    prediction node must still walk through to the paired observation's own
+    evidence roots, exactly as it did when the pairing edge was still named
+    `supported_by`.
+    """
     assert PROVENANCE_RELATIONS == frozenset(
-        {"cites", "derives_from", "supported_by"}
+        {"cites", "derives_from", "supported_by", "predicted_by"}
     )
 
 

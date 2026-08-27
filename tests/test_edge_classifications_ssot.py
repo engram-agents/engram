@@ -74,6 +74,8 @@ def test_no_unclassified_relations_in_schema():
     known_relations = {
         "about", "cites", "contradicts", "derives_from", "exemplifies",
         "instantiates",  # #530 c1 (2026-06-07)
+        "predicted_by",  # #2252 W6 (2026-08-27) — prediction pairing edge,
+                         # split out of supported_by.
         "resolves", "retracts", "serves", "subtask_of", "supersedes",
         "supported_by", "tensions",
     }

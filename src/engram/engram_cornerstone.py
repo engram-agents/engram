@@ -20,6 +20,15 @@ from datetime import datetime, timezone
 import engram_core as core
 
 
+# #2252 W6 colleague review, round 5: computed once here rather than inline
+# in both _remove_edge_impl and _add_edge_impl's blocked-relation error
+# messages (was duplicated verbatim in both, the exact "same-concept logic
+# scattered across two call sites" shape that let earlier rounds' mislabels
+# survive). Derived from EDGE_CLASSIFICATIONS' `provenance` flag via
+# core.PROVENANCE_RELATIONS -- never hand-listed.
+_PROVENANCE_LIST_STR = ", ".join(sorted(core.PROVENANCE_RELATIONS))
+
+
 # ---------------------------------------------------------------------------
 # L-family impl functions
 # ---------------------------------------------------------------------------
@@ -559,24 +568,29 @@ def _remove_edge_impl(
         return json.dumps({"error": "relation is required and cannot be empty."})
 
     if relation not in core._REMOVABLE_EDGE_RELATIONS:
+        # #2255 round-2/4 review fixes + #2252 W6 rounds 3-5 (colleague
+        # review, round 5): this bucket has now been mislabeled TWICE --
+        # first "cascade-bearing" (false for supported_by/predicted_by,
+        # both provenance:True but cascade:False), then "provenance/
+        # dependency-bearing" naming only 3 of the 4 provenance:True
+        # relations while `cites` sat in its own bucket one line down with
+        # an IDENTICAL EDGE_CLASSIFICATIONS profile -- no field distinguishes
+        # them, so the split was unencoded semantics, not a real boundary.
+        # FIX: derive the list from PROVENANCE_RELATIONS (EDGE_CLASSIFICATIONS'
+        # `provenance` flag) at call time, built into the message below --
+        # never hand-list membership again. structural mutations
+        # (supersedes, retracts) and structural commitments (contradicts,
+        # resolves) are provenance:False and correctly stay their own
+        # buckets.
+        _provenance_list = _PROVENANCE_LIST_STR
         return json.dumps({
             "error": (
                 f"Relation '{relation}' is not removable via engram_remove_edge. "
                 f"Allowed: {sorted(core._REMOVABLE_EDGE_RELATIONS)}. "
-                # #2255 round-2 review fix: retracts/supersedes are structural
-                # mutations (revision history), not cascade-bearing — see
-                # EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a.
-                # #2255 round-4 review fix: this message used to lump
-                # supersedes/retracts in with contradicts/resolves under
-                # "structural commitments", contradicting the comment above
-                # — split into the two-bucket vocabulary (structural
-                # mutations vs. structural commitments) server.py's Round-3
-                # comments established.
-                f"Cascade-bearing edges (derives_from, supported_by), "
-                f"structural mutations (supersedes, retracts), structural "
-                f"commitments (contradicts, resolves), and provenance "
-                f"(cites) are blocked. Use engram-surgical if removal is "
-                f"truly required."
+                f"Provenance-bearing edges ({_provenance_list}), "
+                f"structural mutations (supersedes, retracts), and "
+                f"structural commitments (contradicts, resolves) are "
+                f"blocked. Use engram-surgical if removal is truly required."
             )
         })
 
@@ -675,24 +689,30 @@ def _add_edge_impl(
         return json.dumps({"error": "relation is required and cannot be empty."})
 
     if relation not in core._ADDABLE_AFTER_CREATION_RELATIONS:
+        # #2255 round-2/4 review fixes + #2252 W6 rounds 3-5 (colleague
+        # review, round 5): this bucket has now been mislabeled TWICE --
+        # first "cascade-bearing" (false for supported_by/predicted_by,
+        # both provenance:True but cascade:False), then "provenance/
+        # dependency-bearing" naming only 3 of the 4 provenance:True
+        # relations while `cites` sat in its own bucket one line down with
+        # an IDENTICAL EDGE_CLASSIFICATIONS profile -- no field distinguishes
+        # them, so the split was unencoded semantics, not a real boundary.
+        # FIX: derive the list from PROVENANCE_RELATIONS (EDGE_CLASSIFICATIONS'
+        # `provenance` flag) at call time, built into the message below --
+        # never hand-list membership again. structural mutations
+        # (supersedes, retracts) and structural commitments (contradicts,
+        # resolves) are provenance:False and correctly stay their own
+        # buckets.
+        _provenance_list = _PROVENANCE_LIST_STR
         return json.dumps({
             "error": (
                 f"Relation '{relation}' is not addable via engram_add_edge. "
                 f"Allowed: {sorted(core._ADDABLE_AFTER_CREATION_RELATIONS)}. "
-                # #2255 round-2 review fix: retracts/supersedes are structural
-                # mutations (revision history), not cascade-bearing — see
-                # EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a.
-                # #2255 round-4 review fix: this message used to lump
-                # supersedes/retracts in with contradicts/resolves under
-                # "structural commitments", contradicting the comment above
-                # — split into the two-bucket vocabulary (structural
-                # mutations vs. structural commitments) server.py's Round-3
-                # comments established.
-                f"Cascade-bearing edges (derives_from, supported_by), "
-                f"structural mutations (supersedes, retracts), structural "
-                f"commitments (contradicts, resolves), and provenance "
-                f"(cites) are blocked from after-creation addition. Edges "
-                f"that participate in cascade semantics or carry structural "
+                f"Provenance-bearing edges ({_provenance_list}), "
+                f"structural mutations (supersedes, retracts), and "
+                f"structural commitments (contradicts, resolves) are "
+                f"blocked from after-creation addition. Edges that "
+                f"participate in cascade semantics or carry structural "
                 f"epistemic stance must be created at node-add time via the "
                 f"source node's payload, or via the dedicated mutation tool."
             )

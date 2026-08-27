@@ -781,6 +781,111 @@ def test_cornerstone_candidate_exclusion_is_relation_agnostic():
     )
 
 
+def test_cornerstone_candidate_excludes_predicted_by_from_citation_count():
+    """#2252 W6 design decision (coordinator-ruled, not a judgement call):
+    `predicted_by` must NOT count toward cornerstone-candidate cite_count.
+
+    Pins the exclusion so a future 'why isn't predicted_by in this tuple'
+    cleanup cannot silently add it back: a prediction-paired observation
+    with exactly 2 real citations (below min_citations=3) plus its one
+    predicted_by edge must NOT become a candidate (3 total edges would
+    cross the threshold if predicted_by counted, but it must not count).
+    Adding a 3rd real citation must then cross the threshold on its own,
+    proving the pattern still works normally and the miss above wasn't an
+    unrelated scoring quirk.
+    """
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    now = "2026-08-27T00:00:00Z"
+
+    citer_a = _add_observation(obs, "Citer A for predicted_by-exclusion fixture")
+    citer_b = _add_observation(obs, "Citer B for predicted_by-exclusion fixture")
+    citer_c = _add_observation(obs, "Citer C for predicted_by-exclusion fixture")
+
+    # The candidate: a predictive observation (mints a paired prediction via
+    # a predicted_by edge targeting this node).
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/predicted-by-exclusion",
+        title="Predictive source for exclusion fixture",
+        quoted_text="G predicts H will occur.",
+        interpretation="G predicts H.",
+        claim="H will occur.",
+        quote_type="hard_data",
+        is_predictive=True,
+        predicted_event="H occurs within 10 days (predicted_by-exclusion fixture).",
+    ))
+    assert "error" not in r, r
+    node_id = r["observation_id"]
+    pred_id = r["prediction_id"]
+
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET importance_base=2.0, importance_score=2.0 WHERE id=?",
+            (node_id,),
+        )
+        # Exactly 2 real citations — below min_citations=3 on their own.
+        for src in (citer_a, citer_b):
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'cites', ?)",
+                (src, node_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Sanity: the predicted_by edge from pred_id -> node_id really exists.
+    conn = core._get_db()
+    try:
+        pairing = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND relation='predicted_by'",
+            (pred_id, node_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert pairing is not None, f"expected a predicted_by edge {pred_id} -> {node_id}"
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+    result_ids = [c["id"] for c in candidates]
+    assert node_id not in result_ids, (
+        f"{node_id} has only 2 real citations plus 1 predicted_by edge; "
+        f"predicted_by must not count toward cite_count, so this must stay "
+        f"below min_citations=3. Got candidates: {result_ids}"
+    )
+
+    # Add the 3rd real citation — must now cross the threshold on its own.
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+            " VALUES (?, ?, 'cites', ?)",
+            (citer_c, node_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+    result_ids = [c["id"] for c in candidates]
+    assert node_id in result_ids, (
+        f"{node_id} now has 3 real citations and should cross min_citations=3 "
+        f"on its own merit. Got candidates: {result_ids}"
+    )
+
+
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
 
 def test_open_question_answerable_dispatches_cleanly():

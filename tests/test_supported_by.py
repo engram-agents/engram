@@ -4,7 +4,8 @@ Coverage:
   1. Taint cascade — retracting the TARGET of a supported_by edge taints the SOURCE.
   2. Taint cascade (inverse not fired) — retracting the SOURCE does not taint the TARGET.
   3. Prediction path post-fix — is_predictive observation creates
-     (prediction, observation, 'supported_by'); retracting the observation
+     (prediction, observation, 'predicted_by') [#2252 W6: renamed from
+     'supported_by', direction unchanged]; retracting the observation
      taints the prediction, not the reverse.
   4. Migration — fixture with both cornerstone-style and prediction-style
      'supports' edges migrated correctly; idempotent on second run.
@@ -219,10 +220,16 @@ def test_retract_source_does_not_taint_target():
 # ── 3. Prediction path post-fix ─────────────────────────────────────────────
 
 
-def test_predictive_observation_creates_correct_supported_by_edge():
-    """An is_predictive observation creates (prediction, observation, 'supported_by').
+def test_predictive_observation_creates_correct_predicted_by_edge():
+    """An is_predictive observation creates (prediction, observation, 'predicted_by').
 
     The prediction is the dependent (source); the observation is the premise (target).
+
+    #2252 W6: the pairing edge was split out of `supported_by` into its own
+    `predicted_by` relation (direction unchanged — prediction stays the
+    source). This test asserts the NEW relation, and that no `supported_by`
+    edge (either direction) is minted for the pairing — the regression test
+    for a missed rename at the single creation site (engram_observation.py).
     """
     _rev, obs, _cs, core = _make_fresh_mods()
 
@@ -243,17 +250,26 @@ def test_predictive_observation_creates_correct_supported_by_edge():
     pred_id = r.get("prediction_id")
     assert pred_id is not None, f"Expected prediction_id in response, got: {r}"
 
-    # Direction must be: prediction (dependent/source) supported_by observation (premise/target)
-    assert _edge_exists(core, pred_id, obs_id, "supported_by"), (
-        f"Expected (prediction={pred_id}, obs={obs_id}, 'supported_by') edge; "
+    # Direction must be: prediction (dependent/source) predicted_by observation (premise/target)
+    assert _edge_exists(core, pred_id, obs_id, "predicted_by"), (
+        f"Expected (prediction={pred_id}, obs={obs_id}, 'predicted_by') edge; "
         f"inverse or 'supports' would be wrong."
     )
     # The old wrong direction must NOT exist
-    assert not _edge_exists(core, obs_id, pred_id, "supported_by"), (
+    assert not _edge_exists(core, obs_id, pred_id, "predicted_by"), (
         f"Old inverted edge (obs={obs_id}, prediction={pred_id}) must not exist"
     )
     assert not _edge_exists(core, obs_id, pred_id, "supports"), (
         f"Stale 'supports' edge must not exist"
+    )
+    # #2252 W6: no supported_by edge (either direction) should be minted for
+    # the pairing anymore — it must be predicted_by only.
+    assert not _edge_exists(core, pred_id, obs_id, "supported_by"), (
+        f"Pairing edge must be 'predicted_by', not 'supported_by' "
+        f"(prediction={pred_id}, obs={obs_id})"
+    )
+    assert not _edge_exists(core, obs_id, pred_id, "supported_by"), (
+        f"Pairing edge must be 'predicted_by', not 'supported_by' (inverse direction)"
     )
 
 

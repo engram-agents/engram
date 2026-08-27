@@ -761,6 +761,11 @@ def _diagnose_impl() -> str:
         # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
         # enumerated, not derived from `cascade`. See the constant's
         # comment in engram_core.py.
+        # #2252 W6: prediction-pairing exemption unified into a shared helper
+        # (core.prediction_pairing_exemption_sql) — was verbatim-duplicated
+        # here and in engram_lifecycle.py with a hardcoded 'supported_by'
+        # literal before the pairing edge split to `predicted_by`.
+        _pred_pairing_sql, _pred_pairing_params = core.prediction_pairing_exemption_sql("n.id")
         uncited = conn.execute(f"""
             SELECT COUNT(*) as c FROM nodes n
             WHERE n.type IN ('observation_factual', 'observation_predictive')
@@ -771,12 +776,8 @@ def _diagnose_impl() -> str:
                     AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                     AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
               )
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e
-                  WHERE e.target_id = n.id AND e.relation = 'supported_by'
-                    AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
-              )
-        """, tuple(_CITATION_SUPPORT_RELATIONS_SORTED)).fetchone()["c"]
+              AND {_pred_pairing_sql}
+        """, tuple(_CITATION_SUPPORT_RELATIONS_SORTED) + _pred_pairing_params).fetchone()["c"]
         epistemic["uncited_observations"] = uncited
 
         # Resolution rates

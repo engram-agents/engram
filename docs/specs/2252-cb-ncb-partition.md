@@ -291,20 +291,42 @@ doc's author — flagged as such rather than asserted:
 ## The pairing invariant (Q1, settled)
 
 Predictions are NCB (above). Calibration survives that ruling via the **pairing invariant**:
-every `prediction` node is `supported_by` a paired `observation_predictive` node that carries
-the actual claim and a real confidence. The `prediction` node itself tracks `predicted_event`,
-`status`, `resolved_by` — question-pattern fields, not claim fields.
+every `prediction` node is `predicted_by` a paired `observation_predictive` node that carries
+the actual claim and a real confidence (named `predicted_by` per the ruling below; historically
+this pairing edge shared the `supported_by` literal with the unrelated cornerstone-vote usage —
+see that ruling for why and when the rename landed). The `prediction` node itself tracks
+`predicted_event`, `status`, `resolved_by` — question-pattern fields, not claim fields.
 
-**The relation name for this specific edge is an open item, not yet decided — do not write
-code against a name from this doc.** The issue's earlier text named a target (`predicted_by`),
-but that name was chosen when predictions were still (incorrectly) ruled CB, and reads
-backwards on the edge's actual direction (source = prediction, target = the observation; "the
-prediction is predicted_by the observation" doesn't parse — the observation doesn't predict
-the tracker). This is being resolved separately by Borges as its own new-relation design call
-(needs an `EDGE_CLASSIFICATIONS` row under Stage 1.0a's gate: `cascade=False`, since NCB nodes
-don't cascade), tracked outside this doc's scope. Until that lands, the pairing edge is
-`(prediction_id, observation_id, 'supported_by')` — same relation cornerstones use, different
-semantic, both currently sharing the literal string.
+**The relation name is ruled: `predicted_by`** (Lei, 2026-08-27; #2252 W6). The issue's
+earlier text named this same target, and it carries the same backwards-reading tension this
+doc's earlier draft flagged: "the prediction is predicted_by the observation" doesn't parse on
+a naive reading, since the observation doesn't predict the tracker. The ruling keeps the name
+anyway, on the SAME direction the pairing edge already had as `supported_by` — prediction
+stays the SOURCE, the observation stays the TARGET; nothing about the stored direction changes,
+only the relation's name. A conceptual diagram elsewhere (in #2252) draws the arrow the other
+way (predicting act → record) — that is narrative flow, not the edge's storage direction, and
+is not a reason to "fix" the stored direction to match it. A reader who meets `predicted_by`
+alone, with no second edge for contrast, is the case most likely to misread it — so show both
+prediction edges together, direction included:
+
+```
+observation_predictive --(predicted_by)--> prediction <--(resolves)-- observation_factual
+     the predicting act                     the record        the verifying event
+```
+
+(The arrow in this diagram points FROM the observation for readability — "the observation
+predicted this" reads left to right. The STORED edge has `prediction` as the SOURCE and
+`observation_predictive` as the TARGET, same as the diagram's `resolves` edge has
+`observation_factual` as the source and `prediction` as the target. Say this explicitly
+because the arrow-vs-storage ambiguity is exactly what confused an earlier reader of this
+doc.)
+
+The pairing edge is `(prediction_id, observation_id, 'predicted_by')` — split out of
+`supported_by` (which cornerstones still use, unrelated semantic, no longer sharing the
+literal string with this pairing). `EDGE_CLASSIFICATIONS['predicted_by']` carries
+`cascade=False` (settled per Q1 above — NCB nodes don't cascade), `dag_check=True`,
+`provenance=True`, matching `supported_by`'s own non-cascade fields; not hand-addable
+(`addable_after_creation=False`) — minted once at node-add time only. Landed in #2252 W6.
 
 **A consequence worth flagging for whoever builds the pairing-relation rename — corrected here
 after a real gap Borges found (issue #2252 comment, 2026-08-26T18:08:07Z) that an earlier draft
