@@ -998,6 +998,16 @@ def _retract_impl(
       - Resolution reopening: if the retracted node was a resolution
         (had outgoing resolves edges), each target without another
         valid resolution is set back to status='open'.
+      - Prediction basis retraction (issue #2281): if the retracted node
+        is an observation_predictive, any prediction paired to it via a
+        supported_by edge (prediction -> observation) gets RETRACTED
+        (not merely tainted) unless another live observation_predictive
+        still supports it — a voided evidential basis means the
+        prediction was never validly grounded. Independent of the
+        general derivation cascade above, which (post-#2252 Stage 1.3)
+        does not reach predictions at all — supported_by's cascade flag
+        is False and predictions are non-claim-bearing, so this is the
+        only signal a voided prediction gets.
 
     Error types:
       fabricated_quote — quoted_text not found in evidence source
@@ -1176,6 +1186,109 @@ def _retract_impl(
             (node_id,),
         )
 
+        # 1c. If the retracted node is an observation_predictive, retract any
+        # prediction whose sole live evidential basis it was (issue #2281).
+        # A prediction is minted paired to an observation_predictive via a
+        # `supported_by` edge (prediction --supported_by--> observation,
+        # engram_observation.py's decomposition step). If that basis is
+        # retracted and no OTHER live observation_predictive still supports
+        # the same prediction, the prediction was never validly grounded —
+        # void ab initio, not merely tainted. `retract` (not `supersede`) is
+        # the correct terminal state per the retract/supersede split (the
+        # prediction was never valid, it wasn't valid-then-updated); none of
+        # the four VALID_PREDICTION_OUTCOMES fit either, since they all
+        # answer "did the predicted event happen", a different question from
+        # "was the basis ever real".
+        #
+        # Deliberately independent of the general downstream-cascade walk
+        # below (_walk_cascade_downstream): #2252 Stage 1.3 flips
+        # `supported_by`'s cascade flag to False (predictions are
+        # non-claim-bearing, so cascade reaching one has nothing to
+        # re-adjudicate) and, separately, the walker stops at any
+        # non-claim-bearing node regardless of the edge's cascade flag. So
+        # the general cascade neither taints nor retracts a prediction
+        # through this edge — this branch is the only signal a voided
+        # prediction gets.
+        retracted_predictions = []
+        if node["type"] == "observation_predictive":
+            supporting_predictions = conn.execute(
+                "SELECT source_id FROM edges "
+                "WHERE target_id = ? AND relation = 'supported_by' "
+                "AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
+                (node_id,),
+            ).fetchall()
+            for sp in supporting_predictions:
+                pred_id = sp["source_id"]
+                # Skip if another live observation_predictive still grounds
+                # this same prediction (a prediction can be re-minted onto
+                # by multiple predictive observations describing the same
+                # predicted_event — engram_observation.py's
+                # "linked_to_existing" path). Type-filtered on the target
+                # to match the outer supporting_predictions query's own
+                # type filter — unreachable by any non-observation_predictive
+                # target today (supported_by edges onto a prediction are
+                # only ever minted by that one decomposition path), but the
+                # filter keeps the query honest against what the comment
+                # claims rather than relying on that invariant holding
+                # silently (Borges, PR #2292 colleague review).
+                #
+                # This is also why engram_supersede cannot orphan a
+                # validly-grounded prediction, despite supersede's own
+                # supported_by-edge migration being restricted to
+                # cornerstones/lessons (see the migration site elsewhere in
+                # this module): a supersede's replacement observation mints
+                # its OWN supported_by edge via this same linked_to_existing
+                # path, so the prediction always re-acquires a live basis
+                # from the replacement rather than depending on the old
+                # edge being migrated (verified, Borges, PR #2292 colleague
+                # review — a hypothesized false-positive here was built and
+                # then disproved empirically).
+                other_basis = conn.execute(
+                    """SELECT 1 FROM edges e JOIN nodes n ON e.target_id = n.id
+                       WHERE e.source_id = ? AND e.relation = 'supported_by'
+                       AND e.target_id != ? AND n.is_current = 1
+                       AND n.type = 'observation_predictive'
+                       LIMIT 1""",
+                    (pred_id, node_id),
+                ).fetchone()
+                if other_basis:
+                    continue
+                pred = conn.execute(
+                    "SELECT id, status, metadata, is_current FROM nodes WHERE id = ?",
+                    (pred_id,),
+                ).fetchone()
+                if not pred or not pred["is_current"]:
+                    continue  # already retracted/superseded — nothing to do
+                pred_meta = json.loads(pred["metadata"] or "{}")
+                pred_meta["retracted"] = True
+                pred_meta["error_type"] = error_type
+                pred_meta["retraction_reason"] = (
+                    f"Evidential basis retracted: paired observation_predictive "
+                    f"{node_id} was retracted ({error_type}): {reason}"
+                )
+                pred_meta["retracted_at"] = now
+                pred_meta["retracted_via_basis_retraction"] = node_id
+                # A prediction can already have resolved (status a
+                # RESOLVED_STATUSES value — confirmed/refuted/etc, engram_
+                # core.py) before its basis is retracted after the fact.
+                # Overwriting status='retracted' displaces that completed
+                # falsification measurement from the live surface (it
+                # survives in edit_history and the resolves edge stays
+                # intact, but isn't visible without digging into the audit
+                # log) — record it so it's recoverable from the node itself
+                # (Borges, PR #2292 colleague review).
+                if pred["status"] and pred["status"] != "open":
+                    pred_meta["status_before_retraction"] = pred["status"]
+                conn.execute(
+                    "UPDATE nodes SET status = 'retracted', is_current = 0, metadata = ? WHERE id = ?",
+                    (json.dumps(pred_meta), pred_id),
+                )
+                core._log_edit(conn, "retracted", pred_id, "prediction",
+                          {"error_type": error_type,
+                           "reason": f"basis retracted: {node_id}"[:200],
+                           "cascade_via": "prediction_basis_retraction"})
+                retracted_predictions.append({"id": pred_id, "type": "prediction"})
+
         # 2. Find all downstream nodes (anything that derives_from or is supported_by this node)
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
         tainted = []
@@ -1345,6 +1458,9 @@ def _retract_impl(
         if reopened_targets:
             result["reopened_targets"] = reopened_targets
             result["reopened_count"] = len(reopened_targets)
+        if retracted_predictions:
+            result["retracted_predictions"] = retracted_predictions
+            result["retracted_predictions_count"] = len(retracted_predictions)
         if replacement_id:
             result["replacement_id"] = replacement_id
         if result_replacement_skipped:

@@ -257,27 +257,25 @@ def test_predictive_observation_creates_correct_supported_by_edge():
     )
 
 
-def test_retract_predictive_observation_does_not_taint_prediction():
-    """Retracting the paired observation does NOT taint the prediction.
+def test_retract_predictive_observation_retracts_prediction_not_taints():
+    """Retracting the paired observation RETRACTS the prediction — not taint.
 
     #2252 Stage 1.3: `supported_by` no longer carries cascade, and
     `prediction` is NCB (Q1 FINAL, Kepler's corrected #2281 ruling,
-    2026-08-27T00:46:05Z) — the walk stops at the prediction by partition
-    membership before it would even reach this edge. This is a real
-    exemption the partition grants, not a gap: the taint-walk's prior
-    behavior (asserted by this test's predecessor, pre-1.3) was itself the
-    defect Stage 1.3 removes.
+    2026-08-27T00:46:05Z) — the general taint-walk stops at the prediction
+    by partition membership before it would even reach this edge, so it is
+    NOT the mechanism that gives a voided prediction its signal (asserted
+    below, bare form: "not tainted," not "not tainted via supported_by" —
+    the narrower via-supported_by wording from #2283 rested on a
+    since-retracted ruling and is withdrawn).
 
-    Written in the BARE form deliberately — "the prediction is not
-    tainted," not "not tainted via supported_by." The narrower
-    via-supported_by wording (from #2283) rested on a since-retracted
-    ruling and is withdrawn; do not reintroduce it.
-
-    This is NOT the whole story: a prediction whose paired observation is
-    retracted still needs an orphan marker (#2281's proposed fix, not yet
-    built) — the taint-walk was quietly doing that job before Stage 1.3 and
-    no longer does. This test does not assert that gap is fine; it only
-    asserts the mechanism that used to (mis)cover it is gone.
+    The signal is issue #2281's dedicated basis-retraction branch in
+    `_retract_impl`, added alongside this test: a prediction whose sole
+    live evidential basis (its paired observation_predictive) is retracted
+    was never validly grounded — void ab initio — and gets RETRACTED, the
+    correct terminal state per the retract/supersede split (never valid,
+    not valid-then-updated). This closes the orphan-marker gap this test's
+    predecessor docstring flagged as not-yet-built.
     """
     rev, obs, _cs, core = _make_fresh_mods()
 
@@ -303,12 +301,296 @@ def test_retract_predictive_observation_does_not_taint_prediction():
         reason="Quote was not in the source document.",
     ))
     assert "error" not in ret, ret
+    assert ret.get("retracted_predictions_count") == 1, ret
+    assert ret["retracted_predictions"][0]["id"] == pred_id, ret
 
-    # The prediction must NOT be tainted — bare form (#2252 Stage 1.3).
+    # The prediction must NOT be tainted — the general cascade never
+    # reaches it (bare form, #2252 Stage 1.3).
     assert not _is_tainted(core, pred_id, obs_id), (
         f"Expected prediction {pred_id} to NOT be tainted_by {obs_id} — "
         f"predictions are NCB and supported_by no longer cascades (#2252 Stage 1.3)"
     )
+
+    # The prediction must be RETRACTED (#2281's dedicated branch, not the
+    # general cascade).
+    conn = _get_db(core)
+    try:
+        row = conn.execute(
+            "SELECT status, is_current, metadata FROM nodes WHERE id = ?",
+            (pred_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, f"prediction {pred_id} not found"
+    assert row["status"] == "retracted", (
+        f"Expected prediction {pred_id} status='retracted', got {row['status']!r}"
+    )
+    assert row["is_current"] == 0, (
+        f"Expected prediction {pred_id} is_current=0, got {row['is_current']!r}"
+    )
+    meta = json.loads(row["metadata"] or "{}")
+    assert meta.get("error_type") == "fabricated_quote", meta
+    assert meta.get("retracted_via_basis_retraction") == obs_id, meta
+
+
+def test_retract_predictive_observation_does_not_retract_prediction_with_other_basis():
+    """A prediction with a second live observation_predictive basis survives
+    the retraction of one of its supporting observations — its evidential
+    basis is not entirely gone, so #2281's branch must not retract it.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+
+    r1 = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-multi-1",
+        title="Predictive source A",
+        quoted_text="Signal A predicts the event.",
+        interpretation="Signal A predicts event.",
+        claim="Event will occur (signal A).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Shared event occurs within 90 days.",
+    ))
+    assert "error" not in r1, r1
+    obs_a_id = r1["observation_id"]
+    pred_id = r1["prediction_id"]
+
+    r2 = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-multi-2",
+        title="Predictive source B",
+        quoted_text="Signal B also predicts the event.",
+        interpretation="Signal B predicts event.",
+        claim="Event will occur (signal B).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Shared event occurs within 90 days.",
+    ))
+    assert "error" not in r2, r2
+    obs_b_id = r2["observation_id"]
+    # Same predicted_event text dedups onto the same prediction node.
+    assert r2["prediction_id"] == pred_id, r2
+
+    ret = json.loads(rev._retract_impl(
+        node_id=obs_a_id,
+        error_type="fabricated_quote",
+        reason="Signal A's quote was not in the source document.",
+    ))
+    assert "error" not in ret, ret
+    # The implementation only ever adds the key when the list is non-empty
+    # (engram_revision.py's retracted_predictions block), so its absence
+    # already says "zero" — no need for the wordier disjunction.
+    assert "retracted_predictions" not in ret, ret
+
+    conn = _get_db(core)
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?",
+            (pred_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] != "retracted", (
+        f"prediction {pred_id} was retracted even though {obs_b_id} still "
+        f"supports it — a live second basis must protect it"
+    )
+    assert row["is_current"] == 1, row
+
+
+def test_retract_predictive_observation_preserves_resolved_status_before_overwrite():
+    """A prediction that has already RESOLVED (status is a RESOLVED_STATUSES
+    value — confirmed/refuted/etc, engram_core.py) before its basis is
+    retracted must not silently lose that completed falsification
+    measurement from the live surface: retraction still overwrites
+    status='retracted' (the outcome IS displaced, not preserved as the
+    live status), but metadata.status_before_retraction records it so it's
+    recoverable from the node itself, not only by digging into edit_history.
+
+    Caught by Borges's colleague review on PR #2292 (2026-08-27): he first
+    suspected the resolved status was fully lost, then verified it survives
+    in edit_history and the resolves edge stays intact (displaced, not
+    destroyed) — but recovering it required knowing to dig into the audit
+    log. This test covers the one-line fix that makes it visible on the
+    node directly.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-resolved",
+        title="Predictive source, later resolved",
+        quoted_text="Signal E predicts the event.",
+        interpretation="Signal E predicts event.",
+        claim="Event will occur (signal E).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Resolved-then-retracted event occurs within 30 days.",
+    ))
+    assert "error" not in r, r
+    obs_id = r["observation_id"]
+    pred_id = r["prediction_id"]
+
+    resolver_id = _seed_observation(
+        obs, url="https://example.com/resolver",
+        claim="The event did occur, confirming the prediction.",
+    )
+    res = json.loads(rev._resolve_impl(
+        target_id=pred_id,
+        resolving_node_id=resolver_id,
+        prediction_outcome="confirmed",
+    ))
+    assert "error" not in res, res
+
+    conn = _get_db(core)
+    try:
+        pre = conn.execute(
+            "SELECT status FROM nodes WHERE id = ?", (pred_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert pre["status"] == "confirmed", pre
+
+    ret = json.loads(rev._retract_impl(
+        node_id=obs_id,
+        error_type="fabricated_quote",
+        reason="Signal E's quote was not in the source document.",
+    ))
+    assert "error" not in ret, ret
+    assert ret.get("retracted_predictions_count") == 1, ret
+
+    conn = _get_db(core)
+    try:
+        row = conn.execute(
+            "SELECT status, is_current, metadata FROM nodes WHERE id = ?",
+            (pred_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "retracted", row
+    assert row["is_current"] == 0, row
+    meta = json.loads(row["metadata"] or "{}")
+    assert meta.get("status_before_retraction") == "confirmed", meta
+
+
+def test_retract_predictive_observation_with_no_paired_prediction_noops():
+    """Retracting an observation_predictive that has no paired prediction at
+    all (is_predictive=True but predicted_event omitted — legal today,
+    nothing enforces the pairing) must no-op cleanly: no crash, no
+    retracted_predictions key in the result.
+
+    Caught as a gap by round-1 reviewer-fairy on PR #2292 (2026-08-27):
+    verified correct by the fairy's own probe script but unasserted by any
+    shipped test until now.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-unpaired",
+        title="Predictive source, no predicted_event",
+        quoted_text="This reads as predictive in tone but names no event.",
+        interpretation="Predictive framing without a decomposable prediction.",
+        claim="Something predictive-shaped, unpaired.",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        # predicted_event deliberately omitted.
+    ))
+    assert "error" not in r, r
+    assert r.get("prediction_id") is None, r
+    obs_id = r["observation_id"]
+
+    ret = json.loads(rev._retract_impl(
+        node_id=obs_id,
+        error_type="fabricated_quote",
+        reason="No paired prediction exists to react to.",
+    ))
+    assert "error" not in ret, ret
+    assert "retracted_predictions" not in ret, ret
+
+
+def test_retract_predictive_observation_retracts_prediction_only_after_last_basis_gone():
+    """Sequential retraction of BOTH bases of a shared prediction: the first
+    retraction (while the other basis is still live) must leave the
+    prediction alone; only the second retraction (removing the last live
+    basis) retracts it.
+
+    Companion to test_retract_predictive_observation_does_not_retract_prediction_with_other_basis
+    above, which only covers the "one basis retracted, one still live" half.
+    This is the terminal case that half deliberately doesn't reach — caught
+    as a gap by round-1 reviewer-fairy on PR #2292 (2026-08-27), verified
+    correct by the fairy's own probe script but unasserted by any shipped
+    test until now.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+
+    r1 = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-sequential-1",
+        title="Predictive source C",
+        quoted_text="Signal C predicts the shared event.",
+        interpretation="Signal C predicts event.",
+        claim="Event will occur (signal C).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Sequential shared event occurs within 45 days.",
+    ))
+    assert "error" not in r1, r1
+    obs_c_id = r1["observation_id"]
+    pred_id = r1["prediction_id"]
+
+    r2 = json.loads(obs._add_observation_impl(
+        url="https://example.com/predictive-sequential-2",
+        title="Predictive source D",
+        quoted_text="Signal D also predicts the shared event.",
+        interpretation="Signal D predicts event.",
+        claim="Event will occur (signal D).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Sequential shared event occurs within 45 days.",
+    ))
+    assert "error" not in r2, r2
+    obs_d_id = r2["observation_id"]
+    assert r2["prediction_id"] == pred_id, r2
+
+    # First retraction: obs_d is still live, so the prediction must survive.
+    ret1 = json.loads(rev._retract_impl(
+        node_id=obs_c_id,
+        error_type="fabricated_quote",
+        reason="Signal C's quote was not in the source document.",
+    ))
+    assert "error" not in ret1, ret1
+    assert "retracted_predictions" not in ret1, ret1
+
+    conn = _get_db(core)
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?",
+            (pred_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] != "retracted", row
+    assert row["is_current"] == 1, row
+
+    # Second retraction: obs_c is already is_current=0 (retracted above), so
+    # it no longer counts as "another basis" — this is the last live basis
+    # gone, and the prediction must now be retracted.
+    ret2 = json.loads(rev._retract_impl(
+        node_id=obs_d_id,
+        error_type="fabricated_quote",
+        reason="Signal D's quote was not in the source document either.",
+    ))
+    assert "error" not in ret2, ret2
+    assert ret2.get("retracted_predictions_count") == 1, ret2
+    assert ret2["retracted_predictions"][0]["id"] == pred_id, ret2
+
+    conn = _get_db(core)
+    try:
+        row = conn.execute(
+            "SELECT status, is_current, metadata FROM nodes WHERE id = ?",
+            (pred_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["status"] == "retracted", row
+    assert row["is_current"] == 0, row
+    meta = json.loads(row["metadata"] or "{}")
+    assert meta.get("retracted_via_basis_retraction") == obs_d_id, meta
 
 
 # ── 5. #2252 Stage 1.3 — derived NCB cascade skip ───────────────────────────
