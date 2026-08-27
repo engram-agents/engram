@@ -441,6 +441,13 @@ fi
 > 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
 >    markers meet a threshold, cascade-sensitive categories are force-included
 >    regardless of the draw. Lottery = frequency; interrupt = urgency.
+>    **Currently unarmed pending #2013:** #2137 emptied the default
+>    force-include set (`DEFAULT_INTERRUPT_TYPES = frozenset()`), so on the
+>    default config there is nothing for the interrupt to force-include and
+>    it structurally cannot fire — the mechanism above describes what
+>    `--interrupt-types` re-arms, not the current default behavior. It
+>    re-arms when the #2013 cascade machine gives dreams a principled
+>    marker-resolution path.
 >
 > **Window semantics under rotation (the audit precondition #1901 asked for,
 > before wiring the lottery in):** a category that doesn't run every night
