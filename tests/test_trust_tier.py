@@ -468,10 +468,20 @@ def test_derive_rejects_ts_as_supporting_id():
     assert ts_id in r["error"], r
 
 
-# ── Test 16: Cascade — retract source ob_ taints ts_ ─────────────────────
+# ── Test 16: Cascade — retract source ob_ does NOT taint ts_ (#2252 Stage 1.3) ──
 
-def test_retract_source_obs_taints_trust_signal():
-    """Retracting the source ob_ taints the derived ts_ node."""
+def test_retract_source_obs_does_not_taint_trust_signal():
+    """Retracting the source ob_ does NOT taint the derived ts_ node.
+
+    #2252 Stage 1.3: `trust_signal` is NCB, and `_walk_cascade_downstream`'s
+    skip rule is now derived from the CB/NCB partition (`core._is_claim_bearing`)
+    rather than a hand-written {cornerstone, lesson} tuple — the walk stops
+    at the trust_signal by partition membership before writing tainted_by,
+    the same way it stops at a cornerstone or lesson. This inverts this
+    test's pre-1.3 assertion, which is exactly the W0 doc's flagged
+    trust_signal cascade tension that Stage 1.3 resolves (Kepler's
+    corrected #2281 ruling, point 1, 2026-08-27T00:46:05Z).
+    """
     _fresh_mods()
     tru, obs, rev, drv, qry, core = _mods()
     pn_id = _mk_person(tru, "CascadeSubject")
@@ -491,7 +501,7 @@ def test_retract_source_obs_taints_trust_signal():
     ret_r = json.loads(rev._retract_impl(
         node_id=ob_id,
         error_type="fabricated_quote",
-        reason="Test retract to verify cascade to ts_.",
+        reason="Test retract to verify the walk stops at ts_.",
     ))
     assert ret_r.get("status") == "retracted", ret_r
 
@@ -502,16 +512,21 @@ def test_retract_source_obs_taints_trust_signal():
     conn.close()
     assert ts_row is not None
     meta = json.loads(ts_row["metadata"] or "{}")
-    assert "tainted_by" in meta, f"ts_ should have tainted_by in metadata. Got: {meta}"
-    assert ob_id in meta["tainted_by"], (
-        f"ts_ should be tainted by {ob_id}. tainted_by: {meta['tainted_by']}"
+    assert "tainted_by" not in meta, (
+        f"ts_ should NOT have tainted_by in metadata — trust_signal is NCB "
+        f"and the derived skip must stop the walk there. Got: {meta}"
     )
 
 
-# ── Test 17: Cascade — supersede source ob_ stales ts_ ───────────────────
+# ── Test 17: Cascade — supersede source ob_ does NOT stale ts_ (#2252 Stage 1.3) ──
 
-def test_supersede_source_obs_stales_trust_signal():
-    """Superseding the source ob_ marks the derived ts_ as stale."""
+def test_supersede_source_obs_does_not_stale_trust_signal():
+    """Superseding the source ob_ does NOT mark the derived ts_ as stale.
+
+    #2252 Stage 1.3: same derived-skip reasoning as
+    test_retract_source_obs_does_not_taint_trust_signal above — the walk
+    stops at the NCB trust_signal node before writing stale_by.
+    """
     _fresh_mods()
     tru, obs, rev, drv, qry, core = _mods()
     pn_id = _mk_person(tru, "SupersedeSubject")
@@ -532,7 +547,7 @@ def test_supersede_source_obs_stales_trust_signal():
     sup_r = json.loads(rev._supersede_impl(
         old_node_id=ob_old,
         new_node_id=ob_new,
-        supersede_reason="Refined claim — test supersede cascade to ts_.",
+        supersede_reason="Refined claim — test supersede stops at ts_.",
     ))
     assert sup_r.get("status") == "superseded", sup_r
 
@@ -543,7 +558,7 @@ def test_supersede_source_obs_stales_trust_signal():
     conn.close()
     assert ts_row is not None
     meta = json.loads(ts_row["metadata"] or "{}")
-    assert "stale_by" in meta, f"ts_ should have stale_by in metadata. Got: {meta}"
-    assert ob_old in meta["stale_by"], (
-        f"ts_ should be stale_by {ob_old}. stale_by: {meta['stale_by']}"
+    assert "stale_by" not in meta, (
+        f"ts_ should NOT have stale_by in metadata — trust_signal is NCB "
+        f"and the derived skip must stop the walk there. Got: {meta}"
     )

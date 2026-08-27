@@ -141,6 +141,7 @@ def _add_goal_impl(
 
         meta = json.dumps({"motivation": motivation})
 
+        core._refuse_ncb_confidence("goal", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                status, metadata)
@@ -271,6 +272,7 @@ def _add_task_impl(
 
         meta = json.dumps({"scope": scope})
 
+        core._refuse_ncb_confidence("task", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
                VALUES (?, 'task', ?, ?, 'planned', ?)""",
@@ -704,6 +706,7 @@ def _report_feeling_impl(
                 "best_approximation_not_truth_claim"
             )
 
+        core._refuse_ncb_confidence("feeling_report", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (
                 id, type, claim, created_at, status,

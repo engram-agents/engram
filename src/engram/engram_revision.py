@@ -108,11 +108,13 @@ def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> No
 
 def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
     """Walk downstream from node_id following derives_from / supported_by
-    edges. Visits each downstream node at most once. For each live non-cs/ls
-    node visited, calls on_live_node(node) — the caller decides what to
-    write. Stops cascade at retracted/superseded nodes (node not is_current)
-    AND at cornerstones/lessons (vote-accumulator semantics — §2.0 of
-    PR-A-SPEC).
+    edges. Visits each downstream node at most once. For each live
+    claim-bearing node visited, calls on_live_node(node) — the caller
+    decides what to write. Stops cascade at retracted/superseded nodes
+    (node not is_current) AND at any non-claim-bearing (NCB) node — an NCB
+    node has no claim to re-adjudicate, so cascade reaching it accomplishes
+    nothing (#2252 W0). Cornerstones/lessons are the vote-accumulator
+    *instance* of this rule, not the rule itself.
 
     Visit pattern (Lei 2026-05-28): visited check is at the top of the call,
     BEFORE on_live_node fires. This guarantees on_live_node fires exactly
@@ -131,8 +133,8 @@ def _walk_cascade_downstream(conn, node_id, *, visited, on_live_node):
     ).fetchone()
     if not node:
         return  # retracted/superseded — stop cascade (parity with old _flag_stale)
-    if node["type"] in ("cornerstone", "lesson"):
-        return  # cs/ls skip rule (PR-A-SPEC §2.0)
+    if not core._is_claim_bearing(node["type"]):
+        return  # NCB: no claim to re-adjudicate, so nothing to taint (#2252 W0)
 
     on_live_node(node)
 
@@ -380,7 +382,7 @@ def _resolve_impl(
         ).fetchone()
         if not resolver:
             return json.dumps({"error": f"Resolving node '{resolving_node_id}' not found."})
-        if resolver["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(resolver["type"]):
             return json.dumps({
                 "error": f"Protocol violation: resolving node must be claim-bearing "
                          f"(observation, derivation, theory, axiom, conjecture). "

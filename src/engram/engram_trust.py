@@ -188,6 +188,7 @@ def _add_person_impl(
         # Resolve trust_tier column: use provided value or fall back to 'unknown'.
         tier_col = trust_tier.strip() if trust_tier and trust_tier.strip() else "unknown"
 
+        core._refuse_ncb_confidence("person", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at,
                status, metadata, trust_tier)
@@ -1090,6 +1091,7 @@ def _add_trust_signal_impl(
         ts_id = core._next_id(conn, "trust_signal")
         now = core._now()
 
+        core._refuse_ncb_confidence("trust_signal", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status,
                trust_signal_kind, trust_signal_polarity, trust_signal_weight)

@@ -70,8 +70,14 @@ from engram_core import EDGE_CLASSIFICATIONS
 # is actively wrong, see engram_core.py's EDGE_CLASSIFICATIONS comments on
 # those two relations). This is the authorising decision for the set
 # narrowing from four members to two.
+#
+# #2252 Stage 1.3 narrowed it again, from two members to one: `supported_by`
+# no longer carries cascade — post-1.3 it is NCB accumulation (the W0 doc:
+# 99.2% of live instances are cornerstone-sourced vote edges), and an NCB
+# target has no claim to re-adjudicate. See the `supported_by` entry's
+# comment in EDGE_CLASSIFICATIONS.
 _EXPECTED_CASCADE_RELATIONS = frozenset(
-    {"derives_from", "supported_by"}
+    {"derives_from"}
 )
 
 

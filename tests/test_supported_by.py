@@ -257,11 +257,27 @@ def test_predictive_observation_creates_correct_supported_by_edge():
     )
 
 
-def test_retract_predictive_observation_taints_prediction():
-    """Retracting the observation taints the prediction (not the reverse).
+def test_retract_predictive_observation_does_not_taint_prediction():
+    """Retracting the paired observation does NOT taint the prediction.
 
-    After the direction fix: prediction --supported_by--> observation.
-    Taint cascade: retract observation (target) → taint prediction (source).
+    #2252 Stage 1.3: `supported_by` no longer carries cascade, and
+    `prediction` is NCB (Q1 FINAL, Kepler's corrected #2281 ruling,
+    2026-08-27T00:46:05Z) — the walk stops at the prediction by partition
+    membership before it would even reach this edge. This is a real
+    exemption the partition grants, not a gap: the taint-walk's prior
+    behavior (asserted by this test's predecessor, pre-1.3) was itself the
+    defect Stage 1.3 removes.
+
+    Written in the BARE form deliberately — "the prediction is not
+    tainted," not "not tainted via supported_by." The narrower
+    via-supported_by wording (from #2283) rested on a since-retracted
+    ruling and is withdrawn; do not reintroduce it.
+
+    This is NOT the whole story: a prediction whose paired observation is
+    retracted still needs an orphan marker (#2281's proposed fix, not yet
+    built) — the taint-walk was quietly doing that job before Stage 1.3 and
+    no longer does. This test does not assert that gap is fine; it only
+    asserts the mechanism that used to (mis)cover it is gone.
     """
     rev, obs, _cs, core = _make_fresh_mods()
 
@@ -288,10 +304,200 @@ def test_retract_predictive_observation_taints_prediction():
     ))
     assert "error" not in ret, ret
 
-    # The prediction must be tainted
-    assert _is_tainted(core, pred_id, obs_id), (
-        f"Expected prediction {pred_id} to be tainted_by {obs_id} after "
-        f"retracting its supporting observation"
+    # The prediction must NOT be tainted — bare form (#2252 Stage 1.3).
+    assert not _is_tainted(core, pred_id, obs_id), (
+        f"Expected prediction {pred_id} to NOT be tainted_by {obs_id} — "
+        f"predictions are NCB and supported_by no longer cascades (#2252 Stage 1.3)"
+    )
+
+
+# ── 5. #2252 Stage 1.3 — derived NCB cascade skip ───────────────────────────
+
+
+def test_cascade_relations_is_derives_from_only():
+    """CASCADE_RELATIONS == {'derives_from'} after Stage 1.3.
+
+    Asserted directly so a future flag flip (e.g. re-adding cascade to
+    supported_by, or adding a new cascade-bearing relation) is loud rather
+    than silently changing cascade-walk behavior with no test to catch it.
+    """
+    assert engram_core.CASCADE_RELATIONS == frozenset({"derives_from"}), (
+        f"Expected CASCADE_RELATIONS == {{'derives_from'}}, got "
+        f"{engram_core.CASCADE_RELATIONS}"
+    )
+
+
+def test_derives_from_chain_between_cb_nodes_still_cascades():
+    """A derives_from chain between two CB nodes still cascades.
+
+    Guards against the derived NCB skip (#2252 Stage 1.3's
+    `_walk_cascade_downstream` change) over-firing and exempting
+    claim-bearing nodes it should not touch.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+    engram_derive = importlib.import_module("engram_derive")
+
+    obs_id = _seed_observation(obs, url="https://example.com/chain-root",
+                                claim="Root claim.", quote="Root quote.")
+
+    d1_r = json.loads(engram_derive._derive_impl(
+        claim="Derived from root.",
+        supporting_ids=obs_id,
+        logical_chain="root implies d1",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert "error" not in d1_r, d1_r
+    d1_id = d1_r["derivation_id"]
+
+    d2_r = json.loads(engram_derive._derive_impl(
+        claim="Derived from d1.",
+        supporting_ids=d1_id,
+        logical_chain="d1 implies d2",
+        reasoning_type="deductive_modus_ponens",
+    ))
+    assert "error" not in d2_r, d2_r
+    d2_id = d2_r["derivation_id"]
+
+    ret = json.loads(rev._retract_impl(
+        node_id=obs_id,
+        error_type="fabricated_quote",
+        reason="Root was fabricated.",
+    ))
+    assert "error" not in ret, ret
+
+    assert _is_tainted(core, d1_id, obs_id), (
+        f"Expected d1 {d1_id} to be tainted_by {obs_id} — direct derives_from cascade"
+    )
+    assert _is_tainted(core, d2_id, obs_id), (
+        f"Expected d2 {d2_id} to be tainted_by {obs_id} — derives_from cascade "
+        f"must still propagate through a chain of CB nodes"
+    )
+
+
+def test_retract_taints_trust_signal_dependent_via_derives_from():
+    """Retracting a CB node whose dependent is a trust_signal (reached via
+    derives_from, cascade: True) leaves the trust_signal untainted.
+
+    trust_signal is NCB; the derived skip (core._is_claim_bearing) exempts
+    it from the walk the same way it exempts cornerstone/lesson/prediction
+    — this is the resolution of the W0 doc's flagged trust_signal cascade
+    tension, folded automatically out of the derive-from-partition fix
+    rather than requiring its own hand-written exemption.
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+    engram_trust = importlib.import_module("engram_trust")
+
+    obs_id = _seed_observation(obs, url="https://example.com/trust-source",
+                                claim="Trust-relevant claim.", quote="Trust quote.")
+
+    person_r = json.loads(engram_trust._add_person_impl(
+        name="Test Person",
+    ))
+    assert "error" not in person_r, person_r
+    pn_id = person_r["person_id"]
+
+    ts_r = json.loads(engram_trust._add_trust_signal_impl(
+        subject_pn=pn_id,
+        source_obs_id=obs_id,
+        claim="Signal claim.",
+        kind="consistency",
+        polarity=1.0,
+        weight=0.5,
+    ))
+    assert "error" not in ts_r, ts_r
+    ts_id = ts_r["trust_signal_id"]
+
+    ret = json.loads(rev._retract_impl(
+        node_id=obs_id,
+        error_type="fabricated_quote",
+        reason="Source was fabricated.",
+    ))
+    assert "error" not in ret, ret
+
+    assert not _is_tainted(core, ts_id, obs_id), (
+        f"Expected trust_signal {ts_id} to NOT be tainted_by {obs_id} — "
+        f"trust_signal is NCB and the derived skip must stop the walk there"
+    )
+
+
+# ── 6. #2252 Stage 1.3 round 2 — pin the NCB-skip independently of supported_by ──
+
+
+def test_retract_taints_prediction_dependent_via_derives_from_reaches_ncb_membership_only():
+    """Reach a prediction via `derives_from` (still cascade=True) to isolate
+    the NCB-membership skip from `supported_by`'s cascade flag.
+
+    Ariadne's colleague review on PR #2289, finding 2: two mechanisms
+    independently protect predictions from taint —
+    (a) `supported_by` no longer cascades at all (Stage 1.3 §1), and
+    (b) the derived skip stops the walk at any NCB node (Stage 1.3 §2),
+    which includes `prediction`. `test_retract_predictive_observation_does_
+    not_taint_prediction` (test 3 above) asserts only the outcome, and her
+    mutation runs showed either change alone leaves it green — so if
+    `supported_by`'s cascade were ever restored, that test would stay green
+    while protection had silently halved.
+
+    This test isolates (b): the prediction is linked to the retracted root
+    NOT via the product `supported_by` edge (prediction --supported_by-->
+    paired observation, which no longer cascades and would trivially pass
+    regardless of NCB membership), but via a raw `derives_from` edge
+    (prediction --derives_from--> root), a relation that still carries
+    cascade=True. No product code path creates a `derives_from` edge into a
+    prediction node — inserted directly, mirroring the raw-SQL edge
+    fixtures already used for cascade-semantics probes elsewhere (e.g.
+    tests/test_cascade_semantics.py's round-trip and supported_by-from-cs
+    fixtures). If `_walk_cascade_downstream`'s skip ever regresses to the
+    old hand-written ("cornerstone", "lesson") tuple, this test goes RED
+    even though `supported_by`'s cascade flag is untouched — the same
+    single-mechanism-isolation property the trust_signal tests already have
+    (M1-alone reddens all three; mirrored here for prediction).
+    """
+    rev, obs, _cs, core = _make_fresh_mods()
+
+    root_id = _seed_observation(obs, url="https://example.com/pred-derives-root",
+                                 claim="Root premise for the prediction derives_from probe.")
+
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/pred-derives-paired",
+        title="Predictive source (derives_from probe)",
+        quoted_text="Signal predicts an upcoming event.",
+        interpretation="Signal predicts event.",
+        claim="Event will occur (derives_from probe).",
+        quote_type="attributed_analysis",
+        is_predictive=True,
+        predicted_event="Derives_from-probe event occurs within 90 days.",
+    ))
+    assert "error" not in r, r
+    pred_id = r["prediction_id"]
+
+    # Wire prediction --derives_from--> root directly. Not addable via the
+    # public engram_add_edge API (derives_from is cascade-bearing and
+    # excluded from _ADDABLE_AFTER_CREATION_RELATIONS by design), and no
+    # product creation path produces this edge shape for a prediction —
+    # this is the deliberate probe fixture, not a real product state.
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) "
+            "VALUES (?, ?, 'derives_from', ?)",
+            (pred_id, root_id, core._now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    ret = json.loads(rev._retract_impl(
+        node_id=root_id,
+        error_type="fabricated_quote",
+        reason="Root premise fabricated — derives_from-only cascade probe.",
+    ))
+    assert "error" not in ret, ret
+
+    assert not _is_tainted(core, pred_id, root_id), (
+        f"Expected prediction {pred_id} to NOT be tainted_by {root_id} — "
+        f"reached via derives_from (cascade=True), so only the NCB-"
+        f"membership skip (not supported_by's cascade flag) can be "
+        f"protecting it here (#2252 Stage 1.3 round 2, finding 2)"
     )
 
 

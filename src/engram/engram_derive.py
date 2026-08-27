@@ -236,7 +236,7 @@ def _derive_impl(
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
                 missing.append(sid)
-            elif row["type"] not in core.CLAIM_BEARING_TYPES:
+            elif not core._is_claim_bearing(row["type"]):
                 wrong_type.append(f"{sid} (type: {row['type']})")
         if missing:
             return json.dumps({"error": f"Supporting node(s) not found: {', '.join(missing)}"})
@@ -411,13 +411,13 @@ def _contradict_impl(
             return json.dumps({"error": f"Node '{node_id_a}' not found."})
         if not node_b:
             return json.dumps({"error": f"Node '{node_id_b}' not found."})
-        if node_a["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(node_a["type"]):
             return json.dumps({
                 "error": f"Protocol violation: contradictions can only link claim-bearing nodes "
                          f"(observations, derivations, theories, axioms, conjectures). Node '{node_id_a}' is type '{node_a['type']}'. "
                          f"Extract observations from evidence sources first, then flag contradictions between those observations.",
             })
-        if node_b["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(node_b["type"]):
             return json.dumps({
                 "error": f"Protocol violation: contradictions can only link claim-bearing nodes "
                          f"(observations, derivations, theories, axioms, conjectures). Node '{node_id_b}' is type '{node_b['type']}'. "
@@ -454,6 +454,7 @@ def _contradict_impl(
         node_id = core._next_id(conn, "contradiction")
         now = core._now()
 
+        core._refuse_ncb_confidence("contradiction", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status)
                VALUES (?, 'contradiction', ?, ?, 'active')""",
@@ -595,6 +596,7 @@ def _ask_impl(
         node_id = core._next_id(conn, "question")
         now = core._now()
 
+        core._refuse_ncb_confidence("question", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status,
                        question_category, question_lacks, last_assessed_turn, last_assessed_at)

@@ -514,6 +514,44 @@ def _is_claim_bearing(node_type: str) -> bool:
     return node_type in CLAIM_BEARING_TYPES
 
 
+def _refuse_ncb_confidence(node_type: str, confidence) -> None:
+    """Raise if `node_type` is non-claim-bearing (NCB) and `confidence` is
+    non-NULL.
+
+    #2252 Stage 1.3 write-path guard. Today the partition holds by
+    convention, not enforcement: most NCB `INSERT INTO nodes` sites simply
+    never name the `confidence` column, which is structural luck rather
+    than a guard — a new NCB write path that happened to pass a confidence
+    would get it silently. Every node-creation call site is expected to
+    call this, with the confidence value it is about to write (or `None`
+    where the column isn't set), immediately before its `INSERT INTO
+    nodes`.
+
+    Deliberately routed through `_is_claim_bearing` — never an inline type
+    list — so the check tracks `CLAIM_BEARING_TYPES` automatically as the
+    partition's membership declaration changes. `_stamp_new_node` is
+    deliberately NOT this guard's home: it feeds the *importance* formula,
+    not the stored `confidence` column, and conflating the two is the
+    trap #2252's W0 doc names (the "importance-seeding path" paragraph).
+
+    Call sites that pass a literal `None` are audit markers, not live
+    guards: they record that the site was reviewed and its type carries no
+    confidence column, and — because `confidence is not None` is
+    independent of partition membership — they cannot fire, under any
+    future change to `CLAIM_BEARING_TYPES`. Do not copy the `None` idiom
+    onto a new NCB write path believing it adds enforcement; if the new
+    site can ever receive a non-NULL confidence, pass that value through
+    instead so the guard is actually armed (round-2 colleague review on
+    PR #2289, Ariadne — "the call-site corpus otherwise teaches the
+    placebo idiom").
+    """
+    if confidence is not None and not _is_claim_bearing(node_type):
+        raise ValueError(
+            f"non-claim-bearing type '{node_type}' cannot carry a "
+            f"non-NULL confidence ({confidence!r}) — #2252 CB/NCB partition"
+        )
+
+
 # Valid TARGET types for the `instantiates` relation (#530): the principle-family
 # nodes a claim-bearing source can realize. Lessons are deliberately ABSENT —
 # incident → lesson membership is `exemplifies` territory (engine-coupled to the
@@ -657,7 +695,12 @@ EDGE_CLASSIFICATIONS = {
         "provenance": False,
     },
     "supported_by": {
-        "cascade": True,
+        "cascade": False,      # #2252 Stage 1.3: post-1.3 supported_by is NCB
+                                # accumulation (W0 doc: 99.2% of live instances are
+                                # cornerstone-sourced vote edges). An NCB target has
+                                # no claim to re-adjudicate, so cascade reaching it
+                                # accomplishes nothing. provenance/dag_check/removable
+                                # deliberately UNCHANGED — this is a cascade-only flip.
         "dag_check": True,
         "removable": False,
         "addable_after_creation": False,
@@ -7227,6 +7270,7 @@ def _create_derivation(
         f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
     )
 
+    _refuse_ncb_confidence("derivation", confidence)  # #2252 Stage 1.3 write-path guard
     conn.execute(
         """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
            confidence, confidence_history, metadata, recall_summary,

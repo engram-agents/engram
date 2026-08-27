@@ -163,6 +163,7 @@ def _add_axiom_impl(
         node_id = core._next_id(conn, "axiom")
         now = core._now()
 
+        core._refuse_ncb_confidence("axiom", 1.0)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                confidence, confidence_history, status, metadata)
@@ -288,6 +289,7 @@ def _add_definition_impl(
         combined_claim = f"{term}: {definition}"
         meta = json.dumps({"term": term, "definition": definition})
 
+        core._refuse_ncb_confidence("definition", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
                recall_summary, recall_keywords, needs_tightening, summary_missing)
@@ -442,6 +444,7 @@ def _add_conjecture_impl(
         node_id = core._next_id(conn, "conjecture")
         now = core._now()
 
+        core._refuse_ncb_confidence("conjecture", conf)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                confidence, confidence_history, status, metadata, recall_summary,
@@ -793,6 +796,7 @@ def _goal_tension_impl(
         node_id = core._next_id(conn, "goal_tension")
         now = core._now()
 
+        core._refuse_ncb_confidence("goal_tension", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain, status)
                VALUES (?, 'goal_tension', ?, ?, ?, 'open')""",
@@ -999,7 +1003,7 @@ def _add_lesson_impl(
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
                 missing.append(sid)
-            elif row["type"] not in core.CLAIM_BEARING_TYPES:
+            elif not core._is_claim_bearing(row["type"]):
                 wrong_type.append(f"{sid} (type: {row['type']})")
         if missing:
             return json.dumps({"error": f"Incident node(s) not found: {', '.join(missing)}"})
@@ -1051,6 +1055,7 @@ def _add_lesson_impl(
             # that an override was exercised against a real block condition).
             meta["bypass_prose_check"] = True
 
+        core._refuse_ncb_confidence("lesson", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                metadata, recall_summary,
@@ -1459,7 +1464,7 @@ def _register_exemplar_impl(
         ).fetchone()
         if not exemplar_row:
             return json.dumps({"error": f"Exemplar node not found: {exemplar_id}"})
-        if exemplar_row["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(exemplar_row["type"]):
             return json.dumps({
                 "error": (
                     f"Exemplar must be claim-bearing. {exemplar_id} has type "

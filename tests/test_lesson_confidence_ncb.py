@@ -408,3 +408,70 @@ def test_migration_does_not_re_touch_freshly_created_lesson_rows():
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. #2252 Stage 1.3 round 2 — `_refuse_ncb_confidence` wiring, demonstrated
+#    as a fireable mechanism (not just a fireable function)
+#
+# Round-1 verification (PR #2289 body) called the guard's *logic* correct
+# via a handful of spot checks, but the guard itself had zero test coverage
+# — the guard was demonstrated as callable and correct on the cases spot
+# checked, never as fired-by-iterating-every-type. Ariadne's colleague
+# review (finding 1) named the gap: 14 of 18 real call sites pass a literal
+# `None` and can never raise regardless of `_refuse_ncb_confidence`'s own
+# correctness, so nothing in the round-1 suite could have caught a broken
+# guard. These two tests close that: they call the guard directly across
+# the FULL derived membership set (never a hand-listed one), both
+# directions.
+# ---------------------------------------------------------------------------
+
+def _ncb_types(core):
+    """The full non-claim-bearing type set: everything in VALID_NODE_TYPES
+    that is not in CLAIM_BEARING_TYPES, plus `trust_signal` — which is
+    absent from VALID_NODE_TYPES entirely (a separate tracked gap, #2203)
+    but is a real NCB write-path guarded by `_refuse_ncb_confidence`
+    (engram_trust.py). Derived, never hand-listed — the whole point of
+    this rung is that the test tracks the classification, not a copy of it.
+    """
+    return (core.VALID_NODE_TYPES - core.CLAIM_BEARING_TYPES) | {"trust_signal"}
+
+
+def test_refuse_ncb_confidence_rejects_every_ncb_type():
+    """Every NCB type raises ValueError when passed a non-NULL confidence.
+
+    Iterates the derived NCB set (see _ncb_types) rather than the 13
+    NCB literals inline — re-listing them here would reproduce, in the
+    guard's own test, exactly the re-enumeration defect #2252 exists to
+    remove.
+    """
+    core = _fresh_mods()
+    ncb_types = _ncb_types(core)
+    assert len(ncb_types) >= 12, (
+        f"sanity: expected a double-digit NCB set, got {sorted(ncb_types)} "
+        f"— VALID_NODE_TYPES or CLAIM_BEARING_TYPES may have changed shape"
+    )
+    for node_type in sorted(ncb_types):
+        try:
+            core._refuse_ncb_confidence(node_type, 0.5)
+        except ValueError:
+            continue
+        else:
+            raise AssertionError(
+                f"_refuse_ncb_confidence('{node_type}', 0.5) did not raise — "
+                f"'{node_type}' is NCB and must reject a non-NULL confidence"
+            )
+
+
+def test_refuse_ncb_confidence_accepts_every_cb_type():
+    """Every claim-bearing type is ACCEPTED with a valid confidence.
+
+    The mirror direction of the test above. A guard test never seen to
+    pass-and-fail on both sides is not a control (round-2 spec, citing
+    Ariadne's finding 1) — this side confirms the guard doesn't
+    over-fire and start rejecting the types it must let through.
+    """
+    core = _fresh_mods()
+    for node_type in sorted(core.CLAIM_BEARING_TYPES):
+        core._refuse_ncb_confidence(node_type, 0.5)  # must not raise
+        core._refuse_ncb_confidence(node_type, None)  # NULL is always fine too

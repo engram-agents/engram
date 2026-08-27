@@ -939,6 +939,7 @@ def _add_evidence_impl(
         # Used by the dedup heuristic to grade action_hints by artifact kind.
         source_type = core._infer_source_type(url)
 
+        core._refuse_ncb_confidence("evidence", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, created_at, source_url, source_title,
                source_domain, source_date, source_accessed, content_snippet, metadata,
@@ -1398,6 +1399,7 @@ def _add_observation_impl(
         if source_class != "external":
             conf_reason += f" (source_class: {source_class})"
 
+        core._refuse_ncb_confidence(node_type, confidence)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
                interpretation, quote_type, confidence, confidence_history, metadata,
@@ -1471,6 +1473,7 @@ def _add_observation_impl(
                 result["prediction_status"] = "linked_to_existing"
             else:
                 prediction_id = core._next_id(conn, "prediction")
+                core._refuse_ncb_confidence("prediction", None)  # #2252 Stage 1.3 write-path guard
                 conn.execute(
                     """INSERT INTO nodes (id, type, predicted_event, resolution_timeframe,
                        status, created_at, confidence)

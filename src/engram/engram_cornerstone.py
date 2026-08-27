@@ -96,6 +96,7 @@ def _add_cornerstone_impl(
             "triggering_experience": triggering_experience,
         })
 
+        core._refuse_ncb_confidence("cornerstone", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
                VALUES (?, 'cornerstone', ?, ?, 'active', ?)""",
@@ -263,6 +264,7 @@ def _outgrow_cornerstone_impl(
             "outgrew": old_cornerstone_id,
         })
 
+        core._refuse_ncb_confidence("cornerstone", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
                supersedes, is_current)
@@ -750,7 +752,7 @@ def _add_edge_impl(
                         f"for incident→lesson membership use `exemplifies`."
                     )
                 })
-            if source["type"] not in core.CLAIM_BEARING_TYPES:
+            if not core._is_claim_bearing(source["type"]):
                 return json.dumps({
                     "error": (
                         f"'instantiates' sources must be claim-bearing "

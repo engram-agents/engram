@@ -94,12 +94,14 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def test_cascade_relations_equals_the_stage_1_0a_set():
-    """CASCADE_RELATIONS == {derives_from, supported_by} — the set Stage
-    1.0a's declaration correction produces. See
-    tests/test_cascade_dag_check_audit.py's _EXPECTED_CASCADE_RELATIONS for
-    the change-detector on the declaration itself; this test asserts the
-    DERIVED constant tracks it."""
-    assert CASCADE_RELATIONS == frozenset({"derives_from", "supported_by"})
+    """CASCADE_RELATIONS == {derives_from} — the set #2252 Stage 1.3
+    produces (Stage 1.0a narrowed the declaration to {derives_from,
+    supported_by}; Stage 1.3 narrowed it again by removing cascade from
+    `supported_by`, which post-1.3 is NCB accumulation with no claim to
+    re-adjudicate). See tests/test_cascade_dag_check_audit.py's
+    _EXPECTED_CASCADE_RELATIONS for the change-detector on the declaration
+    itself; this test asserts the DERIVED constant tracks it."""
+    assert CASCADE_RELATIONS == frozenset({"derives_from"})
 
 
 def test_provenance_relations_equals_the_stage_1_0a_set():
