@@ -1,15 +1,31 @@
 # Spec: #2252 W0 — the claim-bearing / non-claim-bearing type partition
 
-**Author:** Luria Hebb · **Date:** 2026-08-26, re-verified against `dev` at `f676721`. This is
+**Author:** Luria Hebb · **Date:** 2026-08-26, doc-alignment pass 2026-08-27 (issue #2299)
+re-verified against `dev` at `6b794df`. This is
 the **design of record** (#2252's W0 workstream) — it ratifies what was settled with @LeiShi
 in session (2026-08-25 evening) and refined through Stage 1.0/1.0a/1.0b (Borges, Kepler,
 Ariadne), reconciled against the code as merged through this doc's latest revision (`4431e89`
-#2255, `3d5cc6e` #2262, `4ff3fcb` #2260, `9f411f5` #2261, `76a4de1` #2266, `7c1ba57` #2263).
+#2255, `3d5cc6e` #2262, `4ff3fcb` #2260, `9f411f5` #2261, `76a4de1` #2266, `7c1ba57` #2263,
+`ac0e429` #2289 Stage 1.3, `6f8f21e` #2292, `6b794df` #2296 W6).
 **Nothing this doc describes is new design** — every claim below is either a direct read of
 `EDGE_CLASSIFICATIONS`/`CLAIM_BEARING_TYPES`/`VALID_NODE_TYPES` on the commit named above, or a
 settled answer already recorded in issue #2252. Where the issue's own early draft text
 disagrees with what actually shipped, this doc follows the shipped code and says so explicitly
 — a stale draft line is not the design of record; the merged declaration is.
+
+**2026-08-27 correction (issue #2299), stated plainly because the thing it corrects was itself
+stated plainly and confidently:** Stage 1.3 (#2289) landed the day after this doc's prior
+revision and flipped `supported_by`'s `cascade` flag to `False` — the exact narrowing the "edge
+partition" section below had described as pending. The section's own caveat paragraph asserted,
+with two confidence markers (*"confirmed directly from `EDGE_CLASSIFICATIONS`"* and *"full
+stop"*) built specifically to discourage re-checking, that `supported_by` still carried
+`cascade: True`. Once 1.3 merged, that paragraph was actively wrong — not stale-and-harmless,
+wrong-and-authoritative, since this file is the design of record. Found by Borges while
+reviewing W6 and reported on #2289; Ariadne corrected the framing (Borges's comment originally
+read as though the doc were already false on `dev`, when at that time `dev` still agreed and
+only the stack disagreed) and filed #2299 as its own issue so the fix has an address that
+survives #2289 closing. Fixed below; the caveat is kept as history (not deleted) per the same
+instinct that keeps this section's own revision-history note above.
 
 **This doc's own revision history is worth naming, not hiding, since it's an instance of the
 exact discipline it argues for.** Its first round (this doc's original commit) went stale
@@ -68,39 +84,48 @@ the commit, so that's an interesting fact, not a load-bearing claim.
 `goal`, `goal_tension`, `feeling_report`, `task`, `person`, `cornerstone`, `lesson`,
 `trust_signal`.
 
-**`trust_signal` is a real, live type with an unresolved cascade tension — named here rather
-than silently omitted.** It does not appear in `VALID_NODE_TYPES` at all (a separate,
-already-tracked gap — issue #2203, filed by Borges, Lei has ruled on the type-set half) — so a
-naive "NCB = `VALID_NODE_TYPES` minus `CLAIM_BEARING_TYPES`" derivation misses it entirely,
-which is exactly how an earlier draft of this doc did. It is unambiguously NCB by the
-partition's own definition (a trust signal carries no truth-evaluable claim), but its write
-path (`engram_trust.py`, `_add_trust_signal_impl`) mints a `derives_from` edge FROM the new
+**`trust_signal` is a real, live type whose cascade tension was resolved by Stage 1.3, named
+here as history rather than silently omitted.** It does not appear in `VALID_NODE_TYPES` at all
+(a separate, already-tracked gap — issue #2203, filed by Borges, Lei has ruled on the type-set
+half) — so a naive "NCB = `VALID_NODE_TYPES` minus `CLAIM_BEARING_TYPES`" derivation misses it
+entirely, which is exactly how an earlier draft of this doc did. It is unambiguously NCB by the
+partition's own definition (a trust signal carries no truth-evaluable claim), and its write path
+(`engram_trust.py`, `_add_trust_signal_impl`) mints a `derives_from` edge FROM the new
 `trust_signal` node TO the citing `observation` (the `about`-relation edge, separately, points
 at the person the signal concerns — the cascade-relevant edge is the `derives_from` one, not
-that one) — and `derives_from` is `cascade: True`. So if that observation is ever retracted,
-the taint-cascade walker (`_walk_cascade_downstream`, `engram_revision.py`) walks to whatever
-cites it via a cascade relation — which includes the `trust_signal` node, since its skip rule
-("cs/ls skip rule") exempts exactly two types, `cornerstone` and `lesson` — not `trust_signal`.
-So an NCB node type is, today, a live cascade-walk participant through this one edge. Borges has logged
-the cascade half of this alongside the type-set half on #2203 rather than opening a second
-tracker. **Flagged as an open item for Stage 1.3 to resolve** (either exempt `trust_signal` in
-the skip rule, or argue why it should stay a cascade participant) — not resolved by this doc.
+that one).
 
-**`prediction` has the identical structural gap — independently found by Borges (issue #2252
-comment, 2026-08-26T18:08:07Z) while specc'ing 1.3, not by this doc's author, and worth stating
-here rather than leaving it isolated as a test-update footnote later in this doc (the
-pairing-invariant section below).** `_walk_cascade_downstream`'s skip tuple exempts exactly
-`cornerstone` and `lesson`; `prediction` is NCB too and is absent from it, same as
-`trust_signal`. Unlike `trust_signal`, this isn't only a read-the-code inference:
-`tests/test_supported_by.py::test_retract_predictive_observation_taints_prediction` currently
-**passes**, proving the walk taints a `prediction` today. The underlying question — which NCB
-types the skip rule should exempt — is itself a **membership question** under this doc's own
-derive-vs-enumerate criterion (below: "derive where the question IS classification membership"),
-so this doc deliberately does not pre-answer it by hand-listing `{trust_signal, prediction}` as
-the fix. Borges's own read is that the skip-list should become derived from the NCB partition
-rather than enumerated — but flags that as widening 1.3's scope beyond a call he can make alone.
-**Flagged as an open item for Stage 1.3, same status as trust_signal above** — not resolved by
-this doc.
+> **History (the gap as it stood before Stage 1.3):** `derives_from` is `cascade: True`, so if
+> that observation was ever retracted, the taint-cascade walker (`_walk_cascade_downstream`,
+> `engram_revision.py`) would walk to whatever cited it via a cascade relation — which included
+> the `trust_signal` node, since its skip rule then ("cs/ls skip rule") exempted exactly two
+> types, `cornerstone` and `lesson` — not `trust_signal`. An NCB node type was, at that point, a
+> live cascade-walk participant through this one edge. Borges logged the cascade half of this
+> alongside the type-set half on #2203 rather than opening a second tracker; flagged as an open
+> item for Stage 1.3 to resolve.
+
+**Resolved by Stage 1.3 (#2289, merged), via the derive route Borges anticipated rather than a
+hand-list fix:** `_walk_cascade_downstream`'s skip check is no longer an enumerated tuple — it
+now reads `not core._is_claim_bearing(node["type"])`, so every NCB type, `trust_signal` included,
+is automatically exempted regardless of which specific types exist today or get added later. No
+`{trust_signal, prediction}` hand-list was ever written; the underlying membership question this
+doc's own derive-vs-enumerate criterion (below) says should be derived, is.
+
+**`prediction` had the identical structural gap and is resolved by the same mechanism —
+independently found by Borges (issue #2252 comment, 2026-08-26T18:08:07Z) while specc'ing 1.3,
+not by this doc's author, and worth stating here rather than leaving it isolated as a
+test-update footnote later in this doc (the pairing-invariant section below).**
+
+> **History:** `_walk_cascade_downstream`'s skip tuple then exempted exactly `cornerstone` and
+> `lesson`; `prediction` was NCB too and was absent from it, same as `trust_signal`. Unlike
+> `trust_signal`, this wasn't only a read-the-code inference: the taint-walk test then named
+> `test_retract_predictive_observation_taints_prediction` passed, proving the walk tainted a
+> `prediction` at that point.
+
+Now covered by the same derived skip (`not core._is_claim_bearing`) as `trust_signal` above —
+`prediction` is NCB, so the walker stops at it unconditionally. The orphan-detection
+consequence this created for the prediction-pairing edge specifically is a separate, now-also-
+resolved matter — see "the pairing invariant" below (engram-alpha#2281, merged as PR #2292).
 
 **`prediction` is NCB — this reverses an earlier draft in the issue and is worth stating
 explicitly because the reversal is easy to miss on a partial read.** Lei's own tentative call in
@@ -141,7 +166,7 @@ shared helper, closed by #2250/#2266's dead-write removal.
 
 ## The edge partition
 
-Source: `EDGE_CLASSIFICATIONS`, `src/engram/engram_core.py` (current `dev`, post-#2255/#2262).
+Source: `EDGE_CLASSIFICATIONS`, `src/engram/engram_core.py` (current `dev`, post-#2289/#2296).
 This is the actual shipped declaration — read from source, not reconstructed from the issue
 thread's earlier drafts, several of which (see below) turned out to be wrong about specific
 flag values.
@@ -149,7 +174,8 @@ flag values.
 | relation | cascade | provenance | dag_check | removable | notes |
 |---|---|---|---|---|---|
 | `derives_from` | **True** | **True** | True | False | CB cascade relation — taint/stale propagation |
-| `supported_by` | **True** | **True** | True | False | CB cascade relation (see caveat below) |
+| `supported_by` | **False** | **True** | True | False | NCB accumulation (cornerstone-sourced vote edges) — see history below |
+| `predicted_by` | **False** | **True** | True | False | prediction-pairing edge, split out of `supported_by` (#2252 W6) — see "the pairing invariant" below |
 | `cites` | False | True | True | False | provenance-only; overloaded with ~5 meanings (#2243/#4, separate workstream) |
 | `retracts` | **False** | False | True | False | revision-history: source exists *because* target was wrong (1.0a) |
 | `supersedes` | **False** | False | True | False | revision-history: same family as `retracts` (1.0a) |
@@ -162,18 +188,25 @@ flag values.
 | `subtask_of` | False | False | True | True | |
 | `tensions` | False | False | False | True | symmetric, DAG-exempt |
 
-**`derives_from` = CB cascade relation; `supported_by` = CB cascade relation TODAY, with a
-known future narrowing.** The issue's own early W0 draft line ("the edge partition:
-`derives_from` = CB cascade relation; `supported_by` = NCB accumulation, no cascade") **does
-not match the shipped declaration** and should not be treated as settled — `supported_by`
-carries `cascade: True` and `provenance: True` on `dev` right now, confirmed directly from
-`EDGE_CLASSIFICATIONS` and from Kepler's Stage-1.0a ruling itself: *"`cascade=True` should be
-exactly `{derives_from, supported_by}`."* The draft line was aspirational (a description of
-where `supported_by` is headed once its NCB-accumulation uses — 99.2% of current instances,
-cornerstone-sourced — are the only ones left), not a description of the current declaration.
-**Stage 1.3 is where `supported_by` is planned to stop carrying cascade** (per the issue's own
-W2 workstream: *"stop `supported_by` carrying cascade"*) — until that lands, treat
-`supported_by` as CB-cascade-bearing, full stop.
+**`derives_from` = CB cascade relation; `supported_by` = NCB accumulation, no cascade — settled,
+as of Stage 1.3 (#2289, merged).** The table above is the current, shipped state; the paragraph
+below is kept as **history**, not current state (per this doc's own "don't delete a dated-true
+passage" instinct, exercised earlier for the `lesson`/1.6 note above) — it records why the
+narrowing happened and, separately, is the exact passage that went stale-while-confident when
+1.3 landed (issue #2299).
+
+> **History (accurate through 2026-08-26, superseded 2026-08-27 by #2289's merge):** The
+> issue's own early W0 draft line ("the edge partition: `derives_from` = CB cascade relation;
+> `supported_by` = NCB accumulation, no cascade") did not match the shipped declaration at the
+> time this doc was first written, and was not yet settled — `supported_by` carried
+> `cascade: True` and `provenance: True` on `dev` at that point, confirmed directly from
+> `EDGE_CLASSIFICATIONS` and from Kepler's Stage-1.0a ruling itself: *"`cascade=True` should be
+> exactly `{derives_from, supported_by}`."* The draft line was aspirational then (a description
+> of where `supported_by` was headed once its NCB-accumulation uses — 99.2% of instances at
+> audit time, cornerstone-sourced — were the only ones left), not a description of the
+> declaration as it stood. Stage 1.3 is what carried out that narrowing; the draft line the
+> issue started with turned out to be exactly right about the destination, just early about the
+> arrival.
 
 **Why `retracts`/`supersedes` are `cascade: False` despite superficially looking like
 revision edges that "should" propagate** (Stage 1.0a, Kepler's ruling, decided by a concrete
@@ -218,19 +251,26 @@ property deserve to join automatically?** If yes, derive. If a human should deci
 — and staleness there is a *feature*, because it forces the decision to be made explicitly
 rather than drift in silently.
 
-Two sites are enumerated on purpose and will **not** auto-follow the `cascade`/`provenance`
-flags, even after Stage 1.3 changes them:
+Two sites are enumerated on purpose and do **not** auto-follow the `cascade`/`provenance`
+flags — including after Stage 1.3 (#2289) changed them:
 
 1. **`CITATION_SUPPORT_RELATIONS`** (`engram_core.py`) — `frozenset({"derives_from",
    "supported_by"})`, consumed by `engram_lifecycle.py`/`engram_stats.py` for a
    citation-coverage question ("is this observation cited by anything?"), which is NOT the
-   same question as cascade even though today's membership happens to coincide. The
-   constant's own comment states the reason explicitly: *"#2252 Stage 1.3 will remove
-   `cascade` from `supported_by`, and if this constant were derived from `CASCADE_RELATIONS`
-   instead, the uncited-observation metric would silently change meaning that day with no test
-   to catch it."* This is the load-bearing hand-update site for Stage 1.3 — when `supported_by`
-   loses cascade, `CITATION_SUPPORT_RELATIONS` does **not** change (citation-coverage still
-   wants both relations), and that divergence from `CASCADE_RELATIONS` is exactly the point.
+   same question as cascade, and — since Stage 1.3 (#2289, merged) — no longer even
+   numerically the same set: `CASCADE_RELATIONS` is now the strict subset `{derives_from}`,
+   while this constant still deliberately includes `supported_by`. Re-verified directly in
+   source (2026-08-27, issue #2299): the constant's own comment was itself updated by #2289's
+   own commit to describe this in the past tense, not left stale —
+   *"#2252 Stage 1.3 (now landed) removed `cascade` from `supported_by`, so the two sets are no
+   longer even numerically equal... Had this constant been derived from `CASCADE_RELATIONS`
+   instead of hand-enumerated, the uncited-observation metric would have silently changed
+   meaning on the day Stage 1.3 landed, with no test to catch it — the now-realized divergence
+   is exactly why it stays hand-enumerated."* Worth naming as its own small data point for this
+   doc's own thesis: the code comment upgraded itself from a "will happen" caveat to a
+   "did happen, and here's the proof it mattered" record on the same PR that made it true — this
+   doc's caveat paragraph (the edge-partition section above) needed a follow-up pass to do the
+   same; the source comment did not lag behind its own change.
 
 2. **`_trace_observation_leaves`'s premise-spine walk** (`engram_core.py`) — hardcodes
    `relation IN ('derives_from', 'supported_by')` rather than deriving from
@@ -328,43 +368,44 @@ literal string with this pairing). `EDGE_CLASSIFICATIONS['predicted_by']` carrie
 `provenance=True`, matching `supported_by`'s own non-cascade fields; not hand-addable
 (`addable_after_creation=False`) — minted once at node-add time only. Landed in #2252 W6.
 
-**A consequence worth flagging for whoever builds the pairing-relation rename — corrected here
-after a real gap Borges found (issue #2252 comment, 2026-08-26T18:08:07Z) that an earlier draft
-of this doc didn't account for:** the taint-walk test
-`tests/test_supported_by.py::test_retract_predictive_observation_taints_prediction` currently
-asserts the OLD (CB) semantics — that retracting the paired observation taints the prediction —
-and it currently **passes** (see the membership-section note above: `prediction` is absent from
-`_walk_cascade_downstream`'s skip tuple, same gap as `trust_signal`). Under the settled NCB
-ruling this assertion is stale and the test should eventually go red.
+**Resolved: engram-alpha#2281, merged as PR #2292 (2026-08-27).** The paragraphs below record
+the gap as it stood and the reasoning that shaped the fix — kept as history, not rewritten away,
+per this doc's own discipline — followed by what actually shipped.
 
-**The replacement is not simply "assert the inverse" — that presupposes the inverse is
-writable, and until now it was not.** Once the pairing edge stops carrying cascade (Stage 1.3's
-`supported_by` change), a `prediction` whose paired observation is later retracted gets no marker
-at all: none of the four `VALID_PREDICTION_OUTCOMES` values (`confirmed`, `partially_confirmed`,
-`refuted`, `partially_refuted`) represents "the observation this was minted from was retracted."
-Such a prediction would sit open and unmarked, permanently, with no outcome to assert against —
-today's cascade taint is quietly doing orphan-detection work for this case, not confidence
-propagation, and that's the one job Stage 1.3's `supported_by` change removes without naming a
-replacement.
+> **History.** A real gap Borges found (issue #2252 comment, 2026-08-26T18:08:07Z) that an
+> earlier draft of this doc didn't account for: the taint-walk test then named
+> `test_retract_predictive_observation_taints_prediction` asserted the OLD (CB) semantics — that
+> retracting the paired observation taints the prediction — and it then passed, because
+> `prediction` was absent from `_walk_cascade_downstream`'s skip tuple (same gap as
+> `trust_signal`, above). Once the pairing edge stopped carrying cascade (Stage 1.3's
+> `supported_by` change, then pending), a `prediction` whose paired observation was later
+> retracted would get no marker at all: none of the four `VALID_PREDICTION_OUTCOMES` values
+> (`confirmed`, `partially_confirmed`, `refuted`, `partially_refuted`) represents "the
+> observation this was minted from was retracted" — the cascade taint had quietly been doing
+> orphan-detection work for this case, not confidence propagation, and that was the one job the
+> `supported_by` change would remove without naming a replacement. The fix judged correct at
+> the time: **not** a fifth `VALID_PREDICTION_OUTCOMES` value (the four existing members answer
+> *did the predicted event happen*, a different question from *was the prediction's basis ever
+> valid*) but the existing retraction mechanism — retract means never-valid/error, supersede
+> means was-valid-then-updated, and a prediction minted from a fabricated observation was never
+> validly grounded, void ab initio, not refuted.
 
-**Answered, tracked separately: engram-alpha#2281** (filed after this doc's tip; Borges's design
-read). **Not a fifth `VALID_PREDICTION_OUTCOMES` value** — the four existing members all answer
-*did the predicted event happen*, a different question from *was the prediction's basis ever
-valid*, and the predicted event may still be genuinely pending when the basis is gone. **The
-mechanism already exists: retraction.** Retract means never-valid/error; supersede means
-was-valid-then-updated. A prediction minted from an observation that turns out fabricated was
-never validly grounded — void ab initio, not refuted — so the fix is a `prediction` branch in
-`_retract_impl` (propagating the parent's `error_type`), or a broader NCB-orphan sweep, not new
-enum vocabulary.
-
-**Load-bearing constraint for whoever writes the inverse test, preserved from #2281 because the
-wrong version of this test erases the gap it should be guarding:** write it NARROWLY — assert
-only that the prediction is not cascade-tainted. Do **not** write it as "nothing happens to the
-prediction," and this doc does **not** say the prediction is *correctly* left alone — a test
-asserting a gap is intended behavior is the hardest kind to ever remove, because the next reader
-sees a green test and closes their own investigation before #2281's proposed fix ever lands.
-#2281 is filed under the still-open umbrella epic (#2252); implementing its proposed fix remains
-open work.
+**What shipped, PR #2292:** a dedicated branch in `_retract_impl` (`engram_revision.py`) —
+retracting an `observation_predictive` now **retracts** (terminal, `status='retracted'`,
+`is_current=0` — not a taint marker) any `prediction` whose **sole live** basis it was, checked
+via a direct query independent of the general cascade walk (which, post-1.3, cannot reach a
+`prediction` at all — neither by the `supported_by`/`predicted_by` cascade flag, now `False`,
+nor by the walker's NCB skip). A prediction with another live `observation_predictive` still
+supporting it (the `linked_to_existing` reuse path, above) is left alone. Carries the parent's
+`error_type`; a prediction already resolved before its basis is retracted has its prior
+`status` preserved in `metadata.status_before_retraction` rather than silently displaced.
+Covered by `tests/test_supported_by.py`'s prediction-retract tests (renamed from the stale
+taint-assertion named above to `test_retract_predictive_observation_retracts_prediction_not_taints`,
+plus dedicated multi-basis, no-paired-prediction, sequential-retraction, and
+resolved-status-preservation tests). `engram_client.py`'s `engram_retract` tool description
+was updated to disclose the terminal side-effect — a tool contract that only describes the
+general taint case would leave a caller unable to predict that retracting one observation can
+kill a prediction outright.
 
 ## Lesson confidence (Q2, settled) — confidence dropped; maturity preserved by a different mechanism
 
@@ -392,7 +433,7 @@ retirement** (a node applying a principle should learn when that principle is re
 yet built as of this doc — no relation name or issue number confirmed; flagged as open rather
 than invented here.
 
-## Status as of this doc (2026-08-26)
+## Status as of this doc (2026-08-26, updated 2026-08-27 — issue #2299)
 
 | workstream | status | PR/issue |
 |---|---|---|
@@ -402,23 +443,29 @@ than invented here.
 | 1.4 — predictive-hint write-path affordance | merged | PR #2260 |
 | 1.7 — `min_confidence` CB-only predicate | merged | PR #2261 |
 | 1.5 (part) — #2250 cornerstone dead-write | merged | PR #2266 |
-| 1.6/1.6a — drop lesson confidence | **merged** | PR #2263 |
-| W2 (remainder) / 1.3 — refuse confidence on NCB types generally, refuse NCB nodes as premises, stop `supported_by` carrying cascade | not started, Borges specc'ing (open design questions to Kepler as of this doc) | — |
-| W3/W4 — migration + `cites` re-typing | not started | — |
-| 1.5 (remainder) — pairing-edge rename, misfiled edge | not started, Borges's lane | issue #2265 (blocker) |
-| W5 — cascade machine | blocked on W0-W4 | issue #2013 |
+| 1.6/1.6a — drop lesson confidence | merged | PR #2263 |
+| 1.5 (remainder-of-remainder) — `_retract_impl` prediction-basis-retraction branch | merged | issue #2281, PR #2292 |
+| W2 (remainder) / 1.3 — stop `supported_by` carrying cascade, NCB-derived cascade-walk skip, `_refuse_ncb_confidence` write-path guard | **merged** | PR #2289 (part of #2252) |
+| 1.5 (remainder), rename half — pairing-edge rename (`supported_by` → `predicted_by` for the prediction-pairing edge specifically) | **merged** | PR #2296 (W6) |
+| 1.5 (remainder), re-type half — the misfiled `supported_by` edge (a claim about which hooks can inject context, wrongly filed as derived-from a claim about handler types) re-typed to `about` | **still open — not resolved by this pass** | issue #2265 (blocker: no agent-facing path to re-type a provably-wrong `supported_by` edge, since `removable: False`) |
+| W3/W4 — migration + `cites` re-typing | not started, as far as this pass checked | — |
+| W5 — cascade machine (#2013 build table) | **build table open** (Kepler, 2026-08-27T21:12Z, forum #348) — the exit-criteria run on post-W6 `dev` is the stage's own precondition per the epic's derived-set mutation-site notes, not yet confirmed run as of this pass | issue #2013 |
 
 **Note on 1.3's scope, corrected from an earlier draft of this doc:** 1.3 is **not** "the
 confidence rung" — `lesson`'s confidence removal already shipped via 1.6/1.6a, ahead of and
-separately from 1.3. 1.3's remaining scope per the epic's W2 workstream is the other three
-enforcement pieces: refuse confidence on NCB types as a general write-path guard (not just
-`lesson`'s case), refuse NCB nodes as premises, and stop `supported_by` carrying cascade. The
-`trust_signal` cascade-tension flagged above is a candidate item for 1.3 to resolve, not yet
-assigned there as of this doc.
+separately from 1.3. 1.3's remaining scope per the epic's W2 workstream was the other
+enforcement pieces: a general NCB write-path confidence guard, and stopping `supported_by`
+carrying cascade. **This pass verified `_refuse_ncb_confidence`'s one call site (derivation
+creation) directly in source; it did not independently re-verify every NCB write path carries
+an equivalent guard, or re-derive the full scope of what 1.3 shipped beyond the two items this
+issue named** (`supported_by`'s cascade flag, the derived cascade-walk skip) — flagged as
+unchecked rather than asserted complete, per this doc's own discipline. The `trust_signal` and
+`prediction` cascade tensions flagged above are both resolved by the derived skip mechanism
+(confirmed directly in `_walk_cascade_downstream`'s source, above).
 
-This doc gates 1.3: its enforcement (refuse confidence on NCB types generally, refuse NCB
-nodes as premises, stop `supported_by` carrying cascade — `lesson`'s own confidence removal is
-already done, via 1.6/1.6a, not 1.3) is correct exactly to the extent it matches the
-membership, confidence rule, and edge partition stated above — not the other way around. If
-1.3's implementation needs to diverge from this doc, the divergence is a doc bug to fix here
-first, not a silent implementation choice.
+This doc gated 1.3 while it was open: its enforcement was correct exactly to the extent it
+matched the membership, confidence rule, and edge partition stated above. Now that 1.3 and W6
+have both merged, this doc's job flips — it describes the shipped state (as of the commit named
+in the header) rather than gating work still in flight. If a future reader finds the doc and
+`EDGE_CLASSIFICATIONS`/`CLAIM_BEARING_TYPES` disagree, the same rule still applies: the
+divergence is a doc bug to fix here, not a silent implementation choice to infer from.

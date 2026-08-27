@@ -62,13 +62,29 @@ above):
    implied by tests 1 and 3 together, kept here as explicit defense-in-depth
    rather than relied on as inference (Borges, PR #2293 colleague review).
 
-Deliberately NOT covered here (out of scope for #2277, per the doc's own
-prose): `EDGE_CLASSIFICATIONS` cascade/provenance flag values (e.g.
-`supported_by`'s `cascade: True`) — the doc explicitly flags that value as a
-known, imminent, in-flight change (#2252 Stage 1.3 / PR #2289), so binding it
-now would make this test go red on the very next unrelated merge, the
-opposite of this issue's intent. `CASCADE_RELATIONS` / `PROVENANCE_RELATIONS`
-already have their own binding tests in tests/test_cascade_derived_sets.py.
+**Edge-partition table binding, added issue #2299:** the exclusion this
+docstring originally stated here — `EDGE_CLASSIFICATIONS` cascade/provenance
+values were "a known, imminent, in-flight change (#2252 Stage 1.3 / PR
+#2289)" and binding them "would make this test go red on the very next
+unrelated merge" — was correct when #2277 was built and has since expired:
+#2289 merged, `supported_by`'s `cascade` flipped to `False` exactly as
+anticipated, and the doc's own edge-partition table (and its now-stale
+caveat paragraph) went briefly wrong-and-confident in the gap before anyone
+checked — which is #2299 itself, filed by Kepler after Borges caught it live
+on `dev`. That is the exact failure this exclusion's own point (a
+doc-binding test that declines to bind the one value that later goes false)
+predicted about itself, and #2299's own body names it explicitly: *"the one
+value the test declined to bind is exactly the value that is now false, and
+the test cannot report it."* The in-flight change is no longer in flight, so
+the exclusion's justification is gone — `_parse_doc_edge_table` below now
+binds the doc's "## The edge partition" table (all four boolean columns:
+cascade, provenance, dag_check, removable) to `EDGE_CLASSIFICATIONS`
+directly, the same reads-the-actual-doc discipline as the membership parser
+above. `CASCADE_RELATIONS` / `PROVENANCE_RELATIONS` still have their own,
+separate derivation-correctness binding in tests/test_cascade_derived_sets.py
+— that file checks the constants are *wired right*; this one checks the doc
+*describes them right*, which is a different question the other file cannot
+answer (it never reads the doc).
 
 Import-pattern contract (#948-style): imports engram_core directly and
 contains no ``import server``.
@@ -232,4 +248,166 @@ def test_valid_node_types_fully_partitioned():
         "docs/specs/2252-cb-ncb-partition.md's NCB list overlap — a node "
         "type is claimed as both CB and NCB, which violates the doc's own "
         "partition definition"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Edge-partition table binding (issue #2299) — parse the "## The edge
+# partition" markdown table at test time and bind its four boolean columns
+# to EDGE_CLASSIFICATIONS, the same discipline as the type-list parser above.
+# ---------------------------------------------------------------------------
+
+_EDGE_TABLE_ROW_RE = re.compile(
+    r"^\|\s*`([a-zA-Z_]+)`\s*\|"          # relation, backtick-quoted
+    r"\s*\**(True|False)\**\s*\|"          # cascade — optionally **bold**
+    r"\s*\**(True|False)\**\s*\|"          # provenance — optionally **bold**
+    r"\s*\**(True|False)\**\s*\|"          # dag_check
+    r"\s*\**(True|False)\**\s*\|",         # removable
+    re.MULTILINE,
+)
+
+
+def _parse_doc_edge_table(doc_text):
+    """Parse docs/specs/2252-cb-ncb-partition.md's "## The edge partition"
+    table into {relation: {"cascade": bool, "provenance": bool,
+    "dag_check": bool, "removable": bool}}.
+
+    Matched by the row shape itself (a line starting "| `relation` | ..."), not by
+    slicing between section headers — every data row in this table starts
+    with a backtick-quoted relation name immediately after the leading
+    `| `, and nothing else in the doc does (checked: this is the ONLY
+    matching line shape in the file, verified when this parser was written
+    — issue #2299). A markdown bold marker (`**True**`/`**False**`) is
+    stripped, not required: some cells are emphasized (the values Stage 1.3
+    changed) and some aren't, and the boolean the cell states is the same
+    either way.
+
+    Deliberately fails LOUDLY (raises) rather than returning an empty/wrong
+    dict if zero rows match — a shape change here is a signal this parser
+    needs updating alongside the doc, not a silent pass-through, same
+    discipline as `_parse_doc_type_list` above.
+
+    The row regex above binds cells to flag names by POSITION (1st boolean
+    cell = cascade, 2nd = provenance, ...), not by reading a column label —
+    so a doc edit that reordered the table's columns (e.g. swapping
+    `provenance` and `dag_check`) would silently mis-bind every row's
+    values to the wrong flag name without the "zero rows match" guard above
+    ever firing (the row shape still matches; only the meaning of each
+    position changed). Guarded explicitly here (round-1 reviewer-fairy
+    finding, PR #2301) by checking the table's own header row states the
+    column order this parser assumes, before trusting any row.
+    """
+    header_match = re.search(
+        r"^\|\s*relation\s*\|\s*cascade\s*\|\s*provenance\s*\|\s*dag_check\s*\|"
+        r"\s*removable\s*\|",
+        doc_text,
+        re.MULTILINE,
+    )
+    if not header_match:
+        raise AssertionError(
+            f"Could not find the edge-partition table's header row "
+            f"('| relation | cascade | provenance | dag_check | removable "
+            f"| ...') in {_DOC_PATH} in that exact column order — "
+            f"_parse_doc_edge_table's row regex binds cells to flag names "
+            f"by position, so either the header changed order or this "
+            f"parser is being run against the wrong section; update "
+            f"_parse_doc_edge_table's regex to match the doc's actual "
+            f"column order before trusting any parsed row."
+        )
+    rows = {}
+    for line in doc_text.splitlines():
+        m = _EDGE_TABLE_ROW_RE.match(line)
+        if not m:
+            continue
+        relation, cascade, provenance, dag_check, removable = m.groups()
+        rows[relation] = {
+            "cascade": cascade == "True",
+            "provenance": provenance == "True",
+            "dag_check": dag_check == "True",
+            "removable": removable == "True",
+        }
+    if not rows:
+        raise AssertionError(
+            f"Could not find any '| `relation` | True/False | ... |' table "
+            f"rows in {_DOC_PATH} — the doc's edge-partition table has "
+            f"changed shape; update _parse_doc_edge_table in this file to "
+            f"match."
+        )
+    return rows
+
+
+DOC_EDGE_TABLE = _parse_doc_edge_table(_DOC_TEXT)
+
+# The four columns the doc's table carries and this binding covers.
+# addable_after_creation is a real EDGE_CLASSIFICATIONS field but has no
+# column in the doc's table (the doc's prose covers it narratively per-edge
+# instead — e.g. "minted once at node-add time only" in the pairing-invariant
+# section) — deliberately not asserted here for that reason, not an oversight.
+_BOUND_EDGE_COLUMNS = ("cascade", "provenance", "dag_check", "removable")
+
+
+def test_edge_table_relations_match_edge_classifications_keys():
+    """Every relation in EDGE_CLASSIFICATIONS appears in the doc's table,
+    and vice versa — the doc's edge-partition table is a complete
+    enumeration, not a partial one that happens to cover today's relations.
+
+    If this fails because a new relation was added to EDGE_CLASSIFICATIONS,
+    the doc's table needs a new row (and this test isn't wrong to demand
+    one — an edge-partition doc that silently omits a real relation is
+    exactly the "site nobody tests" gap #2299 exists to close). If it fails
+    because the doc's table has a row for a relation no longer in
+    EDGE_CLASSIFICATIONS, the doc's row is stale and should be removed (or
+    moved to a History block, per this doc's own discipline for retired
+    claims).
+    """
+    doc_relations = frozenset(DOC_EDGE_TABLE)
+    code_relations = frozenset(engram_core.EDGE_CLASSIFICATIONS)
+    assert doc_relations == code_relations, (
+        "docs/specs/2252-cb-ncb-partition.md's edge-partition table "
+        f"relations ({sorted(doc_relations)}) no longer match "
+        f"engram_core.EDGE_CLASSIFICATIONS's keys ({sorted(code_relations)}) "
+        f"— missing from doc: {sorted(code_relations - doc_relations)}; "
+        f"extra in doc: {sorted(doc_relations - code_relations)}"
+    )
+
+
+def test_edge_table_flags_match_edge_classifications():
+    """Pins every (relation, column) cell in the doc's edge-partition table
+    to the matching EDGE_CLASSIFICATIONS flag, for all four bound columns
+    (cascade, provenance, dag_check, removable).
+
+    This is the specific regression guard for the #2299 incident: Stage 1.3
+    (#2289) flipped `supported_by`'s `cascade` flag to False in code while
+    the doc's table still asserted **True**, with a caveat paragraph adding
+    two confidence markers ("confirmed directly from EDGE_CLASSIFICATIONS",
+    "full stop") built specifically to discourage re-checking. Had this test
+    existed then, it would have gone red the moment #2289 merged instead of
+    staying silently wrong until Borges caught it by hand while reviewing
+    W6. Runs as one assertion per (relation, column) rather than one big
+    dict-equality so a failure names exactly which cell is wrong, not just
+    that something in the table is.
+    """
+    mismatches = []
+    for relation, doc_flags in sorted(DOC_EDGE_TABLE.items()):
+        code_flags = engram_core.EDGE_CLASSIFICATIONS.get(relation)
+        if code_flags is None:
+            # Covered by test_edge_table_relations_match_edge_classifications_keys;
+            # skip here so this test's failure list stays about value
+            # mismatches, not membership mismatches.
+            continue
+        for column in _BOUND_EDGE_COLUMNS:
+            if doc_flags[column] != code_flags[column]:
+                mismatches.append(
+                    f"`{relation}`.{column}: doc says {doc_flags[column]}, "
+                    f"EDGE_CLASSIFICATIONS says {code_flags[column]}"
+                )
+    assert not mismatches, (
+        "docs/specs/2252-cb-ncb-partition.md's edge-partition table "
+        "disagrees with engram_core.EDGE_CLASSIFICATIONS on "
+        f"{len(mismatches)} cell(s):\n"
+        + "\n".join(f"  - {m}" for m in mismatches)
+        + "\nUpdate the doc's table row(s) to match the shipped declaration "
+        "— unless this is a deliberate flag change, in which case update "
+        "EDGE_CLASSIFICATIONS's comment, the doc's table, AND this test's "
+        "expectations together."
     )
