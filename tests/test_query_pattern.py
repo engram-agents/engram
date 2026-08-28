@@ -30,6 +30,7 @@ import atexit
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -986,7 +987,248 @@ def test_recent_resolution_echo_dispatches_cleanly():
     ))
     assert "results" in r
     assert "total_matches" in r
-    assert isinstance(r["results"], list)
+
+
+# ── #1860: category 1/6 status-filter widening (open -> open + partially_resolved) ──
+#
+# Both _pattern_open_question_answerable and _pattern_recent_resolution_echo
+# match candidates via core._semantic_search, which has NO fts/keyword
+# fallback (engram_core.py:4008-4009 returns [] unconditionally once
+# _embedder.is_available() is False) — unlike the tests elsewhere in this
+# suite that combine semantic + FTS. This whole file runs under
+# ENGRAM_NO_EMBEDDINGS=1 for determinism, so a genuine positive-match test
+# for either pattern needs a deterministic stand-in for _semantic_search
+# rather than a real embedding model. _stub_semantic_search below scores by
+# simple word-overlap (Jaccard) against the real claim text in the DB —
+# still exercises the real SQL/status-filter/type-filter code path in the
+# pattern functions themselves, just replaces the embedding-similarity step.
+
+
+def _words(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _stub_semantic_search(conn, query_text, top_k=10, min_similarity=0.3,
+                           type_filter=None, importance_threshold=0.0,
+                           include_superseded=False):
+    query_words = _words(query_text)
+    rows = conn.execute(
+        "SELECT id, type, claim, confidence, quote_type FROM nodes "
+        "WHERE is_current=1 AND (status IS NULL OR status != 'retracted')"
+    ).fetchall()
+    scored = []
+    for r in rows:
+        if type_filter and r["type"] not in type_filter:
+            continue
+        claim = r["claim"] or ""
+        claim_words = _words(claim)
+        if not claim_words or not query_words:
+            continue
+        overlap = len(query_words & claim_words) / len(query_words | claim_words)
+        if overlap >= min_similarity:
+            scored.append({
+                "id": r["id"], "type": r["type"], "claim": claim,
+                "confidence": r["confidence"], "quote_type": r["quote_type"],
+                "similarity": round(overlap, 4),
+            })
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:top_k]
+
+
+def test_open_question_answerable_admits_partially_resolved_question(monkeypatch):
+    """A partially_resolved question (some evidence landed, but below the
+    0.7 resolution-confidence threshold) must be a candidate, not silently
+    excluded — #1860. Previously the filter was status='open' only."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    q_result = json.loads(drv._ask_impl(
+        question="What causes the recall-hook habituation-decay slip on the sixth fire?",
+        category="research",
+    ))
+    q_id = q_result["question_id"]
+
+    # A low-confidence (editorial, ~0.35) observation resolves the question
+    # PARTIALLY -- below DEFAULT_RESOLUTION_THRESHOLD (0.7), so status lands
+    # on partially_resolved rather than resolved (engram_revision.py:429-432).
+    partial_obs = _add_observation(
+        obs, "The habituation-decay slip on the sixth fire may relate to render-length keying"
+    )
+    conn = core._get_db()
+    conn.execute("UPDATE nodes SET confidence=0.35 WHERE id=?", (partial_obs,))
+    conn.commit()
+    conn.close()
+    rev._resolve_impl(target_id=q_id, resolving_node_id=partial_obs)
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (q_id,)).fetchone()
+    assert status_row[0] == "partially_resolved", (
+        f"test fixture assumption broken: expected partially_resolved, got {status_row[0]!r}"
+    )
+    conn.close()
+
+    # A derivation with closely-overlapping claim text -- the candidate a
+    # real dream-fairy pass should surface for this now-partially-resolved
+    # question.
+    deriv_result = json.loads(drv._derive_impl(
+        claim="The recall-hook habituation-decay slip on the sixth fire is caused by render-length keying",
+        supporting_ids=partial_obs,
+        logical_chain="The partial-resolution observation directly names the mechanism.",
+        reasoning_type="abductive_best_explanation",
+    ))
+    deriv_id = deriv_result["derivation_id"]
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_open_question_answerable(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert q_id in ids, (
+        "partially_resolved question was excluded from the candidate set -- "
+        "the #1860 filter widening regressed"
+    )
+    matched = next(c for c in candidates if c["id"] == q_id)
+    assert matched["candidate_resolution"]["id"] == deriv_id
+
+
+def test_open_question_answerable_still_admits_open_question(monkeypatch):
+    """Regression guard: widening the filter to include partially_resolved
+    must not accidentally drop plain open questions."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    q_result = json.loads(drv._ask_impl(
+        question="Why does the surface daemon leak file handles on restart?",
+        category="research",
+    ))
+    q_id = q_result["question_id"]
+
+    obs_id = _add_observation(obs, "File handle leak on restart traces to a missing close() in the reap path")
+    deriv_result = json.loads(drv._derive_impl(
+        claim="The surface daemon leaks file handles on restart because reap() skips close()",
+        supporting_ids=obs_id,
+        logical_chain="The observation directly names the missing call.",
+        reasoning_type="abductive_best_explanation",
+    ))
+    deriv_id = deriv_result["derivation_id"]
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_open_question_answerable(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert q_id in ids
+    matched = next(c for c in candidates if c["id"] == q_id)
+    assert matched["candidate_resolution"]["id"] == deriv_id
+
+
+def test_recent_resolution_echo_admits_partially_resolved_question(monkeypatch):
+    """Same #1860 widening, category 6: a partially_resolved question
+    semantically close to a just-landed resolution must be surfaced as a
+    candidate echo, not silently excluded."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    # The resolution that will anchor the echo search. Wording deliberately
+    # mirrors echo_q's question below closely -- the stub scores by plain
+    # word-overlap (no real embedder in this test harness), so the fixture
+    # needs strong lexical overlap to stand in for semantic similarity.
+    resolved_q = json.loads(drv._ask_impl(
+        question="does category three correctly exempt seed axioms via the basis string check",
+        category="research",
+    ))
+    resolved_q_id = resolved_q["question_id"]
+    resolver_obs = _add_observation(
+        obs, "category three correctly exempts seed axioms via the basis string check"
+    )
+    rev._resolve_impl(target_id=resolved_q_id, resolving_node_id=resolver_obs)
+
+    # A DIFFERENT, still-open-ish question, semantically close to the
+    # resolution above, but only partially_resolved.
+    echo_q = json.loads(drv._ask_impl(
+        question="does category three correctly exempt seed axioms via the basis string check for cornerstones too",
+        category="research",
+    ))
+    echo_q_id = echo_q["question_id"]
+    partial_obs = _add_observation(
+        obs, "category three may also need to exempt cornerstones, unconfirmed"
+    )
+    conn = core._get_db()
+    conn.execute("UPDATE nodes SET confidence=0.35 WHERE id=?", (partial_obs,))
+    conn.commit()
+    conn.close()
+    rev._resolve_impl(target_id=echo_q_id, resolving_node_id=partial_obs)
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (echo_q_id,)).fetchone()
+    assert status_row[0] == "partially_resolved", (
+        f"test fixture assumption broken: expected partially_resolved, got {status_row[0]!r}"
+    )
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_recent_resolution_echo(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert echo_q_id in ids, (
+        "partially_resolved question was excluded from the resolution-echo "
+        "candidate set -- the #1860 filter widening regressed"
+    )
+
+
+def test_recent_resolution_echo_still_admits_open_question(monkeypatch):
+    """Regression guard: widening category 6's status check to include
+    partially_resolved must not accidentally drop plain open questions --
+    mirrors test_open_question_answerable_still_admits_open_question's
+    coverage for category 1."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    resolved_q = json.loads(drv._ask_impl(
+        question="does the surface daemon correctly reap stray file handles on restart",
+        category="research",
+    ))
+    resolved_q_id = resolved_q["question_id"]
+    resolver_obs = _add_observation(
+        obs, "the surface daemon correctly reaps stray file handles on restart"
+    )
+    rev._resolve_impl(target_id=resolved_q_id, resolving_node_id=resolver_obs)
+
+    # A different, plain OPEN question (never resolved at all) that's
+    # semantically close to the resolution above.
+    echo_q = json.loads(drv._ask_impl(
+        question="does the surface daemon correctly reap stray file handles on restart for the voice service too",
+        category="research",
+    ))
+    echo_q_id = echo_q["question_id"]
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (echo_q_id,)).fetchone()
+    assert status_row[0] == "open", (
+        f"test fixture assumption broken: expected open, got {status_row[0]!r}"
+    )
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_recent_resolution_echo(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert echo_q_id in ids, (
+        "plain open question was excluded from the resolution-echo candidate "
+        "set -- the #1860 filter widening accidentally narrowed instead of widened"
+    )
 
 
 # ── min_confidence CB-only predicate, main hybrid-search path ─────────────

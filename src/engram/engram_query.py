@@ -237,9 +237,16 @@ def _pattern_open_question_answerable(
     top_k = int(preset_params.get("top_k", 15))
     min_conf = float(preset_params.get("min_confidence", 0.0))
 
+    # #1860: widened from status='open' alone -- a partially_resolved question
+    # already has some evidence landed, making it the MOST likely to have a
+    # derivation chain nearby, not less. The prior open-only filter silently
+    # admitted a near-empty candidate set on graphs where most live questions
+    # sit at partially_resolved, and the fairy reported that as "clean" rather
+    # than "out of scope" -- see #1860 for the false-completeness failure mode.
     questions = conn.execute(
         "SELECT id, claim FROM nodes "
-        "WHERE type='question' AND is_current=1 AND status='open' "
+        "WHERE type='question' AND is_current=1 "
+        "AND status IN ('open', 'partially_resolved') "
         "ORDER BY id DESC LIMIT 200"
     ).fetchall()
 
@@ -741,7 +748,12 @@ def _pattern_recent_resolution_echo(
             row = conn.execute(
                 "SELECT status FROM nodes WHERE id=?", (m["id"],)
             ).fetchone()
-            if not row or row[0] != "open":
+            # #1860: widened from == "open" -- same rationale as Category 1's
+            # filter above _pattern_open_question_answerable: a
+            # partially_resolved question already has evidence landed, so a
+            # semantically-close recent resolution is a plausible echo for it
+            # too, not just for fully-open questions.
+            if not row or row[0] not in ("open", "partially_resolved"):
                 continue
             seen_questions.add(m["id"])
             candidates.append({
