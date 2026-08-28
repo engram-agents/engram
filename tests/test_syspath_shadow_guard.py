@@ -24,6 +24,22 @@ merely check today's known collision, it fails loudly the moment ANY test
 file (present or future) reintroduces the anti-pattern, naming the file,
 line, and the colliding names -- so file #8 (the issue's own phrase) gets
 caught before it ever reaches the confusing collection-time failure.
+
+## Bound (#2111)
+
+The guard detects a specific, named set of mechanisms for putting a
+tools-ish directory at `sys.path` position 0: `sys.path.insert(0, ...)`
+(directly, or reached via a `p = sys.path` value-alias, an `import sys as s`
+module-alias, `from sys import path`, or `getattr(sys, "path")`), the
+in-place slice-assignment forms `sys.path[0:0] = [...]` / `sys.path[:0] =
+[...]` (and the same through any of the same alias/import/getattr forms,
+since slice-assignment mutates the shared list object), and direct
+rebinding of the module attribute itself (`sys.path = [...] + sys.path`).
+It is **not** a general points-to analysis of every conceivable way to
+manipulate `sys.path` -- e.g. `sys.path.__setitem__`, augmented assignment
+(`sys.path[0:0] += [...]`), `unittest.mock.patch("sys.path", ...)`, or
+mutation through a name that only *copied* a value once and was never
+tracked back to `sys.path` -- and does not attempt to be.
 """
 
 from __future__ import annotations
@@ -196,25 +212,97 @@ class _AliasTable:
         return self._assignments.get(name)
 
 
-def _is_sys_path_expr(
-    node: ast.expr, alias: _AliasTable, seen: frozenset = frozenset()
-) -> bool:
-    """True if *node* resolves to `sys.path` -- directly, or through a
-    chain of alias-table lookups (bypass #2: `p = sys.path`)."""
+def _collect_import_bindings(nodes) -> "tuple[set[str], set[str]]":
+    """Scope-bounded scan (same *nodes* shape as `_collect_assignments`,
+    i.e. already produced by `_iter_scope_nodes`) for two binding classes
+    #2111 needs beyond `name = <expr>`: names bound to the `sys` MODULE
+    object (`import sys as s` -- bare `import sys` also lands here via the
+    caller unioning in the literal `"sys"`), and names bound directly to
+    the `sys.path` ATTRIBUTE (`from sys import path` / `from sys import
+    path as p`). Returns ``(sys_module_names, sys_path_names)``, each a
+    plain (unscoped-merge) set -- the caller chains these across the same
+    module/ancestor/own lexical scoping `_find_insert0_violations` already
+    does for the assignment-alias table."""
+    sys_module_names: set[str] = set()
+    sys_path_names: set[str] = set()
+    for node in nodes:
+        if isinstance(node, ast.Import):
+            for alias_node in node.names:
+                if alias_node.name == "sys":
+                    sys_module_names.add(alias_node.asname or "sys")
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "sys":
+                for alias_node in node.names:
+                    if alias_node.name == "path":
+                        sys_path_names.add(alias_node.asname or "path")
+    return sys_module_names, sys_path_names
+
+
+def _is_sys_path_attribute(node: ast.expr, sys_module_names: frozenset) -> bool:
+    """STRICT form: True only if *node* is literally the `sys.path`
+    ATTRIBUTE expression itself -- directly (`sys.path`), through a module
+    alias (`import sys as s` -> `s.path`), or through a dynamic lookup
+    (`getattr(sys, "path")` / `getattr(s, "path")`). Deliberately does NOT
+    chase the value-alias chain (`p = sys.path`) or a direct-imported name
+    (`from sys import path` -> bare `path`) the way `_is_sys_path_expr`
+    does for a *read* site (an `.insert(...)`/slice-mutation receiver) --
+    this form exists only for #2111's rebinding-target check
+    (`sys.path = ...`), where reassigning a name that merely COPIED a
+    reference (`p = sys.path; p = [...]`, or `from sys import path; path =
+    [...]`) rebinds only the LOCAL name and never touches the real
+    `sys.path` attribute on the module -- not a violation, and conflating
+    it with one would be a false positive."""
     if (
         isinstance(node, ast.Attribute)
         and node.attr == "path"
         and isinstance(node.value, ast.Name)
-        and node.value.id == "sys"
+        and node.value.id in sys_module_names
     ):
         return True
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) == 2
+        and not node.keywords
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in sys_module_names
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == "path"
+    ):
+        return True
+    return False
+
+
+def _is_sys_path_expr(
+    node: ast.expr,
+    alias: _AliasTable,
+    sys_module_names: frozenset,
+    sys_path_names: frozenset,
+    seen: frozenset = frozenset(),
+) -> bool:
+    """True if *node* resolves to `sys.path` -- directly or via a module
+    alias or dynamic `getattr` (delegated to the strict
+    `_is_sys_path_attribute` check, #2111), a name directly imported via
+    `from sys import path` (#2111), or through a chain of alias-table
+    lookups (bypass #2: `p = sys.path`). This is the permissive form used
+    for anything that only READS/mutates-in-place through the reference
+    (an `.insert(...)` receiver, or a slice-assignment target) -- all of
+    these forms genuinely reach the same underlying list object, unlike
+    the rebinding case `_is_sys_path_attribute` alone guards."""
+    if _is_sys_path_attribute(node, sys_module_names):
+        return True
     if isinstance(node, ast.Name):
+        if node.id in sys_path_names:
+            return True
         if node.id in seen or len(seen) >= _MAX_ALIAS_CHAIN_DEPTH:
             return False
         target = alias.lookup(node.id)
         if target is None:
             return False
-        return _is_sys_path_expr(target, alias, seen | {node.id})
+        return _is_sys_path_expr(
+            target, alias, sys_module_names, sys_path_names, seen | {node.id}
+        )
     return False
 
 
@@ -392,7 +480,12 @@ def _check_insert_call(call: ast.Call, alias: _AliasTable) -> "tuple[bool, str]"
     return False, ""
 
 
-def _scan_calls(nodes, alias: "_AliasTable") -> "list[tuple[int, str]]":
+def _scan_calls(
+    nodes,
+    alias: "_AliasTable",
+    sys_module_names: frozenset,
+    sys_path_names: frozenset,
+) -> "list[tuple[int, str]]":
     """Check every `Call` node in *nodes* (a scope-bounded node sequence)
     against *alias*, the resolution table for THAT scope. Shared by the
     module-level scan and every per-function scan below."""
@@ -403,11 +496,71 @@ def _scan_calls(nodes, alias: "_AliasTable") -> "list[tuple[int, str]]":
         func = node.func
         if not (isinstance(func, ast.Attribute) and func.attr == "insert"):
             continue
-        if not _is_sys_path_expr(func.value, alias):
+        if not _is_sys_path_expr(func.value, alias, sys_module_names, sys_path_names):
             continue
         is_violation, detail = _check_insert_call(node, alias)
         if is_violation:
             offenders.append((node.lineno, detail))
+    return offenders
+
+
+def _scan_assignments(
+    nodes,
+    alias: "_AliasTable",
+    sys_module_names: frozenset,
+    sys_path_names: frozenset,
+) -> "list[tuple[int, str]]":
+    """#2111 (b): the two mechanisms that reach `sys.path` position 0
+    without any `.insert(...)` call for `_scan_calls` to see -- neither
+    defeats the call-scanner, both defeat the underlying INTENT the guard
+    exists to enforce.
+
+    - **Slice assignment** (`sys.path[0:0] = [...]` / `sys.path[:0] =
+      [...]`): mutates the list IN PLACE, so this is checked through the
+      permissive `_is_sys_path_expr` (any alias/import/getattr form that
+      reaches the same underlying list object is a real vector here).
+    - **Direct rebinding** (`sys.path = [tools_dir] + sys.path`): replaces
+      the module attribute itself, so this is checked through the STRICT
+      `_is_sys_path_attribute` (a name that merely copied a reference does
+      NOT rebind the real `sys.path` on reassignment -- see that
+      function's docstring for why conflating the two would be a false
+      positive)."""
+    offenders: list[tuple[int, str]] = []
+    for node in nodes:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Subscript) and isinstance(
+                target.slice, ast.Slice
+            ):
+                if not _is_sys_path_expr(
+                    target.value, alias, sys_module_names, sys_path_names
+                ):
+                    continue
+                sl = target.slice
+                if sl.step is not None:
+                    continue
+                lower_is_zero = sl.lower is None or _resolves_to_zero(sl.lower, alias)
+                upper_is_zero = sl.upper is not None and _resolves_to_zero(
+                    sl.upper, alias
+                )
+                if not (lower_is_zero and upper_is_zero):
+                    continue
+                _, fragments = _resolve_text(node.value, alias)
+                if any(_is_tools_ish_text(f) for f in fragments):
+                    offenders.append((
+                        node.lineno,
+                        f"slice-assignment to sys.path[...] contains tools-ish "
+                        f"fragment(s) {fragments!r}",
+                    ))
+            elif _is_sys_path_attribute(target, sys_module_names):
+                _, fragments = _resolve_text(node.value, alias)
+                if any(_is_tools_ish_text(f) for f in fragments):
+                    offenders.append((
+                        node.lineno,
+                        f"sys.path rebinding contains tools-ish fragment(s) "
+                        f"{fragments!r}",
+                    ))
     return offenders
 
 
@@ -437,8 +590,12 @@ def _build_func_ancestry(tree: ast.AST) -> "dict[ast.AST, list[ast.AST]]":
 
 
 def _find_insert0_violations(text: str, filename: str = "<file>") -> "list[tuple[int, str]]":
-    """AST-scan *text* for `sys.path.insert(0, <tools-ish>)` violations
-    (directly or via alias/indirection), with alias resolution built by
+    """AST-scan *text* for violations of the #2111 bound documented in this
+    file's module docstring: `sys.path.insert(0, <tools-ish>)` (directly,
+    via alias/indirection, or via a module-alias / `from sys import path` /
+    `getattr(sys, "path")` receiver -- #2111 (a)), `sys.path[0:0] = [...]`
+    / `sys.path[:0] = [...]` slice-assignment, and direct rebinding
+    `sys.path = [...]` (#2111 (b)) -- with alias resolution built by
     proper LEXICAL CHAINING (#2089 round 3): a use site inside function
     `F` resolves through `F`'s own locals, then each enclosing function's
     own locals (innermost enclosing checked first, i.e. shadowing
@@ -447,40 +604,82 @@ def _find_insert0_violations(text: str, filename: str = "<file>") -> "list[tuple
     each other's ancestry chain, so the round-2 cross-function isolation
     fix is preserved: only genuine lexical enclosure contributes locals to
     a nested function's table, never an unrelated function defined
-    elsewhere in the file. Returns a list of ``(lineno, detail)`` pairs."""
+    elsewhere in the file. The same lexical chaining is applied to the
+    #2111 sys-module-alias / sys-path-import binding sets (unioned rather
+    than last-wins, since imports are additive, not reassignment).
+    Returns a list of ``(lineno, detail)`` pairs."""
     tree = ast.parse(text, filename=filename)
 
     module_nodes = list(_iter_scope_nodes(tree))
     module_assignments = _collect_assignments(module_nodes)
     module_alias = _AliasTable(module_assignments)
+    # #2111: module aliases (`import sys as s`) and direct-imported names
+    # (`from sys import path`) -- "sys" itself is always a valid module
+    # name regardless of whether an explicit `import sys` line is present
+    # in this scope (matches the pre-#2111 behavior, which hardcoded the
+    # literal name "sys" unconditionally).
+    module_sys_modules_raw, module_sys_paths_raw = _collect_import_bindings(
+        module_nodes
+    )
+    module_sys_modules = frozenset(module_sys_modules_raw | {"sys"})
+    module_sys_paths = frozenset(module_sys_paths_raw)
 
-    # Module-level call sites (not inside any function) resolve against
-    # the module scope only.
-    offenders = _scan_calls(module_nodes, module_alias)
+    # Module-level call/assignment sites (not inside any function) resolve
+    # against the module scope only.
+    offenders = _scan_calls(module_nodes, module_alias, module_sys_modules, module_sys_paths)
+    offenders.extend(
+        _scan_assignments(module_nodes, module_alias, module_sys_modules, module_sys_paths)
+    )
 
     ancestry = _build_func_ancestry(tree)
 
     # Pass 1: collect every function's OWN locals in isolation (no scope
     # chaining yet -- this is scope-bounded via `_iter_scope_nodes`, which
-    # does not recurse into a nested function's body).
+    # does not recurse into a nested function's body). Also collect each
+    # function's own sys-module/sys-path import bindings the same way
+    # (#2111).
     own_assignments: "dict[ast.AST, dict[str, ast.expr]]" = {}
+    own_sys_bindings: "dict[ast.AST, tuple[set[str], set[str]]]" = {}
     for func in ast.walk(tree):
         if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
-        own_assignments[func] = _collect_assignments(list(_iter_scope_nodes(func)))
+        func_scope_nodes = list(_iter_scope_nodes(func))
+        own_assignments[func] = _collect_assignments(func_scope_nodes)
+        own_sys_bindings[func] = _collect_import_bindings(func_scope_nodes)
 
     # Pass 2: chain each function's effective table = module scope, then
     # every enclosing function's own locals (outermost -> innermost), then
     # the function's own locals -- each later merge shadowing the earlier
-    # ones, matching normal lexical shadowing.
+    # ones, matching normal lexical shadowing. The sys-module/sys-path
+    # binding sets are additive (imports don't shadow the way a `name =
+    # expr` reassignment does), so they're unioned rather than merged with
+    # last-wins semantics.
     for func, own in own_assignments.items():
         func_assignments: "dict[str, ast.expr]" = dict(module_assignments)
+        func_sys_modules: "set[str]" = set(module_sys_modules)
+        func_sys_paths: "set[str]" = set(module_sys_paths)
         for ancestor in ancestry.get(func, []):
             func_assignments.update(own_assignments.get(ancestor, {}))
+            ancestor_mod, ancestor_path = own_sys_bindings.get(ancestor, (set(), set()))
+            func_sys_modules |= ancestor_mod
+            func_sys_paths |= ancestor_path
         func_assignments.update(own)
+        own_mod, own_path = own_sys_bindings.get(func, (set(), set()))
+        func_sys_modules |= own_mod
+        func_sys_paths |= own_path
+
         func_alias = _AliasTable(func_assignments)
+        func_sys_modules_f = frozenset(func_sys_modules)
+        func_sys_paths_f = frozenset(func_sys_paths)
         func_nodes = list(_iter_scope_nodes(func))
-        offenders.extend(_scan_calls(func_nodes, func_alias))
+        offenders.extend(
+            _scan_calls(func_nodes, func_alias, func_sys_modules_f, func_sys_paths_f)
+        )
+        offenders.extend(
+            _scan_assignments(
+                func_nodes, func_alias, func_sys_modules_f, func_sys_paths_f
+            )
+        )
 
     offenders.sort(key=lambda pair: pair[0])
     return offenders
@@ -828,6 +1027,131 @@ class TestAdversarialBypasses:
             "inner()'s own local D (non-tools) must shadow outer()'s "
             "enclosing tools-ish D -- it was incorrectly resolved against "
             "the enclosing scope instead of inner()'s own reassignment"
+        )
+
+
+class TestIssue2111UnflaggedConstructions:
+    """The six constructions issue #2111 demonstrated as unflagged against
+    the merged #2089/#2102 guard. Each `test_*_is_caught` is a can-it-fail
+    control: if the corresponding detection added in `_is_sys_path_expr` /
+    `_is_sys_path_attribute` / `_scan_assignments` is removed, that specific
+    fixture (and only that one) stops being flagged -- it is not a
+    tautology, it depends on the new code. Two negative controls close the
+    obvious false-positive risk the two NEW mechanisms (slice-assignment,
+    rebinding) introduce: reassigning a name that only ever *copied* a
+    reference to `sys.path` must not be treated as touching the real
+    attribute.
+
+    #2111 (a) -- three are `_is_sys_path_expr` receiver-resolution gaps:
+    """
+
+    def test_module_alias_import_is_caught(self, tmp_path: Path) -> None:
+        """`import sys as s; s.path.insert(0, ...)` -- a module alias, not
+        a value alias of `sys.path` itself (which #2089 already caught)."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys as s\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "s.path.insert(0, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "import sys as s; s.path.insert(0, ...) was not caught"
+
+    def test_from_sys_import_path_is_caught(self, tmp_path: Path) -> None:
+        """`from sys import path; path.insert(0, ...)` -- the attribute
+        imported directly, bypassing any `sys.` prefix entirely."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "from sys import path\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "path.insert(0, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "from sys import path; path.insert(0, ...) was not caught"
+
+    def test_getattr_dynamic_attribute_is_caught(self, tmp_path: Path) -> None:
+        """`getattr(sys, "path").insert(0, ...)` -- a dynamic attribute
+        fetch instead of a literal `.path` access."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "getattr(sys, 'path').insert(0, str(TOOLS_DIR))\n",
+        )
+        assert offenders, "getattr(sys, 'path').insert(0, ...) was not caught"
+
+    # -- #2111 (b): the two unmodelled-mechanism constructions, no
+    # `.insert(...)` call for the call-scanner to see at all. --
+
+    def test_slice_assign_0_0_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path[0:0] = [tools_dir]` -- explicit `0:0` slice, the form
+        the issue singles out as the one it "would not wave off"."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path[0:0] = [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, "sys.path[0:0] = [...] was not caught"
+
+    def test_slice_assign_colon_0_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path[:0] = [tools_dir]` -- the omitted-lower-bound sibling
+        of the `0:0` form; same front-insertion effect."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path[:0] = [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, "sys.path[:0] = [...] was not caught"
+
+    def test_direct_rebinding_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path = [tools_dir] + sys.path` -- rebinding the module
+        attribute itself, no subscript or call in sight."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path = [str(TOOLS_DIR)] + sys.path\n",
+        )
+        assert offenders, "sys.path = [tools_dir] + sys.path was not caught"
+
+    # -- False-positive controls for the two NEW (non-call) mechanisms. --
+
+    def test_slice_assign_non_toolsish_not_flagged(self, tmp_path: Path) -> None:
+        """A legitimate `sys.path[0:0] = [...]` inserting something that is
+        NOT tools-ish must not be flagged -- mirrors
+        `test_unrelated_alias_not_flagged` for the call-based scanner."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "SRC_DIR = Path('/repo') / 'src'\n"
+            "sys.path[0:0] = [str(SRC_DIR)]\n",
+        )
+        assert not offenders, "a non-tools-ish sys.path[0:0] = [...] must not be flagged"
+
+    def test_reassigning_copied_reference_not_flagged(self, tmp_path: Path) -> None:
+        """Reassigning a name that only ever COPIED a reference to
+        `sys.path` (`from sys import path; path = [...]`) rebinds the
+        LOCAL name only -- it never touches the real `sys.path` attribute,
+        so it is not a violation. This is the false positive
+        `_is_sys_path_attribute`'s strict (non-alias-chasing) design
+        exists to avoid, per that function's own docstring."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "from sys import path\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "path = [str(TOOLS_DIR)] + path\n",
+        )
+        assert not offenders, (
+            "reassigning a name that only copied a reference to sys.path "
+            "was incorrectly treated as rebinding sys.path itself"
         )
 
 
