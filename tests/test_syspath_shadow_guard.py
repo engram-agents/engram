@@ -32,14 +32,20 @@ tools-ish directory at `sys.path` position 0: `sys.path.insert(0, ...)`
 (directly, or reached via a `p = sys.path` value-alias, an `import sys as s`
 module-alias, `from sys import path`, or `getattr(sys, "path")`), the
 in-place slice-assignment forms `sys.path[0:0] = [...]` / `sys.path[:0] =
-[...]` (and the same through any of the same alias/import/getattr forms,
-since slice-assignment mutates the shared list object), and direct
-rebinding of the module attribute itself (`sys.path = [...] + sys.path`).
-It is **not** a general points-to analysis of every conceivable way to
-manipulate `sys.path` -- e.g. `sys.path.__setitem__`, augmented assignment
-(`sys.path[0:0] += [...]`), `unittest.mock.patch("sys.path", ...)`, or
-mutation through a name that only *copied* a value once and was never
-tracked back to `sys.path` -- and does not attempt to be.
+[...]` -- including their augmented form `sys.path[0:0] += [...]` (#2322:
+`+=` on a `[0:0]` slice front-inserts identically to `=`) -- (and the same
+through any of the same alias/import/getattr forms, since slice-assignment
+mutates the shared list object), and direct rebinding of the module
+attribute itself (`sys.path = [...] + sys.path`), reached through any
+assignment target shape -- including a name buried inside a tuple/list/
+starred compound target (`sys.path, x = [...], 1`) or carrying a type
+annotation (`sys.path: list = [...]`) (#2322: the target-scanner is a
+general AST walker over binding sites, not an enumeration of specific
+target shapes). It is **not** a general points-to analysis of every
+conceivable way to manipulate `sys.path` -- e.g. `sys.path.__setitem__`,
+`unittest.mock.patch("sys.path", ...)`, or mutation through a name that
+only *copied* a value once and was never tracked back to `sys.path` -- and
+does not attempt to be.
 """
 
 from __future__ import annotations
@@ -504,63 +510,182 @@ def _scan_calls(
     return offenders
 
 
+def _unwrap_assignment_targets(target: ast.expr):
+    """Yield every actual binding-site expression reachable from *target*,
+    recursively unwrapping `Tuple` / `List` / `Starred` compound targets to
+    reach the real assignment sites nested inside them (#2322: `sys.path, x
+    = [T], 1`, `[sys.path, x] = [[T], 1]`, and arbitrarily-nested forms like
+    `(a, (sys.path, b)) = ...` all bind `sys.path` somewhere inside a
+    compound target -- this walk is what makes `_scan_assignments` a
+    general AST walker over binding SITES rather than an enumeration of
+    `node.targets` shapes)."""
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            yield from _unwrap_assignment_targets(elt)
+    elif isinstance(target, ast.Starred):
+        yield from _unwrap_assignment_targets(target.value)
+    else:
+        yield target
+
+
+def _paired_walk(target: ast.expr, value: ast.expr):
+    """Round-2 fix (#2346 review): yield ``(leaf_target, corresponding_value)``
+    pairs by walking *target* and *value* together, position-by-position,
+    instead of pairing every unwrapped leaf with the untouched whole
+    *value* the way `_unwrap_assignment_targets` alone would.
+
+    This distinguishes genuine tuple/list-UNPACKING (`sys.path, x = [T],
+    [U]`, where `sys.path` binds only to `[T]`, never to `[U]` or to the
+    RHS as a whole) from CHAINED assignment (`sys.path = x = [T]`, where
+    both targets legitimately share the entire `value` -- that sharing is
+    correct and must not change here; see `_scan_assignments`'s outer
+    `compound_targets` loop, which calls this once per chain-target with
+    the same `value` each time, so a chain-target that is itself a bare
+    name/attribute simply falls through this function's fallback branch
+    below and keeps pairing with the whole `value`, unchanged from before
+    this fix).
+
+    Recurses into `Tuple`/`List` only when BOTH sides are `Tuple`/`List`
+    literals of the SAME shape (same element count, neither side
+    containing a `Starred`) -- that is the only case where positional
+    correspondence is statically knowable. Falls back to yielding
+    ``(leaf, value)`` for every leaf reachable from *target* (via
+    `_unwrap_assignment_targets`) whenever:
+      - *value* isn't itself a `Tuple`/`List` literal at this nesting
+        level (e.g. some_function_call(), or a plain name/attribute) --
+        Python's runtime unpacking makes positional correspondence
+        unknowable statically, so this is the same over-flagging-but-safe
+        behavior `_scan_assignments` had before this fix, preserved
+        deliberately rather than regressed;
+      - either side contains a `Starred` element -- a `Starred` spans a
+        variable number of elements at runtime, so positional
+        correspondence past it can't be resolved without runtime info
+        (out of scope to attempt; falling back here only ever widens
+        what's checked, never narrows it, so it can't introduce a miss);
+      - the two sides' element counts differ (a real unpacking mismatch
+        would raise at runtime; there's no valid static correspondence to
+        pair on)."""
+    if isinstance(target, (ast.Tuple, ast.List)) and isinstance(
+        value, (ast.Tuple, ast.List)
+    ):
+        target_has_star = any(isinstance(e, ast.Starred) for e in target.elts)
+        value_has_star = any(isinstance(e, ast.Starred) for e in value.elts)
+        if (
+            not target_has_star
+            and not value_has_star
+            and len(target.elts) == len(value.elts)
+        ):
+            for t_elt, v_elt in zip(target.elts, value.elts):
+                yield from _paired_walk(t_elt, v_elt)
+            return
+    for leaf in _unwrap_assignment_targets(target):
+        yield leaf, value
+
+
 def _scan_assignments(
     nodes,
     alias: "_AliasTable",
     sys_module_names: frozenset,
     sys_path_names: frozenset,
 ) -> "list[tuple[int, str]]":
-    """#2111 (b): the two mechanisms that reach `sys.path` position 0
+    """#2111 (b) / #2322: the mechanisms that reach `sys.path` position 0
     without any `.insert(...)` call for `_scan_calls` to see -- neither
-    defeats the call-scanner, both defeat the underlying INTENT the guard
-    exists to enforce.
+    defeats the call-scanner, all defeat the underlying INTENT the guard
+    exists to enforce. Walks `ast.Assign`, `ast.AnnAssign`, and
+    `ast.AugAssign` nodes, and for each `compound_target` in the chain
+    (`node.targets` -- every entry legitimately shares the whole `value`,
+    e.g. chained `a = b = value`) pairs it against `value` via
+    `_paired_walk`, which unwraps tuple/list/starred compound targets the
+    same way `_unwrap_assignment_targets` does (#2322: a general walker
+    over binding sites, replacing the #2111 enumeration of `node.targets`
+    shapes) but additionally walks INTO a genuine tuple/list-unpacking
+    target (e.g. `sys.path, x = [T], [U]`) in lockstep with a
+    same-shaped tuple/list `value` literal, so each unwrapped leaf is
+    checked against the RHS element that actually corresponds to its
+    position rather than the whole RHS (round-2 fix, #2346 review --
+    see `_paired_walk`'s docstring for the chained-vs-unpacking
+    distinction and the fallback cases).
+
+    - **Chained assignment** (`sys.path = x = [T]`): every entry of
+      `node.targets` is a bare (non-tuple/list) target, so `_paired_walk`
+      falls through to pairing it with the whole `value` -- unchanged
+      from before this fix.
 
     - **Slice assignment** (`sys.path[0:0] = [...]` / `sys.path[:0] =
-      [...]`): mutates the list IN PLACE, so this is checked through the
-      permissive `_is_sys_path_expr` (any alias/import/getattr form that
-      reaches the same underlying list object is a real vector here).
+      [...]`, or the augmented `sys.path[0:0] += [...]`): mutates the list
+      IN PLACE, so this is checked through the permissive
+      `_is_sys_path_expr` (any alias/import/getattr form that reaches the
+      same underlying list object is a real vector here). `AugAssign` only
+      ever produces this shape -- `+=` on a subscript target isn't a name
+      rebinding in the same sense `=` is, so there is no rebinding analog
+      for it below.
     - **Direct rebinding** (`sys.path = [tools_dir] + sys.path`): replaces
       the module attribute itself, so this is checked through the STRICT
       `_is_sys_path_attribute` (a name that merely copied a reference does
       NOT rebind the real `sys.path` on reassignment -- see that
       function's docstring for why conflating the two would be a false
-      positive)."""
+      positive). Not applicable to `AugAssign` (see above)."""
     offenders: list[tuple[int, str]] = []
     for node in nodes:
-        if not isinstance(node, ast.Assign):
+        if isinstance(node, ast.Assign):
+            compound_targets = node.targets
+            value = node.value
+            is_augassign = False
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                continue
+            compound_targets = [node.target]
+            value = node.value
+            is_augassign = False
+        elif isinstance(node, ast.AugAssign):
+            compound_targets = [node.target]
+            value = node.value
+            is_augassign = True
+        else:
             continue
-        for target in node.targets:
-            if isinstance(target, ast.Subscript) and isinstance(
-                target.slice, ast.Slice
-            ):
-                if not _is_sys_path_expr(
-                    target.value, alias, sys_module_names, sys_path_names
+
+        for compound_target in compound_targets:
+            for target, target_value in _paired_walk(compound_target, value):
+                if isinstance(target, ast.Subscript) and isinstance(
+                    target.slice, ast.Slice
                 ):
-                    continue
-                sl = target.slice
-                if sl.step is not None:
-                    continue
-                lower_is_zero = sl.lower is None or _resolves_to_zero(sl.lower, alias)
-                upper_is_zero = sl.upper is not None and _resolves_to_zero(
-                    sl.upper, alias
-                )
-                if not (lower_is_zero and upper_is_zero):
-                    continue
-                _, fragments = _resolve_text(node.value, alias)
-                if any(_is_tools_ish_text(f) for f in fragments):
-                    offenders.append((
-                        node.lineno,
-                        f"slice-assignment to sys.path[...] contains tools-ish "
-                        f"fragment(s) {fragments!r}",
-                    ))
-            elif _is_sys_path_attribute(target, sys_module_names):
-                _, fragments = _resolve_text(node.value, alias)
-                if any(_is_tools_ish_text(f) for f in fragments):
-                    offenders.append((
-                        node.lineno,
-                        f"sys.path rebinding contains tools-ish fragment(s) "
-                        f"{fragments!r}",
-                    ))
+                    if not _is_sys_path_expr(
+                        target.value, alias, sys_module_names, sys_path_names
+                    ):
+                        continue
+                    sl = target.slice
+                    if sl.step is not None:
+                        continue
+                    lower_is_zero = sl.lower is None or _resolves_to_zero(
+                        sl.lower, alias
+                    )
+                    upper_is_zero = sl.upper is not None and _resolves_to_zero(
+                        sl.upper, alias
+                    )
+                    if not (lower_is_zero and upper_is_zero):
+                        continue
+                    _, fragments = _resolve_text(target_value, alias)
+                    if any(_is_tools_ish_text(f) for f in fragments):
+                        kind = (
+                            "augmented slice-assignment"
+                            if is_augassign
+                            else "slice-assignment"
+                        )
+                        offenders.append((
+                            node.lineno,
+                            f"{kind} to sys.path[...] contains tools-ish "
+                            f"fragment(s) {fragments!r}",
+                        ))
+                elif not is_augassign and _is_sys_path_attribute(
+                    target, sys_module_names
+                ):
+                    _, fragments = _resolve_text(target_value, alias)
+                    if any(_is_tools_ish_text(f) for f in fragments):
+                        offenders.append((
+                            node.lineno,
+                            f"sys.path rebinding contains tools-ish fragment(s) "
+                            f"{fragments!r}",
+                        ))
     return offenders
 
 
@@ -1152,6 +1277,221 @@ class TestIssue2111UnflaggedConstructions:
         assert not offenders, (
             "reassigning a name that only copied a reference to sys.path "
             "was incorrectly treated as rebinding sys.path itself"
+        )
+
+
+class TestIssue2322GeneralAssignmentWalker:
+    """#2322: `_scan_assignments` walks `ast.Assign` / `ast.AnnAssign` /
+    `ast.AugAssign` nodes and unwraps `Tuple` / `List` / `Starred` compound
+    targets to reach every real binding site inside them -- replacing the
+    #2111 enumeration of specific target shapes with a general walker over
+    binding sites. Each `test_*_is_caught` here is a construction Borges's
+    prototype (issue comment) measured as missed by the merged #2111
+    detector and caught by the general walker."""
+
+    def test_tuple_target_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path, x = [T], 1` -- `sys.path` is one element of a bare
+        tuple-unpacking target, not `node.targets[0]` directly."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path, x = [str(TOOLS_DIR)], 1\n",
+        )
+        assert offenders, "sys.path, x = [T], 1 was not caught"
+
+    def test_annassign_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path: list = [T]` -- rebinding via an annotated assignment,
+        which the old `ast.Assign`-only loop never even visited."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path: list = [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, "sys.path: list = [T] was not caught"
+
+    def test_list_target_is_caught(self, tmp_path: Path) -> None:
+        """`[sys.path, x] = [[T], 1]` -- the list-target sibling of the
+        tuple-target form."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "[sys.path, x] = [[str(TOOLS_DIR)], 1]\n",
+        )
+        assert offenders, "[sys.path, x] = [[T], 1] was not caught"
+
+    def test_nested_tuple_target_is_caught(self, tmp_path: Path) -> None:
+        """`(a, (sys.path, b)) = (1, ([T], 2))` -- `sys.path` buried two
+        levels deep inside a nested compound target, exercising the
+        recursive unwrap rather than a single flat pass."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "(a, (sys.path, b)) = (1, ([str(TOOLS_DIR)], 2))\n",
+        )
+        assert offenders, "(a, (sys.path, b)) = (1, ([T], 2)) was not caught"
+
+    def test_augassign_slice_is_caught(self, tmp_path: Path) -> None:
+        """`sys.path[0:0] += [T]` -- augmented slice-assignment; this is a
+        genuine behavior CHANGE from #2111 (previously a declared miss in
+        the module docstring's Bound section), not just new coverage: `+=`
+        on a `[0:0]` slice front-inserts identically to `=`."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path[0:0] += [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, "sys.path[0:0] += [T] was not caught"
+
+    # -- Negative controls (#2322's issue comment table). Two of the three
+    # (non-tools-ish slice-assignment, a copied-reference reassignment) are
+    # already covered by `TestIssue2111UnflaggedConstructions` above -- not
+    # duplicated here. The third (wrong attribute entirely) has no existing
+    # fixture. --
+
+    def test_wrong_attribute_not_flagged(self, tmp_path: Path) -> None:
+        """`other.path = [T]` -- `other` is not a name bound to the `sys`
+        module, so this is an unrelated `.path` attribute on an unrelated
+        object, not `sys.path` at all."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "other.path = [str(TOOLS_DIR)]\n",
+        )
+        assert not offenders, "other.path = [T] was incorrectly flagged as sys.path"
+
+    def test_tuple_unpacking_with_positional_correspondence_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 fix (#2346 review): `sys.path, other_var = [SAFE], [T]`
+        is a genuine tuple-UNPACKING assignment, not chained assignment --
+        `sys.path` binds only to the first element `[SAFE]` (not tools-ish),
+        never to `other_var`'s element `[T]` or to the RHS as a whole. Before
+        the round-2 fix, every unwrapped target (including `sys.path`) was
+        checked against the ENTIRE RHS tuple, so `other_var`'s tools-ish
+        value alone was enough to wrongly flag `sys.path` here."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "SAFE_DIR = Path('/repo') / 'src'\n"
+            "sys.path, other_var = [str(SAFE_DIR)], [str(TOOLS_DIR)]\n",
+        )
+        assert not offenders, (
+            "sys.path, other_var = [SAFE], [T] was incorrectly flagged -- "
+            "sys.path is bound only to [SAFE] (not tools-ish), not to "
+            "other_var's [T] or the whole RHS"
+        )
+
+    def test_tuple_unpacking_own_element_tools_ish_still_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Companion to the negative control above: when `sys.path`'s OWN
+        corresponding element in a genuine tuple-unpacking assignment IS
+        tools-ish, it must still be flagged -- confirms the round-2
+        position-pairing fix didn't over-correct into exempting real
+        tuple-unpacking violations."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "SAFE_DIR = Path('/repo') / 'src'\n"
+            "sys.path, x = [str(TOOLS_DIR)], [str(SAFE_DIR)]\n",
+        )
+        assert offenders, (
+            "sys.path, x = [T], [SAFE] was not caught -- sys.path's own "
+            "corresponding element is tools-ish"
+        )
+
+    def test_chained_assignment_falls_back_correctly(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 reviewer-fairy (round 2) flagged: `_paired_walk`'s three
+        fallback branches (chained-target sharing, Starred, length-mismatch)
+        had no DEDICATED regression test in this class -- only hand
+        verification. This is the chained-assignment fallback: `sys.path = x
+        = [T]` is NOT a tuple/list target, so `_paired_walk` falls straight
+        through to pairing every unwrapped leaf with the whole (shared)
+        `value`, exactly as before the round-2 fix. Must still be flagged."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "sys.path = x = [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, (
+            "sys.path = x = [T] (chained assignment) was not caught -- "
+            "chained targets legitimately share the whole value and must "
+            "stay flagged through _paired_walk's fallback branch"
+        )
+
+    def test_starred_target_falls_back_to_whole_value(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 fallback branch: a `Starred` element on EITHER side of a
+        tuple/list target-value pair makes positional correspondence
+        unknowable statically (a starred slice spans a variable number of
+        elements at runtime), so `_paired_walk` falls back to checking every
+        unwrapped leaf against the WHOLE value -- the safe, over-flagging
+        direction. Target and value here have the SAME element count (2 and
+        2) so this isolates the Starred guard specifically, distinct from
+        the length-mismatch fallback tested separately below: without the
+        Starred guard, the element-count check alone would let this pair
+        positionally and (wrongly) treat `sys.path` as bound only to the
+        safe first element. `sys.path` itself binds to the safe first
+        element, but `*rest` could capture a tools-ish second element, so
+        the fallback (correctly) flags sys.path too rather than trying to
+        resolve the star."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "SAFE_DIR = Path('/repo') / 'src'\n"
+            "sys.path, *rest = [str(SAFE_DIR)], [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, (
+            "sys.path, *rest = [SAFE], [T] was not caught -- a Starred "
+            "element on the target side must fall back to the whole-value "
+            "check (safe/over-flagging), not attempt static resolution, "
+            "even when element counts happen to match"
+        )
+
+    def test_length_mismatch_falls_back_to_whole_value(
+        self, tmp_path: Path
+    ) -> None:
+        """Round-2 fallback branch: when target and value ARE both
+        Tuple/List literals but have DIFFERENT element counts, there is no
+        valid static correspondence to pair on (a real mismatch would raise
+        `ValueError` at runtime) -- `_paired_walk` falls back to the whole
+        value for every unwrapped leaf, same safe direction as the other two
+        fallback branches."""
+        offenders = _scan_fixture(
+            tmp_path,
+            "import sys\n"
+            "from pathlib import Path\n"
+            "TOOLS_DIR = Path('/repo') / 'tools'\n"
+            "SAFE_DIR = Path('/repo') / 'src'\n"
+            "sys.path, x, y = [str(SAFE_DIR)], [str(TOOLS_DIR)]\n",
+        )
+        assert offenders, (
+            "sys.path, x, y = [SAFE], [T] (3 targets, 2 values -- a length "
+            "mismatch) was not caught -- mismatched shapes must fall back "
+            "to the whole-value check, not attempt a partial pairing"
         )
 
 
