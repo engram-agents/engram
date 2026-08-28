@@ -393,31 +393,29 @@ def _seed_dv(derive, claim, supporting_ids):
 
 
 def _is_tainted(core, node_id, by_id):
+    """Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+    slice 1). Test INTENT is unchanged — "did by_id's retract cascade reach
+    node_id" — only the store moved. Written as a marker read because
+    metadata is no longer where cascade state lives.
+    """
+    return _has_pending_marker(core, node_id, by_id, "retract")
+
+
+def _has_pending_marker(core, node_id, by_id, root_op):
     conn = core._get_db()
     try:
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (node_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        meta = json.loads(row["metadata"] or "{}")
-        return by_id in meta.get("tainted_by", [])
+        return conn.execute(
+            "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+            "AND root_op = ? AND status = 'pending'",
+            (node_id, by_id, root_op),
+        ).fetchone() is not None
     finally:
         conn.close()
 
 
 def _is_stale(core, node_id, by_id):
-    conn = core._get_db()
-    try:
-        row = conn.execute(
-            "SELECT metadata FROM nodes WHERE id = ?", (node_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        meta = json.loads(row["metadata"] or "{}")
-        return by_id in meta.get("stale_by", [])
-    finally:
-        conn.close()
+    """Marker-store twin of _is_tainted above; same intent, same migration."""
+    return _has_pending_marker(core, node_id, by_id, "supersede")
 
 
 def test_retract_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded(monkeypatch):

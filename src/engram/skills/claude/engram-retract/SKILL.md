@@ -38,8 +38,11 @@ engram_retract(payload_json=json.dumps({
 
 The engine:
 - Marks the node retracted (preserved, not deleted — honest audit trail).
-- Propagates `tainted_by` to downstream derivations (cornerstones/lessons are
-  skipped per the vote-accumulator semantics; they get `support_lost` instead).
+- Propagates a `tainted_by` cascade marker to downstream derivations
+  (`cascade_markers` table, engram-alpha#2013/#2009 — surfaced back to you via
+  `engram_reflect`'s `tainted_nodes` and `engram_inspect`'s `warnings.tainted_by`,
+  same shape as before the storage moved off metadata; cornerstones/lessons are
+  skipped per the vote-accumulator semantics — they get `support_lost` instead).
 - Detects zero-support cornerstones/lessons and sets `support_lost`.
 - Returns the full cascade scope — the downstream nodes now flagged.
 
@@ -66,9 +69,9 @@ and a worked example — is the **single source of truth in
 > tainted one.**
 
 ⛔ **Never clear taint by surgery.** Do not edit a tainted node in place, and do
-not use `tools/surgical.py` or raw `knowledge.db` edits to delete a `tainted_by`
-flag or re-point an edge. Both corrupt the graph silently — re-pointing an older
-node at a newer replacement violates the time-ordered DAG, and deleting the flag
+not use `tools/surgical.py` or raw `knowledge.db` edits to delete a `cascade_markers`
+row or re-point an edge. Both corrupt the graph silently — re-pointing an older
+node at a newer replacement violates the time-ordered DAG, and deleting the marker
 without re-establishing the conclusion leaves a confident-looking node resting
 on disowned evidence (a loud failure turned silent). Route through
 **engram-resolve-cascade**; don't improvise.

@@ -30,7 +30,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import engram_core as core
 from engram_log_emitter import emit_if_initialized
@@ -660,32 +660,29 @@ def _pattern_tainted_still_valid(
     top_k = int(preset_params.get("top_k", 15))
     min_conf = float(preset_params.get("min_confidence", 0.0))
 
-    # Taint is stored in metadata.tainted_by (array of upstream retracted/
-    # superseded node IDs that triggered the cascade). The memory_status
-    # field remains 'active' — the taint signal lives in the JSON metadata,
-    # not in a top-level column. json_extract scans efficiently in SQLite.
+    # Taint lives in cascade_markers, not metadata (#2013/#2009 slice 1 —
+    # the cascade machine). Pull every node with at least one pending
+    # taint-severity marker: distinct node_id, joined to nodes for the
+    # candidate fields.
     rows = conn.execute(
-        "SELECT id, type, claim, confidence, metadata FROM nodes "
-        "WHERE is_current=1 "
-        "AND json_extract(metadata, '$.tainted_by') IS NOT NULL "
-        "AND json_array_length(json_extract(metadata, '$.tainted_by')) > 0"
+        "SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n "
+        "JOIN cascade_markers cm ON cm.node_id = n.id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, conf, metadata in rows:
-        # min_confidence is a CB-only predicate (#2252 stage 1.7): ask "is
+    for nid, ntype, claim, conf in rows:
+        # min_confidence is a CB-only predicate (#2252 Stage 1.7): ask "is
         # this claim-bearing" before applying the threshold, rather than
         # letting absent-confidence collapse to zero. NCB nodes and CB
-        # nodes with a NULL confidence always pass.
-        is_cb = core._is_claim_bearing(ntype)
-        if is_cb and conf is not None and conf < min_conf:
+        # nodes with a NULL confidence always pass. Carried across the
+        # marker migration unchanged — the predicate is about which nodes
+        # the threshold *applies to*, which is independent of where the
+        # taint is stored.
+        if core._is_claim_bearing(ntype) and conf is not None and conf < min_conf:
             continue  # drop: claim-bearing and genuinely below threshold
         conf = conf or 0  # display/score coercion, applied only after the filter decision
-        try:
-            md = json.loads(metadata or "{}")
-        except (ValueError, json.JSONDecodeError):
-            md = {}
-        tainted_by = md.get("tainted_by") or []
+        tainted_by, _ = core._classify_pending_markers(conn, nid)
         candidates.append({
             "id": nid,
             "type": ntype,
@@ -1246,11 +1243,17 @@ def _build_inspect_edges_view(
 
 
 def _extract_warnings(
-    metadata: Union[str, dict, None],
+    node_id: Optional[str],
     conn: sqlite3.Connection,
 ) -> Optional[dict]:
-    """Convert metadata.tainted_by / metadata.stale_by into a structured
+    """Convert node_id's pending cascade markers into a structured
     warnings object for surface-level exposure (MECH-5).
+
+    Migrated off metadata.tainted_by / metadata.stale_by to the
+    cascade_markers table (#2013/#2009 slice 1 — the cascade machine).
+    Takes node_id rather than a metadata blob now, since the marker table
+    is keyed on node_id and no longer reachable from a node's own metadata
+    JSON at all.
 
     Previously these fields were buried inside the raw metadata JSON blob,
     so agents reading a tainted derivation saw the original confidence and
@@ -1272,20 +1275,10 @@ def _extract_warnings(
             ],
         }
     """
-    if metadata is None:
-        return None
-    if isinstance(metadata, str):
-        if not metadata:
-            return None
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(metadata, dict):
+    if not node_id:
         return None
 
-    tainted_ids = metadata.get("tainted_by") or []
-    stale_ids = metadata.get("stale_by") or []
+    tainted_ids, stale_ids = core._classify_pending_markers(conn, node_id)
     if not tainted_ids and not stale_ids:
         return None
 
@@ -2565,8 +2558,7 @@ def _surface_impl(
         # drift structurally impossible.
         warned_nodes: dict[str, dict] = {}
         for n in results:
-            meta_str = n.get("metadata", "")
-            w = _extract_warnings(meta_str, conn)
+            w = _extract_warnings(n["id"], conn)
             if w:
                 warned_nodes[n["id"]] = w
         stale_count = sum(1 for w in warned_nodes.values() if w.get("stale_by"))
@@ -2811,7 +2803,7 @@ def _inspect_impl(
             node["last_assessed_ago"] = core._humanized_ago(node.get("last_assessed_at"), now=now_utc)
 
         # MECH-5: surface taint / stale as a top-level warning.
-        warnings = _extract_warnings(meta, conn)
+        warnings = _extract_warnings(node_id, conn)
 
         # Refresh recall on the target node ONLY (skip in dream mode)
         if not dream_mode:
@@ -2866,7 +2858,7 @@ def _query_impl(
         for node in search["results"]:
             # MECH-5: extract warnings BEFORE popping metadata so agents
             # reading query results see taint / stale status.
-            w = _extract_warnings(node.get("metadata"), conn)
+            w = _extract_warnings(node.get("id"), conn)
             # #1940: extract the typed relational fields BEFORE popping
             # metadata, same ordering discipline as the warnings extraction
             # above. Gated on `not return_debug`: return_debug=True's

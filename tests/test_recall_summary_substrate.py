@@ -1023,15 +1023,15 @@ def test_engram_surface_matched_meta_carries_tainted_signal():
     dependent_id = _add_obs(srv, f"{keyword} dependent observation built on the base")
     clean_id = _add_obs(srv, f"{keyword} entirely unrelated clean observation")
 
-    # Manually taint the dependent node's metadata the same way the
-    # retraction-cascade machinery would (avoids depending on unrelated
-    # cascade-trigger mechanics not under test here).
-    row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (dependent_id,)).fetchone()
-    meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
-    meta["tainted_by"] = [base_id]
+    # Manually taint the dependent node the same way the retraction-cascade
+    # machinery would (avoids depending on unrelated cascade-trigger
+    # mechanics not under test here). Migrated off metadata.tainted_by to a
+    # cascade_markers row (#2013/#2009 slice 1).
     conn.execute(
-        "UPDATE nodes SET metadata = ? WHERE id = ?",
-        (json.dumps(meta), dependent_id),
+        "INSERT INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, created_at) "
+        "VALUES (?, 'cev_fabricated_test', ?, 'retract', 'pending', ?)",
+        (dependent_id, base_id, srv._now()),
     )
     conn.commit()
 
@@ -1056,35 +1056,44 @@ def test_engram_surface_matched_meta_carries_tainted_signal():
 
 
 def test_engram_surface_empty_taint_list_does_not_inflate_aggregate_count():
-    """Regression test (Borges, colleague review on gh#1621): a node
-    carrying an EMPTY metadata.stale_by/tainted_by list (e.g. left behind
-    by cascade machinery that clears the list without removing the key)
-    must NOT inflate the aggregate 'Warnings: N stale, M tainted' count —
-    the count and the per-node ⚠ markers must derive from the SAME source
-    (_extract_warnings via warned_nodes), which correctly treats an empty
-    list as "not actually tainted/stale." A raw string-match approach
-    (matching on '"stale_by": [' regardless of what follows) would count
-    this node while rendering zero markers for it — the exact
-    count-vs-marker disagreement this test guards against."""
+    """Regression test (Borges, colleague review on gh#1621): a node whose
+    marker has RESOLVED must NOT inflate the aggregate 'Warnings: N stale,
+    M tainted' count — the count and the per-node ⚠ markers must derive
+    from the SAME source (_extract_warnings via warned_nodes /
+    _pending_markers_for_node), which correctly excludes resolved markers.
+
+    Migrated off metadata.stale_by (#2013/#2009 slice 1): the original
+    fabrication was an EMPTY metadata.stale_by list ("left behind by
+    cascade machinery that clears the list without removing the key"). The
+    cascade_markers analog of "leftover but inert" is a RESOLVED marker
+    row — resolved markers are NEVER deleted (invariant, not convention;
+    see engram_core.py's table docstring), so a resolved-but-present row is
+    exactly the shape this test needs to guard against: present in the
+    table, must not count as pending. A raw metadata string-match approach
+    would have counted a node regardless of resolution state; querying
+    status='pending' structurally can't make that mistake."""
     srv = fresh_server()
     conn = fresh_conn(srv)
 
     keyword = "emptytaintlist"
-    empty_list_id = _add_obs(srv, f"{keyword} node with an emptied stale_by list")
-    genuinely_stale_id = _add_obs(srv, f"{keyword} node with a real stale_by entry")
+    empty_list_id = _add_obs(srv, f"{keyword} node with a resolved (inert) marker")
+    genuinely_stale_id = _add_obs(srv, f"{keyword} node with a real pending marker")
 
-    row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (empty_list_id,)).fetchone()
-    meta = json.loads(row["metadata"]) if row and row["metadata"] else {}
-    meta["stale_by"] = []  # emptied, e.g. by a resolution pass — key present, list empty
-    conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), empty_list_id))
-
-    row2 = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (genuinely_stale_id,)).fetchone()
-    meta2 = json.loads(row2["metadata"]) if row2 and row2["metadata"] else {}
-    # stale_by/tainted_by hold plain node-ID strings (_extract_warnings looks
-    # each one up and enriches it into a {superseded_id, replaced_by_id,
-    # superseded_at} dict on the way OUT — the raw metadata shape in is just IDs).
-    meta2["stale_by"] = ["ob_9999"]
-    conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta2), genuinely_stale_id))
+    now = srv._now()
+    conn.execute(
+        "INSERT INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, "
+        "resolution_kind, created_at, resolved_at) "
+        "VALUES (?, 'cev_fabricated_resolved', 'ob_9998', 'supersede', 'resolved', "
+        "'acknowledged', ?, ?)",
+        (empty_list_id, now, now),
+    )
+    conn.execute(
+        "INSERT INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, created_at) "
+        "VALUES (?, 'cev_fabricated_pending', 'ob_9999', 'supersede', 'pending', ?)",
+        (genuinely_stale_id, now),
+    )
     conn.commit()
 
     result_json = srv.engram_surface(payload_json=json.dumps({"query": keyword, "top_k": 10, "semantic": False}))

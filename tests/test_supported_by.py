@@ -97,14 +97,18 @@ def _edge_exists(core, source_id, target_id, relation):
 
 
 def _is_tainted(core, node_id, by_id):
-    """Return True if node_id has tainted_by containing by_id in its metadata."""
+    """Return True if node_id carries a pending retract-severity cascade
+    marker rooted at by_id. Migrated off metadata.tainted_by to
+    cascade_markers (#2013/#2009 slice 1) — same meaning, new storage.
+    """
     conn = _get_db(core)
     try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        if row is None:
-            return False
-        meta = json.loads(row["metadata"] or "{}")
-        return by_id in meta.get("tainted_by", [])
+        row = conn.execute(
+            "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+            "AND root_op = 'retract' AND status = 'pending'",
+            (node_id, by_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

@@ -152,11 +152,14 @@ def _derive_impl(
             Kept for backward compatibility: "chain" or "corroboration".
         context_ids: Optional comma-separated node IDs for context references (e.g. definitions).
             Creates 'cites' edges (not 'derives_from') — these don't affect confidence computation.
-        use_stale: Opt-in override for MECH-5 stale-premise guard. Set to True ONLY when
-            you've judged that the upstream supersede does not affect the logic of your
-            derivation — the new derivation will carry a metadata.built_on_stale audit
-            marker so future maintenance tools can auto-redirect edges to replacements.
-            Has no effect on tainted premises (taint is always a hard block — no override).
+        use_stale: RETIRED (#2324) — accepted for compatibility, but it has NO EFFECT.
+            A stale premise is now a hard block, and passing this flag returns a loud
+            `use_stale_retired` notice on both the refusal and the success payload
+            rather than silently doing nothing. The cascade machine replaced the
+            force-through with resolution: supersede or retract a premise that carries
+            a cascade marker, or cite the successor of a premise that is itself
+            superseded. It no longer writes metadata.built_on_stale — that stamp is
+            read-only history now. Removed from this signature in #2013 slice 2.
         use_contested: Opt-in override for MECH-5 contradicted-premise guard (#1654).
             Set to True ONLY when you're deliberately building on a premise that sits
             on an open, unresolved contradiction (a live ct_ node with no resolves
@@ -180,7 +183,9 @@ def _derive_impl(
         If premises are compromised, returns a structured block response:
           - BLOCKED_TAINTED: any premise was retracted; no override path.
           - BLOCKED_CONTRADICTED: premise(s) sit on an open contradiction and use_contested=False.
-          - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
+          - BLOCKED_STALE: premise(s) carry an unresolved cascade marker, or have
+            themselves been superseded. Hard block since #2324 — no override; each
+            entry carries a per-case `route`.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python; without this check, a use_stale: "false"
@@ -342,8 +347,13 @@ def _derive_impl(
             result["utility_bumped_count"] = success["bumped_count"]
         if success["structure_warnings"]:
             result["structure_warnings"] = success["structure_warnings"]
-        if use_stale and success["stale_ids"]:
-            result["built_on_stale"] = success["stale_ids"]
+        # Success path with use_stale=True: the premises were clean, so the
+        # flag changed nothing — but say so LOUDLY rather than accepting a
+        # retired parameter in silence. A caller still passing it holds a
+        # false belief about what protects their derivation, and the only
+        # moment we can correct that is the call where they passed it.
+        if use_stale:
+            result["use_stale_retired"] = core.USE_STALE_RETIRED_NOTICE
         if use_contested and success["contested_ids"]:
             result["built_on_contested"] = success["contested_ids"]
         if independence_advisory:

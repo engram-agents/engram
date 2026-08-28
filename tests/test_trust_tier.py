@@ -505,16 +505,30 @@ def test_retract_source_obs_does_not_taint_trust_signal():
     ))
     assert ret_r.get("status") == "retracted", ret_r
 
+    # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+    # slice 1) — ts_ should carry a pending retract-severity marker rooted
+    # at ob_id.
     db_path = os.path.join(TEST_DIR, "knowledge.db")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    ts_row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ts_id,)).fetchone()
+    marker = conn.execute(
+        "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+        "AND root_op = 'retract' AND status = 'pending'",
+        (ts_id, ob_id),
+    ).fetchone()
     conn.close()
-    assert ts_row is not None
-    meta = json.loads(ts_row["metadata"] or "{}")
-    assert "tainted_by" not in meta, (
-        f"ts_ should NOT have tainted_by in metadata — trust_signal is NCB "
-        f"and the derived skip must stop the walk there. Got: {meta}"
+    # TEST INTENT (decided 2026-08-28, #2009 slice-1 integration): dev's
+    # SEMANTICS win, this branch's STORAGE wins. The pre-Stage-1.3 version
+    # of this branch asserted a marker was PRESENT; #2252 Stage 1.3 then
+    # shipped the derived-skip, so _walk_cascade_downstream now returns at
+    # the NCB trust_signal before any marker is written. Asserting presence
+    # would re-assert behaviour the merged code no longer has — and would
+    # contradict this test's own name and docstring. So: absence, checked
+    # against cascade_markers rather than metadata, because metadata is no
+    # longer where cascade state lives.
+    assert marker is None, (
+        f"ts_ {ts_id} should carry NO cascade marker — trust_signal is NCB "
+        f"and the derived skip must stop the walk there before marking."
     )
 
 
@@ -551,14 +565,23 @@ def test_supersede_source_obs_does_not_stale_trust_signal():
     ))
     assert sup_r.get("status") == "superseded", sup_r
 
+    # Migrated off metadata.stale_by to cascade_markers (#2013/#2009
+    # slice 1) — ts_ should carry a pending supersede-severity marker
+    # rooted at ob_old.
     db_path = os.path.join(TEST_DIR, "knowledge.db")
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    ts_row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (ts_id,)).fetchone()
+    marker = conn.execute(
+        "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+        "AND root_op = 'supersede' AND status = 'pending'",
+        (ts_id, ob_old),
+    ).fetchone()
     conn.close()
-    assert ts_row is not None
-    meta = json.loads(ts_row["metadata"] or "{}")
-    assert "stale_by" not in meta, (
-        f"ts_ should NOT have stale_by in metadata — trust_signal is NCB "
-        f"and the derived skip must stop the walk there. Got: {meta}"
+    # TEST INTENT (decided 2026-08-28): same call as the retract twin above
+    # — dev's absence semantics (#2252 Stage 1.3 derived-skip) over this
+    # branch's presence assertion, expressed through the cascade_markers
+    # store this slice migrates to.
+    assert marker is None, (
+        f"ts_ {ts_id} should carry NO cascade marker — trust_signal is NCB "
+        f"and the derived skip must stop the walk there before marking."
     )

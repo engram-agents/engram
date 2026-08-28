@@ -617,9 +617,6 @@ def _graph_lineage_count(*args, **kwargs):
 VALID_ERROR_TYPES = _revision_mod.VALID_ERROR_TYPES
 _THRESHOLD_GATE_DISCIPLINE_HINT = _revision_mod._THRESHOLD_GATE_DISCIPLINE_HINT
 
-def _add_stale_replacement(*args, **kwargs):
-    return _revision_mod._add_stale_replacement(*args, **kwargs)
-
 def _walk_cascade_downstream(*args, **kwargs):
     return _revision_mod._walk_cascade_downstream(*args, **kwargs)
 
@@ -5464,24 +5461,33 @@ _DERIVE_FIELDS = frozenset({
 # is mathematically valid ONLY when premises cite DISTINCT evidence sources —
 # misusing it on co-sourced premises produces structurally inflated confidence.
 #
-# MECH-5 stale-premise + tainted-premise + contradicted-premise guards
-# (use_stale / use_contested opt-ins): a derivation resting on premises that
-# have been superseded, retracted, or sit on an open unresolved contradiction
-# (#1654) gets BLOCKED at filing time. The block is a feature: it surfaces
-# "this reasoning needs to be re-grounded (or the dispute resolved)" rather
-# than letting derivation chains rot silently, or compound on contested
-# ground without a trace. the honesty axiom honesty-is-structural in action.
-# The contradiction guard is deliberately overridable (a live dispute isn't a
-# refutation) but the override auto-stamps metadata.built_on_contested —
-# never author-supplied — so opting in stays measurable, not a laundering path.
+# MECH-5 stale-premise + tainted-premise + contradicted-premise guards:
+# a derivation resting on premises that have been superseded, retracted, or
+# sit on an open unresolved contradiction (#1654) gets BLOCKED at filing
+# time. The block is a feature: it surfaces "this reasoning needs to be
+# re-grounded (or the dispute resolved)" rather than letting derivation
+# chains rot silently, or compound on contested ground without a trace. the
+# honesty axiom honesty-is-structural in action.
+#
+# ONE override remains, and it is use_contested — a live dispute is not a
+# refutation, so building on the contested side stays a deliberate,
+# loudly-marked choice, auto-stamped metadata.built_on_contested (never
+# author-supplied) so opting in stays measurable rather than a laundering
+# path. `use_stale` was RETIRED (#2324): with the cascade machine there is
+# no legitimate "cite over a stale premise without resolving it", and the
+# routes that replace it are supersede/retract for a marker-carrying
+# premise, or citing the successor for one that is itself superseded. The
+# parameter is still ACCEPTED and returns a loud use_stale_retired notice —
+# never silently ignored — until #2013 slice 2 removes the signature.
 #
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
     name="engram_derive",
     capability=(
         "Creates a derivation from EXISTING claim-bearing premises with an explicit "
-        "logical_chain. Blocked if a premise is stale or contested (overridable via "
-        "use_stale/use_contested) or tainted (never overridable — no override path)."
+        "logical_chain. Hard-blocked if a premise is tainted or stale (no override — "
+        "resolve the premise, or cite its successor); soft-blocked if a premise is "
+        "contested, overridable via use_contested."
     ),
     annotations={
         "title": "Create Derived Claim",
@@ -5520,8 +5526,13 @@ def engram_derive(payload_json: str) -> str:
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context
                 references (e.g. definitions). Creates 'cites' edges.
-            use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
-                guard. Default False. Has no effect on tainted premises.
+            use_stale (bool, optional): RETIRED (#2324) — accepted for
+                compatibility, NO EFFECT. Stale is a hard block now; passing
+                this returns a loud use_stale_retired notice rather than
+                silently doing nothing. Resolve the premise instead:
+                supersede/retract one that carries a cascade marker, or cite
+                the successor of one that is itself superseded. Removed from
+                the signature in #2013 slice 2.
             use_contested (bool, optional): Opt-in override for MECH-5
                 contradicted-premise guard (#1654) — set True only when
                 deliberately building on a premise under an open, unresolved
@@ -5602,7 +5613,8 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 # Pairs with engram_resolve: a contradiction resolves when a claim-bearing
 # node (typically a supersede of one side, or a derivation that reconciles)
 # is wired via engram_resolve. Resolution can be:
-#   - resolved-by-supersede (one side superseded; ct gets a stale_by entry)
+#   - resolved-by-supersede (one side superseded; ct gets a pending cascade
+#     marker — see engram_core.py's cascade_markers table, #2013/#2009)
 #   - resolved-by-derivation (a derivation reconciles both)
 #   - resolved-by-obsolescence (both sides outdated, ct closed as stale)
 #
@@ -5835,9 +5847,12 @@ def engram_resolve(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 
 
-# _add_stale_replacement body moved to engram_revision.py (family E) in #872 wave 6.
 # _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6.
-# Compat forwarders above in wave-6 compat block.
+# Compat forwarder above in wave-6 compat block.
+#
+# _add_stale_replacement retired (#2013/#2009 slice 1, cascade machine):
+# downstream-node replacement info doesn't survive the unified-marker
+# redesign in the same shape — see engram_revision.py's module docstring.
 
 # Set of legitimate field names for the engram_supersede payload.
 _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
@@ -5856,14 +5871,16 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 # derive, etc.) FIRST, then calls engram_supersede to link. Parallels how
 # engram_resolve is pure-wire (issue #229 same family).
 #
-# Cascade semantics:
-#   - downstream derivations citing old as premise: flagged stale
-#   - contradictions citing old: stale_by populated with old_node_id +
-#     stale_replacement {old: new} for downstream resolution
+# Cascade semantics (#2013/#2009 slice 1 — the cascade machine):
+#   - downstream derivations citing old as premise: pending 'stale'-severity
+#     cascade_markers row written (see engram_core.py's table docstring)
+#   - contradictions citing old: same cascade_event marks the ct_ node too
 #   - retracted nodes are NOT supersede-able (use engram_retract path)
 #
-# stale_replacement metadata (the supersede-no-drop discipline): downstream readers
-# can find the replacement automatically without traversing the supersede edge.
+# A downstream node's OWN replacement isn't cached at marking time (the old
+# stale_replacement metadata is retired) — it's decided when THAT node
+# itself resolves, via the marker's resolution_replacement_id once a later
+# slice adds the resolve/acknowledge write path.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(

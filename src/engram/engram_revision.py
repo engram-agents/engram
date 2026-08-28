@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 
 import engram_core as core
 
@@ -83,22 +84,150 @@ _THRESHOLD_GATE_DISCIPLINE_HINT = (
 # Cascade helpers
 # ---------------------------------------------------------------------------
 
-def _add_stale_replacement(meta: dict, old_node_id: str, new_node_id: str) -> None:
-    """Add an entry to metadata.stale_replacement dict, upgrading from legacy
-    scalar if needed. Mutates meta in place.
+# ---------------------------------------------------------------------------
+# Cascade markers (engram-alpha#2013 / #2009 slice 1)
+# ---------------------------------------------------------------------------
+#
+# Replaces the old metadata.stale_by / metadata.tainted_by / metadata.
+# stale_replacement fields (issue #231's dict-keyed form included) with rows
+# in the cascade_markers table (schema: engram_core._init_db). One marker
+# per (node_id, cascade_event); see the table's own docstring in
+# engram_core.py for the full design rationale, the never-delete-resolved
+# invariant, and the deliberately-unresolved orphan-marker residue.
+#
+# _add_stale_replacement is retired, not migrated: the concept it served
+# (a downstream node's replacement, cached at marking time) doesn't survive
+# the redesign in the same shape. A downstream node's OWN eventual
+# replacement is decided when THAT node resolves — a later event, not
+# knowable at the time the original cascade marks it. What a downstream
+# node's *premise* was replaced by is now the immediate_cause/dead_premises
+# derived read below, computed from the premise's own resolution rather
+# than cached onto the downstream node at write time.
 
-    Writers always emit dict-keyed form {old_node_id: new_node_id}. If a legacy
-    scalar exists (pre-PR #231), it is preserved under a "_legacy" sentinel key
-    so downstream readers can still surface it. Coexists indefinitely; no
-    one-shot migration. See issue #231.
+
+def _new_cascade_event() -> str:
+    """Generate a fresh cascade_event id — one per retract/supersede call,
+    shared by every marker that call's downstream walk writes. Not a graph
+    node id (doesn't follow the `xx_NNNN` TYPE_PREFIX convention in
+    engram_ids.py) — cascade_event never appears as a nodes.id.
     """
-    stale_repl = meta.get("stale_replacement", {})
-    if isinstance(stale_repl, str):
-        stale_repl = {"_legacy": stale_repl}
-    elif not isinstance(stale_repl, dict):
-        stale_repl = {}
-    stale_repl[old_node_id] = new_node_id
-    meta["stale_replacement"] = stale_repl
+    return f"cev_{uuid.uuid4().hex[:16]}"
+
+
+def _write_cascade_marker(conn, node_id: str, cascade_event: str,
+                           root_node: str, root_op: str, now: str) -> None:
+    """Write one pending cascade marker for node_id. Called once per
+    downstream node visited by _walk_cascade_downstream's on_live_node
+    callback (marking is idempotent per event because the walker's visited
+    set already guarantees on_live_node fires at most once per node — see
+    _walk_cascade_downstream's docstring). Also used to mark contradiction
+    (ct_) nodes reached via the parallel contradicts-edge cascade, same
+    cascade_event as the derivation-cascade call in the same revision.
+
+    root_op must be 'retract' or 'supersede' — enforced by the table's own
+    CHECK constraint; this function does not re-validate.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'pending', ?)",
+        (node_id, cascade_event, root_node, root_op, now),
+    )
+
+
+def _resolve_own_markers(conn, node_id: str, resolution_kind: str, now: str,
+                          replacement_id: str = None) -> list:
+    """Resolve every PENDING marker sitting on node_id, because node_id has
+    itself just been superseded or retracted. Returns the cascade_event ids
+    that were resolved (for the caller's response payload).
+
+    WHY THIS EXISTS (#2324, spec revision 2026-08-28 16:29Z): with
+    backfilled and live markers both hard-blocking, a marked node's ONLY
+    resolution routes before the frontier verb ships are supersede and
+    retract. If those two verbs did not clear the node's own markers, a
+    marked node would have no route at all — the guard would keep refusing
+    citations of a node that has since been properly re-derived, forever.
+
+    The resolution_kind vocabulary is the schema's, and the mapping is the
+    obvious one: superseding a marked node means the concern was addressed
+    by a NEW claim ('superseded', replacement recorded); retracting it means
+    the node was withdrawn rather than fixed ('retracted', no replacement).
+    Neither is 'acknowledged' — that third kind is reserved for the frontier
+    verb's "I looked, the drift does not change my claim" case, which by
+    definition leaves the node itself unchanged and so cannot be reached
+    from here.
+
+    NOTE this makes an existing read live rather than merely adding one:
+    _dead_premises filters on status='resolved' AND resolution_kind IN
+    ('superseded','retracted'), and until this function existed NOTHING in
+    the codebase wrote status='resolved' — so that predicate could never be
+    satisfied and the function always returned []. A structurally vacuous
+    production read, of the same shape as the three vacuous test guards
+    #2009 already fixed.
+    """
+    pending = conn.execute(
+        "SELECT cascade_event FROM cascade_markers "
+        "WHERE node_id = ? AND status = 'pending'",
+        (node_id,),
+    ).fetchall()
+    if not pending:
+        return []
+    conn.execute(
+        "UPDATE cascade_markers "
+        "SET status = 'resolved', resolution_kind = ?, "
+        "    resolution_replacement_id = ?, resolved_at = ? "
+        "WHERE node_id = ? AND status = 'pending'",
+        (resolution_kind, replacement_id, now, node_id),
+    )
+    return [r["cascade_event"] for r in pending]
+
+
+def _immediate_cause(conn, node_id: str, cascade_event: str) -> list:
+    """Derived read (never stored): the direct premises of node_id that
+    themselves carry a marker for cascade_event — i.e. which of node_id's
+    OWN premises is the reason node_id was marked. One-hop by construction
+    (Ariadne, correcting the relayed premises(X) phrasing to direct_premises
+    (X) — the one-hop read is the whole point of the field it replaces,
+    #1969's direct-premise marking refinement).
+
+    Core primitives (_direct_premise_ids, table access) live in
+    engram_core.py — this module may call core.X per the family→core
+    dependency direction, never the reverse (house rule at module top).
+    """
+    premises = core._direct_premise_ids(conn, node_id)
+    if not premises:
+        return []
+    placeholders = ",".join("?" for _ in premises)
+    rows = conn.execute(
+        f"SELECT node_id FROM cascade_markers "
+        f"WHERE cascade_event = ? AND node_id IN ({placeholders})",
+        (cascade_event, *premises),
+    ).fetchall()
+    return [r["node_id"] for r in rows]
+
+
+def _dead_premises(conn, node_id: str, cascade_event: str) -> list:
+    """Derived read (never stored): which of node_id's direct premises
+    GENUINELY moved under cascade_event — i.e. resolved with kind in
+    {superseded, retracted}. Excludes 'acknowledged' deliberately: an
+    acknowledged premise's marker resolved, but the premise itself never
+    substantively changed, so it isn't dead. This is why the field cannot
+    be written at marking time (Lei's diamond argument, via #2013 comment
+    2026-08-14T21:23:31Z / Kepler's world crossing seq 1911): at marking
+    time a merely-marked premise is not yet known to be dead at all.
+    """
+    premises = core._direct_premise_ids(conn, node_id)
+    if not premises:
+        return []
+    placeholders = ",".join("?" for _ in premises)
+    rows = conn.execute(
+        f"SELECT node_id FROM cascade_markers "
+        f"WHERE cascade_event = ? AND node_id IN ({placeholders}) "
+        f"AND status = 'resolved' "
+        f"AND resolution_kind IN ('superseded', 'retracted')",
+        (cascade_event, *premises),
+    ).fetchall()
+    return [r["node_id"] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -575,14 +704,19 @@ def _supersede_impl(
     per-claim review before supersede.
 
     Cascade behavior (parallel cascades for derivation and contradiction
-    dependents):
+    dependents; #2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
         edges (today just derives_from — supported_by lost its cascade
-        flag in #2252 Stage 1.3) gets marked stale_by_premise
-        (metadata.stale_by includes old_node_id,
-        metadata.stale_replacement[old_node_id] = new_node_id).
+        flag in #2252 Stage 1.3) gets a pending cascade_markers row
+        (root_node=old_node_id, root_op='supersede'). The walk stops at
+        non-claim-bearing nodes, so an NCB dependent gets no marker at
+        all. The marker row carries no severity column — severity is
+        derived at resolution time from root_op, per the 2026-08-26
+        amendment; see engram_core.py's cascade_markers table docstring
+        for the schema.
       - Contradiction cascade (issue #229): every contradiction node that
-        has old as a contradicting side gets marked stale_by_premise too.
+        has old as a contradicting side gets marked with the SAME
+        cascade_event too.
         Dream-fairy-2 reviews each stale contradiction and decides whether
         the supersede substantively resolved the contradiction (case 1:
         wire engram_resolve from new_node to ct) or preserved the conflict
@@ -834,21 +968,27 @@ def _supersede_impl(
 
         # Flag downstream dependents of the old node as stale.
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
+        # Cascade machine (#2013/#2009 slice 1): one cascade_event per this
+        # call, shared by the derivation-cascade write below AND the
+        # contradiction-cascade write further down — "one id shared by every
+        # marker written by one revision" (#2013 §2).
+        # The old node may itself be carrying pending markers from an
+        # EARLIER cascade. Superseding it is one of the two resolution
+        # routes that exist before the frontier verb ships, so clear them
+        # here — otherwise a marked node stays blocked even after it has
+        # been properly re-derived (#2324 spec revision).
+        resolved_own = _resolve_own_markers(
+            conn, old_node_id, "superseded", now, replacement_id=new_node_id
+        )
+
+        cascade_event = _new_cascade_event()
         visited = {old_node_id}  # seed superseded node so walker won't process it
         visited.add(new_node_id)  # also don't process the replacement
         stale = []
 
         def _on_live_for_supersede(dep):
-            meta = json.loads(dep["metadata"]) if dep["metadata"] else {}
-            stale_by = meta.get("stale_by", [])
-            if old_node_id not in stale_by:
-                stale_by.append(old_node_id)
-            meta["stale_by"] = stale_by
-            _add_stale_replacement(meta, old_node_id, new_node_id)
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(meta), dep["id"]),
-            )
+            _write_cascade_marker(conn, dep["id"], cascade_event,
+                                   old_node_id, "supersede", now)
             stale.append({
                 "id": dep["id"],
                 "type": dep["type"],
@@ -869,12 +1009,13 @@ def _supersede_impl(
                                      on_live_node=_on_live_for_supersede)
 
         # Cascade to contradiction nodes that have old as a contradicting side
-        # (issue #229): mark each affected contradiction as stale_by_premise
-        # so dream-fairy-2 reviews whether the supersede substantively resolved
-        # the conflict (case 1: wire engram_resolve from new_node to ct) or
-        # preserved it (case 2: new-contradict between new_node + other side,
-        # then supersede old contradiction → new contradiction). Per the
-        # supersede no-drop discipline (the supersede-no-drop discipline), case 3 (orthogonal supersede)
+        # (issue #229): mark each affected contradiction with the SAME
+        # cascade_event so dream-fairy-2 reviews whether the supersede
+        # substantively resolved the conflict (case 1: wire engram_resolve
+        # from new_node to ct) or preserved it (case 2: new-contradict
+        # between new_node + other side, then supersede old contradiction →
+        # new contradiction). Per the supersede no-drop discipline (the
+        # supersede-no-drop discipline), case 3 (orthogonal supersede)
         # cannot arise — the new node either kept or altered the conflicting
         # claim; dropping is forbidden.
         stale_contradictions = []
@@ -896,16 +1037,8 @@ def _supersede_impl(
             ).fetchone()
             if not ct:
                 continue
-            ct_meta = json.loads(ct["metadata"]) if ct["metadata"] else {}
-            stale_by = ct_meta.get("stale_by", [])
-            if old_node_id not in stale_by:
-                stale_by.append(old_node_id)
-            ct_meta["stale_by"] = stale_by
-            _add_stale_replacement(ct_meta, old_node_id, new_node_id)
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(ct_meta), ct_id),
-            )
+            _write_cascade_marker(conn, ct_id, cascade_event,
+                                   old_node_id, "supersede", now)
             stale_contradictions.append({
                 "id": ct_id,
                 "type": "contradiction",
@@ -958,6 +1091,14 @@ def _supersede_impl(
             "stale_contradictions": stale_contradictions,
             "stale_contradiction_count": len(stale_contradictions),
         }
+        # Surfaced, not merely done: the caller needs to see that this
+        # supersede also CLEARED the old node's own pending markers, because
+        # that is now the primary way an agent gets a hard-blocked node
+        # unblocked (#2324 spec revision). Omitted entirely when empty so
+        # the common case reads unchanged.
+        if resolved_own:
+            result["resolved_own_markers"] = resolved_own
+            result["resolved_own_marker_count"] = len(resolved_own)
         if support_lost_cs_ls:
             result["support_lost"] = support_lost_cs_ls
             result["support_lost_count"] = len(support_lost_cs_ls)
@@ -990,14 +1131,19 @@ def _retract_impl(
     (derivations, theories) that depend on the retracted node are flagged as
     tainted so they can be reviewed and corrected.
 
-    Cascade behavior:
+    Cascade behavior (#2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
         edges (today just derives_from — supported_by lost its cascade
-        flag in #2252 Stage 1.3) gets marked tainted_by
-        (metadata.tainted_by includes the retracted node id).
+        flag in #2252 Stage 1.3) gets a pending cascade_markers row
+        (root_node=the retracted node, root_op='retract'). The walk stops
+        at non-claim-bearing nodes, so an NCB dependent gets no marker at
+        all. The marker row carries no severity column — severity is
+        derived at resolution time from root_op, per the 2026-08-26
+        amendment; see engram_core.py's cascade_markers table docstring
+        for the schema.
       - Contradiction cascade (issue #229): every contradiction node that
-        has the retracted node as a contradicting side gets marked
-        tainted_by. Dream-fairy-2 reviews tainted contradictions —
+        has the retracted node as a contradicting side gets marked with
+        the SAME cascade_event. Dream-fairy-2 reviews tainted contradictions —
         the retracted side was never valid, so the contradiction itself
         may need to be closed (since one of its claims is now invalid)
         or rewired to a corrected replacement observation if one was
@@ -1312,19 +1458,23 @@ def _retract_impl(
         #    derives_from — supported_by lost its cascade flag in #2252
         #    Stage 1.3, so it no longer reaches anything through this walk).
         # Uses shared walker (_walk_cascade_downstream) — PR-AA SSoT refactor.
+        # Cascade machine (#2013/#2009 slice 1): one cascade_event per this
+        # call, shared by the derivation-cascade write below AND the
+        # contradiction-cascade write further down.
+        # Same as supersede's: the node being retracted may itself carry
+        # pending markers from an earlier cascade. Retraction is the other
+        # resolution route available before the frontier verb (#2324 spec
+        # revision) — no replacement, because a retracted node was
+        # withdrawn rather than fixed.
+        resolved_own = _resolve_own_markers(conn, node_id, "retracted", now)
+
+        cascade_event = _new_cascade_event()
         tainted = []
         visited = {node_id}  # seed retracted node so walker won't process it
 
         def _on_live_for_retract(dep):
-            meta = json.loads(dep["metadata"] or "{}")
-            tainted_by = meta.get("tainted_by", [])
-            if node_id not in tainted_by:
-                tainted_by.append(node_id)
-            meta["tainted_by"] = tainted_by
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(meta), dep["id"]),
-            )
+            _write_cascade_marker(conn, dep["id"], cascade_event,
+                                   node_id, "retract", now)
             tainted.append({
                 "id": dep["id"],
                 "type": dep["type"],
@@ -1344,10 +1494,10 @@ def _retract_impl(
 
         # Cascade to contradiction nodes that have the retracted node as a
         # contradicting side (issue #229): mark each affected contradiction
-        # as tainted_by so dream-fairy-2 reviews whether the contradiction
-        # itself is still valid (the retracted side was never valid; if the
-        # other side stands alone now, the contradiction may itself need
-        # supersede / explicit close).
+        # with the SAME cascade_event so dream-fairy-2 reviews whether the
+        # contradiction itself is still valid (the retracted side was never
+        # valid; if the other side stands alone now, the contradiction may
+        # itself need supersede / explicit close).
         tainted_contradictions = []
         contradiction_edges = conn.execute(
             "SELECT source_id, target_id FROM edges "
@@ -1367,15 +1517,8 @@ def _retract_impl(
             ).fetchone()
             if not ct:
                 continue
-            ct_meta = json.loads(ct["metadata"]) if ct["metadata"] else {}
-            tainted_by = ct_meta.get("tainted_by", [])
-            if node_id not in tainted_by:
-                tainted_by.append(node_id)
-            ct_meta["tainted_by"] = tainted_by
-            conn.execute(
-                "UPDATE nodes SET metadata = ? WHERE id = ?",
-                (json.dumps(ct_meta), ct_id),
-            )
+            _write_cascade_marker(conn, ct_id, cascade_event,
+                                   node_id, "retract", now)
             tainted_contradictions.append({
                 "id": ct_id,
                 "type": "contradiction",
@@ -1464,6 +1607,11 @@ def _retract_impl(
             "tainted_contradictions": tainted_contradictions,
             "tainted_contradiction_count": len(tainted_contradictions),
         }
+        # Same as supersede's — see the note there. Retracting a marked node
+        # is the other pre-frontier-verb resolution route.
+        if resolved_own:
+            result["resolved_own_markers"] = resolved_own
+            result["resolved_own_marker_count"] = len(resolved_own)
         if initiation:
             result["initiation"] = initiation
         if initiation_gate:

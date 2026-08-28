@@ -2067,6 +2067,39 @@ def _take_pre_migration_backup_if_pending(
     return backup_ok
 
 
+def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
+    """Whether migration rung `target` may run right now.
+
+    THE LADDER MUST BE A LADDER. Every rung is an independent `if` gated on
+    `current_user_version`, which is read ONCE at the top of
+    _run_db_one_time_setup — so a rung whose body raised (leaving the version
+    un-bumped, deliberately, so it retries) does NOT stop the rungs after it.
+    Before this helper, a failed rung 4 followed by a successful rung 5 left
+    PRAGMA user_version at 5: rung 4's own retry gate (`< 4`) could then never
+    be true again, and its migration was skipped FOREVER, silently.
+
+    That hazard was invisible while rung 4 was the last one — it needs a
+    successor to bite, which is why adding rung 5 (#2324) is what surfaced it,
+    via test_migration4_fault_injected_rebuild_stays_at_v3_and_does_not_crash_writes.
+    The same latent bug applies to rungs 2-4 over a failed rung 1-3; this
+    helper is applied to all of them, not only the new one.
+
+    Reads the version LIVE rather than trusting the caller's cached copy —
+    that cached value is precisely what cannot see a mid-run failure.
+    Requires `live == target - 1` (not `live < target`), which is the same
+    thing on a healthy ladder — each rung bumps by exactly one, in order — and
+    differs only in the case that matters: a predecessor that did not land.
+
+    EVERY FUTURE RUNG MUST USE THIS. A hand-written
+    `if current_user_version < N and _pre_migration_backup_ok:` reintroduces
+    the skip.
+    """
+    if not backup_ok:
+        return False
+    live = conn.execute("PRAGMA user_version").fetchone()[0]
+    return live == target - 1
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -2165,11 +2198,83 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             last_num INTEGER NOT NULL DEFAULT 0
         );
 
+        -- Cascade machine (engram-alpha#2013) — the unified retract/supersede
+        -- marker. One row per (node_id, cascade_event): every node reached by
+        -- a single retract/supersede's downstream walk gets exactly one
+        -- marker naming that event. Replaces the old ad-hoc
+        -- metadata.stale_by / metadata.tainted_by list fields (#2009).
+        --
+        -- Deliberately thin: severity, immediate_cause, and dead_premises are
+        -- NEVER stored here — all three are derived reads computed from
+        -- (root_op, direct-premise edges, sibling markers of the same event)
+        -- at query time. A cached copy drifts from its source; a derived
+        -- value cannot (Kepler, world crossing seq 1911 — "bind VALUES late;
+        -- record DEPENDENCIES eagerly"). Slice 1 (#2009) ships marking only,
+        -- uniform severity (severity(X, event) = taint if root_op == retract
+        -- else stale, no per-hop attenuation) — the reasoning_type-conductor
+        -- refinement in #2013 §1 is real design reasoning for a LATER slice,
+        -- deliberately deferred (Ariadne, 2026-08-16): narrowing the derive
+        -- function from f(root_op) to f(root_op, path) later touches only
+        -- the derive function + the _validate_premises gate, not this table.
+        --
+        -- resolved rows are NEVER deleted (invariant, not convention) — the
+        -- resolution-time scan for "which of my premises moved in this
+        -- event" works by finding this same event's marker on each premise
+        -- ALREADY resolved; deleting a resolved marker breaks that scan
+        -- silently (Lei, via #2013 comment 2026-08-14T21:23:31Z / Ariadne).
+        --
+        -- OPEN QUESTION, deliberately unresolved (Borges + Ariadne,
+        -- 2026-08-16): the event's marked set is computed once at cascade
+        -- time; if a later repair drops an edge, a node can keep a marker
+        -- for an event that no longer structurally reaches it — nagging
+        -- forever with nothing to adjudicate. One-sided: a newly-ADDED
+        -- premise simply lacks the marker and is correctly excluded, so the
+        -- scan self-heals in that direction only. No confident rule exists
+        -- yet for the drop direction. Do not invent one here — raise it to
+        -- Lei if a build forces the question.
+        CREATE TABLE IF NOT EXISTS cascade_markers (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id                 TEXT NOT NULL REFERENCES nodes(id),
+            cascade_event           TEXT NOT NULL,
+            root_node               TEXT NOT NULL,
+            root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+            status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted') OR resolution_kind IS NULL),
+            resolution_replacement_id TEXT,
+            created_at              TEXT NOT NULL,
+            resolved_at             TEXT,
+            -- Backfill provenance (#2324, rung 5). NULL on every marker
+            -- written by a live retract/supersede cascade. On a marker the
+            -- rung-5 migration wrote from retired metadata.stale_by /
+            -- metadata.tainted_by, one of:
+            --   'recovered'      created_at is the ORIGINAL cascade time,
+            --                    recovered from the edit_history
+            --                    stale_flagged/tainted row for this exact
+            --                    (node, root) pair.
+            --   'migration_time' no such row survived; created_at is the
+            --                    migration's own clock.
+            -- Two states rather than one boolean because the spec's demand
+            -- is "never a fabricated timestamp wearing an original's face"
+            -- (#2009 comment 5455009878 §3), and a single backfilled=1 flag
+            -- cannot answer WHICH of the two a given created_at is.
+            backfill_provenance     TEXT CHECK (backfill_provenance IN ('recovered', 'migration_time') OR backfill_provenance IS NULL),
+            -- 1 when the legacy entry this marker came from was unparseable
+            -- or named a root node that no longer exists. The marker is
+            -- written ANYWAY and blocks citation: over-blocking is the
+            -- fail-safe direction, silently skipping is the corruption
+            -- (spec §4). Enumerated in the migration report, never fatal.
+            backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(node_id, cascade_event)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
         CREATE INDEX IF NOT EXISTS idx_nodes_current ON nodes(is_current);
         CREATE INDEX IF NOT EXISTS idx_nodes_evidence_id ON nodes(evidence_id);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event);
     """
     )
 
@@ -2530,17 +2635,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
     # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 4 -> PRAGMA user_version = 4). No single named
+    # below (currently rung 5 -> PRAGMA user_version = 5). No single named
     # constant exists elsewhere in this function for "the latest schema
     # version" — each rung below hardcodes its own target inline — so this
     # local mirrors that existing convention rather than inventing a new
     # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 5. (Mechanically checked against the
+    # alongside adding any future rung 6. (Mechanically checked against the
     # rungs' own PRAGMA user_version = N literals by
     # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
     # — forgetting the bump fails loudly at test time instead of silently
     # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 4
+    _PRE_MIGRATION_LATEST_VERSION = 5
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -2552,7 +2657,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         conn, current_user_version, _PRE_MIGRATION_LATEST_VERSION
     )
 
-    if current_user_version < 1 and _pre_migration_backup_ok:
+    if _rung_ready(conn, 1, _pre_migration_backup_ok):
         try:
             conn.execute(
                 """
@@ -2586,7 +2691,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Strategy: drop vocab↔fts dependency chain, rebuild both, backfill all
     # non-retracted nodes into the new 5-column schema, recreate triggers.
     # Gated by user_version so it runs exactly once.
-    if current_user_version < 2 and _pre_migration_backup_ok:
+    if _rung_ready(conn, 2, _pre_migration_backup_ok):
         try:
             # Drop in dependency order: vocab depends on FTS, FTS is the target.
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
@@ -2673,7 +2778,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     #   b. Trigger: nodes_fts_supersede_remove is created at setup time (above)
     #      via CREATE TRIGGER IF NOT EXISTS; the CREATE here is a no-op safety net
     #      for the path where setup ran before this migration block was added.
-    if current_user_version < 3 and _pre_migration_backup_ok:
+    if _rung_ready(conn, 3, _pre_migration_backup_ok):
         try:
             conn.execute(
                 """
@@ -2749,7 +2854,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     #      corrected claim (step 1) and the new FTS-adjacent columns.
     #      Expect real wall-clock time on a large graph; that is expected
     #      and correct, not a bug to route around.
-    if current_user_version < 4 and _pre_migration_backup_ok:
+    if _rung_ready(conn, 4, _pre_migration_backup_ok):
         try:
             import engram_backup
 
@@ -2904,6 +3009,292 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
                 f"[_run_db_one_time_setup] migration 4 FAILED — could not "
                 f"import engram_backup, will retry on next startup: "
                 f"{_migration4_import_err!r}",
+                file=sys.stderr,
+            )
+
+    # ── Migration version 5 (#2324): backfill cascade_markers from the
+    # retired metadata.stale_by / metadata.tainted_by fields ────────────────
+    #
+    # WHY THIS RIDES THE SAME PR AS THE SCHEMA (Lei's directive, relayed by
+    # Kepler on #2009 comment 5455009878): #2009 moves every cascade READER
+    # off metadata onto this table. Ship the schema without the backfill and
+    # there is a state — any graph upgraded from before #2009 — where the
+    # guard consults a marker table that has no rows for legacy taint. The
+    # failure is SILENT and in the dangerous direction: a derivation that
+    # would be blocked goes through, because the guard finds nothing rather
+    # than finding a marker. Measured on the author's own graph at spec
+    # time: 30 current nodes carrying stale_by (35 markers, 5 of them
+    # two-root), every one of them blocked before this PR and unblocked by
+    # a schema-only merge.
+    #
+    # "soft-blocked" is what that measurement said when it was taken, and
+    # it is why the wording here avoids it: those 30 were soft-blocked
+    # under the pre-#2324 world where use_stale could force them through.
+    # TWO rulings, not one — the distinction matters because the first
+    # explicitly PRESERVED the behaviour the second removed. Timestamps
+    # read from the API rather than recalled:
+    #   16:25:14Z  #2009 comment 5455009878 — the backfill spec. Its §7
+    #              required backfilled supersede-rooted markers to stay
+    #              use_stale-overridable, exactly as metadata.stale_by was.
+    #   16:29:55Z  comment 5455057267 — the spec REVISION, 4m41s later,
+    #              which overruled that §7: hard-block both root_ops, no
+    #              use_stale compatibility.
+    #   16:33:31Z  comment 5455098302 — "Reading B", a LATER and separate
+    #              ruling answering a different question: whether a premise
+    #              that is ITSELF superseded (no marker involved) also
+    #              hard-blocks. It does; use_stale retires entirely.
+    # Collapsing any of these into "the same ruling" would erase a
+    # reversal. So they are HARD blocks now. The gap's direction is unchanged and its
+    # severity is worse — a "today" in a comment ages into a lie the moment
+    # the thing it describes moves.
+    # So schema-without-backfill is the bug, and the
+    # migration ladder is the only place that runs exactly once, exactly at
+    # upgrade.
+    #
+    # HONEST RESIDUAL, stated rather than papered over: "atomic" here means
+    # the backfill either fully applies or fully rolls back, and the version
+    # gate only advances on success. It does NOT mean the process refuses to
+    # serve a partially-migrated graph — if the rung fails, the gate stays at
+    # 4, the rung retries next startup, and in between the guard reads an
+    # empty marker table for legacy-tainted nodes. Closing that would mean
+    # either aborting startup (a much larger policy call than this rung) or
+    # keeping a legacy-metadata fallback reader alive (which contradicts
+    # spec §8's "reads move to markers"). Neither is this rung's to decide;
+    # the failure is at least LOUD on stderr, which is what makes it
+    # reportable rather than silent.
+    if _rung_ready(conn, 5, _pre_migration_backup_ok):
+        try:
+            # Defensive column add. No RELEASED version has cascade_markers
+            # at all (it lands in #2009, same PR as this rung), so no user
+            # is owed an ALTER — but a peer who ran the branch before the
+            # provenance columns existed would have the table without them,
+            # and CREATE TABLE IF NOT EXISTS will not add a column to an
+            # existing table. Four lines that turn a hard "no such column"
+            # crash on a colleague's seat into a clean upgrade.
+            _cm_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(cascade_markers)").fetchall()
+            }
+            if "backfill_provenance" not in _cm_cols:
+                conn.execute(
+                    "ALTER TABLE cascade_markers ADD COLUMN backfill_provenance TEXT"
+                )
+            if "backfill_anomaly" not in _cm_cols:
+                conn.execute(
+                    "ALTER TABLE cascade_markers ADD COLUMN backfill_anomaly "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
+            _bf_now = _now()
+            _bf_anomalies: list = []
+
+            # Recover the ORIGINAL cascade timestamp per (node, root) pair
+            # from edit_history, which recorded each downstream marking as
+            # it happened: 'stale_flagged' carries details.stale_premise,
+            # 'tainted' carries details.tainted_by — in both cases the
+            # cascade ROOT, which is exactly the value that was appended to
+            # the metadata list. MIN(timestamp) because a node can be
+            # re-flagged for the same root; the first is the true origin.
+            # Guarded on table existence: edit_history is created further
+            # down in this same function, so on a genuinely fresh DB (which
+            # runs every rung) it does not exist yet. A fresh DB also has no
+            # nodes, so the map being empty there costs nothing.
+            _origin_ts: dict = {}
+            _has_edit_history = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edit_history'"
+            ).fetchone()
+            if _has_edit_history:
+                for _eh in conn.execute(
+                    "SELECT node_id, action, details, timestamp FROM edit_history "
+                    "WHERE action IN ('stale_flagged', 'tainted') ORDER BY id"
+                ).fetchall():
+                    try:
+                        _d = json.loads(_eh["details"] or "{}")
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(_d, dict):
+                        continue
+                    _root = (
+                        _d.get("stale_premise")
+                        if _eh["action"] == "stale_flagged"
+                        else _d.get("tainted_by")
+                    )
+                    if not isinstance(_root, str) or not _root:
+                        continue
+                    _k = (_eh["node_id"], _root)
+                    # ORDER BY id ascending + setdefault = earliest wins.
+                    _origin_ts.setdefault(_k, _eh["timestamp"])
+
+            # The population, per spec §2: is_current=1 nodes only.
+            # Non-current nodes are excluded — they are already uncitable,
+            # which matches the current-only conformance ruling, and marking
+            # them would be blocking something nothing can reach anyway.
+            #
+            # metadata.built_on_stale is NOT in this population, and the
+            # reason in the spec ("a derived echo of stale_by") is wrong
+            # even though the exclusion is right — verified per §2's own
+            # instruction to check rather than assume. built_on_stale lives
+            # on the DERIVING node, is written only by engram_derive's
+            # use_stale=True override path, and records an author's
+            # conscious opt-in. It is author-intent provenance, not cascade
+            # state: an echo could be regenerated from markers, this cannot
+            # be reconstructed from anything, and must survive §8's eventual
+            # removal of the legacy fields.
+            _legacy_rows = conn.execute(
+                "SELECT id, metadata FROM nodes "
+                "WHERE is_current = 1 AND metadata IS NOT NULL AND metadata != ''"
+            ).fetchall()
+
+            def _legacy_roots(meta_blob, node_id):
+                """(root_id, root_op, anomaly) triples for one node's retired
+                cascade metadata. Anomalies are RETURNED, never dropped —
+                spec §4's fail-safe direction: an entry we cannot parse still
+                earns a blocking marker, because over-blocking is recoverable
+                by a human and silent under-blocking is not.
+                """
+                out = []
+                try:
+                    m = json.loads(meta_blob)
+                except (ValueError, TypeError):
+                    return out
+                if not isinstance(m, dict):
+                    return out
+                for _key, _op in (("stale_by", "supersede"), ("tainted_by", "retract")):
+                    v = m.get(_key)
+                    if v is None:
+                        continue
+                    if isinstance(v, list):
+                        if not v:
+                            # An EMPTY list is not a population member. This
+                            # is the exact trap engram_query.py already
+                            # documents against a substring test — '"stale_by":
+                            # [' matches an empty list too. Counting it here
+                            # would make the §5 gate fail on a node that never
+                            # needed a marker.
+                            continue
+                        for x in v:
+                            if isinstance(x, str) and x:
+                                out.append((x, _op, False))
+                            else:
+                                out.append(("__unparseable__", _op, True))
+                    elif isinstance(v, str) and v:
+                        # Never written by any shipped code path, but a
+                        # hand-edited graph could carry it. Treat the string
+                        # as the root AND flag it — the marker blocks, and
+                        # the report names it for a human to confirm.
+                        out.append((v, _op, True))
+                    else:
+                        out.append(("__unparseable__", _op, True))
+                return out
+
+            _node_ids = {r["id"] for r in conn.execute("SELECT id FROM nodes")}
+            _expected_nodes = set()
+            for _r in _legacy_rows:
+                for _root, _op, _anom in _legacy_roots(_r["metadata"], _r["id"]):
+                    _expected_nodes.add(_r["id"])
+                    _dangling = _root not in _node_ids
+                    _anom = _anom or _dangling
+                    # cascade_event is keyed on (op, root), not root alone:
+                    # a root node that was superseded and later retracted can
+                    # reach the same dependent under BOTH ops, and a
+                    # root-only key would collide under UNIQUE(node_id,
+                    # cascade_event) — where OR IGNORE would drop the second
+                    # marker SILENTLY, and the §5 gate (which counts distinct
+                    # node_ids) would not notice.
+                    _event = f"backfill:{_op}:{_root}"
+                    _ts = _origin_ts.get((_r["id"], _root))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO cascade_markers "
+                        "(node_id, cascade_event, root_node, root_op, status, "
+                        " created_at, backfill_provenance, backfill_anomaly) "
+                        "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                        (
+                            _r["id"],
+                            _event,
+                            _root,
+                            _op,
+                            _ts or _bf_now,
+                            "recovered" if _ts else "migration_time",
+                            1 if _anom else 0,
+                        ),
+                    )
+                    if _anom:
+                        _bf_anomalies.append(
+                            f"{_r['id']} {_op} root={_root!r} "
+                            f"({'root node absent from graph' if _dangling else 'unparseable legacy entry'})"
+                        )
+
+            # §5 count gate. _expected_nodes is built from the LEGACY side by
+            # the same scan that drove the inserts; _actual_nodes is read back
+            # out of the table. They are two different reads of two different
+            # stores, which is the point — a gate computed from the insert
+            # loop's own bookkeeping would agree with itself no matter what
+            # the table ended up holding. (This author shipped exactly that
+            # mistake this week on an unrelated sweep: a fix log reported
+            # 83/83 complete while six sites remained, because the site list
+            # was built with a filter that excluded them by construction.)
+            _actual_nodes = {
+                r["node_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT node_id FROM cascade_markers "
+                    "WHERE backfill_provenance IS NOT NULL"
+                ).fetchall()
+            }
+            if _expected_nodes != _actual_nodes:
+                _missing = sorted(_expected_nodes - _actual_nodes)
+                _extra = sorted(_actual_nodes - _expected_nodes)
+                conn.rollback()
+                print(
+                    "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                    "backfill) COUNT GATE FAILED — rolled back, user_version "
+                    f"stays at {current_user_version}, will retry on next "
+                    f"startup. expected {len(_expected_nodes)} nodes, table has "
+                    f"{len(_actual_nodes)}. missing={_missing[:20]} "
+                    f"extra={_extra[:20]}",
+                    file=sys.stderr,
+                )
+            else:
+                # Loud is not the same as fatal (spec §4): anomalies are
+                # enumerated and the migration COMPLETES, because every
+                # anomalous entry already got its blocking marker above.
+                if _bf_anomalies:
+                    print(
+                        "[_run_db_one_time_setup] migration 5 (#2324): "
+                        f"{len(_bf_anomalies)} legacy cascade entries were "
+                        "dangling or unparseable. Each still received a "
+                        "BLOCKING marker (backfill_anomaly=1) — over-blocking "
+                        "is the fail-safe direction. Review each:",
+                        file=sys.stderr,
+                    )
+                    for _a in _bf_anomalies:
+                        print(f"    anomaly: {_a}", file=sys.stderr)
+                _marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM cascade_markers "
+                    "WHERE backfill_provenance IS NOT NULL"
+                ).fetchone()[0]
+                _recovered = conn.execute(
+                    "SELECT COUNT(*) FROM cascade_markers "
+                    "WHERE backfill_provenance = 'recovered'"
+                ).fetchone()[0]
+                print(
+                    "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                    f"backfill): {len(_expected_nodes)} nodes, {_marker_count} "
+                    f"markers ({_recovered} with original timestamps recovered "
+                    f"from edit_history, {_marker_count - _recovered} stamped at "
+                    f"migration time), {len(_bf_anomalies)} anomalies.",
+                    file=sys.stderr,
+                )
+                # Bump INSIDE the try and only after the gate passes, per
+                # rungs 1-4's retry-safety convention. Re-running is a no-op:
+                # every insert is OR IGNORE on UNIQUE(node_id, cascade_event)
+                # and every synthesized event id is deterministic.
+                conn.execute("PRAGMA user_version = 5")
+                conn.commit()
+        except sqlite3.DatabaseError as _migration5_err:
+            print(
+                "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                "backfill) FAILED, will retry on next startup: "
+                f"{_migration5_err!r}",
                 file=sys.stderr,
             )
 
@@ -6259,6 +6650,108 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     return [r["id"] for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Cascade marker primitives (engram-alpha#2013 / #2009 slice 1)
+# ---------------------------------------------------------------------------
+# Table schema + full design rationale: _init_db's cascade_markers block.
+# These are the CORE-layer primitives (raw table/edge access) — the
+# composed derived reads (_immediate_cause, _dead_premises) and the writer
+# (_write_cascade_marker, _new_cascade_event) live in engram_revision.py
+# (family E) and call back into these via core.X, per the acyclic
+# dependency rule (family imports core; core must never import family).
+
+
+def _direct_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """The node ids node_id directly derives_from / is supported_by — i.e.
+    node_id's own one-hop premises. Used by both _validate_premises below
+    and engram_revision's _immediate_cause/_dead_premises derived reads.
+    """
+    rows = conn.execute(
+        "SELECT target_id FROM edges WHERE source_id = ? "
+        "AND relation IN ('derives_from', 'supported_by')",
+        (node_id,),
+    ).fetchall()
+    return [r["target_id"] for r in rows]
+
+
+def _pending_markers_for_node(conn: sqlite3.Connection, node_id: str) -> list:
+    """All PENDING cascade markers on node_id, across every cascade_event
+    that has reached it and not yet resolved — the read _validate_premises
+    (MECH-5) gates derivation on. A node can carry markers from more than
+    one concurrent cascade (two markers, per-event not per-node — Lei's
+    model via #2013 §9 / comment 2026-08-14T21:23:31Z).
+    """
+    return conn.execute(
+        "SELECT * FROM cascade_markers WHERE node_id = ? AND status = 'pending' "
+        "ORDER BY created_at",
+        (node_id,),
+    ).fetchall()
+
+
+# Loud-inert shim for the retired use_stale override (#2324 spec revision,
+# commander's ruling 2026-08-28). The parameter is still ACCEPTED so existing
+# callers do not crash, but it has no effect — and a parameter that silently
+# does nothing is a silent fallback, which is the failure mode this notice
+# exists to prevent. Emitted on BOTH paths: in the refusal payload when the
+# guard blocks, and in the success payload when the premises happened to be
+# clean anyway. Full signature removal is #2013 §11 slice-2, which carries its
+# own enumerated reader sweep; it deliberately does not move into this PR.
+USE_STALE_RETIRED_NOTICE = (
+    "use_stale is RETIRED and had no effect on this call. The cascade machine "
+    "replaced the force-through: resolve the premise instead of citing over it "
+    "— supersede or retract a marker-carrying premise, or cite the successor of "
+    "a superseded one. (Parameter still accepted for compatibility; it is "
+    "removed in #2013 slice 2.)"
+)
+
+
+def _cascade_marker_severity(root_op: str) -> str:
+    """Slice-1 severity: uniform per root_op, no per-hop conduction.
+    taint for retract, stale for supersede.
+
+    ⚠ THIS IS A CLASSIFICATION LABEL, NOT A BLOCK STRENGTH (#2324 spec
+    revision, 2026-08-28 16:29Z). Both labels now HARD-block a derivation —
+    `use_stale` was retired, so "stale" no longer means "soft". The split is
+    kept because readers genuinely need it: a query warning, the viz colour,
+    and the refusal's own route text all differ between "your premise is
+    downstream of a retraction" and "your premise is downstream of a
+    supersede". Do not re-read this function as answering "can the agent
+    override?" — nothing can, and _validate_premises no longer asks.
+
+    #2013 §1's reasoning_type-conductor
+    refinement (chain conducts taint fully; corroborative attenuates to
+    stale at the junction) is real design reasoning for a LATER slice —
+    deliberately deferred (Ariadne, 2026-08-16, ia seq 5835): this is a
+    strict subset of that richer read (f(root_op) vs f(root_op, path)),
+    and narrowing it later touches only this function and its caller
+    (_validate_premises), never the schema or the writer.
+    """
+    return "taint" if root_op == "retract" else "stale"
+
+
+def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
+    """node_id's pending cascade markers, classified into (tainted_by,
+    stale_by) — each a de-duplicated, order-preserving list of root_node
+    ids. Shared by every reader that needs "which roots is this node
+    tainted/stale because of" (_validate_premises, _extract_warnings,
+    the tainted_still_valid pattern, engram_reflect, health-score/diagnose
+    counts) so the classification logic (severity-per-marker, dedup) lives
+    in exactly one place — reviewer-fairy flagged this as duplicated
+    near-verbatim across 5 call sites in 3 files on #2009's first pass
+    (2026-08-16); this is the fix.
+    """
+    tainted_by: list = []
+    stale_by: list = []
+    for m in _pending_markers_for_node(conn, node_id):
+        root = m["root_node"]
+        if _cascade_marker_severity(m["root_op"]) == "taint":
+            if root not in tainted_by:
+                tainted_by.append(root)
+        else:
+            if root not in stale_by:
+                stale_by.append(root)
+    return tainted_by, stale_by
+
 # RECALL_SUMMARY_TARGET / _SOFT_CAP: the write-time recall_summary contract
 # (#1952 PR1). Distinct from RECALL_SUMMARY_HARD_CAP (200) in
 # tools/recall_summary_validator.py, which governs the OLDER
@@ -6360,8 +6853,11 @@ def _validate_premises(
     the diagnosed-pattern derivation diagnosed.
 
     Rules:
-      - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
-        No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise carrying a pending retract-rooted cascade marker →
+        hard block (BLOCKED_TAINTED). No override. Taint means an upstream
+        was retracted (proven wrong). Read from the cascade_markers table
+        via _classify_pending_markers, NOT from metadata.tainted_by — that
+        field was retired by #2013/#2009 slice 1 and nothing writes it.
       - Any premise sitting on the open side of an unresolved contradiction
         (a live ct_ node, no resolves closure) AND use_contested=False →
         soft block (BLOCKED_CONTRADICTED, #1654). Agent opts in with
@@ -6369,29 +6865,48 @@ def _validate_premises(
         refutation, so building on it is a deliberate, loudly-marked
         choice, not a hard wall. Checked before stale (a disputed claim is
         a more acute concern than a merely-superseded one).
-      - Any premise with metadata.stale_by AND use_stale=False →
-        soft block (BLOCKED_STALE). Agent opts in with use_stale=True
-        when the upstream update is judged irrelevant to current logic.
+      - Any premise carrying a pending supersede-rooted cascade marker, OR
+        any premise that has ITSELF been superseded → HARD block
+        (BLOCKED_STALE). No override: `use_stale` was retired by #2324 and
+        is accepted-but-inert. The two are reported as separate cases with
+        separate routes — a marker is resolved by superseding/retracting the
+        premise that carries it; a superseded premise is resolved by citing
+        its successor. Same marker-table source as the taint rule above;
+        metadata.stale_by is retired as a store.
       - Mixed taint + (contradicted|stale) → treated as tainted (taint
-        dominates — it is a hard block with no override, and short-
-        circuits both other checks for that premise).
+        dominates and short-circuits both other checks for that premise).
+        Stale is now equally hard, so the precedence between them is about
+        which refusal is most USEFUL to report, not which is stronger;
+        contested remains the only genuinely soft block.
       - Contested and stale are NOT mutually exclusive with each other: a
         premise can be both superseded AND sitting on a still-open
         contradiction (e.g. supersede fires on one side of a live dispute
         without auto-resolving it — issue #229's documented workflow).
-        Both are classified independently, so BOTH overrides
-        (use_contested AND use_stale) must clear before such a premise is
-        allowed through — clearing only one would silently drop the
-        other's guard.
+        Both are still classified independently — see the test that reads
+        stale_ids and contested_ids together — but since #2324 that no
+        longer means "both overrides must clear". There is only ONE
+        override left: such a premise is refused on its staleness no matter
+        what use_contested says, and use_stale cannot lift it. The
+        independence is now about REPORTING (neither classification
+        silently drops the other) rather than about clearing.
 
     Returns:
         (block_response, stale_ids, contested_ids)
-        - block_response: None if premises are clean (or opt-ins cover
-          them). Otherwise a dict ready for json.dumps with a structured
-          block error.
-        - stale_ids: list of premise IDs that are stale (for the caller
-          to stamp metadata.built_on_stale when use_stale=True lets us
-          proceed).
+        - block_response: None if premises are clean, or if the ONE
+          surviving override (use_contested) covers the only thing wrong
+          with them. Singular since #2324: tainted and stale premises
+          block unconditionally. Otherwise a dict ready for json.dumps
+          with a structured block error.
+        - stale_ids: list of premise IDs that are stale. Since #2324 this
+          is ONLY ever non-empty alongside a block_response — the caller
+          that used to stamp metadata.built_on_stale from it no longer
+          exists, because nothing proceeds past a stale premise. NO CALLER
+          READS IT TODAY: _create_derivation is the only production caller
+          and it stopped forwarding the value when the always-empty
+          success-dict key was dropped. It is kept in the return tuple for
+          ONE forward-looking reason — slice 4's acknowledge verb needs
+          exactly this list — so if that plan changes, this becomes dead
+          and should go with it.
         - contested_ids: list of premise IDs sitting on an open
           contradiction (for the caller to auto-stamp
           metadata.built_on_contested when use_contested=True lets us
@@ -6405,19 +6920,21 @@ def _validate_premises(
     contested_ids: list = []
     for sid in supporting_ids:
         row = conn.execute(
-            "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
+            "SELECT status, is_current, superseded_by FROM nodes WHERE id = ?",
             (sid,),
         ).fetchone()
         if not row:
             continue
-        meta = {}
-        if row["metadata"]:
-            try:
-                meta = json.loads(row["metadata"])
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-        tainted_by = list(meta.get("tainted_by") or [])
-        stale_by = list(meta.get("stale_by") or [])
+        # Cascade machine (#2013/#2009 slice 1): tainted_by/stale_by are no
+        # longer read from metadata — they're derived from pending markers
+        # in cascade_markers, uniform severity per root_op (slice-1 scope;
+        # see _cascade_marker_severity's docstring). Reporting root_node
+        # here matches TODAY's shipped semantics exactly: the pre-marker
+        # code always wrote the cascade ROOT's id into tainted_by/stale_by
+        # for every downstream node, never a closer intermediate — so this
+        # is a like-for-like restatement (Borges, #2013 comment
+        # 2026-08-13T19:39:45Z), not a behavior change.
+        tainted_by, stale_by = _classify_pending_markers(conn, sid)
 
         # The premise itself may be the retracted or superseded node (not
         # just downstream of one) — the cascade markers only hit dependents.
@@ -6431,8 +6948,13 @@ def _validate_premises(
             and row["superseded_by"] is not None
             and row["status"] != "retracted"
         )
-        if is_superseded_here and sid not in stale_by:
-            stale_by.insert(0, sid)
+        # Case 2 is tracked SEPARATELY from case 1 (the marker list) rather
+        # than folded into it. Before #2324 both were "stale" with one shared
+        # guidance string, so conflating them cost nothing. Now the refusal
+        # must name a route PER CASE — case 1 resolves by supersede/retract of
+        # the premise itself, case 2 by citing the successor that already
+        # exists — and a single merged list cannot say which applies.
+        superseded_itself = bool(is_superseded_here)
 
         # Taint dominates unconditionally, so only compute contested/stale
         # when the premise isn't already tainted. But contested and stale
@@ -6474,15 +6996,40 @@ def _validate_premises(
                     "open_contradictions": open_ct_ids,
                 })
                 contested_ids.append(sid)
-            if stale_by:
+            if stale_by or superseded_itself:
                 replacement_info = []
+                # Case 1 — sid is DOWNSTREAM of one or more supersedes and
+                # carries their pending markers. Route: resolve sid itself.
                 for old_id in stale_by:
                     drow = conn.execute(
                         "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
                     ).fetchone()
                     replacement_info.append({
+                        "case": "cascade_marker",
                         "superseded_id": old_id,
                         "replaced_by_id": drow["superseded_by"] if drow else None,
+                        "route": (
+                            f"supersede or retract {sid} — that resolves its own "
+                            "markers in the same operation. (The acknowledge "
+                            "route, for when the upstream change does not affect "
+                            "this claim, arrives with #2013 slice 4.)"
+                        ),
+                    })
+                # Case 2 — sid IS the superseded node. No marker is ever
+                # written here: the cascade walker seeds the superseded node
+                # into `visited` so it cannot mark itself. The route needs no
+                # machine at all, because the successor already exists.
+                if superseded_itself:
+                    replacement_info.append({
+                        "case": "superseded_premise",
+                        "superseded_id": sid,
+                        "replaced_by_id": row["superseded_by"],
+                        "route": (
+                            f"cite the successor {row['superseded_by']} instead "
+                            f"of {sid}. If the successor does not support your "
+                            "derivation, that is information about the "
+                            "derivation, not an obstacle to route around."
+                        ),
                     })
                 stale_premises.append({
                     "id": sid,
@@ -6490,7 +7037,10 @@ def _validate_premises(
                 })
                 stale_ids.append(sid)
 
-    # Taint dominates — block even if use_stale/use_contested=True.
+    # Taint dominates — blocks regardless of any flag. Since #2324 that
+    # is a weaker statement than it used to be: stale blocks regardless
+    # too, and use_stale does nothing at all, so the only flag this line
+    # is really overriding is use_contested.
     if tainted_premises:
         return ({
             "status": "blocked_tainted",
@@ -6505,10 +7055,46 @@ def _validate_premises(
             ),
         }, stale_ids, contested_ids)
 
+    # HARD block since #2324 — `use_stale` is gone as a semantic. Placed
+    # ABOVE the contested check, which inverts the previous order and the
+    # rationale that went with it ("a disputed claim is a more acute concern
+    # than a merely-superseded one"). That rationale was written when stale
+    # was the SOFT one; now stale is hard and contested is the only
+    # remaining soft block, so reporting contested first would hand the
+    # agent an override that cannot actually unblock the call — they would
+    # set use_contested=True and walk straight into a wall nothing clears.
+    # Hard blocks report first because they are the ones that decide the
+    # outcome.
+    if stale_premises:
+        resp = {
+            "status": "blocked_stale",
+            "error": (
+                "BLOCKED_STALE: premise(s) carry an unresolved cascade marker, "
+                "or have themselves been superseded."
+            ),
+            "stale_premises": stale_premises,
+            "guidance": (
+                "This is a hard block — there is no override. Each entry in "
+                "stale_premises carries a per-case `route`: a premise that "
+                "carries a cascade marker is resolved by superseding or "
+                "retracting it; a premise that is itself superseded is resolved "
+                "by citing its successor. Resolving the premise is the point — "
+                "the old force-through let a derivation record a dependency on "
+                "a claim its author already knew had moved."
+            ),
+        }
+        if use_stale:
+            resp["use_stale_retired"] = USE_STALE_RETIRED_NOTICE
+        return (resp, stale_ids, contested_ids)
+
     # #1654 — a premise under an open, unresolved contradiction is a live
     # dispute, not (yet) a refutation. Block by default so new derivations
     # don't silently compound on contested ground; the override is a
-    # deliberate, loudly-marked choice (mirrors use_stale/BLOCKED_STALE).
+    # deliberate, loudly-marked choice. This is now the ONLY soft block:
+    # #2324 retired use_stale, but deliberately did NOT reach use_contested —
+    # a contradiction is a dispute under adjudication, not a cascade
+    # consequence, and nobody has ruled on it (commander's ruling
+    # 2026-08-28, endorsing the distinction explicitly).
     if contested_premises and not use_contested:
         return ({
             "status": "blocked_contradicted",
@@ -6524,18 +7110,6 @@ def _validate_premises(
             ),
         }, stale_ids, contested_ids)
 
-    if stale_premises and not use_stale:
-        return ({
-            "status": "blocked_stale",
-            "error": "BLOCKED_STALE: premise(s) have superseded upstream.",
-            "stale_premises": stale_premises,
-            "guidance": (
-                "Either retry with use_stale=True (writes a "
-                "metadata.built_on_stale audit marker — use when the upstream "
-                "update does not affect your logic), OR cite the replacement "
-                "premise(s) directly via their IDs."
-            ),
-        }, stale_ids, contested_ids)
 
     return (None, stale_ids, contested_ids)
 
@@ -7388,7 +7962,9 @@ def _create_derivation(
             → reasoning_type default before calling
         context_ids: optional 'cites' targets; missing IDs are silently
             filtered (legacy engram_derive behavior)
-        use_stale: MECH-5 opt-in for stale premises
+        use_stale: RETIRED (#2324) — accepted, inert, and loud about it.
+            NOT an opt-in: stale premises block unconditionally. Passing
+            it only attaches a use_stale_retired notice to the response.
         use_contested: MECH-5 opt-in for premises under an open,
             unresolved contradiction (#1654) — the resolution-pressure
             valve. metadata.built_on_contested is auto-stamped by this
@@ -7413,11 +7989,17 @@ def _create_derivation(
     Returns:
         (block, success) — exactly one is non-None.
           block: MECH-5 guard response ready for json.dumps when a
-            premise was tainted, contradicted, or stale without opt-in
+            premise was tainted, stale, or contradicted-without-opt-in.
+            Note the opt-in clause attaches ONLY to contradicted since
+            #2324: taint never had an override and stale no longer does.
           success: dict with node_id, confidence, reasoning_type,
-            reasoning_class, stale_ids, contested_ids, structure_warnings,
-            bumped_count, context_nodes
+            reasoning_class, contested_ids, structure_warnings,
+            bumped_count, context_nodes.
+            NO stale_ids — removed in #2324; see the comment on the return
+            dict itself for why, and do not re-add it from this list.
     """
+    # stale_ids is unpacked for position only — see the success dict below
+    # for why this function no longer forwards it anywhere.
     block, stale_ids, contested_ids = _validate_premises(
         supporting_ids, conn, use_stale=use_stale, use_contested=use_contested,
     )
@@ -7437,8 +8019,16 @@ def _create_derivation(
     discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
 
     derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
-    if use_stale and stale_ids:
-        derive_meta["built_on_stale"] = stale_ids
+    # metadata.built_on_stale is NO LONGER WRITTEN (#2324). Its only writer
+    # was the use_stale=True override, and stale is now a hard block — so
+    # stale_ids is non-empty only on a path that already returned a refusal
+    # and never reaches here. The stamp is retired as a WRITE; it stays fully
+    # readable, because every stamp already in a graph records a real past
+    # opt-in and retiring the writer must not retire the record.
+    # NOTE the strip below deliberately still lists built_on_stale: an
+    # author-supplied stamp must stay impossible. Retiring the legitimate
+    # writer would otherwise quietly make the key forgeable through
+    # extra_meta — the opposite of what retiring it is for.
     if use_contested and contested_ids:
         derive_meta["built_on_contested"] = contested_ids
     if extra_meta:
@@ -7512,7 +8102,19 @@ def _create_derivation(
         "confidence": confidence,
         "reasoning_type": reasoning_type,
         "reasoning_class": rclass,
-        "stale_ids": stale_ids,
+        # "stale_ids" is DELIBERATELY ABSENT (#2324). It used to carry the
+        # premises a use_stale=True override let through; with stale now a
+        # hard block, _validate_premises returns a refusal whenever
+        # stale_premises is non-empty, so this path can only ever have been
+        # reached with an EMPTY list. Shipping an always-[] field reads as
+        # live signal ("we checked, none were stale") when it is really a
+        # tautology, so it is removed rather than left to mislead. Its only
+        # reader — engram_derive's built_on_stale stamp — died with the
+        # override in this same change. Do not re-add it: the list slice 4's
+        # acknowledge verb needs is the one in _validate_premises' RETURN
+        # TUPLE, which is still there and still populated on the block path.
+        # contested_ids stays because use_contested survives, so it can
+        # genuinely be non-empty here.
         "contested_ids": contested_ids,
         "structure_warnings": structure_warnings,
         "bumped_count": bumped_count,

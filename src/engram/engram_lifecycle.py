@@ -817,56 +817,67 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 uncited_observations.append(entry)
         report["uncited_observations"] = uncited_observations
 
-        # 9. Tainted nodes (downstream of retracted nodes)
-        tainted_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"tainted_by": [%'"""
+        # 9. Tainted nodes (downstream of retracted nodes).
+        # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+        # slice 1) — one row per node with >=1 pending taint-severity
+        # marker, tainted_by = every such marker's root_node.
+        tainted_rows = conn.execute(
+            """SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n
+               JOIN cascade_markers cm ON cm.node_id = n.id
+               WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"""
         ).fetchall()
         report["tainted_nodes"] = []
-        for t in tainted_nodes:
-            meta = json.loads(t["metadata"] or "{}")
+        for t in tainted_rows:
+            tainted_by, _ = core._classify_pending_markers(conn, t["id"])
             report["tainted_nodes"].append({
                 "id": t["id"],
                 "type": t["type"],
                 "claim": t["claim"],
                 "confidence": t["confidence"],
-                "tainted_by": meta.get("tainted_by", []),
+                "tainted_by": tainted_by,
             })
 
-        # 10. Stale nodes (downstream of superseded premises)
-        stale_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"stale_by": [%'"""
+        # 10. Stale nodes (downstream of superseded premises). Same
+        # migration. replacement_hint(s) is reconstructed from each root's
+        # OWN superseded_by column rather than a cached downstream field
+        # (metadata.stale_replacement is retired — see engram_revision.py's
+        # module docstring): under slice 1's uniform severity, root_node IS
+        # the node that was directly superseded, so its own superseded_by
+        # column already names the replacement — no per-downstream cache
+        # needed. Ordered by marker created_at so the most recent cascade's
+        # hint wins, same "latest cascade wins" semantics the old dict-
+        # insertion-order trick relied on.
+        stale_rows = conn.execute(
+            """SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n
+               JOIN cascade_markers cm ON cm.node_id = n.id
+               WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"""
         ).fetchall()
         report["stale_nodes"] = []
-        for s in stale_nodes:
-            meta = json.loads(s["metadata"] or "{}")
-            _sr = meta.get("stale_replacement")
-            if isinstance(_sr, dict):
-                # Python 3.7+ dicts preserve insertion order, so reversed() returns
-                # the most-recent entry first. For re-supersede-same-key cases (same
-                # old_node_id cascaded twice), dict update behavior overwrites — only
-                # the latest replacement survives for that specific old_node_id. This
-                # is correct: the older cascade's replacement was itself superseded,
-                # so the chain naturally points to the most-recent.
-                _replacement_hint = next(reversed(_sr.values())) if _sr else None
-                _replacement_hints_all = _sr
-            elif isinstance(_sr, str):
-                _replacement_hint = _sr
-                _replacement_hints_all = {"_legacy": _sr}
-            else:
-                _replacement_hint = None
-                _replacement_hints_all = {}
+        for s in stale_rows:
+            stale_markers = [
+                m for m in core._pending_markers_for_node(conn, s["id"])
+                if core._cascade_marker_severity(m["root_op"]) == "stale"
+            ]
+            stale_by = [m["root_node"] for m in stale_markers]
+            replacement_hints_all = {}
+            for m in stale_markers:
+                root = m["root_node"]
+                rrow = conn.execute(
+                    "SELECT superseded_by FROM nodes WHERE id = ?", (root,)
+                ).fetchone()
+                replacement_hints_all[root] = rrow["superseded_by"] if rrow else None
+            replacement_hint = (
+                replacement_hints_all[stale_markers[-1]["root_node"]]
+                if stale_markers else None
+            )
             report["stale_nodes"].append({
                 "id": s["id"],
                 "type": s["type"],
                 "claim": s["claim"],
                 "confidence": s["confidence"],
-                "stale_by": meta.get("stale_by", []),
-                "replacement_hint": _replacement_hint,
-                "replacement_hints_all": _replacement_hints_all,
+                "stale_by": stale_by,
+                "replacement_hint": replacement_hint,
+                "replacement_hints_all": replacement_hints_all,
             })
 
         # 11. Retracted nodes (for audit visibility) — slim entries; the

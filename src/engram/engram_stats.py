@@ -250,17 +250,23 @@ def _compute_health_score(conn) -> float:
     ).fetchone()["c"]
     score -= min(dag_violations * 5, 20)
 
-    # Tainted nodes (downstream of retracted premises)
+    # Tainted nodes (downstream of retracted premises).
+    # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+    # slice 1) — count DISTINCT nodes with at least one pending
+    # taint-severity marker, joined against is_current so a node that was
+    # itself later superseded/retracted (no longer live) doesn't count.
     tainted = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes"
-        " WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+        "JOIN nodes n ON n.id = cm.node_id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
     ).fetchone()["c"]
     score -= min(tainted * 3, 15)
 
-    # Stale nodes (downstream of superseded premises)
+    # Stale nodes (downstream of superseded premises). Same migration.
     stale = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes"
-        " WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
+        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+        "JOIN nodes n ON n.id = cm.node_id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
     ).fetchone()["c"]
     score -= min(stale * 2, 10)
 
@@ -728,16 +734,23 @@ def _diagnose_impl() -> str:
         """).fetchone()["c"]
         epistemic["single_source_derivations"] = single_source_dvs
 
-        # Tainted nodes
+        # Tainted nodes. Migrated off metadata.tainted_by to cascade_markers
+        # (#2013/#2009 slice 1) — same DISTINCT-node-with-pending-marker
+        # query as the health-score computation above, kept in sync by
+        # construction now (one table, not two independently-drifting
+        # metadata string patterns).
         tainted_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
         ).fetchone()["c"]
         epistemic["tainted_nodes"] = tainted_count
 
         # Stale nodes
         stale_count = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
         ).fetchone()["c"]
         epistemic["stale_nodes"] = stale_count
 

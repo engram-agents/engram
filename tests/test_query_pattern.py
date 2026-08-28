@@ -433,23 +433,27 @@ def test_tainted_still_valid_min_confidence_is_cb_only():
         row = conn.execute("SELECT confidence FROM nodes WHERE id=?", (cst_id,)).fetchone()
         assert row["confidence"] is None  # sanity: cornerstones never carry confidence
 
-        conn.execute(
-            "UPDATE nodes SET metadata = json_set(COALESCE(metadata, '{}'), "
-            "'$.tainted_by', json(?)) WHERE id=?",
-            (json.dumps(["some_upstream_id"]), cst_id),
-        )
-        conn.execute(
-            "UPDATE nodes SET confidence=0.10, "
-            "metadata = json_set(COALESCE(metadata, '{}'), '$.tainted_by', json(?)) "
-            "WHERE id=?",
-            (json.dumps(["some_upstream_id"]), low_conf_obs_id),
-        )
-        conn.execute(
-            "UPDATE nodes SET confidence=NULL, "
-            "metadata = json_set(COALESCE(metadata, '{}'), '$.tainted_by', json(?)) "
-            "WHERE id=?",
-            (json.dumps(["some_upstream_id"]), null_conf_obs_id),
-        )
+        # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+        # slice 1). Test INTENT unchanged — this fixture exists to prove
+        # min_confidence is a CB-only predicate (#2252 Stage 1.7) — but the
+        # taint it stamps must live where the scan now reads it. Stamped
+        # directly rather than via a real retract because the point is the
+        # filter, not the cascade walk (which would refuse to mark the NCB
+        # cornerstone at all, per the Stage 1.3 derived-skip).
+        def _mark(node_id):
+            conn.execute(
+                "INSERT OR IGNORE INTO cascade_markers "
+                "(node_id, cascade_event, root_node, root_op, status, created_at) "
+                "VALUES (?, ?, ?, 'retract', 'pending', ?)",
+                (node_id, "cev_min_conf_cb_only_fixture", "some_upstream_id",
+                 core._now()),
+            )
+
+        _mark(cst_id)
+        conn.execute("UPDATE nodes SET confidence=0.10 WHERE id=?", (low_conf_obs_id,))
+        _mark(low_conf_obs_id)
+        conn.execute("UPDATE nodes SET confidence=NULL WHERE id=?", (null_conf_obs_id,))
+        _mark(null_conf_obs_id)
         conn.commit()
 
         params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])  # min_confidence 0.50

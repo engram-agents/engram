@@ -384,7 +384,6 @@
 | `tests/test_skill_server_sync.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_source_class.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_special_type_bypass.py` | dev-only | — | _?_ | _unswept_ |
-| `tests/test_stale_replacement_dict.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_starred_block.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_stop_hook_idle_suppression.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_strip_agent_facing_fields.py` | dev-only | — | _?_ | _unswept_ |

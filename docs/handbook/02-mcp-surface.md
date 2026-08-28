@@ -113,10 +113,10 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 **6. engram_derive** — Multi-premise inference.
 - **contract**: `{claim, supporting_ids, logical_chain, [reasoning_type, derivation_mode, context_ids, use_stale, use_contested]}`
-- **guards**: hard block BLOCKED_TAINTED on retracted premises (no override); soft block BLOCKED_STALE on superseded premises and soft block BLOCKED_CONTRADICTED on premises sitting on an open unresolved contradiction (MECH-5 guard, #1654); `use_stale` and `use_contested` each bypass their own soft-block only, independently (a premise that is both stale and contested requires both overrides — clearing one does not clear the other); both gated by bool type-check to prevent "false" string bypass; taint-cascade on retract; stale-cascade on supersede; `contradict` itself stays cascade-free (block-new-only, cascade rides resolution); `use_contested` auto-stamps `metadata.built_on_contested` (never author-supplied); reasoning_type must be in REASONING_TYPES dict
+- **guards**: hard block BLOCKED_TAINTED on retracted premises (no override); **hard** block BLOCKED_STALE on premises carrying a pending cascade marker OR themselves superseded (`use_stale` RETIRED by #2324 — accepted-but-inert with a loud `use_stale_retired` notice, signature removed in #2013 slice 2; the refusal carries a per-case `route`: supersede/retract a marker-carrying premise, cite the successor of a superseded one); soft block BLOCKED_CONTRADICTED on premises sitting on an open unresolved contradiction (MECH-5 guard, #1654) — the ONLY remaining override, deliberately untouched by #2324 because a contradiction is a dispute under adjudication, not a cascade consequence; stale and contested are still classified INDEPENDENTLY (a premise can be both; neither classification silently drops the other, even though only one is now overridable); `use_contested` gated by bool type-check to prevent "false" string bypass; taint-cascade on retract; stale-cascade on supersede; supersede/retract of a marker-carrying node RESOLVES that node's own markers in the same operation (resolution_kind superseded/retracted — the pre-slice-4 resolution routes); `contradict` itself stays cascade-free (block-new-only, cascade rides resolution); `use_contested` auto-stamps `metadata.built_on_contested` (never author-supplied); reasoning_type must be in REASONING_TYPES dict
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (confidence-computation model per SKILL.md §2.3)
-- **tests**: test_derive_reasoning_types.py, test_cascade_semantics.py, test_stale_replacement_dict.py
+- **tests**: test_derive_payload.py, test_cascade_semantics.py
 
 **7. engram_ask** — Open research question.
 - **contract**: `{question, [context_ids, category, lacks]}`
@@ -132,7 +132,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **guards**: DAG invariant (new.created_at ≥ old.created_at); same-type only; new node must not already supersede another; no-drop discipline on load-bearing claims; stale-cascade to derivation dependents
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
-- **tests**: test_cascade_semantics.py, test_stale_replacement_dict.py
+- **tests**: test_cascade_semantics.py, test_cascade_derived_sets.py
 
 **9. engram_retract** — Mark claim as erroneous.
 - **contract**: `{node_id, error_type, reason, [replacement_json]}`
@@ -395,7 +395,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ## Zombie Hunt Findings *(fairy claims — credibility-discounted per header; re-verify in accuracy pass)*
 
 - (b) unused payload fields: NONE claimed — all field validation via explicit `_<TOOL>_FIELDS` frozensets with unknown-field rejection (post-#872: distributed in server.py ~1305+, previously line 5405–5409 in the monolith).
-- (c) guard bypass params: TWO — `use_stale` and `use_contested` (#1654) in engram_derive; both intentional, bool-type-gated, audit-marked (`metadata.built_on_stale` / `metadata.built_on_contested` respectively; the latter auto-stamped by the override path only, never author-supplied).
+- (c) guard bypass params: ONE live — `use_contested` (#1654) in engram_derive; intentional, bool-type-gated, auto-stamped `metadata.built_on_contested` by the override path only, never author-supplied. `use_stale` is RETIRED (#2324): still in the signature until #2013 slice 2, but inert and loud about it, and it no longer writes `metadata.built_on_stale` — existing stamps stay readable, because retiring a writer must not retire the record it wrote.
 - (d) undiscoverable tools: NONE claimed (all 49 in SKILL.md).
 - (e) success-shaped error paths: NONE claimed (uniform `{"error": ...}` shape).
 - (f) multi-arg stragglers: NONE — 56/56 on payload_json (or no-arg). **Wave-3 migration complete** (mechanical, trustworthy).
@@ -417,4 +417,4 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 | destructiveHint True | 4 |
 | Test coverage claim | **VOID — fabricated filenames found; re-derive mechanically** |
 | Multi-arg regressed tools | 0 *(mechanical)* |
-| Guard-bypass params | 2 (use_stale, use_contested — both intentional + audited) |
+| Guard-bypass params | 1 live (use_contested — intentional + audited); use_stale retired-but-accepted (#2324) |

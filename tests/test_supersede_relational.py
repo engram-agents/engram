@@ -259,17 +259,28 @@ def test_supersede_relational():
         assert r["stale_count"] >= 1, f"T11: expected cascade, got stale_count={r['stale_count']}"
         stale_ids = {s["id"] for s in r["stale_downstream"]}
         assert dv_downstream in stale_ids, f"T11: {dv_downstream} should be in stale set {stale_ids}"
+        # Migrated off metadata.stale_by/stale_replacement to cascade_markers
+        # (#2013/#2009 slice 1) — dv_downstream should carry a pending
+        # marker rooted at dv_upstream; dv_upstream's own superseded_by
+        # gives the replacement (stale_replacement is retired, see
+        # engram_revision.py's module docstring).
         conn = engram_core._get_db()
         try:
-            ds_row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (dv_downstream,)).fetchone()
-            meta = json.loads(ds_row["metadata"])
-            assert dv_upstream in meta.get("stale_by", []), f"T11: stale_by metadata missing"
-            stale_repl = meta.get("stale_replacement")
-            assert isinstance(stale_repl, dict), f"T11: stale_replacement should be dict, got {type(stale_repl)}"
-            assert stale_repl.get(dv_upstream) == dv_upstream_v2, f"T11: stale_replacement dict wrong: {stale_repl}"
+            marker = conn.execute(
+                "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+                "AND root_op = 'supersede' AND status = 'pending'",
+                (dv_downstream, dv_upstream),
+            ).fetchone()
+            assert marker is not None, "T11: pending marker missing on downstream node"
+            up_row = conn.execute(
+                "SELECT superseded_by FROM nodes WHERE id = ?", (dv_upstream,)
+            ).fetchone()
+            assert up_row["superseded_by"] == dv_upstream_v2, (
+                f"T11: dv_upstream.superseded_by wrong: {up_row['superseded_by']}"
+            )
         finally:
             conn.close()
-        print("  T11 PASS — stale cascade walks and stamps metadata on downstream")
+        print("  T11 PASS — stale cascade walks and marks downstream")
         passed += 1
 
         # ---- Test 12: chain supersede A ← B ← C ----

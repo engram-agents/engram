@@ -1620,7 +1620,10 @@ def test_migration4_happy_path_reindexes_full_claim_and_reaches_v4():
 
         conn = core._get_db()
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 4, f"migration rung 4 must reach user_version 4 on a clean run, got {version}"
+        assert version == LATEST_RUNG, (
+            f"a clean run must carry the ladder all the way to "
+            f"v{LATEST_RUNG}, got {version}"
+        )
 
         claim = conn.execute(
             "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
@@ -1648,6 +1651,47 @@ def test_migration4_happy_path_reindexes_full_claim_and_reaches_v4():
 # _build_pre_migration4_truncated_feeling_db (above) as the realistic
 # pending-migration fixture — same user_version=3, truncated-claim
 # feeling_report shape migration rung 4's own tests already exercise.
+
+def _latest_rung_target():
+    """The highest `PRAGMA user_version = N` any rung in
+    _run_db_one_time_setup actually writes — parsed from the source, not
+    hardcoded.
+
+    Every version assertion in this file used to spell `4` literally, which
+    meant adding rung 5 (#2324) broke eight unrelated tests that were only
+    ever trying to say "the ladder finished". Hand-listing a value the
+    codebase owns is the same staleness trap this file's own
+    _PRE_MIGRATION_LATEST_VERSION test exists to catch; deriving it means
+    rung 6 costs nothing here.
+    """
+    import ast
+    import re
+
+    core_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "engram", "engram_core.py",
+    )
+    with open(core_path) as f:
+        source = f.read()
+    tree = ast.parse(source)
+    func_node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_run_db_one_time_setup"),
+        None,
+    )
+    assert func_node is not None, "_run_db_one_time_setup not found via ast"
+    func_source = ast.get_source_segment(source, func_node)
+    written = [
+        int(m) for m in re.findall(
+            r'conn\.execute\(\s*"PRAGMA user_version = (\d+)"\s*\)', func_source
+        )
+    ]
+    assert written, "no PRAGMA user_version writes found in the migration ladder"
+    return max(written)
+
+
+LATEST_RUNG = _latest_rung_target()
+
 
 def _fresh_core_in_tmp(prefix: str):
     """Return (core, core_test_dir) — a fresh_module(engram_core) instance
@@ -1695,7 +1739,10 @@ def test_2181_pre_migration_backup_fires_on_upgrade():
 
         conn = core._get_db()
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == 4, f"expected migration to complete and reach v4, got {version}"
+        assert version == LATEST_RUNG, (
+                f"expected migration to complete and reach "
+                f"v{LATEST_RUNG}, got {version}"
+            )
         post_claim = conn.execute(
             "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
         ).fetchone()[0]
@@ -1742,9 +1789,9 @@ def test_2181_pre_migration_backup_does_not_fire_on_fresh_db():
         conn = core._get_db()  # fresh DB: creates schema, runs rungs 1-4 with 0 rows
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
-        assert version == 4, (
-            f"a fresh DB should still reach v4 (0 rows, nothing to migrate "
-            f"but the version gate must still advance), got {version}"
+        assert version == LATEST_RUNG, (
+            f"a fresh DB should still reach v{LATEST_RUNG} (0 rows, nothing "
+            f"to migrate but the version gate must still advance), got {version}"
         )
 
         backup_dir = core.DATA_DIR / "db-backup"
@@ -1770,7 +1817,7 @@ def test_2181_pre_migration_backup_does_not_fire_when_already_current():
     core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_current_")
     try:
         conn = core._get_db()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
         conn.execute(
             "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
             "('ob_2181_current', 'observation', '2026-08-22T00:00:00Z', "
@@ -1783,7 +1830,9 @@ def test_2181_pre_migration_backup_does_not_fire_when_already_current():
         conn = core._get_db()
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
-        assert version == 4, f"already-current DB must stay at v4, got {version}"
+        assert version == LATEST_RUNG, (
+            f"already-current DB must stay at v{LATEST_RUNG}, got {version}"
+        )
 
         backup_dir = core.DATA_DIR / "db-backup"
         pre_mig_files = (
@@ -1858,7 +1907,7 @@ def test_2181_escape_hatch_proceeds_and_is_loud(capsys):
             conn = core._get_db()
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             conn.close()
-            assert version == 4, (
+            assert version == LATEST_RUNG, (
                 f"the escape hatch must let the migration proceed to "
                 f"completion even though the backup dir is unwritable, "
                 f"got {version}"
@@ -1905,7 +1954,7 @@ def test_2181_nothing_reaches_stdout_during_migrating_setup(capsys):
         # nodes_fts + its sync triggers -- comes out in the real,
         # already-canonical 6-column shape the current code produces.
         conn = core._get_db()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
         conn.close()
 
         # Rewind to a pending-rung-4 precondition WITHOUT touching the
@@ -1931,8 +1980,9 @@ def test_2181_nothing_reaches_stdout_during_migrating_setup(capsys):
         conn = core._get_db()
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         conn.close()
-        assert version == 4, (
-            f"fixture must actually re-run rung 4 and reach v4, got {version}"
+        assert version == LATEST_RUNG, (
+            f"fixture must actually re-run rung 4 and carry the ladder to "
+            f"v{LATEST_RUNG}, got {version}"
         )
 
         captured = capsys.readouterr()
@@ -2037,7 +2087,7 @@ def test_2181_pre_migration_backup_sources_from_conn_not_db_path():
             "'active')"
         )
         conn.commit()
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
         conn.close()
 
         # A SEPARATE db file -- built via a first _run_db_one_time_setup
@@ -2050,7 +2100,7 @@ def test_2181_pre_migration_backup_sources_from_conn_not_db_path():
         foreign_conn = sqlite3.connect(foreign_path)
         foreign_conn.row_factory = sqlite3.Row
         core._run_db_one_time_setup(foreign_conn)  # bootstrap real schema, 0 rows -> v4
-        assert foreign_conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert foreign_conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
 
         foreign_conn.execute(
             "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
@@ -2066,7 +2116,7 @@ def test_2181_pre_migration_backup_sources_from_conn_not_db_path():
         core._run_db_one_time_setup(foreign_conn)
         foreign_version = foreign_conn.execute("PRAGMA user_version").fetchone()[0]
         foreign_conn.close()
-        assert foreign_version == 4, (
+        assert foreign_version == LATEST_RUNG, (
             f"the foreign connection should still migrate normally, got {foreign_version}"
         )
 
@@ -2307,7 +2357,7 @@ def test_2181_row_count_read_failure_does_not_skip_the_backup():
             list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
         )
 
-        assert version == 4, (
+        assert version == LATEST_RUNG, (
             f"migration should reach completion once the (unaffected, "
             f"file-level) backup succeeds despite the COUNT read failing, "
             f"got user_version={version}"
@@ -2396,10 +2446,10 @@ def test_2186_migration_ladder_against_in_memory_reaches_v4_or_fails_loudly():
             )
         else:
             version = mem_conn.execute("PRAGMA user_version").fetchone()[0]
-            assert version == 4, (
+            assert version == LATEST_RUNG, (
                 f"_run_db_one_time_setup returned without raising, so the "
                 f"migration ladder must have reached the latest version "
-                f"(4) -- silently stalling at an intermediate version "
+                f"({LATEST_RUNG}) -- silently stalling at an intermediate version "
                 f"while returning normally is exactly the #2186 bug. Got "
                 f"user_version={version}"
             )

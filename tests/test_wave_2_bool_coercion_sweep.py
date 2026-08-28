@@ -151,9 +151,17 @@ class TestObservationIsPredictiveBool:
 # RETIRED 2026-05-20 (issue #229): use_stale is no longer a field on
 # engram_resolve. The 2026-05-20 redesign made engram_resolve pure-wire —
 # it just wires an existing resolving_node to a target, no derivation
-# creation, no MECH-5 stale guard. The bool-string truthy trap remains a
-# real concern for engram_derive (which still has use_stale); the
-# TestDeriveUseStaleBool class earlier in this file continues to enforce it.
+# creation, no MECH-5 stale guard.
+#
+# AMENDED 2026-08-28 (#2324): the sentence here used to say the bool-string
+# truthy trap "remains a real concern for engram_derive (which still has
+# use_stale)". Half of that is still true and the load-bearing half is not.
+# engram_derive does still ACCEPT use_stale, and TestDeriveUseStaleBool does
+# still enforce the isinstance guard — but the trap those exist to prevent
+# cannot occur any more: stale premises block unconditionally, so a truthy
+# string cannot weaken a guard that no value of this parameter can reach.
+# The guard survives as schema hygiene until #2013 slice 2 removes the
+# parameter, not as a blocking-guard protection.
 
 
 # ---------------------------------------------------------------------------
