@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Optional
 
 import engram_core as core
+import engram_conformance as _conformance_mod
 
 
 # #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
@@ -914,6 +915,16 @@ def _diagnose_impl() -> str:
         provenance["untrusted_domain_evidence"] = untrusted_domains
 
         metrics["provenance"] = provenance
+
+        # ── Partition Conformance (#2300) ──────────────────────────────────
+        # The CB/NCB red-flag channel: five binary, zero-or-investigate
+        # invariants over the claim-bearing/non-claim-bearing partition and
+        # the cascade-relation set (#2252), all derived from the shipped
+        # constants at call time — see engram_conformance.py's own module
+        # docstring for why nothing here is hand-enumerated. No severity, no
+        # scoring, no acknowledged state — #2300 scope; this section is a
+        # pure read of the checker's own return value.
+        metrics["partition_conformance"] = _conformance_mod.check_partition_conformance(conn)
 
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}

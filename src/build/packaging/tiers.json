@@ -84,6 +84,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_conformance.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_query.py",
       "tier": "essential"
     },
