@@ -161,41 +161,88 @@ URL_BASE="$BASE/api/updates?agent=$SELF&kinds=$KINDS"
 # claim than "verified not a match" and must not be silently folded into it —
 # say so loudly so the agent knows this candidate needs a manual look.
 #
+# Portability (#2134): /proc does not exist on macOS, so the whole
+# verification pass above used to raise ENOENT on the FIRST open() and land
+# in the "process gone" branch — dead and SILENT, byte-identical to "checked,
+# found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process` fix
+# (umwelt #205): when /proc is absent, fall back to the portable
+# `ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+# reported as such: `ps -o args=` returns a space-JOINED string, not true
+# NUL-separated argv, so a wrapper whose script path sits inside a single
+# quoted argument (e.g. `bash -c "... forum-updates-monitor.sh ..."`) can
+# manufacture a false token boundary and over-match — measured on Linux
+# (issue #2134 comments) against a `bash -c` wrapper. Kept anyway because a
+# weaker-but-labeled detector beats no detection at all on the one platform
+# that has no /proc to fall back on. rc 3 (below) marks this weaker verdict
+# distinctly from rc 0's /proc-verified one so the two warning classes don't
+# get conflated into a single alarm-fatigue channel.
+#
 # Set $FORUM_UPDATES_NO_REAP to any non-empty value to disable (now disables
 # the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
 _check_forum_updates_dup() {
     # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
-    # argv). Exit codes:
-    #   0 = confirmed duplicate — stdout is the cmdline (argv joined on
-    #       spaces, truncated to ~100 chars — the boot charge alone runs
-    #       ~2.5KB and must not flood the Monitor event stream).
+    # argv) when /proc exists; falls back to `ps -p <pid> -o args=` (space-
+    # joined, weaker) when it does not (macOS). Exit codes:
+    #   0 = confirmed duplicate, /proc-verified (strong) — stdout is the
+    #       cmdline (argv joined on spaces, truncated to ~100 chars — the
+    #       boot charge alone runs ~2.5KB and must not flood the Monitor
+    #       event stream).
     #   1 = not a duplicate, including "process gone mid-read" (a race, not
     #       an error) — silent, nothing on stdout.
     #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
-    #       denied) — stdout is a short reason string; caller must warn, not
-    #       silently skip.
+    #       denied, or the `ps` fallback itself erroring) — stdout is a short
+    #       reason string; caller must warn, not silently skip.
+    #   3 = probable duplicate, ps-fallback-verified (weak — /proc absent,
+    #       string-split match only) — stdout is the ps `args=` output,
+    #       truncated to ~100 chars.
     python3 -c '
-import errno, os, sys
+import errno, os, subprocess, sys
 pid, script = sys.argv[1], sys.argv[2]
+# ENGRAM_PROC_DIR is a true optional: it exists only so tests can force the
+# ps-fallback branch on Linux (point it at an empty dir). Its ABSENCE means
+# "use the real system procfs" and must warn about nothing.
+_PROC = os.environ.get("ENGRAM_PROC_DIR", "/proc")
+if os.path.exists(_PROC + "/self/cmdline"):
+    try:
+        with open(_PROC + "/" + pid + "/cmdline", "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ESRCH):
+            sys.exit(1)  # process gone mid-read: not a match, not an error
+        print(str(e) or type(e).__name__)
+        sys.exit(2)  # could not verify — do not silently treat as "not a match"
+    argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    if not argv:
+        sys.exit(1)
+    interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
+    if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
+        sys.exit(1)
+    if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
+        sys.exit(1)
+    cmd = " ".join(argv)
+    print(cmd[:100])
+    sys.exit(0)
+# No /proc (macOS): portable fallback, mirrors umwelt-bell.py.
 try:
-    with open("/proc/" + pid + "/cmdline", "rb") as f:
-        raw = f.read()
-except OSError as e:
-    if e.errno in (errno.ENOENT, errno.ESRCH):
-        sys.exit(1)  # process gone mid-read: not a match, not an error
+    r = subprocess.run(["ps", "-p", pid, "-o", "args="],
+                        capture_output=True, text=True, timeout=5)
+except Exception as e:
     print(str(e) or type(e).__name__)
-    sys.exit(2)  # could not verify — do not silently treat as "not a match"
-argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-if not argv:
+    sys.exit(2)
+cmd = r.stdout.strip()
+if not cmd:
+    sys.exit(1)  # ps found no such pid: gone, not a match
+tokens = cmd.split()
+if not tokens:
     sys.exit(1)
-interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
+interp = os.path.basename(tokens[0]).lstrip("-")
 if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
     sys.exit(1)
-if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
+if not any(t == script or t.endswith("/" + script) for t in tokens[1:]):
     sys.exit(1)
-cmd = " ".join(argv)
 print(cmd[:100])
+sys.exit(3)  # weak match — ps-fallback only, no /proc to verify against
 ' "$1" "$2" 2>/dev/null
 }
 
@@ -227,6 +274,9 @@ if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
         _rc=$?
         if [ "$_rc" -eq 0 ]; then
             echo "⚠️  forum-updates-monitor.sh: possible duplicate instance — pid $_pid cmdline: ${_out}"
+            echo "⚠️  forum-updates-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
+        elif [ "$_rc" -eq 3 ]; then
+            echo "⚠️  forum-updates-monitor.sh: possible duplicate instance (WEAK match — no /proc on this platform, verified via \`ps\` string-split only; may false-positive on wrapper processes, #2134) — pid $_pid cmdline: ${_out}"
             echo "⚠️  forum-updates-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
         elif [ "$_rc" -eq 2 ]; then
             echo "⚠️  forum-updates-monitor.sh: could not verify candidate pid $_pid (${_out}) — NOT auto-flagged as a duplicate; check it by hand if you suspect a stale instance."
