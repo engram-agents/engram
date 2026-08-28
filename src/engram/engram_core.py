@@ -751,6 +751,16 @@ PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c
 _PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
 _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
 
+# Same pattern, for the upstream (premise-direction) cascade walk used by
+# _walk_cascade_upstream / _trace_observation_leaves below. engram_revision.py
+# has its own copy (`_CASCADE_RELATIONS_SORTED`) for the downstream taint
+# walker — this is engram_core's own derivation of the same upstream
+# constant, not an import of revision's, since core has no dependency on
+# revision (#2298, superseding #2255's "leave enumerated" doctrine for this
+# specific walk — see _walk_cascade_upstream's docstring).
+_CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)
+_CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
+
 # Relations by which a claim-bearing node CONSUMES another as support. Used for
 # citation-coverage ("is this observation cited by anything?"), NOT for cascade.
 # DELIBERATELY ENUMERATED, NOT DERIVED FROM `cascade` — see #2252 Stage 1.0b.
@@ -764,6 +774,8 @@ _PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SOR
 # hand-enumerated, the uncited-observation metric would have silently changed
 # meaning on the day Stage 1.3 landed, with no test to catch it — the
 # now-realized divergence is exactly why it stays hand-enumerated.
+# TODO(#1991): whether "uncited by derives_from/supported_by" is even a GOOD
+# health metric is deliberately deferred to the health-score epic's design.
 CITATION_SUPPORT_RELATIONS = frozenset({"derives_from", "supported_by"})
 
 
@@ -6572,13 +6584,96 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
     return roots
 
 
+def _walk_cascade_upstream(
+    conn: sqlite3.Connection,
+    node_id: str,
+    *,
+    collect_if,
+    descend_if,
+    max_depth: int = 4096,
+) -> set:
+    """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
+    follows each visited node's own outgoing cascade edges back toward its
+    origins. Mirrors ``engram_revision._walk_cascade_downstream``'s shape
+    (visited-set dedup, per-dequeue budget decrement, caller-supplied
+    per-node decision) for the inverse direction — that walker finds who
+    DEPENDS ON a node (``target_id = node_id``); this one finds what a node
+    DEPENDS ON (``source_id = node_id``).
+
+    For every node reached (starting at ``node_id`` itself), ``collect_if(row)``
+    decides whether to add it to the returned set, and ``descend_if(row)``
+    decides whether to continue the walk past it (query its own outgoing
+    ``CASCADE_RELATIONS`` edges). Both receive the node's ``(id, type)`` row.
+    A dangling/missing node is skipped without collecting or descending.
+
+    ``visited`` dedup happens before either predicate runs, so a node already
+    reached (via any path) is neither re-collected nor re-descended —
+    ``collect_if``/``descend_if`` fire at most once per node, same guarantee
+    ``_walk_cascade_downstream`` documents for ``on_live_node``.
+
+    Two shapes in use:
+      - **Leaf-trace** (``_trace_observation_leaves``, below): ``collect_if`` /
+        ``descend_if`` = is-observation / is-not-observation — terminates AT
+        each observation, reproducing the walk's historical
+        ``{derives_from, supported_by}``-enumerated behavior observably (the
+        walked relation set itself is narrower now — see that function's
+        docstring for the #2298 doctrine this supersedes).
+      - **Full ancestor set** (``collect_if=descend_if=lambda row: True``):
+        the raw transitive closure via ``CASCADE_RELATIONS`` — the shape
+        the #2013 cascade machine's mode-C travel (``ancestors(X) ∩
+        pending``) filters down to a pending-marker subset once the marker
+        table lands (slice 1). That intersection is NOT built here — it is
+        the #2013 slice-3 row (derived reads: frontier, ``ancestors(X) ∩
+        pending``) — this function only supplies the shared ``ancestors(X)``
+        primitive both callers walk with, per #2298 §2's "one traversal, two
+        filters" unification. See ``tests/test_cascade_derived_sets.py``.
+
+    Cost, inherited unchanged from the pre-#2298 ``_trace_observation_leaves``
+    (not a regression here, but worth flagging for the full-ancestor-set
+    consumer above, which may walk far larger subgraphs than a single leaf
+    trace): one SQL query per visited node, and ``queue.pop(0)`` on a plain
+    Python list is O(n) per dequeue. Fine at leaf-trace scale; worth
+    revisiting (indexed deque, batched node lookups) if slice-3's
+    ``ancestors(X)`` runs hot over large subgraphs.
+    """
+    visited: set = set()
+    queue = [node_id]
+    collected: set = set()
+
+    while queue and max_depth > 0:
+        max_depth -= 1
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (current,)).fetchone()
+        if not node:
+            continue
+
+        if collect_if(node):
+            collected.add(current)
+        if not descend_if(node):
+            continue
+
+        edges = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+            (current, *_CASCADE_RELATIONS_SORTED),
+        ).fetchall()
+        for e in edges:
+            queue.append(e["target_id"])
+
+    return collected
+
+
 def _trace_observation_leaves(
     conn: sqlite3.Connection, node_id: str, max_depth: int = 4096
 ) -> set:
     """Trace a node back to the OBSERVATION leaves it rests on.
 
-    Walks the derivation spine (``derives_from`` / ``supported_by``) backward
-    and collects nodes of ``type LIKE 'observation_%'`` — the layer where the
+    Walks the premise spine backward via ``_walk_cascade_upstream`` and
+    collects nodes of ``type LIKE 'observation_%'`` — the layer where the
     standpoint axes (author/collection/lineage) and ``quote_type``/``fs_class``
     actually live. Terminates AT each observation: it does NOT descend past an
     observation into its own ``cites``→evidence hops, because evidence nodes
@@ -6592,55 +6687,52 @@ def _trace_observation_leaves(
     The standpoint/F-S leaves are observations, one layer up from evidence.
     (Ariadne #49 — the prior ``_trace_evidence_roots`` reuse was the wrong layer.)
 
-    Mirrors ``_trace_evidence_roots``'s per-visit-budget semantics (``max_depth``
-    decremented per dequeued node, NOT a depth limit; termination guaranteed by
-    ``visited``) for behavioral parity — including the raised budget (#1186): at
-    the former 10 a deep derivation spine truncated the leaf set, which on this
-    (all-or-omit-gated) consumer caused silent under-credit rather than a
+    ``max_depth`` semantics (decremented per dequeued node, NOT a depth limit;
+    termination guaranteed by the walk's own visited-set) are inherited from
+    ``_walk_cascade_upstream`` unchanged, preserving the #1186 raised budget:
+    at the former 10 a deep derivation spine truncated the leaf set, which on
+    this (all-or-omit-gated) consumer caused silent under-credit rather than a
     false-positive, but is the same latent defect.
+
+    **Edge set: derives from ``CASCADE_RELATIONS``, not hand-enumerated
+    (#2298, ruled 2026-08-28) — this SUPERSEDES the #2252 Stage 1.0b / #2255
+    "leave enumerated" doctrine for this walk specifically.** #2255 argued
+    "what counts as a premise" and "does taint propagate here" were different
+    questions that only coincidentally shared a tuple, and that deriving one
+    from the other would let a future ``cascade``-flag change silently
+    redefine premise-hood. Lei's #2298 ruling (aware of that doctrine, per
+    Kepler's #2298 comment) is that post-partition the two questions are the
+    SAME one by construction: a node's evidential lineage is exactly its
+    cascade ancestry, so "premise" should derive from ``cascade``, not merely
+    coincide with it. ``supported_by`` drops out of the walked set as a
+    consequence (``CASCADE_RELATIONS`` is now the strict subset
+    ``{derives_from}``) — behavior-preserving today, though the reason is
+    about the edge's SOURCE, not its target (reviewer-fairy catch, PR #2329:
+    an earlier draft of this note wrongly reasoned from the target side).
+    Every ``supported_by`` edge is minted with a cornerstone or lesson as its
+    SOURCE (``engram_cornerstone.py``'s ``add_cornerstone``/exemplar wiring;
+    the person-supersede migration in ``engram_revision.py``) — its target
+    can be an observation, a derivation, a prior cornerstone, or even a
+    person, so "exemplar" is not a target-type guarantee. What actually
+    matters: cornerstone/lesson are NON-claim-bearing, and ``engram_derive``
+    rejects non-claim-bearing ``supporting_ids`` (``engram_derive.py``'s
+    claim-bearing check), so no ``derives_from`` edge can ever TARGET a
+    cornerstone/lesson. Since this walk only ever visits claim-bearing nodes
+    reached via ``derives_from``, it can never land on a cornerstone/lesson
+    to descend into its own outgoing ``supported_by`` edges — regardless of
+    what those edges point at. Independently re-verified against source, not
+    just the issue's own claim, before this landed.
+    ``CITATION_SUPPORT_RELATIONS`` (the citation-coverage constant) is
+    UNCHANGED and stays hand-enumerated per #2298 §1 — that is a genuinely
+    different question (health-metric semantics), not this one.
     """
-    visited = set()
-    queue = [node_id]
-    leaves = set()
-
-    while queue and max_depth > 0:
-        max_depth -= 1
-        current = queue.pop(0)
-        if current in visited:
-            continue
-        visited.add(current)
-
-        node = conn.execute("SELECT type FROM nodes WHERE id = ?", (current,)).fetchone()
-        if not node:
-            continue
-        if node["type"].startswith("observation"):
-            leaves.add(current)
-            continue  # terminate AT the observation — do not follow its cites→evidence
-
-        # Non-observation (derivation / goal / etc.): follow the premise spine
-        # only — NOT 'cites' (an observation's cites→evidence is the layer we
-        # stop above; a derivation's cites→context is not a premise).
-        # #2252 Stage 1.0b / #2255 colleague-review fix: DELIBERATELY LEFT
-        # ENUMERATED, not derived from CASCADE_RELATIONS. The reason is
-        # semantic, not a cost tradeoff: this walk's exclusion of 'cites' is a
-        # commitment about what counts as a PREMISE. {derives_from,
-        # supported_by} used to coincidentally EQUAL CASCADE_RELATIONS before
-        # #2252 Stage 1.3 flipped supported_by's cascade flag to False; they
-        # no longer even numerically coincide (CASCADE_RELATIONS is now the
-        # strict subset {derives_from}), which makes the case for keeping
-        # this hand-enumerated STRONGER, not weaker — deriving "premise
-        # spine" from `cascade` was never correct even when the two sets
-        # agreed, since they answer different questions ("what's a premise"
-        # vs "does taint propagate here"). Do not "fix" this to
-        # CASCADE_RELATIONS.
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supported_by')",
-            (current,),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
-
-    return leaves
+    return _walk_cascade_upstream(
+        conn,
+        node_id,
+        collect_if=lambda row: row["type"].startswith("observation"),
+        descend_if=lambda row: not row["type"].startswith("observation"),
+        max_depth=max_depth,
+    )
 
 
 _LINEAGE_RE = re.compile(r"[a-z0-9_-]+:[a-z0-9._-]+")

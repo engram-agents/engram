@@ -48,6 +48,12 @@ Coverage:
      diverges the two sets.
   4. cascade ⇒ dag_check still holds (re-confirmed here; the authoritative
      test is test_cascade_dag_check_audit.py).
+  6. (#2298, 2026-08-28) _trace_observation_leaves's premise-spine walk now
+     DERIVES from CASCADE_RELATIONS via the shared _walk_cascade_upstream
+     primitive — superseding, for this walk specifically, the #2255
+     "leave enumerated" doctrine tests 1b/1c/2/2b/3 exist to protect for the
+     OTHER two sites. Same Layer-0 can-it-fail shape as test 2/2b, plus a
+     second test proving "one traversal, two filters" shares one function.
 
 Import-pattern contract (#948 wave B — R1): imports engram_core and
 engram_revision (plus engram_observation / engram_derive for fixture
@@ -605,3 +611,133 @@ def test_citation_coverage_uses_citation_support_relations_placeholders():
     expected = sorted(CITATION_SUPPORT_RELATIONS)
     assert engram_lifecycle._CITATION_SUPPORT_RELATIONS_SORTED == expected
     assert engram_stats._CITATION_SUPPORT_RELATIONS_SORTED == expected
+
+
+# ---------------------------------------------------------------------------
+# 6 — #2298: _trace_observation_leaves's premise-spine walk now DERIVES from
+#     CASCADE_RELATIONS (superseding #2255's "leave enumerated" doctrine for
+#     this specific walk — see engram_core._trace_observation_leaves's
+#     docstring for the ruling). Same Layer-0 shape as tests 2/2b above,
+#     applied to the shared upstream walker, plus a second test proving the
+#     "one traversal, two filters" unification actually shares one function
+#     rather than two similarly-shaped ones.
+# ---------------------------------------------------------------------------
+
+
+def test_trace_observation_leaves_derives_from_CASCADE_RELATIONS_not_hardcoded(
+    monkeypatch,
+):
+    """``_trace_observation_leaves`` (via the shared ``_walk_cascade_upstream``)
+    walks exactly the relations named by ``engram_core``'s derived
+    ``_CASCADE_RELATIONS_SORTED`` / ``_CASCADE_RELATION_PLACEHOLDERS``
+    constants — not a re-hardcoded ``('derives_from', 'supported_by')``
+    literal. Same proof shape as
+    ``test_retract_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded`` and
+    ``test_trace_evidence_roots_derives_from_PROVENANCE_RELATIONS_not_hardcoded``
+    above, applied to the premise-spine site.
+
+    Proof structure: with the REAL derived constants (today
+    ``CASCADE_RELATIONS == {derives_from}``), tracing a derivation back
+    through its ``derives_from`` edge finds its observation premise —
+    ordinary, expected behaviour. Then, on a fresh derivation, the SAME
+    module-level constants are monkeypatched to a relation set that excludes
+    ``derives_from``. If the walk is genuinely derived, the same trace must
+    now find NO leaves, because the ``derives_from`` edge no longer matches
+    the (patched) walked-relation set.
+
+    This can fail: if ``_walk_cascade_upstream``'s edge query were
+    re-hardcoded back to a literal
+    ``relation IN ('derives_from', 'supported_by')``, monkeypatching the
+    module constants would have no effect and the leaf would still be
+    found — the flip-leg assertion below would fail.
+
+    Can-it-fail check performed by hand before this test was committed:
+    temporarily re-hardcoded ``_walk_cascade_upstream``'s edge query back to
+    that literal, ran this test, and watched the flip-leg assertion go red
+    (leaves2 was non-empty instead of empty) — then reverted the hardcoding.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    # Sanity leg — REAL derived constants: ordinary leaf-trace.
+    ob_id = _seed_ob(obs, "Premise-spine premise (real constants).")
+    dv_id = _seed_dv(derive, "Derived from the premise (real constants).", [ob_id])
+    conn = core._get_db()
+    try:
+        leaves = core._trace_observation_leaves(conn, dv_id)
+    finally:
+        conn.close()
+    assert leaves == {ob_id}, (
+        "sanity leg: with the real derived cascade set, tracing a "
+        f"derivation's derives_from edge must find its observation leaf, got {leaves}"
+    )
+
+    # Flip leg — patch the derived constants away from 'derives_from'.
+    monkeypatch.setattr(core, "_CASCADE_RELATIONS_SORTED", ["retracts"])
+    monkeypatch.setattr(core, "_CASCADE_RELATION_PLACEHOLDERS", "?")
+
+    conn = core._get_db()
+    try:
+        leaves2 = core._trace_observation_leaves(conn, dv_id)
+    finally:
+        conn.close()
+    assert leaves2 == set(), (
+        "flip leg: with the walked-relation constants patched away from "
+        "'derives_from', tracing the same derivation must find NO "
+        "observation leaves. A non-empty result here means the walk is not "
+        "actually reading the module's derived constants (i.e. it has "
+        "drifted back to a hardcoded literal)."
+    )
+
+
+def test_walk_cascade_upstream_full_ancestor_mode():
+    """``_walk_cascade_upstream`` is ONE shared traversal serving two
+    filters (#2298 §2's "one traversal, two filters" unification), not two
+    independently-shaped walks that happen to look similar. Proven by
+    exercising the SAME function with different ``collect_if``/``descend_if``
+    predicates over the SAME two-hop chain (``ob -> dv1 -> dv2``) and getting
+    genuinely different result shapes:
+
+      - leaf-trace mode (what ``_trace_observation_leaves`` uses): stops AT
+        the observation, returning only ``{ob_id}`` — dv1 is descended past,
+        never collected.
+      - full-ancestor mode (``collect_if=descend_if=lambda row: True``): the
+        raw transitive closure via ``CASCADE_RELATIONS`` — every node on the
+        premise spine, ``{dv2_id, dv1_id, ob_id}``. This is the ``ancestors(X)``
+        primitive the #2013 cascade machine's mode-C travel filters down to
+        ``ancestors(X) ∩ pending`` once the marker table lands (slice 1) —
+        NOT built here (that intersection is the #2013 slice-3 row), but the
+        shared traversal it will filter is.
+
+    If these two modes required separate walk functions instead of one
+    parameterised by predicates, this test would need to import two
+    differently-named functions; it imports (and calls) exactly one.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob_id = _seed_ob(obs, "Full-ancestor-mode premise.")
+    dv1_id = _seed_dv(derive, "Intermediate derivation.", [ob_id])
+    dv2_id = _seed_dv(derive, "Final derivation.", [dv1_id])
+
+    conn = core._get_db()
+    try:
+        leaf_mode = core._trace_observation_leaves(conn, dv2_id)
+        full_mode = core._walk_cascade_upstream(
+            conn, dv2_id,
+            collect_if=lambda row: True,
+            descend_if=lambda row: True,
+        )
+    finally:
+        conn.close()
+
+    assert leaf_mode == {ob_id}, (
+        f"leaf-trace mode must terminate AT the observation, got {leaf_mode}"
+    )
+    assert full_mode == {dv2_id, dv1_id, ob_id}, (
+        "full-ancestor mode must collect every node on the premise spine "
+        f"(the raw ancestors(X) set), got {full_mode}"
+    )
+    assert leaf_mode != full_mode, (
+        "the two filters must produce genuinely different results over the "
+        "same chain, or this test cannot distinguish 'one traversal, two "
+        "filters' from 'two hardcoded near-duplicate walks'"
+    )

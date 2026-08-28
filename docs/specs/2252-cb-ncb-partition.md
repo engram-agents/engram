@@ -251,8 +251,10 @@ property deserve to join automatically?** If yes, derive. If a human should deci
 — and staleness there is a *feature*, because it forces the decision to be made explicitly
 rather than drift in silently.
 
-Two sites are enumerated on purpose and do **not** auto-follow the `cascade`/`provenance`
-flags — including after Stage 1.3 (#2289) changed them:
+One site is enumerated on purpose and does **not** auto-follow the `cascade`/`provenance`
+flags — including after Stage 1.3 (#2289) changed them. A second site (`_trace_observation_leaves`)
+was enumerated for the same reason through 2026-08-27, but #2298 (ruled 2026-08-28) superseded that
+doctrine for it specifically — see the history note after item 1 below.
 
 1. **`CITATION_SUPPORT_RELATIONS`** (`engram_core.py`) — `frozenset({"derives_from",
    "supported_by"})`, consumed by `engram_lifecycle.py`/`engram_stats.py` for a
@@ -272,14 +274,35 @@ flags — including after Stage 1.3 (#2289) changed them:
    doc's caveat paragraph (the edge-partition section above) needed a follow-up pass to do the
    same; the source comment did not lag behind its own change.
 
-2. **`_trace_observation_leaves`'s premise-spine walk** (`engram_core.py`) — hardcodes
-   `relation IN ('derives_from', 'supported_by')` rather than deriving from
-   `CASCADE_RELATIONS`, per its own comment: *"this walk's exclusion of `cites` is a commitment
-   about what counts as a PREMISE, and today's cascade set happening to equal `{derives_from,
-   supported_by}` is coincidence, not cause… Deriving this from `cascade` would make 'premise
-   spine' track a flag that means 'taint propagates here' — a different question that merely
-   agrees with this one today. Do not fix this to `CASCADE_RELATIONS`."* Same shape as #1: a
-   future change to the `cascade` flag must not silently redefine what counts as a premise.
+> **History — `_trace_observation_leaves`'s premise-spine walk was carve-out #2 through
+> 2026-08-27, and no longer is (#2298, ruled 2026-08-28).** It hardcoded
+> `relation IN ('derives_from', 'supported_by')` rather than deriving from `CASCADE_RELATIONS`,
+> per its own comment (as it read through yesterday's #2296): *"this walk's exclusion of `cites`
+> is a commitment about what counts as a PREMISE, and today's cascade set happening to equal
+> `{derives_from, supported_by}` is coincidence, not cause… Deriving this from `cascade` would
+> make 'premise spine' track a flag that means 'taint propagates here' — a different question
+> that merely agrees with this one today. Do not fix this to `CASCADE_RELATIONS`."* — same shape
+> as #1, reasoned the same way.
+>
+> This doc independently re-verified and ratified that exact doctrine on 2026-08-27 (issue
+> #2299, the pass immediately above), without either side having #2298 in view: #2298 was filed
+> 2h20m earlier the same evening, arguing the opposite. Flagged as a live conflict on #2298 and
+> the forum rather than resolved unilaterally either way (2026-08-28). **Lei's ruling: #2298
+> supersedes the #2255 doctrine for this walk specifically** — post-partition, "what is a
+> premise" and "what should cascade" are the same question by construction (a node's evidential
+> lineage IS its cascade ancestry), not two questions that merely coincide. `supported_by` drops
+> out of the walked set as a consequence (behavior-preserving: every `supported_by` edge is
+> minted with a cornerstone or lesson as its SOURCE — never its target, "exemplar" is not a
+> target-type guarantee, a reviewer-fairy catch on PR #2329 that corrected an earlier draft of
+> this note — and since those source types are non-claim-bearing, `engram_derive` structurally
+> rejects them as `derives_from` targets, so this claim-bearing-only walk can never land on one
+> to descend into its own `supported_by` edges — independently re-verified against source before
+> the fix landed, not just asserted). The walk now derives
+> from `CASCADE_RELATIONS` via the shared `_walk_cascade_upstream` primitive (`engram_core.py`),
+> which also supplies the #2013 cascade machine's future `ancestors(X)` traversal (mode-C
+> travel) — one traversal, two filters, per #2298 §2's unification. `CITATION_SUPPORT_RELATIONS`
+> (item 1 above) is UNCHANGED by this ruling — it answers a genuinely different question
+> (citation-coverage / health-metric semantics), not premise-hood.
 
 **The derive-vs-enumerate criterion, stated precisely (Kepler/Borges, folded into this doc at
 their request — this is the rider that resolves an apparent tension in the two rules above):**
@@ -297,9 +320,10 @@ object — a person decides it, and it changes only by an explicit edit to
 `CLAIM_BEARING_TYPES`/`EDGE_CLASSIFICATIONS`. **Checks against that membership** — a query
 asking "is this node claim-bearing," a walk asking "does this relation cascade" — are the
 derived object, and must read the declaration rather than re-list types/relations inline.
-`CITATION_SUPPORT_RELATIONS` and `_trace_observation_leaves`'s premise-spine literal are the
-named exception to the *derive* half specifically because each one's question only coincides
-with today's cascade membership — it isn't asking the membership question itself.
+`CITATION_SUPPORT_RELATIONS` is the named exception to the *derive* half specifically because
+its question only coincides with today's cascade membership — it isn't asking the membership
+question itself. (`_trace_observation_leaves`'s premise-spine walk was a second named exception
+through 2026-08-27; #2298 ruled it out of this class — see the history note above.)
 
 **The canonical accessor for the derive half already exists and already carries this
 doctrine:** `core._is_claim_bearing(node_type)` — `return node_type in CLAIM_BEARING_TYPES` —
@@ -450,6 +474,7 @@ than invented here.
 | 1.5 (remainder), re-type half — the misfiled `supported_by` edge (a claim about which hooks can inject context, wrongly filed as derived-from a claim about handler types) re-typed to `about` | **still open — not resolved by this pass** | issue #2265 (blocker: no agent-facing path to re-type a provably-wrong `supported_by` edge, since `removable: False`) |
 | W3/W4 — migration + `cites` re-typing | not started, as far as this pass checked | — |
 | W5 — cascade machine (#2013 build table) | **build table open** (Kepler, 2026-08-27T21:12Z, forum #348) — the exit-criteria run on post-W6 `dev` is the stage's own precondition per the epic's derived-set mutation-site notes, not yet confirmed run as of this pass | issue #2013 |
+| W5 (row) — `_trace_observation_leaves` premise-spine derives from `CASCADE_RELATIONS`, unified with mode-C travel's shared traversal | **PR open** (2026-08-28) — see the history note above this table for the #2255-superseding ruling | issue #2298, PR #2329 |
 
 **Note on 1.3's scope, corrected from an earlier draft of this doc:** 1.3 is **not** "the
 confidence rung" — `lesson`'s confidence removal already shipped via 1.6/1.6a, ahead of and
