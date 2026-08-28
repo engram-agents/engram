@@ -109,6 +109,19 @@ def test_observation_fault_injected_readback_miss_reports_failed_not_durable(mon
     server = fresh_server()
     import engram_observation
 
+    # Create the evidence node BEFORE the monkeypatch (genuinely durable) and
+    # cite it by evidence_id below, rather than letting engram_add_observation
+    # auto-create evidence from url+title. #2234 wired the same
+    # core.verify_write_durability guard into _add_evidence_impl, so a
+    # url+title payload here would trip the mock during the internal
+    # evidence-creation sub-call and mask what this test targets: the
+    # observation's own guard.
+    ev = json.loads(server.engram_add_evidence(payload_json=json.dumps({
+        "url": "https://example.com/durability-obs-fault",
+        "title": "Durability fault",
+    })))
+    evidence_id = ev["evidence_id"]
+
     monkeypatch.setattr(
         engram_observation.core, "verify_write_durability",
         lambda *a, **k: (engram_observation.core.DURABILITY_NOT_DURABLE,
@@ -116,8 +129,7 @@ def test_observation_fault_injected_readback_miss_reports_failed_not_durable(mon
     )
 
     payload = {
-        "url": "https://example.com/durability-obs-fault",
-        "title": "Durability fault",
+        "evidence_id": evidence_id,
         "quoted_text": "X says Y",
         "interpretation": "X claims Y",
         "claim": "Y is true according to X (fault-injected)",
@@ -253,14 +265,24 @@ def test_observation_indeterminate_is_distinguishable(monkeypatch):
     server = fresh_server()
     import engram_observation
 
+    # See the analogous comment in
+    # test_observation_fault_injected_readback_miss_reports_failed_not_durable:
+    # cite a pre-created (genuinely durable) evidence node by id, so the
+    # #2234 guard now inside _add_evidence_impl's internal auto-create path
+    # doesn't intercept this mock ahead of the observation's own guard.
+    ev = json.loads(server.engram_add_evidence(payload_json=json.dumps({
+        "url": "https://example.com/durability-obs-indeterminate",
+        "title": "Durability indeterminate",
+    })))
+    evidence_id = ev["evidence_id"]
+
     monkeypatch.setattr(
         engram_observation.core, "verify_write_durability",
         lambda *a, **k: (engram_observation.core.DURABILITY_INDETERMINATE,
                          {"same_conn": True, "fresh_conn": False})
     )
     payload = {
-        "url": "https://example.com/durability-obs-indeterminate",
-        "title": "Durability indeterminate",
+        "evidence_id": evidence_id,
         "quoted_text": "X says Y",
         "interpretation": "X claims Y",
         "claim": "Y is true according to X (indeterminate-injected)",
@@ -1209,3 +1231,89 @@ def test_trust_signal_fault_injected_indeterminate_reports_durability_indetermin
     )
     assert "trust_signal_id" in r
     assert "error" in r
+
+
+# ── Evidence (alpha#2234) — non-claim_field variant ────────────────────────
+#
+# Evidence nodes never populate a `claim` column (the `nodes` table's evidence
+# rows carry source_url/source_title/etc instead), so the call site in
+# _add_evidence_impl passes claim_field="source_url" -- the always-populated
+# column here (url is validated non-empty before the INSERT). These three
+# tests mirror the shape above (positive control / fault-injected
+# not_durable / fault-injected indeterminate), confirming the non-default
+# claim_field is actually wired through.
+
+
+def test_evidence_positive_control_reports_created_and_is_durable():
+    server = fresh_server()
+    payload = {
+        "url": "https://example.com/durability-evidence",
+        "title": "Durability evidence control",
+    }
+    r = json.loads(server.engram_add_evidence(payload_json=json.dumps(payload)))
+    assert r.get("status") == "created", f"Expected created, got {r}"
+    node_id = r["evidence_id"]
+
+    # Independent confirmation the row genuinely exists with real content —
+    # not merely that the guard was told to say yes.
+    import engram_core as core
+    conn = core._get_db()
+    try:
+        row = conn.execute(
+            "SELECT source_url FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        assert row is not None, "row should exist after a real commit"
+        assert row["source_url"] and row["source_url"].strip(), (
+            "source_url should be non-empty"
+        )
+    finally:
+        conn.close()
+
+
+def test_evidence_fault_injected_not_durable_reports_failed_not_durable(monkeypatch):
+    server = fresh_server()
+    import engram_observation
+
+    monkeypatch.setattr(
+        engram_observation.core, "verify_write_durability",
+        lambda *a, **k: (engram_observation.core.DURABILITY_NOT_DURABLE,
+                         {"same_conn": False, "fresh_conn": False})
+    )
+
+    payload = {
+        "url": "https://example.com/durability-evidence-fault",
+        "title": "Durability evidence fault",
+    }
+    r = json.loads(server.engram_add_evidence(payload_json=json.dumps(payload)))
+    assert r.get("status") == "failed_not_durable", (
+        f"Expected failed_not_durable under injected read-back miss, got {r}. "
+        "If this assertion fails with status=='created', the guard's call "
+        "site in _add_evidence_impl has likely been removed."
+    )
+    assert "evidence_id" in r
+    assert "error" in r
+
+
+def test_evidence_fault_injected_indeterminate_reports_durability_indeterminate(monkeypatch):
+    server = fresh_server()
+    import engram_observation
+
+    monkeypatch.setattr(
+        engram_observation.core, "verify_write_durability",
+        lambda *a, **k: (engram_observation.core.DURABILITY_INDETERMINATE,
+                         {"same_conn": True, "fresh_conn": False})
+    )
+
+    payload = {
+        "url": "https://example.com/durability-evidence-indeterminate",
+        "title": "Durability evidence indeterminate",
+    }
+    r = json.loads(server.engram_add_evidence(payload_json=json.dumps(payload)))
+    assert r.get("status") == "durability_indeterminate", (
+        f"Expected durability_indeterminate under injected disagreement, got {r}. "
+        "A status of failed_not_durable here means the three-way branch has "
+        "been collapsed back to two."
+    )
+    assert r["durability"]["same_conn"] is True
+    assert "DISAGREE" in r["error"]
+    assert "did not verify as durable" not in r["error"]

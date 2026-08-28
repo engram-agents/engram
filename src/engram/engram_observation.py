@@ -953,6 +953,20 @@ def _add_evidence_impl(
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         conn.commit()
 
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability. Evidence nodes never populate a
+        # `claim` column (#2234) -- `source_url` stands in as the
+        # always-populated column instead, since url is required and
+        # validated non-empty before the INSERT above.
+        _verdict, _durability = core.verify_write_durability(
+            conn, node_id, claim_field="source_url")
+        if _verdict != core.DURABILITY_DURABLE:
+            return json.dumps(core.durability_failure_response(
+                _verdict, _durability, "evidence_id", node_id, "#2234"))
+
         result = {
             "status": "created",
             "evidence_id": node_id,
