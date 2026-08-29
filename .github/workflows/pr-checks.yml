@@ -18,8 +18,33 @@ name: pr-checks
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
-    branches: [dev, main]
+    # `edited` (#2361): the test-id-set-check names a remedy — add a
+    # `Removed-test:` line to the PR body — that the workflow could not
+    # observe without it. A body edit fires `edited`, which was absent, and a
+    # manual re-run replays the ORIGINAL event payload (measured), so the only
+    # remedy the gate named was invisible to the gate. It also starts a run
+    # when GitHub auto-retargets a stacked PR to dev (addresses #2344).
+    # `edited` cannot be filtered to body-only, so this also fires on title
+    # edits; pr-checks is one combined job of static scrubs and the runner
+    # cost of that is accepted deliberately (Kepler's call, #2361).
+    types: [opened, reopened, synchronize, edited]
+    # NO `branches:` FILTER, deliberately (#2361). The filter matches the BASE
+    # branch, so `[dev, main]` meant a PR stacked onto a sibling feature branch
+    # ran none of these scrubs — exactly the long-lived stack where an
+    # intermediate round can drop a test id and nothing re-counts until the
+    # stack bottom retargets. Do not re-add a base filter without re-reading
+    # that issue; the stacked case is the one these gates most need to cover.
+
+# One in-flight run per PR (#2361 review). `edited` raises trigger frequency --
+# every title or body edit now starts a run -- which widens a pre-existing race
+# in the name-leak-warn step: it upserts a PR comment by list-then-create/update,
+# so two overlapping runs can both read "no comment yet" and both create one.
+# Cancelling the superseded run also stops paying for scrub results nobody reads.
+# NOT cancel-in-progress on the merge queue's behalf -- this keys on the PR ref,
+# so it cannot cancel a run belonging to a different PR.
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   pr-checks:

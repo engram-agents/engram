@@ -21,7 +21,10 @@ name: anti-dup-retro-check
 on:
   pull_request:
     types: [closed]
-    branches: [dev, main]
+    # NO `branches:` FILTER, deliberately (#2361) — the filter matches the BASE
+    # branch, so this retro check never ran when a stacked PR merged into its
+    # parent feature branch. The job's own `merged == true` guard still gates
+    # the work; widening the trigger only widens WHICH merges it can see.
 
 jobs:
   anti-dup-retro:
@@ -38,6 +41,12 @@ jobs:
           MERGED_PR: ${{ github.event.pull_request.number }}
           PR_BODY: ${{ github.event.pull_request.body }}
           REPO: ${{ github.repository }}
+          # Read via env, never templated into the run: script below. `base.ref`
+          # is not attacker-controllable from a fork today, so this is not a live
+          # injection -- but "not currently exploitable" is a property of the
+          # trigger set, not of the code, and the trigger set is exactly what
+          # #2361 just changed. (#2361 round-2 review.)
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           # Strip inline-code spans before grepping — GitHub's auto-close parser
           # ignores keywords inside backticks (verified #1191), and CLAUDE.md
@@ -78,6 +87,64 @@ jobs:
           for N in $CLOSING_NS; do
             echo ""
             echo "-- Scanning for orphaned PRs targeting #$N --"
+
+            # ── Is issue #N ACTUALLY closed? ────────────────────────────────
+            # A closing keyword in a merged PR body does NOT imply the issue
+            # closed: GitHub only auto-closes on merge into the repository's
+            # DEFAULT branch. Before #2361 this workflow was base-filtered to
+            # [dev, main] and the assumption held for dev; #2361 widened it to
+            # every base so stacked PRs get scrubbed, which makes the inference
+            # unsound — a stacked PR merging into its parent feature branch
+            # closes nothing, and this workflow would then post a FAILING
+            # check-run plus a comment on someone else's open PR accusing it of
+            # duplicating an issue that is still open. Found by a reviewer pass
+            # on #2361; the same defect already existed for main-targeted merges
+            # (main is not the default branch either), so this fixes that too.
+            #
+            # Mirrors the real-state check in pr-checks.yml's anti-dup step.
+            # DELIBERATE DIFFERENCE on the error path: that step WARNS and
+            # continues, because its failure mode is a missed warning on the
+            # author's own PR. Here the failure mode is a false accusation
+            # posted on a THIRD PARTY's PR, so an unresolvable state SKIPS.
+            # Silence is the safe direction when the output lands on someone
+            # else's work.
+            # Query the issues endpoint, which serves BOTH issues and PRs, and
+            # take state + is-it-a-PR in ONE call. Round-2 review measured the
+            # trap this closes: `gh issue view` on a CLOSED-but-unmerged PR
+            # number returns state=CLOSED, indistinguishable from a genuinely
+            # closed issue -- so a closing keyword pointing at a PR number
+            # would satisfy the guard and re-open the false-accusation path
+            # this guard exists to shut. `.pull_request` is present only on PRs.
+            # BRANCH ON EXIT STATUS, NOT ON EMPTINESS. Round-3 review measured
+            # why: on a 404 (and any structured HTTP error) `gh api` prints its
+            # JSON error body to STDOUT and exits 1, so the capture is NON-empty
+            # and an emptiness test never fires. The round-2 fix this replaces
+            # tested `-z` and was therefore unreachable for the dominant real
+            # failure shape -- it fell through to state=UNKNOWN and printed a
+            # line that reads like an ordinary business-logic skip. A check
+            # whose failure looks like its success is worse than no check.
+            # `|| echo ""` cannot help either: it decides whether an ADDITIONAL
+            # echo runs, it does not erase what the failing command already
+            # wrote to stdout.
+            if ! ISSUE_JSON=$(gh api "repos/$REPO/issues/$N" 2>/dev/null); then
+              # Unresolvable, NOT open. Skip -- the output of this workflow
+              # lands on a THIRD PARTY's PR, so silence beats a guess. But say
+              # so LOUDLY: a transient API failure here drops the one safety
+              # net the workflow provides, and a silent drop is
+              # indistinguishable from a clean run. (#2361 rounds 2 and 3.)
+              echo "::warning::anti-dup-retro: could not resolve #$N (gh api failed). Skipping to avoid a false duplicate accusation; this run did NOT check #$N."
+              continue
+            fi
+            if printf '%s' "$ISSUE_JSON" | jq -e 'has("pull_request")' >/dev/null; then
+              echo "#$N is a PULL REQUEST, not an issue -- a closing keyword cannot orphan it. Skipping."
+              continue
+            fi
+            ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // "unknown"' | tr '[:lower:]' '[:upper:]')
+            if [ "$ISSUE_STATE" != "CLOSED" ]; then
+              echo "Issue #$N is not closed (state=$ISSUE_STATE) -- the merge did not close it (base was '$PR_BASE_REF'; only the default branch auto-closes). Nothing orphaned; skipping."
+              continue
+            fi
+            echo "Issue #$N confirmed CLOSED and is a real issue. ✓"
 
             # Filter: open PRs (excluding the merged PR) whose body contains a
             # closing-keyword reference to #N. Output: "<number> <headRefOid>" per match.

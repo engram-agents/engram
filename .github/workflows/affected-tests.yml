@@ -1,12 +1,18 @@
 name: affected-tests
 
-# Moved off per-PR CI (#1597) — run affected-tests locally as a review
-# requirement; the full suite (tests.yml) runs on the dev→main release PR.
+# MANUAL ONLY — `workflow_dispatch`. This does NOT run automatically on any
+# pull request. It was moved off per-PR CI by #1597; running affected-tests is
+# now a LOCAL review requirement, and the full suite (tests.yml) runs on the
+# dev→main release PR.
 #
-# Import-graph selective pytest on every dev PR.
-# Runs only the tests affected by the PR's changed files via
-# src/engram/tools/run_touched_tests.py (Layer 1: static import graph;
-# Layer 2: packaging/test-map.json convention map).
+# Comment corrected in #2361: the two lines below used to read "Import-graph
+# selective pytest on every dev PR", describing the pre-#1597 behaviour four
+# lines above its own `on:` block. Nothing here has run per-PR since #1597.
+#
+# What it does WHEN DISPATCHED: import-graph selective pytest — only the tests
+# affected by the changed files, via src/engram/tools/run_touched_tests.py
+# (Layer 1: static import graph; Layer 2: packaging/test-map.json convention
+# map).
 #
 # Fail-open: any changed file unresolved by both layers triggers the full
 # suite so a new surface can never silently escape coverage.
@@ -18,7 +24,13 @@ name: affected-tests
 #
 # Decision (Lei 2026-06-23, issue #1358): mechanical gate > vigilance for
 # dev-PR coverage. A SyntaxError in a hook (#1347 → #1356) merged to dev
-# green because no tests ran on dev PRs. This workflow closes that gap.
+# green because no tests ran on dev PRs.
+#
+# HISTORICAL: that paragraph describes why this workflow was created, and
+# "closes that gap" was true while it ran on dev PRs. Since #1597 it does not,
+# so the #1358 gap is currently covered by the LOCAL review requirement rather
+# than by this file. Stated plainly (#2361) because the previous wording read
+# as a live guarantee.
 on:
   workflow_dispatch:
 
