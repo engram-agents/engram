@@ -472,6 +472,7 @@ class Playbox:
             "triple_diamond": self._build_triple_diamond,
             "nested_diamond": self._build_nested_diamond,
             "mutual_crossing": self._build_mutual_crossing,
+            "converging_diamonds": self._build_converging_diamonds,
         }
         if name not in builders:
             raise ValueError(
@@ -530,6 +531,35 @@ class Playbox:
             "right": right,
             "tip": tip,
         }
+
+    def _build_converging_diamonds(self) -> dict:
+        """Lei's double-event shape (2026-08-29): two roots feeding the same
+        middle layer, one tip over both.
+
+            A, B          -- two independent root observations
+            C, D          -- derivations, EACH derives_from A AND B
+            E             -- derivation, derives_from C AND D
+
+        [A, C, D, E] is one diamond, [B, C, D, E] another; they share every
+        non-root node. Superseding (or retracting) BOTH A and B is therefore
+        the multi-event case: C, D and E each carry TWO pending markers, one
+        per event, and every per-node/one-judgement/trivial-resolution rule
+        in #2013 is exercised on the same three nodes at once.
+
+        Built WITHOUT any event — the scenario decides what happens to A/B.
+        Two ready-made replacements are minted alongside (A2 deliberately a
+        weaker source than A, B2 the same strength as B) so a supersede
+        scenario can show confidence moving on one leg and not the other.
+        """
+        A = self.node("A", kind="observation", claim="A: root reading one.")
+        B = self.node("B", kind="observation", claim="B: root reading two.")
+        A2 = self.node("A2", kind="observation", claim="A2: corrected reading of A.",
+                       quote_type="editorial")
+        B2 = self.node("B2", kind="observation", claim="B2: corrected reading of B.")
+        C = self.node("C", kind="derivation", supports=[A, B], claim="C: from A and B.")
+        D = self.node("D", kind="derivation", supports=[A, B], claim="D: from A and B, differently.")
+        E = self.node("E", kind="derivation", supports=[C, D], claim="E: from C and D.")
+        return {"A": A, "B": B, "A2": A2, "B2": B2, "C": C, "D": D, "E": E}
 
     def _build_mutual_crossing(self) -> dict:
         """Two supersedes whose replacements each sit in the OTHER's
