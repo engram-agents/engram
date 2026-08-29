@@ -14,6 +14,8 @@ name: pr-checks
 #   5b. stray-baton-path-check  (#2316 — advisory, never blocks job)
 #   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
 #   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
+#   7c. stdlib-only guards      (#2376 — 5 SSoT/sync/drift gates measured to need
+#      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
 
@@ -526,6 +528,32 @@ jobs:
         # entries are caught at dev-PR time rather than only at release-cut.
         # See issue #1147.
         run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q
+
+      # ── 7c. stdlib-only guards ────────────────────────────────────────────
+      # #2376 — five more SSoT/sync/drift guards that ran in no CI workflow at
+      # all, reachable only at release-cut, same staleness-by-omission class
+      # as manifest-gate's own tiers.json check above. Measured (not assumed)
+      # to need nothing beyond this same Python 3.12 + pytest setup: a fresh
+      # venv with ONLY `pip install pytest` (no requirements.txt) runs all
+      # five clean, ~1s combined. They sit inside the "pure stdlib + pytest"
+      # carve-out this file already documents at manifest-gate above, so —
+      # unlike #2371's tool_capability_index guard, which needs fastmcp and
+      # is therefore a real cost-model question — these need no ruling.
+      #
+      # test_skill_server_sync.py deliberately NOT wired here even though it
+      # was measured alongside these five: it is a documented #1149 tombstone
+      # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
+      # step that runs, does nothing, and can never fail would read as
+      # coverage that isn't there.
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency
+        run: |
+          python3 -m pytest \
+            tests/test_check_claude_md_drift.py \
+            tests/test_plugin_manifest_import_sync.py \
+            tests/test_tool_policy_sync.py \
+            tests/test_upgrade_drift_sources.py \
+            tests/test_build_plugin_hooks_consistency.py \
+            -q
 
       # ── 8. test-id-set-check ────────────────────────────────────────────
       # #2350 — a deleted test cannot fail, so a PR that removes coverage is
