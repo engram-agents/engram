@@ -781,15 +781,26 @@ def _add_edge_impl(
                     )
                 })
 
-        # DAG guard: among addable-after-creation relations, only `subtask_of` has
-        # dag_check=True today. `serves` and `tensions` were exempted in #1076
-        # (three-tier edge taxonomy — those edges are cross-temporal by design).
-        # This guard also covers any future addable relations that gain dag_check=True.
+        # Temporal-causal guard (#2357 renamed dag_check -> temporal_causal;
+        # semantics unchanged): among addable-after-creation relations, only
+        # `subtask_of` has temporal_causal=True today. `serves` and `tensions`
+        # were exempted in #1076 (three-tier edge taxonomy — those edges are
+        # cross-temporal by design). This guard also covers any future
+        # addable relations that gain temporal_causal=True.
         # Convention (from startup check at _ensure_data_dir and engram_inspect):
         # a violation is source.created_at < target.created_at — i.e. the source
         # is OLDER than the target. Valid edges have source newer-or-equal.
+        #
+        # TODO(#2349): a `dag: True` relation also needs a real reachability
+        # check here (would this edge close a cycle?), independent of the
+        # temporal check above. No addable-after-creation relation carries
+        # dag=True and temporal_causal=False today (acknowledged_derives_from,
+        # the one relation where they diverge, is never addable via this
+        # generic tool — see its EDGE_CLASSIFICATIONS entry), so there is no
+        # live gap yet. Wire in once #2349's reachability walker merges to
+        # dev; do not duplicate it here in the meantime (#2357 design thread).
         classification = core.EDGE_CLASSIFICATIONS.get(relation, {})
-        if classification.get("dag_check", False):
+        if classification.get("temporal_causal", False):
             if source["created_at"] < target["created_at"]:
                 return json.dumps({
                     "error": (

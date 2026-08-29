@@ -617,15 +617,21 @@ def test_retract_predictive_observation_retracts_prediction_only_after_last_basi
 
 
 def test_cascade_relations_is_derives_from_only():
-    """CASCADE_RELATIONS == {'derives_from'} after Stage 1.3.
+    """CASCADE_RELATIONS == {'derives_from', 'acknowledged_derives_from'}
+    after Stage 1.3 + #2357.
 
     Asserted directly so a future flag flip (e.g. re-adding cascade to
     supported_by, or adding a new cascade-bearing relation) is loud rather
     than silently changing cascade-walk behavior with no test to catch it.
+    #2357 (2026-08-29) added `acknowledged_derives_from` as a second cascade
+    relation — the cascade-frontier acknowledgement edge, which must
+    cascade (that's the entire reason it exists).
     """
-    assert engram_core.CASCADE_RELATIONS == frozenset({"derives_from"}), (
-        f"Expected CASCADE_RELATIONS == {{'derives_from'}}, got "
-        f"{engram_core.CASCADE_RELATIONS}"
+    assert engram_core.CASCADE_RELATIONS == frozenset(
+        {"derives_from", "acknowledged_derives_from"}
+    ), (
+        f"Expected CASCADE_RELATIONS == {{'derives_from', "
+        f"'acknowledged_derives_from'}}, got {engram_core.CASCADE_RELATIONS}"
     )
 
 

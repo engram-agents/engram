@@ -129,9 +129,10 @@ def get_schema_data() -> dict:
     No DB access required — the schema is static.  Called by the
     /api/schema endpoint and directly by the CI drift gate.
     """
-    # Logical-substrate set: the 9 from engram_query plus instantiates
-    # (instantiates is in VALID_RELATIONS but in neither _LOGICAL_SUBSTRATE_RELATIONS
-    # nor _CONTEXTUAL_RELATIONS — treat as logical-substrate per spec §Deliverable 1).
+    # Logical-substrate set: the 10 from engram_query (#2357 added
+    # acknowledged_derives_from) plus instantiates (instantiates is in
+    # VALID_RELATIONS but in neither _LOGICAL_SUBSTRATE_RELATIONS nor
+    # _CONTEXTUAL_RELATIONS — treat as logical-substrate per spec §Deliverable 1).
     logical_substrate = sorted(
         set(_LOGICAL_SUBSTRATE_RELATIONS) | {"instantiates"}
     )

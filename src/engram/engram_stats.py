@@ -33,6 +33,7 @@ from typing import Optional
 
 import engram_core as core
 import engram_conformance as _conformance_mod
+import engram_dag_conformance as _dag_conformance_mod
 
 
 # #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
@@ -938,6 +939,15 @@ def _diagnose_impl() -> str:
         # scoring, no acknowledged state — #2300 scope; this section is a
         # pure read of the checker's own return value.
         metrics["partition_conformance"] = _conformance_mod.check_partition_conformance(conn)
+
+        # ── DAG Conformance (#2357) ────────────────────────────────────────
+        # Real edge-walk acyclicity over the `dag: True` relation set —
+        # deliberately a separate module/check from partition_conformance
+        # above (engram_dag_conformance.py's own docstring explains why: a
+        # DAG cycle is a different property from the CB/NCB partition, with
+        # a different owner). Zero-or-investigate, same as partition
+        # conformance — no severity, no scoring, no acknowledged state.
+        metrics["dag_conformance"] = _dag_conformance_mod.check_dag_conformance(conn)
 
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}

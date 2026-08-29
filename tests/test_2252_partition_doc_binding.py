@@ -78,7 +78,7 @@ value the test declined to bind is exactly the value that is now false, and
 the test cannot report it."* The in-flight change is no longer in flight, so
 the exclusion's justification is gone — `_parse_doc_edge_table` below now
 binds the doc's "## The edge partition" table (all four boolean columns:
-cascade, provenance, dag_check, removable) to `EDGE_CLASSIFICATIONS`
+cascade, provenance, temporal_causal, removable) to `EDGE_CLASSIFICATIONS`
 directly, the same reads-the-actual-doc discipline as the membership parser
 above. `CASCADE_RELATIONS` / `PROVENANCE_RELATIONS` still have their own,
 separate derivation-correctness binding in tests/test_cascade_derived_sets.py
@@ -261,7 +261,7 @@ _EDGE_TABLE_ROW_RE = re.compile(
     r"^\|\s*`([a-zA-Z_]+)`\s*\|"          # relation, backtick-quoted
     r"\s*\**(True|False)\**\s*\|"          # cascade — optionally **bold**
     r"\s*\**(True|False)\**\s*\|"          # provenance — optionally **bold**
-    r"\s*\**(True|False)\**\s*\|"          # dag_check
+    r"\s*\**(True|False)\**\s*\|"          # temporal_causal
     r"\s*\**(True|False)\**\s*\|",         # removable
     re.MULTILINE,
 )
@@ -270,7 +270,7 @@ _EDGE_TABLE_ROW_RE = re.compile(
 def _parse_doc_edge_table(doc_text):
     """Parse docs/specs/2252-cb-ncb-partition.md's "## The edge partition"
     table into {relation: {"cascade": bool, "provenance": bool,
-    "dag_check": bool, "removable": bool}}.
+    "temporal_causal": bool, "removable": bool}}.
 
     Matched by the row shape itself (a line starting "| `relation` | ..."), not by
     slicing between section headers — every data row in this table starts
@@ -290,7 +290,7 @@ def _parse_doc_edge_table(doc_text):
     The row regex above binds cells to flag names by POSITION (1st boolean
     cell = cascade, 2nd = provenance, ...), not by reading a column label —
     so a doc edit that reordered the table's columns (e.g. swapping
-    `provenance` and `dag_check`) would silently mis-bind every row's
+    `provenance` and `temporal_causal`) would silently mis-bind every row's
     values to the wrong flag name without the "zero rows match" guard above
     ever firing (the row shape still matches; only the meaning of each
     position changed). Guarded explicitly here (round-1 reviewer-fairy
@@ -298,7 +298,7 @@ def _parse_doc_edge_table(doc_text):
     column order this parser assumes, before trusting any row.
     """
     header_match = re.search(
-        r"^\|\s*relation\s*\|\s*cascade\s*\|\s*provenance\s*\|\s*dag_check\s*\|"
+        r"^\|\s*relation\s*\|\s*cascade\s*\|\s*provenance\s*\|\s*temporal_causal\s*\|"
         r"\s*removable\s*\|",
         doc_text,
         re.MULTILINE,
@@ -306,7 +306,7 @@ def _parse_doc_edge_table(doc_text):
     if not header_match:
         raise AssertionError(
             f"Could not find the edge-partition table's header row "
-            f"('| relation | cascade | provenance | dag_check | removable "
+            f"('| relation | cascade | provenance | temporal_causal | removable "
             f"| ...') in {_DOC_PATH} in that exact column order — "
             f"_parse_doc_edge_table's row regex binds cells to flag names "
             f"by position, so either the header changed order or this "
@@ -319,11 +319,11 @@ def _parse_doc_edge_table(doc_text):
         m = _EDGE_TABLE_ROW_RE.match(line)
         if not m:
             continue
-        relation, cascade, provenance, dag_check, removable = m.groups()
+        relation, cascade, provenance, temporal_causal, removable = m.groups()
         rows[relation] = {
             "cascade": cascade == "True",
             "provenance": provenance == "True",
-            "dag_check": dag_check == "True",
+            "temporal_causal": temporal_causal == "True",
             "removable": removable == "True",
         }
     if not rows:
@@ -343,7 +343,7 @@ DOC_EDGE_TABLE = _parse_doc_edge_table(_DOC_TEXT)
 # column in the doc's table (the doc's prose covers it narratively per-edge
 # instead — e.g. "minted once at node-add time only" in the pairing-invariant
 # section) — deliberately not asserted here for that reason, not an oversight.
-_BOUND_EDGE_COLUMNS = ("cascade", "provenance", "dag_check", "removable")
+_BOUND_EDGE_COLUMNS = ("cascade", "provenance", "temporal_causal", "removable")
 
 
 def test_edge_table_relations_match_edge_classifications_keys():
@@ -374,7 +374,7 @@ def test_edge_table_relations_match_edge_classifications_keys():
 def test_edge_table_flags_match_edge_classifications():
     """Pins every (relation, column) cell in the doc's edge-partition table
     to the matching EDGE_CLASSIFICATIONS flag, for all four bound columns
-    (cascade, provenance, dag_check, removable).
+    (cascade, provenance, temporal_causal, removable).
 
     This is the specific regression guard for the #2299 incident: Stage 1.3
     (#2289) flipped `supported_by`'s `cascade` flag to False in code while

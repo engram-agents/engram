@@ -604,48 +604,108 @@ VALID_RELATIONS = {
                      # `supported_by` used for this pairing. Minted once, at
                      # node-add time (engram_observation.py); never hand-addable
                      # (see _ADDABLE_AFTER_CREATION_RELATIONS below).
+    "acknowledged_derives_from",  # #2357/#2013: cascade-frontier acknowledgement
+                     # edge — a node whose stale premise resolved as
+                     # "acknowledged" records this edge to the resolving
+                     # replacement, so a LATER supersede of the replacement
+                     # doesn't leave the acknowledgement silently stranded.
+                     # Deliberately backwards in creation time (see its
+                     # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
+                     # by the cascade-resolution machinery once #2349 lands.
 }
 
 
+# #2357: dag_check used to do two jobs under one name. It was a sound proxy
+# for real acyclicity only as long as every DAG-bearing edge also pointed
+# backwards in creation time — which held for every relation below UNTIL
+# `acknowledged_derives_from` (see its entry), whose whole point is to point
+# forward. Split into two independent per-relation flags:
+#   temporal_causal — PURE RENAME of the old dag_check semantics (creation-
+#     order: source created at-or-after target). This is what every existing
+#     call site (the supersede/add_edge timestamp guards, the startup scan)
+#     actually measures, honestly named.
+#   dag — the real, structural property: is this relation safe from cycles?
+#     For every relation that existed before this split, dag == temporal_causal
+#     (the two never diverged until now, so no relation needed re-judging).
+#     `acknowledged_derives_from` is the first and so far only relation where
+#     they differ: dag=True (a cycle through it would be genuinely bad — see
+#     its entry), temporal_causal=False (it is deliberately backwards in time,
+#     by construction).
+# dag is per-relation, not scoped to CASCADE_RELATIONS — structural relations
+# like supersedes/retracts/subtask_of need cycle protection too and are not
+# cascade relations, so a walk limited to CASCADE_RELATIONS would miss a cycle
+# among them entirely.
 EDGE_CLASSIFICATIONS = {
     "about": {
         "cascade": False,
-        "dag_check": False,
+        "temporal_causal": False,
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "cites": {
         "cascade": False,
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # provenance load-bearing; removal would orphan claims
         "addable_after_creation": False,  # legacy dual-use; PR 3 introduces new relation for relevance-marking
         "provenance": True,
     },
     "contradicts": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
+        "temporal_causal": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
+        "dag": False,
         "removable": False,    # structural commitment; alters epistemic stance
         "addable_after_creation": False,
         "provenance": False,
     },
     "derives_from": {
         "cascade": True,       # taint/stale propagation
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # cascade-bearing
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
+    "acknowledged_derives_from": {
+        # #2357: the acknowledgement edge (#2013's cascade-frontier machine,
+        # slice 3/4 — deferred there pending this split, see engram_revision.py
+        # on the feature branch). An acknowledging node X necessarily exists
+        # BEFORE the replacement P′ it comes to rest on — that is what an
+        # acknowledgement IS — so `X --acknowledged_derives_from--> P′` is
+        # always backwards in creation time: temporal_causal=False, by design,
+        # not an oversight.
+        #
+        # But it is NOT exempt from acyclicity. Constructed through public
+        # verbs only: base → P, X derives_from P, P′ derives_from X (legal —
+        # X is unmarked at that moment), supersede P → P′, then acknowledge X.
+        # The ack edge closes X → P′ → X. A real per-relation dag flag is what
+        # catches that a plain "cascade relations are acyclic because they're
+        # temporal_causal" argument cannot: dag=True, checked by a real edge
+        # walk (see engram_dag_conformance.check_dag_conformance and the
+        # write-time guard tracked in #2349's follow-up), independent of the
+        # temporal direction.
+        "cascade": True,        # must participate in cascade walks — that is
+                                 # the entire reason this relation exists.
+        "temporal_causal": False,
+        "dag": True,
+        "removable": False,     # cascade-bearing, mirrors derives_from.
+        "addable_after_creation": False,
+        "provenance": True,
+    },
     "exemplifies": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
+        "temporal_causal": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "instantiates": {
         "cascade": False,      # pure relevance marker — no confidence propagation
-        "dag_check": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
+        "temporal_causal": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -656,8 +716,9 @@ EDGE_CLASSIFICATIONS = {
                                 # cascade reaching one has nothing to re-adjudicate.
                                 # An earlier cascade:True clause was withdrawn by its
                                 # own author; do not restore it.
-        "dag_check": True,      # same provenance-chain shape as supported_by, which
+        "temporal_causal": True,      # same provenance-chain shape as supported_by, which
                                 # this edge is split out of.
+        "dag": True,
         "removable": False,    # provenance load-bearing, mirrors supported_by.
         "addable_after_creation": False,  # minted once at node-add time
                                            # (engram_observation.py); never hand-addable.
@@ -665,10 +726,11 @@ EDGE_CLASSIFICATIONS = {
     },
     "resolves": {
         "cascade": False,      # not a confidence-propagating edge
-        "dag_check": False,    # back-reference edge: resolver legitimately pre-dates the question
+        "temporal_causal": False,    # back-reference edge: resolver legitimately pre-dates the question
                                # (a question filed and immediately resolved by a pre-existing node
                                # has resolver.created_at < question.created_at — correct, not a
                                # violation). Exemption added 2026-06-10, issue #1076.
+        "dag": False,
         "removable": False,    # structural commitment
         "addable_after_creation": False,
         "provenance": False,
@@ -681,23 +743,26 @@ EDGE_CLASSIFICATIONS = {
                                 # `replacement —retracts→ retracted_node`; walking this relation
                                 # would make a retract cascade's first taint target the
                                 # replacement that same retract just created.
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,
         "addable_after_creation": False,
         "provenance": False,
     },
     "serves": {
         "cascade": False,
-        "dag_check": False,    # same shape as instantiates: a goal can be articulated after the node
+        "temporal_causal": False,    # same shape as instantiates: a goal can be articulated after the node
                                # that serves it — serves.source legitimately pre-dates serves.target.
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "subtask_of": {
         "cascade": False,
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -709,7 +774,8 @@ EDGE_CLASSIFICATIONS = {
                                 # carry an incoming supersedes edge, and the cascade walk stops
                                 # at non-current nodes, so a stale cascade:True here would only
                                 # ever fire on invariant-violating data.
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # structural mutation; use engram-surgical for emergencies
         "addable_after_creation": False,
         "provenance": False,
@@ -719,18 +785,20 @@ EDGE_CLASSIFICATIONS = {
                                 # accumulation (W0 doc: 99.2% of live instances are
                                 # cornerstone-sourced vote edges). An NCB target has
                                 # no claim to re-adjudicate, so cascade reaching it
-                                # accomplishes nothing. provenance/dag_check/removable
+                                # accomplishes nothing. provenance/temporal_causal/dag/removable
                                 # deliberately UNCHANGED — this is a cascade-only flip.
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,
         "addable_after_creation": False,
         "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
     "tensions": {
         "cascade": False,
-        "dag_check": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
+        "temporal_causal": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
                                # like contradicts (already exempt). A tension between nodes has no causal
                                # direction; either can pre-date the other legitimately.
+        "dag": False,
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
@@ -844,26 +912,28 @@ def prediction_pairing_exemption_sql(target_col: str = "n.id") -> "tuple[str, tu
 # (the three-tier edge taxonomy: dependency / relational / classification).
 # Maintained as a SEPARATE dict from
 # EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
-# its schema of {cascade, dag_check, removable, addable_after_creation,
-# provenance}) are not affected.
+# its schema of {cascade, temporal_causal, dag, removable,
+# addable_after_creation, provenance}) are not affected.
 #
-# Tier→dag_check expectation:
-#   dependency     ⇒ dag_check=True   (causal / provenance chain; temporal order matters)
-#   relational     ⇒ dag_check=False  (symmetric or cross-temporal; no causal direction)
-#   classification ⇒ dag_check=False  (realization / membership; no temporal constraint)
+# Tier→temporal_causal expectation (#2357 renamed dag_check→temporal_causal;
+# this tier map is about creation-order, not the newer `dag` acyclicity flag
+# — see EDGE_CLASSIFICATIONS's own header comment for why the two split):
+#   dependency     ⇒ temporal_causal=True   (causal / provenance chain; temporal order matters)
+#   relational     ⇒ temporal_causal=False  (symmetric or cross-temporal; no causal direction)
+#   classification ⇒ temporal_causal=False  (realization / membership; no temporal constraint)
 #
-# NOTE on subtask_of: tiered "dependency" (dag_check=True) deliberately.
+# NOTE on subtask_of: tiered "dependency" (temporal_causal=True) deliberately.
 # A subtask generally post-dates its parent goal/task, making the DAG check
 # correct in the common case. The rare task-reorg inversion (old task becomes
 # subtask of a newer umbrella) has 0 current violations, so it stays checked.
 # This is a watch item, not a divergence requiring acknowledgment.
 #
 # AUDIT SURFACE (not enforcement): test_edge_tier_audit.py uses this map to
-# warn on unintended drift between dag_check flags and tier expectations.
+# warn on unintended drift between temporal_causal flags and tier expectations.
 # Divergence emits a warnings.warn for human review — never a hard failure.
 # A relation MAY intentionally diverge (see EDGE_TIER_DIVERGENCE_ACK below).
 EDGE_TIERS: dict[str, str] = {
-    # dependency tier: causal / provenance edges; dag_check=True expected
+    # dependency tier: causal / provenance edges; temporal_causal=True expected
     "cites":        "dependency",
     "derives_from": "dependency",
     "retracts":     "dependency",
@@ -872,32 +942,50 @@ EDGE_TIERS: dict[str, str] = {
     "subtask_of":   "dependency",
     "predicted_by": "dependency",  # #2252 W6: same provenance-chain shape as
                                     # supported_by, which it is split out of.
-    # relational tier: symmetric / cross-temporal; dag_check=False expected
+    "acknowledged_derives_from": "dependency",  # #2357: provenance-chain shape,
+                                    # but deliberately temporal_causal=False —
+                                    # see EDGE_TIER_DIVERGENCE_ACK below.
+    # relational tier: symmetric / cross-temporal; temporal_causal=False expected
     "contradicts":  "relational",
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
-    # classification tier: realization / membership; dag_check=False expected
+    # classification tier: realization / membership; temporal_causal=False expected
     "instantiates": "classification",
     "serves":       "classification",
     "exemplifies":  "classification",
 }
 
 # Intentional-divergence acknowledgment table.
-# If a relation's dag_check flag intentionally diverges from its tier's
+# If a relation's temporal_causal flag intentionally diverges from its tier's
 # expectation, add it here with a short reason string. The audit test
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
-# Currently empty — there are no intentional divergences.
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
-    # "<relation>": "<reason for intentional divergence>"
-    # Example (hypothetical):
-    #   "about": "temporarily dag_check=True pending refactor #NNNN"
+    "acknowledged_derives_from": (
+        "#2357: deliberately backwards in creation time — the acknowledging "
+        "node necessarily predates the replacement it acknowledges. Real "
+        "acyclicity is still enforced via dag=True, checked by an edge walk "
+        "rather than the temporal_causal timestamp comparison."
+    ),
 }
 
+# DAG_EXEMPT_RELATIONS: relations exempt from the CREATION-ORDER (temporal_causal)
+# check — the name predates #2357's dag/temporal_causal split and is kept for
+# call-site stability, but every current reader (the startup consistency scan,
+# the generic add_edge_impl timestamp guard) wants the temporal_causal set, not
+# the newer real-acyclicity `dag` set. Do not repoint this at `dag` without
+# updating every reader — the two sets differ (acknowledged_derives_from is
+# temporal_causal=False but dag=True).
 DAG_EXEMPT_RELATIONS = frozenset(
-    r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
+    r for r, c in EDGE_CLASSIFICATIONS.items() if not c["temporal_causal"]
 )
+
+# The set of relations that must be walked for real acyclicity (#2357). Unlike
+# CASCADE_RELATIONS (walked for taint/stale propagation), this set exists
+# purely to bound the cycle-detection walk — see
+# engram_dag_conformance.check_dag_conformance.
+DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
 
 
 _ADDABLE_AFTER_CREATION_RELATIONS = frozenset(

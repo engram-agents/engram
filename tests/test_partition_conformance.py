@@ -22,7 +22,7 @@ Coverage:
        e. the invariant-5 reachability control (round 3, reviewer-fairy PR
           #2326 round-1 suggestion) — invariant 5's endpoint-currency join
           is dormant while ``cascade_ndc`` derives to empty by construction;
-          this control monkeypatches one relation's ``dag_check`` flag to
+          this control monkeypatches one relation's ``dag`` flag to
           reach the guarded branch and proves the join discriminates a
           superseded endpoint once it actually runs.
        f. the invariant-4 supersede-gap control (round 4, PR #2326 round-2
@@ -132,7 +132,7 @@ def test_clean_graph_flags_nothing():
         "invariant_2_ncb_node_with_confidence",
         "invariant_3_cb_node_ncb_premise",
         "invariant_4_unpaired_prediction",
-        "invariant_5_cascade_not_dag_check",
+        "invariant_5_cascade_not_dag_safe",
     ):
         assert out[key]["count"] == 0, f"{key} flagged a clean graph"
 
@@ -228,16 +228,19 @@ def test_invariant_4_paired_prediction_not_flagged():
 
 def test_invariant_5_derives_to_empty_by_construction():
     """#2300: invariant 5 is a static invariant holding by construction
-    today — every cascade relation also has dag_check:True in
-    EDGE_CLASSIFICATIONS, so cascade_ndc is the empty set and no fixture can
-    make invariant 5 non-empty without also editing EDGE_CLASSIFICATIONS
-    itself. This test pins that emptiness rather than special-casing it."""
-    non_dag_check_cascade = {
+    today — every cascade relation also has dag:True in EDGE_CLASSIFICATIONS
+    (#2357 renamed dag_check -> temporal_causal; this invariant follows the
+    new `dag` flag, not temporal_causal — see engram_conformance.py's
+    `_derive_cascade` docstring), so cascade_ndc is the empty set and no
+    fixture can make invariant 5 non-empty without also editing
+    EDGE_CLASSIFICATIONS itself. This test pins that emptiness rather than
+    special-casing it."""
+    non_dag_cascade = {
         r for r, c in core.EDGE_CLASSIFICATIONS.items()
-        if r in core.CASCADE_RELATIONS and not c["dag_check"]
+        if r in core.CASCADE_RELATIONS and not c["dag"]
     }
-    assert non_dag_check_cascade == set(), (
-        "a cascade relation now lacks dag_check — invariant 5 should no "
+    assert non_dag_cascade == set(), (
+        "a cascade relation now lacks dag — invariant 5 should no "
         "longer be vacuous; this test's premise needs updating alongside it"
     )
 
@@ -248,7 +251,7 @@ def test_invariant_5_derives_to_empty_by_construction():
     conn.commit()
 
     out = conformance.check_partition_conformance(conn)
-    assert out["invariant_5_cascade_not_dag_check"]["count"] == 0
+    assert out["invariant_5_cascade_not_dag_safe"]["count"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +330,7 @@ def test_control_b_overlap_is_union_not_sum():
             "invariant_2_ncb_node_with_confidence",
             "invariant_3_cb_node_ncb_premise",
             "invariant_4_unpaired_prediction",
-            "invariant_5_cascade_not_dag_check",
+            "invariant_5_cascade_not_dag_safe",
         )
     )
     assert naive_sum == 2, "fixture no longer exercises the overlap (both invariants must fire)"
@@ -414,25 +417,26 @@ def test_control_e_invariant_5_endpoint_filter_reaches_guarded_branch(monkeypatc
     """The invariant-5 reachability control (reviewer-fairy, PR #2326 round
     1 suggestion). ``_invariant_5``'s ``is_current`` endpoint join is
     commented "dormant, not dead" but, as shipped, ``cascade_ndc`` derives
-    to the empty set (every CASCADE_RELATIONS member also has
-    ``dag_check: True`` in EDGE_CLASSIFICATIONS today), so the
-    ``if not cascade_ndc`` guard short-circuits before the join's query
-    ever runs — the filter is asserted, not demonstrated.
+    to the empty set (every CASCADE_RELATIONS member also has ``dag: True``
+    in EDGE_CLASSIFICATIONS today — #2357 renamed the old ``dag_check`` to
+    ``temporal_causal`` and this invariant now follows the new ``dag`` flag),
+    so the ``if not cascade_ndc`` guard short-circuits before the join's
+    query ever runs — the filter is asserted, not demonstrated.
 
     This test reaches the guarded branch without touching the shipped
-    constants permanently: it flips the ONE cascade relation's own
-    ``dag_check`` entry to False via ``monkeypatch.setitem`` on the nested
+    constants permanently: it flips one cascade relation's own ``dag``
+    entry to False via ``monkeypatch.setitem`` on the nested
     ``EDGE_CLASSIFICATIONS[<relation>]`` dict (auto-restored at teardown —
     the shipped module-level dict is never left mutated for other tests).
     ``core.CASCADE_RELATIONS`` itself is a frozenset built once at import
     time from the *original* ``cascade`` flags, so it is untouched by this
-    patch; only ``dag_check`` — which ``_derive_cascade`` re-reads from
+    patch; only ``dag`` — which ``_derive_cascade`` re-reads from
     ``EDGE_CLASSIFICATIONS`` at CALL time, not import time — moves, which is
-    exactly the lever ``cascade_ndc = cascade & non_dag_check`` needs to
-    become non-empty.
+    exactly the lever ``cascade_ndc = cascade & non_dag`` needs to become
+    non-empty.
 
     With the branch reached, this builds two edges on the (now-marked)
-    non-dag_check cascade relation — one with both endpoints current, one
+    non-dag-safe cascade relation — one with both endpoints current, one
     with a superseded (``is_current = 0``) endpoint — and asserts invariant
     5 flags ONLY the both-current edge, proving the endpoint join + filter
     behave like invariants 1/3 when they actually run.
@@ -444,14 +448,14 @@ def test_control_e_invariant_5_endpoint_filter_reaches_guarded_branch(monkeypatc
     edge); restoring the clause made it pass again, with the rest of the
     suite green throughout.
     """
-    monkeypatch.setitem(core.EDGE_CLASSIFICATIONS[_CASCADE_RELATION], "dag_check", False)
+    monkeypatch.setitem(core.EDGE_CLASSIFICATIONS[_CASCADE_RELATION], "dag", False)
 
     # Sanity: the patch really does make cascade_ndc non-empty, else this
     # test would silently fall back to exercising the short-circuit guard
     # it claims to bypass.
     cascade, cascade_ndc = conformance._derive_cascade()
     assert cascade_ndc == {_CASCADE_RELATION}, (
-        "monkeypatching EDGE_CLASSIFICATIONS[relation]['dag_check'] did not "
+        "monkeypatching EDGE_CLASSIFICATIONS[relation]['dag'] did not "
         "make cascade_ndc non-empty — this test is not reaching the "
         "guarded branch it exists to cover"
     )
@@ -475,7 +479,7 @@ def test_control_e_invariant_5_endpoint_filter_reaches_guarded_branch(monkeypatc
     conn.commit()
 
     out = conformance.check_partition_conformance(conn)
-    inv5 = out["invariant_5_cascade_not_dag_check"]
+    inv5 = out["invariant_5_cascade_not_dag_safe"]
     assert inv5["entity_kind"] == "edge"
     assert inv5["count"] == 1, (
         f"invariant 5 flagged {inv5['count']} edges once cascade_ndc was "

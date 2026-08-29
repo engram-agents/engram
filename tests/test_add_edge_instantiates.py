@@ -24,7 +24,7 @@ Coverage:
   6.  Idempotency — second identical add returns no_op_already_exists.
   7.  DAG-exemption — source OLDER than target succeeds (a goal articulated
       AFTER the work that realizes it is the gl-0008-shaped first customer).
-      Mutation note: if instantiates had dag_check=True, this test would fail
+      Mutation note: if instantiates had temporal_causal=True, this test would fail
       with the DAG-time invariant error — the exemption is deliberate.
   8.  Removability — engram_remove_edge removes an instantiates edge
       (EDGE_CLASSIFICATIONS removable=True drives the remove whitelist).
@@ -254,7 +254,7 @@ def test_instantiates_dag_exempt_source_older_than_target():
     """A goal articulated AFTER the work that realizes it is wirable — the
     gl-0008-shaped first customer.
 
-    Mutation note: if instantiates had dag_check=True in EDGE_CLASSIFICATIONS,
+    Mutation note: if instantiates had temporal_causal=True in EDGE_CLASSIFICATIONS,
     this add would fail with the DAG-time invariant error — the exemption is a
     deliberate design property (realization is not a temporal dependency), and
     this test pins it.

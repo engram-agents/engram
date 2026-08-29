@@ -51,6 +51,9 @@ _TYPE_ALIASES: dict[str, str] = {
 # recall_summary in the recall view.
 _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
     "derives_from",
+    "acknowledged_derives_from",  # #2357: cascade-frontier acknowledgement
+                     # edge — same dependency tier and provenance weight as
+                     # derives_from, classified alongside it.
     "supported_by",
     "predicted_by",  # #2252 W6: prediction pairing edge, split out of
                      # supported_by — same dependency tier, same

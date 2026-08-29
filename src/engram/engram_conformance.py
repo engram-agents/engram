@@ -91,13 +91,20 @@ def _derive_cb_ncb(conn: sqlite3.Connection) -> "tuple[set, set]":
 def _derive_cascade() -> "tuple[frozenset, frozenset]":
     """(cascade, cascade_ndc). ``cascade`` is core.CASCADE_RELATIONS itself
     (already derived from EDGE_CLASSIFICATIONS at import time in
-    engram_core.py). ``cascade_ndc`` is the subset of cascade relations
-    whose EDGE_CLASSIFICATIONS entry does NOT require dag_check — recomputed
-    here from EDGE_CLASSIFICATIONS at call time (not cached), so a future
-    edit to that declaration is picked up with no edit to this module."""
+    engram_core.py). ``cascade_ndc`` is the subset of cascade relations whose
+    EDGE_CLASSIFICATIONS entry does NOT carry ``dag`` (real edge-walk
+    acyclicity, #2357) — recomputed here from EDGE_CLASSIFICATIONS at call
+    time (not cached), so a future edit to that declaration is picked up with
+    no edit to this module.
+
+    #2357 note: this checks ``dag``, not the (renamed) ``temporal_causal``
+    flag. A cascade relation deliberately backwards in creation time (e.g.
+    ``acknowledged_derives_from``) is exactly the case this module exists to
+    NOT flag, as long as it's still dag-safe — that's the whole point of
+    splitting the two properties apart."""
     cascade = core.CASCADE_RELATIONS
-    non_dag_check = {r for r, c in core.EDGE_CLASSIFICATIONS.items() if not c["dag_check"]}
-    return cascade, cascade & non_dag_check
+    non_dag = {r for r, c in core.EDGE_CLASSIFICATIONS.items() if not c["dag"]}
+    return cascade, cascade & non_dag
 
 
 def _report(entity_kind: str, ids) -> "tuple[dict, set]":
@@ -252,10 +259,12 @@ def _invariant_4(conn: sqlite3.Connection) -> "tuple[dict, set]":
 
 
 def _invariant_5(conn: sqlite3.Connection, cascade_ndc: frozenset) -> "tuple[dict, set]":
-    """5 — cascade-causing edge that is not dag_check.
+    """5 — cascade-causing edge that is not dag-safe (#2357: checks ``dag``,
+    real edge-walk acyclicity — not the renamed ``temporal_causal`` creation-
+    order flag; see ``_derive_cascade``'s docstring for why the two diverge).
 
     Derives to the empty set today by construction (every relation in
-    CASCADE_RELATIONS also has dag_check:True in EDGE_CLASSIFICATIONS) — do
+    CASCADE_RELATIONS also has dag:True in EDGE_CLASSIFICATIONS) — do
     NOT special-case; the empty result falling out of the derivation is the
     evidence that the derivation works (#2300).
 
@@ -287,7 +296,7 @@ def check_partition_conformance(conn: sqlite3.Connection) -> dict:
 
     Runs all five #2300 invariants against `conn` and returns a dict:
 
-      - ``invariant_1_cascade_edge_ncb_endpoint`` .. ``invariant_5_cascade_not_dag_check``:
+      - ``invariant_1_cascade_edge_ncb_endpoint`` .. ``invariant_5_cascade_not_dag_safe``:
         each ``{"entity_kind": "edge"|"node", "count": int, "sample_ids": [...]}``.
         `count` is always the full affected-entity count (never a capped
         sample count, never a GROUP BY row count — #2300's row-vs-node trap).
@@ -317,7 +326,7 @@ def check_partition_conformance(conn: sqlite3.Connection) -> dict:
         "invariant_2_ncb_node_with_confidence": inv2,
         "invariant_3_cb_node_ncb_premise": inv3,
         "invariant_4_unpaired_prediction": inv4,
-        "invariant_5_cascade_not_dag_check": inv5,
+        "invariant_5_cascade_not_dag_safe": inv5,
         "distinct_total": distinct_total,
         "flare": flare,
     }

@@ -46,7 +46,8 @@ Coverage:
      tests 1b/2b matter: a constant mis-wired to the wrong upstream set would
      pass every other test here and only break silently once Stage 1.3
      diverges the two sets.
-  4. cascade ⇒ dag_check still holds (re-confirmed here; the authoritative
+  4. cascade ⇒ dag still holds (#2357 renamed dag_check -> temporal_causal;
+     this invariant now follows `dag`, re-confirmed here; the authoritative
      test is test_cascade_dag_check_audit.py).
   6. (#2298, 2026-08-28) _trace_observation_leaves's premise-spine walk now
      DERIVES from CASCADE_RELATIONS via the shared _walk_cascade_upstream
@@ -100,29 +101,35 @@ atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
 def test_cascade_relations_equals_the_stage_1_0a_set():
-    """CASCADE_RELATIONS == {derives_from} — the set #2252 Stage 1.3
-    produces (Stage 1.0a narrowed the declaration to {derives_from,
-    supported_by}; Stage 1.3 narrowed it again by removing cascade from
-    `supported_by`, which post-1.3 is NCB accumulation with no claim to
-    re-adjudicate). See tests/test_cascade_dag_check_audit.py's
+    """CASCADE_RELATIONS == {derives_from, acknowledged_derives_from} — the
+    set #2357 produces (Stage 1.0a narrowed the declaration to
+    {derives_from, supported_by}; Stage 1.3 narrowed it again by removing
+    cascade from `supported_by`, which post-1.3 is NCB accumulation with no
+    claim to re-adjudicate; #2357 widened it back to two by adding
+    `acknowledged_derives_from`, which must cascade — that's the entire
+    reason it exists). See tests/test_cascade_dag_check_audit.py's
     _EXPECTED_CASCADE_RELATIONS for the change-detector on the declaration
     itself; this test asserts the DERIVED constant tracks it."""
-    assert CASCADE_RELATIONS == frozenset({"derives_from"})
+    assert CASCADE_RELATIONS == frozenset({"derives_from", "acknowledged_derives_from"})
 
 
 def test_provenance_relations_equals_the_stage_1_0a_set():
-    """PROVENANCE_RELATIONS == {cites, derives_from, supported_by, predicted_by}
-    — matches what engram_core.py's _trace_evidence_roots (the provenance
-    walk) actually traces.
+    """PROVENANCE_RELATIONS == {cites, derives_from, supported_by,
+    predicted_by, acknowledged_derives_from} — matches what
+    engram_core.py's _trace_evidence_roots (the provenance walk) actually
+    traces.
 
     #2252 W6 added `predicted_by`, provenance:True, matching the
     `supported_by` pairing edge it was split out of — a trace starting from a
     prediction node must still walk through to the paired observation's own
     evidence roots, exactly as it did when the pairing edge was still named
-    `supported_by`.
+    `supported_by`. #2357 (2026-08-29) added `acknowledged_derives_from`,
+    provenance:True — an acknowledgement is a provenance-chain edge, mirroring
+    `derives_from`.
     """
     assert PROVENANCE_RELATIONS == frozenset(
-        {"cites", "derives_from", "supported_by", "predicted_by"}
+        {"cites", "derives_from", "supported_by", "predicted_by",
+         "acknowledged_derives_from"}
     )
 
 
@@ -321,24 +328,29 @@ def test_citation_support_relations_not_derived_from_cascade():
 
 
 def test_cascade_implies_dag_check_still_holds():
-    """cascade ⇒ dag_check still holds after Stage 1.0a's correction.
+    """cascade ⇒ dag still holds after Stage 1.0a's correction.
 
-    The authoritative test is test_cascade_dag_check_audit.py's
-    test_cascade_implies_dag_check; this is a light re-confirmation scoped
-    to the two relations Stage 1.0a actually touched, so a regression here
-    is attributable to this stage without needing to cross-reference the
-    other file.
+    #2357 renamed dag_check -> temporal_causal and added the new `dag` (real
+    acyclicity) flag; the cascade⇒X invariant follows `dag`, not
+    `temporal_causal` — a cascade relation deliberately backwards in time
+    (acknowledged_derives_from) is exactly the case that must still be
+    dag-safe without being temporal_causal. The authoritative test is
+    test_cascade_dag_check_audit.py's test_cascade_implies_dag_check; this is
+    a light re-confirmation scoped to the two relations Stage 1.0a actually
+    touched, so a regression here is attributable to this stage without
+    needing to cross-reference the other file.
     """
     for relation in CASCADE_RELATIONS:
-        assert EDGE_CLASSIFICATIONS[relation]["dag_check"], (
-            f"{relation} carries cascade=True but dag_check=False"
+        assert EDGE_CLASSIFICATIONS[relation]["dag"], (
+            f"{relation} carries cascade=True but dag=False"
         )
     # The two relations this stage specifically corrected must both still
-    # carry dag_check=True even though cascade dropped to False — dag_check
-    # is a separate, unrelated design dimension (retracts/supersedes are
-    # legitimately acyclic edges regardless of whether they cascade).
-    assert EDGE_CLASSIFICATIONS["retracts"]["dag_check"] is True
-    assert EDGE_CLASSIFICATIONS["supersedes"]["dag_check"] is True
+    # carry dag=True even though cascade dropped to False — dag (like the
+    # temporal_causal it was split from) is a separate, unrelated design
+    # dimension (retracts/supersedes are legitimately acyclic edges
+    # regardless of whether they cascade).
+    assert EDGE_CLASSIFICATIONS["retracts"]["dag"] is True
+    assert EDGE_CLASSIFICATIONS["supersedes"]["dag"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -111,8 +111,14 @@ def _get_entries(result, key):
 
 def test_predicted_by_declared_with_cascade_false_and_dag_check_true():
     """predicted_by is in VALID_RELATIONS and EDGE_CLASSIFICATIONS, cascade
-    False, dag_check True — read directly from the declaration, never a
-    hardcoded member-list."""
+    False, temporal_causal/dag both True — read directly from the
+    declaration, never a hardcoded member-list.
+
+    #2357 renamed dag_check -> temporal_causal + added the new dag flag;
+    predicted_by's value is unchanged and identical on both (no relation
+    existing before #2357 needed re-judging — see EDGE_CLASSIFICATIONS'
+    header comment), so this test checks both fields.
+    """
     import engram_core as core
 
     assert "predicted_by" in core.VALID_RELATIONS, (
@@ -126,9 +132,13 @@ def test_predicted_by_declared_with_cascade_false_and_dag_check_true():
         f"predicted_by cascade must be False (Q1 FINAL — predictions are "
         f"non-claim-bearing; settled, not a judgement call), got: {classification}"
     )
-    assert classification["dag_check"] is True, (
-        f"predicted_by dag_check must be True (same provenance-chain shape "
-        f"as supported_by, which it is split out of), got: {classification}"
+    assert classification["temporal_causal"] is True, (
+        f"predicted_by temporal_causal must be True (same provenance-chain "
+        f"shape as supported_by, which it is split out of), got: {classification}"
+    )
+    assert classification["dag"] is True, (
+        f"predicted_by dag must be True (real acyclicity matters for a "
+        f"dependency-tier provenance edge), got: {classification}"
     )
     assert classification["addable_after_creation"] is False, (
         "predicted_by must not be hand-addable — minted once at node-add "

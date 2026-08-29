@@ -171,9 +171,18 @@ This is the actual shipped declaration — read from source, not reconstructed f
 thread's earlier drafts, several of which (see below) turned out to be wrong about specific
 flag values.
 
-| relation | cascade | provenance | dag_check | removable | notes |
+**Column note (#2357, 2026-08-29):** `dag_check` was renamed `temporal_causal`
+(pure rename, same values below — every relation's creation-order check is
+unchanged) and split from a new, independent `dag` (real edge-walk
+acyclicity) flag, not shown in this table (this doc covers the CB/NCB
+partition, not DAG/acyclicity design — see `engram_dag_conformance.py` and
+issue #2357 for that property). For every relation below except
+`acknowledged_derives_from`, `dag` equals `temporal_causal`.
+
+| relation | cascade | provenance | temporal_causal | removable | notes |
 |---|---|---|---|---|---|
 | `derives_from` | **True** | **True** | True | False | CB cascade relation — taint/stale propagation |
+| `acknowledged_derives_from` | **True** | **True** | **False** | False | #2357/#2013 cascade-frontier acknowledgement edge — deliberately backwards in creation time; `dag=True` protects it instead |
 | `supported_by` | **False** | **True** | True | False | NCB accumulation (cornerstone-sourced vote edges) — see history below |
 | `predicted_by` | **False** | **True** | True | False | prediction-pairing edge, split out of `supported_by` (#2252 W6) — see "the pairing invariant" below |
 | `cites` | False | True | True | False | provenance-only; overloaded with ~5 meanings (#2243/#4, separate workstream) |
@@ -388,7 +397,7 @@ doc.)
 The pairing edge is `(prediction_id, observation_id, 'predicted_by')` — split out of
 `supported_by` (which cornerstones still use, unrelated semantic, no longer sharing the
 literal string with this pairing). `EDGE_CLASSIFICATIONS['predicted_by']` carries
-`cascade=False` (settled per Q1 above — NCB nodes don't cascade), `dag_check=True`,
+`cascade=False` (settled per Q1 above — NCB nodes don't cascade), `temporal_causal=True`,
 `provenance=True`, matching `supported_by`'s own non-cascade fields; not hand-addable
 (`addable_after_creation=False`) — minted once at node-add time only. Landed in #2252 W6.
 
