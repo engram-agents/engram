@@ -646,7 +646,14 @@ def _retract_impl(*args, **kwargs):
 # in-server forwarder, same shape as the wave-6 forwarders above.
 def _cascade_frontier_impl(*args, **kwargs):
     return _revision_mod._cascade_frontier_impl(*args, **kwargs)
-# ---- end engram_cascade_frontier forwarder -----------------------------
+
+
+# engram_cascade_resolve (engram-alpha#2013 slice 4 — the adjudication verb).
+# Same placement rationale: the write half lives next to the marker helpers
+# and the frontier read it composes with.
+def _cascade_resolve_impl(*args, **kwargs):
+    return _revision_mod._cascade_resolve_impl(*args, **kwargs)
+# ---- end engram_cascade_frontier/resolve forwarders --------------------
 
 # ---- #872 wave-7 compat forwarders -----------------------------------
 # Impls + helpers moved to engram_stats.py (family H).
@@ -2585,6 +2592,178 @@ def engram_cascade_frontier(payload_json: str) -> str:
                      f"Allowed: {sorted(_CASCADE_FRONTIER_FIELDS)}"
         })
     return _cascade_frontier_impl(**params)
+
+
+# DESIGN INTENT — engram_cascade_resolve
+# -------------------------------------
+# engram-alpha#2013 slice 4 (the adjudication verb). The WRITE half of the
+# cascade machine, and the counterpart to engram_cascade_frontier's read.
+#
+# PURE-WIRE: this tool NEVER creates a node. A 'superseded' resolution names
+# an already-existing replacement, created beforehand via its own canonical
+# tool — the same contract engram_supersede has, and for the same reason
+# (bundling creation into the wiring risks orphans on a mid-way failure).
+#
+# PER-NODE, not per-marker: there is deliberately no cascade_event parameter.
+# One judgement stamps the same resolution_kind on ALL of the node's pending
+# markers. That is safe rather than an over-resolve because the frontier
+# packet the agent adjudicates from lists EVERY pending event on the node —
+# the single judgement is made with all the deltas in view.
+#
+# WHAT THE MACHINE DECIDES vs WHAT THE AGENT DECIDES (§4). The machine
+# enforces eligibility, recomputes confidence and orders the work. It never
+# picks a resolution shape, with exactly one exception — the trivial
+# auto-resolution, where every affected premise resolved as 'acknowledged'
+# so nothing actually moved. That exception is decided by PROOF, not
+# judgement, which is why it is the only one.
+#
+# TWO PROPAGATIONS, OPPOSITE RULES — the single most likely thing for a later
+# edit to get backwards. The DERIVATION cascade does NOT re-fire on
+# resolution: everything downstream already carries the original event's
+# markers and invariant 4 forbids a new descendant appearing while the node
+# was pending, so a second event would mark a provably-covered set.
+# Confidence DOES re-propagate, and transitively, because a child was
+# computed from the parent's OLD value.
+#
+# THE CONTRADICTION CASCADE IS A THIRD CASE AND FOLLOWS NEITHER RULE. It is
+# NOT covered by the proof above: contradictions are non-claim-bearing, so
+# the derivation walk never reaches one — they are marked only by a query
+# against the OPERATED node's own contradicts edges, which means a
+# contradiction on a mid-chain node was never marked by the root's cascade
+# either. So a resolution DOES mint a dedicated contradiction-only cascade
+# event when the node carries contradictions (response field
+# `contradiction_cascade_event`). That event marks ONLY contradiction nodes;
+# no claim-bearing node's adjudication count changes, which is what
+# invariant 7 and §6 actually protect. Bounded at two markers per
+# contradiction — a contradicts set has two sides, and retract/supersede
+# makes a side non-current.
+#
+# cascade_triggering is NOT in the field allowlist below and must never be:
+# it is the internal seam by which this verb reaches the shared retract /
+# supersede cores without opening a new event, and an agent that could pass
+# it could silently disarm the cascade on an ordinary revision.
+_CASCADE_RESOLVE_FIELDS = frozenset({
+    "node_id", "resolution_kind", "replacement_id", "note", "error_type",
+})
+
+
+@mcp.tool(
+    name="engram_cascade_resolve",
+    capability=(
+        "Record your adjudication of ONE cascade-marked node that is on the "
+        "frontier: retract it, supersede it with an already-created "
+        "replacement, or acknowledge that the upstream change does not touch "
+        "its claim. Stamps the decision on ALL that node's pending markers, "
+        "recomputes confidence transitively, and auto-resolves any dependent "
+        "the decision renders trivial. Never creates a node."
+    ),
+    annotations={
+        "title": "Resolve Cascade Marker",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_resolve(payload_json: str) -> str:
+    """Adjudicate one frontier node of the cascade machine.
+
+    Pair this with engram_cascade_frontier: that tool tells you WHICH nodes
+    are ready to adjudicate and gives you the packet to adjudicate from; this
+    one records what you decided. A node not on the frontier is refused, with
+    the blocking ancestors named — its eligible shapes are a function of how
+    ALL its premises resolve, so they are not knowable until they have.
+
+    THE THREE SHAPES (#2013 §4):
+      retracted    — the argument is broken.
+      superseded   — the claim survives on the remaining premises, and you
+                     have ALREADY created the replacement node.
+      acknowledged — the upstream delta provably does not touch this claim.
+
+    'acknowledged' is available IFF no affected direct premise resolved as
+    retracted. Supersede and acknowledge both permit it; only retract forbids
+    it, because only retract removes a LEG from the argument — a superseded
+    premise still supports the claim, differently. The predicate gates the
+    AVAILABILITY of the option, never your choice: you still judge whether a
+    superseded premise's delta touches your claim.
+
+    Confidence is ALWAYS recomputed, however the marker resolves, and never
+    typed by you. Acknowledging that a CLAIM is unchanged is a separate
+    matter from the CONFIDENCE of that claim — measured on this graph, 57.3%
+    of supersede pairs carry a different confidence, so the recompute is the
+    majority case, not an edge case.
+
+    An 'acknowledged' resolution also records a derives_from edge to each
+    superseding premise. That is not bookkeeping: an acknowledgement outlives
+    the repair window, so without the edge nothing would re-read this node if
+    the replacement is itself superseded later.
+
+    THE DERIVATION CASCADE DOES NOT RE-FIRE. No claim-bearing node is marked
+    by this resolution, whatever shape you choose, so nothing downstream
+    acquires a second marker to adjudicate. If you want a fresh derivation
+    cascade you are not resolving — you are making a new revision, and
+    engram_retract / engram_supersede are the tools for that.
+
+    ONE EXCEPTION, and a mode-B sweep must account for it: if the node
+    carries CONTRADICTIONS, this call mints a dedicated contradiction-only
+    cascade event and marks them (see `contradiction_cascade_event` and
+    `marked_contradictions`). Contradictions are non-claim-bearing, so the
+    derivation walk never reaches them and the covered-set proof above does
+    not apply — without this they would never be reviewed at all. **So the
+    frontier CAN grow underneath you across a resolution.** A frontier ->
+    resolve loop must re-read the frontier after each resolution rather than
+    assuming one pass drains it.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, REQUIRED): the frontier node you are adjudicating.
+            resolution_kind (str, REQUIRED): one of "retracted",
+                "superseded", "acknowledged".
+            replacement_id (str): REQUIRED iff resolution_kind is
+                "superseded"; refused otherwise. Must already exist — this
+                tool never creates it.
+            note (str, optional): your reasoning, recorded with the
+                resolution.
+            error_type (str, optional): only read when resolution_kind is
+                "retracted"; passed through to the shared retract core.
+                Defaults to "other". One of: fabricated_quote,
+                wrong_citation, wrong_evidence, hallucinated_claim,
+                duplicate, other.
+
+    Returns:
+        JSON with: node_id, resolution_kind, resolved_events (every
+        cascade_event this one judgement closed) + resolved_marker_count,
+        affected_premises (which of your direct premises moved, per event,
+        and how — including the cascade ROOT, which carries no marker of its
+        own), eligible_shapes, confidence_recompute ({nodes_considered,
+        changed, skipped, passes} — plus convergence_warning if the
+        recompute could not settle, which should be unreachable and most
+        likely means a CASCADE_RELATIONS cycle), auto_resolved_trivial,
+        acknowledgement_edges_deferred, acknowledgement_edge_note, note
+        (a human-readable summary, always present, null when empty),
+        marked_contradictions (contradiction nodes
+        this resolution marked for review), contradiction_cascade_event (the
+        dedicated event id they were marked under, or null when the node has
+        no contradictions), re_cascade (an explanation of what did and
+        did not propagate), and — only when resolution_kind is `superseded`
+        or `retracted` — delegated_to + delegated_result, naming the verb
+        this resolution handed off to and what it returned.
+        On refusal, {"error": "..."} — with blocking_ancestors + next_call
+        when the node is not on the frontier, or eligible +
+        acknowledge_blocked_by when the shape is not available.
+
+    See _cascade_resolve_impl (engram_revision.py) for full semantics.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_RESOLVE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_RESOLVE_FIELDS)}"
+        })
+    return _cascade_resolve_impl(**params)
 
 
 # ---- Version control tools ----

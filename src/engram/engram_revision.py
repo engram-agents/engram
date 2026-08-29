@@ -135,6 +135,49 @@ def _write_cascade_marker(conn, node_id: str, cascade_event: str,
     )
 
 
+def _affected_contradiction_ids(conn, node_id: str) -> list:
+    """Contradiction nodes that have node_id as one of their contradicting
+    sides (issue #229's parallel cascade).
+
+    WHY THIS IS A SEPARATE WALK AND NOT PART OF THE DERIVATION CASCADE:
+    contradictions are NON-claim-bearing, so _walk_cascade_downstream stops
+    before ever reaching one (#2252 W0). They are only ever marked by this
+    query, run against the edges of the node being operated on — which is
+    what makes the covered-set proof in §6 NOT extend to them. That proof is
+    about the derivation walk: everything downstream of a node already
+    carries the root event's markers. A contradiction attached to a
+    MID-CHAIN node was never marked by the root's cascade, because the root
+    ran this query against its OWN edges, not the mid-chain node's.
+
+    Extracted into one named helper because the same query was hand-copied
+    into _supersede_impl and _retract_impl, and the resolution path now
+    needs a third caller — three copies of a walk whose subtlety is exactly
+    that it does not follow the rule the other walk follows.
+    """
+    rows = conn.execute(
+        "SELECT source_id, target_id FROM edges "
+        "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
+        (node_id, node_id),
+    ).fetchall()
+    out = set()
+    for ce in rows:
+        ct_id = ce["source_id"] if ce["source_id"].startswith("ct_") else ce["target_id"]
+        if not ct_id.startswith("ct_"):
+            continue  # contradicts edges only attach contradictions to claim-bearers
+        if ct_id == node_id:
+            # SELF-MATCH. A contradiction node owns the contradicts edges, so
+            # calling this with a ct_ id returns that node itself — which is
+            # not "a contradiction that has node_id as a side", and directly
+            # contradicts this function's own docstring. Harmless at today's
+            # three call sites only because each re-fetches with is_current=1
+            # and the ct is still current, i.e. it is defused by an unrelated
+            # guard rather than by anything here. Excluded explicitly so the
+            # helper means what it says on its own. (Round-2 reviewer.)
+            continue
+        out.add(ct_id)
+    return sorted(out)
+
+
 def _resolve_own_markers(conn, node_id: str, resolution_kind: str, now: str,
                           replacement_id: str = None) -> list:
     """Resolve every PENDING marker sitting on node_id, because node_id has
@@ -635,6 +678,766 @@ def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# engram_cascade_resolve (engram-alpha#2013 slice 4 — the adjudication verb)
+# ---------------------------------------------------------------------------
+# The WRITE half of the cascade machine. Slice 3's frontier answers "which
+# marked nodes are ready to adjudicate"; this answers "the agent has decided,
+# record it".
+#
+# Four properties the spec fixes, restated here because each one is a place a
+# later edit could plausibly go the other way:
+#
+#  1. PURE-WIRE — never creates a node (Lei's ruling, §10.2). A `superseded`
+#     resolution names an ALREADY-EXISTING replacement, created beforehand via
+#     its own canonical tool, exactly as engram_supersede requires. Bundling
+#     creation into the resolution risks orphans on a mid-way failure.
+#  2. PER-NODE, not per-marker (§10.2) — there is deliberately no
+#     `cascade_event` parameter. One judgement stamps the same
+#     resolution_kind on ALL of the node's pending markers. The per-event
+#     rows are retained for audit. What makes this safe rather than an
+#     over-resolve is that the frontier packet the agent adjudicates from
+#     shows EVERY pending event on the node (slice 3's `events` list), so the
+#     single judgement is made with all the deltas in view.
+#  3. THE AGENT DECIDES (§4). The machine propagates, orders, computes
+#     confidence and enforces eligibility. It never picks a resolution shape
+#     — with exactly one exception, the trivial auto-resolution below, which
+#     is decided by PROOF (no premise actually moved) rather than judgement.
+#  4. CONFIDENCE IS ALWAYS RECOMPUTED, however the marker resolves, and the
+#     recompute is TRANSITIVE (§4). Note the machine carries two propagations
+#     with OPPOSITE rules: markers do NOT re-cascade on resolution, confidence
+#     DOES.
+
+_CASCADE_RESOLUTION_KINDS = ("acknowledged", "retracted", "superseded")
+
+# root_op -> the resolution_kind that root op amounts to, for a cascade ROOT
+# that is also a direct premise of the node being adjudicated. The root never
+# carries a marker for its own event (the walker seeds it into `visited`), so
+# without this mapping the MODAL case — "the premise I derived from is the
+# thing that got retracted" — would read as no affected premises at all.
+# This is the 2026-08-26 amendment: the root counts as a premise resolving as
+# root_op.
+_CASCADE_ROOT_OP_AS_RESOLUTION = {"retract": "retracted", "supersede": "superseded"}
+
+
+def _cascade_affected_premises(conn, node_id: str) -> list:
+    """Which of node_id's DIRECT premises are affected by node_id's OWN
+    pending cascade events, and how each one resolved.
+
+    Returns a list of dicts, one per (premise, event) pair, each carrying
+    ``premise_id``, ``cascade_event``, ``via`` ("marker" or "root"),
+    ``resolution_kind`` (None while the premise is still pending) and
+    ``still_pending``. Deliberately NOT collapsed to one row per premise:
+    a premise can be affected by two of the node's events and resolve
+    differently under each, and invariant 8 says over-surface rather than
+    pick one.
+
+    "Direct premise" is core._direct_premise_ids — derives_from AND
+    supported_by. That is broader than CASCADE_RELATIONS (supported_by lost
+    its cascade flag in #2252 Stage 1.3, so a supported_by parent is never
+    itself marked BY the walk) and it is the right breadth here: this read
+    asks which of MY premises moved, not which edges conduct a cascade.
+    """
+    premises = set(core._direct_premise_ids(conn, node_id))
+    if not premises:
+        return []
+
+    out = []
+    for m in core._pending_markers_for_node(conn, node_id):
+        event = m["cascade_event"]
+        root_node = m["root_node"]
+
+        placeholders = ",".join("?" for _ in premises)
+        rows = conn.execute(
+            f"SELECT node_id, status, resolution_kind FROM cascade_markers "
+            f"WHERE cascade_event = ? AND node_id IN ({placeholders}) "
+            f"ORDER BY node_id",
+            (event, *sorted(premises)),
+        ).fetchall()
+        for r in rows:
+            out.append({
+                "premise_id": r["node_id"],
+                "cascade_event": event,
+                "via": "marker",
+                "resolution_kind": r["resolution_kind"],
+                "still_pending": r["status"] == "pending",
+            })
+
+        if root_node in premises:
+            out.append({
+                "premise_id": root_node,
+                "cascade_event": event,
+                "via": "root",
+                "resolution_kind": _CASCADE_ROOT_OP_AS_RESOLUTION.get(m["root_op"]),
+                "still_pending": False,
+            })
+
+    out.sort(key=lambda a: (a["cascade_event"], a["premise_id"], a["via"]))
+    return out
+
+
+def _cascade_eligible_shapes(conn, node_id: str, affected: list = None) -> dict:
+    """§11's ``eligible(node)`` — which resolution shapes this node may take.
+
+        {retract, supersede}                if any affected direct premise
+                                            resolved as 'retracted'
+        {retract, supersede, acknowledge}   otherwise
+
+    Acknowledge is the only shape that can be withdrawn, and only retract
+    withdraws it, because only retract removes a LEG from the argument: a
+    superseded premise still supports the claim (differently), a retracted
+    one never supported it at all. The predicate gates the AVAILABILITY of
+    the option, never the choice — the agent still judges whether a
+    superseded premise's delta touches the claim (§4).
+
+    Returns {"eligible": [...], "acknowledge_blocked_by": [...],
+    "affected_premises": [...]} — the blockers are named, not merely
+    counted, so a refusal tells the agent WHICH premise closed the option
+    (invariant 8: the agent must be able to re-derive the machine's verdict
+    from what it was shown).
+
+    Computed here and NEVER persisted; severity has no column (§1). Derived
+    fresh at each node's own resolution turn, which is the only time it is
+    knowable (§6).
+    """
+    if affected is None:
+        affected = _cascade_affected_premises(conn, node_id)
+    blockers = sorted({
+        a["premise_id"] for a in affected if a["resolution_kind"] == "retracted"
+    })
+    eligible = ["retracted", "superseded"]
+    if not blockers:
+        eligible.append("acknowledged")
+    return {
+        "eligible": eligible,
+        "acknowledge_blocked_by": blockers,
+        "affected_premises": affected,
+    }
+
+
+def _cascade_recompute_confidence_transitive(conn, node_id: str) -> dict:
+    """Recompute node_id's confidence and then every cascade-descendant's,
+    to a fixpoint (§4: "the recompute is itself a propagation, and it must
+    be transitive" — one hop is not enough, because a child was computed
+    from the OLD value).
+
+    WHY A FIXPOINT AND NOT ONE ORDERED PASS: correctness needs parents
+    recomputed before children, and the descendant walk
+    (_walk_cascade_downstream) is depth-first, which does not produce a
+    topological order on a diamond — a node reachable by both a short and a
+    long path can be visited before one of its own parents. Rather than
+    build a second ordering primitive, this repeats whole passes until a
+    pass changes nothing. Each pass advances the frontier of settled values
+    by at least one level of the DAG, so it converges in at most
+    depth(subgraph) + 1 passes; the bound below is len(order) + 1, which is
+    >= that for any DAG.
+
+    Non-convergence would mean a CYCLE in CASCADE_RELATIONS (the DAG
+    integrity scan is advisory, not blocking, so one can exist in a live
+    graph). That is reported, loudly and by name, rather than silently
+    truncated at the bound — a partial recompute reported as a complete one
+    is exactly the shape invariant 8 refuses.
+    """
+    order = []
+    seen = set()
+
+    def _collect(row):
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            order.append(row["id"])
+
+    # The subject node first, but ONLY while it is still current. An
+    # 'acknowledged' resolution leaves it current and its recompute is the
+    # whole point (§4). A 'retracted' or 'superseded' resolution has already
+    # set is_current=0 — a dead node's confidence is a historical record, and
+    # rewriting it would edit the audit trail rather than repair the graph.
+    # The descendant walk below is seeded from its dependents either way, so
+    # skipping it never truncates the propagation.
+    subject = conn.execute(
+        "SELECT is_current FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if subject and subject["is_current"] == 1:
+        seen.add(node_id)
+        order.append(node_id)
+
+    dependents = conn.execute(
+        "SELECT source_id FROM edges "
+        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+        (node_id, *_CASCADE_RELATIONS_SORTED),
+    ).fetchall()
+    visited = {node_id}
+    for d in dependents:
+        _walk_cascade_downstream(conn, d["source_id"],
+                                 visited=visited, on_live_node=_collect)
+
+    changes = []
+    skipped = []
+    passes = 0
+    max_passes = len(order) + 1
+    # `converged` is tracked EXPLICITLY rather than inferred from
+    # `passes >= max_passes`, because that inference is wrong on the modal
+    # path and wrong in the direction that publishes a false claim.
+    # Convergence means "a whole pass changed nothing"; hitting the bound
+    # means "we stopped counting". They coincide only by accident.
+    #
+    # Two measured false positives from the inferred version, both ordinary:
+    #   * a leaf resolved as retracted/superseded -> `order` is empty, so
+    #     max_passes == 1 and the single pass trips `1 >= 1`;
+    #   * a leaf acknowledged with a real confidence change -> one node,
+    #     max_passes == 2, pass 1 changes it, pass 2 confirms, `2 >= 2`.
+    # Both then told the agent the recompute was "PARTIAL, not final" and
+    # blamed a CASCADE_RELATIONS cycle that did not exist, while `changed`
+    # was in fact complete and correct. (Caught by the round-1 reviewer.)
+    converged = False
+    while passes < max_passes:
+        passes += 1
+        changed_this_pass = False
+        for nid in order:
+            d = core._recompute_node_confidence(conn, nid)
+            if d["disposition"] == "recomputed":
+                changed_this_pass = True
+                changes.append(d)
+            elif d["disposition"] == "skipped" and passes == 1:
+                skipped.append(d)
+        if not changed_this_pass:
+            converged = True
+            break
+
+    result = {
+        "nodes_considered": len(order),
+        "changed": [
+            {"node_id": c["node_id"], "old": c["old"], "new": c["new"]}
+            for c in changes
+        ],
+        "skipped": skipped,
+        "passes": passes,
+    }
+    if not converged:
+        result["convergence_warning"] = (
+            f"Confidence recompute did NOT converge within {max_passes} "
+            f"passes over {len(order)} node(s). The recorded 'changed' list "
+            f"is therefore PARTIAL, not final. This should be unreachable in "
+            f"a well-formed graph: the most likely cause is a CYCLE in "
+            f"CASCADE_RELATIONS (the time-ordered-DAG integrity scan is "
+            f"advisory, not blocking, so a cycle can exist in a live graph). "
+            f"Re-running this resolution's recompute is idempotent and safe "
+            f"once the cycle is broken."
+        )
+    return result
+
+
+def _cascade_acknowledgement_edges_deferred(conn, node_id: str,
+                                            affected: list) -> list:
+    """§4 requires that an acknowledgement record a `derives_from` edge to
+    the superseding node. THIS SLICE DOES NOT WRITE THAT EDGE, and the
+    reason is a genuine collision between §4 and a live invariant rather
+    than a difficulty in implementing it. Returns the pairs that WOULD be
+    written, so the caller can surface the deferral instead of hiding it.
+
+    WHY §4's REQUIREMENT IS NOT IMPLEMENTABLE AS STATED. The acknowledging
+    node X exists BEFORE the replacement P′ is created — that is the whole
+    situation an acknowledgement arises in. So `X --derives_from--> P′` is
+    always backwards in time, on a relation whose EDGE_CLASSIFICATIONS entry
+    carries `temporal_causal: True` (#2357 renamed this flag from dag_check;
+    the creation-order semantics are the renamed flag's, not the new `dag`
+    edge-walk flag's). Measured: every acknowledgement produces one
+    time-ordering violation, and the general edge tool
+    (`engram_cornerstone.py`'s add-edge guard) refuses exactly this shape.
+
+    AND IT CAN CLOSE A CYCLE, which is the worse half. Constructed through
+    public verbs only: `base → P`, `X` derives from `P`, `P′` derives from
+    `X` (legal — X is unmarked at that moment), supersede `P → P′`, then
+    acknowledge `X`. The ack edge closes `X → P′ → X`. Measured
+    consequences: the confidence recompute stops being idempotent
+    (0.641 → 0.567 → 0.503 → 0.446 across four identical runs, decaying
+    each time), and once both members carry markers the frontier reports
+    `frontier_count: 0` against a non-empty pending set — both nodes refuse
+    resolution permanently. Slice 3's invariant-1 anomaly field names the
+    cause correctly, but a loud failure does not undo the decayed stored
+    confidences.
+
+    So the requirement needs a design ruling — a DAG-exempt relation, an
+    explicit exemption, or a different mechanism entirely — and that is a
+    #2013 question, not something to settle inside a review round. Filed
+    separately; the hole it leaves is real and stated in the response:
+    an acknowledgement currently does NOT survive a later supersede of the
+    replacement, which is exactly the blindness §4 wrote the edge to close.
+    """
+    out = []
+    for a in affected:
+        if a["resolution_kind"] != "superseded":
+            continue
+        premise_id = a["premise_id"]
+        if a["via"] == "marker":
+            row = conn.execute(
+                "SELECT resolution_replacement_id FROM cascade_markers "
+                "WHERE node_id = ? AND cascade_event = ?",
+                (premise_id, a["cascade_event"]),
+            ).fetchone()
+            replacement = row["resolution_replacement_id"] if row else None
+        else:
+            # The cascade ROOT of a supersede event carries no marker of its
+            # own; its replacement is the nodes.superseded_by pointer.
+            row = conn.execute(
+                "SELECT superseded_by FROM nodes WHERE id = ?", (premise_id,)
+            ).fetchone()
+            replacement = row["superseded_by"] if row else None
+        if not replacement or replacement == node_id:
+            continue
+        out.append({"premise_id": premise_id, "replacement_id": replacement})
+    return out
+
+
+def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
+    """§4's trivial-resolution rule, applied downstream of a node that has
+    just resolved: a child auto-resolves as 'acknowledged' iff its derived
+    DEAD-premise set is thereby empty — i.e. every affected premise resolved
+    as 'acknowledged' (nothing actually moved) and none is still pending.
+
+    This is the ONLY shape the machine decides for itself, and it is decided
+    by PROOF rather than judgement: if no premise substantively changed,
+    there is no delta for an agent to weigh. §10.2: trivial resolutions
+    auto-resolve inside the machine and the agent never sees them on the
+    frontier — which needs no cooperation from the frontier read, because
+    they are already resolved by the time it next runs.
+
+    Recurses: an auto-resolution can make ITS children trivial in turn.
+
+    THE FRONTIER CHECK IS DEFENSIVE, AND I COULD NOT CONSTRUCT A LIVE CASE
+    FOR IT — stated plainly because an earlier version of this docstring
+    argued it was load-bearing, and that claim was more than the code can
+    demonstrate. (The round-1 reviewer caught it as a surviving mutation:
+    deleting the check breaks no test.)
+
+    Why it is hard to reach: for the check to matter, every affected direct
+    premise must have resolved 'acknowledged' while some further ancestor is
+    still pending. But 'acknowledged' is written by exactly two paths —
+    _cascade_resolve_impl and this function — and BOTH gate on the frontier
+    first. The plain retract/supersede verbs write only 'retracted' /
+    'superseded' via _resolve_own_markers, and either of those fails the
+    all-acknowledged test one line above regardless. So through current
+    write paths the two checks appear to coincide.
+
+    THE REASON I FIRST GAVE FOR KEEPING IT WAS ALSO WRONG — corrected here
+    from the round-2 reviewer, who could not falsify the unreachability
+    either but found the mechanism that actually establishes it. I had
+    appealed to #2324's BACKFILLED markers as a source of out-of-frontier
+    -order resolutions. They are not: the backfill writes status='pending'
+    unconditionally (engram_core.py's migration-5 block) and never writes a
+    resolution at all, so it cannot produce a resolved-out-of-order marker.
+
+    What actually closes the construction is the CITATION guard: engram_derive
+    refuses to cite a pending-marked premise, and `use_stale` is retired with
+    no effect — so a descendant cannot be created under a pending ancestor,
+    which is invariant 4 holding mechanically rather than by convention.
+
+    Kept anyway as one cheap query, on the general ground that invariant 6 is
+    a design rule no write path enforces and this is the last gate before an
+    automatic resolution the agent never sees. Asserting it is exercised is
+    what was wrong, twice; if a future reader can construct the case, pin it.
+    """
+    # Collect the candidate set ONCE (every cascade-descendant of node_id),
+    # then sweep it to a fixpoint. A single downward pass would be wrong for
+    # the same reason the confidence recompute needs a fixpoint: the walk is
+    # depth-first, so on a diamond a node can be examined and rejected as
+    # still-blocked BEFORE the sibling path that unblocks it has resolved.
+    # A rejected node is never re-examined by a queue-with-visited-set, and
+    # the failure is silent — the node simply never auto-resolves and shows
+    # up on the frontier for an agent to adjudicate by hand, which reads
+    # exactly like a node that was never trivial.
+    candidates = []
+    seen = {node_id}
+
+    def _collect(row):
+        if row["id"] not in seen:
+            seen.add(row["id"])
+            candidates.append(row["id"])
+
+    dependents = conn.execute(
+        "SELECT source_id FROM edges "
+        f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+        (node_id, *_CASCADE_RELATIONS_SORTED),
+    ).fetchall()
+    visited = {node_id}
+    for d in dependents:
+        _walk_cascade_downstream(conn, d["source_id"],
+                                 visited=visited, on_live_node=_collect)
+
+    auto = []
+    resolved_here = set()
+    while True:
+        pending_rows = conn.execute(
+            "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'"
+        ).fetchall()
+        pending_node_ids = {r["node_id"] for r in pending_rows}
+
+        progressed = False
+        for child in candidates:
+            if child in resolved_here:
+                continue
+            if not core._pending_markers_for_node(conn, child):
+                continue
+            if _cascade_blocked(conn, child, pending_node_ids):
+                continue
+
+            affected = _cascade_affected_premises(conn, child)
+            if not affected:
+                continue
+            if any(a["still_pending"] for a in affected):
+                continue
+            if any(a["resolution_kind"] != "acknowledged" for a in affected):
+                continue
+
+            _resolve_own_markers(conn, child, "acknowledged", now)
+            resolved_here.add(child)
+            progressed = True
+            auto.append({
+                "node_id": child,
+                "reason": "every affected direct premise resolved as "
+                          "'acknowledged' — the derived dead-premise set is "
+                          "empty, so no delta reaches this claim",
+            })
+        if not progressed:
+            break
+    return auto
+
+
+def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
+                          replacement_id: str = "", note: str = "",
+                          error_type: str = "other") -> str:
+    """Impl for engram_cascade_resolve — see the @mcp.tool wrapper's
+    docstring in server.py for the full contract.
+
+    Records the agent's adjudication of ONE frontier node: stamps
+    ``resolution_kind`` on ALL of that node's pending markers, recomputes
+    confidence transitively, and auto-resolves any child the decision
+    renders trivial. Never creates a node.
+
+    THE PHASE SPLIT, and its one honest limitation. Validation runs on its
+    own connection; the 'retracted' and 'superseded' shapes then delegate to
+    _retract_impl / _supersede_impl (each of which opens and commits its own
+    connection — they are the ONE shared core for those verbs, per §10.2,
+    reached here with cascade_triggering=False); the confidence recompute and
+    trivial auto-resolution then run on a third connection. So the whole
+    resolution is NOT one transaction. A failure between phases leaves the
+    markers resolved and the confidence recompute not yet applied.
+
+    That is a deliberate trade rather than an oversight, and it is bounded in
+    a specific way: the recompute is a PURE FUNCTION of graph state and is
+    idempotent, so the repair for a half-applied resolution is to run the
+    recompute again — nothing is lost and nothing is double-counted. The
+    alternative, inlining supersede's and retract's bodies to share one
+    transaction, would fork the two verbs' semantics, which §10.2 rules out
+    by name ("ONE shared retract core"). A divergent second retract
+    implementation is a worse failure than a recoverable stale number.
+    """
+    if not node_id or not str(node_id).strip():
+        return json.dumps({"error": "node_id is required and cannot be empty."})
+    node_id = str(node_id).strip()
+
+    if resolution_kind not in _CASCADE_RESOLUTION_KINDS:
+        return json.dumps({
+            "error": f"Invalid resolution_kind {resolution_kind!r}. Must be one "
+                     f"of: {', '.join(sorted(_CASCADE_RESOLUTION_KINDS))}.",
+        })
+
+    # replacement_id is required IFF superseded, and refused otherwise.
+    # Refusing rather than ignoring it is deliberate: a caller who passes a
+    # replacement alongside 'acknowledged' has a different model of what they
+    # are doing than the machine does, and silently dropping the argument
+    # would leave that disagreement undetected.
+    replacement_id = (replacement_id or "").strip()
+    if resolution_kind == "superseded" and not replacement_id:
+        return json.dumps({
+            "error": "replacement_id is required when resolution_kind is "
+                     "'superseded'. engram_cascade_resolve is PURE-WIRE — it "
+                     "never creates a node. Create the replacement first via "
+                     "its own canonical tool (engram_derive, "
+                     "engram_add_observation, ...), then name it here.",
+        })
+    if resolution_kind != "superseded" and replacement_id:
+        return json.dumps({
+            "error": f"replacement_id is only meaningful when resolution_kind "
+                     f"is 'superseded' (got {resolution_kind!r}).",
+        })
+
+    conn = core._get_db()
+    try:
+        node = conn.execute(
+            "SELECT id, type, is_current FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if not node:
+            return json.dumps({"error": f"Node '{node_id}' not found."})
+        if node["is_current"] != 1:
+            return json.dumps({
+                "error": f"Node '{node_id}' is not current (already superseded "
+                         f"or retracted) — there is nothing left to adjudicate.",
+            })
+
+        pending = core._pending_markers_for_node(conn, node_id)
+        if not pending:
+            return json.dumps({
+                "error": f"Node '{node_id}' carries no pending cascade markers "
+                         f"— nothing to resolve. (Markers never return from "
+                         f"'resolved' to 'pending'; invariant 6 has no reopen. "
+                         f"A resolution later believed wrong is corrected the "
+                         f"way every wrong claim is: supersede it, which fires "
+                         f"a new cascade event through the normal path.)",
+            })
+
+        # Invariant 6: a marker resolves ONLY while its node is on the
+        # frontier. Enforced here, at the write, rather than trusted — see
+        # _cascade_blocked's docstring for why "the design rule holds" is not
+        # the same as "the code enforces it".
+        pending_rows = conn.execute(
+            "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'"
+        ).fetchall()
+        pending_node_ids = {r["node_id"] for r in pending_rows}
+        if _cascade_blocked(conn, node_id, pending_node_ids):
+            blocking = sorted(
+                (_cascade_ancestors(conn, node_id) - {node_id}) & pending_node_ids
+            )
+            return json.dumps({
+                "error": f"Node '{node_id}' is NOT on the frontier — "
+                         f"{len(blocking)} of its cascade-ancestors still carry "
+                         f"pending markers, so its own eligible resolution "
+                         f"shapes are not yet knowable (they are a function of "
+                         f"how ALL its premises resolve). Resolve upstream "
+                         f"first.",
+                "blocking_ancestors": blocking,
+                "next_call": f"engram_cascade_frontier(node_id={node_id!r}) — "
+                             f"returns the minimal pending-ancestor slice that "
+                             f"unblocks this node.",
+            })
+
+        affected = _cascade_affected_premises(conn, node_id)
+        eligibility = _cascade_eligible_shapes(conn, node_id, affected)
+        if resolution_kind not in eligibility["eligible"]:
+            return json.dumps({
+                "error": f"'{resolution_kind}' is not an eligible resolution "
+                         f"shape for '{node_id}'. Acknowledge is available iff "
+                         f"NO affected direct premise resolved as retracted — "
+                         f"only retract removes a leg from the argument.",
+                "eligible": eligibility["eligible"],
+                "acknowledge_blocked_by": eligibility["acknowledge_blocked_by"],
+                "affected_premises": affected,
+            })
+
+        if resolution_kind == "superseded":
+            repl = conn.execute(
+                "SELECT id FROM nodes WHERE id = ?", (replacement_id,)
+            ).fetchone()
+            if not repl:
+                return json.dumps({
+                    "error": f"replacement_id '{replacement_id}' not found. "
+                             f"Create the replacement before resolving.",
+                })
+
+        node_type = node["type"]
+        resolved_events = [m["cascade_event"] for m in pending]
+    finally:
+        conn.close()
+
+    # ---- Phase 2: apply the resolution shape ----------------------------
+    delegated = None
+    if resolution_kind == "acknowledged":
+        conn = core._get_db()
+        try:
+            now = core._now()
+            ack_edges = _cascade_acknowledgement_edges_deferred(
+                conn, node_id, affected
+            )
+            _resolve_own_markers(conn, node_id, "acknowledged", now)
+            core._log_edit(conn, "cascade_acknowledged", node_id, node_type,
+                           {"cascade_events": resolved_events,
+                            "note": (note or "")[:200]})
+            conn.commit()
+        finally:
+            conn.close()
+    elif resolution_kind == "superseded":
+        ack_edges = []
+        # _supersede_impl resolves the node's own pending markers itself
+        # (_resolve_own_markers with kind 'superseded' + the replacement),
+        # which is exactly this resolution. cascade_triggering=False stops it
+        # opening a SECOND event over a provably-covered set.
+        delegated = json.loads(_supersede_impl(
+            old_node_id=node_id,
+            new_node_id=replacement_id,
+            supersede_reason=note or f"cascade resolution of {resolved_events}",
+            cascade_triggering=False,
+        ))
+        if "error" in delegated:
+            return json.dumps({
+                "error": f"supersede core refused this resolution: "
+                         f"{delegated['error']}",
+                "phase": "apply",
+                "markers_unchanged": True,
+            })
+    else:  # retracted
+        ack_edges = []
+        delegated = json.loads(_retract_impl(
+            node_id=node_id,
+            error_type=error_type or "other",
+            reason=note or f"cascade resolution of {resolved_events}",
+            cascade_triggering=False,
+        ))
+        if "error" in delegated:
+            return json.dumps({
+                "error": f"retract core refused this resolution: "
+                         f"{delegated['error']}",
+                "phase": "apply",
+                "markers_unchanged": True,
+            })
+
+    # ---- Phase 3: contradictions, confidence recompute, auto-resolution -
+    conn = core._get_db()
+    try:
+        now = core._now()
+
+        # CONTRADICTION CASCADE — runs on the resolution path too, and this
+        # is the one thing cascade_triggering must NOT sweep away.
+        #
+        # §6's covered-set proof licenses suppressing the DERIVATION walk:
+        # everything downstream already carries the root event's markers.
+        # It does NOT extend to contradictions, and the reason is structural
+        # rather than incidental: contradictions are non-claim-bearing, so
+        # _walk_cascade_downstream stops before reaching one. They are only
+        # ever marked by a query against the OPERATED node's own contradicts
+        # edges — so a contradiction attached to a MID-CHAIN node was never
+        # marked by the root's cascade, because the root ran that query
+        # against its own edges. Nothing covers it. Measured before fixing:
+        # with `ob -> d1` and a contradiction on `d1`, retracting `ob` left
+        # the contradiction unmarked, and resolving `d1` left it unmarked
+        # too — while an ordinary supersede of an unmarked `d1` marks it.
+        # A contradiction resolved through the cascade flow would simply
+        # never be reviewed. (Round-1 reviewer's blocker 2.)
+        #
+        # ON A DEDICATED CONTRADICTION-ONLY EVENT, not the node's pre-existing
+        # ones. The first version of this fix reused `resolved_events`, on the
+        # reasoning that invariant 7 forbids opening a new event. That was
+        # wrong, and wrong in the way this PR keeps being wrong: it reported
+        # success for a write that silently did not happen.
+        #
+        # MEASURED (round-2 reviewer, reproduced here): with `ob -> d1`,
+        # `ob -> d2` and a contradiction between d1 and d2, retract `ob`, then
+        # resolve d1 and then d2. Resolving d1 marks the ct under event E.
+        # Resolving d2 writes NOTHING — `UNIQUE(node_id, cascade_event)` plus
+        # `INSERT OR IGNORE` make the second write a silent no-op — while the
+        # response still listed the ct in `marked_contradictions`. A marker
+        # row records ONE (root_node, root_op) pair, so one event id simply
+        # cannot carry two different nodes' resolutions of the same
+        # contradiction. If the ct's marker had already been adjudicated, d2's
+        # revision would never have reached dream-fairy-2 at all; if d2 was
+        # retracted, the ct would keep d1's `root_op: supersede` and classify
+        # as stale rather than tainted.
+        #
+        # WHY A FRESH EVENT DOES NOT VIOLATE INVARIANT 7. What invariant 7
+        # and §6 protect is the DERIVATION graph: a second event there would
+        # mark a provably-covered set and force every downstream node to be
+        # adjudicated twice before reaching "fully resolved" (invariant 9).
+        # This event marks ONLY contradiction nodes — no claim-bearing node
+        # gets a marker from it, so none of that applies. The contradiction
+        # cascade was never covered by the covered-set proof in the first
+        # place (that is blocker 2's whole finding), so it has no claim on
+        # the no-new-event rule either.
+        marked_contradictions = []
+        contradiction_event = None
+        if resolution_kind in ("retracted", "superseded"):
+            _root_op = "retract" if resolution_kind == "retracted" else "supersede"
+            _cts = [
+                ct_id for ct_id in _affected_contradiction_ids(conn, node_id)
+                if conn.execute(
+                    "SELECT 1 FROM nodes WHERE id = ? AND is_current = 1", (ct_id,)
+                ).fetchone()
+            ]
+            if _cts:
+                contradiction_event = _new_cascade_event()
+                for ct_id in _cts:
+                    _write_cascade_marker(
+                        conn, ct_id, contradiction_event, node_id, _root_op, now
+                    )
+                    # Same audit trail the ordinary retract/supersede paths
+                    # write. Round-2 reviewer measured the divergence: the
+                    # resolution path left ct edit_history at ['created']
+                    # where the ordinary path leaves ['created',
+                    # 'stale_flagged'].
+                    core._log_edit(
+                        conn,
+                        "stale_flagged" if _root_op == "supersede" else "tainted",
+                        ct_id, "contradiction",
+                        {"cascade_via": "contradicts_edge",
+                         "via_resolution_of": node_id},
+                    )
+                    marked_contradictions.append(ct_id)
+
+        recompute = _cascade_recompute_confidence_transitive(conn, node_id)
+        auto_resolved = _cascade_auto_resolve_trivial(conn, node_id, now)
+        # An auto-resolution changes nothing about a claim (that is what makes
+        # it trivial) but the confidence algebra still has to follow the
+        # premise's own recomputed value — §4's recompute is unconditional,
+        # "however its marker resolves".
+        for a in auto_resolved:
+            sub = _cascade_recompute_confidence_transitive(conn, a["node_id"])
+            recompute["changed"].extend(sub["changed"])
+            if "convergence_warning" in sub:
+                recompute["convergence_warning"] = sub["convergence_warning"]
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = {
+        "node_id": node_id,
+        "resolution_kind": resolution_kind,
+        "resolved_events": resolved_events,
+        "resolved_marker_count": len(resolved_events),
+        "affected_premises": affected,
+        "eligible_shapes": eligibility["eligible"],
+        "confidence_recompute": recompute,
+        "auto_resolved_trivial": auto_resolved,
+        "marked_contradictions": marked_contradictions,
+        "contradiction_cascade_event": contradiction_event,
+        "acknowledgement_edges_deferred": ack_edges,
+        "acknowledgement_edge_note": (
+            "§4 requires an acknowledgement to record a derives_from edge to "
+            "each superseding premise. THIS SLICE DOES NOT WRITE IT. The "
+            "acknowledging node predates its replacement, so that edge is "
+            "always backwards in time on a temporal_causal relation, and it "
+            "can "
+            "close a cascade cycle that makes the confidence recompute "
+            "non-idempotent and strands both members off the frontier "
+            "permanently. Both measured. The requirement needs a design "
+            "ruling (a DAG-exempt relation, an explicit exemption, or a "
+            "different mechanism) — see the linked issue. THE HOLE IS REAL: "
+            "this acknowledgement will NOT be revisited if the replacement "
+            "is itself superseded later, which is the blindness §4 wrote "
+            "the edge to close."
+        ) if ack_edges else None,
+        "note": note or None,
+        "re_cascade": (
+            "SUPPRESSED by design for the DERIVATION cascade — no "
+            "claim-bearing node was marked by this resolution, and no "
+            "claim-bearing node's adjudication count changed. (A "
+            "contradiction-only event IS opened when this node has "
+            "contradictions — see contradiction_cascade_event and "
+            "marked_contradictions; it marks no claim-bearing node, so the "
+            "rule below does not reach it.) Everything downstream of this "
+            "node already carries the "
+            "original event's pending markers, and invariant 4 forbids a new "
+            "descendant appearing while the node was pending, so a second "
+            "event would mark a provably-covered set (#2013 §6, §10.2). "
+            "Confidence propagation is the OPPOSITE case and DID run "
+            "transitively — see confidence_recompute."
+        ),
+    }
+    if delegated is not None:
+        response["delegated_to"] = (
+            "_supersede_impl" if resolution_kind == "superseded"
+            else "_retract_impl"
+        )
+        response["delegated_result"] = delegated
+    return json.dumps(response)
+
+
+# ---------------------------------------------------------------------------
 # Shared cascade walker (PR-AA — cascade-walker SSoT refactor)
 # ---------------------------------------------------------------------------
 
@@ -1079,6 +1882,7 @@ def _supersede_impl(
     old_node_id: str = "",
     new_node_id: str = "",
     supersede_reason: str = "",
+    cascade_triggering: bool = True,
 ) -> str:
     """Internal implementation — see engram_supersede MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -1106,6 +1910,17 @@ def _supersede_impl(
 
     Atomic claims are unambiguous. Multi-claim nodes require explicit
     per-claim review before supersede.
+
+    cascade_triggering (INTERNAL — not reachable from the MCP surface; the
+    engram_supersede payload allowlist does not carry this field, and a test
+    pins that): True (default) opens a NEW cascade event and marks
+    everything downstream. False suppresses that, for the ONE caller that
+    needs it — _cascade_resolve_impl, where this supersede IS the
+    resolution of an existing cascade rather than a fresh revision. See the
+    comment at the guard itself for why re-cascading there marks a provably
+    covered set (#2013 §10.2 / §6 / invariant 7). Suppressing the cascade
+    does NOT suppress _resolve_own_markers: the node's own pending markers
+    still resolve, which is the whole point of the resolution path.
 
     Cascade behavior (parallel cascades for derivation and contradiction
     dependents; #2013/#2009 slice 1 — the cascade machine):
@@ -1385,75 +2200,78 @@ def _supersede_impl(
             conn, old_node_id, "superseded", now, replacement_id=new_node_id
         )
 
-        cascade_event = _new_cascade_event()
-        visited = {old_node_id}  # seed superseded node so walker won't process it
-        visited.add(new_node_id)  # also don't process the replacement
+        # #2013 §10.2 / §6 — "No re-cascade during resolution". When this
+        # call IS the resolution of an existing cascade (the
+        # engram_cascade_resolve path passes cascade_triggering=False), it
+        # must NOT open a NEW cascade event. Invariant 7 states this for the
+        # supersede side specifically: such a supersede is "a PARTIAL
+        # RESOLUTION of the existing event, never a new one". Everything
+        # downstream already carries the original event's pending markers,
+        # and invariant 4 (no node is cited as a premise while pending)
+        # means no new descendant can have appeared since. The categorical
+        # line is marked-vs-unmarked, NOT which verb was called — hence the
+        # default True, with only the resolution path passing False.
         stale = []
-
-        def _on_live_for_supersede(dep):
-            _write_cascade_marker(conn, dep["id"], cascade_event,
-                                   old_node_id, "supersede", now)
-            stale.append({
-                "id": dep["id"],
-                "type": dep["type"],
-                "claim": dep["claim"],
-                "stale_premise": old_node_id,
-                "replacement": new_node_id,
-            })
-
-        # Walk direct dependents of the superseded node.
-        direct = conn.execute(
-            "SELECT source_id FROM edges "
-            f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-            (old_node_id, *_CASCADE_RELATIONS_SORTED),
-        ).fetchall()
-        for d in direct:
-            _walk_cascade_downstream(conn, d["source_id"],
-                                     visited=visited,
-                                     on_live_node=_on_live_for_supersede)
-
-        # Cascade to contradiction nodes that have old as a contradicting side
-        # (issue #229): mark each affected contradiction with the SAME
-        # cascade_event so dream-fairy-2 reviews whether the supersede
-        # substantively resolved the conflict (case 1: wire engram_resolve
-        # from new_node to ct) or preserved it (case 2: new-contradict
-        # between new_node + other side, then supersede old contradiction →
-        # new contradiction). Per the supersede no-drop discipline (the
-        # supersede-no-drop discipline), case 3 (orthogonal supersede)
-        # cannot arise — the new node either kept or altered the conflicting
-        # claim; dropping is forbidden.
         stale_contradictions = []
-        contradiction_edges = conn.execute(
-            "SELECT source_id, target_id FROM edges "
-            "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
-            (old_node_id, old_node_id),
-        ).fetchall()
-        affected_ct_ids = set()
-        for ce in contradiction_edges:
-            ct_id = ce["source_id"] if ce["source_id"].startswith("ct_") else ce["target_id"]
-            if not ct_id.startswith("ct_"):
-                continue  # contradicts edges only attach contradictions to claim-bearers; skip otherwise
-            affected_ct_ids.add(ct_id)
-        for ct_id in affected_ct_ids:
-            ct = conn.execute(
-                "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
-                (ct_id,),
-            ).fetchone()
-            if not ct:
-                continue
-            _write_cascade_marker(conn, ct_id, cascade_event,
-                                   old_node_id, "supersede", now)
-            stale_contradictions.append({
-                "id": ct_id,
-                "type": "contradiction",
-                "claim": ct["claim"],
-                "status": ct["status"],
-                "stale_premise": old_node_id,
-                "replacement": new_node_id,
-            })
-            core._log_edit(conn, "stale_flagged", ct_id, "contradiction",
-                      {"stale_premise": old_node_id, "replacement": new_node_id,
-                       "cascade_via": "contradicts_edge"})
+        cascade_event = None
+        if cascade_triggering:
+            cascade_event = _new_cascade_event()
+            visited = {old_node_id}  # seed superseded node so walker won't process it
+            visited.add(new_node_id)  # also don't process the replacement
+
+            def _on_live_for_supersede(dep):
+                _write_cascade_marker(conn, dep["id"], cascade_event,
+                                       old_node_id, "supersede", now)
+                stale.append({
+                    "id": dep["id"],
+                    "type": dep["type"],
+                    "claim": dep["claim"],
+                    "stale_premise": old_node_id,
+                    "replacement": new_node_id,
+                })
+
+            # Walk direct dependents of the superseded node.
+            direct = conn.execute(
+                "SELECT source_id FROM edges "
+                f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+                (old_node_id, *_CASCADE_RELATIONS_SORTED),
+            ).fetchall()
+            for d in direct:
+                _walk_cascade_downstream(conn, d["source_id"],
+                                         visited=visited,
+                                         on_live_node=_on_live_for_supersede)
+
+            # Cascade to contradiction nodes that have old as a contradicting side
+            # (issue #229): mark each affected contradiction with the SAME
+            # cascade_event so dream-fairy-2 reviews whether the supersede
+            # substantively resolved the conflict (case 1: wire engram_resolve
+            # from new_node to ct) or preserved it (case 2: new-contradict
+            # between new_node + other side, then supersede old contradiction →
+            # new contradiction). Per the supersede no-drop discipline (the
+            # supersede-no-drop discipline), case 3 (orthogonal supersede)
+            # cannot arise — the new node either kept or altered the conflicting
+            # claim; dropping is forbidden.
+            affected_ct_ids = _affected_contradiction_ids(conn, old_node_id)
+            for ct_id in affected_ct_ids:
+                ct = conn.execute(
+                    "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                    (ct_id,),
+                ).fetchone()
+                if not ct:
+                    continue
+                _write_cascade_marker(conn, ct_id, cascade_event,
+                                       old_node_id, "supersede", now)
+                stale_contradictions.append({
+                    "id": ct_id,
+                    "type": "contradiction",
+                    "claim": ct["claim"],
+                    "status": ct["status"],
+                    "stale_premise": old_node_id,
+                    "replacement": new_node_id,
+                })
+                core._log_edit(conn, "stale_flagged", ct_id, "contradiction",
+                          {"stale_premise": old_node_id, "replacement": new_node_id,
+                           "cascade_via": "contradicts_edge"})
 
         # §2.3 Zero-support detection: after cascade settles, check cs/ls
         # nodes that lost or regained a supporting edge (distinct from
@@ -1522,6 +2340,7 @@ def _retract_impl(
     initiation: str = "",
     initiation_gate: str = "",
     initiation_ref: str = "",
+    cascade_triggering: bool = True,
     _obs_creator=None,
 ) -> str:
     """Internal implementation — see engram_retract MCP tool for the public
@@ -1574,6 +2393,15 @@ def _retract_impl(
       hallucinated_claim — claim not supported by evidence
       duplicate — same claim already existed (should have used support_existing)
       other — anything else
+
+    cascade_triggering (INTERNAL — not reachable from the MCP surface; the
+    engram_retract payload allowlist does not carry this field, and a test
+    pins that): True (default) opens a NEW cascade event and marks
+    everything downstream. False suppresses that, for the ONE caller that
+    needs it — _cascade_resolve_impl, where this retract IS the resolution
+    of an existing cascade rather than a fresh error correction. See the
+    comment at the guard itself for the covered-set argument (#2013 §10.2 /
+    §6). The node's own pending markers still resolve either way.
 
     Args:
         node_id: The node to retract.
@@ -1872,65 +2700,71 @@ def _retract_impl(
         # withdrawn rather than fixed.
         resolved_own = _resolve_own_markers(conn, node_id, "retracted", now)
 
-        cascade_event = _new_cascade_event()
+        # #2013 §10.2 / §6 — "No re-cascade during resolution". When this
+        # call IS the resolution of an existing cascade (the
+        # engram_cascade_resolve path passes cascade_triggering=False), it
+        # must NOT open a NEW cascade event. Everything downstream of this
+        # node already carries the original event's pending markers, and
+        # invariant 4 (no node is cited as a premise while pending) means it
+        # cannot have acquired new descendants while pending — so a second
+        # event would mark a provably-covered set, and would additionally
+        # force every one of those nodes to be adjudicated twice before it
+        # could reach "fully resolved" (invariant 9). The categorical line
+        # is marked-vs-unmarked, NOT which verb was called: an UNMARKED node
+        # reached through the normal path still fires a normal cascade,
+        # which is why the default is True and only the resolution path
+        # passes False.
         tainted = []
-        visited = {node_id}  # seed retracted node so walker won't process it
-
-        def _on_live_for_retract(dep):
-            _write_cascade_marker(conn, dep["id"], cascade_event,
-                                   node_id, "retract", now)
-            tainted.append({
-                "id": dep["id"],
-                "type": dep["type"],
-                "claim": dep["claim"],
-            })
-
-        # Walk direct dependents of the retracted node.
-        direct = conn.execute(
-            "SELECT source_id FROM edges "
-            f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
-            (node_id, *_CASCADE_RELATIONS_SORTED),
-        ).fetchall()
-        for d in direct:
-            _walk_cascade_downstream(conn, d["source_id"],
-                                     visited=visited,
-                                     on_live_node=_on_live_for_retract)
-
-        # Cascade to contradiction nodes that have the retracted node as a
-        # contradicting side (issue #229): mark each affected contradiction
-        # with the SAME cascade_event so dream-fairy-2 reviews whether the
-        # contradiction itself is still valid (the retracted side was never
-        # valid; if the other side stands alone now, the contradiction may
-        # itself need supersede / explicit close).
         tainted_contradictions = []
-        contradiction_edges = conn.execute(
-            "SELECT source_id, target_id FROM edges "
-            "WHERE relation = 'contradicts' AND (source_id = ? OR target_id = ?)",
-            (node_id, node_id),
-        ).fetchall()
-        affected_ct_ids = set()
-        for ce in contradiction_edges:
-            ct_id = ce["source_id"] if ce["source_id"].startswith("ct_") else ce["target_id"]
-            if not ct_id.startswith("ct_"):
-                continue
-            affected_ct_ids.add(ct_id)
-        for ct_id in affected_ct_ids:
-            ct = conn.execute(
-                "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
-                (ct_id,),
-            ).fetchone()
-            if not ct:
-                continue
-            _write_cascade_marker(conn, ct_id, cascade_event,
-                                   node_id, "retract", now)
-            tainted_contradictions.append({
-                "id": ct_id,
-                "type": "contradiction",
-                "claim": ct["claim"],
-                "status": ct["status"],
-            })
-            core._log_edit(conn, "tainted", ct_id, "contradiction",
-                      {"tainted_by": node_id, "cascade_via": "contradicts_edge"})
+        cascade_event = None
+        if cascade_triggering:
+            cascade_event = _new_cascade_event()
+            visited = {node_id}  # seed retracted node so walker won't process it
+
+            def _on_live_for_retract(dep):
+                _write_cascade_marker(conn, dep["id"], cascade_event,
+                                       node_id, "retract", now)
+                tainted.append({
+                    "id": dep["id"],
+                    "type": dep["type"],
+                    "claim": dep["claim"],
+                })
+
+            # Walk direct dependents of the retracted node.
+            direct = conn.execute(
+                "SELECT source_id FROM edges "
+                f"WHERE target_id = ? AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+                (node_id, *_CASCADE_RELATIONS_SORTED),
+            ).fetchall()
+            for d in direct:
+                _walk_cascade_downstream(conn, d["source_id"],
+                                         visited=visited,
+                                         on_live_node=_on_live_for_retract)
+
+            # Cascade to contradiction nodes that have the retracted node as a
+            # contradicting side (issue #229): mark each affected contradiction
+            # with the SAME cascade_event so dream-fairy-2 reviews whether the
+            # contradiction itself is still valid (the retracted side was never
+            # valid; if the other side stands alone now, the contradiction may
+            # itself need supersede / explicit close).
+            affected_ct_ids = _affected_contradiction_ids(conn, node_id)
+            for ct_id in affected_ct_ids:
+                ct = conn.execute(
+                    "SELECT id, type, claim, status, metadata FROM nodes WHERE id = ? AND is_current = 1",
+                    (ct_id,),
+                ).fetchone()
+                if not ct:
+                    continue
+                _write_cascade_marker(conn, ct_id, cascade_event,
+                                       node_id, "retract", now)
+                tainted_contradictions.append({
+                    "id": ct_id,
+                    "type": "contradiction",
+                    "claim": ct["claim"],
+                    "status": ct["status"],
+                })
+                core._log_edit(conn, "tainted", ct_id, "contradiction",
+                          {"tainted_by": node_id, "cascade_via": "contradicts_edge"})
 
         # §2.3 Zero-support detection: after cascade settles, check cs/ls
         # nodes that lost or regained a supporting edge (distinct from

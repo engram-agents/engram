@@ -6336,6 +6336,170 @@ def _compute_confidence(
     return 0.5  # default
 
 
+# ---------------------------------------------------------------------------
+# Confidence recompute from a node's OWN stored inputs (#2013 slice 4)
+# ---------------------------------------------------------------------------
+# _compute_confidence above is the CREATION-time formula: its caller supplies
+# the inputs (quote_type, supporting_ids, reasoning_type, ...) because at
+# creation the node does not exist yet. The cascade machine needs the same
+# arithmetic pointed at a node that ALREADY exists — #2013 §4, "confidence is
+# ALWAYS recomputed, on every affected node, however its marker resolves".
+#
+# This helper is the bridge: it reads a stored node's own formula inputs back
+# out of the graph and delegates the arithmetic to _compute_confidence. It
+# deliberately does NOT reimplement any of the math — a second copy of the
+# confidence formulas is exactly the divergence _supersede_impl's docstring
+# warns about ("the canonical creation tools are the single source of truth
+# for each node type's confidence math").
+
+# Types whose stored confidence has a runtime creation-time FORMULA that
+# _compute_confidence can reproduce from the node's own stored inputs.
+#
+# Deliberately NOT the whole of CLAIM_BEARING_TYPES, and the two exclusions
+# are different in kind:
+#   - `conjecture` is excluded BY DESIGN: its confidence is clamped at
+#     creation to [0.10, 0.60] and is a judgement, not a formula output
+#     (engram_confidence.py). There is no input set to recompute from.
+#   - `theory` is excluded because the runtime has NO theory creation tool,
+#     so no creation-time formula exists to be the SSoT. The only surviving
+#     implementation (tools/surgical.py::_compute_confidence_for_node, a T3
+#     dev tool) applies a theory-specific x0.90 discount that
+#     _compute_confidence does not. Recomputing a legacy theory node here
+#     would have to pick one of two numbers with no authority for either, so
+#     it picks neither and reports the skip instead. Tracked as a follow-up.
+#
+# Both are reported as `skipped`, never silently left at a stale value — the
+# caller surfaces the disposition so a node the machine did not touch is
+# visible rather than assumed-recomputed.
+CONFIDENCE_RECOMPUTABLE_TYPES = frozenset({
+    "observation_factual",
+    "observation_predictive",
+    "derivation",
+    "axiom",
+})
+
+
+def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
+                               *, write: bool = True) -> dict:
+    """Recompute one existing node's confidence from its own stored formula
+    inputs, delegating the arithmetic to _compute_confidence.
+
+    Returns a disposition dict — ALWAYS, never None, and never raises for an
+    ordinary miss:
+        {"node_id", "type", "old": float|None, "new": float|None,
+         "changed": bool, "disposition": str, "reason": str|None}
+
+    `disposition` is one of:
+        "recomputed"       — a new value was computed (and written, if write)
+        "unchanged"        — recomputed to the identical stored value
+        "skipped"          — no creation-time formula for this type, or the
+                             node's own formula inputs are absent/unusable
+        "missing"          — no such node id
+
+    WHY A SKIP IS NOT A FAILURE, and why it is reported rather than swallowed:
+    the alternative to skipping is stamping a fallback number (both existing
+    implementations return a bare 0.5 when inputs are missing). A fallback
+    written into the graph is indistinguishable, afterwards, from a genuinely
+    computed one — so a node whose inputs were missing would end up asserting
+    a confidence nobody derived. Under-writing is visible and recoverable;
+    a silent 0.5 is neither.
+
+    `write=False` makes this a pure read — used to PREVIEW the value a node
+    would carry (#2013 §4's "the confidence the node would carry if
+    superseded — computed, never typed") without touching the graph.
+    """
+    row = conn.execute(
+        "SELECT id, type, confidence, quote_type, metadata FROM nodes WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    if not row:
+        return {"node_id": node_id, "type": None, "old": None, "new": None,
+                "changed": False, "disposition": "missing",
+                "reason": "no such node"}
+
+    ntype = row["type"]
+    old = row["confidence"]
+
+    def _skip(reason: str) -> dict:
+        return {"node_id": node_id, "type": ntype, "old": old, "new": None,
+                "changed": False, "disposition": "skipped", "reason": reason}
+
+    if ntype not in CONFIDENCE_RECOMPUTABLE_TYPES:
+        return _skip(
+            f"type '{ntype}' has no runtime creation-time confidence formula "
+            f"to recompute from (see CONFIDENCE_RECOMPUTABLE_TYPES)"
+        )
+
+    try:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+
+    if ntype == "axiom":
+        new = 1.0
+    elif ntype in ("observation_factual", "observation_predictive"):
+        qt = row["quote_type"]
+        if not qt or qt not in CONFIDENCE_MAP:
+            # Guarding this explicitly matters: _compute_confidence falls
+            # THROUGH its quote_type branch when quote_type is absent or
+            # unrecognised, and would then answer from the supporting_ids
+            # branch (or the bare 0.5 default) — a derivation-shaped number
+            # silently stamped on an observation.
+            return _skip(
+                f"observation has no usable quote_type "
+                f"({qt!r}) — nothing to recompute from"
+            )
+        new = _compute_confidence(
+            conn, ntype,
+            quote_type=qt,
+            is_predictive=(ntype == "observation_predictive"),
+            source_class=meta.get("source_class", "external"),
+        )
+    else:  # derivation
+        # derives_from ONLY — deliberately NOT _direct_premise_ids, which
+        # also returns supported_by targets. The two answer different
+        # questions: _direct_premise_ids is the CASCADE's "which premises
+        # were affected" read, while this is the CONFIDENCE formula's input
+        # set, and _derive_impl computes from derives_from premises alone.
+        premise_ids = [
+            r["target_id"] for r in conn.execute(
+                "SELECT target_id FROM edges "
+                "WHERE source_id = ? AND relation = 'derives_from' "
+                "ORDER BY target_id",
+                (node_id,),
+            ).fetchall()
+        ]
+        if not premise_ids:
+            return _skip("derivation has no derives_from premises")
+        have_conf = conn.execute(
+            "SELECT COUNT(*) AS c FROM nodes "
+            f"WHERE confidence IS NOT NULL AND id IN "
+            f"({','.join('?' for _ in premise_ids)})",
+            tuple(premise_ids),
+        ).fetchone()["c"]
+        if not have_conf:
+            return _skip(
+                "no derives_from premise carries a confidence — "
+                "_compute_confidence would answer from its bare default"
+            )
+        new = _compute_confidence(
+            conn, ntype,
+            supporting_ids=premise_ids,
+            reasoning_type=meta.get("reasoning_type"),
+        )
+
+    changed = (old != new)
+    if write and changed:
+        _refuse_ncb_confidence(ntype, new)
+        conn.execute(
+            "UPDATE nodes SET confidence = ? WHERE id = ?", (new, node_id)
+        )
+    return {"node_id": node_id, "type": ntype, "old": old, "new": new,
+            "changed": changed,
+            "disposition": "recomputed" if changed else "unchanged",
+            "reason": None}
+
+
 def _rebuild_incidents_cache() -> dict:
     """Rebuild the error_incidents.json cache from the graph.
 
