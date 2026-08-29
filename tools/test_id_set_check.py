@@ -53,6 +53,69 @@ Collected, for every `*.py` under `tests/`:
 The base/head comparison reads git objects directly (`git ls-tree` +
 `git show <rev>:<path>`) — it never checks anything out.
 
+LIMIT (by design, not oversight) — the comparison is ONE-DIRECTIONAL, so a
+REVERTED CORRECTION is invisible, and worse, it reads as improvement. This gate
+reports ids that LEFT the base set. Undoing a fix moves the head set back TOWARD
+base, which is the quiet direction: an id that had been disappearing simply
+stops disappearing, and the unaccounted count goes DOWN.
+
+Measured in the wild on #2349:
+
+    pre-rebase  (505b25d -> 1c03cc6), no markers:  disappeared=3
+    post-rebase (db955ed -> 7694dd5), 2 markers:   disappeared=2, PASS
+
+A test rename the PR had made was reverted by an over-broad "resolve toward
+dev" conflict rule. Two of the three disappearances were legitimately accounted
+for by the author's markers; the third was NOT accounted for — it ceased to
+exist as a disappearance — and the gate PASSED. Anyone comparing an earlier
+published figure of 3 against "disappeared=2, both marked, PASS" concludes the
+accounting is complete. `3 -> 2` reads as progress, and one disappearance of
+the three has silently stopped being one.
+
+No set difference over ids can separate "this correction was never made" from
+"this correction was made and then reverted": both yield the same head set.
+This does NOT reopen the opening argument that only a set diff of names is
+sound — within a single comparison it still is. The limit is that two separate
+invocations share no memory of each other, so the direction of travel between
+them is invisible to both.
+
+The gate is not entirely silent here, and the accurate version of that matters
+more than the tidy one. On the post-rebase run above it emits, from the PR body
+it already reads:
+
+    ::warning::Removed-test marker names
+    'tests/test_supported_by.py::test_cascade_relations_is_derives_from_only',
+    which did not disappear between base and head (stale marker).
+
+That warning is a fingerprint of this scenario — the marker was written when the
+rename was made, and goes stale at exactly the moment the revert makes the id
+reappear. So detection did not need the PR's history; it needed someone to read
+a line the gate already prints.
+
+BUT THE FINGERPRINT IS CONDITIONAL, and the condition is doing real work: it
+exists only because a marker had ALREADY been filed for that disappearance. The
+warning is emitted from inside the loop over markers, so an id with no marker
+naming it is never examined. A revert that erases a correction before any
+marker was ever written for it — corrected and reverted between gate runs, say
+— produces NO signal of any kind. Measured on the same pair with an empty PR
+body: the reverted id appears zero times in the output, which names only the
+two genuine disappearances. That case is exactly as invisible as this LIMIT's
+opening paragraph describes.
+
+The warning also cannot be promoted past a warning. The escape-hatch section
+below states half the reason — a marker naming an id that did not disappear is
+deliberately a warning and not a failure, so that an author who correctly
+restored a test is not blocked by their own stale housekeeping. The other half
+follows from it rather than being written there: the gate holds no information
+distinguishing that benign restoration from a revert that undid a correction,
+because both produce exactly the same stale marker over the same id set.
+Hardening this to a failure would therefore false-positive on the case the
+escape hatch exists to permit. Hence a stated limit rather than a patch.
+
+The practical consequence for a reviewer: a FALLING unaccounted count across a
+rebase is not evidence of accounting. Read the stale-marker warnings, and diff
+the two runs' id sets, rather than taking the smaller number as progress.
+
 Escape hatch — a PR body line:
 
     Removed-test: <id> — <reason>
