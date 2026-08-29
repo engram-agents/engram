@@ -2139,6 +2139,39 @@ def _supersede_impl(
                          "If your understanding has shifted, file a NEW feeling report.",
             })
 
+        # #2343 / #2013 invariant 7 (first sentence): "the tool REFUSES a
+        # supersede that supplies no resolution." The PLAIN verb reaching a
+        # node that already carries a pending cascade marker is exactly that
+        # case — the caller is revising a node whose own premises are still
+        # under adjudication. Lei's ruling (2026-08-29): refuse, and point at
+        # mode C so the WHOLE chain up to this node is adjudicated through
+        # engram_cascade_resolve, rather than letting the plain verb clear
+        # this node's own marker while the rest of the cascade stays
+        # unadjudicated (a bypass wearing invariant 7's clothes). The
+        # resolution route reaches this function with cascade_triggering=False
+        # and is the ONLY legitimate way to supersede a marked node.
+        if cascade_triggering:
+            _pending_here = core._pending_markers_for_node(conn, old_node_id)
+            if _pending_here:
+                _events = sorted({m["cascade_event"] for m in _pending_here})
+                return json.dumps({
+                    "error": f"Node '{old_node_id}' carries {len(_pending_here)} pending "
+                             f"cascade marker(s) ({len(_events)} event(s)) — a plain "
+                             f"engram_supersede is refused on a node whose own "
+                             f"premises are still under adjudication (#2013 "
+                             f"invariant 7). Resolve the cascade through the "
+                             f"frontier instead: read mode C for this node, "
+                             f"adjudicate each frontier entry with "
+                             f"engram_cascade_resolve, and when this node is "
+                             f"itself on the frontier resolve it as 'superseded' "
+                             f"with this replacement.",
+                    "pending_events": _events,
+                    "next_call": f"engram_cascade_frontier(node_id={old_node_id!r})",
+                    "then": f"engram_cascade_resolve(node_id={old_node_id!r}, "
+                            f"resolution_kind='superseded', "
+                            f"replacement_id={new_node_id!r})",
+                })
+
         new = conn.execute(
             "SELECT id, type, is_current, created_at, supersedes FROM nodes WHERE id = ?",
             (new_node_id,),
@@ -2628,6 +2661,32 @@ def _retract_impl(
         if not node:
             return json.dumps({"error": f"Node '{node_id}' not found."})
 
+        # #2343 / #2013 invariant 7: same refusal as _supersede_impl — a PLAIN
+        # retract of a node that already carries a pending cascade marker is
+        # refused and pointed at mode C; the resolution route (cascade_
+        # triggering=False, via engram_cascade_resolve) is the only way to
+        # retract a marked node. See the sibling comment in _supersede_impl.
+        if cascade_triggering and node["is_current"] == 1:
+            _pending_here = core._pending_markers_for_node(conn, node_id)
+            if _pending_here:
+                _events = sorted({m["cascade_event"] for m in _pending_here})
+                return json.dumps({
+                    "error": f"Node '{node_id}' carries {len(_pending_here)} pending "
+                             f"cascade marker(s) ({len(_events)} event(s)) — a plain "
+                             f"engram_retract is refused on a node whose own "
+                             f"premises are still under adjudication (#2013 "
+                             f"invariant 7). Resolve the cascade through the "
+                             f"frontier instead: read mode C for this node, "
+                             f"adjudicate each frontier entry with "
+                             f"engram_cascade_resolve, and when this node is "
+                             f"itself on the frontier resolve it as 'retracted'.",
+                    "pending_events": _events,
+                    "next_call": f"engram_cascade_frontier(node_id={node_id!r})",
+                    "then": f"engram_cascade_resolve(node_id={node_id!r}, "
+                            f"resolution_kind='retracted', "
+                            f"error_type={error_type!r})",
+                })
+
         now = core._now()
 
         # Self-anchor guard: retracting a person self-anchor leaves zero current
@@ -2874,11 +2933,22 @@ def _retract_impl(
         # cannot have acquired new descendants while pending — so a second
         # event would mark a provably-covered set, and would additionally
         # force every one of those nodes to be adjudicated twice before it
-        # could reach "fully resolved" (invariant 9). The categorical line
-        # is marked-vs-unmarked, NOT which verb was called: an UNMARKED node
+        # could reach "fully resolved" (invariant 9). An UNMARKED node
         # reached through the normal path still fires a normal cascade,
         # which is why the default is True and only the resolution path
         # passes False.
+        #
+        # SCOPE (#2343, read this before generalising): the "no new event"
+        # rule above is a property of the RESOLUTION PATH only. It is NOT a
+        # licence for the plain verb to supersede a MARKED node quietly —
+        # the plain verb REFUSES a marked node (guard above; #2013 invariant
+        # 7 first sentence, "the tool refuses a supersede that supplies no
+        # resolution"). An earlier wording here — "the categorical line is
+        # marked-vs-unmarked, NOT which verb was called" — was read by two
+        # seats on 2026-08-29 as exactly that licence, and nearly shipped an
+        # accept-and-resolve bypass. The line that matters is: marked ⇒ the
+        # resolve verb is the only route; unmarked ⇒ plain verb, normal
+        # cascade.
         tainted = []
         tainted_contradictions = []
         cascade_event = None

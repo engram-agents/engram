@@ -826,8 +826,13 @@ def test_retract_resolution_opens_no_new_DERIVATION_cascade_event():
 
     # Invariant 7's FIRST line, which pulls the OPPOSITE way from the
     # no-re-cascade half and is therefore the thing a cascade_triggering
-    # guard could silently swallow: "Superseding a marked node must also
-    # resolve its marker." The same holds for retracting one. If the
+    # guard could silently swallow — quoted IN FULL (#2343: an earlier copy
+    # here stopped at the em-dash, and the dropped clause is the refusal Lei
+    # ruled on 2026-08-29; the truncation is how two seats read the design
+    # backwards): "Superseding a marked node must also resolve its marker —
+    # the tool refuses a supersede that supplies no resolution." The
+    # resolution route (this verb) resolves it; the PLAIN verb refuses it.
+    # The same holds for retracting one. If the
     # own-marker resolution were ever moved inside the cascade guard, a
     # `retracted` resolution would suppress the propagation correctly AND
     # leave dv1's own markers pending forever — the node would stay blocked

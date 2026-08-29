@@ -131,8 +131,11 @@ def test_direct_target_frontier_transitive_dependent_blocked():
 
     # Resolve dv1 (retract it too) — its own pending marker clears, and dv2
     # should now be frontier.
+    # #2343: the PLAIN verb refuses a marked node; fixtures take the internal
+    # resolution route (what engram_cascade_resolve calls) to build the state.
     ret2 = json.loads(rev._retract_impl(
         node_id=dv1_id, error_type="hallucinated_claim", reason="also wrong",
+        cascade_triggering=False,
     ))
     assert "error" not in ret2, ret2
 
@@ -222,7 +225,11 @@ def test_multi_event_node_once_and_blocked_until_all_ancestors_resolved():
     # Resolve only mid1. joint must STILL be blocked (mid2 still pending) —
     # this is the "all pending direct premises resolved ACROSS ALL EVENTS"
     # rule, not per-event.
-    json.loads(rev._retract_impl(node_id=mid1, error_type="hallucinated_claim", reason="c"))
+    # #2343: plain retract of a marked node is refused; fixtures use the
+    # internal resolution route (cascade_triggering=False), which resolves the
+    # node's own marker and fires no new event (invariant 7).
+    json.loads(rev._retract_impl(node_id=mid1, error_type="hallucinated_claim", reason="c",
+                                 cascade_triggering=False))
     resp2 = json.loads(rev._cascade_frontier_impl())
     ids2 = _frontier_ids(resp2)
     assert joint not in ids2, (
@@ -231,34 +238,29 @@ def test_multi_event_node_once_and_blocked_until_all_ancestors_resolved():
 
     # Resolve mid2 too. joint must now be frontier, appearing EXACTLY ONCE.
     #
-    # Event count on joint at this point is 4, not 2 — retracting mid1/mid2
-    # (each already a marked node) each fire their OWN fresh downstream
-    # cascade (a brand-new cascade_event whose root_node is mid1/mid2
-    # respectively), which reaches joint again with a NEW pending marker,
-    # layered on top of the two original (now-orphaned, still 'pending' on
-    # joint itself, but harmless) markers from ob1/ob2's events. This is
-    # real, correct system behavior (every retract/supersede call re-walks
-    # its own downstream fresh, INSERT OR IGNORE only dedupes an exact
-    # (node_id, cascade_event) pair, never across different events) — not a
-    # frontier-tool defect. What matters for frontier-membership is joint's
-    # ANCESTORS' pending status, not how many historical marker rows joint
-    # itself has accumulated: none of joint's ancestors (ob1, mid1, ob2,
-    # mid2) carry a pending marker anymore, so joint is unblocked regardless
-    # of its own event count.
-    json.loads(rev._retract_impl(node_id=mid2, error_type="hallucinated_claim", reason="d"))
+    # (Historical note: before #2343 this fixture used the PLAIN retract on
+    # the marked mid1/mid2, which fired a fresh event each and left joint
+    # with 4 markers; the frontier read was correct regardless because
+    # membership depends on ANCESTORS' pending status. Since #2343 the plain
+    # verb refuses a marked node, and the resolution route fires no new
+    # event — invariant 7 — so joint keeps exactly its two original markers.)
+    json.loads(rev._retract_impl(node_id=mid2, error_type="hallucinated_claim", reason="d",
+                                 cascade_triggering=False))
     resp3 = json.loads(rev._cascade_frontier_impl())
     joint_entries = [s for s in resp3["frontier"] if s["id"] == joint]
     assert len(joint_entries) == 1, (
         f"joint must appear EXACTLY ONCE in the frontier, got {joint_entries}"
     )
-    assert len(joint_entries[0]["events"]) == 4, (
-        f"joint's single entry must carry ALL FOUR of its accumulated "
-        f"events (2 orphaned + 2 fresh from resolving mid1/mid2), never "
-        f"collapsed or dropped: {joint_entries[0]}"
+    # #2343 / invariant 7: resolving mid1/mid2 through the resolution route
+    # fires NO new event, so joint carries exactly its two original events
+    # (before #2343 the plain verb fired two fresh ones and this read 4).
+    assert len(joint_entries[0]["events"]) == 2, (
+        f"joint's single entry must carry BOTH of its original events, never "
+        f"collapsed or dropped — and no fresh ones (invariant 7): {joint_entries[0]}"
     )
     event_roots = {e["root_node"] for e in joint_entries[0]["events"]}
-    assert event_roots == {ob1, ob2, mid1, mid2}, (
-        f"the four events' root_nodes must be exactly {{ob1, ob2, mid1, mid2}}, "
+    assert event_roots == {ob1, ob2}, (
+        f"the two events' root_nodes must be exactly {{ob1, ob2}}, "
         f"got {event_roots}"
     )
 
@@ -346,9 +348,13 @@ def test_transitive_catches_out_of_order_resolution_direct_premises_would_miss()
         conn.close()
     assert {g, p1, n}.issubset(pending_after_retract), pending_after_retract
 
+    # #2343: plain supersede of the marked P1 is refused; the fixture takes
+    # the internal resolution route, which resolves P1's own marker(s) and
+    # leaves G's untouched — the out-of-order precondition this test rests on.
     sup = json.loads(rev._supersede_impl(
         old_node_id=p1, new_node_id=new_p1,
         supersede_reason="round-3 fixture: replacement drops premise g",
+        cascade_triggering=False,
     ))
     assert "error" not in sup, sup
 
@@ -669,6 +675,7 @@ def test_dead_premise_detail_is_populated_and_root_case_covered():
     sup = json.loads(rev._supersede_impl(
         old_node_id=g, new_node_id=new_g,
         supersede_reason="dead-premise-detail fixture: replacement drops r1",
+        cascade_triggering=False,   # #2343: plain verb refuses a marked node
     ))
     assert "error" not in sup, sup
 
@@ -682,10 +689,12 @@ def test_dead_premise_detail_is_populated_and_root_case_covered():
     retract_events = [e for e in events if e["root_op"] == "retract"]
     supersede_events = [e for e in events if e["root_op"] == "supersede"]
     assert len(retract_events) == 1, events
-    assert len(supersede_events) == 1, events
+    # #2343 / invariant 7: superseding the marked G through the resolution
+    # route is a partial resolution of r1's event, NOT a new supersede event
+    # (before #2343 the plain verb fired one and this asserted len == 1).
+    assert len(supersede_events) == 0, events
 
     retract_event = next(e for e in retract_events if e["root_node"] == r1)
-    supersede_event = next(e for e in supersede_events if e["root_node"] == g)
 
     # -- retract event (root=r1): g is N's dead direct premise --------------
     assert retract_event["immediate_cause"] == [g], retract_event
@@ -699,12 +708,9 @@ def test_dead_premise_detail_is_populated_and_root_case_covered():
     # r1 (the retract event's root) is not N's *direct* premise — g is.
     assert retract_event["root_is_direct_premise"] is False, retract_event
 
-    # -- supersede event (root=g): g IS N's direct premise, so it carries --
-    # -- no marker of its own — the empty fields here are expected, not ----
-    # -- a bug (a cascade root never gets its own marker). ------------------
-    assert supersede_event["root_is_direct_premise"] is True, supersede_event
-    assert supersede_event["immediate_cause"] == [], supersede_event
-    assert supersede_event["dead_premises"] == [], supersede_event
+    # (The pre-#2343 second half of this test asserted a supersede event
+    # rooted at g with empty cause/dead fields; that event no longer exists —
+    # see invariant 7 note above.)
 
 
 if __name__ == "__main__":

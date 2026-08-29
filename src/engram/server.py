@@ -6273,6 +6273,15 @@ def engram_supersede(payload_json: str) -> str:
     creation tool, then calls this to link. Pass all fields as one JSON object
     string in payload_json.
 
+    REFUSED on a node that carries a pending cascade marker (#2013 invariant
+    7, #2343): its own premises are still under adjudication, so a plain
+    supersede would clear this node's marker while the rest of the cascade
+    stays unadjudicated. The refusal returns `next_call` (the mode-C
+    frontier read for this node) and `then` (the exact engram_cascade_resolve
+    call, resolution_kind='superseded', with your replacement) — resolve the
+    chain through the frontier instead. That resolution is a partial
+    resolution of the existing event, never a new one.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             old_node_id (str, required): The node being superseded.
@@ -6373,6 +6382,13 @@ def engram_retract(payload_json: str) -> str:
     The retracted node is PRESERVED for audit; downstream derivations are
     TAINTED, not deleted — the cascade surfaces "re-derive needed" rather
     than silently rewriting the graph.
+
+    REFUSED on a node that already carries a pending cascade marker (#2013
+    invariant 7, #2343): retract it through the frontier instead — the
+    refusal returns `next_call` (the mode-C frontier read for this node) and
+    `then` (the exact engram_cascade_resolve call with
+    resolution_kind='retracted'). A retract resolved that way is a partial
+    resolution of the existing cascade event, not a new one.
 
     Pass all fields as one JSON object string in payload_json. Note: the
     outer wrapper parameter is `payload_json` and there is also an INNER

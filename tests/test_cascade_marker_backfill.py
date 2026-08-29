@@ -426,11 +426,13 @@ def test_refusal_names_the_route_for_each_case():
     assert new in route2 and "cite the successor" in route2, route2
 
 
-def test_superseding_a_marked_node_resolves_its_own_markers():
-    """Design invariant 7 pairing. With the override gone, a marked node's
-    only routes before the frontier verb are supersede and retract — so if
-    those did not clear its markers, a properly re-derived node would stay
-    blocked forever, with no route in existence.
+def test_superseding_a_marked_node_is_refused_and_resolves_via_the_verb():
+    """Design invariant 7, both sentences (#2343, Lei 2026-08-29). The PLAIN
+    supersede of a marked node is REFUSED with a pointer at the frontier /
+    resolve verb; the route out is engram_cascade_resolve, which resolves the
+    node's own marker as 'superseded' with the replacement recorded. (Before
+    the frontier verb shipped, the plain verb resolved the marker itself — a
+    deliberate accommodation, retired here.)
     """
     rev, obs, derive, core = _mods()
     root = _mk_obs(obs, "Root.")
@@ -447,12 +449,20 @@ def test_superseding_a_marked_node_resolves_its_own_markers():
     conn.commit()
     conn.close()
 
-    sup = json.loads(rev._supersede_impl(
+    refused = json.loads(rev._supersede_impl(
         old_node_id=marked, new_node_id=replacement,
         supersede_reason="re-derived on live premises",
     ))
-    assert sup.get("status") == "superseded", sup
-    assert sup.get("resolved_own_marker_count") == 1, sup
+    assert "error" in refused and "engram_cascade_resolve" in refused["error"], refused
+    assert refused["next_call"].startswith("engram_cascade_frontier("), refused
+    assert marked in refused["then"] and replacement in refused["then"], refused
+
+    sup = json.loads(rev._cascade_resolve_impl(
+        node_id=marked, resolution_kind="superseded",
+        replacement_id=replacement, note="re-derived on live premises",
+    ))
+    assert "error" not in sup, sup
+    assert sup.get("resolved_marker_count") == 1, sup
 
     conn = core._get_db()
     row = conn.execute(
@@ -521,13 +531,22 @@ def test_supersede_resolves_markers_from_ALL_cascades_not_just_one():
     conn.close()
     assert pending_before == 2, pending_before
 
-    sup = json.loads(rev._supersede_impl(
+    refused = json.loads(rev._supersede_impl(
         old_node_id=marked, new_node_id=replacement,
         supersede_reason="re-derived; both upstream changes folded in",
     ))
-    assert sup.get("status") == "superseded", sup
-    assert sup.get("resolved_own_marker_count") == 2, sup
-    assert set(sup["resolved_own_markers"]) == {
+    assert "error" in refused, refused   # #2343: plain verb refuses a marked node
+    assert set(refused["pending_events"]) == {
+        "backfill:supersede:A", "backfill:supersede:B"
+    }, refused
+
+    sup = json.loads(rev._cascade_resolve_impl(
+        node_id=marked, resolution_kind="superseded",
+        replacement_id=replacement, note="re-derived; both upstream changes folded in",
+    ))
+    assert "error" not in sup, sup
+    assert sup.get("resolved_marker_count") == 2, sup
+    assert set(sup["resolved_events"]) == {
         "backfill:supersede:A", "backfill:supersede:B"
     }, sup
 
@@ -548,7 +567,7 @@ def test_supersede_resolves_markers_from_ALL_cascades_not_just_one():
         assert row["resolution_replacement_id"] == replacement, (ev, row)
 
 
-def test_retracting_a_marked_node_resolves_its_own_markers():
+def test_retracting_a_marked_node_is_refused_and_resolves_via_the_verb():
     rev, obs, derive, core = _mods()
     root = _mk_obs(obs, "Root.")
     marked = _mk_obs(obs, "Marked node about to be withdrawn.")
@@ -562,12 +581,18 @@ def test_retracting_a_marked_node_resolves_its_own_markers():
     conn.commit()
     conn.close()
 
-    r = json.loads(rev._retract_impl(
+    refused = json.loads(rev._retract_impl(
         node_id=marked, error_type="wrong_evidence",
         reason="withdrawn rather than fixed",
     ))
-    assert r.get("status") == "retracted", r
-    assert r.get("resolved_own_marker_count") == 1, r
+    assert "error" in refused and "engram_cascade_resolve" in refused["error"], refused
+
+    r = json.loads(rev._cascade_resolve_impl(
+        node_id=marked, resolution_kind="retracted",
+        error_type="wrong_evidence", note="withdrawn rather than fixed",
+    ))
+    assert "error" not in r, r
+    assert r.get("resolved_marker_count") == 1, r
 
     conn = core._get_db()
     row = conn.execute(
@@ -622,8 +647,12 @@ def test_dead_premises_was_vacuous_before_a_resolution_writer_existed():
     conn.close()
 
     replacement = _mk_obs(obs, "The premise, corrected.")
+    # #2343: the plain verb refuses a marked node; this test's subject is
+    # _dead_premises, so use the internal resolution route to write the
+    # resolution it reads.
     sup = json.loads(rev._supersede_impl(
         old_node_id=premise, new_node_id=replacement, supersede_reason="corrected",
+        cascade_triggering=False,
     ))
     assert sup.get("status") == "superseded", sup
 
