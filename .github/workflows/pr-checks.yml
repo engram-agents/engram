@@ -13,6 +13,8 @@ name: pr-checks
 #   5. stray-master-ref-check    (#1884 — advisory, never blocks job)
 #   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
 #   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
+#   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
+#      PR that removes coverage is exactly as green as a PR that adds it)
 
 on:
   pull_request:
@@ -482,3 +484,40 @@ jobs:
         # entries are caught at dev-PR time rather than only at release-cut.
         # See issue #1147.
         run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q
+
+      # ── 8. test-id-set-check ────────────────────────────────────────────
+      # #2350 — a deleted test cannot fail, so a PR that removes coverage is
+      # exactly as green as a PR that adds it: no existing gate here reads
+      # which tests *stopped existing*. A count is NOT enough — measured on
+      # the motivating commit (2ecf88c, tests/test_cascade_resolve.py +
+      # tests/test_supported_by.py): whole-tree count delta -7 vs the real
+      # set diff of 11 disappeared / 4 appeared; one of those disappearances
+      # (test_supported_by.py) is a perfect 1:1 rename with a COUNT DELTA OF
+      # ZERO, invisible to any count-based check in a file a count-based
+      # sweep would certify as clean.
+      #
+      # BLOCKING, unlike the advisory name-leak-warn / stray-master-ref-check
+      # steps above: the whole point of this gate is that a silent test
+      # deletion is currently free — an advisory posture would leave it free.
+      #
+      # Compares base (the merge-base of the PR's target branch, NOT the
+      # target branch's current tip — so tests deleted on dev since the
+      # branch point are never attributed to this PR) against HEAD. This
+      # matters even though actions/checkout does default to the PR merge
+      # ref: that merge commit's base-parent is a SNAPSHOT of the target
+      # branch as of this PR's last sync event, not a live pointer at the
+      # target's current tip — so the merge-base and the branch's current
+      # tip genuinely differ whenever anything has landed on the target
+      # branch since that sync. A PR body line `Removed-test: <id> —
+      # <reason>` accounts for a legitimate deletion; see
+      # tools/test_id_set_check.py's module docstring for the full marker
+      # syntax and the accounting rules.
+      - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          printf '%s' "$PR_BODY" > /tmp/pr_body.txt
+          python3 tools/test_id_set_check.py \
+            --base "$BASE_SHA" --head HEAD \
+            --pr-body-file /tmp/pr_body.txt
