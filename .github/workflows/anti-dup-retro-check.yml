@@ -68,10 +68,30 @@ jobs:
 
           # Fetch all open PRs in one call to avoid repeated API round-trips.
           # headRefOid is needed to target the check-run at the correct commit SHA.
-          OPEN_PRS_JSON=$(gh pr list --repo "$REPO" --state open \
-            --json number,headRefOid,title,body --limit 200 2>/dev/null)
+          # Colleague-review finding (Borges, PR#2375): the first cut here used
+          # `|| true`, matching CHECK_RESULT's fix -- but CHECK_RESULT's failure
+          # STAYS VISIBLE (its content-based dispatch below prints an explicit
+          # "FAILED -- ..." line either way). Here, `|| true` combined with
+          # `2>/dev/null` made a real `gh pr list` failure INDISTINGUISHABLE
+          # from the genuine "no open PRs" case -- both produce an empty/absent
+          # OPEN_PRS_JSON, both hit the same branch below, both print "No open
+          # PRs to scan." and exit 0. That converts this errexit fix's own
+          # failure mode from LOUD (crash) to SILENT (looks like success) --
+          # the wrong direction, and the opposite of what CHECK_RESULT/
+          # COMMENT_RESULT's fixes do. Confirmed via a stubbed failing `gh`:
+          # indistinguishable from a clean empty scan, exactly as flagged.
+          #
+          # Fixed by matching this file's OWN established idiom for this exact
+          # situation (see ISSUE_JSON below): `if ! VAR=$(...); then warn;
+          # exit 0; fi` -- still exit-0 (the file's contract, unchanged), but
+          # now LOUD about which case actually happened.
+          if ! OPEN_PRS_JSON=$(gh pr list --repo "$REPO" --state open \
+            --json number,headRefOid,title,body --limit 200 2>/dev/null); then
+            echo "::warning::anti-dup-retro: could not fetch open PRs (gh pr list failed). Skipping this run -- could not scan for orphaned PRs."
+            exit 0
+          fi
 
-          if [ -z "$OPEN_PRS_JSON" ] || [ "$OPEN_PRS_JSON" = "[]" ]; then
+          if [ "$OPEN_PRS_JSON" = "[]" ]; then
             echo "No open PRs to scan."
             exit 0
           fi
@@ -173,6 +193,18 @@ jobs:
 
               # ── Post failing check-run on orphaned PR's head commit ─────────
               # Use --field flags rather than --input to avoid heredoc YAML issues.
+              # `|| true` (#2366): this workflow's own closing contract is
+              # "always exit 0, informational + retroactive, never fail the
+              # triggering PR" -- but a bare `VAR=$(cmd)` takes cmd's exit
+              # status, and this step runs under Actions' default `bash -e`.
+              # An API failure here would terminate the whole step, silently
+              # skipping every remaining orphan in the loop and never reaching
+              # the `else` branch below that exists specifically to report it.
+              # Content-based dispatch (grep for `"id":`) is UNCHANGED and
+              # deliberately preserved -- this file's own hard-won lesson
+              # above is that `gh api` can print an error body to stdout on
+              # failure, so checking exit status instead here would be a
+              # regression, not an improvement.
               CHECK_RESULT=$(gh api --method POST "repos/$REPO/check-runs" \
                 --field name="anti-dup" \
                 --field head_sha="$ORPHAN_SHA" \
@@ -180,7 +212,7 @@ jobs:
                 --field conclusion="failure" \
                 --field output[title]="Duplicate PR -- target issue #$N now closed" \
                 --field output[summary]="PR #$MERGED_PR merged and closed issue #$N. This PR also targets #$N with a closing keyword and is now a duplicate. Options: (1) If this PR supersedes the merged fix, reopen issue #$N and explain the distinction in this PR description. (2) If this PR duplicates the merged fix, close it." \
-                2>&1)
+                2>&1) || true
               if printf '%s' "$CHECK_RESULT" | grep -q '"id":[[:space:]]*[0-9]'; then
                 echo "  check-run posted on #$ORPHAN_NUM: OK"
               else
@@ -194,9 +226,17 @@ jobs:
                 '**Duplicate PR detected (anti-dup-retro-check)**\n\nPR #%s merged and closed issue #%s. This PR also references #%s with a closing keyword and is now orphaned.\n\n**Options:**\n- If this PR supersedes or extends the merged fix, reopen issue #%s and update this PR description to explain the distinction.\n- If this PR duplicates the merged fix, close it.\n\n*(Posted by the anti-dup-retro-check workflow.)*' \
                 "$MERGED_PR" "$N" "$N" "$N")
 
-              COMMENT_RESULT=$(gh pr comment "$ORPHAN_NUM" --repo "$REPO" \
-                --body "$COMMENT" 2>&1)
-              if [ $? -eq 0 ]; then
+              # #2366: same errexit trap as CHECK_RESULT above, plus a second
+              # subtlety a bare `|| true` here would introduce -- this
+              # dispatch is EXIT-CODE-based (`[ $? -eq 0 ]`), not
+              # content-based, so appending `|| true` to the assignment
+              # would force $? to 0 unconditionally and make every failure
+              # print as "OK". Restructuring as the condition of `if` (a
+              # documented `set -e` exemption, and the same safe pattern
+              # this file already uses for ISSUE_JSON above) captures the
+              # real exit status without ever exposing it to errexit.
+              if COMMENT_RESULT=$(gh pr comment "$ORPHAN_NUM" --repo "$REPO" \
+                --body "$COMMENT" 2>&1); then
                 echo "  comment posted on #$ORPHAN_NUM: OK"
               else
                 echo "  comment on #$ORPHAN_NUM: FAILED -- $COMMENT_RESULT"
