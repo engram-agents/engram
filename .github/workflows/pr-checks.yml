@@ -11,6 +11,7 @@ name: pr-checks
 #   3. pr-body-close-keyword     (was check-pr-body-close-keyword.yml)
 #   4. name-leak-warn            (was name-leak-warn.yml — advisory, never blocks job)
 #   5. stray-master-ref-check    (#1884 — advisory, never blocks job)
+#   5b. stray-baton-path-check  (#2316 — advisory, never blocks job)
 #   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
 #   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
@@ -429,6 +430,22 @@ jobs:
         continue-on-error: true
         run: |
           python3 tools/stray_master_ref_check.py | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # ── 5b. stray-baton-path-check ───────────────────────────────────────
+      # #2316 — the 2026-06-27 baton-store cutover left 13 files carrying the
+      # pre-cutover path, three of them live runtime defaults rather than
+      # merely documentation (one measured to miss 56% of real in-flight
+      # batons as a result). The old directory was never removed, so a stale
+      # reference resolves silently to a real-looking but wrong tree instead
+      # of failing loudly. Advisory, never blocks — same posture as
+      # stray-master-ref-check: a false positive on a legitimate historical
+      # note should cost a glance, not a red X. Whole-tree by design (unlike
+      # stray-master-ref-check's load-bearing-surfaces-only scope) — see
+      # tools/stray_baton_path_check.py's module docstring for why.
+      - name: stray-baton-path-check — scan for the stale pre-cutover baton path
+        continue-on-error: true
+        run: |
+          python3 tools/stray_baton_path_check.py | tee -a "$GITHUB_STEP_SUMMARY"
 
       # ── 6. invariant-checks ────────────────────────────────────────────
       # (from invariant-checks.yml)

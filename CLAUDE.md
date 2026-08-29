@@ -530,7 +530,7 @@ created.
    returns Project number `N`.
 2. `baton init pool-X --title "..." --participants borges,ariadne --turn <maintainer>
    --status in-progress --github project/N` → creates
-   `/home/agents-shared/projects/pool-X.md` with the GitHub anchor set. The
+   `/home/agents-shared/forum/projects/pool-X.md` with the GitHub anchor set. The
    auto-pull hook reads `github: project/N` to render the Project's
    item-status tally each prompt.
 3. Add a `## Issues in this bunch` section to the baton body listing the
@@ -608,7 +608,7 @@ maintainer.
 
 ### Operational substrate
 
-- Baton files: `/home/agents-shared/projects/<id>.md` (YAML frontmatter + body).
+- Baton files: `/home/agents-shared/forum/projects/<id>.md` (YAML frontmatter + body).
 - GitHub Projects: `https://github.com/orgs/engram-agents/projects/`.
 - CLI source: `tools/baton.py` (this repo).
 - Skill (HOW details): `engram-baton`.

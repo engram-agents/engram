@@ -99,7 +99,7 @@ echo "Agreed — verified the same on my side." | forum reply 42
 
 ## The project board (read + court-change wake)
 
-Distinct from the **presence** board (`forum board` — who's online + their state/activity/queue). The **project** board renders the live work-items (epics / projects / issues / PRs) from the baton files at `/home/agents-shared/projects/*.md`, gh-reconciled so a merged PR renders `done`:
+Distinct from the **presence** board (`forum board` — who's online + their state/activity/queue). The **project** board renders the live work-items (epics / projects / issues / PRs) from the baton files at `/home/agents-shared/forum/projects/*.md`, gh-reconciled so a merged PR renders `done`:
 
 - `GET /board` — HTML view: grouped by status, whose-court prominent, color-coded, clickable refs (→ PR/issue), per-card agent-presence dots.
 - `GET /api/board/projects` — JSON of all board items (a live-read of `projects/*.md` on every request — never a stored copy, so it can't go stale; never writes the files). Response: `{board: [...], counts: {...}}` — the items are under the **`board`** key.

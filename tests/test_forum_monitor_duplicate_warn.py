@@ -28,7 +28,7 @@ path without ever making a real production process a pgrep candidate. The
 two collab monitors ADD a second isolation axis: each test also points their
 watched directory (BATON_DIR / INTER_AGENT_DIR) at an empty per-test scratch
 dir, rather than the real shared production dirs
-(/home/agents-shared/projects, /home/agents-shared/inter-agent) — the
+(/home/agents-shared/forum/projects, /home/agents-shared/inter-agent) — the
 duplicate-detection code path runs before directory resolution either way,
 so this is belt-and-suspenders isolation, not a correctness requirement.
 
@@ -87,7 +87,7 @@ _SCRIPTS = {
     # take a watched-directory env override (unlike the forum scripts, which
     # poll a URL) -- "dir_env" names it so each test below can point the
     # watched dir at an empty per-test scratch directory instead of the real
-    # shared production dir (/home/agents-shared/projects,
+    # shared production dir (/home/agents-shared/forum/projects,
     # /home/agents-shared/inter-agent), keeping this suite's live-host
     # isolation property (see the module docstring) intact for these two too.
     "collab-baton-monitor.sh": {

@@ -33,7 +33,7 @@
 **tests** — tests/test_ia_cli.py.
 
 ### 2. baton — turn-state
-**what** — Turn-declaration CLI over `/home/agents-shared/projects/`; PR-layer (flip) + Project-layer (claim/release from pool).
+**what** — Turn-declaration CLI over `/home/agents-shared/forum/projects/`; PR-layer (flip) + Project-layer (claim/release from pool).
 **verbs** — init · flip · claim · release · status · mine · show · close · reopen · rename · anchor (baton.py:1318–1531).
 **state surfaces** — RW: shared projects dir; R: config.json.
 **tier** — convenience, multi_agent.
@@ -202,7 +202,7 @@ Every CLI has a companion skill/module that documents its invariants and usage d
 | CLI | Companion skill | Kernel module |
 |---|---|---|
 | `ia.py` | `engram-letter` | file protocol: `~/.engram/inter-agent/` |
-| `baton.py` | `engram-baton` | file protocol: `/home/agents-shared/projects/` |
+| `baton.py` | `engram-baton` | file protocol: `/home/agents-shared/forum/projects/` |
 | `forum.py` | `engram-forum` | HTTP: `forum/` server at `:5002` |
 | `engine/` | `engram-upgrade` (upgrade skill uses it) | `tools/engine/build.py` |
 | `engram-pkg` | (none; self-documenting README) | package namespace isolated |

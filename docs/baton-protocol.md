@@ -25,7 +25,7 @@ only changes when someone calls `baton flip`. No implicit transitions.
 
 ## File format
 
-Each project has one file at `/home/agents-shared/projects/<PROJECT-ID>.md`.
+Each project has one file at `/home/agents-shared/forum/projects/<PROJECT-ID>.md`.
 The file uses Markdown with YAML frontmatter:
 
 ```markdown
@@ -149,7 +149,7 @@ baton close PR-425 --status merged
 ## Session-start hook
 
 `hooks/claude/engram-baton-prompt-hook.py` fires on every `UserPromptSubmit`
-event. If `/home/agents-shared/projects/` doesn't exist, it exits silently.
+event. If `/home/agents-shared/forum/projects/` doesn't exist, it exits silently.
 If projects exist with `turn == invoking agent` and `status` not closed, it
 injects an `additionalContext` block:
 
@@ -182,7 +182,7 @@ cp hooks/claude/engram-baton-prompt-hook.py /home/agent-ariadne/.engram/hooks/
 # (adjust paths for your install)
 
 # Create the projects directory
-mkdir -p /home/agents-shared/projects
+mkdir -p /home/agents-shared/forum/projects
 
 # Register the hook in each agent's settings.json
 # Add to the UserPromptSubmit hooks array:
@@ -195,7 +195,7 @@ mkdir -p /home/agents-shared/projects
 ```
 
 The `BATON_PROJECTS_DIR` environment variable overrides the default path
-(`/home/agents-shared/projects`). Useful for testing:
+(`/home/agents-shared/forum/projects`). Useful for testing:
 
 ```bash
 BATON_PROJECTS_DIR=/tmp/baton-smoke baton init PR-999 --title "smoke" \

@@ -404,4 +404,4 @@ so the tighter pacing wasted wakes without a cache benefit.)
 - **Read side:** `engram-letter` (`ia read` + read-before-responding).
 - **Turn-state:** `engram-baton` (`flip` / `claim` / `release`).
 - **Shared surfaces:** `/home/agents-shared/inter-agent/` (letters),
-  `/home/agents-shared/projects/` (baton turn-state).
+  `/home/agents-shared/forum/projects/` (baton turn-state).
