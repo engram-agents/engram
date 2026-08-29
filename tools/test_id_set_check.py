@@ -130,8 +130,19 @@ because a PR author who correctly restored a test after writing the marker
 line should not be blocked by their own now-stale housekeeping.
 
 Usage:
-    python3 tools/test_id_set_check.py --base <rev> --head <rev> \
+    python3 tools/test_id_set_check.py \
+        --base "$(git merge-base origin/dev HEAD)" --head HEAD \
         [--pr-body-file PATH] [--repo-root PATH] [--format text|json]
+
+`--base` MUST be the merge-base with the target branch, never the target
+branch's current tip — see #2381. Passing the tip fabricates disappearances
+for every test that landed on the target branch after this branch was cut
+(the branch deletes nothing; it simply predates those tests). CI's own
+invocation (`.github/workflows/pr-checks.yml`) computes this correctly; a
+manual reproduction that copies the target branch name instead reproduces
+the bug, not the gate. If `--base` is not an ancestor of `--head`, `main()`
+prints a `::warning::` naming the real merge-base — read it, and re-run with
+that value, before trusting a reported disappearance.
 
 Exit codes:
     0 — pass (no disappearances, or every disappearance is accounted for;
@@ -445,6 +456,102 @@ def read_sources_at_rev(repo_root: Path, rev: str) -> dict[str, str]:
     return sources
 
 
+def _is_ancestor(repo_root: Path, base: str, head: str) -> bool | None:
+    """True if `base` is an ancestor of (or equal to) `head`, False if not,
+    None if git could not answer at all. Measured exit codes (Ariadne,
+    #2381): 0=ancestor, 1=NOT an ancestor (both a genuine divergence AND
+    unrelated histories share this code), 128=invalid revision. Checks
+    `== 1` specifically rather than `!= 0`, per that measurement — the
+    128 case is unreachable in practice (`main()` only calls this after
+    `read_sources_at_rev` has already resolved both revs via `ls-tree`,
+    which fails fast with its own `GitReadError` on a bad rev first), but
+    coding the precise value rather than the negation is correct on its
+    own terms and does not depend on staying unreachable. The caller
+    treats None the same as True (stay silent) since this check is
+    advisory only and must never itself crash or gate the tool.
+    Deliberately a raw `subprocess.run`, not `_run_git`: a non-ancestor
+    result is exit code 1, which `_run_git` would otherwise raise as a
+    `GitReadError`."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", base, head],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _merge_base(repo_root: Path, base: str, head: str) -> str | None:
+    """Return the real merge-base of `base` and `head`, or None if `base`
+    and `head` share no common ancestor at all (unrelated histories).
+    Measured (Ariadne, #2381): `git merge-base` on two unrelated histories
+    exits 1 with EMPTY stdout — a hazard for a naive implementation that
+    checked only stdout-non-empty and missed the exit code, but this
+    function checks `returncode != 0` first, and exit 1 is already
+    nonzero, so that single check catches the unrelated-histories case
+    with no separate stdout check needed. Verified by mutation: dropping
+    to only a `not stdout.strip()` check (no returncode check at all)
+    would fail to distinguish "no merge-base" from "merge-base is the
+    empty tree", which does not exist as a real git output — so the
+    returncode check alone is both necessary and sufficient, and an
+    additional stdout-emptiness check on top of it is dead code that adds
+    a rationale for a case that cannot occur (the same shape as the
+    128-exit-code case `_is_ancestor` explicitly declines to test). The
+    caller must still handle None as its own distinct case (say so
+    explicitly) rather than treat it as "nothing to report" — printing a
+    warning with a blank interpolated into it is worse than no warning."""
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "merge-base", base, head],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def warn_if_base_is_not_ancestor(repo_root: Path, base: str, head: str) -> None:
+    """#2381: `--base` naming the target branch's current tip instead of the
+    merge-base fabricates disappearances for anything that landed on the
+    target branch after this branch was cut. This is advisory ONLY —
+    deliberately a `::warning::`, never a failure or a silent auto-resolve
+    (see the module docstring's #2381 note for why: a legitimate
+    non-ancestor base is conceivable, and a tool that quietly reinterprets
+    the rev it was handed is a worse trap than the one this closes). Prints
+    the real merge-base so the reader has the exact fix in hand rather than
+    just being told something is wrong — UNLESS `base`/`head` share no
+    common ancestor at all (`_merge_base` returns None), in which case
+    there is no fix to hand over and the message says so instead of
+    printing a warning with a blank where the SHA belongs. Silently does
+    nothing if the ancestor check itself cannot be answered at all
+    (`_is_ancestor` returns None) — an advisory check must never become a
+    second way for this tool to error out."""
+    is_ancestor = _is_ancestor(repo_root, base, head)
+    if is_ancestor is not False:
+        return
+    merge_base = _merge_base(repo_root, base, head)
+    if merge_base is None:
+        print(
+            f"::warning::test_id_set_check: --base {base} is not an ancestor of "
+            f"--head {head} (see #2381), and the two have no common ancestor at "
+            f"all (unrelated histories) -- some reported disappearances below "
+            f"may be an artifact of that rather than real deletions.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"::warning::test_id_set_check: --base {base} is not an ancestor of "
+        f"--head {head} (see #2381) -- some reported disappearances below may "
+        f"be commits this branch simply predates, not real deletions. The "
+        f"actual merge-base is {merge_base}; re-run with "
+        f"--base {merge_base} before trusting a disappearance.",
+        file=sys.stderr,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -454,7 +561,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fail a PR whose test-id set shrinks without an explicit Removed-test marker (#2350)."
     )
-    parser.add_argument("--base", required=True, metavar="REV", help="Base git revision (e.g. merge-base SHA).")
+    parser.add_argument(
+        "--base",
+        required=True,
+        metavar="REV",
+        help="Base git revision — MUST be the merge-base with the target branch "
+        '(e.g. $(git merge-base origin/dev HEAD)), never the target branch\'s '
+        "current tip. Passing the tip fabricates disappearances for anything "
+        "that landed on the target branch after this branch was cut (#2381).",
+    )
     parser.add_argument("--head", required=True, metavar="REV", help="Head git revision.")
     parser.add_argument(
         "--pr-body-file",
@@ -483,6 +598,11 @@ def main(argv: list[str] | None = None) -> int:
     except GitReadError as exc:
         print(f"test_id_set_check: error — {exc}", file=sys.stderr)
         return 2
+
+    # Deliberately AFTER both revs are already confirmed resolvable above:
+    # an invalid --base/--head fails loudly via GitReadError first, so this
+    # advisory check only ever runs on revs git can already read (#2381).
+    warn_if_base_is_not_ancestor(repo_root, args.base, args.head)
 
     try:
         base_ids = collect_ids(base_sources)

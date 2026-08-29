@@ -29,6 +29,7 @@ tmp repos, per the spec's testability-seam design.
 """
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -52,6 +53,10 @@ evaluate = _mod.evaluate
 ParseError = _mod.ParseError
 Marker = _mod.Marker
 format_report_text = _mod.format_report_text
+main = _mod.main
+warn_if_base_is_not_ancestor = _mod.warn_if_base_is_not_ancestor
+_is_ancestor = _mod._is_ancestor
+_merge_base = _mod._merge_base
 
 
 # ---------------------------------------------------------------------------
@@ -547,3 +552,192 @@ def test_stray_unterminated_backtick_swallows_a_later_marker_by_design():
     report_without_stray = evaluate(base_ids, head_ids, markers_without_stray)
     assert report_without_stray.passed
     assert report_without_stray.unaccounted == ()
+
+
+# ---------------------------------------------------------------------------
+# #2381 — tip-as-base fabricates disappearances; the non-ancestor warning
+#
+# A deliberate departure from this file's own "no git, no tmp repos" design
+# (see the module docstring above): everything else in this suite tests pure
+# functions with inline source strings, but the bug this section guards
+# against is inherently about git ancestry between two real revisions, which
+# cannot be represented without a real repo. THE POSITIVE CONTROL IS STILL
+# THE POINT: the case below reproduces the exact fabricated-disappearance
+# shape (Ariadne, PR#2380 review, engram-alpha#2381) with a real git history,
+# not merely a code path that runs without raising.
+# ---------------------------------------------------------------------------
+
+
+def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def _make_ancestry_fixture(tmp_path: Path) -> dict[str, str]:
+    """Build a real repo reproducing #2381's shape: a `dev`-tip commit that
+    has moved past the point a `feature` branch was cut from, by adding a
+    brand-new test file dev never had when feature branched. Returns the
+    three revisions under test: `merge_base` (the true common ancestor),
+    `dev_tip` (NOT an ancestor of feature — this is the trap), and
+    `feature_tip` (the PR branch being checked, unaffected by the trap)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_existing.py").write_text("def test_a():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    merge_base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # feature branch: cut here, makes an UNRELATED change (never touches the
+    # test-id set at all) -- the branch that "deletes nothing".
+    _git(repo, "checkout", "-q", "-b", "feature")
+    (repo / "README.md").write_text("unrelated change\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feature: unrelated change")
+    feature_tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    # dev advances past the branch point with a genuinely NEW test file --
+    # the sibling PR that merged in after feature was cut.
+    _git(repo, "checkout", "-q", merge_base)
+    _git(repo, "checkout", "-q", "-b", "dev")
+    (tests_dir / "test_new_on_dev.py").write_text("def test_new():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "dev: new test file, unrelated to feature")
+    dev_tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return {"repo": str(repo), "merge_base": merge_base, "dev_tip": dev_tip, "feature_tip": feature_tip}
+
+
+def test_2381_dev_tip_as_base_is_not_an_ancestor_and_warns(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The exact trap: passing dev's tip (not the merge-base) as --base.
+    warn_if_base_is_not_ancestor must fire, naming the REAL merge-base."""
+    fx = _make_ancestry_fixture(tmp_path)
+    warn_if_base_is_not_ancestor(Path(fx["repo"]), fx["dev_tip"], fx["feature_tip"])
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.err
+    assert "#2381" in captured.err
+    assert fx["merge_base"] in captured.err, (
+        "the warning must name the ACTUAL merge-base so the reader has the "
+        "exact fix in hand, not merely a notice that something is wrong"
+    )
+
+
+def test_2381_merge_base_as_base_is_an_ancestor_and_is_silent(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The correct invocation must never warn -- a false positive here would
+    train readers to ignore the warning entirely."""
+    fx = _make_ancestry_fixture(tmp_path)
+    warn_if_base_is_not_ancestor(Path(fx["repo"]), fx["merge_base"], fx["feature_tip"])
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out == ""
+
+
+def test_2381_cli_with_dev_tip_fabricates_disappearances_but_warns(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """End-to-end reproduction of Ariadne's #2381 report through main()
+    itself: --base dev_tip reports a FAKE disappearance (test_new_on_dev.py
+    never existed on feature, but feature never deleted it either -- dev
+    simply gained it after the branch point) alongside the warning that
+    explains why. The warning does not change the exit code -- it is
+    strictly advisory, per the module docstring's explicit design."""
+    fx = _make_ancestry_fixture(tmp_path)
+    exit_code = main(["--base", fx["dev_tip"], "--head", fx["feature_tip"], "--repo-root", fx["repo"]])
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.err
+    assert fx["merge_base"] in captured.err
+    assert "tests/test_new_on_dev.py::test_new" in captured.out, (
+        "confirms the trap actually reproduces: a fabricated disappearance "
+        "for a test the feature branch never touched"
+    )
+    assert exit_code == 1, "the fabricated disappearance still fails the gate -- this is the bug, not a non-bug"
+
+
+def test_2381_cli_with_merge_base_passes_cleanly_and_silently(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The correct invocation, same branches: no warning, no fabricated
+    disappearance, clean PASS. Also stands in for CI's own invocation shape
+    (a real merge-base SHA is an ancestor by construction) -- an explicit
+    assertion that the warning never fires there, per Ariadne's #2381 note,
+    so nobody later 'fixes' the CI workflow into the warning path."""
+    fx = _make_ancestry_fixture(tmp_path)
+    exit_code = main(["--base", fx["merge_base"], "--head", fx["feature_tip"], "--repo-root", fx["repo"]])
+    captured = capsys.readouterr()
+    assert "::warning::" not in captured.err
+    assert captured.err == ""
+    assert exit_code == 0
+    assert "PASS" in captured.out
+
+
+def _make_orphan_fixture(tmp_path: Path) -> dict[str, str]:
+    """Two commits sharing NO common ancestor at all -- distinct from
+    `_make_ancestry_fixture`'s divergent-but-related branches. Measured
+    (Ariadne, #2381): `git merge-base` on two such refs exits 1 with EMPTY
+    stdout, which the empty-blank-warning guard exists to catch."""
+    repo = tmp_path / "orphan_repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "main history")
+    main_tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    _git(repo, "checkout", "-q", "--orphan", "unrelated")
+    _git(repo, "rm", "-rf", "-q", ".")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_b.py").write_text("def test_b():\n    assert True\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "unrelated history")
+    orphan_tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return {"repo": str(repo), "main_tip": main_tip, "orphan_tip": orphan_tip}
+
+
+def test_2381_unrelated_histories_have_no_merge_base_and_return_none(tmp_path: Path) -> None:
+    """`_merge_base` must return None (not an empty string) for two commits
+    with no common ancestor -- distinguishing 'no merge-base exists' from
+    'merge-base is empty' is exactly the guard the blank-interpolation
+    hazard needs."""
+    fx = _make_orphan_fixture(tmp_path)
+    assert _is_ancestor(Path(fx["repo"]), fx["orphan_tip"], fx["main_tip"]) is False
+    assert _merge_base(Path(fx["repo"]), fx["orphan_tip"], fx["main_tip"]) is None
+
+
+def test_2381_unrelated_histories_warn_without_a_blank_sha(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The actual hazard Ariadne flagged: naming a merge-base that does not
+    exist must not print a blank where the SHA belongs -- it must say
+    plainly that there is no common ancestor."""
+    fx = _make_orphan_fixture(tmp_path)
+    warn_if_base_is_not_ancestor(Path(fx["repo"]), fx["orphan_tip"], fx["main_tip"])
+    captured = capsys.readouterr()
+    assert "::warning::" in captured.err
+    assert "no common ancestor" in captured.err
+    assert "--base " not in captured.err.split("no common ancestor")[-1], (
+        "must not suggest a re-run command when there is no merge-base to suggest"
+    )
+
+
+def test_2381_is_ancestor_returns_none_on_an_invalid_revision(tmp_path: Path) -> None:
+    """Robustness, not a claim about reachability via the CLI: main() never
+    reaches this path today (read_sources_at_rev's ls-tree call fails first
+    on a bad rev), but `_is_ancestor` itself must not raise if ever called
+    directly with one, since a raised exception is a much worse failure
+    mode for an advisory-only check than silently returning None."""
+    fx = _make_ancestry_fixture(tmp_path)
+    assert _is_ancestor(Path(fx["repo"]), "deadbeef" * 5, fx["feature_tip"]) is None
