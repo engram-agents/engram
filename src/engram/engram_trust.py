@@ -208,13 +208,11 @@ def _add_person_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Pass importance_base directly so _stamp_new_node writes
+        # the anchor in one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()

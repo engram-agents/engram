@@ -161,14 +161,13 @@ def _add_goal_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -337,13 +336,11 @@ def _add_task_impl(
                         (json.dumps(parent_meta), parent_task_id),
                     )
 
-        # Stamp with planned importance (2.0)
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        planned_score = core._compute_importance(TASK_IMPORTANCE["planned"], core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = ?, importance_score = ? WHERE id = ?",
-            (TASK_IMPORTANCE["planned"], planned_score, node_id),
-        )
+        # Stamp with planned importance (TASK_IMPORTANCE["planned"] = 2.0).
+        # Pass importance_base directly so _stamp_new_node writes the anchor
+        # in one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
 
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
         # implements_ids (cites edges) and goal_id (serves edge) are
@@ -756,14 +753,11 @@ def _report_feeling_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # Stamp + anchor importance. Same pattern as goals/axioms: stamp first
-        # to compute embedding, then overwrite importance to the anchored 2.0.
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id),
-        )
+        # Stamp + anchor importance. Same pattern as goals/axioms: pass
+        # importance_base directly so _stamp_new_node writes the anchor in
+        # one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
 
         conn.commit()
 

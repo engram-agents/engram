@@ -184,11 +184,13 @@ def _add_axiom_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=1.0, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -315,11 +317,13 @@ def _add_definition_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
@@ -1098,19 +1102,12 @@ def _add_lesson_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # Stamp importance, then anchor (like goals — lessons persist).
-        # confidence= here feeds ONLY the importance formula, not the stored
-        # confidence — lessons are non-claim-bearing and store confidence =
-        # NULL (see the INSERT above). 0.5 is a neutral importance prior,
-        # matching the goal/cornerstone convention for NCB types, and this
-        # importance_base write is itself superseded immediately below by
-        # the fixed lesson anchor (importance_base = 2.0).
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Lessons are importance-anchored at a fixed value (2.0), like goals
+        # and cornerstones — lessons persist. Pass importance_base directly
+        # so _stamp_new_node writes the anchor in one pass instead of
+        # computing an interim value from confidence/surprise and then
+        # overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
