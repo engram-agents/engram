@@ -188,69 +188,16 @@ URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only 
 # the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
 _check_forum_mention_dup() {
-    # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
-    # argv) when /proc exists; falls back to `ps -p <pid> -o args=` (space-
-    # joined, weaker) when it does not (macOS). Exit codes:
-    #   0 = confirmed duplicate, /proc-verified (strong) — stdout is the
-    #       cmdline (argv joined on spaces, truncated to ~100 chars — the
-    #       boot charge alone runs ~2.5KB and must not flood the Monitor
-    #       event stream).
-    #   1 = not a duplicate, including "process gone mid-read" (a race, not
-    #       an error) — silent, nothing on stdout.
-    #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
-    #       denied, or the `ps` fallback itself erroring) — stdout is a short
-    #       reason string; caller must warn, not silently skip.
-    #   3 = probable duplicate, ps-fallback-verified (weak — /proc absent,
-    #       string-split match only) — stdout is the ps `args=` output,
-    #       truncated to ~100 chars.
-    python3 -c '
-import errno, os, subprocess, sys
-pid, script = sys.argv[1], sys.argv[2]
-# ENGRAM_PROC_DIR is a true optional: it exists only so tests can force the
-# ps-fallback branch on Linux (point it at an empty dir). Its ABSENCE means
-# "use the real system procfs" and must warn about nothing.
-_PROC = os.environ.get("ENGRAM_PROC_DIR", "/proc")
-if os.path.exists(_PROC + "/self/cmdline"):
-    try:
-        with open(_PROC + "/" + pid + "/cmdline", "rb") as f:
-            raw = f.read()
-    except OSError as e:
-        if e.errno in (errno.ENOENT, errno.ESRCH):
-            sys.exit(1)  # process gone mid-read: not a match, not an error
-        print(str(e) or type(e).__name__)
-        sys.exit(2)  # could not verify — do not silently treat as "not a match"
-    argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-    if not argv:
-        sys.exit(1)
-    interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
-    if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
-        sys.exit(1)
-    if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
-        sys.exit(1)
-    cmd = " ".join(argv)
-    print(cmd[:100])
-    sys.exit(0)
-# No /proc (macOS): portable fallback, mirrors umwelt-bell.py.
-try:
-    r = subprocess.run(["ps", "-p", pid, "-o", "args="],
-                        capture_output=True, text=True, timeout=5)
-except Exception as e:
-    print(str(e) or type(e).__name__)
-    sys.exit(2)
-cmd = r.stdout.strip()
-if not cmd:
-    sys.exit(1)  # ps found no such pid: gone, not a match
-tokens = cmd.split()
-if not tokens:
-    sys.exit(1)
-interp = os.path.basename(tokens[0]).lstrip("-")
-if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
-    sys.exit(1)
-if not any(t == script or t.endswith("/" + script) for t in tokens[1:]):
-    sys.exit(1)
-print(cmd[:100])
-sys.exit(3)  # weak match — ps-fallback only, no /proc to verify against
-' "$1" "$2" 2>/dev/null
+    # $1=pid $2=script-basename. Delegates to the shared _proc_identity.py
+    # (#2321 -- extracted from a 1629-byte block that used to be
+    # byte-identical, hand-synced, in this file and
+    # forum-updates-monitor.sh). See that module's own docstring for the
+    # full exit-code table and the /proc-vs-ps-fallback reasoning; this
+    # wrapper's only job is finding the sibling script and forwarding argv.
+    local _self _proc_identity
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    _proc_identity="$(dirname "$_self")/_proc_identity.py"
+    python3 "$_proc_identity" "$1" "$2" 2>/dev/null
 }
 
 if [ -z "${FORUM_MENTION_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then

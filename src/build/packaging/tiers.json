@@ -280,6 +280,12 @@
       "multi_agent": true
     },
     {
+      "path": "tools/_proc_identity.py",
+      "tier": "convenience",
+      "multi_agent": true,
+      "reason": "shared process-identity verification (#2321), extracted from forum-mention-monitor.sh/forum-updates-monitor.sh -- ships alongside both, same tier"
+    },
+    {
       "path": "tools/codex-umwelt-wake.py",
       "tier": "convenience"
     },
