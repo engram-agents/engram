@@ -200,7 +200,8 @@ def _immediate_cause(conn, node_id: str, cascade_event: str) -> list:
     placeholders = ",".join("?" for _ in premises)
     rows = conn.execute(
         f"SELECT node_id FROM cascade_markers "
-        f"WHERE cascade_event = ? AND node_id IN ({placeholders})",
+        f"WHERE cascade_event = ? AND node_id IN ({placeholders}) "
+        f"ORDER BY node_id",
         (cascade_event, *premises),
     ).fetchall()
     return [r["node_id"] for r in rows]
@@ -224,10 +225,413 @@ def _dead_premises(conn, node_id: str, cascade_event: str) -> list:
         f"SELECT node_id FROM cascade_markers "
         f"WHERE cascade_event = ? AND node_id IN ({placeholders}) "
         f"AND status = 'resolved' "
-        f"AND resolution_kind IN ('superseded', 'retracted')",
+        f"AND resolution_kind IN ('superseded', 'retracted') "
+        f"ORDER BY node_id",
         (cascade_event, *premises),
     ).fetchall()
     return [r["node_id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# engram_cascade_frontier (engram-alpha#2013 slice 3 — derived reads)
+# ---------------------------------------------------------------------------
+# READ-ONLY throughout: no INSERT/UPDATE/DELETE anywhere below. The frontier
+# is a PURE FUNCTION of cascade_markers + edges + nodes state — no queue, no
+# cursor, no persisted frontier state. Composes with core._walk_cascade_upstream
+# (the shared premise-direction primitive) and the existing derived reads
+# above (_immediate_cause, _dead_premises) — neither is modified.
+#
+# Frontier definition (spec, verbatim): a node is on the frontier iff it
+# carries >=1 PENDING cascade marker AND none of its cascade-ancestors (full
+# transitive closure via CASCADE_RELATIONS, not merely direct premises — the
+# spec explicitly names _walk_cascade_upstream as the mechanism) currently
+# carries a pending marker, for ANY cascade_event, against ANY root. Checked
+# per-NODE across ALL of that node's own events at once (a node touched by
+# two cascade events is frontier only once every pending direct-and-indirect
+# ancestor, across both events, has resolved) — never per-event.
+
+_CASCADE_FRONTIER_DEFAULT_LIMIT = 5
+_CASCADE_FRONTIER_CLAIM_GIST_LEN = 160
+
+
+def _cascade_ancestors(conn, node_id: str) -> set:
+    """ancestors(node_id): the full transitive closure over CASCADE_RELATIONS
+    via the shared core._walk_cascade_upstream primitive (full-ancestor mode:
+    collect_if=descend_if=lambda row: True). INCLUDES node_id itself — this
+    matches the walk's own established "ancestors(X)" terminology/precedent
+    (tests/test_cascade_derived_sets.py::test_walk_cascade_upstream_full_ancestor_mode,
+    whose full_mode assertion includes the start node). Callers that need
+    PROPER ancestors (excluding node_id) subtract {node_id} themselves at
+    the call site — kept out of this helper so there is exactly one place
+    (here) deciding what "ancestors(X)" means, and every call site is
+    explicit about whether it wants the self-inclusive or self-exclusive
+    reading.
+    """
+    return core._walk_cascade_upstream(
+        conn, node_id,
+        collect_if=lambda row: True,
+        descend_if=lambda row: True,
+    )
+
+
+def _cascade_blocked(conn, node_id: str, pending_node_ids: set) -> bool:
+    """True iff node_id has a cascade-ancestor (excluding itself) that
+    currently carries >=1 PENDING marker, for ANY cascade_event and ANY
+    root_node — the frontier-blocking check. ``pending_node_ids`` is the
+    pre-computed set of every node_id in the graph with >=1 pending marker
+    (one query, shared across every candidate this call is made for) rather
+    than a fresh query per candidate.
+
+    Spec phrases the frontier rule two ways, and this implements the
+    TRANSITIVE one: #2013 §3 defines it over the full cascade-ancestor
+    closure ("pending markers all of whose cascade-ancestors are
+    resolved"), while §10.2's corollary phrases it over direct premises only
+    ("ALL pending direct premises resolved"). Do not narrow this to
+    direct-premises-only — transitive is the CORRECT reading, not merely the
+    cautious one, for the reason below.
+
+    Under Invariant 6 (a marker resolves only while its node is itself on
+    the frontier) the two readings pick out the identical set: by
+    induction, a resolved direct premise was unblocked at the moment it
+    resolved, so every one of ITS ancestors was already resolved too —
+    direct-premises-clean implies ancestors-clean. But invariant 6 is a
+    DESIGN RULE, not something any code enforces at write time:
+    _resolve_own_markers clears every pending marker on node_id alone
+    (``UPDATE cascade_markers ... WHERE node_id = ? AND status =
+    'pending'``), with no check that node_id's own cascade-ancestors are
+    clean first. Nothing in the write path stops a node's marker from
+    resolving while an ancestor's marker is still pending.
+
+    So divergence is not confined to a one-time migration — #2324's
+    backfilled markers (synthesized from retired metadata rather than
+    produced by a live cascade) are one instance of invariant 6 not
+    holding, not the category. Ordinary out-of-order resolution through the
+    live retract/supersede path produces it too: given a real chain
+    R1 -> G -> P1 -> N (derives_from edges, no backfill), retract R1
+    (markers land on G, P1, N via the derivation cascade), then supersede
+    P1 with a replacement that does not cite G. P1's own marker clears
+    (supersede resolves the superseded node's own pending markers
+    unconditionally) while G's marker is untouched and stays pending.
+    Direct-premises-only would read N as unblocked (its one direct premise,
+    P1, is clean) even though G — still upstream of N via P1's edges,
+    which supersede does not rewire — is still live. Transitive correctly
+    keeps N blocked: it withholds frontier status while ANY upstream marker
+    is still pending, rather than trusting a resolved direct premise to
+    imply a clean spine above it. (Regression fixture:
+    test_transitive_catches_out_of_order_resolution_direct_premises_would_miss
+    in tests/test_cascade_frontier.py.)
+    """
+    ancestors = _cascade_ancestors(conn, node_id) - {node_id}
+    return any(a in pending_node_ids for a in ancestors)
+
+
+def _cascade_event_creation_time(conn, cascade_event: str) -> str:
+    """The event's own ordering key: earliest created_at among ALL markers
+    (any status) sharing cascade_event. cascade_event carries no timestamp
+    column of its own. Every marker one retract/supersede call writes shares
+    the same ``now`` (see _write_cascade_marker's callers), so this is
+    normally just that shared timestamp; MIN() is a defensive choice for
+    backfilled events, where #2324's per-node 'recovered' provenance can
+    carry genuinely different original timestamps across markers nominally
+    sharing one migration-synthesized event id.
+    """
+    row = conn.execute(
+        "SELECT MIN(created_at) AS t FROM cascade_markers WHERE cascade_event = ?",
+        (cascade_event,),
+    ).fetchone()
+    return row["t"] if row and row["t"] else ""
+
+
+def _cascade_dead_premise_detail(conn, node_id: str, cascade_event: str) -> list:
+    """Detail companion to _dead_premises: which of node_id's direct
+    premises genuinely moved (resolved superseded/retracted) under
+    cascade_event, plus the resolution_kind / replacement id / resolved_at
+    each carries. Reuses _dead_premises for the id set (never re-derives its
+    filter) and pulls only the extra columns that function does not return.
+    """
+    dead_ids = _dead_premises(conn, node_id, cascade_event)
+    if not dead_ids:
+        return []
+    placeholders = ",".join("?" for _ in dead_ids)
+    rows = conn.execute(
+        f"SELECT node_id, resolution_kind, resolution_replacement_id, resolved_at "
+        f"FROM cascade_markers WHERE cascade_event = ? AND node_id IN ({placeholders}) "
+        f"ORDER BY node_id",
+        (cascade_event, *dead_ids),
+    ).fetchall()
+    return [
+        {
+            "premise_id": r["node_id"],
+            "resolution_kind": r["resolution_kind"],
+            "resolution_replacement_id": r["resolution_replacement_id"],
+            "resolved_at": r["resolved_at"],
+        }
+        for r in rows
+    ]
+
+
+def _cascade_frontier_node_summary(conn, node_id: str) -> dict:
+    """One frontier node's summary entry: id, type, a truncated claim gist
+    (truncation explicitly flagged, never silent), and per-event marker
+    detail (root_node / root_op / which direct premises died and how).
+
+    Every PENDING marker on node_id contributes one entry to "events" — a
+    multi-event node surfaces ALL of its events here, never collapsed to a
+    single value (Invariant 8: default to over-surfacing; see the
+    coder-fairy handoff's ambiguous-decision log for why "events" is a list
+    rather than the spec's singular "root_op" field).
+    """
+    node_row = conn.execute(
+        "SELECT type, claim FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    claim = (node_row["claim"] or "") if node_row else ""
+    node_type = node_row["type"] if node_row else "UNKNOWN"
+
+    truncated = len(claim) > _CASCADE_FRONTIER_CLAIM_GIST_LEN
+    claim_gist = (
+        claim[:_CASCADE_FRONTIER_CLAIM_GIST_LEN] + "..." if truncated else claim
+    )
+
+    direct_premises = set(core._direct_premise_ids(conn, node_id))
+    events = []
+    for m in core._pending_markers_for_node(conn, node_id):
+        cascade_event = m["cascade_event"]
+        root_node = m["root_node"]
+        root_op = m["root_op"]
+        events.append({
+            "cascade_event": cascade_event,
+            "root_node": root_node,
+            "root_op": root_op,
+            # Classification label, NOT a block-strength directive — both
+            # root_ops hard-block equally (core._cascade_marker_severity's
+            # own docstring warns against reading it as authority). Surfaced
+            # as a machine-labeled hint per Invariant 8, never unmarked.
+            "severity_label_hint": core._cascade_marker_severity(root_op),
+            "created_at": m["created_at"],
+            "root_is_direct_premise": root_node in direct_premises,
+            "immediate_cause": _immediate_cause(conn, node_id, cascade_event),
+            "dead_premises": _cascade_dead_premise_detail(conn, node_id, cascade_event),
+        })
+
+    events.sort(key=lambda e: (e["created_at"], e["cascade_event"]))
+    earliest_created_at = events[0]["created_at"] if events else ""
+    earliest_event = events[0]["cascade_event"] if events else ""
+
+    return {
+        "id": node_id,
+        "type": node_type,
+        "claim_gist": claim_gist,
+        "claim_gist_truncated": truncated,
+        "events": events,
+        "_earliest_pending_created_at": earliest_created_at,
+        "_earliest_pending_event": earliest_event,
+    }
+
+
+def _cascade_frontier_packet(conn, node_id: str, summary: dict) -> dict:
+    """Full adjudication packet for one frontier node — the K (``limit``)
+    nodes this pass admits. Everything the summary carries, plus the full
+    (untruncated) claim, confidence, recall_summary, created_at, is_current.
+    Invariant 8: show ALL the raw information the agent needs to
+    adjudicate, never only the machine's compressed summary-tier take.
+    """
+    row = conn.execute(
+        "SELECT claim, confidence, recall_summary, created_at, is_current, type "
+        "FROM nodes WHERE id = ?", (node_id,),
+    ).fetchone()
+    return {
+        "id": node_id,
+        "type": row["type"] if row else summary.get("type"),
+        "claim": row["claim"] if row else None,
+        "confidence": row["confidence"] if row else None,
+        "recall_summary": row["recall_summary"] if row else None,
+        "created_at": row["created_at"] if row else None,
+        "is_current": bool(row["is_current"]) if row else None,
+        "events": summary["events"],
+    }
+
+
+def _cascade_frontier_impl(node_id: str = None, limit: int = None) -> str:
+    """Impl for engram_cascade_frontier — see the @mcp.tool wrapper's
+    docstring in server.py for the full contract. READ-ONLY throughout: no
+    write ever happens on this path (no marker mutation, no confidence
+    recompute, no recall/utility side effects).
+
+    Mode B (node_id is None): every frontier node in the graph.
+    Mode C (node_id given): the frontier restricted to
+    ancestors(node_id) ∩ pending — node_id's own pending-marked
+    cascade-ancestors (plus node_id itself, when node_id is itself already
+    frontier — ancestors(node_id) includes node_id per _cascade_ancestors'
+    documented convention). Also returns a labeled blast-radius ESTIMATE.
+
+    Recomputed fresh from marker state on every call — no queue, no cursor,
+    no persisted frontier state; identical input state always yields
+    identical output (deterministic ordering, see the sort key below).
+    """
+    if limit is None:
+        limit = _CASCADE_FRONTIER_DEFAULT_LIMIT
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        return json.dumps({
+            "error": f"limit must be a non-negative integer, got {limit!r}"
+        })
+
+    conn = core._get_db()
+    try:
+        if node_id is not None:
+            root_row = conn.execute(
+                "SELECT id FROM nodes WHERE id = ?", (node_id,)
+            ).fetchone()
+            if not root_row:
+                return json.dumps({"error": f"Node '{node_id}' not found."})
+
+        pending_rows = conn.execute(
+            "SELECT DISTINCT node_id FROM cascade_markers WHERE status = 'pending'"
+        ).fetchall()
+        pending_node_ids = {r["node_id"] for r in pending_rows}
+
+        if node_id is None:
+            candidates = set(pending_node_ids)
+        else:
+            ancestors = _cascade_ancestors(conn, node_id)
+            candidates = ancestors & pending_node_ids
+
+        frontier_ids = [
+            nid for nid in candidates
+            if not _cascade_blocked(conn, nid, pending_node_ids)
+        ]
+
+        # Ordering (Lei's ruling, settles §9.4 item 3): event-grouped first
+        # tier (by the EVENT's own earliest-ever marker timestamp, across
+        # every marker sharing that event id, any status), then created_at
+        # ascending within a node's own earliest pending event, tie-break on
+        # cascade_event id (keeps groups from interleaving under a timestamp
+        # tie) then on node id for full determinism. ORDERING IS
+        # PRESENTATION-ONLY — nothing in this function reads position as
+        # meaning; recomputing this sort from identical marker state always
+        # yields identical order.
+        summaries = [_cascade_frontier_node_summary(conn, nid) for nid in frontier_ids]
+        event_time_cache: dict = {}
+
+        def _event_order_key(ev: str) -> str:
+            if ev not in event_time_cache:
+                event_time_cache[ev] = _cascade_event_creation_time(conn, ev)
+            return event_time_cache[ev]
+
+        summaries.sort(
+            key=lambda s: (
+                _event_order_key(s["_earliest_pending_event"]),
+                s["_earliest_pending_event"],
+                s["_earliest_pending_created_at"],
+                s["id"],
+            )
+        )
+        for s in summaries:
+            del s["_earliest_pending_created_at"]
+            del s["_earliest_pending_event"]
+
+        packets = [
+            _cascade_frontier_packet(conn, s["id"], s)
+            for s in summaries[:limit]
+        ]
+
+        response: dict = {
+            "mode": "B" if node_id is None else "C",
+            "node_id": node_id,
+            "frontier": summaries,
+            "frontier_count": len(summaries),
+            "total_pending_nodes": len(pending_node_ids),
+            "packets": packets,
+            "packets_returned": len(packets),
+            "packets_limit": limit,
+        }
+
+        # Invariant-1 anomaly check (READ-ONLY — flags, never repairs). If
+        # `candidates` (self-inclusive: pending_node_ids in mode B,
+        # ancestors(node_id) ∩ pending in mode C) is non-empty but the
+        # frontier came out empty, no candidate is currently resolvable —
+        # a state that should be UNREACHABLE in a well-formed graph
+        # (Invariant 1: "no pending marker survives a completed mode-B
+        # run" presupposes the frontier always contains a minimal unblocked
+        # element while pending markers remain). Silently returning
+        # frontier_count: 0 here is indistinguishable from "all clear" to a
+        # caller that isn't independently cross-checking total_pending_nodes
+        # — exactly the condition that would let a mode-B sweep loop
+        # (frontier -> resolve) terminate clean while pending markers are
+        # still stuck. Surfaced ONLY on this branch — omitted entirely from
+        # the healthy-path response (never emitted as null/false) so its
+        # mere presence is the loud signal, consistent with how the mode-C-
+        # only fields below are absent rather than null in mode B.
+        if not summaries and candidates:
+            if node_id is None:
+                _anomaly_scope = (
+                    f"{len(pending_node_ids)} node(s) graph-wide carry a "
+                    "pending cascade marker (total_pending_nodes) but "
+                    "frontier_count is 0 — nothing is resolvable."
+                )
+            else:
+                _anomaly_scope = (
+                    f"{len(candidates)} node(s) in {node_id}'s own "
+                    "pending-ancestor set (self-inclusive) carry a pending "
+                    "cascade marker but frontier_count is 0 — nothing in "
+                    "that set is resolvable."
+                )
+            response["invariant_1_violation_suspected"] = (
+                "ANOMALY SUSPECTED, not confirmed — machine assessment, not "
+                "a directive. " + _anomaly_scope + " This state should be "
+                "unreachable in a well-formed graph. Most likely cause: a "
+                "CYCLE in CASCADE_RELATIONS — the time-ordered-DAG "
+                "integrity scan is advisory, not blocking, so a cycle can "
+                "exist in a live graph and every node on it blocks every "
+                "other, leaving no minimal unblocked element. Also "
+                "possible: an out-of-order resolution elsewhere in the "
+                "cascade machine. A mode-B sweep (the frontier -> resolve "
+                "loop) MUST NOT treat this response as a completed, clean "
+                "sweep — Invariant 1 (no pending marker survives a "
+                "completed mode-B run) is not satisfied while this field "
+                "is present."
+            )
+
+        if node_id is not None:
+            # ancestors(node_id) ∩ pending, EXCLUDING node_id itself — "the
+            # pending-marked cascade-ancestors of the target" the spec names
+            # for the blast estimate (distinct from `candidates` above,
+            # which is self-inclusive for frontier-membership purposes).
+            ancestors_pending = candidates - {node_id}
+            events_in_play: set = set()
+            for anc in ancestors_pending:
+                for m in core._pending_markers_for_node(conn, anc):
+                    events_in_play.add(m["cascade_event"])
+            blast_ids: set = set()
+            if events_in_play:
+                placeholders = ",".join("?" for _ in events_in_play)
+                rows = conn.execute(
+                    f"SELECT DISTINCT node_id FROM cascade_markers "
+                    f"WHERE cascade_event IN ({placeholders})",
+                    tuple(events_in_play),
+                ).fetchall()
+                blast_ids = {r["node_id"] for r in rows}
+            response["pending_ancestor_count"] = len(ancestors_pending)
+            response["blast_radius_estimate"] = len(blast_ids)
+            response["blast_radius_estimate_note"] = (
+                "ESTIMATE, not a guarantee. blast_radius_estimate = total "
+                "distinct nodes ever marked (pending OR resolved) by the "
+                f"cascade_event(s) reaching {node_id}'s pending ancestors — "
+                "the larger historical footprint. pending_ancestor_count is "
+                "the SMALLER, minimal set that must resolve before node_id "
+                "itself clears (full pending_ancestor_count ~= blast_radius_"
+                "estimate; the claim you need now unblocks by resolving "
+                "pending_ancestor_count nodes, typically << blast_radius_"
+                "estimate). Every junction where an agent resolves a "
+                "premise as 'acknowledged' (claim unchanged) rather than "
+                "superseding/retracting it further changes what the "
+                "eventual real footprint turns out to be — resolve, then "
+                "re-call this tool rather than trusting either number as "
+                "fixed."
+            )
+
+        return json.dumps(response)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

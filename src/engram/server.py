@@ -640,6 +640,14 @@ def _retract_impl(*args, **kwargs):
     return _revision_mod._retract_impl(*args, _obs_creator=_observation_mod._add_observation_impl, **kwargs)
 # ---- end #872 wave-6 compat forwarders --------------------------------
 
+# ---- engram_cascade_frontier (engram-alpha#2013 slice 3) --------------
+# Core logic lives in engram_revision.py (family E, "cascade helpers") next
+# to _immediate_cause/_dead_premises it composes with; this is the thin
+# in-server forwarder, same shape as the wave-6 forwarders above.
+def _cascade_frontier_impl(*args, **kwargs):
+    return _revision_mod._cascade_frontier_impl(*args, **kwargs)
+# ---- end engram_cascade_frontier forwarder -----------------------------
+
 # ---- #872 wave-7 compat forwarders -----------------------------------
 # Impls + helpers moved to engram_stats.py (family H).
 # Compat forwarders preserve bare-name call sites throughout server.py
@@ -2434,6 +2442,149 @@ def engram_get_subgraph(payload_json: str) -> str:
     if "node_id" not in params:
         return json.dumps({"error": "payload_json must include required field 'node_id'"})
     return _subgraph_impl(**params)
+
+
+# DESIGN INTENT — engram_cascade_frontier
+# ----------------------------------------
+# engram-alpha#2013 slice 3 (derived reads). A READ-ONLY tool: no
+# INSERT/UPDATE/DELETE anywhere in this path, no marker mutation, no
+# confidence recompute. It answers "which marked nodes are ready to
+# adjudicate RIGHT NOW" by recomputing the frontier fresh from
+# cascade_markers state on every call — there is no queue, no cursor, no
+# persisted frontier state. Same input state always yields the same output.
+#
+# Frontier definition: a node is on the frontier iff it carries >=1 PENDING
+# cascade marker AND none of its cascade-ancestors (the full transitive
+# closure via CASCADE_RELATIONS — not merely its one-hop direct premises)
+# currently carries a pending marker, for ANY cascade_event, against ANY
+# root. Checked per-NODE across ALL of that node's own events at once — a
+# node touched by two cascade events is frontier only once every pending
+# ancestor, across BOTH events, has resolved.
+#
+# Two modes:
+#   Mode B (node_id omitted) — every frontier node in the graph.
+#   Mode C (node_id given)   — the frontier restricted to
+#     ancestors(node_id) ∩ pending, i.e. node_id's own pending-marked
+#     cascade-ancestors (provably minimal + sufficient to unblock node_id
+#     itself). Also returns a labeled blast-radius ESTIMATE — see the
+#     response's own blast_radius_estimate_note for what moves the number.
+#
+# Return shape: the FULL frontier as uncapped one-line summaries (id,
+# truncated claim gist, type, and — per node — every pending event with its
+# root_op/severity-label-hint and which direct premises died and how), plus
+# counts, plus full adjudication packets for at most `limit` (K) nodes.
+# Ordering (event-grouped tier, then created_at ascending, tie-broken on
+# node id) is PRESENTATION-ONLY and carries no semantic weight.
+#
+# Does NOT implement engram_cascade_resolve (slice 4) — no write path here.
+_CASCADE_FRONTIER_FIELDS = frozenset({
+    "node_id", "limit",
+})
+
+
+@mcp.tool(
+    name="engram_cascade_frontier",
+    capability=(
+        "Read-only: which cascade-marked nodes are ready to adjudicate right now "
+        "(no pending cascade-ancestor blocking them). Recomputed fresh from marker "
+        "state every call — no queue, no stored cursor. Mode B: whole-graph "
+        "frontier. Mode C (node_id given): minimal pending-ancestor slice for one "
+        "target, plus a labeled blast-radius estimate."
+    ),
+    annotations={
+        "title": "Cascade Marker Frontier",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_frontier(payload_json: str) -> str:
+    """Which cascade-marked nodes are ready to adjudicate right now.
+
+    READ-ONLY (engram-alpha#2013 slice 3): no marker mutation, no confidence
+    recompute, nothing written. Does not resolve/acknowledge anything — that
+    is a later slice's write path (engram_cascade_resolve, not this tool).
+
+    Frontier definition: a node is on the frontier iff it carries >=1
+    PENDING cascade marker AND none of its cascade-ancestors (full
+    transitive closure via CASCADE_RELATIONS, computed fresh via the shared
+    upstream walk — not just its one-hop direct premises) currently carries
+    a pending marker, for ANY cascade_event, against ANY root. Checked
+    per-NODE across ALL of that node's own pending events at once — a node
+    touched by two cascade events is frontier only once every pending
+    ancestor, across both events, has resolved. A multi-event node appears
+    exactly once in the output, with all its events listed.
+
+    The frontier IS the topological order, recomputed from marker state on
+    every call. There is no queue, no stored cursor, no session state —
+    identical marker state always yields an identical result.
+
+    Two modes:
+      Mode B (node_id omitted): every frontier node in the graph.
+      Mode C (node_id given): the frontier restricted to
+        ancestors(node_id) ∩ pending — node_id's own pending-marked
+        cascade-ancestors, provably minimal and sufficient to unblock
+        node_id itself (plus node_id itself, if node_id is already
+        frontier). Also returns blast_radius_estimate + pending_ancestor_count
+        (labeled ESTIMATE — see blast_radius_estimate_note in the response
+        for what moves the number as an agent resolves premises).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, optional): Restrict to Mode C (minimal slice for
+                this one target). Omit for Mode B (whole-graph frontier).
+            limit (int, optional): K, the cap on how many FULL adjudication
+                packets are returned. Summaries are NEVER capped — every
+                frontier node gets a one-line summary regardless of K.
+                Default 5.
+
+    Returns:
+        JSON with:
+          mode ("B" or "C"), node_id (echoed or null).
+          frontier: uncapped list of one-line summaries — {id, type,
+            claim_gist (truncated, see claim_gist_truncated),
+            events: [{cascade_event, root_node, root_op,
+              severity_label_hint (machine classification, not a directive —
+              both root_ops hard-block equally), created_at,
+              root_is_direct_premise, immediate_cause, dead_premises
+              (which direct premises died and how: resolution_kind,
+              resolution_replacement_id, resolved_at)}]}.
+          frontier_count, total_pending_nodes (GRAPH-WIDE in BOTH modes —
+            in mode C this is NOT scoped to node_id's own pending-ancestor
+            set; that scoped count is pending_ancestor_count, mode-C-only,
+            below).
+          packets: full adjudication packets (claim, confidence,
+            recall_summary, is_current, events) for at most `limit` nodes.
+          packets_returned, packets_limit.
+          Mode C only: pending_ancestor_count, blast_radius_estimate,
+            blast_radius_estimate_note.
+          invariant_1_violation_suspected (str, both modes): present ONLY
+            when candidates exist (total_pending_nodes > 0 in mode B, or a
+            non-empty pending-ancestor set in mode C) but frontier_count is
+            0 — nothing is currently resolvable, a state that should be
+            unreachable in a well-formed graph (most likely a cascade cycle
+            in CASCADE_RELATIONS, whose DAG-integrity scan is advisory, not
+            blocking). ABSENT entirely on the healthy path — its mere
+            presence is the signal. A mode-B sweep (frontier -> resolve,
+            looped) MUST NOT treat a response carrying this field as a
+            completed/clean sweep.
+        On payload-parsing failure or unknown node_id, returns
+        {"error": "..."}.
+
+    See _cascade_frontier_impl (engram_revision.py) for full semantics —
+    kept callable with named kwargs for in-server callers.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_FRONTIER_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_FRONTIER_FIELDS)}"
+        })
+    return _cascade_frontier_impl(**params)
 
 
 # ---- Version control tools ----
