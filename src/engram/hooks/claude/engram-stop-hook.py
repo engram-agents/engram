@@ -251,6 +251,8 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "update_lesson",
     "update_person",
     "reflect",
+    # --- #2013 slice 4 (PR #2342): the cascade adjudication verb ---
+    "cascade_resolve",
 })
 
 # Known engram tool name prefixes from production transcripts. Both forms are
