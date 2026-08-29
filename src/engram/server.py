@@ -1437,6 +1437,27 @@ _SIMILAR_STRIP_KEYS = core._SIMILAR_STRIP_KEYS
 # that the (deliberately fastmcp-free) SessionStart hook injects.
 TOOL_CAPABILITIES: dict[str, str] = {}
 
+# Tool-annotations index (issue #2273)
+# ---------------------------------------------------------------------------
+# `_ENGRAM_WRITE_VERBS` in the stop hook (src/engram/hooks/claude/
+# engram-stop-hook.py) is a hand-maintained mirror of "which MCP tools write
+# to ENGRAM", used to decide whether a turn's tool calls should fire the
+# write-check nudge. Hand-maintained mirrors drift — #2273 found it 7 tools
+# behind the real set. The fix is the same shape as TOOL_CAPABILITIES just
+# above: capture the ground truth ONCE, at decoration time, from the same
+# `annotations=` kwarg every @mcp.tool() call site already carries (FastMCP's
+# own `readOnlyHint` — True for read-only tools, False for tools that mutate
+# the graph), so a test can derive the write-capable tool set from this dict
+# instead of a second hand-written list that can silently fall out of sync.
+#
+# Keyed by the tool's registered name, same as TOOL_CAPABILITIES. Value is
+# the full `annotations` dict as passed to @mcp.tool() (not narrowed to just
+# readOnlyHint) — cheap to keep the whole dict here since it is already fully
+# materialized in `kwargs` at decoration time, and it leaves room for a future
+# consumer that wants destructiveHint/idempotentHint/openWorldHint without
+# having to add a second registry.
+TOOL_ANNOTATIONS: dict[str, dict] = {}
+
 
 _original_mcp_tool = mcp.tool
 
@@ -1472,6 +1493,15 @@ def _timing_mcp_tool(*args, **kwargs):
     # wrapper() below: kwargs is this call's dict, available for the whole
     # closure regardless of decorator invocation order.
     _registered_name = kwargs.get("name")
+    # annotations= is a real FastMCP kwarg (unlike capability=, which is
+    # popped above) — still present in kwargs here since kwargs is this
+    # call's own dict and _original_mcp_tool() above received a copy of the
+    # reference, not a mutation of this one. Read defensively: every real
+    # ENGRAM tool call site passes a dict, but a bare @mcp.tool() with no
+    # annotations= would otherwise KeyError inside wrapper() below.
+    _registered_annotations = kwargs.get("annotations")
+    if not isinstance(_registered_annotations, dict):
+        _registered_annotations = {}
 
     def wrapper(func):
         # Recorded at DECORATION time (module import), not call time — the
@@ -1479,7 +1509,14 @@ def _timing_mcp_tool(*args, **kwargs):
         # name= kwarg takes priority when present (all 56 real ENGRAM tool
         # call sites pass it); fall back to func.__name__ for the
         # theoretical case of a bare @mcp.tool() with no name= override.
-        TOOL_CAPABILITIES[_registered_name or func.__name__] = capability
+        _tool_name = _registered_name or func.__name__
+        TOOL_CAPABILITIES[_tool_name] = capability
+        # TOOL_ANNOTATIONS (issue #2273): same decoration-time capture as
+        # TOOL_CAPABILITIES above, keyed identically. Stores a shallow copy
+        # so later mutation of the caller's annotations dict (there isn't
+        # any today, but nothing guards against it) can't retroactively
+        # change what was recorded at decoration time.
+        TOOL_ANNOTATIONS[_tool_name] = dict(_registered_annotations)
 
         @functools.wraps(func)
         def timed(*a, **kw):
