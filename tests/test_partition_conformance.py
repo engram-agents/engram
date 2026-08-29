@@ -108,6 +108,13 @@ def _add_edge(conn, source_id, target_id, relation):
 # (today, and by #2252 Stage 1.3, exactly {"derives_from"}).
 _CB_TYPE = sorted(core.CLAIM_BEARING_TYPES)[0]
 _NCB_TYPE = sorted(core.VALID_NODE_TYPES - core.CLAIM_BEARING_TYPES)[0]
+# Pick a cascade relation the invariant actually INSPECTS. Post-#2357 that is
+# every member of CASCADE_RELATIONS: invariant 5 checks `dag` (real edge-walk
+# acyclicity) rather than the creation-order proxy, and `acknowledged_derives_from`
+# carries dag=True — it is temporal_causal=False, which invariant 5 does not read.
+# So there is no exempt set to subtract any more, and the plain derived pick keeps
+# the "dormant, not dead" join demonstrated. Derived, not hardcoded, so this file
+# does not become a second enumeration site.
 _CASCADE_RELATION = sorted(core.CASCADE_RELATIONS)[0]
 
 

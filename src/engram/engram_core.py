@@ -570,6 +570,22 @@ VALID_RELATIONS = {
     "contradicts",
     "resolves",
     "derives_from",
+    "acknowledged_derives_from",  # #2013 §12.5. A premise edge established by
+                     # ADJUDICATION rather than at authorship: when an agent
+                     # acknowledges that its claim survives a premise being
+                     # superseded, the machine records that the node now also
+                     # rests on the REPLACEMENT. Written only by
+                     # engram_cascade_resolve — never agent-supplied, and
+                     # `addable_after_creation: False` keeps engram_add_edge
+                     # from reaching it (cascade relations are never
+                     # agent-addable; that disjointness is load-bearing).
+                     #
+                     # DAG-EXEMPT BY CONSTRUCTION, not by preference: the
+                     # acknowledging node exists BEFORE the replacement it
+                     # comes to rest on — that is what an acknowledgement IS —
+                     # so this edge always inverts creation order. Filing it as
+                     # `derives_from` produced one time-ordering violation per
+                     # acknowledgement, which is the defect §12.1 records.
     "supersedes",
     "retracts",
     "tensions",
@@ -684,7 +700,7 @@ EDGE_CLASSIFICATIONS = {
         # catches that a plain "cascade relations are acyclic because they're
         # temporal_causal" argument cannot: dag=True, checked by a real edge
         # walk (see engram_dag_conformance.check_dag_conformance and the
-        # write-time guard tracked in #2349's follow-up), independent of the
+        # write-time guard that #2349 lands at §12.7), independent of the
         # temporal direction.
         "cascade": True,        # must participate in cascade walks — that is
                                  # the entire reason this relation exists.
@@ -844,7 +860,26 @@ _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 # now-realized divergence is exactly why it stays hand-enumerated.
 # TODO(#1991): whether "uncited by derives_from/supported_by" is even a GOOD
 # health metric is deliberately deferred to the health-score epic's design.
-CITATION_SUPPORT_RELATIONS = frozenset({"derives_from", "supported_by"})
+#
+# #2349 blocker 2: also the ONE-HOP PREMISE relation set — `_direct_premise_ids`
+# below ranges over this constant (not a second, separately-hand-enumerated
+# `('derives_from', 'supported_by')` literal, which is what it did before this
+# fix and which is why it could not see an `acknowledged_derives_from` premise).
+# `acknowledged_derives_from` belongs here for the same reason `derives_from`
+# and `supported_by` do: it is a genuine one-hop premise relation (the
+# acknowledgement path writes it, and its EDGE_CLASSIFICATIONS entry carries
+# `provenance: True`) — a node that has acknowledged once holds a real premise
+# that neither the citation-coverage query nor `_direct_premise_ids` could see
+# without this addition. Do NOT narrow this constant to CASCADE_RELATIONS
+# instead (that is a DIFFERENT, narrower question — "which edges conduct a
+# cascade" — and would drop `supported_by`, which citation-coverage needs).
+CITATION_SUPPORT_RELATIONS = frozenset(
+    {"derives_from", "supported_by", "acknowledged_derives_from"}
+)
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_RELATION_PLACEHOLDERS = ",".join(
+    "?" * len(_CITATION_SUPPORT_RELATIONS_SORTED)
+)
 
 
 # Relation minted for the prediction -> observation_predictive pairing edge
@@ -936,6 +971,11 @@ EDGE_TIERS: dict[str, str] = {
     # dependency tier: causal / provenance edges; temporal_causal=True expected
     "cites":        "dependency",
     "derives_from": "dependency",
+    "acknowledged_derives_from": "dependency",  # #2013 §12.5 — a genuine
+                                    # provenance edge (it records where a node's
+                                    # ground now sits), so the tier is right and
+                                    # its dag_check=False is an INTENTIONAL
+                                    # divergence, acknowledged below.
     "retracts":     "dependency",
     "supersedes":   "dependency",
     "supported_by": "dependency",
@@ -6456,17 +6496,26 @@ def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
             source_class=meta.get("source_class", "external"),
         )
     else:  # derivation
-        # derives_from ONLY — deliberately NOT _direct_premise_ids, which
-        # also returns supported_by targets. The two answer different
-        # questions: _direct_premise_ids is the CASCADE's "which premises
-        # were affected" read, while this is the CONFIDENCE formula's input
-        # set, and _derive_impl computes from derives_from premises alone.
+        # The CONFIDENCE formula's input set — deliberately NOT
+        # _direct_premise_ids, which also returns supported_by targets and
+        # answers the cascade's "which premises were affected" question.
+        #
+        # RANGES OVER THE DERIVED CASCADE SET (§12.6), not the `derives_from`
+        # literal, and the widening is load-bearing rather than cosmetic:
+        # `acknowledged_derives_from` is how an acknowledgement records that a
+        # node now also rests on the REPLACEMENT of a superseded premise. If
+        # this read stayed on the literal, that edge would be written and then
+        # never consulted — the recompute would run on the acknowledge path and
+        # find nothing to change, which is exactly the inert behaviour measured
+        # while the edge was deferred (0.833 -> 0.833, changed: []).
+        _rels = sorted(CASCADE_RELATIONS)
         premise_ids = [
             r["target_id"] for r in conn.execute(
-                "SELECT target_id FROM edges "
-                "WHERE source_id = ? AND relation = 'derives_from' "
-                "ORDER BY target_id",
-                (node_id,),
+                f"SELECT target_id FROM edges "
+                f"WHERE source_id = ? AND relation IN "
+                f"({','.join('?' for _ in _rels)}) "
+                f"ORDER BY target_id",
+                (node_id, *_rels),
             ).fetchall()
         ]
         if not premise_ids:
@@ -6914,14 +6963,18 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
 
 
 def _direct_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
-    """The node ids node_id directly derives_from / is supported_by — i.e.
-    node_id's own one-hop premises. Used by both _validate_premises below
-    and engram_revision's _immediate_cause/_dead_premises derived reads.
+    """The node ids node_id directly derives_from / is supported_by /
+    acknowledged_derives_from — i.e. node_id's own one-hop premises, ranged
+    over CITATION_SUPPORT_RELATIONS (not a second, separately hand-enumerated
+    literal — see that constant's comment for why `acknowledged_derives_from`
+    belongs here). No live caller in engram_core.py itself; the four callers
+    are engram_revision.py's `_immediate_cause`, `_dead_premises`,
+    `_cascade_frontier_node_summary`, and `_cascade_affected_premises`.
     """
     rows = conn.execute(
-        "SELECT target_id FROM edges WHERE source_id = ? "
-        "AND relation IN ('derives_from', 'supported_by')",
-        (node_id,),
+        f"SELECT target_id FROM edges WHERE source_id = ? "
+        f"AND relation IN ({_CITATION_SUPPORT_RELATION_PLACEHOLDERS})",
+        (node_id, *_CITATION_SUPPORT_RELATIONS_SORTED),
     ).fetchall()
     return [r["target_id"] for r in rows]
 

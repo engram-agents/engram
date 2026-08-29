@@ -2739,8 +2739,8 @@ def engram_cascade_resolve(payload_json: str) -> str:
         changed, skipped, passes} — plus convergence_warning if the
         recompute could not settle, which should be unreachable and most
         likely means a CASCADE_RELATIONS cycle), auto_resolved_trivial,
-        acknowledgement_edges_deferred, acknowledgement_edge_note, note
-        (a human-readable summary, always present, null when empty),
+        acknowledgement_edges, note (a human-readable summary, always
+        present, null when empty),
         marked_contradictions (contradiction nodes
         this resolution marked for review), contradiction_cascade_event (the
         dedicated event id they were marked under, or null when the node has

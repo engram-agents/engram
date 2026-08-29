@@ -112,13 +112,11 @@ except ImportError:
 
 try:
     from engram_query import (  # noqa: E402
-        _LOGICAL_SUBSTRATE_RELATIONS,
         _CONTEXTUAL_RELATIONS,
     )
     _SCHEMA_QUERY_AVAILABLE = True
 except ImportError:
     _SCHEMA_QUERY_AVAILABLE = False
-    _LOGICAL_SUBSTRATE_RELATIONS = frozenset()  # type: ignore[assignment]
     _CONTEXTUAL_RELATIONS = frozenset()  # type: ignore[assignment]
 
 
@@ -129,14 +127,25 @@ def get_schema_data() -> dict:
     No DB access required — the schema is static.  Called by the
     /api/schema endpoint and directly by the CI drift gate.
     """
-    # Logical-substrate set: the 10 from engram_query (#2357 added
-    # acknowledged_derives_from) plus instantiates (instantiates is in
-    # VALID_RELATIONS but in neither _LOGICAL_SUBSTRATE_RELATIONS nor
-    # _CONTEXTUAL_RELATIONS — treat as logical-substrate per spec §Deliverable 1).
-    logical_substrate = sorted(
-        set(_LOGICAL_SUBSTRATE_RELATIONS) | {"instantiates"}
-    )
+    # Logical-substrate set: DERIVED as the residual of VALID_RELATIONS after
+    # the contextual set, so the two groups partition VALID_RELATIONS BY
+    # CONSTRUCTION and a new relation lands in one of them automatically.
+    #
+    # This replaces a hand-union of {"instantiates"} — a relation that sits in
+    # VALID_RELATIONS but in neither underlying constant, and was patched in by
+    # name. That patch was correct and unmaintainable in the same breath: the
+    # next such relation needed a second hand-edit, and #2013 §12.5's
+    # `acknowledged_derives_from` is exactly that next one. Deriving the
+    # residual makes the union-equals-VALID_RELATIONS property true by
+    # construction rather than by remembering (§12.6 — the edge declaration is
+    # the SSoT at every call site).
+    #
+    # Equivalent to the old expression today: the test this replaces asserted
+    # that the hand-union plus the contextual set already covered
+    # VALID_RELATIONS exactly, so the residual is the same set — it just stops
+    # needing an editor.
     contextual = sorted(_CONTEXTUAL_RELATIONS)
+    logical_substrate = sorted(set(VALID_RELATIONS) - set(_CONTEXTUAL_RELATIONS))
 
     relations_detail = {
         rel: {

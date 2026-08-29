@@ -258,6 +258,7 @@ def _invariant_4(conn: sqlite3.Connection) -> "tuple[dict, set]":
     return _report("node", (r["nid"] for r in rows))
 
 
+
 def _invariant_5(conn: sqlite3.Connection, cascade_ndc: frozenset) -> "tuple[dict, set]":
     """5 — cascade-causing edge that is not dag-safe (#2357: checks ``dag``,
     real edge-walk acyclicity — not the renamed ``temporal_causal`` creation-

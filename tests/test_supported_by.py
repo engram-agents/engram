@@ -616,7 +616,7 @@ def test_retract_predictive_observation_retracts_prediction_only_after_last_basi
 # ── 5. #2252 Stage 1.3 — derived NCB cascade skip ───────────────────────────
 
 
-def test_cascade_relations_is_derives_from_only():
+def test_cascade_relations_membership_is_pinned():
     """CASCADE_RELATIONS == {'derives_from', 'acknowledged_derives_from'}
     after Stage 1.3 + #2357.
 
@@ -626,6 +626,21 @@ def test_cascade_relations_is_derives_from_only():
     #2357 (2026-08-29) added `acknowledged_derives_from` as a second cascade
     relation — the cascade-frontier acknowledgement edge, which must
     cascade (that's the entire reason it exists).
+
+    RENAMED from `test_cascade_relations_is_derives_from_only`, and the
+    rename is the point rather than tidying: the old name asserted a
+    membership claim that THIS PR makes false, while the body and the
+    assertion were already correct. The test did its job — it fired on the
+    addition, exactly as its own docstring said it was for — and only its
+    NAME had become the false half. A test named for an invariant it does
+    not test gets trusted by its name later.
+
+    Restored twice. Both rebases resolved this hunk toward `dev`, which
+    carries the old name, under a rule aimed at a DIFFERENT hunk — the
+    classification entry citing the falsified §12.4 proof. That rule was
+    right there and wrong here: this rename is an independent correction
+    `dev` had not seen, not a claim resting on the retracted proof. Found
+    both times by a colleague reading the delta, not by the rebase.
     """
     assert engram_core.CASCADE_RELATIONS == frozenset(
         {"derives_from", "acknowledged_derives_from"}

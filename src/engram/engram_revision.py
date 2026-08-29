@@ -135,6 +135,55 @@ def _write_cascade_marker(conn, node_id: str, cascade_event: str,
     )
 
 
+def _cascade_reaches(conn, ancestor_id: str, candidate_id: str) -> bool:
+    """True iff `candidate_id` is DOWNSTREAM of `ancestor_id` over the cascade
+    relations — i.e. candidate transitively derives from ancestor.
+
+    §12.3's guardrail predicate. Walks upstream from `candidate_id` and asks
+    whether `ancestor_id` is reachable, which is cheaper than enumerating a
+    node's whole descendant set and is the direction the question is asked in
+    ("may this replacement replace that node?").
+
+    RANGES OVER THE DERIVED CASCADE SET, NEVER A RELATION LITERAL. §12.6, and
+    here it is load-bearing rather than stylistic: §12.4's sufficiency proof
+    rests on `marked ⇒ downstream via cascade relations`, and
+    `acknowledged_derives_from` JOINS that set. A guard written against
+    `derives_from` alone would keep passing while silently ceasing to be
+    sufficient the moment a relation is added — the proof would become a
+    coincidence and nothing would say so.
+
+    NO DEPTH BUDGET, DELIBERATELY. The shared `core._walk_cascade_upstream`
+    carries `max_depth=4096` as a total-node budget whose exhaustion is
+    SILENT — a truncated walk returns a partial set indistinguishable from a
+    complete one (engram-alpha#2339). That is tolerable for a derived READ and
+    unacceptable for a GUARD: a partial ancestor set would simply miss
+    `ancestor_id` and wave the cycle through, which is the one outcome this
+    function exists to prevent. Termination does not need the budget — the
+    visited set bounds the walk at one visit per node on a finite graph, and it
+    does so even if a cycle already exists, which is precisely the state this
+    guard is deployed into.
+    """
+    if ancestor_id == candidate_id:
+        return True
+    seen = {candidate_id}
+    frontier = [candidate_id]
+    while frontier:
+        current = frontier.pop()
+        rows = conn.execute(
+            f"SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+            (current, *_CASCADE_RELATIONS_SORTED),
+        ).fetchall()
+        for r in rows:
+            t = r["target_id"]
+            if t == ancestor_id:
+                return True
+            if t not in seen:
+                seen.add(t)
+                frontier.append(t)
+    return False
+
+
 def _affected_contradiction_ids(conn, node_id: str) -> list:
     """Contradiction nodes that have node_id as one of their contradicting
     sides (issue #229's parallel cascade).
@@ -925,42 +974,79 @@ def _cascade_recompute_confidence_transitive(conn, node_id: str) -> dict:
     return result
 
 
-def _cascade_acknowledgement_edges_deferred(conn, node_id: str,
-                                            affected: list) -> list:
-    """§4 requires that an acknowledgement record a `derives_from` edge to
-    the superseding node. THIS SLICE DOES NOT WRITE THAT EDGE, and the
-    reason is a genuine collision between §4 and a live invariant rather
-    than a difficulty in implementing it. Returns the pairs that WOULD be
-    written, so the caller can surface the deferral instead of hiding it.
+class _CascadeCycleError(Exception):
+    """Raised by `_cascade_record_acknowledgement_edges` (#2013 §12.7) when
+    writing an `acknowledged_derives_from` edge would close a cycle over
+    CASCADE_RELATIONS. `_cascade_resolve_impl`'s 'acknowledged' branch
+    catches this and turns it into a refusal response — it must never reach
+    a caller as a raw exception.
+    """
 
-    WHY §4's REQUIREMENT IS NOT IMPLEMENTABLE AS STATED. The acknowledging
-    node X exists BEFORE the replacement P′ is created — that is the whole
-    situation an acknowledgement arises in. So `X --derives_from--> P′` is
-    always backwards in time, on a relation whose EDGE_CLASSIFICATIONS entry
-    carries `temporal_causal: True` (#2357 renamed this flag from dag_check;
-    the creation-order semantics are the renamed flag's, not the new `dag`
-    edge-walk flag's). Measured: every acknowledgement produces one
-    time-ordering violation, and the general edge tool
-    (`engram_cornerstone.py`'s add-edge guard) refuses exactly this shape.
+    def __init__(self, node_id: str, replacement_id: str):
+        self.node_id = node_id
+        self.replacement_id = replacement_id
+        super().__init__(
+            f"acknowledging {node_id!r} would close a cascade cycle: "
+            f"{replacement_id!r} already transitively derives from "
+            f"{node_id!r} over CASCADE_RELATIONS."
+        )
 
-    AND IT CAN CLOSE A CYCLE, which is the worse half. Constructed through
-    public verbs only: `base → P`, `X` derives from `P`, `P′` derives from
-    `X` (legal — X is unmarked at that moment), supersede `P → P′`, then
-    acknowledge `X`. The ack edge closes `X → P′ → X`. Measured
-    consequences: the confidence recompute stops being idempotent
-    (0.641 → 0.567 → 0.503 → 0.446 across four identical runs, decaying
-    each time), and once both members carry markers the frontier reports
-    `frontier_count: 0` against a non-empty pending set — both nodes refuse
-    resolution permanently. Slice 3's invariant-1 anomaly field names the
-    cause correctly, but a loud failure does not undo the decayed stored
-    confidences.
 
-    So the requirement needs a design ruling — a DAG-exempt relation, an
-    explicit exemption, or a different mechanism entirely — and that is a
-    #2013 question, not something to settle inside a review round. Filed
-    separately; the hole it leaves is real and stated in the response:
-    an acknowledgement currently does NOT survive a later supersede of the
-    replacement, which is exactly the blindness §4 wrote the edge to close.
+def _cascade_record_acknowledgement_edges(conn, node_id: str,
+                                          affected: list, now: str) -> list:
+    """§4: an acknowledgement records that the node now ALSO rests on each
+    superseding premise — written as `acknowledged_derives_from` (#2013 §12.5),
+    never as `derives_from`.
+
+    WHY A DISTINCT RELATION, and it is not taxonomy for its own sake: the
+    acknowledging node exists BEFORE the replacement it comes to rest on —
+    that is what an acknowledgement IS — so this edge always inverts creation
+    order. Filed as `derives_from` it produced one DAG-time violation per
+    acknowledgement, measured, because `derives_from` carries
+    `temporal_causal: True` (#2357 renamed that flag from dag_check; the
+    creation-order semantics are the renamed flag's, NOT the new `dag`
+    edge-walk flag's). `acknowledged_derives_from` carries
+    `temporal_causal: False` for exactly that structural reason — and
+    `dag: True`, because it is still not permitted to close a cycle — which
+    keeps `derives_from`'s creation-order check honest everywhere else.
+
+    WHY IT MUST EXIST AT ALL: an acknowledgement OUTLIVES the repair window.
+    Once acknowledged the node stops being marked, so if the replacement is
+    itself superseded LATER there is nothing re-reading the old premise and
+    nothing for the cascade to walk. The edge is the "record DEPENDENCIES
+    eagerly" half of §1 — a dependency is not a cached value, it is what lets
+    the cascade SEE. It carries `cascade: True` and participates in confidence
+    for the same reason.
+
+    §12.4's ORIGINAL PROOF, AND WHY IT WAS INCOMPLETE: a cycle would need the
+    replacement to derive from this node; the node carries a marker only if
+    it is downstream of the superseded premise; so the replacement would have
+    to be downstream of what it replaces — which `_supersede_impl`'s §12.3
+    guardrail refuses. That reasoning is sound for a SINGLE supersede/
+    acknowledgement pair, but §12.3 is a POINT-IN-TIME check: it is evaluated
+    once, at supersede time, over the edge table as it stood THEN — and every
+    acknowledgement written AFTER adds an edge to the very relation the check
+    was evaluated over. Two individually-legal supersedes plus two
+    acknowledgements can therefore still close a cycle across three nodes,
+    measured (#2013 §12.7): confidence recompute stopped being idempotent
+    (0.411 -> 0.322 -> 0.254 on identical re-runs of the same fixture).
+
+    §12.7 THEREFORE ADDS A SECOND, WRITE-TIME GUARD, HERE: before writing an
+    edge from `node_id` to `replacement`, this function refuses if
+    `replacement` already transitively derives from `node_id` — i.e. if THIS
+    edge would itself be the one that closes the cycle, regardless of
+    whether §12.3 passed when each underlying supersede was considered alone.
+    Reuses `_cascade_reaches` (never a second walker). Refusal raises
+    `_CascadeCycleError`; `_cascade_resolve_impl` catches it and returns an
+    error object, not partial success — no acknowledgement edges from this
+    call are left written.
+
+    The replacement is read at USE time from the premise's own resolution
+    (invariant 2: a marker caches nothing derivable, and a replacement pointer
+    is a cached VALUE that can drift). The OLD premise edge is deliberately
+    left in place: it is the true historical provenance of the claim, and
+    removing it would rewrite the node's derivation history rather than
+    extend it.
     """
     out = []
     for a in affected:
@@ -983,6 +1069,27 @@ def _cascade_acknowledgement_edges_deferred(conn, node_id: str,
             replacement = row["superseded_by"] if row else None
         if not replacement or replacement == node_id:
             continue
+        exists = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_derives_from'",
+            (node_id, replacement),
+        ).fetchone()
+        if not exists:
+            # §12.7 WRITE-TIME GUARD: refuse if writing THIS edge would
+            # close a cycle over CASCADE_RELATIONS. §12.3's supersede-time
+            # guardrail is a point-in-time check, re-evaluated only when
+            # each supersede happens; every acknowledgement grows the very
+            # relation it was evaluated over, so a cycle can still close
+            # here even though both underlying supersedes were
+            # individually legal (measured, #2013 §12.7). Reuses
+            # `_cascade_reaches` — do not write a second walker.
+            if _cascade_reaches(conn, node_id, replacement):
+                raise _CascadeCycleError(node_id, replacement)
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) "
+                "VALUES (?, ?, 'acknowledged_derives_from', ?)",
+                (node_id, replacement, now),
+            )
         out.append({"premise_id": premise_id, "replacement_id": replacement})
     return out
 
@@ -1243,9 +1350,32 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
         conn = core._get_db()
         try:
             now = core._now()
-            ack_edges = _cascade_acknowledgement_edges_deferred(
-                conn, node_id, affected
-            )
+            try:
+                ack_edges = _cascade_record_acknowledgement_edges(
+                    conn, node_id, affected, now
+                )
+            except _CascadeCycleError as exc:
+                # §12.7: refuse loudly, not partial success — nothing from
+                # this call is committed (no ack edges, no marker
+                # resolution, no audit entry).
+                conn.rollback()
+                return json.dumps({
+                    "error": f"Cycle guard: acknowledging {exc.node_id!r} "
+                             f"would write an acknowledged_derives_from edge "
+                             f"to {exc.replacement_id!r}, which already "
+                             f"transitively derives from {exc.node_id!r} — "
+                             f"closing a cycle over CASCADE_RELATIONS. "
+                             f"Supersede or retract this node instead of "
+                             f"acknowledging it.",
+                    "guard": "acknowledgement_would_close_cascade_cycle",
+                    "node_id": exc.node_id,
+                    "replacement_id": exc.replacement_id,
+                    "relation": "acknowledged_derives_from",
+                    "remedy": "supersede or retract this node instead of "
+                              "acknowledging it",
+                    "phase": "apply",
+                    "markers_unchanged": True,
+                })
             _resolve_own_markers(conn, node_id, "acknowledged", now)
             core._log_edit(conn, "cascade_acknowledged", node_id, node_type,
                            {"cascade_events": resolved_events,
@@ -1395,22 +1525,7 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
         "auto_resolved_trivial": auto_resolved,
         "marked_contradictions": marked_contradictions,
         "contradiction_cascade_event": contradiction_event,
-        "acknowledgement_edges_deferred": ack_edges,
-        "acknowledgement_edge_note": (
-            "§4 requires an acknowledgement to record a derives_from edge to "
-            "each superseding premise. THIS SLICE DOES NOT WRITE IT. The "
-            "acknowledging node predates its replacement, so that edge is "
-            "always backwards in time on a temporal_causal relation, and it "
-            "can "
-            "close a cascade cycle that makes the confidence recompute "
-            "non-idempotent and strands both members off the frontier "
-            "permanently. Both measured. The requirement needs a design "
-            "ruling (a DAG-exempt relation, an explicit exemption, or a "
-            "different mechanism) — see the linked issue. THE HOLE IS REAL: "
-            "this acknowledgement will NOT be revisited if the replacement "
-            "is itself superseded later, which is the blindness §4 wrote "
-            "the edge to close."
-        ) if ack_edges else None,
+        "acknowledgement_edges": ack_edges,
         "note": note or None,
         "re_cascade": (
             "SUPPRESSED by design for the DERIVATION cascade — no "
@@ -2051,6 +2166,56 @@ def _supersede_impl(
                          f"If the correction changes the epistemic category, use "
                          f"engram_retract on the old node and cite the replacement "
                          f"organically in new derivations.",
+            })
+
+        # §12.3 GUARDRAIL — the replacement must not be DOWNSTREAM of what it
+        # replaces. Superseding a node with something that transitively derives
+        # from it is ill-formed on its face: you would be superseding your own
+        # transitive premise, and thereby making the replacement stale by the
+        # very act that installs it.
+        #
+        # WHY IT WAS INVISIBLE BEFORE THIS CHECK (measured, #2013 §12.2): the
+        # supersede was ACCEPTED, the intervening node got a marker, and the
+        # replacement got NONE despite being downstream — it escaped only
+        # because the cascade walk below seeds `new_node_id` into `visited`, a
+        # guard that exists to stop a BORN-MARKED replacement (invariant 7),
+        # an unrelated concern. An ill-formed operation hidden by a mechanism
+        # aimed at something else.
+        #
+        # WHAT THIS CHECK GETS RIGHT, AND WHERE THAT ARGUMENT STOPS. §12.4: the
+        # ack edge runs X -> P', so a cycle needs P' -> ... -> X; X carries a
+        # marker only if it is downstream of P, so P' deriving from X would put
+        # P' downstream of P — exactly what this refuses. That reasoning is
+        # sound for a SINGLE supersede/acknowledge pair evaluated in isolation.
+        # But this check is a POINT-IN-TIME guard: it runs once, here, at
+        # supersede time, over the edge table as it stood THEN. Every
+        # acknowledgement written AFTER this call adds an edge to the very
+        # relation the argument above was evaluated over, so it does not
+        # extend to a SEQUENCE of supersedes and acknowledgements — two
+        # individually-legal supersedes plus two acknowledgements can still
+        # close a cycle across three nodes (measured, #2013 §12.7). This check
+        # alone does not make the ack edge safe; §12.7's write-time guard in
+        # `_cascade_record_acknowledgement_edges` (re-checks at the moment
+        # each ack edge is actually written, over the graph as it stands then)
+        # is what closes the gap this one leaves open.
+        if _cascade_reaches(conn, old_node_id, new_node_id):
+            return json.dumps({
+                "error": f"Cycle guard: '{new_node_id}' transitively derives from "
+                         f"'{old_node_id}', so it cannot replace it. Superseding a "
+                         f"node with one of its own descendants would make the "
+                         f"replacement stale by the act that installs it, and it is "
+                         f"the one shape that lets an acknowledgement close a "
+                         f"cascade cycle (#2013 §12.3).",
+                "guard": "supersede_replacement_is_downstream",
+                "old_node_id": old_node_id,
+                "new_node_id": new_node_id,
+                "guidance": (
+                    "The replacement must not rest on the node it replaces. "
+                    "Either compose a replacement that does not cite anything "
+                    "downstream of the superseded node, or — if the downstream "
+                    "claim really is the successor — retract the old node "
+                    "instead and let the newer claim stand on its own."
+                ),
             })
         if new["supersedes"] is not None:
             return json.dumps({

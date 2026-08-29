@@ -164,6 +164,62 @@ def _premises(core, node_id):
         conn.close()
 
 
+def _cascade_cycle(core):
+    """PROPERTY check (#2013 §12.6 / §12.7), not a mechanism check: reads the
+    WHOLE edges table filtered to the DERIVED cascade relation set —
+    `core.CASCADE_RELATIONS`, never a relation-name literal — builds the
+    adjacency, and DFS's for a back edge (grey-node revisit). Returns the
+    cycle as a list of node ids (first repeated at both ends) if one exists,
+    else None. Deliberately relation-set-agnostic: it must catch a cycle
+    over ANY combination of cascade relations, of ANY length, not just the
+    two-relation three-node shape the guard was written against — a check
+    that only recognises the shape of the known defect is the mechanism
+    test this property test replaces.
+    """
+    conn = core._get_db()
+    try:
+        relations = sorted(core.CASCADE_RELATIONS)
+        placeholders = ",".join("?" * len(relations))
+        rows = conn.execute(
+            f"SELECT source_id, target_id FROM edges "
+            f"WHERE relation IN ({placeholders})",
+            relations,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    adjacency = {}
+    for r in rows:
+        adjacency.setdefault(r["source_id"], []).append(r["target_id"])
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {}
+    path = []
+
+    def visit(node):
+        color[node] = GRAY
+        path.append(node)
+        for nxt in adjacency.get(node, ()):
+            state = color.get(nxt, WHITE)
+            if state == WHITE:
+                found = visit(nxt)
+                if found is not None:
+                    return found
+            elif state == GRAY:
+                idx = path.index(nxt)
+                return path[idx:] + [nxt]
+        color[node] = BLACK
+        path.pop()
+        return None
+
+    for start in list(adjacency.keys()):
+        if color.get(start, WHITE) == WHITE:
+            found = visit(start)
+            if found is not None:
+                return found
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1 — eligibility: the cascade ROOT counts as a premise resolving as root_op
 # ---------------------------------------------------------------------------
@@ -224,31 +280,31 @@ def test_acknowledge_allowed_when_the_root_premise_was_only_superseded():
     assert all(m["resolution_kind"] == "acknowledged" for m in resolved), resolved
 
 
-def test_acknowledgement_defers_the_derives_from_edge_and_says_so():
-    """§4 requires an acknowledgement to record a derives_from edge to the
-    superseding node. THIS SLICE DOES NOT WRITE IT, and the response says
-    so rather than staying silent.
+def test_acknowledgement_records_the_edge_on_the_new_relation():
+    """§4's requirement, finally satisfied — as `acknowledged_derives_from`,
+    never as `derives_from` (#2013 §12.5).
 
-    The reason is a collision, not a difficulty. The acknowledging node
-    exists BEFORE its premise's replacement — that is the situation an
-    acknowledgement arises in — so the edge is always backwards in time on
-    a `temporal_causal: True` relation (#2357's rename of dag_check —
-    creation-order, not the new `dag` edge-walk flag). Measured on this exact
-    fixture before the
-    deferral: source.created_at < target.created_at, every time.
+    The reason for a distinct relation is a collision, not a difficulty: the
+    acknowledging node exists BEFORE its premise's replacement — that is the
+    situation an acknowledgement arises in — so the edge is always backwards
+    in time, and `derives_from` carries `temporal_causal: True` (#2357's
+    rename of dag_check — creation-order, not the new `dag` edge-walk flag).
+    Measured on this exact fixture before the relation existed:
+    source.created_at < target.created_at, every time.
 
-    The test asserts the OLD premise edge is untouched (provenance is
-    extended, never rewritten) and that the deferral is reported with the
-    pair that would have been written, so the information is not lost —
-    only the illegal write is.
+    The fixture ordering is load-bearing: the replacement is created AFTER
+    the dependent, which is the only ordering that can occur in life and the
+    one that makes the edge invert creation order. A fixture that creates the
+    replacement first cannot see the property this relation exists for — and
+    an earlier version of my own probe did exactly that and reported the
+    defect absent.
+
+    The OLD premise edge is retained: provenance is extended, never rewritten.
     """
     rev, obs, derive, core = _make_fresh_mods()
 
     ob = _seed_ob(obs, "Original premise.", quote_type="official_statement")
     dv1 = _seed_dv(derive, "Depends on the premise.", [ob])
-    # Replacement created AFTER the dependent — the realistic ordering, and
-    # the one that makes the edge backwards in time. A fixture that creates
-    # it first cannot see the defect at all.
     ob2 = _seed_ob(obs, "Refined premise.", quote_type="editorial")
 
     assert _premises(core, dv1) == [ob]
@@ -258,18 +314,126 @@ def test_acknowledgement_defers_the_derives_from_edge_and_says_so():
     resp = json.loads(rev._cascade_resolve_impl(
         node_id=dv1, resolution_kind="acknowledged"))
     assert "error" not in resp, resp
-
-    assert resp["acknowledgement_edges_deferred"] == [
+    assert resp["acknowledgement_edges"] == [
         {"premise_id": ob, "replacement_id": ob2}
-    ], resp["acknowledgement_edges_deferred"]
-    assert resp["acknowledgement_edge_note"], "the deferral must be stated"
-    assert "NOT WRITE" in resp["acknowledgement_edge_note"]
-    assert "HOLE IS REAL" in resp["acknowledgement_edge_note"], (
-        "the note must name the blindness the deferral leaves, not just the "
-        "reason for it")
+    ], resp["acknowledgement_edges"]
 
-    assert _premises(core, dv1) == [ob], (
-        "no edge may be written, and the original premise edge is untouched")
+    conn = core._get_db()
+    try:
+        rels = sorted(
+            (e["relation"], e["target_id"]) for e in conn.execute(
+                "SELECT relation, target_id FROM edges WHERE source_id = ?",
+                (dv1,)).fetchall()
+            if e["relation"].endswith("derives_from")
+        )
+    finally:
+        conn.close()
+    assert rels == [("acknowledged_derives_from", ob2), ("derives_from", ob)], rels
+
+
+def test_acknowledgement_survives_a_second_generation():
+    """#2349 blocker 2 — an acknowledgement must survive MORE THAN ONE
+    supersede of the node it now rests on, not just the first.
+
+    Measured symptom before the fix: an acknowledgement survived EXACTLY
+    ONE supersede. Generation 2 adjudicated with an EMPTY affected-premise
+    list (the acknowledged premise was invisible to
+    `core._direct_premise_ids`, which read a hand-enumerated
+    `('derives_from', 'supported_by')` literal that `acknowledged_derives_from`
+    was never added to) — so no new acknowledgement edge got written, even
+    though `_resolve_own_markers` still stamped the marker 'acknowledged'
+    regardless. Generation 3 was then not marked at all: the node had no
+    live cascade-bearing edge to generation 2's replacement for a THIRD
+    supersede's downstream walk to find.
+
+    The fix ranges `_direct_premise_ids` over `core.CITATION_SUPPORT_RELATIONS`
+    (now including `acknowledged_derives_from`) instead of the old literal —
+    see that constant's own comment in engram_core.py for why the relation
+    belongs there. NOT the same fix as #2013 §12.6 (ranging a walk over
+    CASCADE_RELATIONS): CASCADE_RELATIONS already included
+    `acknowledged_derives_from` before this PR (#2013 §12.5), which is why
+    generation 2's marker gets written correctly in the first place — the
+    bug was downstream of that, in the read that decides what to do with
+    the marker once it exists.
+
+    Public verbs only (#2356): three generations of supersede on a single
+    premise chain, with an acknowledgement between each pair.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob1 = _seed_ob(obs, "Generation 1 premise.", quote_type="official_statement")
+    dv = _seed_dv(derive, "Depends on the premise across generations.", [ob1])
+
+    # --- Generation 1: supersede ob1 -> ob2, dv acknowledges. ---
+    s1 = json.loads(rev._supersede_impl(
+        old_node_id=ob1, new_node_id=(ob2 := _seed_ob(
+            obs, "Generation 2 premise.", quote_type="official_statement")),
+        supersede_reason="gen1->gen2"))
+    assert "error" not in s1, s1
+    assert len(_markers(core, dv, "pending")) == 1, (
+        "dv must be marked once ob1 is superseded")
+
+    ack1 = json.loads(rev._cascade_resolve_impl(
+        node_id=dv, resolution_kind="acknowledged"))
+    assert "error" not in ack1, f"generation 1 acknowledgement: {ack1}"
+    assert ack1["acknowledgement_edges"] == [
+        {"premise_id": ob1, "replacement_id": ob2}
+    ], ack1["acknowledgement_edges"]
+
+    # --- Generation 2: supersede ob2 -> ob3. The marking walk already
+    # ranges over CASCADE_RELATIONS (includes acknowledged_derives_from
+    # since #2013 §12.5, landed before this PR) — dv gets marked here
+    # regardless of blocker 2. The bug is in what dv's OWN adjudication
+    # sees, checked next. ---
+    s2 = json.loads(rev._supersede_impl(
+        old_node_id=ob2, new_node_id=(ob3 := _seed_ob(
+            obs, "Generation 3 premise.", quote_type="official_statement")),
+        supersede_reason="gen2->gen3"))
+    assert "error" not in s2, s2
+    assert len(_markers(core, dv, "pending")) == 1, (
+        "dv must be marked again once ob2 is superseded — this part of "
+        "the marking walk was never the bug (CASCADE_RELATIONS already "
+        "carried acknowledged_derives_from before this PR)")
+
+    # THE ASSERTION Part B calls for: generation 2's affected-premise read
+    # must be NON-EMPTY — before the fix this was [], because ob2 (reached
+    # from dv only via acknowledged_derives_from) was invisible to
+    # _direct_premise_ids.
+    affected_gen2 = rev._cascade_affected_premises(core._get_db(), dv)
+    assert affected_gen2 != [], (
+        "generation 2's affected-premise list must be non-empty — an "
+        "empty list here is exactly the measured pre-fix symptom")
+    assert any(a["premise_id"] == ob2 for a in affected_gen2), affected_gen2
+
+    ack2 = json.loads(rev._cascade_resolve_impl(
+        node_id=dv, resolution_kind="acknowledged"))
+    assert "error" not in ack2, f"generation 2 acknowledgement: {ack2}"
+    assert ack2["acknowledgement_edges"] == [
+        {"premise_id": ob2, "replacement_id": ob3}
+    ], ack2["acknowledgement_edges"]
+
+    # --- Generation 3: supersede ob3 -> ob4. dv must STILL be marked —
+    # before the fix, dv had no live edge to ob3 at all (generation 2's
+    # acknowledgement never actually wrote one), so this walk would have
+    # found nothing downstream of ob3 to mark. ---
+    ob4 = _seed_ob(obs, "Generation 4 premise.", quote_type="official_statement")
+    s3 = json.loads(rev._supersede_impl(
+        old_node_id=ob3, new_node_id=ob4, supersede_reason="gen3->gen4"))
+    assert "error" not in s3, s3
+    assert len(_markers(core, dv, "pending")) == 1, (
+        "generation 3 must still be marked — this is the assertion that "
+        "actually distinguishes the fix from the bug: before it, dv had "
+        "no acknowledged_derives_from edge to ob3 at all, so this supersede's "
+        "downstream walk would find nothing to mark")
+
+    ack3 = json.loads(rev._cascade_resolve_impl(
+        node_id=dv, resolution_kind="acknowledged"))
+    assert "error" not in ack3, f"generation 3 acknowledgement: {ack3}"
+    assert ack3["acknowledgement_edges"] == [
+        {"premise_id": ob3, "replacement_id": ob4}
+    ], ack3["acknowledgement_edges"]
+
+    assert _cascade_cycle(core) is None, "the generational chain must stay acyclic"
 
 
 def test_acknowledgement_writes_no_backwards_in_time_edge():
@@ -312,21 +476,19 @@ def test_acknowledgement_writes_no_backwards_in_time_edge():
         f"{[(r['source_id'], r['target_id']) for r in bad]}")
 
 
-def test_acknowledgement_cannot_close_a_cascade_cycle():
-    """The worse half of the collision, constructed through PUBLIC VERBS
-    only: base -> P, X derives from P, P-prime derives from X (legal, X is
-    unmarked at that moment), supersede P -> P-prime, acknowledge X.
+def test_supersede_guard_refuses_a_downstream_replacement():
+    """§12.3, and the reason the acknowledgement edge is safe at all.
 
-    The removed writer closed `X -> P' -> X`. Measured consequences at the
-    time: the confidence recompute stopped being idempotent — 0.641, 0.567,
-    0.503, 0.446 across four IDENTICAL runs, decaying each time — and once
-    both members carried markers the frontier reported frontier_count 0
-    against a non-empty pending set, so both refused resolution forever.
+    Construction, public verbs only: base -> P, X derives from P, P-prime
+    derives from X. Superseding P with P-prime is now REFUSED — P-prime is
+    downstream of the node it would replace, so installing it would make it
+    stale by the very act, and it is the one shape that lets an
+    acknowledgement close a cycle (§12.4).
 
-    The idempotence half matters beyond the cycle: this impl's phase split
-    is not one transaction, and its entire safety argument is that the
-    recompute can simply be re-run. That argument is only true while this
-    holds.
+    Before the guard this supersede was ACCEPTED and the cycle followed:
+    the confidence recompute decayed a stored value on every identical run
+    (0.641, 0.567, 0.503, 0.446) and both members sat off the frontier
+    permanently.
     """
     rev, obs, derive, core = _make_fresh_mods()
 
@@ -335,32 +497,270 @@ def test_acknowledgement_cannot_close_a_cascade_cycle():
     x = _seed_dv(derive, "X, depends on P.", [p])
     p2 = _seed_dv(derive, "P-prime, which happens to cite X.", [x])
 
-    s = json.loads(rev._supersede_impl(
+    r = json.loads(rev._supersede_impl(
         old_node_id=p, new_node_id=p2, supersede_reason="r"))
-    assert "error" not in s, s
-    r = json.loads(rev._cascade_resolve_impl(
-        node_id=x, resolution_kind="acknowledged"))
-    assert "error" not in r, r
+    assert "error" in r, f"the guard must refuse this: {r}"
+    assert r["guard"] == "supersede_replacement_is_downstream", r
+    assert r["old_node_id"] == p and r["new_node_id"] == p2, r
+
+    # ...and an ORDINARY supersede, whose replacement is independent, is
+    # untouched. Without this the guard could be refusing everything.
+    clean = _seed_ob(obs, "Independent replacement basis.",
+                     quote_type="official_statement")
+    p_ok = _seed_dv(derive, "A legitimate replacement.", [clean])
+    ok = json.loads(rev._supersede_impl(
+        old_node_id=x, new_node_id=p_ok, supersede_reason="ordinary"))
+    assert "error" not in ok, ok
+
+
+def test_acknowledgement_cannot_close_a_cascade_cycle():
+    """§12.7's write-time guard, restored as a PROPERTY test rather than the
+    narrow mechanism test it replaces.
+
+    The replaced version asserted the ONE cycle shape we had thought of —
+    a single relation, a single node pair, checked directly. Its intent was
+    right and its reach was not; this one derives the relation set from
+    CASCADE_RELATIONS and walks the whole edge table, so a cycle of any
+    length over any cascade relation fails it. Do not narrow it back.
+
+    (An earlier revision of this docstring pointed at `git show 3af90ab:...`
+    for the old body. That commit was never pushed and two rebases have made
+    it unreachable from origin — a pointer into a reader's `fatal: Not a
+    valid object name`. The intent is stated above instead, which is what
+    the pointer was carrying anyway.)
+
+    §12.3's supersede-time guardrail refuses a replacement that is already
+    downstream of what it replaces — but it is a POINT-IN-TIME check,
+    evaluated once, at supersede time, over the edge table as it stood THEN.
+    Every acknowledgement WRITTEN AFTER adds an edge to the very relation
+    (`acknowledged_derives_from` JOINS CASCADE_RELATIONS) the check was
+    evaluated over — so two individually-legal supersedes plus two
+    acknowledgements can still close a cycle across THREE nodes and TWO
+    relations, a shape the old test's single-relation, single-pair
+    assertion could never have caught (that is the point of this being a
+    property test: it must detect ANY cycle, ANY length, over the whole
+    derived cascade set — not just this one).
+
+    Fixture, public verbs only (`_derive_impl` / `_supersede_impl` /
+    `_cascade_resolve_impl` — no hand-inserted edges, no direct SQL writes;
+    a hand-built unreachable state proves nothing, #2356):
+
+        dv1 --------> ob   (base)
+        dv2 --------> ob   (base)
+        dv3 --------> dv2  (dv3 derives from dv2)
+        dv4 --------> dv3  (dv4 derives from dv3)
+        dv5 --------> dv1  (dv5 derives from dv1)
+
+    Then: supersede(dv1 -> dv4), supersede(dv2 -> dv5) — each individually
+    legal under §12.3 (neither replacement is yet downstream of what it
+    replaces). Acknowledge dv3 (writes dv3 -> dv5). Before this guard, the
+    FOURTH call — acknowledge dv5 (which would write dv5 -> dv4) — closes
+    `dv3 -> dv5 -> dv4 -> dv3` (the last leg is dv4's pre-existing
+    `derives_from` edge to dv3). Measured before the fix: confidence
+    recompute stopped being idempotent (0.411, 0.322, 0.254 on identical
+    re-runs) and conformance reported `flare: false`.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Base observation.", quote_type="official_statement")
+    dv1 = _seed_dv(derive, "dv1, a base derivation.", [ob])
+    dv2 = _seed_dv(derive, "dv2, a second base derivation.", [ob])
+    dv3 = _seed_dv(derive, "dv3, derives from dv2.", [dv2])
+    dv4 = _seed_dv(derive, "dv4, derives from dv3.", [dv3])
+    dv5 = _seed_dv(derive, "dv5, derives from dv1.", [dv1])
+
+    assert _cascade_cycle(core) is None, (
+        "the fixture itself must start acyclic, or this test proves nothing")
+
+    s1 = json.loads(rev._supersede_impl(
+        old_node_id=dv1, new_node_id=dv4, supersede_reason="r1"))
+    assert "error" not in s1, f"s1 must be individually legal under §12.3: {s1}"
+
+    s2 = json.loads(rev._supersede_impl(
+        old_node_id=dv2, new_node_id=dv5, supersede_reason="r2"))
+    assert "error" not in s2, f"s2 must be individually legal under §12.3: {s2}"
+
+    a1 = json.loads(rev._cascade_resolve_impl(
+        node_id=dv3, resolution_kind="acknowledged"))
+    assert "error" not in a1, f"acknowledging dv3 must be legal on its own: {a1}"
+
+    # THE FOURTH CALL — this is the one the guard must refuse.
+    a2 = json.loads(rev._cascade_resolve_impl(
+        node_id=dv5, resolution_kind="acknowledged"))
+    assert "error" in a2, (
+        f"the guard must refuse the cycle-closing acknowledgement, got: {a2}")
+    assert a2["guard"] == "acknowledgement_would_close_cascade_cycle", a2
+    assert a2["relation"] == "acknowledged_derives_from", a2
+    assert a2["node_id"] == dv5, a2
+    assert "supersede or retract" in a2["remedy"], a2
+
+    # THE PROPERTY: acyclic over the WHOLE derived cascade set, not merely
+    # "the two edges the old test happened to check for".
+    cycle = _cascade_cycle(core)
+    assert cycle is None, f"cascade relation set has a cycle: {cycle}"
+
+
+def test_acknowledgement_rollback_undoes_a_genuinely_written_prior_edge():
+    """#2349 blocker 2 / round-2 reviewer suggestion — the ONE path the test
+    above cannot exercise, by construction.
+
+    §12.7's write-time guard sits inside a loop over `affected` in
+    `_cascade_record_acknowledgement_edges`. If a LATER iteration raises
+    after an EARLIER one already INSERTed an ack edge, correctness depends
+    on `conn.rollback()` undoing that earlier insert (single connection, no
+    intermediate commit — confirmed by reading the code). The test above
+    gives its acknowledging node (dv5) exactly ONE affected premise, so the
+    raise always fires on the first and only iteration — the
+    rollback-of-a-prior-successful-insert path has never actually run.
+
+    This fixture gives the acknowledging node (N) TWO affected premises —
+    P2 (safe) and B (cycle-closing) — sorted so P2 processes FIRST (its id
+    sorts before B's; both markers are on the SAME cascade event, so
+    premise_id is the tiebreaker). Public verbs only, no hand-inserted
+    edges (#2356):
+
+        R_ob --> P2 --> N          R_ob --> B --> N     (N's two premises)
+        X_ob --> Mp --> M          M --> RB              (the "bridge" arm)
+
+    Retract R_ob (marks P2, B, N on ONE event). Resolve P2 -> RA (a
+    genuinely unrelated replacement) — legal under §12.3, no relation to N.
+    Build RB deriving from M, BEFORE M has anything to do with N, then
+    resolve B -> RB — also legal under §12.3 at THAT moment (RB's only
+    ancestor is M -> Mp -> X_ob; nothing connects it to B yet).
+
+    THEN supersede Mp -> N directly (Mp's own supersede, not via B or P2 at
+    all) and have M acknowledge it, writing M -> N. This is the same
+    §12.3-is-point-in-time move the test above uses, except the bridge
+    lands AFTER B's supersede was already validated, not via a second
+    acknowledge on the SAME node the property test above exercises — so by
+    the time N itself tries to acknowledge, RB (B's replacement, built on M)
+    has become transitively downstream of N through the new M -> N edge,
+    even though nothing about B or RB changed.
+
+    N's own acknowledge call must therefore: write N -> RA cleanly (P2
+    first, real INSERT, real committed... no, NOT committed — same
+    connection, no intermediate commit), then raise on N -> RB (B second).
+    Assert, after the refusal:
+      - the call returns the SAME guard key as the property test above;
+      - N -> RA is NOT in the edges table — the whole point: the rollback
+        must have removed a row that was genuinely written, not merely
+        skipped one that was never attempted;
+      - N's own markers are unchanged (still pending, not resolved);
+      - the graph is still acyclic by `_cascade_cycle`.
+
+    Can-it-fail control (performed by hand during authoring, per this
+    file's convention — see the sibling test's own docstring pointer). A
+    plain no-op in place of `conn.rollback()` does NOT reproduce the bug —
+    measured, not assumed: `core._get_db()` opens a fresh, non-pooled
+    connection per call, and closing an sqlite3 connection with an
+    uncommitted transaction pending discards it, so the surrounding
+    `finally: conn.close()` already undoes an un-rolled-back INSERT as a
+    side effect of connection teardown. The control that actually exercises
+    what `conn.rollback()` is FOR is replacing it with `conn.commit()` —
+    forcing the partial write to survive past close(). That mutation left
+    N -> RA surviving in the edges table after the (still-returned)
+    refusal, turning this test's `got is None` assertion red, while the
+    property test above continued to PASS unchanged (it has only one
+    affected premise, so there is nothing for a broken rollback to leave
+    behind) — which is the actual demonstration that this test covers
+    ground the older one structurally cannot.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    r_ob = _seed_ob(obs, "Root to retract.", quote_type="official_statement")
+    x_ob = _seed_ob(obs, "Bridge base.", quote_type="official_statement")
+    mp = _seed_dv(derive, "Mp, derives from x_ob.", [x_ob])
+
+    p2 = _seed_dv(derive, "P2, derives from r_ob.", [r_ob])
+    b = _seed_dv(derive, "B, derives from r_ob.", [r_ob])
+    assert p2 < b, (
+        "fixture requires p2's id to sort before b's, so P2 is the FIRST "
+        "affected-premise entry processed within N's single acknowledge "
+        "call — creation order controls this since ids are sequential")
+
+    n = _seed_dv(derive, "N, derives from p2 and b.", [p2, b])
+    m = _seed_dv(derive, "M, derives from mp.", [mp])
+
+    assert _cascade_cycle(core) is None, (
+        "the fixture itself must start acyclic, or this test proves nothing")
+
+    ret = json.loads(rev._retract_impl(
+        node_id=r_ob, error_type="hallucinated_claim", reason="w"))
+    assert "error" not in ret, ret
+
+    clean_ob = _seed_ob(obs, "Clean basis for P2's replacement.",
+                         quote_type="official_statement")
+    ra = _seed_dv(derive, "RA, safe replacement for P2.", [clean_ob])
+    rp2 = json.loads(rev._cascade_resolve_impl(
+        node_id=p2, resolution_kind="superseded", replacement_id=ra))
+    assert "error" not in rp2, f"resolving P2 must be legal on its own: {rp2}"
+
+    # RB is built on M BEFORE M has any relationship to N — so superseding
+    # B -> RB is legal under §12.3 at this moment (checked below).
+    rb = _seed_dv(derive, "RB, replacement for B, derives from M.", [m])
+    rb_supersede = json.loads(rev._cascade_resolve_impl(
+        node_id=b, resolution_kind="superseded", replacement_id=rb))
+    assert "error" not in rb_supersede, (
+        f"resolving B -> RB must be legal under §12.3 at THIS moment, "
+        f"before the M -> N bridge exists: {rb_supersede}")
+
+    # The bridge: Mp is superseded directly by N (unrelated to N's own
+    # premises p2/b), then M acknowledges — writing M -> N. AFTER this, RB
+    # (which derives from M) is transitively downstream of N, even though
+    # RB's supersede-of-B was validated before this bridge existed.
+    s_mp = json.loads(rev._supersede_impl(
+        old_node_id=mp, new_node_id=n, supersede_reason="bridge"))
+    assert "error" not in s_mp, f"Mp -> N must be legal under §12.3: {s_mp}"
+    ack_m = json.loads(rev._cascade_resolve_impl(
+        node_id=m, resolution_kind="acknowledged"))
+    assert "error" not in ack_m, f"M acknowledging must be legal: {ack_m}"
 
     conn = core._get_db()
     try:
-        edges = {(e["source_id"], e["target_id"]) for e in conn.execute(
-            "SELECT source_id, target_id FROM edges "
-            "WHERE relation = 'derives_from'").fetchall()}
-        assert not ((x, p2) in edges and (p2, x) in edges), (
-            f"acknowledgement closed a cascade cycle: {sorted(edges)}")
-
-        vals = []
-        for _ in range(4):
-            rev._cascade_recompute_confidence_transitive(conn, p)
-            vals.append(conn.execute(
-                "SELECT confidence FROM nodes WHERE id = ?", (x,)).fetchone()["confidence"])
-        conn.commit()
+        reaches_before = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_derives_from'", (m, n)).fetchone()
     finally:
         conn.close()
-    assert len(set(vals)) == 1, (
-        f"the recompute must be idempotent — the phase-split safety argument "
-        f"rests on it. Got {vals}")
+    assert reaches_before, "the M -> N bridge edge must exist before N acts"
+
+    n_markers_before = sorted(
+        r["status"] for r in _markers(core, node_id=n))
+
+    # THE CALL UNDER TEST: N acknowledges both P2 and B in ONE call. P2
+    # (sorts first) writes N -> RA cleanly; B (sorts second) raises because
+    # RB is now downstream of N via the bridge.
+    ack_n = json.loads(rev._cascade_resolve_impl(
+        node_id=n, resolution_kind="acknowledged"))
+    assert "error" in ack_n, (
+        f"the guard must refuse N's acknowledgement once B's replacement "
+        f"RB is reachable from N: {ack_n}")
+    assert ack_n["guard"] == "acknowledgement_would_close_cascade_cycle", ack_n
+    assert ack_n["relation"] == "acknowledged_derives_from", ack_n
+    assert ack_n["node_id"] == n, ack_n
+    assert ack_n["replacement_id"] == rb, ack_n
+
+    conn = core._get_db()
+    try:
+        got = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_derives_from'", (n, ra)).fetchone()
+    finally:
+        conn.close()
+    assert got is None, (
+        "THE WHOLE POINT: N -> RA was genuinely INSERTed by the first "
+        "iteration before the second raised — conn.rollback() must have "
+        "removed it. A surviving row here means the rollback path is "
+        "broken (or never ran).")
+
+    n_markers_after = sorted(
+        r["status"] for r in _markers(core, node_id=n))
+    assert n_markers_after == n_markers_before, (
+        f"N's own markers must be unchanged by a refused acknowledgement: "
+        f"before={n_markers_before}, after={n_markers_after}")
+
+    cycle = _cascade_cycle(core)
+    assert cycle is None, f"cascade relation set has a cycle: {cycle}"
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +981,7 @@ def test_trivial_does_not_fire_when_a_premise_actually_died():
 # ---------------------------------------------------------------------------
 
 
-def test_acknowledge_recompute_is_inert_while_the_ack_edge_is_deferred():
+def test_acknowledge_recompute_follows_the_replacement():
     """§4 calls this out explicitly: recomputing X changes X, and X's
     children were computed from X's OLD value, so one hop is not enough.
     """
@@ -603,24 +1003,86 @@ def test_acknowledge_recompute_is_inert_while_the_ack_edge_is_deferred():
 
     dv1_after, dv2_after = _conf(core, dv1), _conf(core, dv2)
 
-    # NOTHING CHANGED, and that is the currently-correct answer — it is also
-    # a cost of the deferred acknowledgement edge, recorded here rather than
-    # buried. §4 couples its two requirements more tightly than it says: the
-    # recompute only has anything to read on the acknowledge path BECAUSE
-    # the ack edge brings the replacement into the premise set. Without it,
-    # dv1's premises are unchanged and the superseded premise's own
-    # confidence is untouched by being superseded, so "confidence is ALWAYS
-    # recomputed" runs and finds nothing.
+    # §4's two requirements are COUPLED, and this is where that shows: the
+    # recompute only has anything to read on the acknowledge path BECAUSE the
+    # acknowledgement edge brings the replacement into the premise set. While
+    # the edge was deferred this measured 0.833 -> 0.833, changed: [].
     #
-    # This test therefore no longer demonstrates transitivity. The diamond
-    # test below does, driven by a path that does not depend on the edge.
-    assert dv1_after == dv1_before == round(0.85 * 0.98, 3), (dv1_before, dv1_after)
-    assert dv2_after == dv2_before, (dv2_before, dv2_after)
-    assert resp["confidence_recompute"]["changed"] == [], (
-        "with the ack edge deferred there is nothing for an acknowledgement "
-        "to recompute — see acknowledgement_edge_note")
-    assert resp["acknowledgement_edges_deferred"], (
-        "and the deferral that causes it must be reported")
+    # dv1 now rests on ob (0.85) AND ob2 (0.35); weakest link wins. And it
+    # propagates: dv2 was computed from dv1's OLD value, so one hop is not
+    # enough.
+    assert dv1_after == round(0.35 * 0.98, 3), (dv1_before, dv1_after)
+    assert dv2_after < dv2_before, (dv2_before, dv2_after)
+    assert dv2_after == round(dv1_after * 0.98, 3), dv2_after
+    changed = {c["node_id"] for c in resp["confidence_recompute"]["changed"]}
+    assert {dv1, dv2} <= changed, resp["confidence_recompute"]
+
+
+def test_recompute_is_idempotent_across_the_acknowledgement_edge():
+    """The phase split is NOT one transaction, and its whole safety argument
+    is that the recompute can simply be re-run. That argument is only true
+    while re-running is a no-op.
+
+    This assertion used to live inside the cycle test, whose fixture the
+    §12.3 guardrail now refuses to build — so it was deleted along with it.
+    It is restored here on a LEGAL fixture, and it matters more after §12.5
+    than before: `acknowledged_derives_from` joins the premise set, so the
+    acknowledged node's own recompute now reads an edge that did not exist
+    when the value was first computed. When the cycle version regressed it
+    read 0.641, 0.567, 0.503, 0.446 across four IDENTICAL runs — decaying,
+    never settling. A single run cannot see that; only repetition can.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+
+    ob = _seed_ob(obs, "Strong premise.", quote_type="official_statement")
+    ob2 = _seed_ob(obs, "Weak replacement.", quote_type="editorial")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+    dv2 = _seed_dv(derive, "Transitive dependent.", [dv1])
+
+    json.loads(rev._supersede_impl(old_node_id=ob, new_node_id=ob2,
+                                   supersede_reason="weaker"))
+    ack = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="acknowledged"))
+    assert "error" not in ack, ack
+
+    conn = core._get_db()
+    try:
+        # The edge must actually be there, or this test is idempotent about
+        # nothing — the deferral measured a clean no-op for exactly that
+        # reason.
+        assert conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_derives_from'",
+            (dv1, ob2)).fetchone() is not None, "no acknowledgement edge to be idempotent across"
+
+        # CAN-IT-FAIL. Without this, a recompute that did NOTHING would pass
+        # the loop below — resolve already wrote the correct values, so four
+        # no-ops read back four identical correct numbers. Poisoning the
+        # stored values first means run 1 has to actually repair them.
+        conn.execute("UPDATE nodes SET confidence = 0.111 WHERE id IN (?, ?)",
+                     (dv1, dv2))
+
+        runs = []
+        for _ in range(4):
+            rev._cascade_recompute_confidence_transitive(conn, ob)
+            runs.append((
+                conn.execute("SELECT confidence FROM nodes WHERE id = ?",
+                             (dv1,)).fetchone()["confidence"],
+                conn.execute("SELECT confidence FROM nodes WHERE id = ?",
+                             (dv2,)).fetchone()["confidence"],
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert len(set(runs)) == 1, (
+        f"the recompute must be idempotent — the phase-split safety argument "
+        f"rests on it. Got {runs}")
+    # And it settled on the value the single-run test asserts, not merely on
+    # SOME fixed point: a recompute that stuck at the pre-supersede number
+    # would also be idempotent, and would be wrong.
+    assert runs[0] == (round(0.35 * 0.98, 3), round(0.35 * 0.98 * 0.98, 3)), runs[0]
+
 
 
 def test_recompute_skips_a_conjecture_and_leaves_its_confidence_untouched():
@@ -1061,7 +1523,7 @@ def test_convergence_warning_DOES_fire_when_the_recompute_cannot_settle():
 
 
 def test_acknowledgement_edge_via_marker_branch_is_exercised():
-    """The `via="marker"` branch of _cascade_acknowledgement_edges_deferred —
+    """The `via="marker"` branch of _cascade_record_acknowledgement_edges —
     reached when the superseded premise carries a MARKER of its own, rather
     than being the cascade root (the `via="root"` branch, which
     test_acknowledgement_records_a_derives_from_edge_to_the_superseder
@@ -1097,12 +1559,17 @@ def test_acknowledgement_edge_via_marker_branch_is_exercised():
     rn = json.loads(rev._cascade_resolve_impl(
         node_id=n, resolution_kind="acknowledged"))
     assert "error" not in rn, rn
-    assert rn["acknowledgement_edges_deferred"] == [
+    assert rn["acknowledgement_edges"] == [
         {"premise_id": p, "replacement_id": p2}
-    ], rn["acknowledgement_edges_deferred"]
-    assert p2 not in _premises(core, n), (
-        "the edge is DEFERRED, not written — see "
-        "test_acknowledgement_writes_no_backwards_in_time_edge")
+    ], rn["acknowledgement_edges"]
+    conn = core._get_db()
+    try:
+        got = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'acknowledged_derives_from'", (n, p2)).fetchone()
+    finally:
+        conn.close()
+    assert got, "the marker-branch replacement must be recorded on the new relation"
 
 
 def test_contradiction_marking_writes_the_same_audit_trail_as_the_ordinary_path():

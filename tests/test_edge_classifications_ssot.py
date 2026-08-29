@@ -77,7 +77,10 @@ def test_no_unclassified_relations_in_schema():
     remove-edge / DAG behavior is undefined.
     """
     # Hardcoded — extend when adding a relation.
+    # `acknowledged_derives_from` added 2026-08-29 (#2013 §12.5) — a premise
+    # edge established by adjudication rather than at authorship.
     known_relations = {
+        "acknowledged_derives_from",
         "about", "cites", "contradicts", "derives_from", "exemplifies",
         "instantiates",  # #530 c1 (2026-06-07)
         "predicted_by",  # #2252 W6 (2026-08-27) — prediction pairing edge,

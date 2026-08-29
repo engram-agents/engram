@@ -295,26 +295,38 @@ def test_no_other_module_frozenset_equals_provenance_relations():
 def test_citation_support_relations_not_derived_from_cascade():
     """Regression guard for the Stage 1.3 hazard: CITATION_SUPPORT_RELATIONS
     is a NEW ENUMERATED CONSTANT, deliberately not derived from
-    CASCADE_RELATIONS, per #2252 Stage 1.0b table row 2. Today the two sets
-    happen to be equal by VALUE (both {derives_from, supported_by}) — that
-    coincidence is exactly what this test guards against silently breaking:
-    when Stage 1.3 removes cascade from supported_by, CASCADE_RELATIONS will
-    shrink to {derives_from} while CITATION_SUPPORT_RELATIONS must NOT, or
-    the uncited-observation metric (engram_lifecycle.py, engram_stats.py)
-    silently changes meaning with no test to catch it.
+    CASCADE_RELATIONS, per #2252 Stage 1.0b table row 2. At Stage 1.0b's
+    authoring the two sets happened to be equal by VALUE (both
+    {derives_from, supported_by}) — that coincidence is exactly what this
+    test guards against silently breaking: when Stage 1.3 removed cascade
+    from supported_by, CASCADE_RELATIONS shrank to {derives_from} while
+    CITATION_SUPPORT_RELATIONS did NOT, or the uncited-observation metric
+    (engram_lifecycle.py, engram_stats.py) would have silently changed
+    meaning with no test to catch it.
 
-    This test cannot assert inequality today (the two sets ARE equal by
-    value pre-Stage-1.3) — it asserts the thing that actually matters:
-    CITATION_SUPPORT_RELATIONS is its own independent constant, not an
-    alias/derivation of CASCADE_RELATIONS, so a future narrowing of one
-    cannot silently narrow the other. Checked by identity-independence: the
-    two names must not be the SAME frozenset object bound by construction to
-    depend on `cascade`.
+    Both sets have since grown independently, in the SAME direction this
+    test exists to police: #2013 §12.5 added `acknowledged_derives_from` to
+    CASCADE_RELATIONS (cascade must reach an acknowledging node when its
+    replacement is later superseded); #2349 blocker 2 separately added it to
+    CITATION_SUPPORT_RELATIONS (a node that has acknowledged holds a real
+    one-hop premise the citation-coverage metric must be able to see). The
+    two constants are NOT value-equal today — CASCADE_RELATIONS is
+    {derives_from, acknowledged_derives_from}, CITATION_SUPPORT_RELATIONS is
+    {derives_from, supported_by, acknowledged_derives_from} — which is
+    itself evidence the two questions really are independent, not that one
+    silently tracks the other.
+
+    This test asserts the thing that actually matters regardless of the
+    two sets' current value relationship: CITATION_SUPPORT_RELATIONS is its
+    own independent constant, not an alias/derivation of CASCADE_RELATIONS,
+    so a future narrowing of one cannot silently narrow the other. Checked
+    by identity-independence: the two names must not be the SAME frozenset
+    object bound by construction to depend on `cascade`.
     """
-    assert CITATION_SUPPORT_RELATIONS == frozenset({"derives_from", "supported_by"})
-    # Value-equal today by coincidence (documented above and in the
-    # constant's own comment in engram_core.py) — this is not itself the
-    # guard. The guard is that CITATION_SUPPORT_RELATIONS is NOT computed
+    assert CITATION_SUPPORT_RELATIONS == frozenset(
+        {"derives_from", "supported_by", "acknowledged_derives_from"}
+    )
+    # The guard is that CITATION_SUPPORT_RELATIONS is NOT computed
     # from EDGE_CLASSIFICATIONS' cascade flag the way CASCADE_RELATIONS is:
     assert CITATION_SUPPORT_RELATIONS is not CASCADE_RELATIONS
     computed_from_cascade_flag = frozenset(
