@@ -971,20 +971,21 @@ EDGE_TIERS: dict[str, str] = {
     # dependency tier: causal / provenance edges; temporal_causal=True expected
     "cites":        "dependency",
     "derives_from": "dependency",
-    "acknowledged_derives_from": "dependency",  # #2013 §12.5 — a genuine
-                                    # provenance edge (it records where a node's
-                                    # ground now sits), so the tier is right and
-                                    # its dag_check=False is an INTENTIONAL
-                                    # divergence, acknowledged below.
+    "acknowledged_derives_from": "dependency",  # #2013 §12.5: a genuine
+                                    # provenance edge (it records where a
+                                    # node's ground now sits), so the tier
+                                    # is right — but it's deliberately
+                                    # temporal_causal=False (#2357 renamed
+                                    # the old dag_check flag to
+                                    # temporal_causal), an INTENTIONAL
+                                    # divergence acknowledged in
+                                    # EDGE_TIER_DIVERGENCE_ACK below.
     "retracts":     "dependency",
     "supersedes":   "dependency",
     "supported_by": "dependency",
     "subtask_of":   "dependency",
     "predicted_by": "dependency",  # #2252 W6: same provenance-chain shape as
                                     # supported_by, which it is split out of.
-    "acknowledged_derives_from": "dependency",  # #2357: provenance-chain shape,
-                                    # but deliberately temporal_causal=False —
-                                    # see EDGE_TIER_DIVERGENCE_ACK below.
     # relational tier: symmetric / cross-temporal; temporal_causal=False expected
     "contradicts":  "relational",
     "tensions":     "relational",
@@ -2736,8 +2737,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # the shared _recreate_fts_sync_triggers helper (round-3 fix; #2077's
     # own duplication flag) — see that function's docstring for the full
     # per-trigger rationale, previously inlined here and independently
-    # inlined again at migration rung 4 below, ~370 lines apart, with no
-    # guard against the two copies drifting on the next column-set change.
+    # inlined again at migration rung 2 below (nodes_fts_insert,
+    # nodes_fts_delete, and nodes_retract_remove_from_fts, hand-written with
+    # a hardcoded 5-column list rather than routed through this helper) —
+    # NOT rung 4 as an earlier version of this comment said (#2408: the
+    # rung-4 gate opens ~125 lines after the surviving inline copy, so
+    # following this pointer there lands in the wrong block). No guard
+    # pins the two copies together against drifting on the next
+    # column-set change; #2408 tracks finishing the round-3 unification by
+    # routing rung 2 through this helper too.
     # drop_first=False here: no DROP precedes this call, so CREATE TRIGGER
     # IF NOT EXISTS is used, matching this block's pre-existing idempotent,
     # safe-to-run-every-startup behavior.
