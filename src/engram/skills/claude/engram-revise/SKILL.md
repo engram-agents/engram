@@ -31,7 +31,7 @@ it's `is_current=1`, and that its type is what you expected.
 ## Step 1 — Check it isn't already mid-cascade
 
 **Both verbs refuse outright** if the target already carries a pending cascade
-marker of its own (#2013 invariant 7, #2343): a plain revision would let this
+marker of its own (cascade-machine invariant 7): a plain revision would let this
 node's marker clear while everything else the same cascade touched stays
 unadjudicated — a bypass wearing invariant 7's clothes. The refusal names the
 pending events and hands you the two calls to make instead:
@@ -93,7 +93,7 @@ allowed:
   cross-type revision) is not supersede; if the correction changes the
   epistemic category, retract the old node and cite the replacement
   organically in new derivations instead.
-- **The #2349 cycle guardrail** — the replacement must not be downstream of
+- **The supersede cycle guardrail** — the replacement must not be downstream of
   (transitively derive from) the node it replaces. Superseding a node with
   something that already depends on it would make the replacement stale by
   the very act that installs it.

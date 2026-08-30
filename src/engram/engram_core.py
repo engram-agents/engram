@@ -548,7 +548,7 @@ def _refuse_ncb_confidence(node_type: str, confidence) -> None:
     if confidence is not None and not _is_claim_bearing(node_type):
         raise ValueError(
             f"non-claim-bearing type '{node_type}' cannot carry a "
-            f"non-NULL confidence ({confidence!r}) — #2252 CB/NCB partition"
+            f"non-NULL confidence ({confidence!r}) — the CB/NCB partition"
         )
 
 
@@ -7016,7 +7016,7 @@ USE_STALE_RETIRED_NOTICE = (
     "adjudicate with engram_cascade_resolve (a plain supersede/retract is "
     "refused while markers are pending), or cite the successor of a "
     "superseded one. (Parameter still accepted for compatibility; it is "
-    "removed in #2013 slice 2.)"
+    "removed in a future release.)"
 )
 
 

@@ -1584,7 +1584,8 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             "node already carries the "
             "original event's pending markers, and invariant 4 forbids a new "
             "descendant appearing while the node was pending, so a second "
-            "event would mark a provably-covered set (#2013 §6, §10.2). "
+            "event would mark a provably-covered set (cascade-machine design: "
+            "no re-cascade during resolution). "
             "Confidence propagation is the OPPOSITE case and DID run "
             "transitively — see confidence_recompute."
         ),
@@ -2204,7 +2205,7 @@ def _supersede_impl(
                     "error": f"Node '{old_node_id}' carries {len(_pending_here)} pending "
                              f"cascade marker(s) ({len(_events)} event(s)) — a plain "
                              f"engram_supersede is refused on a node whose own "
-                             f"premises are still under adjudication (#2013 "
+                             f"premises are still under adjudication (cascade-machine "
                              f"invariant 7). Resolve the cascade through the "
                              f"frontier instead: read mode C for this node, "
                              f"adjudicate each frontier entry with "
@@ -2284,7 +2285,7 @@ def _supersede_impl(
                          f"node with one of its own descendants would make the "
                          f"replacement stale by the act that installs it, and it is "
                          f"the one shape that lets an acknowledgement close a "
-                         f"cascade cycle (#2013 §12.3).",
+                         f"cascade cycle.",
                 "guard": "supersede_replacement_is_downstream",
                 "old_node_id": old_node_id,
                 "new_node_id": new_node_id,
@@ -2754,7 +2755,7 @@ def _retract_impl(
             _why = (
                 f"A plain engram_retract on a non-current node is refused — "
                 f"retracting an already-{_actual_status} node would reopen "
-                f"descendants that were already adjudicated (#2013/#2396) "
+                f"descendants that were already adjudicated "
                 f"and is not idempotent."
             )
             if _successor:
@@ -2802,7 +2803,7 @@ def _retract_impl(
                     "error": f"Node '{node_id}' carries {len(_pending_here)} pending "
                              f"cascade marker(s) ({len(_events)} event(s)) — a plain "
                              f"engram_retract is refused on a node whose own "
-                             f"premises are still under adjudication (#2013 "
+                             f"premises are still under adjudication (cascade-machine "
                              f"invariant 7). Resolve the cascade through the "
                              f"frontier instead: read mode C for this node, "
                              f"adjudicate each frontier entry with "

@@ -18,9 +18,8 @@ NOT used during the retract/supersede action itself — that's the
 a replacement, call the plain verb, engine handles the cascade automatically
 unless the target is itself already marked).
 
-# Background: how cascade markers fire (PR #421 semantics; storage + verbs
-# updated 2026-08 through engram-alpha#2013/#2009/#2338/#2342/#2349/#2343 —
-# the cascade machine)
+# Background: how cascade markers fire (the cascade machine; design of
+# record: docs/cascade-machine.md in the ENGRAM source repository)
 
 After a retract or supersede, the engine walks downstream and marks:
 
