@@ -192,6 +192,16 @@ class TestIsHumanPrompt:
         payload = {"prompt": "<local-command>run</local-command>"}
         assert tbh._is_human_prompt(payload) is False
 
+    def test_no_prompt_source_stop_hook_feedback_is_not_human(self):
+        """No promptSource + 'Stop hook feedback:' body -> not human (#2438).
+
+        A blocking Stop-hook re-invocation (e.g. engram-loop-arm-stop-hook.py's
+        own nudge) renders as a user turn starting with 'Stop hook feedback:'
+        and carries promptSource=None -- must not be misclassified as a
+        genuine human prompt."""
+        payload = {"prompt": "Stop hook feedback:\n[Loop Arm Check: a loop marker is active and this turn shows no ScheduleWakeup call. Arm now.]"}
+        assert tbh._is_human_prompt(payload) is False
+
     def test_no_prompt_source_plain_text_is_human(self):
         """No promptSource + plain text body → treated as human (fallback)."""
         payload = {"prompt": "What is the status of #1077?"}
