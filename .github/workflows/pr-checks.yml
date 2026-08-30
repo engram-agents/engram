@@ -555,6 +555,26 @@ jobs:
             tests/test_build_plugin_hooks_consistency.py \
             -q
 
+      # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
+      # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
+      # scenarios/ drives supersede / retract / frontier / resolve through the
+      # real engram_revision.py on named topologies (tests/cascade_playbox.py)
+      # and asserts the ruled guarantees at each stage — CD-01..09 on Lei's
+      # converging diamonds, incl. the #2343 refusal. Lei, 2026-08-29: these
+      # belong in the automated gate, not only the release-cut suite.
+      #
+      # Measured (not assumed) to fit the stdlib carve-out above: a fresh venv
+      # with ONLY `pip install pytest` runs cascade_scenarios + the playbox
+      # harness clean — 26 passed in 1.6s on 6f7addbf. engram_core imports
+      # `server` lazily inside a function, never at module scope, so no
+      # fastmcp is pulled in; nothing here needs a cost-model ruling.
+      - name: cascade behaviour acceptance — playbox scenarios CD-01..09 + harness
+        run: |
+          python3 -m pytest \
+            tests/cascade_scenarios \
+            tests/test_cascade_playbox.py \
+            -q
+
       # ── 8. test-id-set-check ────────────────────────────────────────────
       # #2350 — a deleted test cannot fail, so a PR that removes coverage is
       # exactly as green as a PR that adds it: no existing gate here reads
