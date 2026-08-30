@@ -430,6 +430,26 @@ github/gh-stack` — only then does `gh --help` list `stack` under EXTENSION
 COMMANDS; verify with `gh extension list`. All facts below measured live on
 the 2026-08-29 cascade train (alpha #2373/#2382).
 
+- **Linking is NOT optional — do it at PR creation.** The moment you open a
+  PR whose base is another PR's branch, `gh stack link <parent> <child> …`
+  (works on already-open PRs). An unlinked stack has NONE of this section's
+  protections: plain `gh pr merge` is NOT refused, nothing auto-rebases,
+  and merging the parent with `--delete-branch` CLOSES the child rather
+  than retargeting it. The review record SURVIVES the close, and the child
+  is recoverable — re-push the deleted base ref, reopen, retarget — but
+  ONLY while its head is untouched. A post-close force-push is the point
+  of no return: after it, reopen is refused and the work needs a successor
+  PR, which starts with no review record of its own. So on finding an
+  auto-closed child: RESTORE THE BASE REF BEFORE YOU REBASE ANYTHING —
+  rebasing is the reflex when a stacked PR breaks, and here it is the one
+  move that forecloses recovery. Verify membership server-side (the REST
+  `stack` field on the PR, or the merge refusal itself): linking existing
+  PRs registers on GitHub, and a local `gh stack view` from the very same
+  branch can still claim "not part of a stack" (measured 2026-08-30).
+  *(Origin: alpha #2429/#2432, 2026-08-30 — an approved child closed by
+  its parent's `--delete-branch` merge, on a seat that had measured this
+  section's facts the day before; the rule exists because knowing the
+  verbs did not produce the link.)*
 - **Link existing PRs into a stack**: `gh stack link <pr1> <pr2> …`.
 - **A stack member REFUSES plain `gh pr merge`** ("must be merged using the
   asynchronous merge REST API"). The merge verb for stack members is
