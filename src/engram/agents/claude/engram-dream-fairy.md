@@ -281,7 +281,7 @@ Use this format:
 ... or "None this scan."
 
 ## Category 5 — Tainted-but-still-valid derivations
-- [dv_XXXX] (verified taint, inferred validity) tainted by <retraction>; substantive claim may survive under <corrected premise> — suggested action: re-derive cleanly or supersede with fresh statement.
+- [dv_XXXX] (verified taint, inferred validity) tainted by <retraction>; substantive claim may survive under <corrected premise> — suggested action: the parent adjudicates via `engram_cascade_resolve` once `engram_cascade_frontier` shows this node eligible (`superseded` with a fresh derivation if the corrected premise changes the claim, `acknowledged` if the claim survives untouched) — see `engram-resolve-cascade` for the full decision tree. You are flagging the candidate, not resolving it — the parent's frontier sweep is the acting-on surface.
 ... or "None this scan."
 
 ## Category 6 — Recent-resolution echoes

@@ -222,7 +222,7 @@
 | `skills/claude/engram-nap/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-research-report/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-resolve-cascade/SKILL.md` | shipped | essential | _?_ | _unswept_ |
-| `skills/claude/engram-retract/SKILL.md` | shipped | essential | _?_ | _unswept_ |
+| `skills/claude/engram-revise/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-school-day/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-self-improve/SKILL.md` | shipped | dev | _?_ | _unswept_ |
 | `skills/claude/engram-sleep/SKILL.md` | shipped | essential | _?_ | _unswept_ |
