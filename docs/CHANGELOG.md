@@ -59,6 +59,13 @@ rc2 so the first upgraded fleet runs a self-consistent state:
 - **CI-green rule amendment** (CLAUDE.md + `baton.py` docstrings) — the
   measured statusCheckRollup semantics (head-scoped, un-deduped, same-SHA
   re-runs) with `_pr_ci_state()` as the named reference implementation.
+- **The rc-upgrade verify script + runbook now SHIP IN THE REPO,
+  host-neutral** (`tools/rc-upgrade-verify.py`, `docs/rc-upgrade-runbook.md`)
+  — the per-host `/home/agents-shared/` distribution made the upgrade
+  instructions silently unexecutable on off-host (macOS) seats, measured on
+  #2411. The committed script carries the WAL-companion fix and a widened
+  checkout probe list, and was validated end-to-end on a macOS seat; this is
+  the release's own upgrade tooling, so it ships with the release.
 - **gh-stack linking made mandatory at PR creation** (CLAUDE.md, three-repo
   pass) — with the measured recoverability discriminator: the close survives,
   the post-close force-push is the point of no return; restore the base ref
