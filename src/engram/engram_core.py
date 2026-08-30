@@ -7004,8 +7004,10 @@ def _pending_markers_for_node(conn: sqlite3.Connection, node_id: str) -> list:
 USE_STALE_RETIRED_NOTICE = (
     "use_stale is RETIRED and had no effect on this call. The cascade machine "
     "replaced the force-through: resolve the premise instead of citing over it "
-    "— supersede or retract a marker-carrying premise, or cite the successor of "
-    "a superseded one. (Parameter still accepted for compatibility; it is "
+    "— for a marker-carrying premise, read its frontier (mode C) and "
+    "adjudicate with engram_cascade_resolve (a plain supersede/retract is "
+    "refused while markers are pending), or cite the successor of a "
+    "superseded one. (Parameter still accepted for compatibility; it is "
     "removed in #2013 slice 2.)"
 )
 
@@ -7314,11 +7316,18 @@ def _validate_premises(
                         "superseded_id": old_id,
                         "replaced_by_id": drow["superseded_by"] if drow else None,
                         "route": (
-                            f"supersede or retract {sid} — that resolves its own "
-                            "markers in the same operation. (The acknowledge "
-                            "route, for when the upstream change does not affect "
-                            "this claim, arrives with #2013 slice 4.)"
+                            f"a plain supersede/retract on {sid} is refused "
+                            "while it carries pending cascade markers — read "
+                            f"the frontier for {sid} (mode C) and adjudicate "
+                            "each entry with engram_cascade_resolve instead."
                         ),
+                        "next_call": f"engram_cascade_frontier(node_id={sid!r})",
+                        # resolution_kind is the caller's adjudication choice —
+                        # unknowable at refusal time (unlike the revision-verb
+                        # refusals, which know their own kind). keyword=Ellipsis
+                        # keeps the call-text parseable, unlike a bare `...`.
+                        "then": f"engram_cascade_resolve(node_id={sid!r}, "
+                                f"resolution_kind=...)",
                     })
                 # Case 2 — sid IS the superseded node. No marker is ever
                 # written here: the cascade walker seeds the superseded node

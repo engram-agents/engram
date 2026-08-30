@@ -396,7 +396,7 @@ def test_refusal_names_the_route_for_each_case():
     cases = {e["case"]: e for p in r1["stale_premises"] for e in p["stale_because"]}
     assert "cascade_marker" in cases, r1
     route1 = cases["cascade_marker"]["route"]
-    assert marked in route1 and "supersede or retract" in route1, route1
+    assert marked in route1 and "frontier" in route1, route1
 
     # Case 2 — the premise IS the superseded node. No marker is written for
     # it (the walker seeds it into `visited`), so this path is reached only
@@ -424,6 +424,40 @@ def test_refusal_names_the_route_for_each_case():
     assert "superseded_premise" in cases2, r2
     route2 = cases2["superseded_premise"]["route"]
     assert new in route2 and "cite the successor" in route2, route2
+
+
+def test_refusal_cascade_marker_case_carries_machine_readable_route():
+    """#2394 [part of #2013]: the MECH-5 refusal's cascade_marker entry must
+    carry the SAME machine-readable route fields as the plain
+    supersede/retract refusal (#2343, engram_revision.py) — next_call names
+    engram_cascade_frontier, then names engram_cascade_resolve. A plain
+    supersede/retract on the marked premise is refused while its markers are
+    pending, so the route prose must not tell the caller to do that.
+    """
+    rev, obs, derive, core = _mods()
+    root = _mk_obs(obs, "Root of an earlier cascade.")
+    marked = _mk_obs(obs, "Premise carrying a marker.")
+    other = _mk_obs(obs, "Clean premise.")
+    conn = core._get_db()
+    conn.execute(
+        "INSERT INTO cascade_markers (node_id, cascade_event, root_node, "
+        "root_op, status, created_at, backfill_provenance) VALUES "
+        "(?, 'backfill:supersede:x', ?, 'supersede', 'pending', ?, 'migration_time')",
+        (marked, root, core._now()),
+    )
+    conn.commit()
+    conn.close()
+
+    r1 = json.loads(derive._derive_impl(
+        claim="Case 1, machine-readable route.", supporting_ids=f"{marked},{other}",
+        logical_chain="c", reasoning_type="deductive_modus_ponens",
+    ))
+    assert r1.get("status") == "blocked_stale", r1
+    cases = {e["case"]: e for p in r1["stale_premises"] for e in p["stale_because"]}
+    entry = cases["cascade_marker"]
+    assert entry["next_call"] == f"engram_cascade_frontier(node_id={marked!r})", entry
+    assert "engram_cascade_resolve" in entry["then"], entry
+    assert "supersede or retract" not in entry["route"], entry
 
 
 def test_superseding_a_marked_node_is_refused_and_resolves_via_the_verb():

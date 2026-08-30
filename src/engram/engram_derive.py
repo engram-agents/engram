@@ -156,8 +156,10 @@ def _derive_impl(
             A stale premise is now a hard block, and passing this flag returns a loud
             `use_stale_retired` notice on both the refusal and the success payload
             rather than silently doing nothing. The cascade machine replaced the
-            force-through with resolution: supersede or retract a premise that carries
-            a cascade marker, or cite the successor of a premise that is itself
+            force-through with resolution: for a premise that carries a cascade
+            marker, read its frontier (mode C) and adjudicate with
+            engram_cascade_resolve — a plain supersede/retract is refused while
+            markers are pending — or cite the successor of a premise that is itself
             superseded. It no longer writes metadata.built_on_stale — that stamp is
             read-only history now. Removed from this signature in #2013 slice 2.
         use_contested: Opt-in override for MECH-5 contradicted-premise guard (#1654).
