@@ -20,6 +20,24 @@ state drift silently. The release also carries the CB/NCB claim-bearing
 partition groundwork (#2252 stage 1) it builds on, and a wide CI-gate wave that
 grew out of shipping both.
 
+### rc3 addendum (2026-08-30 evening — between rc2 and rc3)
+
+- **The solo-ScheduleWakeup guard is REVERTED** (shipped in rc2, removed in
+  rc3 by the maintainer's ruling after its first live field day): PreToolUse
+  hooks receive each tool call in isolation, so the guard's batch-sibling
+  detection false-positive-denied every properly-batched arm on
+  human-answering turns, and its Stop-hook escape hatch was bypassed by
+  origin-walking classification. Five fires, one true positive; full record
+  on the original PR. The underlying swallowed-reply defect is a harness
+  bug, reported upstream with the field record; the batching discipline in
+  engram-loop remains the working mitigation. The rc2 addendum's guard
+  bullet is superseded by this one.
+- **Stop-hook re-invocations classify as non-human in the time-bar hook**
+  — the missing prefix that let two hooks oppose each other on one turn.
+- **Touched-test selection resolves hooks/skills/tools shipped paths**
+  (dir-prefix normalization; 99% of test-map entries now exercised by the
+  class guard, with a can-it-fail control).
+
 ### rc2 addendum (2026-08-30 afternoon — between rc1 and rc2)
 
 Documentation, discoverability, and hardening landed after the rc1 tag, cut as
