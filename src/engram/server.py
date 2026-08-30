@@ -2693,8 +2693,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
     of supersede pairs carry a different confidence, so the recompute is the
     majority case, not an edge case.
 
-    An 'acknowledged' resolution also records a derives_from edge to each
-    superseding premise. That is not bookkeeping: an acknowledgement outlives
+    An 'acknowledged' resolution also records an `acknowledged_derives_from`
+    edge to each superseding premise — that relation, NEVER `derives_from`
+    (#2013 §12.5). The distinction is structural, not taxonomic: the
+    acknowledging node exists BEFORE the replacement it comes to rest on, so
+    the edge always inverts creation order, and `derives_from` carries
+    `temporal_causal: True` — filed that way it produced one DAG-time
+    violation per acknowledgement, measured. That is not bookkeeping: an acknowledgement outlives
     the repair window, so without the edge nothing would re-read this node if
     the replacement is itself superseded later.
 

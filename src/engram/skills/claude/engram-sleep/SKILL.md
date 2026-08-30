@@ -826,9 +826,22 @@ Agent(
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items.
 
-    FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
+    THEN, BEFORE THE BUCKET WALK: run the mode-B CASCADE SWEEP — engram_cascade_frontier({}) ->
+    engram_cascade_resolve per frontier entry -> re-read the frontier, looping until it is clear.
+    Your spec's cascade-sweep section is the driver loop; follow it there, it carries the parts a
+    prompt cannot. Three things that decide whether the sweep is real: iterate `frontier` (uncapped),
+    NOT `packets` (capped at `limit`, default 5); the frontier can legitimately GROW mid-loop when a
+    resolution marks contradictions, so never stop on 'it did not shrink'; and stop LOUD on
+    invariant_1_violation_suspected, a confidence convergence_warning, any verb error, or the
+    per-night pass cap — recording that state rather than reporting a clean sweep. The sweep runs
+    FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
+    (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
+
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+
+    FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
 )
 ```
