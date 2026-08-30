@@ -67,7 +67,8 @@ engram_retract(payload_json=json.dumps({
 evidence/citation, not about the fact), file the corrected replacement node
 and cite it when re-establishing any tainted downstream node — the same
 derive-new-then-link pattern as the `superseded` shape in
-`engram-resolve-cascade`'s worked example.
+`engram-resolve-cascade`'s worked examples (example A is the retracted-premise
+case).
 
 ## Step 2′ — For genuine evolution: create the replacement, then supersede
 
