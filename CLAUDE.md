@@ -218,7 +218,74 @@ Before presenting a PR as merge-ready, check CI on the current tip:
 gh pr view <N> --json statusCheckRollup,mergeStateStatus
 ```
 
-(`mergeStateStatus: CLEAN` + every `statusCheckRollup[].conclusion: SUCCESS` = green.)
+**Read the two fields in order — `mergeStateStatus` first, the rollup only if it is
+not `CLEAN` — and the asymmetry between them IS the rule: `CLEAN` is sufficient to
+conclude green; anything else (`UNKNOWN`, `BLOCKED`, `BEHIND`, `DIRTY`, `UNSTABLE`) is
+NOT evidence of red and must fall through to the *deduped* rollup rather than fail the
+PR.** Falling through is not the same as being ready to merge, though: `DIRTY` is a
+merge conflict (8 of 8 measured also read `mergeable: CONFLICTING`) and has to be
+resolved no matter how green CI is. Reading "not CLEAN" as "not green" is a different
+bug in the same place — and it is the common case, not an edge case: measured
+2026-08-30, 12 of this repo's 19 open PRs read non-`CLEAN` (8 `DIRTY`, 4 `BLOCKED`).
+Neither state says anything about whether CI passed. The naive read of the rollup —
+"every `statusCheckRollup[].conclusion` is `SUCCESS`" — is WRONG too, and this doc
+carried it until 2026-08-30:
+
+1. **`mergeStateStatus: CLEAN` is the verdict — stop there.** GitHub computes it from
+   the latest run per check, so CLEAN already accounts for superseded runs. No
+   per-check reading is needed.
+2. **The rollup does NOT dedupe.** `statusCheckRollup` is scoped to the head commit —
+   runs on superseded SHAs never appear in it — but it carries **every** run on that
+   commit, not just the latest. So a stale `FAILURE` or `CANCELLED` from a superseded
+   same-SHA run sits in the list beside the current `SUCCESS`, and requiring every
+   entry to be `SUCCESS` false-blocks a genuinely green PR. Measured 2026-08-30 on
+   #2371: `mergeStateStatus: CLEAN` while its rollup carried `pr-checks=CANCELLED`
+   beside `pr-checks=SUCCESS`.
+3. **Two runs of one check can land on the SAME SHA — that is what the dedupe is
+   for.** Filtering by head SHA adds nothing, since the rollup is already head-scoped.
+   On #2410, `pr-checks` completed `CANCELLED` at 13:19:06Z and `SUCCESS` at 13:19:42Z,
+   36 seconds apart, both on `82ba043e`; on #2419 two `pr-checks` `FAILURE`s (14:29:02Z
+   and 14:44:41Z) sit beside the `SUCCESS` at 14:46:01Z, all three on the merged tip
+   `edc20d56`. The workflow fires on `edited` as well as `synchronize`, so a trigger
+   that changes no code can start a second run on a SHA already checked. What the
+   earlier run leaves behind turns on overlap, and the two above are one of each: #2410's
+   second run was **created** while the first was still running — an overlap in the runs
+   (`gh run list --json name,headSha,createdAt,updatedAt`) but not in the rollup, whose
+   job-level `startedAt` for that run falls a few seconds later, after the first had
+   completed — so `cancel-in-progress` on the per-PR concurrency group killed it, hence
+   the `CANCELLED`; #2419's runs never overlapped (each started only after the previous
+   had finished), so nothing was cancelled and those `FAILURE`s are just the runs' own
+   conclusions. The dedupe is load-bearing WITHIN one SHA — and only there: there is no
+   across-SHAs case, because a superseded SHA's runs are not in the rollup to begin with.
+4. **Use the rollup only to find WHICH check to read when the state is not CLEAN** —
+   and dedupe to the latest run per check name before judging, where *latest* means
+   most recently **completed**: `_dedupe_checks_by_latest()` compares `completedAt`,
+   and ordering by `startedAt` instead picks a different winner whenever one run starts
+   earlier but finishes later. `gh run list --branch <branch> --json
+   name,headSha,conclusion,updatedAt` in time order is the direct way to see which run
+   is the current one — that command exposes no `completedAt`, but on a finished run
+   its `updatedAt` is ≈ the completion time (measured ~1s later, on five runs).
+5. **`UNKNOWN` is not red — measured, not reasoned.** `mergeStateStatus` is computed
+   asynchronously and only for open PRs. It has been observed reading `UNKNOWN` twice a
+   minute apart on a PR that was genuinely fine, then `CLEAN` minutes later, then
+   merging without incident; and the REST `mergeable_state` still reads `unknown` after
+   a successful merge, on a PR that is definitively merged with a merge-commit SHA. So
+   the field is trustworthy in one direction only: `CLEAN` concludes green, `UNKNOWN`
+   concludes nothing. Treat it as the *pending* case below (hold, re-check on the next
+   tick), never as a failure.
+
+**Reference implementation: `_pr_ci_state()` in `src/engram/tools/baton.py`** (with its
+helper `_dedupe_checks_by_latest()`) does exactly the above — returns green
+immediately on `mergeStateStatus == CLEAN`, and otherwise dedupes the rollup to the
+latest run per check name before its red pass and its pending pass. The tool has been
+correct since #1366 — the defect was found and the dedupe prescribed on 2026-06-24
+during release dogfooding, and shipped in code then; only the prose half went
+unassigned, and stayed unapplied until the same defect was re-derived from scratch on
+2026-08-30. For those two months a hand-check that followed the doc could false-block
+a PR the baton CLI would have called green. Read the rule off what those two
+functions **do** (their behaviour, not their prose) rather than re-deriving it — if
+doc and tool drift again, one of them is now visibly contradicting a named function,
+and the doc is the side that moves.
 
 - **Green** → present as merge-ready.
 - **Pending / running** → do NOT present as ready yet. CI is async: hold (keep the
@@ -237,6 +304,12 @@ review-convergence was checked but CI was not). v1 is this discipline (vigilance
 structural form — a flip-to-maintainer guard that refuses when CI is red, mechanical
 like the CI tag-once gate — is the better v2 (mechanical gate > vigilance), tracked as
 a follow-up.*
+
+*Amended 2026-08-30: two PRs that same afternoon carried superseded runs in the rollup
+beside a genuinely green tip, both on the tip's own SHA — #2410 (one stale `CANCELLED`)
+and #2419, the v0.5.0-rc1 release cut (two stale `FAILURE`s). The pre-amendment rule reads both as not-green, and
+would have held the release cut. Both are merged and both still carry those entries, so
+merging does not clean the rollup and the evidence stays checkable.*
 
 ## PR review convention (multi-agent mode)
 

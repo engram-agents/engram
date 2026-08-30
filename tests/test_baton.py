@@ -1974,9 +1974,13 @@ def _load_baton_module():
 class TestCiStateDedup:
     """Unit tests for _dedupe_checks_by_latest and the _pr_ci_state fix (#1366).
 
-    Root cause: statusCheckRollup contains ALL runs including superseded ones.
-    A stale FAILURE from a pre-push commit falsely blocked baton flip even when
-    the latest run of the same check was SUCCESS.
+    Root cause: statusCheckRollup is scoped to the PR's head commit, but it
+    carries EVERY run on that commit, not just the latest.  Two runs of one
+    check can land on the same SHA, leaving a stale CANCELLED or FAILURE in
+    the list beside the current SUCCESS; iterating naively found the stale
+    one and falsely blocked baton flip.  Runs on superseded SHAs never enter
+    the rollup at all, so there is no cross-SHA case — the fixtures below
+    are same-name/different-completedAt, which is that same-SHA case.
     """
 
     @pytest.fixture
