@@ -420,7 +420,7 @@ fi
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
 > "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
 >
-> **As of #1901 (2026-08-04), the 9 dream-fairy scan categories are no longer
+> **As of #1901 (2026-08-04), the dream-fairy scan categories are no longer
 > all dispatched every night.** A weight-aging lottery (`tools/dream_lottery.py`)
 > draws a small subset each cycle — see Step 6 below for the mechanism. **The
 > all-or-nothing invariant still holds, just at a different grain: once the
@@ -441,7 +441,8 @@ fi
 >    5–7.5 below). Its work scales with the day's new-node cohort and is
 >    essential whenever nodes were created; it was never the mostly-zero-
 >    findings cost the lottery targets, and this feature does not touch it.
-> 2. **Lottery-rotated** — the 9 dream-fairy scan categories. Exactly one is
+> 2. **Lottery-rotated** — the scan categories (the Step 6b table below;
+>    `dream_lottery.py`'s `CATEGORIES` dict is the count's SSoT). Exactly one is
 >    drawn per sleep by default (`--count` can raise this later per the
 >    design note "maybe two later").
 > 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
@@ -628,10 +629,11 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 | 8 | Open tasks with stale external references | stale-task-refs |
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
 | 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
+| 11 | Cornerstones/lessons with support_lost | support-lost |
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (10, 11).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (12, 13).
 > [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
@@ -887,7 +889,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
 - **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
-- **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one of 9 categories per dispatch, the lottery-drawn subset each night (was all 9 nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
+- **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one category per dispatch (roster SSoT: `dream_lottery.py`'s `CATEGORIES` dict), the lottery-drawn subset each night (was all-categories-nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## macOS auto-sleep timing

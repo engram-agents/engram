@@ -133,6 +133,16 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "ScheduleWakeup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{{PYTHON}} \"${CLAUDE_PLUGIN_ROOT}/hooks/engram-solo-wakeup-guard-hook.py\"",
+            "timeout": 5
+          }
+        ]
       }
     ],
     "PostCompact": [

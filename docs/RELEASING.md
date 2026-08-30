@@ -51,8 +51,7 @@ alpha to a backward-compatibility commitment — not yet reached.
 ## Branch model
 
 - **`dev`** is the active development branch. All feature/fix PRs merge here.
-  Dev PRs run only the cheap `pr-checks` (combined static scrubs) +
-  `non-author-approval` — the **full pytest suite does NOT run on dev PRs**
+  Dev PRs run only the cheap `pr-checks` (combined static scrubs) — the **full pytest suite does NOT run on dev PRs**
   (run affected-tests **locally** as a review requirement; at agent-PR
   velocity, per-PR test CI is too expensive). See `CLAUDE.md`.
 - **`dev` is a protected branch — direct pushes are rejected in practice.**
@@ -68,7 +67,7 @@ alpha to a backward-compatibility commitment — not yet reached.
   always PR.)*
 - **`main`** holds tagged release points only. A release is cut by opening a
   **PR from `dev` → `main`**, which fires the **full CI gate** (`tests.yml`
-  full suite + `pr-checks` + `non-author-approval`) — the thorough pre-release
+  full suite + `pr-checks`) — the thorough pre-release
   validation. Routine PRs do NOT target main (see `CLAUDE.md` Branching
   convention section).
 - **The `dev→main` PR merges as a MERGE COMMIT, not a fast-forward or a
@@ -222,7 +221,7 @@ accumulate the changelog incrementally as PRs land.*
 
 Cut the release by opening a **PR from `dev` → `main`** (not a direct
 push). This PR **is** the release gate: the full `tests.yml` suite +
-`pr-checks` + `non-author-approval` run on it — the thorough validation that
+`pr-checks` run on it — the thorough validation that
 deliberately does NOT run per-dev-PR.
 
 ```bash

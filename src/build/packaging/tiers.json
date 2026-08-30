@@ -206,6 +206,12 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/rc-upgrade-verify.py",
+      "tier": "convenience",
+      "source": "tools/rc-upgrade-verify.py",
+      "note": "cascade-marker migration verification for the rc1->rc2 upgrade cycle (#2411). Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/rc-upgrade-verify.py) would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above)."
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
@@ -526,6 +532,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-solo-wakeup-guard-hook.py",
+      "tier": "convenience"
+    },
+    {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
       "tier": "convenience"
     },
@@ -555,6 +565,10 @@
     },
     {
       "path": "skills/claude/engram-resolve-cascade",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-support-lost",
       "tier": "essential"
     },
     {

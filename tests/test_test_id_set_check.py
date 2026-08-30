@@ -412,6 +412,86 @@ def test_e5_unparsed_line_inside_backticks_is_not_flagged():
 
 
 # ---------------------------------------------------------------------------
+# E6 — a markdown-bulleted Removed-test line (#2421, the third confirmed
+# variant of the SAME anchor gap #2393 fixed for lines 1 and 2 -- hit live
+# on the v0.5.0 release PR, 15 markers, all 15 dropped).
+#
+# Per the explicit lesson on the issue: drive the parser against all four
+# forms (plain, '- ', '* ', indented bullet) rather than reading the regex
+# -- a fix tested only against the plain form passes its own tests and
+# changes nothing, which is exactly the trap the #2393 round already
+# sprang once.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("prefix", ["", "- ", "* ", "+ ", "  - "])
+def test_e6_bulleted_removed_test_line_now_parses(prefix):
+    pr_body = f"{prefix}Removed-test: tests/x.py::test_a — split into a and b\n"
+    markers = parse_removed_test_markers(pr_body)
+    assert len(markers) == 1, f"prefix {prefix!r} still drops the marker"
+    assert markers[0].id == "tests/x.py::test_a"
+    assert markers[0].reason == "split into a and b"
+
+
+def test_e6_fifteen_bulleted_markers_all_parse_like_the_release_pr_incident():
+    """Reproduces the actual incident shape: many markers, each its own
+    bullet, in one PR body."""
+    pr_body = "\n".join(
+        f"- Removed-test: tests/x.py::test_{i} — consolidated"
+        for i in range(15)
+    )
+    markers = parse_removed_test_markers(pr_body)
+    assert len(markers) == 15
+    assert {m.id for m in markers} == {f"tests/x.py::test_{i}" for i in range(15)}
+
+
+def test_e6_bulleted_marker_now_accounts_for_the_disappearance():
+    """End-to-end: the actual accounting outcome, not just the parse --
+    this is the difference between 'ten disappeared test ids not accounted
+    for' and a clean PASS."""
+    base_ids = {"tests/x.py::test_a"}
+    head_ids = set()
+    markers = parse_removed_test_markers(
+        "- Removed-test: tests/x.py::test_a — consolidated\n"
+    )
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.passed
+    assert report.unaccounted == ()
+
+
+def test_e6_bulleted_marker_no_longer_appears_as_unparsed():
+    """The widened anchor is shared by both detectors (#2421's design
+    choice) -- a bulleted marker that now parses must not ALSO warn as
+    unparsed, or a caller sees both a clean accounting AND a spurious
+    'did not parse' annotation for the same line."""
+    for prefix in ("- ", "* ", "+ "):
+        pr_body = f"{prefix}Removed-test: tests/x.py::test_a — split into a and b\n"
+        assert find_unparsed_removed_test_lines(pr_body) == []
+
+
+def test_e6_variant_1_and_2_still_warn_regardless_of_bullet_prefix():
+    """The widened anchor must not accidentally swallow the OTHER two
+    variants -- a bulleted line that is ALSO malformed in one of the
+    original ways must still warn, not silently parse-as-something-else."""
+    no_separator_bulleted = "- Removed-test: none (renamed)\n"
+    assert parse_removed_test_markers(no_separator_bulleted) == []
+    assert len(find_unparsed_removed_test_lines(no_separator_bulleted)) == 1
+
+    glued_mid_line = (
+        "**Runs:** affected suites 82 passed."
+        "Removed-test: tests/x.py::test_a — split into a and b\n"
+    )
+    assert parse_removed_test_markers(glued_mid_line) == []
+    assert len(find_unparsed_removed_test_lines(glued_mid_line)) == 1
+
+
+def test_e6_bullet_marker_is_case_insensitive_key_still_holds():
+    pr_body = "- removed-TEST: tests/x.py::test_a — case insensitive key\n"
+    markers = parse_removed_test_markers(pr_body)
+    assert len(markers) == 1
+    assert markers[0].id == "tests/x.py::test_a"
+
+
+# ---------------------------------------------------------------------------
 # Marker parsing details (supporting P1-E4, not in the required table but
 # load-bearing for the accounting logic above)
 # ---------------------------------------------------------------------------

@@ -33,7 +33,7 @@ This converts "resolve at the spot" from an exhortation into an economic argumen
 # Architecture (your place in the flow)
 
 **The parent (awake agent who dispatched you) handles orchestration:**
-- **Runs tonight's dream-fairy lottery draw first** (`tools/dream_lottery.py draw`, #1901) — picks a subset of the 9 scan categories by weight-aging draw, plus any cascade-interrupt force-includes. NOT all 9 every night anymore; the set size and membership vary night to night, logged in the draw's JSON output.
+- **Runs tonight's dream-fairy lottery draw first** (`tools/dream_lottery.py draw`, #1901) — picks a subset of the scan categories (the `CATEGORIES` dict in `dream_lottery.py` is the roster's single source of truth) by weight-aging draw, plus any cascade-interrupt force-includes. NOT all of them every night; the set size and membership vary night to night, logged in the draw's JSON output.
 - Dispatches all fairies in parallel at sleep start (the lottery-drawn dream-fairies + one or more batch-summary fairies, one per chunk — batch-summary is unaffected by the lottery, it runs every night)
 - Runs `cohort_dispatch.py validate` after batch-summary fairies return; dispatches a retry fairy if needed; runs `incorporate-retry` to produce `final_payload.json`
 - **Waits** for all fairy completion notifications, collecting reports from disk (dream-fairies) + the `final_payload.json` from the batch-summary validate/retry loop
@@ -59,7 +59,7 @@ All fairy reports arrive **in your initial spawn prompt** — the parent collect
 
 What you receive in the spawn prompt:
 
-1. **Tonight's lottery-drawn dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples — the set is whatever `dream_lottery.py draw` picked (#1901: exactly one type by default, plus any cascade-interrupt force-includes; NOT a fixed 8 or 9). Read the full report from disk via the cited path before integrating each one's findings.
+1. **Tonight's lottery-drawn dream-fairy reports** as `(category, disk path, TL;DR bullets)` triples — the set is whatever `dream_lottery.py draw` picked (#1901: exactly one type by default, plus any cascade-interrupt force-includes; NOT the full roster). Read the full report from disk via the cited path before integrating each one's findings.
 2. **Tonight's lottery-draw provenance** — drawn category/categories, interrupt-forced categories (if any) + why (cascade_marker_count vs threshold), weights_before -> weights_after. Include this verbatim in the dream record's own text — it is the durable "logged draws" record the design calls for; nothing else persists it once this cycle ends.
 3. **Cohort metadata** (today's-new + backfill counts, chunk count, cohort dir path, recall-summary counts already applied by the parent in Step 7.5).
 4. **Timeout markers** for any fairy that didn't return — proceed without that fairy, note it in the dream record.
@@ -188,14 +188,15 @@ Call `engram_reflect` as your first action after the spawn prompt. The returned 
 
 # The cascade sweep (mode B) — runs before anything else that writes
 
-The cascade machine (#2013) marks every downstream node when a claim is
+The cascade machine (design of record: docs/cascade-machine.md in the
+ENGRAM source repository) marks every downstream node when a claim is
 superseded or retracted, and those markers stay **pending** until somebody
 adjudicates them. Nobody did, until this step: the sweep is the whole-graph
 half of the machine (mode B), and dream-time is where it was designed to run.
 
 **Order is not a preference here — it is forced, and the force is measurable.**
 A plain `engram_supersede` or `engram_retract` is **REFUSED** on any node that
-carries a pending cascade marker (#2343/#2392, invariant 7 — the refusal
+carries a pending cascade marker (cascade-machine invariant 7 — the refusal
 returns `next_call` and `then`, pointing at mode C). Your bucket walk's
 `supersedes` and `retractions` buckets **will contain** such nodes on any night
 a cascade fired — not exclusively, but enough that sweeping later turns
@@ -316,8 +317,8 @@ Bias-toward-action on:
 
 - **Recall summaries** — the parent already applied the batch payload in Step 7.5 (before you were spawned). Record the applied/failures counts from the cohort metadata in your dream record's "Recall-summary cohort" section. Do NOT call `engram_set_recall_summaries` — that work is done.
 - **Open questions answerable from existing graph knowledge** — when a fairy or `engram_reflect` flags a question whose answer lives in nodes already present, write the resolution-derivation via `engram_derive` (citing the answering nodes as supporting_ids), then wire via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_NEW)`. **`engram_resolve` is pure-wire** (issue #229) — it does NOT create a derivation; you compose the derivation explicitly with `engram_derive` first.
-- **Contradictions on the cascade path** — check `engram_inspect(ct_XXXX)`'s `warnings` object (cascade state lives in the `cascade_markers` table now, engram-alpha#2013/#2009 — `warnings` is the current surface, not `metadata.stale_by`/`metadata.tainted_by`). A contradiction is `stale_by_premise` (one side superseded, cascade fired) when `warnings.stale_by` is non-empty, or `tainted_by` (one side retracted) when `warnings.tainted_by` is non-empty. Decision tree per the `engram-contradiction-resolution` skill:
-  - **FIRST — is this contradiction still marked?** `warnings.stale_by` / `warnings.tainted_by` are derived from **pending** markers, so a contradiction showing either is a node the cascade sweep above either has adjudicated or still owes. **While a marker is pending, `engram_supersede` and `engram_retract` on that node are REFUSED** (#2343/#2392) — which is exactly the `stale_by_premise` case-2 route below. So: adjudicate it in the sweep first, then run this decision tree against the settled node. If the sweep has run and the warnings are gone, the plain verbs are available again and the tree reads as written.
+- **Contradictions on the cascade path** — check `engram_inspect(ct_XXXX)`'s `warnings` object (cascade state lives in the `cascade_markers` table now — `warnings` is the current surface, not `metadata.stale_by`/`metadata.tainted_by`). A contradiction is `stale_by_premise` (one side superseded, cascade fired) when `warnings.stale_by` is non-empty, or `tainted_by` (one side retracted) when `warnings.tainted_by` is non-empty. Decision tree per the `engram-contradiction-resolution` skill:
+  - **FIRST — is this contradiction still marked?** `warnings.stale_by` / `warnings.tainted_by` are derived from **pending** markers, so a contradiction showing either is a node the cascade sweep above either has adjudicated or still owes. **While a marker is pending, `engram_supersede` and `engram_retract` on that node are REFUSED** (cascade-machine invariant 7) — which is exactly the `stale_by_premise` case-2 route below. So: adjudicate it in the sweep first, then run this decision tree against the settled node. If the sweep has run and the warnings are gone, the plain verbs are available again and the tree reads as written.
   - **`stale_by_premise`** — read the `warnings.stale_by` entry: `replaced_by_id` is the supersede-chain replacement (no separate lookup needed — it's in the same entry). If the new node altered the conflicting claim (case 1: substantive resolve), wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=<that replaced_by_id>)` directly. If the new node kept the conflicting claim (case 2: preserve), create a new contradiction between the new node and the other side via `engram_contradict`, then supersede the old ct → new ct via `engram_supersede`. Per the supersede no-drop discipline, case 3 (orthogonal drop) cannot arise.
   - **`tainted_by`** — the retracted side was never valid (`warnings.tainted_by`'s `retracted_id` names it). Compose a derivation acknowledging the retraction and wire it as resolver, OR if a replacement observation exists, treat as stale-by-premise case 2.
   - **Open with no `warnings` key at all** — compose a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the canonical chain-dilution-resolution-saga failure mode); wire via `engram_resolve`.
@@ -331,6 +332,7 @@ Bias-toward-action on:
 - **Contradictions you uncover** — when consolidating reveals two existing nodes in genuine conflict (no contradiction node yet exists between them), file the contradiction via `engram_contradict`. Distinguish from `engram_resolve`, which closes an existing contradiction node — you may need both in sequence: `engram_contradict` to name the conflict, then `engram_derive` to compose the synthesis derivation, then `engram_resolve(target_id=ct_NEW, resolving_node_id=dv_NEW)` to wire the close.
 - **Category 7 missing-principle-edge suggestions** — for each suggestion from the Category 7 fairy report: call `check_snapshot_divergence` on the source node, then verify the edge still doesn't exist via `fetch_safety_row`, then wire accepted suggestions via `engram_add_edge(source_id=<src>, target_id=<dst>, relation=<instantiates|serves>)` — the tool takes exactly those three fields (no note parameter); carry the evidence snippet into the dream record next to the wired-edge line instead. Gate each one: review the similarity score and evidence snippet before committing. Skip any suggestion whose source node has diverged or whose edge now already exists. Log wired and skipped counts in the dream record.
 - **Category 8 stale-task-ref closures** — for each suggestion from the Category 8 fairy report: call `check_snapshot_divergence` on the task node, then re-verify the external reference state via a fresh `gh pr view N --json state` or `gh issue view N --json state` call (the fairy's snapshot was taken earlier). If MERGED/CLOSED confirmed: call `engram_update_task(task_id=<tk_id>, new_status='done', note='externally resolved: #N <state> confirmed <ISO date>')`. Note: `engram_resolve` is NOT applicable to task nodes (`task` is not in `RESOLVABLE_TYPES`). If the fresh check returns OPEN or UNKNOWN: skip and log as "stale-but-still-open: <tk_id> #N" in the dream record.
+- **Category 11 support-lost recommendations** — adjudicated per the **engram-support-lost** skill (load it before acting on the first Category 11 finding of the night). For each suggestion: `check_snapshot_divergence` on the target cornerstone/lesson, then rewire via `engram_register_exemplar` when the fairy's candidate exemplars hold up, leave the flag in place when the pattern is honestly still unanchored, or retract via the `engram-revise` classification discipline when the pattern no longer applies. Same agency disposition as the cascade sweep — resolve by default, leave open when the evidence doesn't settle it, escalate only for the rare goal/axiom-tension or need-human-input shapes.
 
 # What's outside your domain (flag for the parent in the dream record)
 

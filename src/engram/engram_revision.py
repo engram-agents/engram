@@ -1399,14 +1399,26 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                              f"to {exc.replacement_id!r}, which already "
                              f"transitively derives from {exc.node_id!r} — "
                              f"closing a cycle over CASCADE_RELATIONS. "
-                             f"Supersede or retract this node instead of "
-                             f"acknowledging it.",
+                             f"Acknowledgement is not allowed here. Resolve "
+                             f"{exc.node_id!r} through engram_cascade_resolve "
+                             f"instead, with resolution_kind='superseded' "
+                             f"(supplying a replacement_id) or "
+                             f"resolution_kind='retracted' — that resolution "
+                             f"route's own supersede/retract stays open by "
+                             f"design; only acknowledgement is refused here.",
                     "guard": "acknowledgement_would_close_cascade_cycle",
                     "node_id": exc.node_id,
                     "replacement_id": exc.replacement_id,
                     "relation": "acknowledged_derives_from",
-                    "remedy": "supersede or retract this node instead of "
-                              "acknowledging it",
+                    "remedy": "resolve through engram_cascade_resolve with "
+                              "resolution_kind='superseded' (supplying a "
+                              "replacement_id) or resolution_kind='retracted' "
+                              "— acknowledgement is not allowed here. That "
+                              "resolution route's own supersede/retract "
+                              "stays open by design.",
+                    "next_call": f"engram_cascade_frontier(node_id={exc.node_id!r})",
+                    "then": f"engram_cascade_resolve(node_id={exc.node_id!r}, "
+                            f"resolution_kind=...)",
                     "phase": "apply",
                     "markers_unchanged": True,
                 })
@@ -1572,7 +1584,8 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
             "node already carries the "
             "original event's pending markers, and invariant 4 forbids a new "
             "descendant appearing while the node was pending, so a second "
-            "event would mark a provably-covered set (#2013 §6, §10.2). "
+            "event would mark a provably-covered set (cascade-machine design: "
+            "no re-cascade during resolution). "
             "Confidence propagation is the OPPOSITE case and DID run "
             "transitively — see confidence_recompute."
         ),
@@ -2118,12 +2131,12 @@ def _supersede_impl(
       - Both nodes must exist and be is_current=1 (no resurrecting
         superseded/retracted nodes).
       - old.type must equal new.type (cross-type "promotion" is not
-        supersede — use retract + create fresh instead).
+        supersede — use engram_retract + create a fresh node instead).
       - new.created_at must be >= old.created_at (DAG invariant).
       - new.supersedes must be NULL (a node can't already be the
         successor of a different supersede chain).
       - old.type cannot be feeling_report (terminal type — file a new
-        report or retract).
+        report or use engram_retract).
 
     Evidence nodes (ev_XXXX) are supersede-capable in principle but
     usually the wrong tool — if a URL is wrong or a source is bad, use
@@ -2192,7 +2205,7 @@ def _supersede_impl(
                     "error": f"Node '{old_node_id}' carries {len(_pending_here)} pending "
                              f"cascade marker(s) ({len(_events)} event(s)) — a plain "
                              f"engram_supersede is refused on a node whose own "
-                             f"premises are still under adjudication (#2013 "
+                             f"premises are still under adjudication (cascade-machine "
                              f"invariant 7). Resolve the cascade through the "
                              f"frontier instead: read mode C for this node, "
                              f"adjudicate each frontier entry with "
@@ -2272,7 +2285,7 @@ def _supersede_impl(
                          f"node with one of its own descendants would make the "
                          f"replacement stale by the act that installs it, and it is "
                          f"the one shape that lets an acknowledgement close a "
-                         f"cascade cycle (#2013 §12.3).",
+                         f"cascade cycle.",
                 "guard": "supersede_replacement_is_downstream",
                 "old_node_id": old_node_id,
                 "new_node_id": new_node_id,
@@ -2742,7 +2755,7 @@ def _retract_impl(
             _why = (
                 f"A plain engram_retract on a non-current node is refused — "
                 f"retracting an already-{_actual_status} node would reopen "
-                f"descendants that were already adjudicated (#2013/#2396) "
+                f"descendants that were already adjudicated "
                 f"and is not idempotent."
             )
             if _successor:
@@ -2790,7 +2803,7 @@ def _retract_impl(
                     "error": f"Node '{node_id}' carries {len(_pending_here)} pending "
                              f"cascade marker(s) ({len(_events)} event(s)) — a plain "
                              f"engram_retract is refused on a node whose own "
-                             f"premises are still under adjudication (#2013 "
+                             f"premises are still under adjudication (cascade-machine "
                              f"invariant 7). Resolve the cascade through the "
                              f"frontier instead: read mode C for this node, "
                              f"adjudicate each frontier entry with "

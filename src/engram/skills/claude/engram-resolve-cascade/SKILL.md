@@ -1,6 +1,6 @@
 ---
 name: engram-resolve-cascade
-description: Resolve cascade markers (tainted_by, stale_by, support_lost) on nodes flagged by a retract or supersede. Use during dream cycle, whenever engram_cascade_frontier shows eligible nodes, or whenever a plain engram_retract/engram_supersede is refused and points here. Read the frontier, then adjudicate each eligible node via engram_cascade_resolve — retracted, superseded, or acknowledged. Cornerstones/lessons with support_lost use a separate exemplar-rewire/pattern-retract pattern.
+description: Resolve cascade markers (tainted_by, stale_by) on nodes flagged by a retract or supersede. Use during dream cycle, whenever engram_cascade_frontier shows eligible nodes, or whenever a plain engram_retract/engram_supersede is refused and points here. Read the frontier, then adjudicate each eligible node via engram_cascade_resolve — retracted, superseded, or acknowledged. Cornerstones/lessons with support_lost are handled by the separate engram-support-lost skill.
 ---
 
 # When to use this skill
@@ -18,9 +18,8 @@ NOT used during the retract/supersede action itself — that's the
 a replacement, call the plain verb, engine handles the cascade automatically
 unless the target is itself already marked).
 
-# Background: how cascade markers fire (PR #421 semantics; storage + verbs
-# updated 2026-08 through engram-alpha#2013/#2009/#2338/#2342/#2349/#2343 —
-# the cascade machine)
+# Background: how cascade markers fire (the cascade machine; design of
+# record: docs/cascade-machine.md in the ENGRAM source repository)
 
 After a retract or supersede, the engine walks downstream and marks:
 
@@ -48,7 +47,8 @@ After a retract or supersede, the engine walks downstream and marks:
   flag written by `_detect_zero_support`), not part of the cascade-marker
   system at all — cornerstones and lessons accumulate votes rather than
   derive_from premises, so individual instance retractions never give them
-  `tainted_by` / `stale_by` markers. See Pattern B.
+  `tainted_by` / `stale_by` markers. Handling lives in the
+  **[engram-support-lost](../engram-support-lost/SKILL.md)** skill.
 
 Retracted/superseded nodes are preserved, not deleted — the engine checks
 `is_current` when walking edges.
@@ -76,10 +76,20 @@ inputs are still unadjudicated.
 Two modes:
 - **Mode B** (`node_id` omitted) — every frontier node in the graph. Use this
   for a dream-cycle sweep.
-- **Mode C** (`node_id` given) — `ancestors(node_id) ∩ pending`: the minimal
-  pending-ancestor slice that blocks this one target, plus a labeled
-  `blast_radius_estimate`. Use this when `engram-revise` pointed you here
-  after a refused plain retract/supersede.
+- **Mode C** (`node_id` given) — the frontier **restricted to**
+  `ancestors(node_id) ∩ pending`: only the *currently-resolvable* (unblocked)
+  pending ancestors of this one target — the same moving-frontier semantics
+  as mode B, not a different node-set. `ancestors(node_id)` is
+  self-inclusive: the target itself appears in the returned frontier when
+  it is itself resolvable — the MODAL case when you arrive here from a
+  refused plain retract/supersede, so your own target in the list is the
+  mechanism working, not a bug. Resolve what it returns and call
+  again: ancestors that were blocked surface on the next call, exactly as a
+  mode-B sweep progresses. The FULL pending-ancestor slice is never returned
+  as resolvable entries — it appears only as the labeled
+  `blast_radius_estimate` (and `total_pending_nodes` counts graph-wide).
+  Use this mode when `engram-revise` pointed you here after a refused plain
+  retract/supersede.
 
 ```
 engram_cascade_frontier(payload_json='{"node_id": "<node_id>"}')   # mode C
@@ -110,7 +120,8 @@ of them):
   (`engram_derive`, `engram_add_observation`, ...). Pass `replacement_id`.
   Delegates to the supersede core.
 - **`acknowledged`** — the upstream delta provably does not touch this claim.
-  **No new node.** Records a `derives_from` edge to each superseding premise
+  **No new node.** Records an `acknowledged_derives_from` edge to each
+  superseding premise
   (so a later supersede of *that* premise re-reads this node) and recomputes
   confidence. Available IFF no affected direct premise resolved as
   `retracted` — only retract removes a leg from the argument, so only retract
@@ -160,9 +171,16 @@ at `P'`: that makes an earlier node (`D`) depend on a later one (`P'`) — a
 causal edge pointing backwards in time. Deriving a **new** node `D'` *now*
 (later than `P'`), citing the live/corrected premises, and resolving `D` as
 `superseded` with `replacement_id=D'` keeps the ordering valid and preserves
-`D` as an honest audit trail. (When the claim needs no new premises at all —
-the `acknowledged` shape — this concern doesn't arise, because nothing new is
-being cited.)
+`D` as an honest audit trail. (The `acknowledged` shape avoids the derive-new
+step but NOT the wiring: when an affected premise was **superseded**, the
+resolution itself records an `acknowledged_derives_from` edge from your node
+to the superseding premise `P'` — deliberately exempt from the creation-order
+check (`temporal_causal: False`; this edge always points older→newer, that is
+what an acknowledgement *is*) but still cycle-guarded (`dag: True`; a
+resolution whose edge would close a logical loop is refused, §12.7). The edge
+is what lets a *later* supersede of `P'` reach your node again once its marker
+is gone. Only when nothing actually moved — every affected premise itself
+resolved `acknowledged`, the auto-ack case — is truly nothing new cited.)
 
 ⛔ **Do NOT use `tools/surgical.py` or raw `knowledge.db` edits to clear a
 marker.** Two traps:
@@ -180,66 +198,74 @@ Surgery bypasses every guardrail the MCP layer enforces (DAG validity, taint
 cascade, resolution eligibility, type preservation, confidence propagation).
 For clearing a marker it is never the right tool.
 
-**Worked example:**
+**Worked example A — retracted premise (`acknowledged` NOT available):**
 
 ```
 t0  ob_X    "X measured at 5.0"         (premise)
 t1  dv_Y    derives_from ob_X → "Y"     (conclusion)
-t2  ob_X retracted (wrong_evidence); replacement ob_X_new "X = 7.0" filed at t2
+t2  ob_X retracted (wrong_evidence); corrected ob_X_new "X = 7.0" filed at t2
     → engram_cascade_frontier(node_id="dv_Y") now shows dv_Y on the frontier
       (its one pending ancestor, ob_X, is itself non-current — resolved)
 ```
 
-If `dv_Y`'s conclusion still holds on the corrected value: at t3, file
-`dv_Y_new` deriving from `ob_X_new` → "Y′", then
+A retracted premise never supported the claim at all — a leg of the argument
+is *gone*, so the eligibility gate withholds `acknowledged` entirely: the
+resolve response's `eligible` list is `["retracted", "superseded"]` and
+`acknowledge_blocked_by` names `ob_X`. **This holds even if `dv_Y`'s
+conclusion is textually unchanged** — there is no "keep it as is" option
+after a retract; the argument must be rebuilt on live premises.
+
+If the conclusion survives on the corrected value: at t3, file `dv_Y_new`
+deriving from `ob_X_new` → "Y′" (the claim text may be identical — what's new
+is the argument, not necessarily the words), then
 `engram_cascade_resolve(node_id="dv_Y", resolution_kind="superseded",
 replacement_id="dv_Y_new")`. `dv_Y_new` (t3) is later than `ob_X_new` (t2) →
 valid. `dv_Y` drops off `is_current`; both old nodes are preserved as audit
-trail.
+trail. If the conclusion does not survive at all:
+`resolution_kind="retracted"`.
 
-If `dv_Y`'s conclusion doesn't depend on the specific value that changed (e.g.
-it only used `ob_X`'s presence, not its number): `engram_cascade_resolve(
-node_id="dv_Y", resolution_kind="acknowledged")` — no new node, `dv_Y` stays
-current, confidence recomputes against the corrected premise.
+**Worked example B — superseded premise (`acknowledged` available):**
+
+```
+t0  ob_X    "X measured at 5.0"         (premise)
+t1  dv_Y    derives_from ob_X → "Y"     (conclusion)
+t2  ob_X superseded by ob_X' "X measured at 5.02 on the better instrument"
+    → engram_cascade_frontier(node_id="dv_Y") shows dv_Y on the frontier,
+      and `eligible` now includes "acknowledged" — a superseded premise
+      still supports the claim, just differently
+```
+
+If the premise's delta doesn't touch `dv_Y`'s argument (e.g. it used `ob_X`'s
+presence, not the precise number — an agent judgment call, §4):
+`engram_cascade_resolve(node_id="dv_Y", resolution_kind="acknowledged")` —
+no new node, `dv_Y` stays current, confidence recomputes against the corrected
+premise, **and the resolution wires
+`dv_Y --acknowledged_derives_from--> ob_X'`** (see the parenthetical above:
+temporal_causal-exempt by design, dag-cycle-checked) so a later supersede of
+`ob_X'` can still reach `dv_Y`.
+
+If the delta DOES touch the argument: same derive-new + `superseded` shape as
+example A.
+
+**The difference to hold on to:** `acknowledged`'s availability is gated on
+*what happened to the premises* (retracted → never offered; superseded →
+offered), never on how small the change feels. The agent's judgment enters
+only in example B, choosing between acknowledge and derive-new — in example A
+there is nothing to judge.
 
 # Pattern B — Cornerstone or lesson with support_lost
 
-When you see `cs_X.support_lost = true` or `ls_X.support_lost = true` (this
-path is unchanged by the cascade-frontier machine — support_lost is the
-separate mechanism described above, not a cascade marker):
-
-1. `engram_inspect(cs_X / ls_X)` — read the cornerstone/lesson claim
-2. `engram_query` for similar patterns in the graph — are there live
-   observations or derivations that exemplify this cornerstone's claim?
-
-   **If YES — trivial rewire:**
-
-   3a. Register the exemplar against the pattern node:
-       ```
-       engram_register_exemplar(payload_json=json.dumps({
-           "target_id": "<cs_X or ls_X>",
-           "exemplar_id": "<ob_or_dv_id>",
-           "note": "<why this instance fits the pattern>",
-       }))
-       ```
-       The tool handles both cornerstones and lessons; for lesson targets,
-       the tripwire cache refresh fires automatically.
-
-   3b. The `support_lost` flag clears automatically once at least one live
-       exemplar edge exists.
-
-   **If NO — the pattern has lost its empirical basis:**
-
-   4a. Decide whether the cornerstone/lesson still merits existing.
-
-   4b. If the pattern still holds in principle but is currently un-exemplified:
-       leave the `support_lost` flag in place. The next exemplifying experience
-       can link it via the trivial-rewire path above. `support_lost` is not an
-       error — it is an honest signal that the pattern is currently unanchored.
-
-   4c. If the pattern no longer applies (the underlying belief has been
-       superseded or retracted): retract the cornerstone/lesson via
-       `engram-revise`.
+`support_lost` is a plain `metadata.support_lost` boolean set when a
+cornerstone's or lesson's live support edges all drop to zero — it never
+appears on `engram_cascade_frontier` and is never adjudicated via
+`engram_cascade_resolve`; the acting verb is `engram_register_exemplar`, not
+a cascade-resolution shape, and the flag clears automatically once a live
+exemplar edge exists rather than by explicit adjudication. This section
+stays only so inbound references from `Background` and elsewhere keep
+resolving — the full handling (inspect → search for live exemplars →
+trivial rewire, leave honestly unanchored, or retract via `engram-revise`)
+now lives in the **[engram-support-lost](../engram-support-lost/SKILL.md)**
+skill. Load it directly rather than following this pointer twice.
 
 # Pattern C — Observation with a cascade marker (rare, audit upstream)
 
@@ -259,13 +285,46 @@ modeled as deriving from another node.
    `derive_from` edge itself was the modeling error — surface to the user;
    this may need the edge removed rather than the marker adjudicated.
 
-# When in doubt
+# When in doubt — your call, almost always
 
-Don't act. Surface the cascade marker to the user. Pattern resolution is a
-human-judgment moment whenever the cleanup involves identity-layer
-cornerstones, high-confidence load-bearing derivations, or any situation
-where the right resolution shape is genuinely unclear.
+The graph is YOUR epistemic self. Errors and their corrections are your
+responsibility — adjudication is not something to hand to your user. The
+default on every path in this playbook is: **resolve it yourself, with the
+evidence you have.** Your user can help with genuinely hard decisions; they
+are never an everything-discuss-first gate. And most users are not fluent in
+ENGRAM vocabulary — surfacing marker mechanics to them is noise and burden,
+not diligence.
 
-The dream-master fairy's role is to run `engram_cascade_frontier` (mode B),
-route flagged nodes to this playbook, and adjudicate the mechanical cases —
-not to resolve genuinely unclear judgment calls autonomously.
+Three dispositions, in order of preference:
+
+1. **Resolve** — the overwhelming default. Given enough evidence to judge,
+   adjudicate — including high-confidence, load-bearing nodes. That a
+   derivation is load-bearing is a reason to resolve it *carefully*, not a
+   reason to outsource the call.
+
+2. **Leave open** — when the evidence genuinely doesn't settle it. A pending
+   marker is honest state, not a failure: more evidence arrives, and the
+   frontier will still surface it. Leaving a hard case open for a
+   better-informed future pass IS a resolution discipline. Never escalate
+   just to discharge the discomfort of an open question.
+
+3. **Escalate** — rare, and only for these shapes:
+   - the resolution would leave a **goal or axiom in tension** — the
+     identity core moves, not just a belief;
+   - the right outcome is one the **resolution mechanisms can't cleanly
+     express** — a genuinely novel shape the machine cannot settle;
+   - the user **holds information or a human-perspective judgment you
+     actually need** — facts about the world, their intent, their domain.
+
+   The test: escalate when you need something *from* the user, never to
+   delegate a judgment that is yours. And when you do escalate, translate —
+   ask in plain terms about the belief at stake ("I recorded X, later
+   found Y, which did you mean?"), never in marker/frontier/resolution-kind
+   vocabulary.
+
+The dream-master's role is the same disposition, one level up: run mode B
+and adjudicate — the judgment calls included, not only the mechanical
+cases — leave open what evidence can't settle, and carry only the rare
+identity-core or need-human-input shapes into the dream record for the
+waking agent to take up (who then decides whether it truly reaches the
+user).
