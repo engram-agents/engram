@@ -751,6 +751,34 @@ incident below).
    `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
    messages — see check 3, which covers the path this query cannot see.**
 
+   **This query lags a `gh pr edit --body`/push — measured in EITHER
+   direction, never trust the very first result after an edit.** Both
+   measured live on exam-room's issue 29 / PR#30 (2026-08-23, a different
+   repo, same shared `gh`/GraphQL tooling), with different, non-interchangeable
+   timing evidence for each direction — stated precisely because an earlier
+   draft of this note attributed the tightly-timed measurement to the wrong
+   direction, caught by a reviewer-fairy:
+
+   - **False BLOCKER, tightly timed.** A body edit that removed every
+     close-keyword (a genuinely GOOD edit) queried as **non-empty** —
+     reflecting the stale, pre-edit bad state — immediately after the push.
+     A second query exactly **5 seconds later** correctly read empty. This is
+     the one pairing with a controlled, measured interval: 5 seconds was
+     enough to resolve in this instance, but that is one data point, not a
+     guaranteed bound.
+   - **False SAFE, loosely timed.** Separately, a body edit that still
+     carried a negated close-keyword (a genuinely BAD edit — negation
+     doesn't help, per the trap documented above) queried as **empty**
+     immediately after its own push. The same untouched text was only later
+     found to correctly read non-empty, via a check made after several
+     unrelated actions had intervened — the true gap is unmeasured, but was
+     clearly much longer than a few seconds.
+
+   Query, wait — at least 5 seconds, and longer if anything else is
+   happening in between — query again, and trust only the settled answer.
+   A single-shot check right after editing is not evidence either way, and
+   do not assume the delay is short just because it resolved quickly once.
+
 2. **No trap-shape auto-close** (always): every body match must reference the
    SAME `#N` the title carries.
    ```
