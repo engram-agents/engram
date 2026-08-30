@@ -22,6 +22,8 @@ Coverage (spec table P1-E4, #2350):
   E2 — ambiguous bare-name marker (two files, same function)    -> NOT accounted -> FAIL
   E3 — stale marker (id did not disappear)                      -> PASS, with a warning
   E4 — unparseable source                                       -> ParseError naming the file
+  E5 — Removed-test-shaped line that fails to parse (#2393)     -> advisory warning naming the
+                                                                    line; disappearance still FAILs
 
 Everything below is driven through the pure functions (collect_ids,
 parse_removed_test_markers, evaluate) with inline source strings — no git, no
@@ -49,6 +51,7 @@ _spec.loader.exec_module(_mod)
 
 collect_ids = _mod.collect_ids
 parse_removed_test_markers = _mod.parse_removed_test_markers
+find_unparsed_removed_test_lines = _mod.find_unparsed_removed_test_lines
 evaluate = _mod.evaluate
 ParseError = _mod.ParseError
 Marker = _mod.Marker
@@ -307,6 +310,105 @@ def test_e4_unparseable_source_raises_parse_error_naming_the_file():
         collect_ids({"tests/test_broken.py": bad_src})
     assert excinfo.value.path == "tests/test_broken.py"
     assert "tests/test_broken.py" in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# E5 — a Removed-test-shaped line that fails to parse (#2393)
+#
+# Three variants measured on the live issue, each dropping the SAME way for a
+# DIFFERENT reason. All three must warn; none may block a PR that is
+# otherwise accounted for (advisory, same as a stale marker).
+# ---------------------------------------------------------------------------
+
+def test_e5_no_separator_parenthetical_form_warns_and_still_fails_loud_on_the_id():
+    """#2392's actual body line: a good-faith Removed-test attempt with no
+    id/reason separator at all."""
+    base_ids = {"tests/x.py::test_a", "tests/x.py::test_b"}
+    head_ids = {"tests/x.py::test_a2", "tests/x.py::test_b2"}
+    pr_body = (
+        "Removed-test: none (two tests renamed: `test_a` -> `test_a2`, "
+        "same for test_b).\n"
+    )
+    markers = parse_removed_test_markers(pr_body)
+    assert markers == [], "must not accidentally parse — that would hide the bug it exercises"
+    unparsed = find_unparsed_removed_test_lines(pr_body)
+    assert len(unparsed) == 1
+    assert "Removed-test:" in unparsed[0]
+
+    report = evaluate(base_ids, head_ids, markers, tuple(unparsed))
+    assert not report.passed, "the disappearance is still unaccounted — this stays a real failure"
+    assert len(report.warnings) == 1
+    assert "did not parse" in report.warnings[0]
+    assert "none (two tests renamed" in report.warnings[0]
+
+
+def test_e5_no_separator_words_only_form_warns():
+    pr_body = "Removed-test: tests/x.py::test_a renamed to test_b\n"
+    unparsed = find_unparsed_removed_test_lines(pr_body)
+    assert len(unparsed) == 1
+    assert parse_removed_test_markers(pr_body) == []
+
+
+def test_e5_marker_glued_mid_line_by_a_swallowed_newline_still_warns():
+    """The stronger instance (#2393's second recorded case): a text-replace
+    ate a newline, so a CORRECTLY-FORMED marker landed mid-line rather than
+    at line start. A detector that reuses `_MARKER_RE`'s line anchor would
+    miss this — the same blind spot one level up. Reproduced verbatim from
+    the incident, not a simplified stand-in."""
+    pr_body = (
+        "**Runs:** affected suites 82 passed."
+        "Removed-test: tests/x.py::test_a — split into a and b\n"
+        "Removed-test: tests/y.py::test_b — renamed\n"
+    )
+    markers = parse_removed_test_markers(pr_body)
+    assert len(markers) == 1, "only the properly-line-started second marker parses"
+    assert markers[0].id == "tests/y.py::test_b"
+
+    unparsed = find_unparsed_removed_test_lines(pr_body)
+    assert len(unparsed) == 1
+    assert "test_a" in unparsed[0]
+    assert "split into a and b" in unparsed[0]
+
+
+def test_e5_a_line_start_anchored_detector_would_have_missed_the_glued_case():
+    """Pins the specific defect in the FIRST drafted fix for #2393 (caught
+    before it shipped): `^\\s*removed-test:` as the "did this line mention
+    the key" detector inherits the parser's own anchor, so it can only ever
+    re-diagnose a marker that already starts its line — exactly the shape
+    that never needed the diagnostic. A regression here means someone
+    reintroduced the anchored version."""
+    import re
+    glued_line = (
+        "**Runs:** affected suites 82 passed."
+        "Removed-test: tests/x.py::test_a — split into a and b"
+    )
+    anchored = re.compile(r"^\s*removed-test:", re.IGNORECASE)
+    assert not anchored.match(glued_line), (
+        "sanity check on the OLD detector shape — it must not match this "
+        "line, or this test is not exercising what it claims to")
+    assert find_unparsed_removed_test_lines(glued_line + "\n") == [glued_line]
+
+
+def test_e5_a_correctly_parsing_marker_never_warns():
+    """The negative control: a marker that parses fine must not ALSO show up
+    as an unparsed line — the two detectors would otherwise double-report
+    the same good-faith line."""
+    pr_body = "Removed-test: tests/x.py::test_a — split into a and b\n"
+    assert find_unparsed_removed_test_lines(pr_body) == []
+
+
+def test_e5_no_removed_test_mention_yields_no_unparsed_lines():
+    assert find_unparsed_removed_test_lines("") == []
+    assert find_unparsed_removed_test_lines("Just a normal PR description.\n") == []
+
+
+def test_e5_unparsed_line_inside_backticks_is_not_flagged():
+    """Same illustrative-example discipline as the parser itself
+    (test_backticked_example_marker_does_not_account_for_a_real_disappearance):
+    a malformed example inside backticks is documentation, not an attempt,
+    and must not warn."""
+    pr_body = "See the format: `Removed-test: none (renamed)`.\n"
+    assert find_unparsed_removed_test_lines(pr_body) == []
 
 
 # ---------------------------------------------------------------------------

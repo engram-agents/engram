@@ -315,14 +315,60 @@ def parse_removed_test_markers(pr_body: str) -> list[Marker]:
     return markers
 
 
+def find_unparsed_removed_test_lines(pr_body: str) -> list[str]:
+    """#2393 — the fail-loud half `parse_removed_test_markers` cannot provide
+    on its own: which lines LOOKED like a marker but did not parse.
+
+    A parse failure here is not silent about the DISAPPEARANCE — that
+    already fails loudly via `unaccounted`, correctly. It is silent about
+    the CAUSE: the author is told "test X disappeared without a marker"
+    while looking straight at a marker they wrote, because the line failed
+    the strict `<id> [—-] <reason>` shape. That is a wrong diagnostic, not
+    an absent one, and it is what this function surfaces.
+
+    Deliberately does NOT reuse `_MARKER_RE`'s line anchor as the detector —
+    reusing it would inherit its exact blind spot (a marker glued mid-line
+    onto the preceding line by a text-replace eating a newline never starts
+    at column 0, so a line-anchored detector misses precisely the case that
+    motivated this function; #2393's second recorded instance). Instead:
+    scan each backtick-stripped line for `removed-test:` ANYWHERE
+    (case-insensitive), then ask whether THAT LINE, matched from its own
+    start, parses as a marker — the same question `_MARKER_RE` answers, just
+    without assuming the interesting text starts the line.
+
+    Pure. Returns the raw (stripped) line text for each candidate that
+    mentions the key but does not parse — empty list when every mention
+    parses or none exists.
+    """
+    if not pr_body:
+        return []
+    stripped_body = re.sub(r"`[^`]*`", "", pr_body)
+    unparsed = []
+    for line in stripped_body.splitlines():
+        if "removed-test:" not in line.lower():
+            continue
+        if _MARKER_RE.match(line):
+            continue
+        unparsed.append(line.strip())
+    return unparsed
+
+
 # ---------------------------------------------------------------------------
 # Verdict — pure
 # ---------------------------------------------------------------------------
 
 
 def evaluate(base_ids: set[str] | frozenset[str], head_ids: set[str] | frozenset[str],
-             markers: list[Marker]) -> Report:
-    """Compute the whole verdict from two id sets and a marker list. Pure."""
+             markers: list[Marker],
+             unparsed_removed_test_lines: tuple[str, ...] = ()) -> Report:
+    """Compute the whole verdict from two id sets and a marker list. Pure.
+
+    unparsed_removed_test_lines (#2393, optional, default empty): lines from
+    `find_unparsed_removed_test_lines` that mentioned `removed-test:` but did
+    not parse. Advisory only, same as a stale marker below — a malformed
+    line must not block a PR that is otherwise accounted for; it should
+    just stop being invisible.
+    """
     base_ids = set(base_ids)
     head_ids = set(head_ids)
     disappeared = base_ids - head_ids
@@ -331,6 +377,13 @@ def evaluate(base_ids: set[str] | frozenset[str], head_ids: set[str] | frozenset
     accounted: set[str] = set()
     warnings: list[str] = []
     ambiguous: list[str] = []
+
+    for line in unparsed_removed_test_lines:
+        warnings.append(
+            f"a 'Removed-test:' line did not parse and was ignored — expected "
+            f"'Removed-test: <path::name> — <reason>' with an em-dash or "
+            f"hyphen separator. Line: {line!r}"
+        )
 
     for marker in markers:
         reason = marker.reason.strip()
@@ -620,7 +673,8 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     markers = parse_removed_test_markers(pr_body)
-    report = evaluate(base_ids, head_ids, markers)
+    unparsed_removed_test_lines = find_unparsed_removed_test_lines(pr_body)
+    report = evaluate(base_ids, head_ids, markers, tuple(unparsed_removed_test_lines))
 
     if args.format == "json":
         print(format_report_json(report))
