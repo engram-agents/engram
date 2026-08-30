@@ -981,6 +981,71 @@ def test_trivial_does_not_fire_when_a_premise_actually_died():
         "auto-resolve")
 
 
+def test_trivial_auto_resolve_never_fires_on_an_axiom_even_when_all_premises_acknowledged():
+    """#2406 — an identity-layer node must surface to the user, never be
+    cleared by the machine's own trivial-resolution proof, no matter how
+    cleanly the proof holds.
+
+    MANUFACTURED STATE, same discipline as
+    test_affected_contradiction_ids_ignores_a_malformed_contradicts_edge:
+    no live write path can give an axiom a `derives_from` edge.
+    `engram_add_axiom` only ever writes `cites` edges (context_ids), and
+    `engram_add_edge` refuses `derives_from` outright (it is in
+    CASCADE_RELATIONS and excluded from `_ADDABLE_AFTER_CREATION_RELATIONS`
+    — created only at derivation-creation time, where the source is always
+    the new derivation, never an axiom). So an axiom becoming a cascade
+    candidate at all is unreachable today through any public write path —
+    this test does not claim otherwise. The fix is defense-in-depth for a
+    write path that does not yet exist, on the same "kept anyway as one
+    cheap query" ground this function already applies to its frontier
+    check — and it is cheap to get wrong silently, because #2401's
+    dream-master text already promises an axiom-on-the-frontier surfaces to
+    the user; without this gate the axiom would never REACH the frontier to
+    make that promise apply.
+    """
+    rev, obs, derive, core = _make_fresh_mods()
+    epi = importlib.import_module("engram_epistemic")
+
+    ob = _seed_ob(obs, "Premise.", quote_type="official_statement")
+    ob2 = _seed_ob(obs, "Premise refined.", quote_type="official_statement")
+    dv1 = _seed_dv(derive, "Direct dependent.", [ob])
+
+    ax = json.loads(epi._add_axiom_impl(
+        claim="Identity-layer claim.",
+        basis="Test fixture.",
+    ))["axiom_id"]
+
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) "
+            "VALUES (?, ?, 'derives_from', ?)",
+            (ax, dv1, core._now()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    json.loads(rev._supersede_impl(old_node_id=ob, new_node_id=ob2,
+                                   supersede_reason="refined"))
+    assert len(_markers(core, dv1, "pending")) == 1
+
+    resp = json.loads(rev._cascade_resolve_impl(
+        node_id=dv1, resolution_kind="acknowledged"))
+    assert "error" not in resp, resp
+
+    # Without the #2406 gate, ax's only affected premise (dv1) resolved
+    # 'acknowledged' with nothing pending — exactly the trivial-resolve
+    # predicate — and it would have auto-resolved right here, silently.
+    assert ax not in [a["node_id"] for a in resp["auto_resolved_trivial"]], resp
+    assert len(_markers(core, ax, "pending")) == 1, (
+        "an axiom's cascade marker must stay pending — it belongs on the "
+        "frontier for a human to see, not cleared by proof-of-no-delta")
+
+    frontier = json.loads(rev._cascade_frontier_impl(node_id=ax))
+    assert ax in [f["id"] for f in frontier["frontier"]], frontier
+
+
 # ---------------------------------------------------------------------------
 # 6 — confidence recompute, and it must be transitive
 # ---------------------------------------------------------------------------

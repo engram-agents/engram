@@ -51,6 +51,15 @@ from engram_log_emitter import emit_if_initialized
 _CASCADE_RELATIONS_SORTED = sorted(core.CASCADE_RELATIONS)
 _CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
 
+# #2406: of CLAIM_BEARING_TYPES, the identity-layer subset that must surface
+# to a human rather than be adjudicated by the machine or an agent —
+# currently just 'axiom' (cornerstone/goal are NOT in CLAIM_BEARING_TYPES,
+# so the cascade walk returns early on them and they can never carry a
+# marker at all; see engram_core._is_claim_bearing). A named set rather than
+# an inline == "axiom" check so a future type promoted to identity-layer
+# status is one addition here, not a re-derivation at every call site.
+_IDENTITY_LAYER_CLAIM_BEARING_TYPES = frozenset({"axiom"})
+
 
 # ---------------------------------------------------------------------------
 # Family-E constants (moved from server.py — originals deleted same-commit)
@@ -1141,6 +1150,23 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
     a design rule no write path enforces and this is the last gate before an
     automatic resolution the agent never sees. Asserting it is exercised is
     what was wrong, twice; if a future reader can construct the case, pin it.
+
+    #2406 — IDENTITY-LAYER GATE. This function is the one shape the machine
+    decides for itself, by proof rather than judgement — but "no delta
+    reaches this claim" is a statement about the CLAIM, and for an
+    identity-layer node (currently: axiom) the standing rule elsewhere in
+    this system (engram-revise, the dream-master cascade-sweep section) is
+    that the cascade having touched the node at all is what surfaces to the
+    user, not whether the claim moved. So a candidate whose type is in
+    `_IDENTITY_LAYER_CLAIM_BEARING_TYPES` is skipped here even when every
+    other condition for trivial auto-resolve holds — it is left pending,
+    which puts it on the frontier for an agent to adjudicate (and surface)
+    explicitly, exactly as an axiom already must once it reaches the
+    frontier by any other path. Filed as a gap and fixed same-day: #2401's
+    dream-master text stated the surface-to-user rule for axioms reaching
+    the frontier without this function honoring it, so an axiom whose
+    premises all resolved 'acknowledged' would never have reached the
+    frontier to surface at all.
     """
     # Collect the candidate set ONCE (every cascade-descendant of node_id),
     # then sweep it to a fixpoint. A single downward pass would be wrong for
@@ -1184,6 +1210,14 @@ def _cascade_auto_resolve_trivial(conn, node_id: str, now: str) -> list:
             if not core._pending_markers_for_node(conn, child):
                 continue
             if _cascade_blocked(conn, child, pending_node_ids):
+                continue
+
+            # #2406 — never auto-resolve an identity-layer node's markers;
+            # leave it pending so it surfaces on the frontier instead.
+            child_type_row = conn.execute(
+                "SELECT type FROM nodes WHERE id = ?", (child,)
+            ).fetchone()
+            if child_type_row and child_type_row["type"] in _IDENTITY_LAYER_CLAIM_BEARING_TYPES:
                 continue
 
             affected = _cascade_affected_premises(conn, child)
