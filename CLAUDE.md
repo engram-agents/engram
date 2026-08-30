@@ -27,10 +27,10 @@ the unified payload_json signature as of 2026-05-27.
 - **`main`** is the stable-release branch. It moves only on explicit release
   cuts; routine PRs do NOT target main. **A release cut = opening a formal
   PR from `dev` → `main`** — this fires the full CI gate (`tests.yml` full
-  suite + `pr-checks` + `non-author-approval`), the thorough pre-release
+  suite + `pr-checks`), the thorough pre-release
   validation. See `docs/RELEASING.md`.
 - **CI cost model (#1597):** dev PRs run only the cheap combined `pr-checks`
-  (static scrubs) + `non-author-approval`. The **full pytest suite does NOT run
+  (static scrubs). The **full pytest suite does NOT run
   on dev PRs** — at agent-PR velocity it's too expensive; run **affected-tests
   locally** and paste the result in your review. The full suite runs once, on
   the dev→main release PR (above). `affected-tests.yml` is `workflow_dispatch`
