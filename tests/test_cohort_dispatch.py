@@ -8,6 +8,9 @@ Covers:
     3. Manifest JSON lists both chunks with correct metadata (including attempt_count=0).
     4. Nodes not found in DB are silently skipped with a warning.
     15. Duplicate IDs in input are deduplicated with a warning.
+    29. #1952 PR3: a node with an existing recall_summary carries it into the
+        payload (TIGHTEN-mode signal); a summary-absent node omits the key
+        (AUTHOR mode) — both coexist in one chunk.
 
   verify-in subcommand:
     18. Happy path: valid cohort → exit 0, JSON output {"passed": true}.
@@ -68,8 +71,20 @@ from tools.cohort_dispatch import _check_file_owner, ForeignOwnedFileError  # no
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
-def _make_sqlite_db(node_ids: list[str], tmp_dir: Path) -> Path:
-    """Create a minimal ENGRAM-shaped SQLite DB with the given node IDs."""
+def _make_sqlite_db(
+    node_ids: list[str],
+    tmp_dir: Path,
+    *,
+    predictions: dict[str, tuple[str, str | None]] | None = None,
+) -> Path:
+    """Create a minimal ENGRAM-shaped SQLite DB with the given node IDs.
+
+    `predictions`: optional {node_id: (predicted_event, resolution_timeframe)}
+    for node_ids that should be inserted as type='prediction' with a NULL
+    claim (#1966) — every other node_id gets the default observation_factual
+    row with a real claim, unchanged from before.
+    """
+    predictions = predictions or {}
     db_path = tmp_dir / "knowledge.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute(
@@ -81,21 +96,31 @@ def _make_sqlite_db(node_ids: list[str], tmp_dir: Path) -> Path:
             quoted_text TEXT,
             interpretation TEXT,
             recall_summary TEXT,
-            recall_keywords TEXT
+            recall_keywords TEXT,
+            predicted_event TEXT,
+            resolution_timeframe TEXT
         )
         """
     )
     for i, nid in enumerate(node_ids):
-        conn.execute(
-            "INSERT INTO nodes (id, type, claim, quoted_text, interpretation) VALUES (?, ?, ?, ?, ?)",
-            (
-                nid,
-                "observation_factual",
-                f"This is the claim for node {nid} — a synthetic test claim with enough text.",
-                None,
-                None,
-            ),
-        )
+        if nid in predictions:
+            predicted_event, resolution_timeframe = predictions[nid]
+            conn.execute(
+                "INSERT INTO nodes (id, type, claim, predicted_event, resolution_timeframe) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (nid, "prediction", None, predicted_event, resolution_timeframe),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO nodes (id, type, claim, quoted_text, interpretation) VALUES (?, ?, ?, ?, ?)",
+                (
+                    nid,
+                    "observation_factual",
+                    f"This is the claim for node {nid} — a synthetic test claim with enough text.",
+                    None,
+                    None,
+                ),
+            )
     conn.commit()
     conn.close()
     return db_path
@@ -184,13 +209,58 @@ def test_prepare_chunk_dirs_and_files_exist():
         assert len(payload_0) == 15, f"chunk-0 payload should have 15 entries, got {len(payload_0)}"
         assert len(payload_1) == 15, f"chunk-1 payload should have 15 entries, got {len(payload_1)}"
 
-        # Each payload entry must have id, type, claim; no recall_summary/recall_keywords
+        # Each payload entry must have id, type, claim; recall_keywords is
+        # never included (fresh keywords are always generated); recall_summary
+        # is included only when the DB row has one (#1952 PR3 tighten-mode
+        # signal — see test_prepare_needs_tightening_node_includes_recall_summary
+        # below). None of these fixture nodes have a recall_summary set, so it
+        # is absent here too.
         for entry in payload_0 + payload_1:
             assert "id" in entry, f"payload entry missing 'id': {entry}"
             assert "type" in entry, f"payload entry missing 'type': {entry}"
             assert "claim" in entry, f"payload entry missing 'claim': {entry}"
-            assert "recall_summary" not in entry, "recall_summary must not be in payload"
+            assert "recall_summary" not in entry, "recall_summary must not be in payload for a summary-absent node"
             assert "recall_keywords" not in entry, "recall_keywords must not be in payload"
+
+
+def test_prepare_needs_tightening_node_includes_recall_summary():
+    """#1952 PR3: a node with an existing recall_summary gets it in the payload —
+    this is the TIGHTEN-mode signal to the fairy (see engram-batch-summary-fairy.md
+    "Reviewing vs authoring"). A node with no recall_summary still omits the key
+    entirely (AUTHOR mode), confirming the two modes coexist correctly in one chunk.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001", "ob_0002"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        # ob_0001 is a needs_tightening review node — give it an existing
+        # over-limit summary. ob_0002 stays summary-absent (author mode).
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE nodes SET recall_summary = ? WHERE id = ?",
+            ("Open: this over-long stale summary needs tightening or correcting.", "ob_0001"),
+        )
+        conn.commit()
+        conn.close()
+
+        out_dir = tmp_dir / "out"
+        exit_code = _run([
+            "prepare",
+            "--ids", ",".join(node_ids),
+            "--out", str(out_dir),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+        ])
+        assert exit_code == 0, f"prepare exited {exit_code}"
+
+        payload = json.loads((out_dir / "chunk-0" / "payload.json").read_text())
+        by_id = {e["id"]: e for e in payload}
+
+        assert by_id["ob_0001"].get("recall_summary") == (
+            "Open: this over-long stale summary needs tightening or correcting."
+        ), by_id["ob_0001"]
+        assert "recall_summary" not in by_id["ob_0002"], by_id["ob_0002"]
 
 
 def test_prepare_manifest_has_attempt_count_and_no_prompt_path():
@@ -904,6 +974,145 @@ def test_verify_in_chunk_size_fail():
         fake_db = tmp_dir / "fake.db"
         exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(fake_db)])
         assert exit_code == 1, f"Expected exit 1 (chunk too large), got {exit_code}"
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #1966: prediction nodes silently mis-fail verify-in
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_prediction_node_claim_derived_from_predicted_event():
+    """prepare on a prediction node (claim=NULL, predicted_event set) produces
+    a payload entry whose 'claim' is derived from predicted_event, not empty."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001", "pr_0001"]
+        db_path = _make_sqlite_db(
+            node_ids,
+            tmp_dir,
+            predictions={"pr_0001": ("Cascade slice 1 lands before the release cut", "2026-09-01")},
+        )
+        out_dir = tmp_dir / "out"
+
+        exit_code = _run([
+            "prepare",
+            "--ids", ",".join(node_ids),
+            "--out", str(out_dir),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+        ])
+        assert exit_code == 0
+
+        payload = json.loads((out_dir / "chunk-0" / "payload.json").read_text())
+        pred_entry = next(e for e in payload if e["id"] == "pr_0001")
+        assert pred_entry["claim"], "prediction node's payload claim must not be empty"
+        assert "Cascade slice 1 lands before the release cut" in pred_entry["claim"]
+        assert "2026-09-01" in pred_entry["claim"], (
+            "resolution_timeframe should be folded into the resolved claim text"
+        )
+
+
+def test_verify_in_prediction_node_passes_cleanly():
+    """A prediction node (claim=NULL, predicted_event set) flows through
+    prepare -> verify-in with exit 0 -- the original #1966 failure mode."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["pr_0001"]
+        db_path = _make_sqlite_db(
+            node_ids, tmp_dir,
+            predictions={"pr_0001": ("A documented case will surface", None)},
+        )
+        out_dir = tmp_dir / "out"
+
+        _run([
+            "prepare", "--ids", "pr_0001", "--out", str(out_dir),
+            "--chunk-size", "15", "--db", str(db_path),
+        ])
+        exit_code = _run(["verify-in", "--out", str(out_dir), "--db", str(db_path)])
+        assert exit_code == 0, "prediction node should pass verify-in cleanly, not fail"
+
+
+def test_verify_in_required_fields_failure_does_not_starve_content_integrity(capsys):
+    """Regression for the for/else bug: a node whose payload claim is empty
+    (required_fields legitimately flags it) must still be looked up against
+    the DB -- it must NOT also produce the misleading 'not found in DB — may
+    have been retracted' message for a node that genuinely exists."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        # Payload entry has claim="" -- required_fields will legitimately
+        # flag this, but the node genuinely exists in the DB.
+        empty_claim_entry = [{"id": "ob_0001", "type": "observation_factual", "claim": ""}]
+        cohort_dir = _make_cohort_dir(tmp_dir, [empty_claim_entry], db_path=db_path)
+
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(db_path)])
+        assert exit_code == 1, "required_fields should still fail on empty claim"
+
+        result = json.loads(capsys.readouterr().out)
+        checks = {e["check"] for e in result["errors"]}
+        assert "required_fields" in checks, "empty claim must still fail required_fields"
+
+        # The false-positive this test guards against: db_by_id must have
+        # been asked about ob_0001, so content_integrity (if it fires at all
+        # for this id) must NOT claim the node was "not found ... retracted".
+        retracted_msgs = [
+            e for e in result["errors"]
+            if e.get("check") == "content_integrity"
+            and "not found in DB" in e.get("error", "")
+            and e.get("node_id") == "ob_0001"
+        ]
+        assert not retracted_msgs, (
+            f"node genuinely exists in DB but was misreported as not-found: {retracted_msgs}"
+        )
+
+
+def test_verify_in_genuinely_absent_node_still_reports_not_found(capsys):
+    """A node id that never existed in the DB still produces the 'not found
+    in DB — may have been retracted' message -- the #1966 fix must not lose
+    this real, correct case while fixing the false-positive one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        # DB has ob_0001 only; payload references a different id entirely.
+        db_path = _make_sqlite_db(["ob_0001"], tmp_dir)
+        ghost_entry = [{"id": "ob_9999", "type": "observation_factual", "claim": "a real-looking claim"}]
+        cohort_dir = _make_cohort_dir(tmp_dir, [ghost_entry], db_path=db_path)
+
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(db_path)])
+        assert exit_code == 1
+
+        result = json.loads(capsys.readouterr().out)
+        not_found = [
+            e for e in result["errors"]
+            if e.get("check") == "content_integrity"
+            and e.get("node_id") == "ob_9999"
+            and "not found in DB" in e.get("error", "")
+        ]
+        assert not_found, "genuinely absent node must still report 'not found in DB'"
+
+
+def test_verify_in_claim_mismatch_message_unchanged(capsys):
+    """DB claim differs from payload claim (both non-empty) -> the existing
+    'claim mismatch' message, not the new no-comparable-claim message."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = ["ob_0001"]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+        tampered_payload = [
+            {"id": "ob_0001", "type": "observation_factual", "claim": "TAMPERED CLAIM — does not match DB"}
+        ]
+        cohort_dir = _make_cohort_dir(tmp_dir, [tampered_payload], db_path=db_path)
+
+        exit_code = _run(["verify-in", "--out", str(cohort_dir), "--db", str(db_path)])
+        assert exit_code == 1
+
+        result = json.loads(capsys.readouterr().out)
+        mismatch = [
+            e for e in result["errors"]
+            if e.get("check") == "content_integrity" and "claim mismatch" in e.get("error", "")
+        ]
+        assert mismatch, "unrelated non-empty claims must still report as a mismatch"
 
 
 # ---------------------------------------------------------------------------

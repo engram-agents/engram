@@ -2,9 +2,14 @@
 """baton — Multi-Agent Turn-State CLI
 
 A thin CLI wrapping the baton file protocol at
-/home/agents-shared/projects/. Provides explicit turn declarations for
+/home/agents-shared/forum/projects/. Provides explicit turn declarations for
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
+
+Note: the old path /home/agents-shared/projects/ (pre-2026-06-27) may still
+exist on some hosts and greps clean against it — that misdirection produced
+a real wrong census (issue #2290). Always point at the forum/projects/ path
+above.
 
 Thirteen subcommands:
   init        Create a new project baton file
@@ -2109,7 +2114,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Protocol docs: docs/baton-protocol.md\n"
-            "Projects dir:  /home/agents-shared/projects/ (manual deploy)\n"
+            "Projects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")

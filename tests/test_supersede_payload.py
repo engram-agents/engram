@@ -5,6 +5,11 @@ Coverage:
   2. Schema enforcement — invalid JSON, non-object, unknown fields.
   3. Required-field validation — missing old_node_id / new_node_id rejected.
   4. Internal helper — _supersede_impl works with named kwargs.
+  5. #1777/#1952 PR3 — supersede does NOT touch recall_summary/needs_tightening/
+     summary_missing on either node (confirmed, not assumed symmetric with
+     engram_resolve's fix — see _supersede_impl's docstring for why old's
+     stale summary is inert once is_current=0, and new already carries its
+     own write-time summary under the #1952 PR1 contract).
 """
 
 import atexit
@@ -135,3 +140,89 @@ def test_impl_callable_with_positionals():
     old_id, new_id = _seed_two_observations_same_type(server)
     r = json.loads(server._supersede_impl(old_id, new_id))
     assert "error" not in r, r
+
+
+# ── 5. #1777/#1952 PR3 — supersede leaves recall_summary fields alone ──────
+
+
+def test_supersede_does_not_touch_recall_summary_fields():
+    """Unlike engram_resolve, engram_supersede must not modify recall_summary,
+    needs_tightening, or summary_missing on either node — confirmed via the
+    design-of-record's own claim ("supersede needs nothing special: the
+    successor is a new node under the new contract"), not assumed by
+    symmetry with the resolve fix.
+
+    recall_summary is seeded at WRITE TIME (in the observation payload, an
+    INSERT) rather than via a post-hoc UPDATE — kept deliberately consistent
+    with how every other node actually acquires a recall_summary under the
+    #1952 PR1 contract, and sidesteps a reproducible local-environment
+    sqlite3/mmap+WAL interaction (observed on this machine's venv: sqlite
+    3.53.4 / macOS 26.5.1) where an UPDATE-via-a-second-connection between
+    two other tool calls corrupts the *next* connection's mmap view of an
+    unrelated table. Confirmed pre-existing and unrelated to this PR's
+    diff — reproduces identically via the vanilla, unmodified
+    engram_set_recall_summaries tool with no #1952 PR3 code involved at all.
+    Flagged in the handoff for the parent; not fixed here (out of scope)."""
+    server = fresh_server()
+    base = {
+        "url": "https://example.com/a", "title": "A",
+        "quote_type": "attributed_analysis",
+    }
+    p1 = {
+        **base, "quoted_text": "Original quote.",
+        "interpretation": "Original interp.", "claim": "Original claim.",
+        "recall_summary": "Old node's own summary, unrelated to supersede.",
+        "recall_keywords": ["kw-one", "kw-two"],
+    }
+    p2 = {
+        **base, "quoted_text": "Refined quote.",
+        "interpretation": "Refined interp.", "claim": "Refined claim.",
+    }
+    a = json.loads(server.engram_add_observation(payload_json=json.dumps(p1)))
+    b = json.loads(server.engram_add_observation(payload_json=json.dumps(p2)))
+    old_id, new_id = a["observation_id"], b["observation_id"]
+
+    import sqlite3
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        before_old = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (old_id,),
+        ).fetchone()
+        before_new = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert before_old["recall_summary"] == "Old node's own summary, unrelated to supersede."
+
+    r = json.loads(server.engram_supersede(payload_json=json.dumps({
+        "old_node_id": old_id,
+        "new_node_id": new_id,
+    })))
+    assert "error" not in r, r
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        after_old = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (old_id,),
+        ).fetchone()
+        after_new = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (new_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert tuple(after_old) == tuple(before_old), (
+        f"supersede must not touch old node's recall_summary fields: "
+        f"before={tuple(before_old)}, after={tuple(after_old)}"
+    )
+    assert tuple(after_new) == tuple(before_new), (
+        f"supersede must not touch new node's recall_summary fields: "
+        f"before={tuple(before_new)}, after={tuple(after_new)}"
+    )

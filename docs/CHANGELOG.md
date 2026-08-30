@@ -9,6 +9,103 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-08-30
+
+**The cascade-machine release.** One epic dominates the 100-commit range since
+v0.4.0 (2026-08-19 through 2026-08-30): the #2013 cascade machine — a single
+repair engine for retract and supersede that replaces the field-based
+`stale_by`/`tainted_by` cascade with durable per-event markers, an explicit
+adjudication frontier, and hard guards on every path that used to let revision
+state drift silently. The release also carries the CB/NCB claim-bearing
+partition groundwork (#2252 stage 1) it builds on, and a wide CI-gate wave that
+grew out of shipping both.
+
+### Added — the cascade machine (#2013)
+
+- **`cascade_markers` + the frontier/resolve verbs** (#2338, #2342, #2349) —
+  a retract or supersede now mints one pending marker per affected node per
+  cascade event; `engram_cascade_frontier` reads the adjudication frontier
+  (modes A/B/C) and `engram_cascade_resolve` adjudicates each entry as
+  `superseded` / `retracted` / `acknowledged`, with confidence recompute
+  transitive and unconditional. Cycle guards on acknowledgements; dag vs
+  `temporal_causal` split with a real cycle detector (#2357, #2360).
+- **Revision guards, each Lei-ruled** — a plain supersede or retract of a
+  node carrying pending markers is REFUSED with a machine-readable pointer to
+  the frontier (#2343, #2392); a plain retract of a NON-current node is
+  refused, ungated, mirroring supersede (#2395, #2396, #2410); `engram_derive`'s
+  MECH-5 refusals carry the same `next_call`/`then` route fields (#2394, #2404).
+- **Cascade playbox + behaviour scenarios CD-01..CD-10** (#2356, #2373, #2382,
+  #2397, #2410) — a real-topology test harness and an end-to-end scenario
+  suite for the machine, run in full CI and (1.6s, stdlib-only) on every dev PR.
+- **Nightly mode-B cascade sweep in the dream master** (#2390, #2401) — the
+  dream record's cascade-sweep section is mandatory, so a sweep that never ran
+  is loudly distinguishable from a clean frontier.
+- **Marker migration at upgrade (rung 5, #2324; verified under #2411)** — the
+  pre-#2013 field-based `stale_by`/`tainted_by` state converts to marker rows
+  automatically at first server start on this version; idempotent, timestamps
+  recovered from `edit_history`. Verified two-signal (independent pre-count ==
+  migration's reported count) before release on four seats, of which **two had
+  real payload** (135/241/61 and 32/37/25 nodes/markers/events) — the two
+  zero-payload seats exercise fire-and-report only, not the conversion logic.
+- **Axiom surfacing gate** (#2406, #2415) — an axiom's markers never
+  auto-resolve trivially; they always surface. (The shipped gate is exactly
+  `frozenset({"axiom"})`: cornerstones and goals cannot carry a marker at all.)
+
+### Changed
+
+- **Revising a node with historical stale/taint state now routes through the
+  frontier** — the migration makes old field-based debt visible as markers, so
+  previously freely-revisable nodes refuse plain revision and point at
+  `engram_cascade_frontier` (migrate-all ruling, 2026-08-30). The refusal
+  self-explains; the nightly sweep drains the backlog.
+- **Skills rewritten for the shipped machine** (#2337, #2389, #2402) —
+  `engram-retract` folds into `engram-revise`; `engram-resolve-cascade`
+  rewritten around the real frontier/resolve verbs.
+- **A commander-relayed sleep order is a sufficient sleep trigger**
+  (#2398, #2403) — seats no longer gate on the human's direct per-seat word
+  when the acting commander relays it with the user's authority stated;
+  human-owner standing gates survive the relay.
+- **gh-stack (GitHub Stacked PRs) rules** (#2391, #2407) — CLAUDE.md carries
+  the post-cutoff knowledge (linked stack members refuse plain merge;
+  `gh stack merge` is the verb; GitHub auto-rebases the next layer), and seat
+  provisioning ensures the extension at boot. Duplicated by hand across
+  engram-alpha, umwelt, soma.
+
+### CI / gates
+
+- Playbox scenarios per dev PR (#2397); scrub checks run on stacked PRs and on
+  `edited` (#2361, #2362); five stdlib-only guards wired into pr-checks
+  (#2376, #2377); test-id census gate (#2350, #2358) with fail-loud parse
+  warnings for malformed `Removed-test` lines (#2393, #2416); fairy-brief
+  class-scope rules in the orchestration skill (#2369, #2370).
+
+### Fixed
+
+- Stop-hook write-verb SSoT derived from the server, `cascade_resolve`
+  included (#2273, #2368, #2384); cohort verify-in no longer hard-fails on
+  prediction nodes (#1966, #2325); `importance_base` unified across 7 sites
+  (#2268, #2367); shared `_proc_identity` for both forum monitors with a
+  portable /proc-primary check (#2134, #2314, #2321, #2365); dead baton store
+  path retired with an advisory scanner (#2316, #2372); template/component
+  parity restored for the Codex wake path (#2385, #2412); EDGE_TIERS duplicate
+  key consolidated (#2387, #2414); dream-master spec no longer names calls the
+  verbs refuse (#2408 comment half, #2414).
+
+### Known caveats
+
+- **Migration rung 5's `tainted_by`→retract branch and anomaly path ship
+  unexercised on real data**: every measured seat has zero live (current-node)
+  `tainted_by`. The fail-safe direction is over-blocking, so untested ≠ unsafe
+  — but it ships untested, stated plainly.
+- #2193: a write during WAL-index displacement can report created and not
+  land; the durability verifier reads through the same connection and cannot
+  see this class (dual-read-back design is post-rc). #2012: some readers
+  (reflect / health-score / viz) still read the legacy `stale_by` fields and
+  undercount post-migration. #2339: the cascade walk's `max_depth` is a node
+  budget, not a depth limit. #2003: superseded nodes keep `status='active'`.
+- #2405: `engram_cascade_resolve`'s cycle-guard remedy text may name a call
+  the guards refuse; ruling pending.
+
 ## [v0.4.0] - 2026-08-19
 
 **A reliability-and-hygiene release.** No single forcing incident drove this

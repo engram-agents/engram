@@ -141,25 +141,38 @@ def _seed_ls(obs, epistemic, claim="Lesson pattern.", supporting_ids=None):
 
 
 def _is_tainted(core, node_id, by_id):
+    """node_id carries a PENDING cascade marker whose root is by_id and
+    whose root_op is 'retract' (taint severity — see
+    core._cascade_marker_severity). Migrated off metadata.tainted_by to the
+    cascade_markers table (#2013/#2009 slice 1) — same observable meaning,
+    new storage.
+    """
     conn = core._get_db()
     try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        if row is None:
-            return False
-        meta = json.loads(row["metadata"] or "{}")
-        return by_id in meta.get("tainted_by", [])
+        row = conn.execute(
+            "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+            "AND root_op = 'retract' AND status = 'pending'",
+            (node_id, by_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 
 
 def _is_stale(core, node_id, by_id):
+    """node_id carries a PENDING cascade marker whose root is by_id and
+    whose root_op is 'supersede' (stale severity). Migrated off
+    metadata.stale_by to the cascade_markers table — same meaning, new
+    storage.
+    """
     conn = core._get_db()
     try:
-        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
-        if row is None:
-            return False
-        meta = json.loads(row["metadata"] or "{}")
-        return by_id in meta.get("stale_by", [])
+        row = conn.execute(
+            "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+            "AND root_op = 'supersede' AND status = 'pending'",
+            (node_id, by_id),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 
@@ -637,14 +650,6 @@ def test_retract_ls_with_supported_by_from_cs_does_NOT_taint_cs():
     assert cs_x not in tainted_ids, (
         f"cs {cs_x} must not appear in tainted_downstream"
     )
-    # Confirm tainted_by key is absent from cs_x's metadata entirely.
-    meta = _get_meta(core, cs_x)
-    assert cs_x not in meta.get("tainted_by", []), (
-        f"cs {cs_x} metadata.tainted_by must not include itself"
-    )
-    assert ls_y not in meta.get("tainted_by", []), (
-        f"cs {cs_x} metadata.tainted_by must not include {ls_y}"
-    )
 
 
 def test_retract_cs_with_supported_by_from_other_cs_does_NOT_taint_source_cs():
@@ -675,10 +680,6 @@ def test_retract_cs_with_supported_by_from_other_cs_does_NOT_taint_source_cs():
     tainted_ids = {t["id"] for t in ret.get("tainted_downstream", [])}
     assert cs_x not in tainted_ids, (
         f"cs {cs_x} must not appear in tainted_downstream"
-    )
-    meta = _get_meta(core, cs_x)
-    assert cs_y not in meta.get("tainted_by", []), (
-        f"cs {cs_x} metadata must not contain tainted_by entry for {cs_y}"
     )
 
 
@@ -948,4 +949,509 @@ def test_supersede_stops_at_superseded_downstream_node():
     assert dv_b not in stale_ids, (
         f"dv_B {dv_b} must NOT be in stale_downstream — cascade must not recurse through "
         f"superseded dv_A"
+    )
+
+
+# ---------------------------------------------------------------------------
+# stale_by → superseded_by invariant (slice 1 tripwire)
+# ---------------------------------------------------------------------------
+#
+# Today, a node lands in someone's stale_by list ONLY because the cascade
+# walker (_on_live_for_supersede, engram_revision.py) marks the ROOT
+# superseded node's id in stale_by for every downstream node it walks — not
+# just the direct premise. So an id appearing in a stale_by list is *always*
+# a node that was itself superseded, and therefore always carries a
+# non-NULL superseded_by on that same node.
+#
+# Slice 1 will change the write path to mark the DIRECT premise instead of
+# the superseded root. Under a chain dv_A -> dv_B -> ob_1 (dv_B derives_from
+# ob_1, dv_A derives_from dv_B), if ob_1 is superseded, dv_A's stale_by would
+# become [dv_B] — but dv_B itself was never superseded, so its superseded_by
+# is NULL. A viz layer reading stale_by + superseded_by together would then
+# render a false sentence ("stale — premise dv_B superseded by ?"). This
+# test pins the invariant that makes that impossible TODAY, so it fails
+# loudly the moment the write path changes without preserving the invariant.
+
+
+def _find_stale_by_invariant_violations(conn):
+    """For every PENDING supersede-severity cascade marker, its root_node
+    must name a node with a non-NULL superseded_by. Returns a list of
+    (offending_node_id, root_node_id) violation tuples; empty means the
+    invariant holds.
+
+    Migrated off metadata.stale_by to cascade_markers (#2013/#2009 slice 1
+    — Ariadne: "keep the tripwire commit... it just now passes for a
+    different reason"). The invariant's SHAPE survives unchanged: slice 1
+    reports root_node uniformly (not a direct-premise refinement — that's
+    #1969's territory layered on top later), and root_node is always the
+    literal node passed to _supersede_impl, whose own superseded_by is set
+    atomically in the same call before the walker marks anything — so this
+    should hold by construction, same as the pre-marker code held it by
+    construction. A checker that always finds nothing proves nothing; the
+    negative-control test below fabricates a marker row directly (bypassing
+    the writer) to prove this checker can actually fail.
+    """
+    violations = []
+    rows = conn.execute(
+        "SELECT node_id, root_node FROM cascade_markers "
+        "WHERE status = 'pending' AND root_op = 'supersede'"
+    ).fetchall()
+    for row in rows:
+        node_id, root_node = row["node_id"], row["root_node"]
+        prow = conn.execute(
+            "SELECT superseded_by FROM nodes WHERE id = ?", (root_node,)
+        ).fetchone()
+        if prow is None or prow["superseded_by"] is None:
+            violations.append((node_id, root_node))
+    return violations
+
+
+def test_stale_by_premises_have_superseded_by_across_graph():
+    """Invariant: every stale_by entry names a node with non-NULL superseded_by.
+
+    Builds several independent supersede cascades — a simple chain, a
+    transitive (two-hop) chain, and a diamond-of-supersedes shape where one
+    downstream node accumulates stale_by entries from two separate supersede
+    calls — through the ordinary public API (create/derive/supersede), then
+    checks the invariant against EVERY node in the resulting graph, not a
+    hand-picked one.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+
+    # Cascade 1: simple chain. ob_1 -> dv_1 (derives_from ob_1). Supersede ob_1.
+    ob_1 = _seed_ob(obs, "Premise 1.")
+    dv_1 = _seed_dv(derive, "Derived from premise 1.", ob_1)
+    ob_1_new = _seed_ob(obs, "Refined premise 1.")
+    r1 = json.loads(rev._supersede_impl(ob_1, ob_1_new))
+    assert "superseded" in r1.get("status", ""), r1
+    assert _is_stale(core, dv_1, ob_1), (
+        f"setup check: {dv_1} should be stale_by {ob_1}"
+    )
+
+    # Cascade 2: transitive (two-hop) chain, to exercise the walker's
+    # recursion beyond a direct premise.
+    # ob_2 -> dv_2a (derives_from ob_2) -> dv_2b (derives_from dv_2a).
+    ob_2 = _seed_ob(obs, "Premise 2.")
+    dv_2a = _seed_dv(derive, "First-level derivation from premise 2.", ob_2)
+    dv_2b = _seed_dv(derive, "Second-level derivation from premise 2.", dv_2a)
+    ob_2_new = _seed_ob(obs, "Refined premise 2.")
+    r2 = json.loads(rev._supersede_impl(ob_2, ob_2_new))
+    assert "superseded" in r2.get("status", ""), r2
+    # Sanity: the transitive node really did pick up a stale_by entry, so the
+    # invariant check below has more than one shape to look at.
+    assert _is_stale(core, dv_2b, ob_2), (
+        f"setup check: {dv_2b} should be stale_by {ob_2} (transitive cascade)"
+    )
+
+    # Cascade 3: shared downstream node accumulates stale markers from two
+    # separate supersede calls (diamond-of-supersedes shape, the #231
+    # scenario — test_stale_replacement_dict.py, which used to carry it, was
+    # deleted by this slice along with the metadata.stale_replacement field
+    # it covered).
+    ob_3a = _seed_ob(obs, "Premise 3a.")
+    ob_3b = _seed_ob(obs, "Premise 3b.")
+    dv_shared = _seed_dv(derive, "Derived from both 3a and 3b.", [ob_3a, ob_3b])
+    ob_3a_new = _seed_ob(obs, "Refined premise 3a.")
+    r3a = json.loads(rev._supersede_impl(ob_3a, ob_3a_new))
+    assert "superseded" in r3a.get("status", ""), r3a
+    ob_3b_new = _seed_ob(obs, "Refined premise 3b.")
+    r3b = json.loads(rev._supersede_impl(ob_3b, ob_3b_new))
+    assert "superseded" in r3b.get("status", ""), r3b
+
+    conn = core._get_db()
+    try:
+        violations = _find_stale_by_invariant_violations(conn)
+    finally:
+        conn.close()
+
+    assert violations == [], (
+        "stale_by invariant violated — the following (node, premise) pairs "
+        "name a premise with a NULL superseded_by: "
+        + ", ".join(
+            f"{node_id} names premise {premise_id}"
+            for node_id, premise_id in violations
+        )
+    )
+
+
+def test_stale_by_invariant_checker_flags_never_superseded_premise():
+    """Negative control: prove the checker above can actually fail.
+
+    Directly fabricates (via a raw cascade_markers INSERT, deliberately NOT
+    through the public API — the point is to construct the exact violation
+    shape a buggy write-path could introduce) a pending supersede marker
+    whose root_node was never superseded, then calls the checker on that
+    state and asserts it flags the fabricated pair. If this test cannot
+    fail, the positive test above proves nothing.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+
+    # never_superseded: an ordinary live node — is_current=1, superseded_by NULL.
+    never_superseded = _seed_ob(obs, "Never superseded premise.")
+    # victim: a node that will be (falsely, for this test only) marked stale
+    # by never_superseded — the shape a buggy write-path would produce.
+    victim = _seed_ob(obs, "Falsely-marked-stale node.")
+
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT INTO cascade_markers "
+            "(node_id, cascade_event, root_node, root_op, status, created_at) "
+            "VALUES (?, 'cev_fabricated_test', ?, 'supersede', 'pending', ?)",
+            (victim, never_superseded, core._now()),
+        )
+        conn.commit()
+
+        violations = _find_stale_by_invariant_violations(conn)
+    finally:
+        conn.close()
+
+    assert (victim, never_superseded) in violations, (
+        f"checker failed to flag the fabricated violation: expected "
+        f"({victim!r}, {never_superseded!r}) in violations, got {violations}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# immediate_cause / dead_premises — direct unit tests (#2013/#2009 slice 1)
+# ---------------------------------------------------------------------------
+#
+# These derived-read primitives (engram_revision._immediate_cause,
+# _dead_premises) have no callers yet in this slice — they're built ahead
+# of the resolve/acknowledge write path that will consume them (a later
+# slice) and the frontier/mode-C machinery (Borges's proposed "slice 3",
+# Cascade-machine room 2026-08-16). Reviewer-fairy flagged the zero-caller
+# gap on #2009's first pass: correct on inspection is not the same as
+# tested, and a latent join bug here wouldn't surface until a later slice
+# starts depending on them. These tests exercise both functions directly
+# against a fabricated diamond — Lei's exact case from #2013 (A→B, A→C,
+# B+C→D) — since that's the shape that killed the naive singular
+# immediate_cause/dead_premises fields in the first place.
+
+
+def test_immediate_cause_is_one_hop_not_transitive():
+    """Chain dv_A -> dv_B -> ob_1 (dv_B derives_from ob_1, dv_A derives_from
+    dv_B). A cascade_event marks both ob_1 and dv_B (as a real cascade
+    would — ob_1 is the root, dv_B is a visited downstream node).
+    immediate_cause(dv_A, event) must return dv_B (dv_A's DIRECT premise
+    that carries the marker) — never ob_1, which is two hops out and not
+    among dv_A's own direct_premise_ids. This is #1969's direct-premise
+    refinement, exercised as a unit test rather than only end-to-end.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+
+    ob_1 = _seed_ob(obs, "Root premise.")
+    dv_b = _seed_dv(derive, "Direct derivation from the root.", ob_1)
+    dv_a = _seed_dv(derive, "Transitive derivation, two hops from the root.", dv_b)
+
+    conn = core._get_db()
+    try:
+        event = "cev_immediate_cause_test"
+        now = core._now()
+        # Simulate a real cascade's write pattern: root_node=ob_1 on every
+        # marker (root is never discarded), root_op arbitrary for this test.
+        for marked_node in (ob_1, dv_b):
+            conn.execute(
+                "INSERT INTO cascade_markers "
+                "(node_id, cascade_event, root_node, root_op, status, created_at) "
+                "VALUES (?, ?, ?, 'supersede', 'pending', ?)",
+                (marked_node, event, ob_1, now),
+            )
+        conn.commit()
+
+        cause = rev._immediate_cause(conn, dv_a, event)
+    finally:
+        conn.close()
+
+    assert cause == [dv_b], (
+        f"immediate_cause(dv_a) should be [{dv_b!r}] (the direct premise), "
+        f"got {cause}"
+    )
+
+
+def test_dead_premises_excludes_acknowledged_includes_superseded():
+    """Lei's diamond: A -> B, A -> C, B + C -> D. B's marker for the event
+    resolves 'superseded' (B genuinely changed); C's marker resolves
+    'acknowledged' (C's claim survived unchanged — the delta didn't touch
+    it). dead_premises(D, event) must include B and EXCLUDE C — this is
+    the load-bearing exclusion from Lei's diamond argument (#2013 comment
+    2026-08-14T21:23:31Z / Kepler's world crossing seq 1911): a marker
+    that merely resolved is not the same as a premise that actually died.
+    An unresolved (pending) premise must also be excluded — it hasn't been
+    adjudicated yet, so nothing is known to have died.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+
+    ob_a = _seed_ob(obs, "Root premise A.")
+    dv_b = _seed_dv(derive, "B, derived from A.", ob_a)
+    ob_c_base = _seed_ob(obs, "Placeholder base for C.")
+    dv_c = _seed_dv(derive, "C, derived from a placeholder (not A directly).", ob_c_base)
+    dv_d = _seed_dv(derive, "D, derived from both B and C.", [dv_b, dv_c])
+
+    conn = core._get_db()
+    try:
+        event = "cev_dead_premises_test"
+        now = core._now()
+
+        def _marker(node_id, status="pending", resolution_kind=None):
+            conn.execute(
+                "INSERT INTO cascade_markers "
+                "(node_id, cascade_event, root_node, root_op, status, "
+                "resolution_kind, created_at, resolved_at) "
+                "VALUES (?, ?, ?, 'supersede', ?, ?, ?, ?)",
+                (node_id, event, ob_a, status, resolution_kind, now,
+                 now if status == "resolved" else None),
+            )
+
+        _marker(dv_b, status="resolved", resolution_kind="superseded")
+        _marker(dv_c, status="resolved", resolution_kind="acknowledged")
+        conn.commit()
+
+        dead = rev._dead_premises(conn, dv_d, event)
+    finally:
+        conn.close()
+
+    assert dead == [dv_b], (
+        f"dead_premises(dv_d) should be [{dv_b!r}] (superseded, genuinely "
+        f"dead) and must EXCLUDE {dv_c!r} (acknowledged — never really "
+        f"moved); got {dead}"
+    )
+
+    # Negative control: a PENDING (unresolved) marker on a direct premise
+    # must not appear in dead_premises either — nothing is known to have
+    # died until adjudication resolves it.
+    conn2 = core._get_db()
+    try:
+        conn2.execute(
+            "INSERT INTO cascade_markers "
+            "(node_id, cascade_event, root_node, root_op, status, created_at) "
+            "VALUES (?, 'cev_dead_premises_pending_test', ?, 'retract', 'pending', ?)",
+            (dv_b, ob_a, core._now()),
+        )
+        conn2.commit()
+        dead_with_pending = rev._dead_premises(conn2, dv_d, "cev_dead_premises_pending_test")
+    finally:
+        conn2.close()
+
+    assert dead_with_pending == [], (
+        f"a PENDING marker must not count as a dead premise; got {dead_with_pending}"
+    )
+
+
+# §5.6 #2252 Stage 1.1 — support_lost discharge (state-based, reflect-time)
+# ---------------------------------------------------------------------------
+
+
+def _set_support_lost(core, node_id, value=True):
+    """Directly stamp a support_lost marker via SQL, bypassing any hook.
+
+    Used to simulate a marker whose setting event predates this fix (the
+    shape of the graph's real specimen: a lesson re-wired before any
+    discharge code existed) — no retract/supersede/register_exemplar call
+    is made, only a direct metadata write, matching how a marker set before
+    this code existed would look today.
+    """
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT metadata FROM nodes WHERE id = ?", (node_id,)).fetchone()
+        meta = json.loads(row["metadata"] or "{}")
+        if value:
+            meta["support_lost"] = True
+        else:
+            meta.pop("support_lost", None)
+        conn.execute("UPDATE nodes SET metadata = ? WHERE id = ?", (json.dumps(meta), node_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_reflect_discharges_backlog_marker_with_no_triggering_event():
+    """Part 1 — the backlog test that matters.
+
+    A node carries support_lost:true in metadata AND has live exemplars,
+    with NO retract/supersede/register_exemplar event anywhere in this test.
+    This is the shape of the graph's one real specimen: a lesson whose
+    marker's setting event is already in the past by the time any discharge
+    code exists.
+
+    A hook keyed on retract/supersede/register-exemplar events CANNOT pass
+    this test — there is no event here for a hook to fire on. Only a
+    state-based recount at reflect time (Part 1) can discharge it.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_id = _seed_ob(obs, "Live supporter — never touched by any mutation.")
+    cs_id = _seed_cs(cs, ob_id, tag="backlog-marker-cs")
+
+    # Stamp a false-positive marker with no triggering event.
+    _set_support_lost(core, cs_id, True)
+    assert _get_meta(core, cs_id).get("support_lost") is True, "precondition: marker set"
+
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    assert "error" not in reflect_result, reflect_result
+
+    support_lost_ids = [n["id"] for n in reflect_result.get("support_lost_nodes", [])]
+    assert cs_id not in support_lost_ids, (
+        f"{cs_id} must be discharged (has live exemplars via ob_id) — a "
+        f"hook-only fix would leave it marked forever because no event ever "
+        f"fires on it. Got support_lost_nodes: {support_lost_ids}"
+    )
+
+    cleared_ids = [n["id"] for n in reflect_result.get("support_lost_cleared", [])]
+    assert cs_id in cleared_ids, (
+        f"Expected {cs_id} in support_lost_cleared, got: {cleared_ids}"
+    )
+
+    meta = _get_meta(core, cs_id)
+    assert not meta.get("support_lost"), f"metadata marker should be cleared, got: {meta}"
+
+    summary = reflect_result.get("summary", {})
+    assert summary.get("support_lost_cleared", 0) >= 1, (
+        f"Expected summary.support_lost_cleared >= 1, got: {summary}"
+    )
+
+
+def test_support_lost_mark_restore_remark_round_trip_idempotent():
+    """Part 2 — mark -> restore -> re-mark via the write-time hook.
+
+    Also asserts idempotency: exactly one edit_history row per real state
+    transition, no duplicates from repeated _detect_zero_support triggers.
+    """
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob1 = _seed_ob(obs, "Supporter 1 — retracted first.", url="https://example.com/rt1")
+    cs_id = _seed_cs(cs, ob1, tag="round-trip-cs")
+
+    # 1. Mark: retract the sole supporter.
+    ret1 = json.loads(rev._retract_impl(
+        node_id=ob1, error_type="hallucinated_claim", reason="fabricated 1",
+    ))
+    assert ret1.get("support_lost_count", 0) == 1, ret1
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # 2. Wire two more supporters directly (bypasses any hook on cs itself):
+    # ob2 stays live, ob3 will be retracted to re-trigger _detect_zero_support
+    # against cs's neighborhood.
+    ob2 = _seed_ob(obs, "Supporter 2 — added post-hoc, stays live.", url="https://example.com/rt2")
+    ob3 = _seed_ob(obs, "Supporter 3 — added then retracted to re-trigger.", url="https://example.com/rt3")
+    conn = core._get_db()
+    try:
+        now = core._now()
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+            (cs_id, ob2, now),
+        )
+        conn.execute(
+            "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+            (cs_id, ob3, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 3. Restore: retracting ob3 re-triggers _detect_zero_support against
+    # cs; ob2 is still live, so this should CLEAR support_lost (Part 2).
+    ret2 = json.loads(rev._retract_impl(
+        node_id=ob3, error_type="hallucinated_claim", reason="fabricated 3",
+    ))
+    assert "error" not in ret2, ret2
+    assert _get_meta(core, cs_id).get("support_lost") is not True, (
+        f"cs {cs_id} should be restored (ob2 still live), meta: {_get_meta(core, cs_id)}"
+    )
+    restored_ids = [n["id"] for n in ret2.get("support_restored", [])]
+    assert cs_id in restored_ids, f"Expected {cs_id} in support_restored, got: {restored_ids}"
+
+    # 4. Re-mark: retract the last live supporter ob2.
+    ret3 = json.loads(rev._retract_impl(
+        node_id=ob2, error_type="hallucinated_claim", reason="fabricated 2",
+    ))
+    assert ret3.get("support_lost_count", 0) == 1, ret3
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # 5. Idempotency: exactly 2 'support_lost' rows (steps 1 and 4) and
+    # exactly 1 'support_lost_cleared' row (step 3) for cs_id.
+    conn = core._get_db()
+    try:
+        lost_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM edit_history WHERE node_id = ? AND action = 'support_lost'",
+            (cs_id,),
+        ).fetchone()["c"]
+        cleared_rows = conn.execute(
+            "SELECT COUNT(*) AS c FROM edit_history WHERE node_id = ? AND action = 'support_lost_cleared'",
+            (cs_id,),
+        ).fetchone()["c"]
+    finally:
+        conn.close()
+    assert lost_rows == 2, f"Expected exactly 2 support_lost rows, got {lost_rows}"
+    assert cleared_rows == 1, f"Expected exactly 1 support_lost_cleared row, got {cleared_rows}"
+
+
+def test_register_exemplar_clears_support_lost_marker():
+    """Part 3 — registering a new exemplar on a marked lesson clears it."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_incident = _seed_ob(obs, "Sole incident — will be retracted.")
+    ls_id = _seed_ls(obs, epistemic, "Lesson losing its only incident.", supporting_ids=ob_incident)
+
+    ret = json.loads(rev._retract_impl(
+        node_id=ob_incident, error_type="hallucinated_claim", reason="fabricated incident",
+    ))
+    assert ret.get("support_lost_count", 0) == 1, ret
+    assert _get_meta(core, ls_id).get("support_lost") is True
+
+    ob_new = _seed_ob(obs, "New incident registered post-hoc.", url="https://example.com/new-incident")
+    reg = json.loads(epistemic._register_exemplar_impl(target_id=ls_id, exemplar_id=ob_new))
+    assert "error" not in reg, reg
+
+    meta = _get_meta(core, ls_id)
+    assert not meta.get("support_lost"), (
+        f"lesson {ls_id} support_lost should clear on new exemplar registration, got: {meta}"
+    )
+
+
+def test_genuinely_unsupported_node_stays_marked_through_all_paths():
+    """A node with zero live support must NOT be discharged by any path —
+    the discharge machinery must not become a way to lose the warning."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob_id = _seed_ob(obs, "Sole supporter — retracted, nothing replaces it.")
+    cs_id = _seed_cs(cs, ob_id, tag="genuinely-unsupported-cs")
+
+    ret = json.loads(rev._retract_impl(
+        node_id=ob_id, error_type="hallucinated_claim", reason="fabricated",
+    ))
+    assert ret.get("support_lost_count", 0) == 1, ret
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+    # Part 1: reflect must NOT discharge a genuinely-unsupported node.
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    support_lost_ids = [n["id"] for n in reflect_result.get("support_lost_nodes", [])]
+    cleared_ids = [n["id"] for n in reflect_result.get("support_lost_cleared", [])]
+    assert cs_id in support_lost_ids, (
+        f"Expected {cs_id} to remain in support_lost_nodes, got: {support_lost_ids}"
+    )
+    assert cs_id not in cleared_ids, (
+        f"{cs_id} has zero live support and must NOT appear in support_lost_cleared, "
+        f"got: {cleared_ids}"
+    )
+    assert _get_meta(core, cs_id).get("support_lost") is True
+
+
+def test_reflect_summary_reports_support_lost_cleared_count():
+    """support_lost_cleared appears in the reflect report with a correct count."""
+    rev, obs, derive, cs, epistemic, lifecycle, core = _make_fresh_mods()
+    ob1 = _seed_ob(obs, "Live supporter for backlog cs 1.", url="https://example.com/sc1")
+    cs1 = _seed_cs(cs, ob1, tag="summary-cleared-cs-1")
+    ob2 = _seed_ob(obs, "Live supporter for backlog cs 2.", url="https://example.com/sc2")
+    cs2 = _seed_cs(cs, ob2, tag="summary-cleared-cs-2")
+
+    _set_support_lost(core, cs1, True)
+    _set_support_lost(core, cs2, True)
+
+    reflect_result = json.loads(lifecycle._reflect_impl())
+    assert "error" not in reflect_result, reflect_result
+
+    cleared_ids = {n["id"] for n in reflect_result.get("support_lost_cleared", [])}
+    assert {cs1, cs2} <= cleared_ids, (
+        f"Expected both {cs1} and {cs2} in support_lost_cleared, got: {cleared_ids}"
+    )
+    summary = reflect_result.get("summary", {})
+    assert summary.get("support_lost_cleared", 0) == len(reflect_result.get("support_lost_cleared", [])), (
+        f"summary.support_lost_cleared must match list length, got: {summary}"
     )

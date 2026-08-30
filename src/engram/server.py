@@ -617,9 +617,6 @@ def _graph_lineage_count(*args, **kwargs):
 VALID_ERROR_TYPES = _revision_mod.VALID_ERROR_TYPES
 _THRESHOLD_GATE_DISCIPLINE_HINT = _revision_mod._THRESHOLD_GATE_DISCIPLINE_HINT
 
-def _add_stale_replacement(*args, **kwargs):
-    return _revision_mod._add_stale_replacement(*args, **kwargs)
-
 def _walk_cascade_downstream(*args, **kwargs):
     return _revision_mod._walk_cascade_downstream(*args, **kwargs)
 
@@ -642,6 +639,21 @@ def _retract_impl(*args, **kwargs):
     # references the canonical implementation, not the forwarder chain.
     return _revision_mod._retract_impl(*args, _obs_creator=_observation_mod._add_observation_impl, **kwargs)
 # ---- end #872 wave-6 compat forwarders --------------------------------
+
+# ---- engram_cascade_frontier (engram-alpha#2013 slice 3) --------------
+# Core logic lives in engram_revision.py (family E, "cascade helpers") next
+# to _immediate_cause/_dead_premises it composes with; this is the thin
+# in-server forwarder, same shape as the wave-6 forwarders above.
+def _cascade_frontier_impl(*args, **kwargs):
+    return _revision_mod._cascade_frontier_impl(*args, **kwargs)
+
+
+# engram_cascade_resolve (engram-alpha#2013 slice 4 — the adjudication verb).
+# Same placement rationale: the write half lives next to the marker helpers
+# and the frontier read it composes with.
+def _cascade_resolve_impl(*args, **kwargs):
+    return _revision_mod._cascade_resolve_impl(*args, **kwargs)
+# ---- end engram_cascade_frontier/resolve forwarders --------------------
 
 # ---- #872 wave-7 compat forwarders -----------------------------------
 # Impls + helpers moved to engram_stats.py (family H).
@@ -1440,6 +1452,27 @@ _SIMILAR_STRIP_KEYS = core._SIMILAR_STRIP_KEYS
 # that the (deliberately fastmcp-free) SessionStart hook injects.
 TOOL_CAPABILITIES: dict[str, str] = {}
 
+# Tool-annotations index (issue #2273)
+# ---------------------------------------------------------------------------
+# `_ENGRAM_WRITE_VERBS` in the stop hook (src/engram/hooks/claude/
+# engram-stop-hook.py) is a hand-maintained mirror of "which MCP tools write
+# to ENGRAM", used to decide whether a turn's tool calls should fire the
+# write-check nudge. Hand-maintained mirrors drift — #2273 found it 7 tools
+# behind the real set. The fix is the same shape as TOOL_CAPABILITIES just
+# above: capture the ground truth ONCE, at decoration time, from the same
+# `annotations=` kwarg every @mcp.tool() call site already carries (FastMCP's
+# own `readOnlyHint` — True for read-only tools, False for tools that mutate
+# the graph), so a test can derive the write-capable tool set from this dict
+# instead of a second hand-written list that can silently fall out of sync.
+#
+# Keyed by the tool's registered name, same as TOOL_CAPABILITIES. Value is
+# the full `annotations` dict as passed to @mcp.tool() (not narrowed to just
+# readOnlyHint) — cheap to keep the whole dict here since it is already fully
+# materialized in `kwargs` at decoration time, and it leaves room for a future
+# consumer that wants destructiveHint/idempotentHint/openWorldHint without
+# having to add a second registry.
+TOOL_ANNOTATIONS: dict[str, dict] = {}
+
 
 _original_mcp_tool = mcp.tool
 
@@ -1475,6 +1508,15 @@ def _timing_mcp_tool(*args, **kwargs):
     # wrapper() below: kwargs is this call's dict, available for the whole
     # closure regardless of decorator invocation order.
     _registered_name = kwargs.get("name")
+    # annotations= is a real FastMCP kwarg (unlike capability=, which is
+    # popped above) — still present in kwargs here since kwargs is this
+    # call's own dict and _original_mcp_tool() above received a copy of the
+    # reference, not a mutation of this one. Read defensively: every real
+    # ENGRAM tool call site passes a dict, but a bare @mcp.tool() with no
+    # annotations= would otherwise KeyError inside wrapper() below.
+    _registered_annotations = kwargs.get("annotations")
+    if not isinstance(_registered_annotations, dict):
+        _registered_annotations = {}
 
     def wrapper(func):
         # Recorded at DECORATION time (module import), not call time — the
@@ -1482,7 +1524,14 @@ def _timing_mcp_tool(*args, **kwargs):
         # name= kwarg takes priority when present (all 56 real ENGRAM tool
         # call sites pass it); fall back to func.__name__ for the
         # theoretical case of a bare @mcp.tool() with no name= override.
-        TOOL_CAPABILITIES[_registered_name or func.__name__] = capability
+        _tool_name = _registered_name or func.__name__
+        TOOL_CAPABILITIES[_tool_name] = capability
+        # TOOL_ANNOTATIONS (issue #2273): same decoration-time capture as
+        # TOOL_CAPABILITIES above, keyed identically. Stores a shallow copy
+        # so later mutation of the caller's annotations dict (there isn't
+        # any today, but nothing guards against it) can't retroactively
+        # change what was recorded at decoration time.
+        TOOL_ANNOTATIONS[_tool_name] = dict(_registered_annotations)
 
         @functools.wraps(func)
         def timed(*a, **kw):
@@ -1622,6 +1671,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "source_repo",
     "repo_path",
     "session_id",
+    "recall_summary",
+    "recall_keywords",
 })
 
 
@@ -1675,6 +1726,17 @@ def engram_add_observation(payload_json: str) -> str:
 
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
+
+    Advisory predictive_hint (#2252 Stage 1.4): when is_predictive is falsy,
+    the result may carry a "predictive_hint" key because
+    predicted_event/resolution_timeframe were passed without is_predictive.
+    This is advisory only: it never blocks or alters node creation, and is
+    suppressed whenever is_predictive is true. It exists because the
+    pairing invariant (a claim-bearing predictive observation paired with a
+    non-claim-bearing prediction node) protects nothing if nobody is
+    prompted to use it. (A claim-text keyword/regex trigger was evaluated
+    and removed pre-merge on measured zero precision; redesign tracked in
+    #2264.)
 
     Simplest — citing the CURRENT chat (pass your injected session_id; the
     server resolves the transcript, defaults quote_type=personal_communication
@@ -1735,7 +1797,13 @@ def engram_add_observation(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             quoted_text (str, required): Exact quote from the source document.
             interpretation (str, required): Agent's reasoning about what this quote means.
-            claim (str, required): The atomic, falsifiable claim this observation supports.
+            claim (str, required): The claim this observation supports. Semantic content
+                (knowledge, premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a compound claim
+                is fine. Exception: a live present-tense assertion embedded in an
+                episode (verdict, status claim, generalization) gets its own atomic
+                node - those are falsified piecewise and supersede is node-grained.
+                Detail + worked examples: the engram-observe skill.
             quote_type (str, required unless session_id is set): One of: hard_data, official_statement, attributed_analysis, counterfactual_inference, unnamed_source, personal_communication, editorial. When session_id is the source and quote_type is omitted, it defaults to 'personal_communication'.
             url (str, optional): URL of the source document. The evidence node is auto-created or reused.
             title (str, optional): Title of the source document (required if url is provided).
@@ -1774,6 +1842,8 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
@@ -1857,7 +1927,15 @@ def engram_add_observation_batch(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             observations_json (str, required): Stringified JSON array of
                 observation objects. Each observation must have quoted_text,
-                interpretation, claim, quote_type; optional is_predictive,
+                interpretation, claim, quote_type. claim: the claim this
+                observation supports. Semantic content (knowledge,
+                premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a
+                compound claim is fine. Exception: a live present-tense
+                assertion embedded in an episode (verdict, status claim,
+                generalization) gets its own atomic node - those are
+                falsified piecewise and supersede is node-grained. Detail +
+                worked examples: the engram-observe skill. Optional is_predictive,
                 predicted_event, resolution_timeframe, source_class,
                 standpoint_author_id (see tiered-ID convention in
                 engram_add_observation — pn_* for in-graph entities, namespaced
@@ -1874,7 +1952,14 @@ def engram_add_observation_batch(payload_json: str) -> str:
                 fs_class ("re-executable" for Class 1 claims that can be re-tested by
                 re-running the measurement, or "frozen" for Class 2 claims recording a
                 past event that cannot be re-executed; omit to let the Phase-1 proxy from
-                quote_type apply — hesitation is the correct signal to omit).
+                quote_type apply — hesitation is the correct signal to omit),
+                recall_summary (always provide when you can — ≤140-char recall-scent
+                string compressing this item's interpretation/claim; omission clean-accepts
+                but is flagged summary_missing (distinct from needs_tightening — a
+                fail-loud-surface flag, not an error), soft-accepted (needs_tightening flagged); an excessively long summary
+                hard-rejects that item only — other items in the batch are unaffected), recall_keywords (always provide
+                when you can — array of 3-6 short keyword strings; never rejected
+                regardless of count).
             url (str, optional): Source URL. The evidence node is auto-created
                 or reused. Use this+title OR evidence_id, not both.
             title (str, optional): Source title (required when url given).
@@ -2018,8 +2103,8 @@ def engram_surface(payload_json: str) -> str:
 #
 # Edge classification (recall view):
 #   Logical-substrate (shown with recall_summary):
-#     derives_from, supported_by, supersedes, contradicts, resolves,
-#     retracts, exemplifies, subtask_of, tensions
+#     derives_from, supported_by, predicted_by, supersedes, contradicts,
+#     resolves, retracts, exemplifies, subtask_of, tensions
 #   Contextual (shown with keywords only):
 #     cites, about, serves
 #
@@ -2071,8 +2156,8 @@ def engram_inspect(payload_json: str) -> str:
     For multi-hop evidence chains, use engram_get_subgraph instead.
 
     Neighbor grouping in recall view:
-      upstream   — outgoing derives_from, supported_by, supersedes, resolves, subtask_of
-      downstream — incoming derives_from, supported_by, supersedes, resolves, subtask_of
+      upstream   — outgoing derives_from, supported_by, predicted_by, supersedes, resolves, subtask_of
+      downstream — incoming derives_from, supported_by, predicted_by, supersedes, resolves, subtask_of
       lateral    — contradicts, tensions, exemplifies, retracts
 
     Args:
@@ -2364,6 +2449,326 @@ def engram_get_subgraph(payload_json: str) -> str:
     if "node_id" not in params:
         return json.dumps({"error": "payload_json must include required field 'node_id'"})
     return _subgraph_impl(**params)
+
+
+# DESIGN INTENT — engram_cascade_frontier
+# ----------------------------------------
+# engram-alpha#2013 slice 3 (derived reads). A READ-ONLY tool: no
+# INSERT/UPDATE/DELETE anywhere in this path, no marker mutation, no
+# confidence recompute. It answers "which marked nodes are ready to
+# adjudicate RIGHT NOW" by recomputing the frontier fresh from
+# cascade_markers state on every call — there is no queue, no cursor, no
+# persisted frontier state. Same input state always yields the same output.
+#
+# Frontier definition: a node is on the frontier iff it carries >=1 PENDING
+# cascade marker AND none of its cascade-ancestors (the full transitive
+# closure via CASCADE_RELATIONS — not merely its one-hop direct premises)
+# currently carries a pending marker, for ANY cascade_event, against ANY
+# root. Checked per-NODE across ALL of that node's own events at once — a
+# node touched by two cascade events is frontier only once every pending
+# ancestor, across BOTH events, has resolved.
+#
+# Two modes:
+#   Mode B (node_id omitted) — every frontier node in the graph.
+#   Mode C (node_id given)   — the frontier restricted to
+#     ancestors(node_id) ∩ pending, i.e. node_id's own pending-marked
+#     cascade-ancestors (provably minimal + sufficient to unblock node_id
+#     itself). Also returns a labeled blast-radius ESTIMATE — see the
+#     response's own blast_radius_estimate_note for what moves the number.
+#
+# Return shape: the FULL frontier as uncapped one-line summaries (id,
+# truncated claim gist, type, and — per node — every pending event with its
+# root_op/severity-label-hint and which direct premises died and how), plus
+# counts, plus full adjudication packets for at most `limit` (K) nodes.
+# Ordering (event-grouped tier, then created_at ascending, tie-broken on
+# node id) is PRESENTATION-ONLY and carries no semantic weight.
+#
+# Does NOT implement engram_cascade_resolve (slice 4) — no write path here.
+_CASCADE_FRONTIER_FIELDS = frozenset({
+    "node_id", "limit",
+})
+
+
+@mcp.tool(
+    name="engram_cascade_frontier",
+    capability=(
+        "Read-only: which cascade-marked nodes are ready to adjudicate right now "
+        "(no pending cascade-ancestor blocking them). Recomputed fresh from marker "
+        "state every call — no queue, no stored cursor. Mode B: whole-graph "
+        "frontier. Mode C (node_id given): minimal pending-ancestor slice for one "
+        "target, plus a labeled blast-radius estimate."
+    ),
+    annotations={
+        "title": "Cascade Marker Frontier",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_frontier(payload_json: str) -> str:
+    """Which cascade-marked nodes are ready to adjudicate right now.
+
+    READ-ONLY (engram-alpha#2013 slice 3): no marker mutation, no confidence
+    recompute, nothing written. Does not resolve/acknowledge anything — that
+    is a later slice's write path (engram_cascade_resolve, not this tool).
+
+    Frontier definition: a node is on the frontier iff it carries >=1
+    PENDING cascade marker AND none of its cascade-ancestors (full
+    transitive closure via CASCADE_RELATIONS, computed fresh via the shared
+    upstream walk — not just its one-hop direct premises) currently carries
+    a pending marker, for ANY cascade_event, against ANY root. Checked
+    per-NODE across ALL of that node's own pending events at once — a node
+    touched by two cascade events is frontier only once every pending
+    ancestor, across both events, has resolved. A multi-event node appears
+    exactly once in the output, with all its events listed.
+
+    The frontier IS the topological order, recomputed from marker state on
+    every call. There is no queue, no stored cursor, no session state —
+    identical marker state always yields an identical result.
+
+    Two modes:
+      Mode B (node_id omitted): every frontier node in the graph.
+      Mode C (node_id given): the frontier restricted to
+        ancestors(node_id) ∩ pending — node_id's own pending-marked
+        cascade-ancestors, provably minimal and sufficient to unblock
+        node_id itself (plus node_id itself, if node_id is already
+        frontier). Also returns blast_radius_estimate + pending_ancestor_count
+        (labeled ESTIMATE — see blast_radius_estimate_note in the response
+        for what moves the number as an agent resolves premises).
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, optional): Restrict to Mode C (minimal slice for
+                this one target). Omit for Mode B (whole-graph frontier).
+            limit (int, optional): K, the cap on how many FULL adjudication
+                packets are returned. Summaries are NEVER capped — every
+                frontier node gets a one-line summary regardless of K.
+                Default 5.
+
+    Returns:
+        JSON with:
+          mode ("B" or "C"), node_id (echoed or null).
+          frontier: uncapped list of one-line summaries — {id, type,
+            claim_gist (truncated, see claim_gist_truncated),
+            events: [{cascade_event, root_node, root_op,
+              severity_label_hint (machine classification, not a directive —
+              both root_ops hard-block equally), created_at,
+              root_is_direct_premise, immediate_cause, dead_premises
+              (which direct premises died and how: resolution_kind,
+              resolution_replacement_id, resolved_at)}]}.
+          frontier_count, total_pending_nodes (GRAPH-WIDE in BOTH modes —
+            in mode C this is NOT scoped to node_id's own pending-ancestor
+            set; that scoped count is pending_ancestor_count, mode-C-only,
+            below).
+          packets: full adjudication packets (claim, confidence,
+            recall_summary, is_current, events) for at most `limit` nodes.
+          packets_returned, packets_limit.
+          Mode C only: pending_ancestor_count, blast_radius_estimate,
+            blast_radius_estimate_note.
+          invariant_1_violation_suspected (str, both modes): present ONLY
+            when candidates exist (total_pending_nodes > 0 in mode B, or a
+            non-empty pending-ancestor set in mode C) but frontier_count is
+            0 — nothing is currently resolvable, a state that should be
+            unreachable in a well-formed graph (most likely a cascade cycle
+            in CASCADE_RELATIONS, whose DAG-integrity scan is advisory, not
+            blocking). ABSENT entirely on the healthy path — its mere
+            presence is the signal. A mode-B sweep (frontier -> resolve,
+            looped) MUST NOT treat a response carrying this field as a
+            completed/clean sweep.
+        On payload-parsing failure or unknown node_id, returns
+        {"error": "..."}.
+
+    See _cascade_frontier_impl (engram_revision.py) for full semantics —
+    kept callable with named kwargs for in-server callers.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_FRONTIER_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_FRONTIER_FIELDS)}"
+        })
+    return _cascade_frontier_impl(**params)
+
+
+# DESIGN INTENT — engram_cascade_resolve
+# -------------------------------------
+# engram-alpha#2013 slice 4 (the adjudication verb). The WRITE half of the
+# cascade machine, and the counterpart to engram_cascade_frontier's read.
+#
+# PURE-WIRE: this tool NEVER creates a node. A 'superseded' resolution names
+# an already-existing replacement, created beforehand via its own canonical
+# tool — the same contract engram_supersede has, and for the same reason
+# (bundling creation into the wiring risks orphans on a mid-way failure).
+#
+# PER-NODE, not per-marker: there is deliberately no cascade_event parameter.
+# One judgement stamps the same resolution_kind on ALL of the node's pending
+# markers. That is safe rather than an over-resolve because the frontier
+# packet the agent adjudicates from lists EVERY pending event on the node —
+# the single judgement is made with all the deltas in view.
+#
+# WHAT THE MACHINE DECIDES vs WHAT THE AGENT DECIDES (§4). The machine
+# enforces eligibility, recomputes confidence and orders the work. It never
+# picks a resolution shape, with exactly one exception — the trivial
+# auto-resolution, where every affected premise resolved as 'acknowledged'
+# so nothing actually moved. That exception is decided by PROOF, not
+# judgement, which is why it is the only one.
+#
+# TWO PROPAGATIONS, OPPOSITE RULES — the single most likely thing for a later
+# edit to get backwards. The DERIVATION cascade does NOT re-fire on
+# resolution: everything downstream already carries the original event's
+# markers and invariant 4 forbids a new descendant appearing while the node
+# was pending, so a second event would mark a provably-covered set.
+# Confidence DOES re-propagate, and transitively, because a child was
+# computed from the parent's OLD value.
+#
+# THE CONTRADICTION CASCADE IS A THIRD CASE AND FOLLOWS NEITHER RULE. It is
+# NOT covered by the proof above: contradictions are non-claim-bearing, so
+# the derivation walk never reaches one — they are marked only by a query
+# against the OPERATED node's own contradicts edges, which means a
+# contradiction on a mid-chain node was never marked by the root's cascade
+# either. So a resolution DOES mint a dedicated contradiction-only cascade
+# event when the node carries contradictions (response field
+# `contradiction_cascade_event`). That event marks ONLY contradiction nodes;
+# no claim-bearing node's adjudication count changes, which is what
+# invariant 7 and §6 actually protect. Bounded at two markers per
+# contradiction — a contradicts set has two sides, and retract/supersede
+# makes a side non-current.
+#
+# cascade_triggering is NOT in the field allowlist below and must never be:
+# it is the internal seam by which this verb reaches the shared retract /
+# supersede cores without opening a new event, and an agent that could pass
+# it could silently disarm the cascade on an ordinary revision.
+_CASCADE_RESOLVE_FIELDS = frozenset({
+    "node_id", "resolution_kind", "replacement_id", "note", "error_type",
+})
+
+
+@mcp.tool(
+    name="engram_cascade_resolve",
+    capability=(
+        "Record your adjudication of ONE cascade-marked node that is on the "
+        "frontier: retract it, supersede it with an already-created "
+        "replacement, or acknowledge that the upstream change does not touch "
+        "its claim. Stamps the decision on ALL that node's pending markers, "
+        "recomputes confidence transitively, and auto-resolves any dependent "
+        "the decision renders trivial. Never creates a node."
+    ),
+    annotations={
+        "title": "Resolve Cascade Marker",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_cascade_resolve(payload_json: str) -> str:
+    """Adjudicate one frontier node of the cascade machine.
+
+    Pair this with engram_cascade_frontier: that tool tells you WHICH nodes
+    are ready to adjudicate and gives you the packet to adjudicate from; this
+    one records what you decided. A node not on the frontier is refused, with
+    the blocking ancestors named — its eligible shapes are a function of how
+    ALL its premises resolve, so they are not knowable until they have.
+
+    THE THREE SHAPES (#2013 §4):
+      retracted    — the argument is broken.
+      superseded   — the claim survives on the remaining premises, and you
+                     have ALREADY created the replacement node.
+      acknowledged — the upstream delta provably does not touch this claim.
+
+    'acknowledged' is available IFF no affected direct premise resolved as
+    retracted. Supersede and acknowledge both permit it; only retract forbids
+    it, because only retract removes a LEG from the argument — a superseded
+    premise still supports the claim, differently. The predicate gates the
+    AVAILABILITY of the option, never your choice: you still judge whether a
+    superseded premise's delta touches your claim.
+
+    Confidence is ALWAYS recomputed, however the marker resolves, and never
+    typed by you. Acknowledging that a CLAIM is unchanged is a separate
+    matter from the CONFIDENCE of that claim — measured on this graph, 57.3%
+    of supersede pairs carry a different confidence, so the recompute is the
+    majority case, not an edge case.
+
+    An 'acknowledged' resolution also records an `acknowledged_derives_from`
+    edge to each superseding premise — that relation, NEVER `derives_from`
+    (#2013 §12.5). The distinction is structural, not taxonomic: the
+    acknowledging node exists BEFORE the replacement it comes to rest on, so
+    the edge always inverts creation order, and `derives_from` carries
+    `temporal_causal: True` — filed that way it produced one DAG-time
+    violation per acknowledgement, measured. That is not bookkeeping: an acknowledgement outlives
+    the repair window, so without the edge nothing would re-read this node if
+    the replacement is itself superseded later.
+
+    THE DERIVATION CASCADE DOES NOT RE-FIRE. No claim-bearing node is marked
+    by this resolution, whatever shape you choose, so nothing downstream
+    acquires a second marker to adjudicate. If you want a fresh derivation
+    cascade you are not resolving — you are making a new revision, and
+    engram_retract / engram_supersede are the tools for that.
+
+    ONE EXCEPTION, and a mode-B sweep must account for it: if the node
+    carries CONTRADICTIONS, this call mints a dedicated contradiction-only
+    cascade event and marks them (see `contradiction_cascade_event` and
+    `marked_contradictions`). Contradictions are non-claim-bearing, so the
+    derivation walk never reaches them and the covered-set proof above does
+    not apply — without this they would never be reviewed at all. **So the
+    frontier CAN grow underneath you across a resolution.** A frontier ->
+    resolve loop must re-read the frontier after each resolution rather than
+    assuming one pass drains it.
+
+    Args:
+        payload_json: JSON object (as a string) with these fields:
+            node_id (str, REQUIRED): the frontier node you are adjudicating.
+            resolution_kind (str, REQUIRED): one of "retracted",
+                "superseded", "acknowledged".
+            replacement_id (str): REQUIRED iff resolution_kind is
+                "superseded"; refused otherwise. Must already exist — this
+                tool never creates it.
+            note (str, optional): your reasoning, recorded with the
+                resolution.
+            error_type (str, optional): only read when resolution_kind is
+                "retracted"; passed through to the shared retract core.
+                Defaults to "other". One of: fabricated_quote,
+                wrong_citation, wrong_evidence, hallucinated_claim,
+                duplicate, other.
+
+    Returns:
+        JSON with: node_id, resolution_kind, resolved_events (every
+        cascade_event this one judgement closed) + resolved_marker_count,
+        affected_premises (which of your direct premises moved, per event,
+        and how — including the cascade ROOT, which carries no marker of its
+        own), eligible_shapes, confidence_recompute ({nodes_considered,
+        changed, skipped, passes} — plus convergence_warning if the
+        recompute could not settle, which should be unreachable and most
+        likely means a CASCADE_RELATIONS cycle), auto_resolved_trivial,
+        acknowledgement_edges, note (a human-readable summary, always
+        present, null when empty),
+        marked_contradictions (contradiction nodes
+        this resolution marked for review), contradiction_cascade_event (the
+        dedicated event id they were marked under, or null when the node has
+        no contradictions), re_cascade (an explanation of what did and
+        did not propagate), and — only when resolution_kind is `superseded`
+        or `retracted` — delegated_to + delegated_result, naming the verb
+        this resolution handed off to and what it returned.
+        On refusal, {"error": "..."} — with blocking_ancestors + next_call
+        when the node is not on the frontier, or eligible +
+        acknowledge_blocked_by when the shape is not available.
+
+    See _cascade_resolve_impl (engram_revision.py) for full semantics.
+    """
+    params, err = _parse_payload(payload_json)
+    if err:
+        return err
+    unknown = set(params.keys()) - _CASCADE_RESOLVE_FIELDS
+    if unknown:
+        return json.dumps({
+            "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
+                     f"Allowed: {sorted(_CASCADE_RESOLVE_FIELDS)}"
+        })
+    return _cascade_resolve_impl(**params)
 
 
 # ---- Version control tools ----
@@ -2694,6 +3099,11 @@ def _advance_turn_impl(message: str) -> str:
 # calibration_snapshot field: corpus + this_turn confidence distributions, added by
 # the wrapper (calls engram_stats() which is server-resident; cannot be called from
 # the family module impl — wave-3 structural split).
+#
+# NOT purely a read (#2252 Stage 1.1): the support_lost recompute below writes
+# node metadata + edit_history when it discharges a stale marker. See the
+# tool docstring and its Returns: support_lost_cleared entry for what that
+# means from the caller's side.
 _REFLECT_FIELDS = frozenset({
     "summary_top_k",
 })
@@ -2707,7 +3117,9 @@ _REFLECT_FIELDS = frozenset({
     ),
     annotations={
         "title": "[Sleep cycle] Audit Knowledge Graph Quality (pre-dream briefing)",
-        "readOnlyHint": True,
+        # #2252 Stage 1.1: reflect now recomputes + discharges stale
+        # support_lost markers as it audits — this is no longer a pure read.
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
@@ -2721,6 +3133,15 @@ def engram_reflect(payload_json: str = "{}") -> str:
     unresolved contradictions, weakly-grounded claims, open questions,
     overdue predictions, same-source observation tensions, uncited observations,
     single-source derivations, plus active goals/tasks/lessons context.
+
+    NOT purely a read (#2252 Stage 1.1): while building the support_lost_nodes
+    category, this call recomputes each currently-marked cornerstone/lesson's
+    live-exemplar count against current graph state. Where that recount is
+    non-zero, it clears the stale support_lost marker — writing the node's
+    metadata and an edit_history entry ('support_lost_cleared') — rather than
+    leaving a false positive in place until some future retract/supersede
+    happens to touch that node again. Discharged nodes are reported under
+    support_lost_cleared, not silently dropped from the response.
 
     Read the report, then decide which issues to address — strengthen weak
     claims, resolve contradictions, investigate open questions, etc.
@@ -2737,6 +3158,9 @@ def engram_reflect(payload_json: str = "{}") -> str:
 
     Returns:
         JSON report with categorized issues and recommended actions.
+        - support_lost_cleared: cornerstones/lessons whose support_lost marker
+          was just discharged by this call's recount (see above — this is the
+          write this call makes).
         - calibration_snapshot: Two-key dict with `corpus` (mode=all) and `this_turn`
           (mode=1-turn) confidence-distribution data from engram_stats. Lets dream-master
           see filing-pattern shape alongside topic-selection candidates.
@@ -3113,7 +3537,9 @@ def engram_add_axiom(payload_json: str) -> str:
 
 
 # Set of legitimate field names for the engram_add_definition payload.
-_ADD_DEFINITION_FIELDS = frozenset({"term", "definition", "context_ids"})
+_ADD_DEFINITION_FIELDS = frozenset({
+    "term", "definition", "context_ids", "recall_summary", "recall_keywords",
+})
 
 
 # DESIGN INTENT — engram_add_definition
@@ -3161,6 +3587,16 @@ def engram_add_definition(payload_json: str) -> str:
             term (str, required): The term being defined.
             definition (str, required): What the term means.
             context_ids (str, optional): Comma-separated node IDs cited.
+            recall_summary (str, optional, always provide when you can): Compress
+                the term/definition into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new definition node ID. On payload-parsing failure,
@@ -3183,7 +3619,10 @@ def engram_add_definition(payload_json: str) -> str:
 
 
 # Set of legitimate field names for the engram_add_conjecture payload.
-_ADD_CONJECTURE_FIELDS = frozenset({"claim", "basis", "initial_confidence", "context_ids"})
+_ADD_CONJECTURE_FIELDS = frozenset({
+    "claim", "basis", "initial_confidence", "context_ids",
+    "recall_summary", "recall_keywords",
+})
 
 
 # DESIGN INTENT — engram_add_conjecture
@@ -3239,11 +3678,27 @@ def engram_add_conjecture(payload_json: str) -> str:
 
     Args:
         payload_json: JSON object (as a string) with these fields:
-            claim (str, required): The hypothesis.
+            claim (str, required): The claim this conjecture proposes. Semantic content
+                (knowledge, premise-shaped) -> one atomic, falsifiable claim per node.
+                Episodic content (a record of an event/experience) -> a compound claim
+                is fine. Exception: a live present-tense assertion embedded in an
+                episode (verdict, status claim, generalization) gets its own atomic
+                node - those are falsified piecewise and supersede is node-grained.
+                Detail + worked examples: the engram-observe skill.
             basis (str, required): Why this conjecture is worth investigating.
             initial_confidence (float, optional): Starting confidence in
                 [0.10, 0.60]. Default per CONJECTURE_CONFIDENCE_DEFAULT (0.40).
             context_ids (str, optional): Comma-separated node IDs cited.
+            recall_summary (str, optional, always provide when you can): Compress
+                the claim into a ≤140-char recall-scent string — don't start from
+                a blank line. Not content preservation (the full claim renders on
+                inspect). Omitting it clean-accepts but is flagged summary_missing
+                (distinct from needs_tightening — a fail-loud-surface flag, not an
+                error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new conjecture node ID and confidence. On payload-
@@ -4257,13 +4712,30 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist of edge relations that engram_remove_edge can delete.
 #
 # Excluded by design:
-#   - Cascade-bearing edges (derives_from, supported_by, supersedes, retracts) —
-#     removing them would silently undo retraction taint walks, supersede
-#     stale walks, or confidence-propagation that already cascaded.
+#   - Provenance-bearing edges — every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — removing one would
+#     silently orphan evidence roots or, for `derives_from` specifically,
+#     undo taint/stale walks (it is the only one of the four that still
+#     carries cascade — #2252 Stage 1.3 flipped `supported_by`'s cascade
+#     flag to False, and `predicted_by` was minted cascade:False from the
+#     start, W6). #2252 W6 colleague review, round 5: this bucket was
+#     mislabeled TWICE before landing here — first "cascade-bearing" (false
+#     for supported_by/predicted_by), then a hand-listed "provenance/
+#     dependency-bearing (derives_from, supported_by, predicted_by)" that
+#     excluded `cites` even though `cites` is IDENTICAL to the other three
+#     on every EDGE_CLASSIFICATIONS field. No field separates a
+#     premise-dependency edge from an evidence-citation edge — the split
+#     was unencoded semantics, not a real boundary — so state the property
+#     (`provenance: True`) and point at PROVENANCE_RELATIONS, never
+#     hand-list membership again.
+#   - Structural mutations (supersedes, retracts) — #2255 round-2 review
+#     fix: these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
+#     would still corrupt the revision audit trail, which is why they stay
+#     excluded — the reason is structural mutation, not cascade.
 #   - Structural commitments (contradicts, resolves) — they record a stance
 #     in the graph; un-recording is rewriting history, not correction.
-#   - cites — carries provenance (observations cite their evidence node,
-#     derivations cite context). Removal would orphan a claim from its source.
 #
 # If you truly need to remove one of the excluded relations, engram-surgical
 # is the correct (heavyweight, audited) path.
@@ -4279,12 +4751,25 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Whitelist (safe to remove): about, tensions, subtask_of, serves, exemplifies.
 #
 # BLOCKED (require engram-surgical or substrate-level correction):
-#   - cascade-bearing: derives_from, supported_by, supersedes, retracts, resolves
-#     (removing would break chain-cascade semantics — taint/stale propagation
-#     depends on these)
-#   - structural commitments: contradicts, retracts (removing alters epistemic
+#   - provenance-bearing: every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — removing one would orphan
+#     evidence roots, or break chain-cascade semantics for `derives_from`
+#     specifically — the only one of the four that still carries cascade;
+#     #2252 Stage 1.3 flipped `supported_by`'s cascade flag to False, and
+#     `predicted_by` was minted cascade:False from the start, W6. NOTE
+#     (#2252 W6 colleague review, round 5): this bucket used to hand-list
+#     "derives_from, supported_by, predicted_by" as its own bucket with
+#     `cites` split into a separate one-line "provenance: cites" bullet
+#     below — but `cites` is IDENTICAL to the other three on every
+#     EDGE_CLASSIFICATIONS field, so the split encoded nothing. Folded in;
+#     name the property and point at PROVENANCE_RELATIONS, don't hand-list.
+#   - structural mutations: supersedes, retracts — #2255 round-2 review fix:
+#     these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); removing one
+#     would still corrupt the revision audit trail, not just topology.
+#   - structural commitments: contradicts, resolves (removing alters epistemic
 #     stance, not just topology)
-#   - provenance: cites (evidence linkage is load-bearing for honesty axiom)
 #
 # Idempotency: no_op_not_found is a successful return (not an error). Safe to
 # call defensively without a pre-check (ob_NNNN).
@@ -4359,14 +4844,28 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # All are non-cascade, non-structural-commitment, non-provenance relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
-#   - Cascade-bearing: derives_from, supported_by, supersedes, retracts
-#     (adding after creation would silently re-trigger or contradict cascades
-#     that already propagated at creation time)
+#   - Provenance-bearing: every relation with `provenance: True` in
+#     EDGE_CLASSIFICATIONS (core.PROVENANCE_RELATIONS; today: cites,
+#     derives_from, predicted_by, supported_by) — adding one after creation
+#     would either silently re-trigger or contradict cascades (`derives_from`
+#     is the only one of the four that still carries cascade — #2252 Stage
+#     1.3 flipped `supported_by`'s cascade flag to False, and `predicted_by`
+#     was minted cascade:False from the start, W6), or bypass the
+#     node-add-time provenance guarantee the others rely on: `cites`/
+#     evidence linkage must exist at creation time, and `predicted_by` is
+#     minted once at node-add time only (see engram_observation.py). NOTE
+#     (#2252 W6 colleague review, round 5): this bucket used to hand-list
+#     "derives_from, supported_by, predicted_by" with `cites` split into a
+#     separate "Provenance: cites" bullet below — but `cites` is IDENTICAL
+#     to the other three on every EDGE_CLASSIFICATIONS field, so the split
+#     encoded nothing. Folded in; name the property, don't hand-list.
+#   - Structural mutations: supersedes, retracts — #2255 round-2 review
+#     fix: these are revision-history edges, not cascade-bearing (see
+#     EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a); a post-hoc
+#     add would still re-write revision history established at creation
+#     time, which is why they stay blocked.
 #   - Structural commitments: contradicts, resolves (record an epistemic
 #     stance; the stance must be established through the node's payload)
-#   - Provenance: cites (evidence linkage must exist at creation time; a
-#     post-hoc cites edge would orphan the provenance chain from its
-#     temporal context)
 #
 # Idempotency: no_op_already_exists is a successful return (not an error).
 # Safe to call defensively without a pre-check.
@@ -4374,11 +4873,12 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # Audit-logged: every successful addition writes to edit_history so mutation
 # tooling can trace the edge's origin post-hoc.
 #
-# DAG guard: among addable-after-creation relations, only `subtask_of` has
-# dag_check=True today (`serves` and `tensions` were exempted in #1076 —
-# three-tier edge taxonomy, those edges are cross-temporal by design). The
-# guard enforces the temporal-DAG invariant (source newer than target) for any
-# dag_check relation that reaches the addable set, including future additions.
+# Temporal-causal guard (#2357 renamed dag_check -> temporal_causal): among
+# addable-after-creation relations, only `subtask_of` has temporal_causal=True
+# today (`serves` and `tensions` were exempted in #1076 — three-tier edge
+# taxonomy, those edges are cross-temporal by design). The guard enforces the
+# temporal-DAG invariant (source newer than target) for any temporal_causal
+# relation that reaches the addable set, including future additions.
 #
 # Single-payload signature.
 @mcp.tool(
@@ -4621,6 +5121,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
+    "recall_summary", "recall_keywords",
 })
 
 
@@ -4709,6 +5210,16 @@ def engram_add_lesson(payload_json: str) -> str:
                 bypass_prose_check: true so the graph can audit how often this
                 override was actually exercised. Has no effect when situation_pattern
                 doesn't look like prose, or is empty.
+            recall_summary (str, optional, always provide when you can): Compress
+                the corrective pattern into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
@@ -5301,6 +5812,7 @@ def engram_report_feeling(payload_json: str) -> str:
 _DERIVE_FIELDS = frozenset({
     "claim", "supporting_ids", "logical_chain", "reasoning_type",
     "derivation_mode", "context_ids", "use_stale", "use_contested", "warrant",
+    "recall_summary", "recall_keywords",
 })
 
 
@@ -5322,24 +5834,33 @@ _DERIVE_FIELDS = frozenset({
 # is mathematically valid ONLY when premises cite DISTINCT evidence sources —
 # misusing it on co-sourced premises produces structurally inflated confidence.
 #
-# MECH-5 stale-premise + tainted-premise + contradicted-premise guards
-# (use_stale / use_contested opt-ins): a derivation resting on premises that
-# have been superseded, retracted, or sit on an open unresolved contradiction
-# (#1654) gets BLOCKED at filing time. The block is a feature: it surfaces
-# "this reasoning needs to be re-grounded (or the dispute resolved)" rather
-# than letting derivation chains rot silently, or compound on contested
-# ground without a trace. the honesty axiom honesty-is-structural in action.
-# The contradiction guard is deliberately overridable (a live dispute isn't a
-# refutation) but the override auto-stamps metadata.built_on_contested —
-# never author-supplied — so opting in stays measurable, not a laundering path.
+# MECH-5 stale-premise + tainted-premise + contradicted-premise guards:
+# a derivation resting on premises that have been superseded, retracted, or
+# sit on an open unresolved contradiction (#1654) gets BLOCKED at filing
+# time. The block is a feature: it surfaces "this reasoning needs to be
+# re-grounded (or the dispute resolved)" rather than letting derivation
+# chains rot silently, or compound on contested ground without a trace. the
+# honesty axiom honesty-is-structural in action.
+#
+# ONE override remains, and it is use_contested — a live dispute is not a
+# refutation, so building on the contested side stays a deliberate,
+# loudly-marked choice, auto-stamped metadata.built_on_contested (never
+# author-supplied) so opting in stays measurable rather than a laundering
+# path. `use_stale` was RETIRED (#2324): with the cascade machine there is
+# no legitimate "cite over a stale premise without resolving it", and the
+# routes that replace it are supersede/retract for a marker-carrying
+# premise, or citing the successor for one that is itself superseded. The
+# parameter is still ACCEPTED and returns a loud use_stale_retired notice —
+# never silently ignored — until #2013 slice 2 removes the signature.
 #
 # derivation_mode is legacy (kept for back-compat); prefer reasoning_type.
 @mcp.tool(
     name="engram_derive",
     capability=(
         "Creates a derivation from EXISTING claim-bearing premises with an explicit "
-        "logical_chain. Blocked if a premise is stale or contested (overridable via "
-        "use_stale/use_contested) or tainted (never overridable — no override path)."
+        "logical_chain. Hard-blocked if a premise is tainted or stale (no override — "
+        "resolve the premise, or cite its successor); soft-blocked if a premise is "
+        "contested, overridable via use_contested."
     ),
     annotations={
         "title": "Create Derived Claim",
@@ -5358,7 +5879,10 @@ def engram_derive(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             claim (str, required): The atomic, falsifiable claim being derived.
             supporting_ids (str, required): Comma-separated claim-bearing node IDs
-                (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN').
+                (e.g. 'ob_NNNN_A,ob_NNNN_B,dv_NNNN'). Citing one clause of a
+                compound node? Extract that clause as its own atomic node
+                first (evidence: the compound node), then derive from the
+                extract - premises and cascades are node-grained.
             logical_chain (str, required): Explicit reasoning connecting the cited
                 premises to the conclusion. Show your work.
             reasoning_type (str, optional): The type of logical argument. See
@@ -5375,8 +5899,13 @@ def engram_derive(payload_json: str) -> str:
                 Kept for backward compatibility: "chain" or "corroboration".
             context_ids (str, optional): Comma-separated node IDs for context
                 references (e.g. definitions). Creates 'cites' edges.
-            use_stale (bool, optional): Opt-in override for MECH-5 stale-premise
-                guard. Default False. Has no effect on tainted premises.
+            use_stale (bool, optional): RETIRED (#2324) — accepted for
+                compatibility, NO EFFECT. Stale is a hard block now; passing
+                this returns a loud use_stale_retired notice rather than
+                silently doing nothing. Resolve the premise instead:
+                supersede/retract one that carries a cascade marker, or cite
+                the successor of one that is itself superseded. Removed from
+                the signature in #2013 slice 2.
             use_contested (bool, optional): Opt-in override for MECH-5
                 contradicted-premise guard (#1654) — set True only when
                 deliberately building on a premise under an open, unresolved
@@ -5389,6 +5918,16 @@ def engram_derive(payload_json: str) -> str:
                 the moment of discovery retain the thought-construction, not just
                 the recall." Leave blank if the bridging principle is fully
                 captured in logical_chain.
+            recall_summary (str, optional, always provide when you can): Compress
+                the derived claim into a ≤140-char recall-scent string — don't
+                start from a blank line. Not content preservation (the full claim
+                renders on inspect). Omitting it clean-accepts but is flagged
+                summary_missing (distinct from needs_tightening — a fail-loud-
+                surface flag, not an error); over 140 chars soft-accepts (flagged needs_tightening for later
+                cleanup); an excessively long summary hard-rejects with no
+                node created.
+            recall_keywords (array of str, optional, always provide when you can):
+                3-6 short keyword strings. Never rejected regardless of count.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning
@@ -5447,7 +5986,8 @@ _CONTRADICT_FIELDS = frozenset({"node_id_a", "node_id_b", "description", "root_c
 # Pairs with engram_resolve: a contradiction resolves when a claim-bearing
 # node (typically a supersede of one side, or a derivation that reconciles)
 # is wired via engram_resolve. Resolution can be:
-#   - resolved-by-supersede (one side superseded; ct gets a stale_by entry)
+#   - resolved-by-supersede (one side superseded; ct gets a pending cascade
+#     marker — see engram_core.py's cascade_markers table, #2013/#2009)
 #   - resolved-by-derivation (a derivation reconciles both)
 #   - resolved-by-obsolescence (both sides outdated, ct closed as stale)
 #
@@ -5467,6 +6007,9 @@ def engram_contradict(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             node_id_a (str, required): ID of the first conflicting node.
             node_id_b (str, required): ID of the second conflicting node.
+                Contesting one clause of a compound node (either side)?
+                Extract that clause as its own atomic node first, then
+                contradict the extract.
             description (str, required): Clear description of the contradiction.
             root_cause (str, optional): Analysis of the root cause.
 
@@ -5649,6 +6192,13 @@ def engram_resolve(payload_json: str) -> str:
         When partial_resolution is due to threshold gate, includes
         discipline_hint advising against chain dilution.
 
+    Side effect (#1777, #1952 PR3): if target already carries a
+    recall_summary, a real status change (not the idempotent no_op path)
+    flags it needs_tightening=1 — a summary authored while the target was
+    open can no longer be trusted after resolution, and this queues it for
+    the batch-summary fairy's next reviewer-of-outliers pass rather than
+    leaving it silently stale.
+
     See _resolve_impl for full semantics — kept callable with named kwargs
     for in-server callers.
     """
@@ -5670,9 +6220,12 @@ def engram_resolve(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 
 
-# _add_stale_replacement body moved to engram_revision.py (family E) in #872 wave 6.
 # _walk_cascade_downstream body moved to engram_revision.py (family E) in #872 wave 6.
-# Compat forwarders above in wave-6 compat block.
+# Compat forwarder above in wave-6 compat block.
+#
+# _add_stale_replacement retired (#2013/#2009 slice 1, cascade machine):
+# downstream-node replacement info doesn't survive the unified-marker
+# redesign in the same shape — see engram_revision.py's module docstring.
 
 # Set of legitimate field names for the engram_supersede payload.
 _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"})
@@ -5691,14 +6244,16 @@ _SUPERSEDE_FIELDS = frozenset({"old_node_id", "new_node_id", "supersede_reason"}
 # derive, etc.) FIRST, then calls engram_supersede to link. Parallels how
 # engram_resolve is pure-wire (issue #229 same family).
 #
-# Cascade semantics:
-#   - downstream derivations citing old as premise: flagged stale
-#   - contradictions citing old: stale_by populated with old_node_id +
-#     stale_replacement {old: new} for downstream resolution
+# Cascade semantics (#2013/#2009 slice 1 — the cascade machine):
+#   - downstream derivations citing old as premise: pending 'stale'-severity
+#     cascade_markers row written (see engram_core.py's table docstring)
+#   - contradictions citing old: same cascade_event marks the ct_ node too
 #   - retracted nodes are NOT supersede-able (use engram_retract path)
 #
-# stale_replacement metadata (the supersede-no-drop discipline): downstream readers
-# can find the replacement automatically without traversing the supersede edge.
+# A downstream node's OWN replacement isn't cached at marking time (the old
+# stale_replacement metadata is retired) — it's decided when THAT node
+# itself resolves, via the marker's resolution_replacement_id once a later
+# slice adds the resolve/acknowledge write path.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -5722,6 +6277,15 @@ def engram_supersede(payload_json: str) -> str:
     Pure-wire: caller creates the replacement node FIRST via its canonical
     creation tool, then calls this to link. Pass all fields as one JSON object
     string in payload_json.
+
+    REFUSED on a node that carries a pending cascade marker (#2013 invariant
+    7, #2343): its own premises are still under adjudication, so a plain
+    supersede would clear this node's marker while the rest of the cascade
+    stays unadjudicated. The refusal returns `next_call` (the mode-C
+    frontier read for this node) and `then` (the exact engram_cascade_resolve
+    call, resolution_kind='superseded', with your replacement) — resolve the
+    chain through the frontier instead. That resolution is a partial
+    resolution of the existing event, never a new one.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -5823,6 +6387,13 @@ def engram_retract(payload_json: str) -> str:
     The retracted node is PRESERVED for audit; downstream derivations are
     TAINTED, not deleted — the cascade surfaces "re-derive needed" rather
     than silently rewriting the graph.
+
+    REFUSED on a node that already carries a pending cascade marker (#2013
+    invariant 7, #2343): retract it through the frontier instead — the
+    refusal returns `next_call` (the mode-C frontier read for this node) and
+    `then` (the exact engram_cascade_resolve call with
+    resolution_kind='retracted'). A retract resolved that way is a partial
+    resolution of the existing cascade event, not a new one.
 
     Pass all fields as one JSON object string in payload_json. Note: the
     outer wrapper parameter is `payload_json` and there is also an INNER

@@ -11,13 +11,43 @@ name: pr-checks
 #   3. pr-body-close-keyword     (was check-pr-body-close-keyword.yml)
 #   4. name-leak-warn            (was name-leak-warn.yml — advisory, never blocks job)
 #   5. stray-master-ref-check    (#1884 — advisory, never blocks job)
+#   5b. stray-baton-path-check  (#2316 — advisory, never blocks job)
 #   6. invariant-checks          (was invariant-checks.yml — used to run Python 3.11)
 #   7. manifest-gate             (was manifest-gate.yml — Python 3.12)
+#   7c. stdlib-only guards      (#2376 — 5 SSoT/sync/drift gates measured to need
+#      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
+#   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
+#      PR that removes coverage is exactly as green as a PR that adds it)
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
-    branches: [dev, main]
+    # `edited` (#2361): the test-id-set-check names a remedy — add a
+    # `Removed-test:` line to the PR body — that the workflow could not
+    # observe without it. A body edit fires `edited`, which was absent, and a
+    # manual re-run replays the ORIGINAL event payload (measured), so the only
+    # remedy the gate named was invisible to the gate. It also starts a run
+    # when GitHub auto-retargets a stacked PR to dev (addresses #2344).
+    # `edited` cannot be filtered to body-only, so this also fires on title
+    # edits; pr-checks is one combined job of static scrubs and the runner
+    # cost of that is accepted deliberately (Kepler's call, #2361).
+    types: [opened, reopened, synchronize, edited]
+    # NO `branches:` FILTER, deliberately (#2361). The filter matches the BASE
+    # branch, so `[dev, main]` meant a PR stacked onto a sibling feature branch
+    # ran none of these scrubs — exactly the long-lived stack where an
+    # intermediate round can drop a test id and nothing re-counts until the
+    # stack bottom retargets. Do not re-add a base filter without re-reading
+    # that issue; the stacked case is the one these gates most need to cover.
+
+# One in-flight run per PR (#2361 review). `edited` raises trigger frequency --
+# every title or body edit now starts a run -- which widens a pre-existing race
+# in the name-leak-warn step: it upserts a PR comment by list-then-create/update,
+# so two overlapping runs can both read "no comment yet" and both create one.
+# Cancelling the superseded run also stops paying for scrub results nobody reads.
+# NOT cancel-in-progress on the merge queue's behalf -- this keys on the PR ref,
+# so it cannot cancel a run belonging to a different PR.
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   pr-checks:
@@ -403,6 +433,22 @@ jobs:
         run: |
           python3 tools/stray_master_ref_check.py | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # ── 5b. stray-baton-path-check ───────────────────────────────────────
+      # #2316 — the 2026-06-27 baton-store cutover left 13 files carrying the
+      # pre-cutover path, three of them live runtime defaults rather than
+      # merely documentation (one measured to miss 56% of real in-flight
+      # batons as a result). The old directory was never removed, so a stale
+      # reference resolves silently to a real-looking but wrong tree instead
+      # of failing loudly. Advisory, never blocks — same posture as
+      # stray-master-ref-check: a false positive on a legitimate historical
+      # note should cost a glance, not a red X. Whole-tree by design (unlike
+      # stray-master-ref-check's load-bearing-surfaces-only scope) — see
+      # tools/stray_baton_path_check.py's module docstring for why.
+      - name: stray-baton-path-check — scan for the stale pre-cutover baton path
+        continue-on-error: true
+        run: |
+          python3 tools/stray_baton_path_check.py | tee -a "$GITHUB_STEP_SUMMARY"
+
       # ── 6. invariant-checks ────────────────────────────────────────────
       # (from invariant-checks.yml)
       # Always-on whole-repo invariant gates: scan-leaks + frontmatter-lint.
@@ -482,3 +528,86 @@ jobs:
         # entries are caught at dev-PR time rather than only at release-cut.
         # See issue #1147.
         run: python3 -m pytest tests/test_run_touched_tests.py::TestMappingCompleteness -q
+
+      # ── 7c. stdlib-only guards ────────────────────────────────────────────
+      # #2376 — five more SSoT/sync/drift guards that ran in no CI workflow at
+      # all, reachable only at release-cut, same staleness-by-omission class
+      # as manifest-gate's own tiers.json check above. Measured (not assumed)
+      # to need nothing beyond this same Python 3.12 + pytest setup: a fresh
+      # venv with ONLY `pip install pytest` (no requirements.txt) runs all
+      # five clean, ~1s combined. They sit inside the "pure stdlib + pytest"
+      # carve-out this file already documents at manifest-gate above, so —
+      # unlike #2371's tool_capability_index guard, which needs fastmcp and
+      # is therefore a real cost-model question — these need no ruling.
+      #
+      # test_skill_server_sync.py deliberately NOT wired here even though it
+      # was measured alongside these five: it is a documented #1149 tombstone
+      # (SKILL.md retired, all 4 tests unconditionally skipped) — wiring a
+      # step that runs, does nothing, and can never fail would read as
+      # coverage that isn't there.
+      - name: stdlib-only guards — claude-md-drift, plugin-manifest-import-sync, tool-policy-sync, upgrade-drift-sources, build-plugin-hooks-consistency
+        run: |
+          python3 -m pytest \
+            tests/test_check_claude_md_drift.py \
+            tests/test_plugin_manifest_import_sync.py \
+            tests/test_tool_policy_sync.py \
+            tests/test_upgrade_drift_sources.py \
+            tests/test_build_plugin_hooks_consistency.py \
+            -q
+
+      # ── 7d. cascade behaviour acceptance (playbox) ──────────────────────
+      # The #2013 cascade machine is accepted by BEHAVIOUR: tests/cascade_
+      # scenarios/ drives supersede / retract / frontier / resolve through the
+      # real engram_revision.py on named topologies (tests/cascade_playbox.py)
+      # and asserts the ruled guarantees at each stage — CD-01..09 on Lei's
+      # converging diamonds, incl. the #2343 refusal. Lei, 2026-08-29: these
+      # belong in the automated gate, not only the release-cut suite.
+      #
+      # Measured (not assumed) to fit the stdlib carve-out above: a fresh venv
+      # with ONLY `pip install pytest` runs cascade_scenarios + the playbox
+      # harness clean — 26 passed in 1.6s on 6f7addbf. engram_core imports
+      # `server` lazily inside a function, never at module scope, so no
+      # fastmcp is pulled in; nothing here needs a cost-model ruling.
+      - name: cascade behaviour acceptance — playbox scenarios CD-01..09 + harness
+        run: |
+          python3 -m pytest \
+            tests/cascade_scenarios \
+            tests/test_cascade_playbox.py \
+            -q
+
+      # ── 8. test-id-set-check ────────────────────────────────────────────
+      # #2350 — a deleted test cannot fail, so a PR that removes coverage is
+      # exactly as green as a PR that adds it: no existing gate here reads
+      # which tests *stopped existing*. A count is NOT enough — measured on
+      # the motivating commit (2ecf88c, tests/test_cascade_resolve.py +
+      # tests/test_supported_by.py): whole-tree count delta -7 vs the real
+      # set diff of 11 disappeared / 4 appeared; one of those disappearances
+      # (test_supported_by.py) is a perfect 1:1 rename with a COUNT DELTA OF
+      # ZERO, invisible to any count-based check in a file a count-based
+      # sweep would certify as clean.
+      #
+      # BLOCKING, unlike the advisory name-leak-warn / stray-master-ref-check
+      # steps above: the whole point of this gate is that a silent test
+      # deletion is currently free — an advisory posture would leave it free.
+      #
+      # Compares base (the merge-base of the PR's target branch, NOT the
+      # target branch's current tip — so tests deleted on dev since the
+      # branch point are never attributed to this PR) against HEAD. This
+      # matters even though actions/checkout does default to the PR merge
+      # ref: that merge commit's base-parent is a SNAPSHOT of the target
+      # branch as of this PR's last sync event, not a live pointer at the
+      # target's current tip — so the merge-base and the branch's current
+      # tip genuinely differ whenever anything has landed on the target
+      # branch since that sync. A PR body line `Removed-test: <id> —
+      # <reason>` accounts for a legitimate deletion; see
+      # tools/test_id_set_check.py's module docstring for the full marker
+      # syntax and the accounting rules.
+      - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          printf '%s' "$PR_BODY" > /tmp/pr_body.txt
+          python3 tools/test_id_set_check.py \
+            --base "$BASE_SHA" --head HEAD \
+            --pr-body-file /tmp/pr_body.txt

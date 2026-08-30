@@ -128,7 +128,7 @@ TOOL_SCHEMAS = {
     "engram_derive": {
         "description": "Create a derived claim by combining evidence from existing nodes. You MUST specify reasoning_type to classify the argument. Types: deductive_modus_ponens (0.98), deductive_modus_tollens (0.98), deductive_hypothetical_syllogism (0.98), deductive_disjunctive (0.98), deductive_reductio (0.98), inductive_generalization (0.95, corroborative), inductive_enumeration (0.93, corroborative), inductive_statistical (0.90), inductive_causal (0.85), inductive_analogy (0.70), abductive_best_explanation (cap 0.80), abductive_elimination (cap 0.90), authority_expert (0.95), authority_consensus (0.98, corroborative). Single-payload signature — pass all fields as one JSON object string in payload_json. Required: claim, supporting_ids, logical_chain.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated 'cites' edges for definitions etc., not derives_from), use_stale (bool — opt-in MECH-5 stale-premise override), use_contested (bool — opt-in MECH-5 contradicted-premise override, #1654; set True only when deliberately building on a premise under an open unresolved contradiction, e.g. the derivation that will resolve it; auto-stamps metadata.built_on_contested, never author-supplied), warrant (str — optional Toulmin bridging principle; the general principle that licenses this inference — why do these premises support this claim? Leave blank if logical_chain fully captures it).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with derive fields. Required: claim (the atomic falsifiable claim), supporting_ids (comma-separated claim-bearing node IDs), logical_chain (explicit reasoning connecting premises to conclusion). Optional: reasoning_type (one of deductive_modus_ponens/deductive_modus_tollens/deductive_hypothetical_syllogism/deductive_disjunctive/deductive_reductio/inductive_generalization/inductive_enumeration/inductive_statistical/inductive_analogy/inductive_causal/abductive_best_explanation/abductive_elimination/authority_expert/authority_consensus — determines confidence computation), derivation_mode (LEGACY — use reasoning_type instead; chain or corroboration), context_ids (comma-separated 'cites' edges for definitions etc., not derives_from), use_stale (bool — RETIRED per #2324: accepted but INERT, stale premises block unconditionally; passing it only returns a use_stale_retired notice), use_contested (bool — opt-in MECH-5 contradicted-premise override, #1654; set True only when deliberately building on a premise under an open unresolved contradiction, e.g. the derivation that will resolve it; auto-stamps metadata.built_on_contested, never author-supplied), warrant (str — optional Toulmin bridging principle; the general principle that licenses this inference — why do these premises support this claim? Leave blank if logical_chain fully captures it).", "required": True},
         },
     },
     "engram_add_axiom": {
@@ -186,7 +186,7 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_remove_edge": {
-        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: derives_from, supports, supersedes, retracts, contradicts, resolves, cites (cascade-bearing, structural-commitment, or provenance). Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
+        "description": "Remove a non-cascade edge between two nodes — typically for correcting over-applied `about` edges without engram-surgical. Safe whitelist: about, tensions, subtask_of, serves, exemplifies. Blocked: cites, derives_from, acknowledged_derives_from, predicted_by, supported_by, supersedes, retracts, contradicts, resolves — cites/derives_from/acknowledged_derives_from/predicted_by/supported_by are provenance-bearing (derives_from and acknowledged_derives_from are the two of the five that still carry cascade — #2357 added acknowledged_derives_from as a second cascade-bearing provenance edge; #2252 Stage 1.3 flipped supported_by's cascade flag to False and predicted_by was minted cascade:False from the start, W6 — this module doesn't import engram_core, so this list is hand-maintained, not derived from EDGE_CLASSIFICATIONS' provenance flag like server.py's; keep it in sync with core.PROVENANCE_RELATIONS by hand), supersedes/retracts are structural mutations, contradicts/resolves are structural commitments. Idempotent: removing a non-existent edge returns success. Audit-logged in edit_history. Single-payload signature.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with remove_edge fields. Required: source_id (source node of the edge), target_id (target node of the edge), relation (one of: about, tensions, subtask_of, serves, exemplifies).", "required": True},
         },
@@ -234,13 +234,13 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_retract": {
-        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason. Note: the OUTER param is payload_json; there is also an INNER field replacement_json inside the payload — don't confuse them.",
+        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Retracting an observation_predictive also TERMINALLY RETRACTS (not merely taints) any prediction whose sole live evidential basis it was (#2281) — a destructive side-effect distinct from the taint the docstring describes elsewhere. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason. Note: the OUTER param is payload_json; there is also an INNER field replacement_json inside the payload — don't confuse them.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with retract fields. Required: node_id (the node to retract), error_type (one of fabricated_quote/wrong_citation/wrong_evidence/hallucinated_claim/duplicate/other), reason (human-readable explanation). Optional: replacement_json (inner JSON object string with replacement observation fields {quoted_text, interpretation, claim, quote_type, source_class}; cites the same evidence as the retracted node).", "required": True},
         },
     },
     "engram_reflect": {
-        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
+        "description": "[Sleep cycle — pre-dream briefing.] Structured self-audit of the graph (contradictions, open questions, weak claims, overdue predictions, uncited observations, tainted and retracted nodes). Opens the dream cycle for the engram-sleep skill. Not a tool to reach for during awake-state work. NOT purely a read (#2252 Stage 1.1): recomputes each support_lost-marked cornerstone/lesson's live-exemplar count and clears the marker (writing metadata + edit_history) where support turns out to be non-zero; discharges are reported under support_lost_cleared. High-volume categories (weakly_grounded, thin_support_derivations, uncited_observations) are tiered: top summary_top_k entries get full claim text (from recall_summary if set, else claim); the remainder get keyword-style entries (recall_keywords list, no claim key). Low-volume categories source-swap their content field from recall_summary with claim fallback.",
         "parameters": {
             "payload_json": {"type": "string", "description": "Optional JSON object (as a string) with reflect fields. Optional: summary_top_k (int — how many top-importance entries in each high-volume category receive summary-style rendering; remainder get keyword-style; default 5; clamped to >= 0; set 0 for all keyword-style; set high e.g. 50 for all summary-style). Empty payload '{}' or omitted payload runs the default reflect."},
         },
@@ -312,11 +312,19 @@ TOOL_SCHEMAS = {
 }
 
 # Tools that only read from the graph (no mutations).
-# Note: engram_reflect is listed here because it is non-mutating, but it is
-# sleep-cycle-only at the workflow level — see its [Sleep cycle] description.
+# This is a DECLARATIVE inventory, not an enforced guarantee: nothing in
+# src, tests, or tools reads READ_ONLY_TOOLS today, so membership gates no
+# call path. It is documentation that must be kept accurate by hand — a
+# tool that starts writing has to be removed from here manually, and no
+# mechanism will catch a miss if that removal doesn't happen.
+# engram_reflect is NOT in this set (#2252 Stage 1.1): as of Stage 1.1 it
+# recomputes and clears stale support_lost markers on cornerstones/lessons as
+# part of its audit — writing node metadata + edit_history — so it no longer
+# belongs in a read-only inventory. It was listed here before that change;
+# removed rather than left stale.
 # READ_ONLY membership does NOT imply awake-safe; check the description.
 READ_ONLY_TOOLS = {
-    "engram_query", "engram_get_subgraph", "engram_stats", "engram_reflect",
+    "engram_query", "engram_get_subgraph", "engram_stats",
 }
 
 

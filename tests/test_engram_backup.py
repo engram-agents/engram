@@ -886,30 +886,35 @@ def test_verify_roundtrip_retracted_term_absent_from_recon_fts(tmp_path):
 # touched.
 
 
-def _build_five_column_engram_db(path: str, rows: list) -> None:
-    """Build a nodes table + a full 5-column nodes_fts index (the real
-    production shape post-#403), matching engram_core's live schema closely
-    enough to exercise rebuild_fts_index's column handling.
+def _build_six_column_engram_db(path: str, rows: list) -> None:
+    """Build a nodes table + a full 6-column nodes_fts index (the real
+    production shape post-#1952 PR2), matching engram_core's live schema
+    closely enough to exercise rebuild_fts_index's column handling.
 
     ``rows`` is a list of dicts with keys: id, claim, quoted_text,
-    interpretation, reported_state, trigger_text, status.
+    interpretation, trigger_text, recall_summary, recall_keywords, status.
+    reported_state stays a real ``nodes`` column (PR2 keeps it there for
+    rollback safety) but is no longer FTS-indexed, so it's not part of the
+    row-dict contract here — the INSERT below just writes NULL for it.
     """
     conn = sqlite3.connect(path)
     conn.executescript(
         """
         CREATE TABLE nodes (
-            id             TEXT PRIMARY KEY,
-            claim          TEXT,
-            quoted_text    TEXT,
-            interpretation TEXT,
-            reported_state TEXT,
-            trigger_text   TEXT,
-            status         TEXT,
-            embedding      TEXT
+            id              TEXT PRIMARY KEY,
+            claim           TEXT,
+            quoted_text     TEXT,
+            interpretation  TEXT,
+            reported_state  TEXT,
+            trigger_text    TEXT,
+            recall_summary  TEXT,
+            recall_keywords TEXT,
+            status          TEXT,
+            embedding       TEXT
         );
         CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
         CREATE VIRTUAL TABLE nodes_fts USING fts5(
-            claim, quoted_text, interpretation, reported_state, trigger_text,
+            claim, quoted_text, interpretation, trigger_text, recall_summary, recall_keywords,
             content='nodes', content_rowid='rowid'
         );
         """
@@ -917,10 +922,11 @@ def _build_five_column_engram_db(path: str, rows: list) -> None:
     for r in rows:
         conn.execute(
             "INSERT INTO nodes (id, claim, quoted_text, interpretation, "
-            "reported_state, trigger_text, status, embedding) VALUES (?,?,?,?,?,?,?,NULL)",
+            "reported_state, trigger_text, recall_summary, recall_keywords, status, embedding) "
+            "VALUES (?,?,?,?,NULL,?,?,?,?,NULL)",
             (
                 r["id"], r["claim"], r["quoted_text"], r["interpretation"],
-                r["reported_state"], r["trigger_text"], r["status"],
+                r["trigger_text"], r["recall_summary"], r["recall_keywords"], r["status"],
             ),
         )
     # Populate the FTS index the way a live install would have it before a
@@ -943,15 +949,15 @@ def _fts_match_ids(db_path: str, token: str) -> set:
     return {r["id"] for r in rows}
 
 
-def test_2077_retracted_node_scrubbed_from_all_five_fts_columns(tmp_path):
+def test_2077_retracted_node_scrubbed_from_all_current_fts_columns(tmp_path):
     """Regression for #2077 consequence 1 (the issue's exact measured case).
 
     Before the fix, rebuild_fts_index's delete-insert only touched 3 of the
     5 FTS columns, so a retracted node stayed FTS-findable through
     reported_state and trigger_text (the two columns feeling_report/lesson
     nodes rely on). After rebuild_fts_index, the retracted node's unique
-    tokens must be absent from a MATCH probe against ALL five columns, and
-    the current node's tokens must remain present.
+    tokens must be absent from a MATCH probe against ALL current FTS
+    columns, and the current node's tokens must remain present.
     """
     db_path = str(tmp_path / "knowledge.db")
     rows = [
@@ -960,8 +966,9 @@ def test_2077_retracted_node_scrubbed_from_all_five_fts_columns(tmp_path):
             "claim": "current2077_claimtoken",
             "quoted_text": "current2077_quotedtoken",
             "interpretation": "current2077_interptoken",
-            "reported_state": "current2077_reportedtoken",
             "trigger_text": "current2077_triggertoken",
+            "recall_summary": "current2077_summarytoken",
+            "recall_keywords": "current2077_keywordtoken",
             "status": "active",
         },
         {
@@ -969,40 +976,43 @@ def test_2077_retracted_node_scrubbed_from_all_five_fts_columns(tmp_path):
             "claim": "retracted2077_claimtoken",
             "quoted_text": "retracted2077_quotedtoken",
             "interpretation": "retracted2077_interptoken",
-            "reported_state": "retracted2077_reportedtoken",
             "trigger_text": "retracted2077_triggertoken",
+            "recall_summary": "retracted2077_summarytoken",
+            "recall_keywords": "retracted2077_keywordtoken",
             "status": "retracted",
         },
     ]
-    _build_five_column_engram_db(db_path, rows)
+    _build_six_column_engram_db(db_path, rows)
 
     # Confirm the pre-rebuild state: the retracted row IS indexed (both nodes
     # were populated by the bare 'rebuild' in the fixture builder).
-    assert "ob_retracted" in _fts_match_ids(db_path, "retracted2077_reportedtoken")
+    assert "ob_retracted" in _fts_match_ids(db_path, "retracted2077_summarytoken")
 
     assert engram_backup.rebuild_fts_index(db_path) is True
 
-    # The issue's exact MATCH probes: none of the retracted node's five
+    # The issue's exact MATCH probes: none of the retracted node's current
     # column tokens may match after rebuild_fts_index.
     for token in (
         "retracted2077_claimtoken",
         "retracted2077_quotedtoken",
         "retracted2077_interptoken",
-        "retracted2077_reportedtoken",
         "retracted2077_triggertoken",
+        "retracted2077_summarytoken",
+        "retracted2077_keywordtoken",
     ):
         matched = _fts_match_ids(db_path, token)
         assert "ob_retracted" not in matched, (
             f"retracted node must not match on {token!r} after rebuild_fts_index, got {matched}"
         )
 
-    # The current node's tokens across all five columns must still match.
+    # The current node's tokens across all current FTS columns must still match.
     for token in (
         "current2077_claimtoken",
         "current2077_quotedtoken",
         "current2077_interptoken",
-        "current2077_reportedtoken",
         "current2077_triggertoken",
+        "current2077_summarytoken",
+        "current2077_keywordtoken",
     ):
         matched = _fts_match_ids(db_path, token)
         assert "ob_current" in matched, (
@@ -1013,25 +1023,27 @@ def test_2077_retracted_node_scrubbed_from_all_five_fts_columns(tmp_path):
 def test_2077_repairs_stale_three_column_nodes_fts(tmp_path):
     """Regression for #2077 consequence 2: a stale 3-column nodes_fts table
     (left behind by the pre-fix rebuild_fts_index on a restore) must be
-    detected, dropped, and rebuilt to the full 5-column canonical schema —
-    not silently skipped by `CREATE TABLE IF NOT EXISTS`.
+    detected, dropped, and rebuilt to the full canonical schema — not
+    silently skipped by `CREATE TABLE IF NOT EXISTS`.
     """
     db_path = str(tmp_path / "knowledge.db")
     conn = sqlite3.connect(db_path)
     conn.executescript(
         """
         CREATE TABLE nodes (
-            id             TEXT PRIMARY KEY,
-            claim          TEXT,
-            quoted_text    TEXT,
-            interpretation TEXT,
-            reported_state TEXT,
-            trigger_text   TEXT,
-            status         TEXT,
-            embedding      TEXT
+            id              TEXT PRIMARY KEY,
+            claim           TEXT,
+            quoted_text     TEXT,
+            interpretation  TEXT,
+            reported_state  TEXT,
+            trigger_text    TEXT,
+            recall_summary  TEXT,
+            recall_keywords TEXT,
+            status          TEXT,
+            embedding       TEXT
         );
         CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
-        -- Stale pre-fix shape: only 3 columns, even though `nodes` has all 5.
+        -- Stale pre-fix shape: only 3 columns, even though `nodes` has all 6.
         CREATE VIRTUAL TABLE nodes_fts USING fts5(
             claim, quoted_text, interpretation,
             content='nodes', content_rowid='rowid'
@@ -1040,15 +1052,16 @@ def test_2077_repairs_stale_three_column_nodes_fts(tmp_path):
     )
     conn.execute(
         "INSERT INTO nodes (id, claim, quoted_text, interpretation, reported_state, "
-        "trigger_text, status, embedding) VALUES "
+        "trigger_text, recall_summary, recall_keywords, status, embedding) VALUES "
         "('fl_repair', 'a lesson claim', 'src', 'interp', "
-        "'repairtoken2077_reportedstate', 'repairtoken2077_triggertext', 'active', NULL)"
+        "'repairtoken2077_reportedstate', 'repairtoken2077_triggertext', "
+        "'repairtoken2077_summarytext', 'repairtoken2077_keywordtext', 'active', NULL)"
     )
     conn.commit()
     conn.close()
 
-    # Confirm the pre-repair gap: reported_state content is not indexable —
-    # the stale 3-column table has no such column to match against.
+    # Confirm the pre-repair gap: trigger_text/recall_summary content is not
+    # indexable — the stale 3-column table has neither column to match against.
     stale_cols = [row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(nodes_fts)").fetchall()]
     assert stale_cols == ["claim", "quoted_text", "interpretation"]
 
@@ -1057,20 +1070,20 @@ def test_2077_repairs_stale_three_column_nodes_fts(tmp_path):
     conn = sqlite3.connect(db_path)
     repaired_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
     assert repaired_cols == list(engram_backup.NODES_FTS_COLUMNS), (
-        f"nodes_fts must be repaired to the canonical 5-column schema, got {repaired_cols}"
+        f"nodes_fts must be repaired to the canonical schema, got {repaired_cols}"
     )
 
-    # Full reindex: the reported_state / trigger_text tokens must now match,
+    # Full reindex: the trigger_text / recall_summary tokens must now match,
     # which is only possible once the table has been dropped and recreated.
-    hits_rs = conn.execute(
-        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'repairtoken2077_reportedstate'"
-    ).fetchone()[0]
     hits_tt = conn.execute(
         "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'repairtoken2077_triggertext'"
     ).fetchone()[0]
+    hits_summary = conn.execute(
+        "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'repairtoken2077_summarytext'"
+    ).fetchone()[0]
     conn.close()
-    assert hits_rs == 1, "reported_state token must be indexed after repair"
     assert hits_tt == 1, "trigger_text token must be indexed after repair"
+    assert hits_summary == 1, "recall_summary token must be indexed after repair"
 
 
 def test_2077_drift_guard_create_and_insert_derive_from_canonical_constant(tmp_path):
@@ -1090,19 +1103,21 @@ def test_2077_drift_guard_create_and_insert_derive_from_canonical_constant(tmp_p
     conn.executescript(
         """
         CREATE TABLE nodes (
-            id             TEXT PRIMARY KEY,
-            claim          TEXT,
-            quoted_text    TEXT,
-            interpretation TEXT,
-            reported_state TEXT,
-            trigger_text   TEXT,
-            status         TEXT
+            id              TEXT PRIMARY KEY,
+            claim           TEXT,
+            quoted_text     TEXT,
+            interpretation  TEXT,
+            reported_state  TEXT,
+            trigger_text    TEXT,
+            recall_summary  TEXT,
+            recall_keywords TEXT,
+            status          TEXT
         );
         CREATE TABLE edges (src TEXT, dst TEXT, relation TEXT);
         """
     )
     conn.execute(
-        "INSERT INTO nodes VALUES ('ob_x', 'claim', 'qt', 'interp', 'rs', 'tt', 'active')"
+        "INSERT INTO nodes VALUES ('ob_x', 'claim', 'qt', 'interp', 'rs', 'tt', 'rsum', 'rkw', 'active')"
     )
     conn.commit()
     conn.close()
@@ -1156,9 +1171,9 @@ def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
     3-column table survived every restart forever. This mirrors the
     reviewer's exact probe: build a real DB via engram_core._get_db(),
     manually downgrade nodes_fts to 3 columns behind engram_core's back, then
-    re-run _get_db() and assert the table is back to 5 columns with the
-    reported_state/trigger_text content actually reindexed (not just present
-    in `nodes`).
+    re-run _get_db() and assert the table is back to the canonical column set
+    with the recall_summary/trigger_text content actually reindexed (not
+    just present in `nodes`).
     """
     import importlib
     import shutil
@@ -1178,15 +1193,17 @@ def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
         core._configure_paths(core_test_dir)
         core._ensure_data_dir()
 
-        # First _get_db(): builds the DB fresh, with the correct 5-column
+        # First _get_db(): builds the DB fresh, with the correct canonical
         # nodes_fts (this is the happy path #2077's first fix already covers).
         conn = core._get_db()
         conn.execute(
             "INSERT INTO nodes (id, type, created_at, claim, quoted_text, "
-            "interpretation, reported_state, trigger_text, status) VALUES "
+            "interpretation, reported_state, trigger_text, recall_summary, "
+            "recall_keywords, status) VALUES "
             "('fl_selfheal', 'feeling_report', '2026-08-18T00:00:00Z', "
             "'a feeling claim', 'src quote', 'interp', "
             "'selfhealtoken2077_reportedstate', 'selfhealtoken2077_triggertext', "
+            "'selfhealtoken2077_summarytext', 'selfhealtoken2077_keywordtext', "
             "'active')"
         )
         conn.commit()
@@ -1232,18 +1249,18 @@ def test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db(tmp_path):
         conn = core._get_db()
         repaired_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
         assert repaired_cols == list(engram_backup.NODES_FTS_COLUMNS), (
-            f"nodes_fts must self-heal to the canonical 5-column schema on "
+            f"nodes_fts must self-heal to the canonical schema on "
             f"the next _get_db() call, got {repaired_cols}"
         )
 
-        hits_rs = conn.execute(
-            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'selfhealtoken2077_reportedstate'"
+        hits_summary = conn.execute(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'selfhealtoken2077_summarytext'"
         ).fetchone()[0]
         hits_tt = conn.execute(
             "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH 'selfhealtoken2077_triggertext'"
         ).fetchone()[0]
         conn.close()
-        assert hits_rs == 1, "reported_state token must be reindexed after startup self-heal"
+        assert hits_summary == 1, "recall_summary token must be reindexed after startup self-heal"
         assert hits_tt == 1, "trigger_text token must be reindexed after startup self-heal"
     finally:
         shutil.rmtree(core_test_dir, ignore_errors=True)
@@ -1370,3 +1387,1179 @@ def test_2087_rebuild_fts_bumps_fresh_db_to_at_least_1(tmp_path):
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
     assert version >= 1, f"rebuild_fts_index must bump a fresh DB (user_version 0) to >= 1, got {version}"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Round-3 reviewer-fairy fault-injection finding (PR2, #1952): migration
+# rung 4's trigger-drop-before-rebuild ordering. See engram_core.py's
+# "Migration version 4" block (grep for it) for the fix itself.
+#
+# Before the fix, migration rung 4 delegated the FTS table rebuild to
+# rebuild_fts_index BEFORE dropping+recreating the four FTS-sync triggers.
+# rebuild_fts_index's DROP TABLE/CREATE VIRTUAL TABLE is DDL, and DDL
+# auto-commits immediately in SQLite regardless of any surrounding
+# transaction — so a fault raised between the rebuild returning and the old
+# trigger-recreation code finishing left nodes_fts already in its NEW
+# 6-column shape (auto-committed, can't be rolled back) while the triggers
+# were still the OLD 5-column versions, still referencing `reported_state` —
+# a column the rebuilt table no longer has. The migration's own except
+# handler correctly left PRAGMA user_version at 3 for retry, but every node
+# write in that SAME PROCESS then crashed with `OperationalError: table
+# nodes_fts has no column named reported_state` — only a genuine process
+# restart (which reruns the whole rung from scratch against user_version=3)
+# actually recovered. The fix drops the triggers BEFORE delegating to
+# rebuild_fts_index instead of after, closing the crash window: a fault
+# mid-rebuild now leaves writes silently under-indexed until the retry
+# succeeds — the same risk profile migration rung 2 already accepts —
+# instead of hard-crashing on a stale-column reference.
+# ─────────────────────────────────────────────────────────────────────────
+
+_MIGRATION4_TAIL_TOKEN = "migration4roundthreeuniquetailtoken"
+
+
+def _build_pre_migration4_truncated_feeling_db(core) -> None:
+    """Build a realistic user_version=3 DB — reached via a real
+    ``core._get_db()`` pass over the actual production schema — then
+    regress ``nodes_fts`` and its four sync triggers to the pre-rung-4,
+    5-column shape and stamp a ``feeling_report`` node with a truncated
+    old-style claim (but a full, untruncated ``reported_state``). This is
+    the exact pre-condition migration rung 4 exists to repair.
+
+    ``core`` must already be a ``fresh_module(engram_core)`` instance with
+    ``_configure_paths`` already pointed at an isolated temp dir. Leaves
+    ``core._db_setup_done_paths`` cleared so the next ``core._get_db()``
+    call re-runs ``_run_db_one_time_setup``, as it would on a real process
+    restart against this same DB file.
+    """
+    conn = core._get_db()
+    conn.close()
+
+    long_reported_state = "s" * 200 + " " + _MIGRATION4_TAIL_TOKEN
+    truncated_claim = "I reported feeling: " + "s" * 50 + "..."
+
+    raw = sqlite3.connect(str(core.DB_PATH))
+    raw.executescript(
+        """
+        DROP TABLE IF EXISTS nodes_fts_vocab;
+        DROP TABLE IF EXISTS nodes_fts;
+        DROP TRIGGER IF EXISTS nodes_fts_insert;
+        DROP TRIGGER IF EXISTS nodes_fts_delete;
+        DROP TRIGGER IF EXISTS nodes_retract_remove_from_fts;
+        DROP TRIGGER IF EXISTS nodes_fts_supersede_remove;
+        CREATE VIRTUAL TABLE nodes_fts USING fts5(
+            claim, quoted_text, interpretation, reported_state, trigger_text,
+            content='nodes', content_rowid='rowid'
+        );
+        CREATE TRIGGER nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
+        END;
+        CREATE TRIGGER nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
+        END;
+        CREATE TRIGGER nodes_retract_remove_from_fts
+        AFTER UPDATE OF status ON nodes
+        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+          AND OLD.is_current = 1
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', OLD.rowid, COALESCE(OLD.claim, ''), COALESCE(OLD.quoted_text, ''),
+                    COALESCE(OLD.interpretation, ''), COALESCE(OLD.reported_state, ''), COALESCE(OLD.trigger_text, ''));
+        END;
+        CREATE TRIGGER nodes_fts_supersede_remove
+        AFTER UPDATE OF is_current ON nodes
+        WHEN NEW.is_current = 0 AND OLD.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
+            VALUES ('delete', OLD.rowid, COALESCE(OLD.claim, ''), COALESCE(OLD.quoted_text, ''),
+                    COALESCE(OLD.interpretation, ''), COALESCE(OLD.reported_state, ''), COALESCE(OLD.trigger_text, ''));
+        END;
+        """
+    )
+    raw.execute(
+        "INSERT INTO nodes (id, type, created_at, claim, reported_state, status) "
+        "VALUES ('fl_migration4_round3', 'feeling_report', '2026-08-21T00:00:00Z', ?, ?, 'active')",
+        (truncated_claim, long_reported_state),
+    )
+    # Populate the FTS index the way a live pre-rung-4 install would have it.
+    raw.execute("INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild')")
+    raw.execute("PRAGMA user_version = 3")
+    raw.commit()
+    raw.close()
+
+    core._db_setup_done_paths.clear()
+
+
+def test_migration4_fault_injected_rebuild_stays_at_v3_and_does_not_crash_writes(monkeypatch):
+    """Round-3 reviewer-fairy fault-injection regression (the Blocker).
+
+    Fault-injects engram_backup.rebuild_fts_index to raise right after doing
+    its real DDL swap — the reviewer's exact reproduction — against a
+    realistic user_version=3 DB with a truncated feeling_report claim, then
+    runs the real _get_db()/_run_db_one_time_setup migration path.
+
+    Asserts: PRAGMA user_version stays at 3 (not bumped — the migration's
+    own except handler already covered this), AND — the actual regression
+    check the reviewer's finding was about — a subsequent node write does
+    NOT raise OperationalError, proving the trigger-drop-before-rebuild
+    reorder actually closed the crash window.
+    """
+    import importlib
+    import shutil
+    import tempfile
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from conftest import fresh_module
+
+    engram_core = importlib.import_module("engram_core")
+    core = fresh_module(engram_core)
+
+    core_test_dir = tempfile.mkdtemp(prefix="engram_test_migration4_fault_")
+    try:
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        core._configure_paths(core_test_dir)
+        core._ensure_data_dir()
+
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        # Confirm the fixture actually starts at user_version 3 with the
+        # stale, pre-rung-4 5-column nodes_fts shape.
+        conn = sqlite3.connect(str(core.DB_PATH))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        pre_cols = [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
+        conn.close()
+        assert pre_cols == ["claim", "quoted_text", "interpretation", "reported_state", "trigger_text"], (
+            f"test setup must actually produce the pre-rung-4, 5-column nodes_fts shape, got {pre_cols}"
+        )
+
+        # Patch the SAME engram_backup module object that
+        # core._run_db_one_time_setup's lazy `import engram_backup` will
+        # resolve to. fresh_module() purges the engram_* module family but
+        # only re-imports engram_core itself by name; engram_backup is a
+        # function-local, lazy import inside engram_core, so it is only
+        # (re-)cached in sys.modules the first time _run_db_one_time_setup
+        # actually runs — which the fixture builder's own core._get_db()
+        # call above already triggered. Patching this cached module object
+        # directly (rather than the top-of-file `engram_backup` name, which
+        # after fresh_module()'s purge refers to a stale, orphaned module
+        # object engram_core will never call into again) is what makes the
+        # fault injection actually reach the code under test.
+        live_engram_backup = sys.modules["engram_backup"]
+        original_rebuild = live_engram_backup.rebuild_fts_index
+
+        def _faulty_rebuild(db_path, *a, **kw):
+            original_rebuild(db_path, *a, **kw)  # do the REAL DDL swap first
+            raise sqlite3.DatabaseError(
+                "round-3 regression test: simulated crash right after "
+                "rebuild_fts_index's real DDL swap (reviewer-fairy's exact repro)"
+            )
+
+        monkeypatch.setattr(live_engram_backup, "rebuild_fts_index", _faulty_rebuild)
+
+        conn = core._get_db()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == 3, (
+            f"migration rung 4 must leave PRAGMA user_version at 3 (not bumped) "
+            f"when rebuild_fts_index faults mid-rebuild, got {version}"
+        )
+
+        # The actual regression check.
+        try:
+            conn.execute(
+                "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
+                "('ob_migration4_round3_write', 'observation', '2026-08-21T00:00:01Z', "
+                "'post-fault write must not crash', 'active')"
+            )
+            conn.commit()
+        except sqlite3.OperationalError as e:
+            pytest.fail(
+                f"a node write after the fault-injected migration-4 rung raised "
+                f"OperationalError — the stale-trigger-vs-rebuilt-table crash "
+                f"window is NOT closed: {e!r}"
+            )
+        conn.close()
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_migration4_happy_path_reindexes_full_claim_and_reaches_v4():
+    """Companion happy-path test (also reviewer-requested): with no fault,
+    migration rung 4 must still run clean, reach user_version 4, and the
+    previously-truncated feeling_report claim must be FTS-findable in full
+    — the ordering-correctness check (claim backfill BEFORE FTS reindex)
+    the reviewer separately asked for, on the same realistic fixture used
+    by the fault-injection test above.
+    """
+    import importlib
+    import shutil
+    import tempfile
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from conftest import fresh_module
+
+    engram_core = importlib.import_module("engram_core")
+    core = fresh_module(engram_core)
+
+    core_test_dir = tempfile.mkdtemp(prefix="engram_test_migration4_happy_")
+    try:
+        os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+        core._configure_paths(core_test_dir)
+        core._ensure_data_dir()
+
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        conn = sqlite3.connect(str(core.DB_PATH))
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        conn.close()
+
+        conn = core._get_db()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == LATEST_RUNG, (
+            f"a clean run must carry the ladder all the way to "
+            f"v{LATEST_RUNG}, got {version}"
+        )
+
+        claim = conn.execute(
+            "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
+        ).fetchone()[0]
+        assert _MIGRATION4_TAIL_TOKEN in claim, (
+            f"claim must be recomputed to the full, untruncated reported_state "
+            f"text, got {claim!r}"
+        )
+
+        hits = conn.execute(
+            "SELECT count(*) FROM nodes_fts WHERE nodes_fts MATCH ?",
+            (_MIGRATION4_TAIL_TOKEN,),
+        ).fetchone()[0]
+        assert hits == 1, (
+            f"the previously-truncated claim's tail token must be FTS-findable "
+            f"in full after migration rung 4, got {hits} hits"
+        )
+        conn.close()
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+# ── #2181: pre-migration backup — a copy taken BECAUSE a migration is about
+# to run, keyed to migration rather than to nap. Reuses
+# _build_pre_migration4_truncated_feeling_db (above) as the realistic
+# pending-migration fixture — same user_version=3, truncated-claim
+# feeling_report shape migration rung 4's own tests already exercise.
+
+def _latest_rung_target():
+    """The highest `PRAGMA user_version = N` any rung in
+    _run_db_one_time_setup actually writes — parsed from the source, not
+    hardcoded.
+
+    Every version assertion in this file used to spell `4` literally, which
+    meant adding rung 5 (#2324) broke eight unrelated tests that were only
+    ever trying to say "the ladder finished". Hand-listing a value the
+    codebase owns is the same staleness trap this file's own
+    _PRE_MIGRATION_LATEST_VERSION test exists to catch; deriving it means
+    rung 6 costs nothing here.
+    """
+    import ast
+    import re
+
+    core_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "engram", "engram_core.py",
+    )
+    with open(core_path) as f:
+        source = f.read()
+    tree = ast.parse(source)
+    func_node = next(
+        (n for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_run_db_one_time_setup"),
+        None,
+    )
+    assert func_node is not None, "_run_db_one_time_setup not found via ast"
+    func_source = ast.get_source_segment(source, func_node)
+    written = [
+        int(m) for m in re.findall(
+            r'conn\.execute\(\s*"PRAGMA user_version = (\d+)"\s*\)', func_source
+        )
+    ]
+    assert written, "no PRAGMA user_version writes found in the migration ladder"
+    return max(written)
+
+
+LATEST_RUNG = _latest_rung_target()
+
+
+def _fresh_core_in_tmp(prefix: str):
+    """Return (core, core_test_dir) — a fresh_module(engram_core) instance
+    configured against a fresh temp dir, ready for _get_db()/
+    _run_db_one_time_setup exercise. Caller owns cleanup (shutil.rmtree
+    core_test_dir in a finally), matching the migration4 tests above.
+    """
+    import importlib
+    import tempfile as _tempfile
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from conftest import fresh_module
+
+    engram_core = importlib.import_module("engram_core")
+    core = fresh_module(engram_core)
+    core_test_dir = _tempfile.mkdtemp(prefix=prefix)
+    os.environ["ENGRAM_NO_EMBEDDINGS"] = "1"
+    core._configure_paths(core_test_dir)
+    core._ensure_data_dir()
+    return core, core_test_dir
+
+
+def test_2181_pre_migration_backup_fires_on_upgrade():
+    """Test 1: a DB at user_version < LATEST with >=1 row in `nodes` gets a
+    pre-migration-v*.db taken before the migration rewrites anything, and
+    the backup holds the PRE-migration row content (the truncated claim),
+    not the post-migration rewritten one.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_fires_")
+    try:
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        conn = sqlite3.connect(str(core.DB_PATH))
+        pre_claim = conn.execute(
+            "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
+        ).fetchone()[0]
+        conn.close()
+        assert pre_claim.startswith("I reported feeling: " + "s" * 50), (
+            "test setup must actually start with the truncated pre-migration claim"
+        )
+
+        conn = core._get_db()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        assert version == LATEST_RUNG, (
+                f"expected migration to complete and reach "
+                f"v{LATEST_RUNG}, got {version}"
+            )
+        post_claim = conn.execute(
+            "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
+        ).fetchone()[0]
+        conn.close()
+        assert _MIGRATION4_TAIL_TOKEN in post_claim, (
+            "live DB should hold the POST-migration (rewritten) claim"
+        )
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = sorted(backup_dir.glob("pre-migration-v*.db"))
+        assert len(pre_mig_files) == 1, (
+            f"expected exactly one pre-migration-v*.db, got "
+            f"{[p.name for p in pre_mig_files]}"
+        )
+        pre_mig_path = pre_mig_files[0]
+        assert pre_mig_path.name.startswith("pre-migration-v3-"), (
+            f"pre-migration filename must be keyed to the pre-migration "
+            f"user_version (3), got {pre_mig_path.name}"
+        )
+
+        # Must be a valid SQLite DB holding the PRE-migration row content.
+        backup_conn = sqlite3.connect(str(pre_mig_path))
+        backup_claim = backup_conn.execute(
+            "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
+        ).fetchone()[0]
+        backup_conn.close()
+        assert backup_claim == pre_claim, (
+            f"pre-migration backup must hold the PRE-migration claim "
+            f"{pre_claim!r}, got {backup_claim!r}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_pre_migration_backup_does_not_fire_on_fresh_db():
+    """Test 2 — the regression this whole gate exists to prevent: a fresh,
+    zero-row DB (user_version 0) must NOT get a pre-migration copy. Without
+    the row-count gate this would fire on every install and every CI run.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_fresh_")
+    try:
+        conn = core._get_db()  # fresh DB: creates schema, runs rungs 1-4 with 0 rows
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        assert version == LATEST_RUNG, (
+            f"a fresh DB should still reach v{LATEST_RUNG} (0 rows, nothing "
+            f"to migrate but the version gate must still advance), got {version}"
+        )
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = (
+            list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
+        )
+        assert pre_mig_files == [], (
+            f"a fresh, zero-row DB must NOT get a pre-migration backup, "
+            f"found {pre_mig_files}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_pre_migration_backup_does_not_fire_when_already_current():
+    """Test 3: a DB already at user_version == LATEST (4) with real rows
+    must not get a pre-migration copy, or re-run any rung, on a second
+    setup pass (_db_setup_done_paths cleared to simulate a second process
+    startup against an already-migrated DB file).
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_current_")
+    try:
+        conn = core._get_db()
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
+        conn.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
+            "('ob_2181_current', 'observation', '2026-08-22T00:00:00Z', "
+            "'already-current DB', 'active')"
+        )
+        conn.commit()
+        conn.close()
+
+        core._db_setup_done_paths.clear()
+        conn = core._get_db()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        assert version == LATEST_RUNG, (
+            f"already-current DB must stay at v{LATEST_RUNG}, got {version}"
+        )
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = (
+            list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
+        )
+        assert pre_mig_files == [], (
+            f"an already-current DB (user_version == LATEST) must not get "
+            f"a pre-migration backup, found {pre_mig_files}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_backup_failure_blocks_migration():
+    """Test 4 — the control that proves the guard is a guard. Force the
+    pre-migration copy to fail (an unwritable db-backup/ dir) against a
+    realistic user_version=3 DB with a real pending rewrite, and assert
+    the migration did NOT proceed: user_version stays at 3, and the
+    feeling_report claim is still the truncated PRE-migration value.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_blocks_")
+    try:
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(backup_dir), 0o500)  # r-x: exists()/mkdir ok, file write fails
+        try:
+            conn = core._get_db()
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == 3, (
+                f"a failed pre-migration backup must leave user_version "
+                f"unchanged (3) so the whole migration retries next "
+                f"startup, got {version}"
+            )
+            claim = conn.execute(
+                "SELECT claim FROM nodes WHERE id = 'fl_migration4_round3'"
+            ).fetchone()[0]
+            conn.close()
+            assert (
+                claim.startswith("I reported feeling: " + "s" * 50)
+                and _MIGRATION4_TAIL_TOKEN not in claim
+            ), (
+                f"data must be UNREWRITTEN when the pre-migration backup "
+                f"fails — got claim {claim!r}"
+            )
+        finally:
+            os.chmod(str(backup_dir), 0o700)
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_escape_hatch_proceeds_and_is_loud(capsys):
+    """Test 5: ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1 with a failing backup dir
+    — the migration must proceed anyway (user_version advances) and a
+    stderr line must say the backup was skipped deliberately.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_escape_")
+    try:
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(str(backup_dir), 0o500)
+        os.environ["ENGRAM_SKIP_PRE_MIGRATION_BACKUP"] = "1"
+        try:
+            capsys.readouterr()  # clear anything already buffered
+            conn = core._get_db()
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.close()
+            assert version == LATEST_RUNG, (
+                f"the escape hatch must let the migration proceed to "
+                f"completion even though the backup dir is unwritable, "
+                f"got {version}"
+            )
+            captured = capsys.readouterr()
+            assert "ENGRAM_SKIP_PRE_MIGRATION_BACKUP" in captured.err, (
+                f"escape-hatch use must be logged loudly to stderr, got "
+                f"stderr={captured.err!r}"
+            )
+        finally:
+            os.environ.pop("ENGRAM_SKIP_PRE_MIGRATION_BACKUP", None)
+            os.chmod(str(backup_dir), 0o700)
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_nothing_reaches_stdout_during_migrating_setup(capsys):
+    """Test 6: across a full _run_db_one_time_setup pass on an upgrading
+    DB, stdout must be completely empty (this is an MCP stdio server;
+    anything on stdout corrupts the protocol frame) and the diagnostics
+    must land on stderr instead. Mutation-verify this by hand (not part of
+    the automated suite): temporarily drop `file=sys.stderr` from one of
+    the pre-migration-backup print() calls, confirm this test FAILS, then
+    restore it.
+
+    Deliberately does NOT reuse _build_pre_migration4_truncated_feeling_db's
+    stale-5-column nodes_fts shape: that shape trips the PRE-EXISTING,
+    out-of-scope #2080 startup self-heal (engram_core.py ~2033-2044), which
+    itself prints to stdout independent of anything in this PR — the spec's
+    own "STDOUT IS FORBIDDEN HERE" note names that exact leak as a known,
+    separately-scoped issue (only the two rung-4 failure-path prints were
+    in-scope to fix here). Building the FTS/triggers in their already-
+    canonical shape (via a real _get_db() pass) and only then rewinding
+    user_version + re-truncating the claim isolates this test to the code
+    path THIS PR actually touches (the pre-migration backup + rung 4's
+    happy path), without silently laundering an unrelated, already-flagged
+    bug into a passing assertion.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_stdout_")
+    try:
+        # Bootstrap a fresh DB (0 rows) so the schema -- including
+        # nodes_fts + its sync triggers -- comes out in the real,
+        # already-canonical 6-column shape the current code produces.
+        conn = core._get_db()
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
+        conn.close()
+
+        # Rewind to a pending-rung-4 precondition WITHOUT touching the
+        # already-canonical FTS/trigger shape: insert a feeling_report with
+        # the old truncated-claim form, then set user_version back to 3.
+        raw = sqlite3.connect(str(core.DB_PATH))
+        raw.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, reported_state, status) "
+            "VALUES ('fl_2181_stdout_check', 'feeling_report', "
+            "'2026-08-21T00:00:00Z', ?, ?, 'active')",
+            (
+                "I reported feeling: " + "s" * 50 + "...",
+                "s" * 200 + " " + _MIGRATION4_TAIL_TOKEN,
+            ),
+        )
+        raw.execute("PRAGMA user_version = 3")
+        raw.commit()
+        raw.close()
+        core._db_setup_done_paths.clear()
+
+        capsys.readouterr()
+
+        conn = core._get_db()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.close()
+        assert version == LATEST_RUNG, (
+            f"fixture must actually re-run rung 4 and carry the ladder to "
+            f"v{LATEST_RUNG}, got {version}"
+        )
+
+        captured = capsys.readouterr()
+        assert captured.out == "", (
+            f"an MCP stdio server must never write to stdout during "
+            f"one-time DB setup — got stdout={captured.out!r}"
+        )
+        assert captured.err != "", (
+            "expected at least one diagnostic on stderr during a "
+            "migrating setup pass, got none"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_existing_daily_backup_callers_unchanged():
+    """Test 7: the two _write_binary_backup call sites in the nap paths
+    (both call it as `_write_binary_backup(str(DB_PATH), DATA_DIR /
+    "db-backup")` — two positional args, no filename/glob_pattern) must
+    keep producing knowledge-YYYYMMDD.db with the unchanged same-day-skip
+    and max_keep=7 rotation now that those two new parameters exist.
+    """
+    import datetime as _datetime
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    import engram_core as core
+
+    tmp = tempfile.mkdtemp(prefix="engram_test_2181_callers_")
+    try:
+        src_db = os.path.join(tmp, "knowledge.db")
+        conn = sqlite3.connect(src_db)
+        conn.execute("CREATE TABLE nodes (id TEXT PRIMARY KEY, claim TEXT)")
+        conn.execute("INSERT INTO nodes VALUES ('ob_1', 'hello')")
+        conn.commit()
+        conn.close()
+
+        backup_dir = Path(tmp) / "db-backup"
+        backup_dir.mkdir()
+
+        # 8 pre-existing dated files, NOT today, staggered mtimes so
+        # pruning order is deterministic.
+        today = _datetime.date.today()
+        for i in range(8):
+            d = (today - _datetime.timedelta(days=i + 1)).strftime("%Y%m%d")
+            p = backup_dir / f"knowledge-{d}.db"
+            p.write_bytes(b"x")
+            os.utime(p, (1_700_000_000 + i, 1_700_000_000 + i))
+
+        # Call exactly as the two nap-path call sites do: two positional args.
+        result = core._write_binary_backup(src_db, backup_dir)
+        assert "path" in result, f"expected a successful write, got {result}"
+        expected = backup_dir / f"knowledge-{today.strftime('%Y%m%d')}.db"
+        assert Path(result["path"]) == expected, (
+            f"default naming must be unchanged: expected {expected}, got "
+            f"{result['path']}"
+        )
+        # 8 old + 1 new = 9 total; max_keep default 7 -> 2 pruned.
+        assert result["pruned"] == 2, (
+            f"expected max_keep=7 default to prune 2, got {result}"
+        )
+        remaining = sorted(p.name for p in backup_dir.glob("knowledge-*.db"))
+        assert len(remaining) == 7, f"expected 7 files to remain, got {remaining}"
+
+        # Second call same day -> same-day idempotency skip, unchanged.
+        result2 = core._write_binary_backup(src_db, backup_dir)
+        assert result2.get("skipped") == "same-day copy exists", (
+            f"same-day idempotency skip must still fire with the default "
+            f"(filename=None) call, got {result2}"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+def test_2181_pre_migration_backup_sources_from_conn_not_db_path():
+    """Round-2 blocker fix: the backup SOURCE must come from the connection
+    actually being migrated (PRAGMA database_list), never the module-global
+    DB_PATH. Reproduces the coordinator's own probe: seed DB_PATH with an
+    unrelated, already-current (v4) graph carrying its own marker row, then
+    build a SEPARATE db file with a DIFFERENT marker row at a pending
+    user_version (3) and migrate THAT connection directly (bypassing
+    _get_db(), which always opens against DB_PATH -- the only way to
+    exercise a "foreign" conn is to call _run_db_one_time_setup directly,
+    exactly as the probe did). The resulting pre-migration backup must
+    contain the FOREIGN row and must NOT contain the DB_PATH row.
+    """
+    import shutil
+    import tempfile
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_foreign_")
+    foreign_dir = None
+    try:
+        # DB_PATH: a different, already-current graph. Must never appear in
+        # the foreign connection's backup below.
+        conn = core._get_db()
+        conn.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
+            "('zz_DBPATH_MARKER', 'observation', '2026-08-22T00:00:00Z', "
+            "'DB_PATH graph -- must never appear in the foreign backup', "
+            "'active')"
+        )
+        conn.commit()
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
+        conn.close()
+
+        # A SEPARATE db file -- built via a first _run_db_one_time_setup
+        # pass so its schema is the real production schema (not a hand-
+        # rolled subset), then rewound to a pending user_version with its
+        # own marker row, exactly as _build_pre_migration4_truncated_feeling_db
+        # does above for DB_PATH.
+        foreign_dir = tempfile.mkdtemp(prefix="engram_test_2181_foreign_db_")
+        foreign_path = os.path.join(foreign_dir, "foreign.db")
+        foreign_conn = sqlite3.connect(foreign_path)
+        foreign_conn.row_factory = sqlite3.Row
+        core._run_db_one_time_setup(foreign_conn)  # bootstrap real schema, 0 rows -> v4
+        assert foreign_conn.execute("PRAGMA user_version").fetchone()[0] == LATEST_RUNG
+
+        foreign_conn.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
+            "('zz_FOREIGN_MARKER', 'observation', '2026-08-22T00:00:01Z', "
+            "'foreign graph row -- the one actually being migrated', "
+            "'active')"
+        )
+        foreign_conn.execute("PRAGMA user_version = 3")
+        foreign_conn.commit()
+
+        # Migrate the FOREIGN connection directly -- the exact reproduction
+        # shape of the coordinator's probe.
+        core._run_db_one_time_setup(foreign_conn)
+        foreign_version = foreign_conn.execute("PRAGMA user_version").fetchone()[0]
+        foreign_conn.close()
+        assert foreign_version == LATEST_RUNG, (
+            f"the foreign connection should still migrate normally, got {foreign_version}"
+        )
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = sorted(backup_dir.glob("pre-migration-v*.db"))
+        assert len(pre_mig_files) == 1, (
+            f"expected exactly one pre-migration backup, got "
+            f"{[p.name for p in pre_mig_files]}"
+        )
+
+        backup_conn = sqlite3.connect(str(pre_mig_files[0]))
+        backup_ids = {row[0] for row in backup_conn.execute("SELECT id FROM nodes")}
+        backup_conn.close()
+
+        assert "zz_FOREIGN_MARKER" in backup_ids, (
+            f"the pre-migration backup must contain the FOREIGN connection's "
+            f"row (the one actually being migrated), got {backup_ids}"
+        )
+        assert "zz_DBPATH_MARKER" not in backup_ids, (
+            f"the pre-migration backup must NOT be sourced from the "
+            f"module-global DB_PATH -- got {backup_ids}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+        if foreign_dir is not None:
+            shutil.rmtree(foreign_dir, ignore_errors=True)
+
+
+def test_2181_pre_migration_backup_skips_for_in_memory_connection(capsys):
+    """An in-memory connection (":memory:") has no on-disk file to copy, so
+    the pre-migration-backup step must skip it (loudly, on stderr) rather
+    than silently falling back to DB_PATH -- which would reintroduce the
+    wrong-source bug for the one caller most likely to hit it.
+
+    Both calls below now raise ValueError out of migration rung 4 -- updated
+    for #2186 (rebuild_fts_index now refuses an empty db_path instead of
+    silently opening an unrelated scratch database). Confirmed by direct
+    repro against the UNMODIFIED base commit (cae464e) that migration rung 4
+    itself cannot complete against a genuinely in-memory connection --
+    rebuild_fts_index re-opens its OWN connection via a
+    PRAGMA-database_list-derived path, which is empty for ":memory:". Before
+    #2186 that silently operated on an unrelated scratch database instead of
+    the real one and rung 4 quietly gave up (caught by its own
+    sqlite3.DatabaseError handler, printed "FAILED, will retry", never
+    raised); after #2186 the same empty path is a refused ValueError, which
+    is NOT a sqlite3.DatabaseError/ImportError so rung 4's existing except
+    clauses do not catch it and it propagates out of
+    _run_db_one_time_setup instead -- the exact "fails LOUDLY instead of
+    silently stalling" behavior #2186 is about. This is a real, pre-existing,
+    orthogonal limitation in rung 4 (predates this PR entirely -- reproduced
+    identically on cae464e before any of #2181's changes), not something
+    #2181 or #2186 is scoped to fix (#2186 deliberately fixes only
+    rebuild_fts_index itself and the #2080 startup self-heal call site, not
+    rung 4). What THIS test asserts is only what #2181's own code is
+    responsible for: the backup step does not crash, does not write a
+    backup file, and does not fall back to DB_PATH -- it correctly skips
+    (visible on stderr before rung 4's later, unrelated raise) and lets the
+    (separately, pre-existingly limited) migration attempt proceed on its
+    own terms.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_inmemory_")
+    try:
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+        capsys.readouterr()
+        with pytest.raises(ValueError, match="db_path is empty"):
+            core._run_db_one_time_setup(mem_conn)  # bootstrap pass, 0 rows;
+            # reaches rung 4 (out of #2186's scope) and raises there -- see
+            # docstring.
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = (
+            list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
+        )
+        assert pre_mig_files == [], (
+            f"an in-memory connection must never produce a pre-migration "
+            f"backup file (nothing on disk to copy), found {pre_mig_files}"
+        )
+
+        # Force a pending-migration precondition without going through
+        # rung 4's own re-open path a second time: rewind user_version and
+        # insert a marker row directly, then re-invoke and confirm the
+        # SKIP branch (not a crash, not a DB_PATH fallback) is what fires
+        # for the pre-migration-backup step -- before rung 4 (unmodified,
+        # out of #2186's scope) raises again.
+        mem_conn.execute(
+            "INSERT INTO nodes (id, type, created_at, claim, status) VALUES "
+            "('zz_MEM_MARKER', 'observation', '2026-08-22T00:00:02Z', "
+            "'in-memory graph row', 'active')"
+        )
+        mem_conn.execute("PRAGMA user_version = 3")
+        mem_conn.commit()
+
+        capsys.readouterr()
+        with pytest.raises(ValueError, match="db_path is empty"):
+            core._run_db_one_time_setup(mem_conn)
+        mem_conn.close()
+
+        captured = capsys.readouterr()
+        assert "in-memory" in captured.err and "SKIPPED" in captured.err, (
+            f"expected the in-memory-skip diagnostic on stderr, got "
+            f"stderr={captured.err!r}"
+        )
+
+        pre_mig_files = (
+            list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
+        )
+        assert pre_mig_files == [], (
+            f"an in-memory connection must never produce a pre-migration "
+            f"backup file on a second pass either, found {pre_mig_files}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2181_pre_migration_latest_version_constant_matches_max_rung_target():
+    """Hardening (flagged, now closed): _PRE_MIGRATION_LATEST_VERSION has
+    no structural link to the rungs -- it is a hand-maintained mirror of
+    "the highest PRAGMA user_version = N a rung actually writes". Add a
+    rung 5 and forget to bump the constant, and current_user_version < 4
+    is False for an already-v4 graph, so no backup is taken before rung 5
+    rewrites data -- silent, and in the reassuring direction. This test
+    parses engram_core.py, finds every `conn.execute("PRAGMA user_version
+    = N")` literal actually written inside _run_db_one_time_setup, and
+    asserts the constant equals the max.
+    """
+    import ast
+    import re
+
+    core_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "src", "engram", "engram_core.py",
+    )
+    with open(core_path) as f:
+        source = f.read()
+
+    tree = ast.parse(source)
+    func_node = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_db_one_time_setup":
+            func_node = node
+            break
+    assert func_node is not None, "_run_db_one_time_setup not found via ast"
+
+    func_source = ast.get_source_segment(source, func_node)
+    assert func_source is not None, "could not extract function source"
+
+    # Only the actual write call, not any comment/docstring mentioning the
+    # same phrase -- comments are free text and must not feed the oracle.
+    versions_written = [
+        int(m)
+        for m in re.findall(
+            r'conn\.execute\(\s*"PRAGMA user_version = (\d+)"\s*\)',
+            func_source,
+        )
+    ]
+    assert versions_written, (
+        "expected at least one `conn.execute(\"PRAGMA user_version = N\")` "
+        "write inside _run_db_one_time_setup"
+    )
+    max_rung_version = max(versions_written)
+
+    latest_const_match = re.search(
+        r"_PRE_MIGRATION_LATEST_VERSION\s*=\s*(\d+)", func_source
+    )
+    assert latest_const_match is not None, (
+        "_PRE_MIGRATION_LATEST_VERSION assignment not found inside "
+        "_run_db_one_time_setup"
+    )
+    latest_const = int(latest_const_match.group(1))
+
+    assert latest_const == max_rung_version, (
+        f"_PRE_MIGRATION_LATEST_VERSION={latest_const} must equal the "
+        f"highest `PRAGMA user_version = N` literal a rung actually writes "
+        f"({max_rung_version}) -- add a rung without bumping this constant "
+        f"and the pre-migration backup silently stops firing before the "
+        f"new rung runs."
+    )
+
+
+
+class _CountFailingConnProxy:
+    """Wraps a real sqlite3.Connection; forwards everything through except
+    `execute("SELECT COUNT(*) FROM nodes")`, which raises
+    sqlite3.OperationalError -- reproducing a transient SQLITE_BUSY on
+    exactly the row-count read the fresh-DB gate performs. Matches the
+    coordinator's own reproduction shape for the round-5 blocker.
+    """
+
+    def __init__(self, real_conn):
+        self._real = real_conn
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str) and "SELECT COUNT(*) FROM nodes" in sql:
+            raise sqlite3.OperationalError("database is locked")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_2181_row_count_read_failure_does_not_skip_the_backup():
+    """Round-5 blocker: a FAILED row-count read must be treated as
+    unknown-therefore-protect, never as "empty graph". Before the fix, a
+    transient OperationalError on the `SELECT COUNT(*) FROM nodes` query
+    (e.g. SQLITE_BUSY) was silently mapped to 0 rows, the fresh-DB gate
+    returned True (nothing worth protecting), and the irreversible
+    migration proceeded with NO restore point on a genuinely populated
+    graph.
+
+    Reproduces the coordinator's own probe: a populated DB with one row at
+    user_version=3, the COUNT query proxied to raise, migrate the proxied
+    connection, and assert a real pre-migration backup WAS taken (the
+    underlying file on disk is not actually locked in this test -- only
+    the proxy's COUNT call is faked -- so the fixed behavior is a normal,
+    successful backup followed by a completed migration; the pre-fix
+    behavior was a completed migration with ZERO backup files, exactly
+    the coordinator's own measured output).
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2181_countfail_")
+    try:
+        _build_pre_migration4_truncated_feeling_db(core)
+
+        real_conn = sqlite3.connect(str(core.DB_PATH))
+        real_conn.row_factory = sqlite3.Row
+        proxy_conn = _CountFailingConnProxy(real_conn)
+
+        core._run_db_one_time_setup(proxy_conn)
+        version = real_conn.execute("PRAGMA user_version").fetchone()[0]
+        real_conn.close()
+
+        backup_dir = core.DATA_DIR / "db-backup"
+        pre_mig_files = (
+            list(backup_dir.glob("pre-migration-v*.db")) if backup_dir.exists() else []
+        )
+
+        assert version == LATEST_RUNG, (
+            f"migration should reach completion once the (unaffected, "
+            f"file-level) backup succeeds despite the COUNT read failing, "
+            f"got user_version={version}"
+        )
+        assert len(pre_mig_files) == 1, (
+            f"expected exactly one pre-migration backup taken -- a failed "
+            f"row-count read must fall through to a real backup attempt, "
+            f"not skip it as if the graph were empty. Found: "
+            f"{[p.name for p in pre_mig_files]}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+# ── #2186: rebuild_fts_index("") silently rebuilt the WRONG (an implicit
+# SQLite scratch) database for an in-memory connection, because SQLite
+# treats an empty-string path as "open a private temp DB", not an error.
+# Every caller that derives db_path from
+# conn.execute("PRAGMA database_list").fetchone()[2] gets an empty string
+# for an in-memory connection, so this silently corrupted the intended
+# repair instead of failing. Fixed at the layer closest to the effect: one
+# guard inside rebuild_fts_index itself, covering every call site.
+
+def test_2186_rebuild_fts_index_rejects_empty_db_path():
+    """The most direct regression guard for the actual library-level fix,
+    independent of the migration-ladder integration test below:
+    rebuild_fts_index must reject a falsy db_path with a loud ValueError
+    rather than silently opening an implicit SQLite scratch database.
+    """
+    with pytest.raises(ValueError, match="db_path is empty"):
+        engram_backup.rebuild_fts_index("")
+
+    with pytest.raises(ValueError, match="db_path is empty"):
+        engram_backup.rebuild_fts_index(None)
+
+
+def test_2186_migration_ladder_against_in_memory_reaches_v4_or_fails_loudly():
+    """#2186's own required test (from the issue): run
+    _run_db_one_time_setup against a fresh, genuinely in-memory (":memory:")
+    connection and assert the migration ladder either reaches the latest
+    PRAGMA user_version (4) or fails LOUDLY -- it must never silently
+    stall while returning normally.
+
+    Pre-#2186, this genuinely DID silently stall: rung 4 delegated to
+    rebuild_fts_index("") -- an empty PRAGMA-database_list-derived path --
+    which silently opened an unrelated scratch database, leaving the real
+    connection's nodes_fts stuck at a stale column set. Rung 4's own
+    subsequent write against that stale table then raised
+    OperationalError('table nodes_fts has no column named recall_summary'),
+    which rung 4's `except sqlite3.DatabaseError` handler caught, printed
+    "FAILED, will retry on next startup" for, and swallowed --
+    _run_db_one_time_setup returned normally with user_version stuck at 3,
+    with no exception ever surfacing to the caller (see
+    test_2181_pre_migration_backup_skips_for_in_memory_connection's
+    docstring for the same repro, confirmed directly against the
+    unmodified base commit).
+
+    As of #2186, rebuild_fts_index refuses an empty db_path outright
+    (raises ValueError). Migration rung 4 itself is deliberately NOT
+    modified by #2186 (out of scope -- see the #2080 startup self-heal
+    fix in engram_core.py, which IS in scope, versus rung 4's own
+    version-gated block, which is not), so it still cannot complete
+    against a genuinely in-memory connection: the ValueError it now gets
+    from rebuild_fts_index is not a sqlite3.DatabaseError/ImportError, so
+    rung 4's existing except clauses do not catch it and it propagates
+    out of _run_db_one_time_setup uncaught instead. That satisfies this
+    test's actual requirement -- fails LOUDLY rather than silently
+    stalling -- even though it does not reach v4. The except clause below
+    is narrowed to ValueError specifically (today's actual failure mode,
+    documented above) rather than a bare Exception, so an unrelated bug
+    elsewhere is not silently absorbed as "loud failure, that counts";
+    if rung 4 is ever fixed to complete against an in-memory connection,
+    the `else` branch below already covers that outcome without needing
+    to touch this test.
+    """
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2186_ladder_")
+    try:
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+        try:
+            core._run_db_one_time_setup(mem_conn)
+        except ValueError as exc:
+            assert "db_path is empty" in str(exc) or "rebuild_fts_index" in str(exc), (
+                f"expected the #2186 empty-db_path guard's ValueError, got "
+                f"a differently-worded ValueError: {exc!r}"
+            )
+        else:
+            version = mem_conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version == LATEST_RUNG, (
+                f"_run_db_one_time_setup returned without raising, so the "
+                f"migration ladder must have reached the latest version "
+                f"({LATEST_RUNG}) -- silently stalling at an intermediate version "
+                f"while returning normally is exactly the #2186 bug. Got "
+                f"user_version={version}"
+            )
+        mem_conn.close()
+    finally:
+        import shutil
+        shutil.rmtree(core_test_dir, ignore_errors=True)
+
+
+def test_2186_self_heal_skip_branch_fires_on_stale_in_memory_nodes_fts():
+    """Direct exercise of the new SKIP branch inside the #2080 self-heal
+    block (reviewer-fairy suggestion on PR #2230) -- neither
+    test_2181_pre_migration_backup_skips_for_in_memory_connection nor
+    test_2186_migration_ladder_against_in_memory_reaches_v4_or_fails_loudly
+    reaches it: both hit rung 4's raise before nodes_fts could ever have a
+    stale schema, because a freshly-bootstrapped in-memory connection gets a
+    canonical nodes_fts from the CREATE VIRTUAL TABLE IF NOT EXISTS earlier
+    in _run_db_one_time_setup, so `_existing_fts_cols != _canonical_fts_cols`
+    (the self-heal's own trigger condition) is never true on either of their
+    calls.
+
+    This test manufactures that condition directly: bootstrap a `:memory:`
+    connection once (canonical nodes_fts), then corrupt nodes_fts to a stale
+    3-column shape on that SAME connection object (mirroring
+    test_2077_startup_self_heal_repairs_stale_nodes_fts_on_get_db's
+    file-backed technique, adapted for in-memory -- there is no file to
+    reopen, so the corruption happens directly on the live connection), then
+    re-invoke _run_db_one_time_setup and confirm the SKIP branch actually
+    ran (the "in-memory ... SKIPPED" diagnostic on stderr) rather than
+    silently falling through some other path.
+    """
+    import shutil
+
+    core, core_test_dir = _fresh_core_in_tmp("engram_test_2186_selfheal_skip_")
+    try:
+        mem_conn = sqlite3.connect(":memory:")
+        mem_conn.row_factory = sqlite3.Row
+
+        # First call: bootstrap. Reaches rung 4 and raises (established by
+        # test_2186_migration_ladder_...) -- irrelevant here, the self-heal
+        # block (which runs BEFORE the version-gated rungs) has already done
+        # its job by then, creating a canonical nodes_fts.
+        try:
+            core._run_db_one_time_setup(mem_conn)
+        except ValueError:
+            pass
+
+        canonical_cols = [
+            row[1] for row in mem_conn.execute("PRAGMA table_info(nodes_fts)").fetchall()
+        ]
+        assert canonical_cols, (
+            "test setup must produce a real nodes_fts table on the first "
+            "bootstrap call before it can be corrupted"
+        )
+
+        # Corrupt nodes_fts to a stale 3-column shape directly on the live
+        # connection -- same technique as test_2077, adapted: no file to
+        # reopen for an in-memory DB, so the DROP/CREATE runs on mem_conn
+        # itself rather than a second sqlite3.connect(path).
+        mem_conn.executescript(
+            """
+            DROP TABLE IF EXISTS nodes_fts;
+            CREATE VIRTUAL TABLE nodes_fts USING fts5(
+                claim, quoted_text, interpretation,
+                content='nodes', content_rowid='rowid'
+            );
+            INSERT INTO nodes_fts(nodes_fts) VALUES ('rebuild');
+            """
+        )
+        mem_conn.commit()
+
+        stale_cols = [
+            row[1] for row in mem_conn.execute("PRAGMA table_info(nodes_fts)").fetchall()
+        ]
+        assert stale_cols == ["claim", "quoted_text", "interpretation"], (
+            f"test setup must actually produce the stale 3-column shape, got {stale_cols}"
+        )
+        assert stale_cols != canonical_cols, (
+            "the corrupted shape must actually differ from the canonical one, "
+            "or the self-heal's own trigger condition won't fire"
+        )
+
+        import io
+        import contextlib
+
+        # The self-heal block's SKIP diagnostic is a plain print() (stdout),
+        # matching its own sibling "repairing..." branch in the same
+        # if/else -- NOT the file=sys.stderr convention
+        # _take_pre_migration_backup_if_pending uses for its own, differently
+        # worded in-memory-skip message. Capture stdout accordingly; an
+        # earlier draft of this test wrongly assumed stderr by analogy with
+        # that other function and failed against the real code, which is
+        # exactly the kind of assumption this test exists to catch rather
+        # than make.
+        stdout_buf = io.StringIO()
+        with contextlib.redirect_stdout(stdout_buf):
+            try:
+                core._run_db_one_time_setup(mem_conn)
+            except ValueError:
+                pass  # rung 4, same as every other #2186 in-memory test -- irrelevant here
+        mem_conn.close()
+
+        captured_out = stdout_buf.getvalue()
+        assert "in-memory" in captured_out and "SKIPPED" in captured_out, (
+            f"expected the #2186 self-heal SKIP diagnostic on stdout (the "
+            f"branch this test exists to exercise), got stdout={captured_out!r}"
+        )
+        assert "#2186" in captured_out, (
+            f"expected the SKIP diagnostic to cite #2186 (matching the "
+            f"engram_core.py source), got stdout={captured_out!r}"
+        )
+    finally:
+        shutil.rmtree(core_test_dir, ignore_errors=True)

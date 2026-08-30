@@ -97,7 +97,7 @@ def is_loop_wake(body: str) -> bool:
     ``ScheduleWakeup`` prompt) still classifies identically to the plain
     marker. This is effect-layer robustness: an agent-construction error in
     how the marker gets embedded can't silently defeat detection and get
-    misclassified as a human prompt (gh#1646).
+    misclassified as a human prompt (gh#1649).
 
     Parameters
     ----------

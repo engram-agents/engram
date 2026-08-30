@@ -489,9 +489,65 @@ def main() -> None:
     # `echo $CLAUDE_PLUGIN_ROOT` returns empty in the user shell.) The
     # plugin root IS where bootstrap.py lives, since build-plugin.sh copies
     # bootstrap.py to ${PLUGIN_ROOT}/bootstrap.py.
+    # ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1: skip the tools/hooks plugin-symlink
+    # block below entirely, even when plugin.json is present. Added for a
+    # per-run isolated ENGRAM_HOME build (e.g. exam-room's benchmark harness,
+    # engram-agents/exam-room#21-#22 era) that runs bootstrap.py as an
+    # ordinary subprocess -- everything else in main() (seed graph, CLAUDE.md
+    # render, warm-briefing, first-run-pending marker) works correctly for
+    # that use case exactly as written, since each invocation is its own
+    # fresh process with its own env vars. Only the symlink step is wrong
+    # there: it points ENGRAM_HOME/tools and /hooks at the PLUGIN's bundled
+    # copies, which live outside any per-run sandbox jail -- a benchmark run
+    # that later gets copied wholesale into an isolated directory (per-run
+    # `cp -r` of a golden skeleton) would either carry a symlink that
+    # escapes the jail, or need `cp -rL` to dereference it, silently
+    # depending on the caller getting that flag right. Skipping the
+    # symlinks entirely for this case means the golden-skeleton build must
+    # instead copy (not link) whatever real tool/hook files it needs,
+    # which is the caller's job, not bootstrap.py's -- this flag only
+    # removes the wrong-for-that-context default, it does not replace it
+    # with anything.
+    _skip_symlinks_raw = os.environ.get("ENGRAM_BOOTSTRAP_SKIP_SYMLINKS", "0")
+    skip_symlinks = _skip_symlinks_raw == "1"
+    if _skip_symlinks_raw not in ("0", "1"):
+        # Ariadne's colleague-pass finding on PR#2171: a strict `== "1"`
+        # check means a near-miss value (e.g. "true", "yes") silently falls
+        # through as unset -- no skip AND no announcement, indistinguishable
+        # from a caller who never set the var at all. A guard whose whole
+        # purpose is a safety suppression must fail VISIBLE when
+        # misconfigured, not silently do the opposite of what was asked.
+        #
+        # Reviewer-fairy nit on THIS PR: this WARN is deliberately NOT
+        # gated on `plugin_marker.is_file()`, unlike the skip-announcement
+        # below. That asymmetry is intentional, not an oversight to copy
+        # the other gate onto: the skip-announcement would be misleading
+        # in a non-plugin context because the flag had zero effect there
+        # (nothing to skip). This WARN flags a misconfigured *intent* (a
+        # typo'd env var) -- worth surfacing regardless of whether this
+        # particular run's context would have made the flag consequential,
+        # since the caller's mistake is the same either way.
+        print(
+            f"  WARN: ENGRAM_BOOTSTRAP_SKIP_SYMLINKS={_skip_symlinks_raw!r} is "
+            "not '0' or '1' -- treating as unset (symlinks will NOT be "
+            "skipped). Set it to exactly '1' to skip.",
+            flush=True,
+        )
     bootstrap_dir = Path(__file__).resolve().parent
     plugin_marker = bootstrap_dir / "plugin.json"
-    if plugin_marker.is_file():
+    if skip_symlinks and plugin_marker.is_file():
+        # Reviewer-fairy nit on this PR: only announce the skip when there
+        # was actually something to skip -- printing this whenever the env
+        # var is set, even from a non-plugin source-tree run where
+        # plugin_marker.is_file() is already False, would announce a skip
+        # that never had anything to do.
+        print(
+            "  ENGRAM_BOOTSTRAP_SKIP_SYMLINKS=1 — skipping ~/.engram/tools and "
+            "~/.engram/hooks plugin symlinks (this ENGRAM_HOME is not a real "
+            "plugin install)",
+            flush=True,
+        )
+    if plugin_marker.is_file() and not skip_symlinks:
         # We're in plugin install — bootstrap.py is in the plugin tree.
         engram_tools_link = ENGRAM_HOME / "tools"
         plugin_tools = bootstrap_dir / "tools"

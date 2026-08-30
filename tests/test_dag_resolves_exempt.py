@@ -1,6 +1,6 @@
 """DAG-exemptions for back-reference and relational edges (issue #1076).
 
-Three relation classes now have dag_check=False per Borges's three-tier edge taxonomy:
+Three relation classes now have temporal_causal=False per Borges's three-tier edge taxonomy:
 
   - resolves   back-reference: resolver can legitimately pre-date the question
                (question filed retroactively about a pre-existing answer).
@@ -102,7 +102,7 @@ def test_resolves_in_dag_exempt_relations():
     import engram_core as core
     assert "resolves" in core.DAG_EXEMPT_RELATIONS, (
         "resolves is not in DAG_EXEMPT_RELATIONS — fix not applied. "
-        "Set dag_check=False for 'resolves' in EDGE_CLASSIFICATIONS."
+        "Set temporal_causal=False for 'resolves' in EDGE_CLASSIFICATIONS."
     )
 
 
@@ -116,7 +116,7 @@ def test_tensions_in_dag_exempt_relations():
     import engram_core as core
     assert "tensions" in core.DAG_EXEMPT_RELATIONS, (
         "tensions is not in DAG_EXEMPT_RELATIONS — exemption not applied. "
-        "Set dag_check=False for 'tensions' in EDGE_CLASSIFICATIONS."
+        "Set temporal_causal=False for 'tensions' in EDGE_CLASSIFICATIONS."
     )
 
 
@@ -130,7 +130,7 @@ def test_serves_in_dag_exempt_relations():
     import engram_core as core
     assert "serves" in core.DAG_EXEMPT_RELATIONS, (
         "serves is not in DAG_EXEMPT_RELATIONS — exemption not applied. "
-        "Set dag_check=False for 'serves' in EDGE_CLASSIFICATIONS."
+        "Set temporal_causal=False for 'serves' in EDGE_CLASSIFICATIONS."
     )
 
 
@@ -143,7 +143,7 @@ def test_dag_scan_no_violation_for_back_reference_resolves():
     Edge: obs --resolves--> question (source.created_at < target.created_at).
     Expected: startup scan returns 0 violations.
 
-    Mutation note: with dag_check=True for resolves, the row WOULD appear
+    Mutation note: with temporal_causal=True for resolves, the row WOULD appear
     (verified by test 3 below). This test catches any regression that
     re-enables the check.
     """
@@ -164,7 +164,7 @@ def test_dag_scan_no_violation_for_back_reference_resolves():
     resolves_violations = [v for v in violations if v["relation"] == "resolves"]
     assert resolves_violations == [], (
         f"Startup scan reported DAG violations for resolves edges: {resolves_violations}. "
-        "This is the #1076 false-positive — check dag_check=False for 'resolves' "
+        "This is the #1076 false-positive — check temporal_causal=False for 'resolves' "
         "in EDGE_CLASSIFICATIONS."
     )
 

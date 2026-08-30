@@ -32,6 +32,16 @@ from pathlib import Path
 from typing import Optional
 
 import engram_core as core
+import engram_conformance as _conformance_mod
+import engram_dag_conformance as _dag_conformance_mod
+
+
+# #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
+# engram_core.CITATION_SUPPORT_RELATIONS's own comment for why this is
+# deliberately its own enumerated constant rather than derived from
+# `cascade`). Stable sorted() order for the SQL IN-clause placeholders below.
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(core.CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_PLACEHOLDERS = ",".join("?" * len(_CITATION_SUPPORT_RELATIONS_SORTED))
 
 
 # ---------------------------------------------------------------------------
@@ -241,17 +251,23 @@ def _compute_health_score(conn) -> float:
     ).fetchone()["c"]
     score -= min(dag_violations * 5, 20)
 
-    # Tainted nodes (downstream of retracted premises)
+    # Tainted nodes (downstream of retracted premises).
+    # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+    # slice 1) — count DISTINCT nodes with at least one pending
+    # taint-severity marker, joined against is_current so a node that was
+    # itself later superseded/retracted (no longer live) doesn't count.
     tainted = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes"
-        " WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+        "JOIN nodes n ON n.id = cm.node_id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
     ).fetchone()["c"]
     score -= min(tainted * 3, 15)
 
-    # Stale nodes (downstream of superseded premises)
+    # Stale nodes (downstream of superseded premises). Same migration.
     stale = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes"
-        " WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
+        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+        "JOIN nodes n ON n.id = cm.node_id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
     ).fetchone()["c"]
     score -= min(stale * 2, 10)
 
@@ -719,16 +735,23 @@ def _diagnose_impl() -> str:
         """).fetchone()["c"]
         epistemic["single_source_derivations"] = single_source_dvs
 
-        # Tainted nodes
+        # Tainted nodes. Migrated off metadata.tainted_by to cascade_markers
+        # (#2013/#2009 slice 1) — same DISTINCT-node-with-pending-marker
+        # query as the health-score computation above, kept in sync by
+        # construction now (one table, not two independently-drifting
+        # metadata string patterns).
         tainted_count = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
         ).fetchone()["c"]
         epistemic["tainted_nodes"] = tainted_count
 
         # Stale nodes
         stale_count = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"stale_by\": [%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
         ).fetchone()["c"]
         epistemic["stale_nodes"] = stale_count
 
@@ -748,23 +771,28 @@ def _diagnose_impl() -> str:
         ).fetchone()["c"]
         epistemic["retracted_nodes"] = retracted_count
 
-        # Uncited observations (not referenced by any derivation)
-        uncited = conn.execute("""
+        # Uncited observations (not referenced by any derivation).
+        # #2252 Stage 1.0b: relation set here is citation-coverage
+        # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
+        # enumerated, not derived from `cascade`. See the constant's
+        # comment in engram_core.py.
+        # #2252 W6: prediction-pairing exemption unified into a shared helper
+        # (core.prediction_pairing_exemption_sql) — was verbatim-duplicated
+        # here and in engram_lifecycle.py with a hardcoded 'supported_by'
+        # literal before the pairing edge split to `predicted_by`.
+        _pred_pairing_sql, _pred_pairing_params = core.prediction_pairing_exemption_sql("n.id")
+        uncited = conn.execute(f"""
             SELECT COUNT(*) as c FROM nodes n
             WHERE n.type IN ('observation_factual', 'observation_predictive')
               AND n.is_current = 1
               AND NOT EXISTS (
                   SELECT 1 FROM edges e
                   WHERE e.target_id = n.id
-                    AND e.relation IN ('derives_from', 'supported_by')
+                    AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                     AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
               )
-              AND NOT EXISTS (
-                  SELECT 1 FROM edges e
-                  WHERE e.target_id = n.id AND e.relation = 'supported_by'
-                    AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
-              )
-        """).fetchone()["c"]
+              AND {_pred_pairing_sql}
+        """, tuple(_CITATION_SUPPORT_RELATIONS_SORTED) + _pred_pairing_params).fetchone()["c"]
         epistemic["uncited_observations"] = uncited
 
         # Resolution rates
@@ -901,6 +929,25 @@ def _diagnose_impl() -> str:
         provenance["untrusted_domain_evidence"] = untrusted_domains
 
         metrics["provenance"] = provenance
+
+        # ── Partition Conformance (#2300) ──────────────────────────────────
+        # The CB/NCB red-flag channel: five binary, zero-or-investigate
+        # invariants over the claim-bearing/non-claim-bearing partition and
+        # the cascade-relation set (#2252), all derived from the shipped
+        # constants at call time — see engram_conformance.py's own module
+        # docstring for why nothing here is hand-enumerated. No severity, no
+        # scoring, no acknowledged state — #2300 scope; this section is a
+        # pure read of the checker's own return value.
+        metrics["partition_conformance"] = _conformance_mod.check_partition_conformance(conn)
+
+        # ── DAG Conformance (#2357) ────────────────────────────────────────
+        # Real edge-walk acyclicity over the `dag: True` relation set —
+        # deliberately a separate module/check from partition_conformance
+        # above (engram_dag_conformance.py's own docstring explains why: a
+        # DAG cycle is a different property from the CB/NCB partition, with
+        # a different owner). Zero-or-investigate, same as partition
+        # conformance — no severity, no scoring, no acknowledged state.
+        metrics["dag_conformance"] = _dag_conformance_mod.check_dag_conformance(conn)
 
         # ── Agent Experience ─────────────────────────────────────────────
         experience: dict = {}

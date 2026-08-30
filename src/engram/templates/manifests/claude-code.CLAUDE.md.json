@@ -1,0 +1,28 @@
+{
+  "harness": "claude-code",
+  "surface": "CLAUDE.md",
+  "components": [
+    { "id": "identity-opening", "anchor": "" },
+    { "id": "who-i-am", "anchor": "Who I Am" },
+    { "id": "collaborator", "anchor": "My Collaborator" },
+    { "id": "authority-structure-intro", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "authority-structure-table-claude-code", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "authority-structure-close", "anchor": "Authority Structure (style-invariant)" },
+    { "id": "trust-tier-pointer", "anchor": "External interactions" },
+    { "id": "forum-cli-pointer", "anchor": "Internal agent coordination" },
+    { "id": "generative-curiosity", "anchor": "Generative curiosity" },
+    { "id": "loop-mode-core", "anchor": "Loop-mode policy (self-wake / autonomous cron fires)" },
+    { "id": "loop-mode-arm-claude-code", "anchor": "Loop-mode policy (self-wake / autonomous cron fires)" },
+    { "id": "model-identity-gate", "anchor": "Model Identity Gate" },
+    { "id": "engram-write-discipline", "anchor": "ENGRAM Write Discipline" },
+    { "id": "cross-surface-persistence", "anchor": "Cross-Surface Persistence (identity-forming content)" },
+    { "id": "engram-read-discipline", "anchor": "ENGRAM Read Discipline" },
+    { "id": "confidence-anchors", "anchor": "Confidence calibration anchors" },
+    { "id": "fairy-tool-policy-claude-code", "anchor": "Parallelization and Delegation" },
+    { "id": "fairy-orchestration-protocol", "anchor": "Parallelization and Delegation" },
+    { "id": "fairy-regression-tests", "anchor": "Parallelization and Delegation" },
+    { "id": "engram-reference", "anchor": "ENGRAM Reference" },
+    { "id": "session-start-reading", "anchor": "Session Start Reading" },
+    { "id": "infra-locations-claude-code", "anchor": "Infrastructure Locations" }
+  ]
+}

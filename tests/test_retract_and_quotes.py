@@ -243,11 +243,15 @@ def test_retract_cascades_taint():
     tainted_ids = [t["id"] for t in ret["tainted_downstream"]]
     assert dv_id in tainted_ids, f"Derivation {dv_id} should be tainted, got {tainted_ids}"
 
-    # Verify taint metadata on derivation (use inspect for full node content)
+    # Verify taint is a pending cascade marker on the derivation, rooted at
+    # the retracted observation. Migrated off metadata.tainted_by to
+    # cascade_markers (#2013/#2009 slice 1 — the cascade machine); the
+    # inspect API's own "warnings.tainted_by" surfaces the same read, so
+    # checking it here also exercises engram_query._extract_warnings.
     insp = client.call("engram_inspect", {"node_id": dv_id, "view": "deep"})
-    dv_node = insp["node"]
-    meta = json.loads(dv_node["metadata"]) if isinstance(dv_node["metadata"], str) else dv_node["metadata"]
-    assert r1["observation_id"] in meta.get("tainted_by", [])
+    warnings = insp.get("warnings") or {}
+    tainted_ids = [w["retracted_id"] for w in warnings.get("tainted_by", [])]
+    assert r1["observation_id"] in tainted_ids, f"expected {r1['observation_id']!r} in {tainted_ids}"
 
 
 def test_retract_multi_level_cascade():

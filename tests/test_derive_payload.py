@@ -138,13 +138,33 @@ def test_payload_json_use_stale_bool_round_trips():
 
 
 def test_payload_json_use_stale_string_rejected_per_ls_0034():
-    """JSON-string 'false' is truthy in Python. Without the isinstance guard,
-    a use_stale: 'false' payload would silently bypass the MECH-5 stale-premise
-    block (ax_0005 blocking-guard weakening). The guard must reject the string
-    form with a clear error directing the caller to use a JSON boolean.
+    """JSON-string 'false' is truthy in Python, so the isinstance guard must
+    reject the string form with a clear error directing the caller to a JSON
+    boolean.
 
-    Pattern parallels _resolve_impl's identical guard. Fairy round-1 blocker
-    on PR #110 caught this gap.
+    THE ORIGINAL RATIONALE IS DEAD; THE TEST IS NOT (#2324). This docstring
+    used to say a use_stale: 'false' payload "would silently bypass the
+    MECH-5 stale-premise block". That is no longer true in either direction:
+    stale premises now block UNCONDITIONALLY — _validate_premises' stale
+    return is not gated on use_stale's value at all — so no value of this
+    parameter, well-formed or malformed, can bypass anything. There is no
+    blocking-guard weakening left for a truthy string to achieve here.
+
+    Kept for schema hygiene rather than safety: a caller passing a JSON
+    string where a boolean is declared should get a consistent, immediate
+    error on this parameter for the same reason as every other, and the
+    parameter itself survives only until #2013 slice 2 removes it.
+
+    Fairy round-1 blocker on PR #110 caught the original gap.
+
+    This docstring used to add "Pattern parallels _resolve_impl's identical
+    guard." Dropped: _resolve_impl has no use_stale parameter and no such
+    guard — issue #229 removed the field on 2026-05-20, three months before
+    #2324, when engram_resolve became pure-wire. The sibling that documents
+    that removal (test_wave_2_bool_coercion_sweep.py) has said so since;
+    this file kept pointing at the guard anyway. Predates #2324 and is not
+    drift this PR caused, but it is a false sentence in a docstring this PR
+    is editing, which is a poor place to leave one.
     """
     server = fresh_server()
     obs_a, obs_b = _seed_premises(server)

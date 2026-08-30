@@ -10,7 +10,7 @@ Coverage:
      duplicate edge in DB.
   3. Whitelist enforcement — `cites` blocked (returns "not addable" error).
   4. Whitelist enforcement — `derives_from` blocked (cascade-bearing).
-  5. Whitelist enforcement — `supersedes` blocked (cascade-bearing).
+  5. Whitelist enforcement — `supersedes` blocked (structural mutation).
   6. Source-node-missing — nonexistent source_id returns error.
   7. Target-node-missing — nonexistent target_id returns error.
   8. Payload validation — unknown field returns error listing allowed fields.
@@ -191,11 +191,14 @@ def test_add_derives_from_edge_rejected():
     assert "not addable via engram_add_edge" in r["error"], r
 
 
-# ── 5. Whitelist enforcement: `supersedes` blocked (cascade-bearing) ────────
+# ── 5. Whitelist enforcement: `supersedes` blocked (structural mutation) ──
 
 
 def test_add_supersedes_edge_rejected():
-    """Relation 'supersedes' is cascade-bearing and must be blocked."""
+    """Relation 'supersedes' is a structural-mutation edge (revision
+    history), not cascade-bearing (#2255 round-3 review fix — see
+    EDGE_CLASSIFICATIONS' cascade flag, #2252 Stage 1.0a), and must be
+    blocked regardless."""
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
     r = json.loads(server.engram_add_edge(payload_json=json.dumps({
@@ -462,18 +465,18 @@ def test_add_non_exemplifies_omits_cache_rebuild():
     )
 
 
-# ── 11. DAG guard fires for `subtask_of` (dag_check=True) ─────────────────
+# ── 11. DAG guard fires for `subtask_of` (temporal_causal=True) ─────────────────
 
 
 def test_dag_guard_fires_for_subtask_of_when_source_older():
     """DAG guard blocks `subtask_of` when source.created_at < target.created_at.
 
-    `subtask_of` has dag_check=True + addable_after_creation=True — so the
+    `subtask_of` has temporal_causal=True + addable_after_creation=True — so the
     guard fires today, not only for hypothetical future relations.
 
-    NOTE: `serves` was originally tested here but gained a dag_check=False
+    NOTE: `serves` was originally tested here but gained a temporal_causal=False
     exemption in #1076 (a goal can be articulated after the work serving it).
-    `subtask_of` remains dag_check=True and is now the canonical test case.
+    `subtask_of` remains temporal_causal=True and is now the canonical test case.
     """
     server = fresh_server()
     person_id, obs_id = _seed_self_anchor_and_obs(server)
@@ -521,7 +524,7 @@ def test_serves_allows_source_older_than_target():
     """serves.source can legitimately pre-date serves.target — #1076 exemption.
 
     A goal can be articulated after the work that serves it, so `serves` has
-    dag_check=False (exempted in #1076, three-tier edge taxonomy). This test
+    temporal_causal=False (exempted in #1076, three-tier edge taxonomy). This test
     guards that exemption against future regression: back-dating the source
     older than the target must NOT produce a DAG error.
     """
@@ -540,7 +543,7 @@ def test_serves_allows_source_older_than_target():
     obs2_id = obs2["observation_id"]
 
     # Back-date obs_id (source) so it is older than obs2_id (target).
-    # For dag_check=False relations this must succeed, not raise a DAG error.
+    # For temporal_causal=False relations this must succeed, not raise a DAG error.
     conn = server._get_db()
     try:
         conn.execute(
@@ -565,13 +568,13 @@ def test_serves_allows_source_older_than_target():
     assert r["relation"] == "serves"
 
 
-# ── 12. Happy path for `serves` (dag_check=False, any timestamp order) ──
+# ── 12. Happy path for `serves` (temporal_causal=False, any timestamp order) ──
 
 
 def test_add_serves_edge_correct_order_succeeds():
     """Adding a `serves` edge returns status='created' regardless of timestamp order.
 
-    Confirms the dag_check=False path works end-to-end for `serves`.
+    Confirms the temporal_causal=False path works end-to-end for `serves`.
     Source newer than target also works (just not the only valid ordering).
     """
     server = fresh_server()

@@ -832,11 +832,31 @@ def _write_canonical_knowledge_sql(pkg_db_path: Path, sql_out_path: Path) -> byt
 
     DDL inclusion decisions:
       INCLUDED  — nodes, edges, sequences, edit_history, diagnostic_history,
-                  tool_timing, focus_sets, focus_state (full schema, empty
-                  runtime tables included so EngramClient can operate against
-                  the built db without migration errors), plus nodes_fts FTS5
-                  virtual table + its triggers (FTS5 is built into SQLite's
-                  standard amalgamation, plain sqlite3 handles it fine).
+                  tool_timing, focus_sets, focus_state, cascade_markers (full
+                  schema, empty runtime tables included so EngramClient can
+                  operate against the built db without migration errors),
+                  plus nodes_fts FTS5 virtual table + its triggers (FTS5 is
+                  built into SQLite's standard amalgamation, plain sqlite3
+                  handles it fine).
+                  cascade_markers added 2026-08-16 (engram-alpha#2013/#2009 —
+                  the cascade machine): its own CREATE INDEX statements were
+                  already being emitted by DDL Section 3 below regardless
+                  (that query has no table allowlist, it grabs every non-
+                  sqlite-internal index), so before this fix a scope-exported
+                  pack on a graph running the cascade-marker schema would ship
+                  three CREATE INDEX statements against a table whose CREATE
+                  TABLE was never emitted — `executescript` on the consumer
+                  side would abort mid-transaction on the first such index,
+                  before even the nodes/edges data loaded. Caught by
+                  `test_build_sh_succeeds_on_exported_pack` doing a real
+                  export→delete→rebuild round trip, not by a schema diff —
+                  the failure only manifests on rebuild, which is exactly the
+                  scenario a plain `sqlite3.connect` + `CREATE TABLE IF NOT
+                  EXISTS` migration path (what a live EngramClient would do)
+                  never exercises, since `_init_db` self-heals a missing
+                  table on any live install. This allowlist is the one
+                  surface that doesn't self-heal — a new table needs adding
+                  here explicitly, every time.
       EXCLUDED  — vec_nodes and all vec_* shadow tables: require the sqlite-vec
                   extension (vec0 module) which is NOT available in a standard
                   sqlite3 binary.  Embedding-dependent search degrades silently
@@ -853,7 +873,7 @@ def _write_canonical_knowledge_sql(pkg_db_path: Path, sql_out_path: Path) -> byt
     Emit order (required for correct FK dependency resolution):
       1. nodes (no FK deps)
       2. edges, sequences, edit_history, diagnostic_history, tool_timing,
-         focus_sets, focus_state (after nodes)
+         focus_sets, focus_state, cascade_markers (after nodes)
       3. nodes_fts VIRTUAL TABLE (must come after nodes; it uses
          content='nodes' external content table)
       4. Indexes (ORDER BY name for determinism)
@@ -890,6 +910,7 @@ def _write_canonical_knowledge_sql(pkg_db_path: Path, sql_out_path: Path) -> byt
         "tool_timing",
         "focus_sets",
         "focus_state",
+        "cascade_markers",  # FK-references nodes(id) — must follow "nodes"
     ]
     for tname in _TABLE_EMIT_ORDER:
         row = conn.execute(

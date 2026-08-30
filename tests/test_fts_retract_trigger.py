@@ -29,10 +29,21 @@ Coverage:
     4. test_query_post_retract_does_not_return_retracted — end-to-end:
        engram_query excludes retracted nodes both before and after retraction,
        and also with include_superseded=True after #274.
-    5. test_supersede_then_retract_still_removes_from_fts — node superseded
-       first (is_current→0, removed from FTS by supersede trigger) then retracted
-       (retract trigger does not fire on already-superseded node); node remains
-       absent from FTS throughout.
+    5. test_supersede_then_plain_retract_is_refused_and_fts_is_untouched —
+       #2396 (round 2): a plain engram_retract of an already-superseded node
+       (is_current→0 via supersede) is now REFUSED before it reaches the DB.
+       The refusal names the successor, carries no "status" key, and mutates
+       no FTS state — this is the verb-route replacement for what used to be
+       test 5 (pre-#2396, that route reached a real retract of a superseded
+       node; #2396 closes it).
+    6. test_db_level_retract_of_a_superseded_node_does_not_double_delete_from_fts —
+       #2396: _retract_impl can no longer reach the supersede-then-retract DB
+       transition (see test 5 above), but the retract trigger's
+       OLD.is_current=1 guard remains load-bearing for any OTHER writer that
+       might reach it (a migration, a future code path, a hand-run UPDATE).
+       Exercises the guard directly in SQL, bypassing _retract_impl entirely
+       (same idiom as test 3), and asserts no double-delete ("database disk
+       image is malformed" — see test 3's docstring for that failure mode).
 
 Import-pattern contract (#948 wave 0 pilot — R1):
     This file imports engram_revision, engram_observation, engram_query, and
@@ -403,30 +414,42 @@ def test_query_post_retract_does_not_return_retracted():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: supersede-then-retract path — trigger fires on status transition
+# Test 5: supersede-then-retract, the VERB route — #2396 refuses it
 # ---------------------------------------------------------------------------
 
-def test_supersede_then_retract_still_removes_from_fts():
-    """A node that was first superseded, then retracted, is absent from FTS throughout.
+def test_supersede_then_plain_retract_is_refused_and_fts_is_untouched():
+    """A plain retract of an already-superseded node is REFUSED (#2396).
 
-    Design rev 2026-07-02 (#195): the supersede trigger (nodes_fts_supersede_remove)
-    removes the node from FTS when is_current flips to 0.  By the time the
-    subsequent retract fires, the node is already absent — the retract trigger
-    (nodes_retract_remove_from_fts) has OLD.is_current=1 guard so it does NOT
-    fire on an already-superseded node, preventing a double-delete.
+    Pre-#2396, this file's test 5 drove supersede(A, B) then a real
+    ``_retract_impl(a_id, ...)`` and asserted the node stayed absent from FTS
+    across both steps. #2396 (round 2) bans that second step outright: a
+    plain ``engram_retract`` of a NON-CURRENT node (already superseded or
+    retracted) is refused before it ever reaches the DB, mirroring
+    ``_supersede_impl``'s own ``is_current`` guard. Retracting an
+    already-superseded node used to reopen #2343's double-adjudication
+    through a second door and was not idempotent — see #2396 / #2013 for the
+    full argument; this test only exercises the VERB-level consequence.
 
-    Net result: node is absent from FTS after supersede AND after retract.
+    Supersede A with B — A leaves FTS via the supersede trigger
+    (nodes_fts_supersede_remove, #195). Then call ``_retract_impl(a_id,
+    ...)`` and assert it is refused: the return carries an "error" key that
+    names the successor, carries NO "status" key (nothing was retracted),
+    and A is still absent from FTS afterward — i.e. the refusal mutated no
+    FTS state. The sibling test below,
+    ``test_db_level_retract_of_a_superseded_node_does_not_double_delete_from_fts``,
+    covers the DB-level trigger guard that this refusal makes unreachable
+    through the verb but which remains load-bearing for any other writer.
     """
-    rev, obs, qry, _core = _make_fresh_mods()
+    rev, obs, _qry, _core = _make_fresh_mods()
 
     token_a = "fts280supretract_uniquetokenA5"
     token_b = "fts280supretract_uniquetokenB5"
 
-    # Node A: will be superseded, then retracted.
+    # Node A: will be superseded, then have a plain retract refused.
     a_id = _add_observation(
         obs,
         claim=f"Supersede-then-retract claim {token_a} for trigger test 5.",
-        quoted_text=f"Quote with {token_a} to be superseded then retracted.",
+        quoted_text=f"Quote with {token_a} to be superseded then retract-refused.",
         url="https://example.com/fts280-a5",
     )
     rowid_a = _get_node_rowid(a_id)
@@ -444,7 +467,9 @@ def test_supersede_then_retract_still_removes_from_fts():
         f"Token '{token_a}' should match rowid {rowid_a} in nodes_fts before supersede."
     )
 
-    # Step 1: Supersede A with B — A becomes is_current=0, status='superseded'.
+    # Step 1: Supersede A with B — A becomes is_current=0 (status column is
+    # untouched by supersede — _supersede_impl only ever writes is_current
+    # and superseded_by, never status; see engram_revision.py:2285).
     sup = json.loads(rev._supersede_impl(
         a_id, b_id, supersede_reason="FTS trigger regression test #280 — test 5 step 1"
     ))
@@ -457,33 +482,123 @@ def test_supersede_then_retract_still_removes_from_fts():
         "when is_current flips to 0 (#195)."
     )
 
-    # Step 2: Retract A — now is_current=0 AND status transitions to 'retracted'.
+    # Step 2: A plain retract of A — now non-current — must be REFUSED (#2396).
     ret = json.loads(rev._retract_impl(
         node_id=a_id,
         error_type="other",
-        reason="FTS trigger regression test #280 — test 5 step 2",
+        reason="FTS trigger regression test #280 — test 5 step 2 (#2396 refusal)",
     ))
-    assert ret.get("status") == "retracted", f"retract failed: {ret}"
-
-    # After retract: A remains absent from FTS (was already removed by supersede trigger;
-    # retract trigger has OLD.is_current=1 guard so it does not fire on this path).
-    assert rowid_a not in _fts_match_rowids(token_a), (
-        f"Token '{token_a}' must NOT match rowid {rowid_a} after supersede+retract. "
-        "Node was removed from FTS by the supersede trigger; retract trigger correctly "
-        "does not fire (OLD.is_current was already 0)."
+    assert "error" in ret, (
+        f"a plain retract of an already-superseded node must be refused (#2396): {ret}"
+    )
+    assert b_id in ret["error"], (
+        f"the refusal must name the current successor '{b_id}': {ret['error']}"
+    )
+    assert "status" not in ret, (
+        f"a refused retract must report no status transition: {ret}"
     )
 
-    # Also verify via end-to-end query: include_superseded=True must not return A.
-    query_result = json.loads(qry._query_impl(
-        query=token_a,
-        include_superseded=True,
-        top_k=20,
-        return_debug=True,
+    # After the refused retract: A is STILL absent from FTS (unchanged from
+    # the post-supersede state) — a refusal must mutate no FTS state.
+    assert rowid_a not in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' must still NOT match rowid {rowid_a} after the refused "
+        "retract — a refusal must leave FTS state exactly as the supersede left it."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: supersede-then-retract, the DB-LEVEL route — the trigger guard
+# ---------------------------------------------------------------------------
+
+def test_db_level_retract_of_a_superseded_node_does_not_double_delete_from_fts():
+    """The retract trigger's OLD.is_current=1 guard stays load-bearing (#2396).
+
+    #2396 closes the VERB route to "retract an already-superseded node" (see
+    test 5 above) — but the guard clause itself
+    (``AND OLD.is_current = 1``, engram_core.py's nodes_retract_remove_from_fts
+    trigger, ~line 2012) is NOT deleted, because it protects the DB layer
+    against ANY writer that reaches this state, not only the verb: a
+    migration, a future code path, or a hand-run UPDATE. Without the guard, a
+    SECOND FTS5 'delete' magic-insert on a rowid the supersede trigger has
+    already removed raises "database disk image is malformed" (see test 3's
+    docstring above for that failure mode) — real corruption, not a wrong
+    answer.
+
+    This test reaches the same DB transition directly in SQL, bypassing
+    ``_retract_impl`` entirely (the same idiom test 3 already uses): after a
+    real supersede via the verb, issue a raw
+    ``UPDATE nodes SET status = 'retracted' WHERE id = ?`` on the connection
+    and commit. Asserts no exception is raised and that the node stays
+    absent from FTS — i.e. the guard still prevents the double-delete for a
+    writer that isn't ``_retract_impl``.
+
+    Mutation-checked (#2396 round 2): with the ``AND OLD.is_current = 1``
+    clause deleted from the trigger, this exact test goes red with
+    ``sqlite3.OperationalError: database disk image is malformed`` on the
+    ``UPDATE`` below — confirming the test would actually catch a regression
+    of the guard, not merely exercise a no-op.
+    """
+    rev, obs, _qry, _core = _make_fresh_mods()
+
+    token_a = "fts280supretractdb_uniquetokenA6"
+    token_b = "fts280supretractdb_uniquetokenB6"
+
+    # Node A: will be superseded, then retracted at the raw-SQL level.
+    a_id = _add_observation(
+        obs,
+        claim=f"DB-level supersede-then-retract claim {token_a} for trigger test 6.",
+        quoted_text=f"Quote with {token_a} to be superseded then DB-level retracted.",
+        url="https://example.com/fts280-a6",
+    )
+    rowid_a = _get_node_rowid(a_id)
+
+    # Node B: the superseder (just needs to exist).
+    b_id = _add_observation(
+        obs,
+        claim=f"Superseder claim {token_b} for trigger test 6.",
+        quoted_text=f"Quote with {token_b} as superseder.",
+        url="https://example.com/fts280-b6",
+    )
+
+    # Before anything: A is in FTS.
+    assert rowid_a in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' should match rowid {rowid_a} in nodes_fts before supersede."
+    )
+
+    # Step 1: Supersede A with B via the real verb — A becomes is_current=0.
+    sup = json.loads(rev._supersede_impl(
+        a_id, b_id, supersede_reason="FTS trigger regression test #280 — test 6 step 1"
     ))
-    returned_ids = {n["id"] for n in query_result.get("results", [])}
-    assert a_id not in returned_ids, (
-        f"Retracted node {a_id} must not appear in engram_query with include_superseded=True "
-        f"after supersede+retract. Results: {returned_ids}"
+    assert sup.get("status") == "superseded", f"supersede failed: {sup}"
+
+    # After supersede: A is already ABSENT from FTS — supersede trigger fired.
+    assert rowid_a not in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' must NOT match rowid {rowid_a} after supersede. "
+        "The supersede trigger (nodes_fts_supersede_remove) removes nodes from FTS "
+        "when is_current flips to 0 (#195)."
+    )
+
+    # Step 2: Bypass _retract_impl entirely — raw SQL retract of the
+    # already-superseded node, same idiom as test 3's migration-bypass SQL.
+    # This must NOT raise "database disk image is malformed": the trigger's
+    # OLD.is_current=1 guard sees OLD.is_current=0 (set by the supersede
+    # above) and does not fire a second 'delete' magic-insert.
+    db_path = os.path.join(TEST_DIR, "knowledge.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "UPDATE nodes SET status = 'retracted' WHERE id = ?",
+        (a_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    # After the raw SQL retract: A remains absent from FTS — the guard
+    # prevented a double-delete, and no corruption occurred.
+    assert rowid_a not in _fts_match_rowids(token_a), (
+        f"Token '{token_a}' must NOT match rowid {rowid_a} after the raw SQL retract. "
+        "The retract trigger's OLD.is_current=1 guard must prevent a second FTS5 "
+        "'delete' magic-insert on an already-removed rowid."
     )
 
 

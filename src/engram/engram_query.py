@@ -30,7 +30,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional
 
 import engram_core as core
 from engram_log_emitter import emit_if_initialized
@@ -51,7 +51,13 @@ _TYPE_ALIASES: dict[str, str] = {
 # recall_summary in the recall view.
 _LOGICAL_SUBSTRATE_RELATIONS = frozenset({
     "derives_from",
+    "acknowledged_derives_from",  # #2357: cascade-frontier acknowledgement
+                     # edge — same dependency tier and provenance weight as
+                     # derives_from, classified alongside it.
     "supported_by",
+    "predicted_by",  # #2252 W6: prediction pairing edge, split out of
+                     # supported_by — same dependency tier, same
+                     # logical/epistemic weight, so classified alongside it.
     "supersedes",
     "contradicts",
     "resolves",
@@ -234,9 +240,16 @@ def _pattern_open_question_answerable(
     top_k = int(preset_params.get("top_k", 15))
     min_conf = float(preset_params.get("min_confidence", 0.0))
 
+    # #1860: widened from status='open' alone -- a partially_resolved question
+    # already has some evidence landed, making it the MOST likely to have a
+    # derivation chain nearby, not less. The prior open-only filter silently
+    # admitted a near-empty candidate set on graphs where most live questions
+    # sit at partially_resolved, and the fairy reported that as "clean" rather
+    # than "out of scope" -- see #1860 for the false-completeness failure mode.
     questions = conn.execute(
         "SELECT id, claim FROM nodes "
-        "WHERE type='question' AND is_current=1 AND status='open' "
+        "WHERE type='question' AND is_current=1 "
+        "AND status IN ('open', 'partially_resolved') "
         "ORDER BY id DESC LIMIT 200"
     ).fetchall()
 
@@ -253,7 +266,18 @@ def _pattern_open_question_answerable(
             type_filter={"derivation"},
             importance_threshold=0.0,
         )
-        matches = [m for m in matches if (m.get("confidence") or 0) >= min_conf]
+        # min_confidence is a CB-only predicate (#2252 stage 1.7): ask "is
+        # this claim-bearing" before applying the threshold, rather than
+        # letting absent-confidence collapse to zero. NCB nodes and CB
+        # nodes with a NULL confidence always pass.
+        filtered_matches = []
+        for m in matches:
+            is_cb = core._is_claim_bearing(m.get("type"))
+            conf = m.get("confidence")
+            if is_cb and conf is not None and conf < min_conf:
+                continue  # drop: claim-bearing and genuinely below threshold
+            filtered_matches.append(m)
+        matches = filtered_matches
         if not matches:
             continue
         best = matches[0]
@@ -555,6 +579,42 @@ def _pattern_cornerstone_candidate(
         ).fetchone()[0]
         if already_anchored:
             continue
+        # #2255 colleague-review fix: this is a THIRD, deliberately distinct
+        # relation set from core.CITATION_SUPPORT_RELATIONS ({derives_from,
+        # supported_by}) — do not unify the two. This is cornerstone-candidate
+        # SCORING, not the uncited-observation check: it includes 'cites',
+        # which CITATION_SUPPORT_RELATIONS excludes on purpose (see that
+        # constant's own comment in engram_core.py). Unifying onto
+        # CITATION_SUPPORT_RELATIONS would drop 'cites' from the count
+        # entirely. Measured on two independent ENGRAM graphs, that removes
+        # roughly two-thirds of it (63% and 67%) — so cornerstone-candidate
+        # scoring would silently lose most of its citation signal and
+        # min_citations would filter a different population. Do not state
+        # absolute edge counts here: they are install-specific (every ENGRAM
+        # graph has a different edge population) and would be wrong for
+        # every other reader — the two-graph agreement in direction is the
+        # portable fact, not either graph's number.
+        #
+        # #2252 W6 design decision: `predicted_by` is DELIBERATELY EXCLUDED
+        # from this tuple — do not add it back. Cornerstone candidacy asks
+        # whether an observation is LOAD-BEARING: whether other CLAIMS rest
+        # on it. Predictions are non-claim-bearing (#2252 Q1 FINAL). A
+        # prediction attached to an observation is a tracker, not a
+        # dependent claim, so it should never have counted as a load-bearing
+        # citation. The pre-split behaviour — where the pairing edge's
+        # `supported_by` name made it count here by accident, because it
+        # shared a literal with the real citation relations — was the bug;
+        # excluding `predicted_by` is the correction, not a regression.
+        #
+        # Known transient inconsistency, owned by W3: because the W6
+        # migration is additive (old `supported_by` pairing edges are never
+        # deleted, only paralleled with a new `predicted_by` edge), a
+        # migrated pre-W6 prediction's stale `supported_by` edge STILL
+        # counts toward its observation's cite_count here, while a
+        # newly-minted post-W6 prediction (predicted_by only) does not.
+        # This is a known artifact of the additive migration, not an
+        # oversight — it resolves when W3 retires the stale `supported_by`
+        # pairing edges.
         cite_count = conn.execute(
             "SELECT COUNT(*) FROM edges WHERE target_id=? "
             "AND relation IN ('supported_by', 'cites', 'derives_from')",
@@ -603,27 +663,29 @@ def _pattern_tainted_still_valid(
     top_k = int(preset_params.get("top_k", 15))
     min_conf = float(preset_params.get("min_confidence", 0.0))
 
-    # Taint is stored in metadata.tainted_by (array of upstream retracted/
-    # superseded node IDs that triggered the cascade). The memory_status
-    # field remains 'active' — the taint signal lives in the JSON metadata,
-    # not in a top-level column. json_extract scans efficiently in SQLite.
+    # Taint lives in cascade_markers, not metadata (#2013/#2009 slice 1 —
+    # the cascade machine). Pull every node with at least one pending
+    # taint-severity marker: distinct node_id, joined to nodes for the
+    # candidate fields.
     rows = conn.execute(
-        "SELECT id, type, claim, confidence, metadata FROM nodes "
-        "WHERE is_current=1 "
-        "AND json_extract(metadata, '$.tainted_by') IS NOT NULL "
-        "AND json_array_length(json_extract(metadata, '$.tainted_by')) > 0"
+        "SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n "
+        "JOIN cascade_markers cm ON cm.node_id = n.id "
+        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
     ).fetchall()
 
     candidates: list[dict] = []
-    for nid, ntype, claim, conf, metadata in rows:
-        conf = conf or 0
-        if conf < min_conf:
-            continue
-        try:
-            md = json.loads(metadata or "{}")
-        except (ValueError, json.JSONDecodeError):
-            md = {}
-        tainted_by = md.get("tainted_by") or []
+    for nid, ntype, claim, conf in rows:
+        # min_confidence is a CB-only predicate (#2252 Stage 1.7): ask "is
+        # this claim-bearing" before applying the threshold, rather than
+        # letting absent-confidence collapse to zero. NCB nodes and CB
+        # nodes with a NULL confidence always pass. Carried across the
+        # marker migration unchanged — the predicate is about which nodes
+        # the threshold *applies to*, which is independent of where the
+        # taint is stored.
+        if core._is_claim_bearing(ntype) and conf is not None and conf < min_conf:
+            continue  # drop: claim-bearing and genuinely below threshold
+        conf = conf or 0  # display/score coercion, applied only after the filter decision
+        tainted_by, _ = core._classify_pending_markers(conn, nid)
         candidates.append({
             "id": nid,
             "type": ntype,
@@ -686,7 +748,12 @@ def _pattern_recent_resolution_echo(
             row = conn.execute(
                 "SELECT status FROM nodes WHERE id=?", (m["id"],)
             ).fetchone()
-            if not row or row[0] != "open":
+            # #1860: widened from == "open" -- same rationale as Category 1's
+            # filter above _pattern_open_question_answerable: a
+            # partially_resolved question already has evidence landed, so a
+            # semantically-close recent resolution is a plausible echo for it
+            # too, not just for fully-open questions.
+            if not row or row[0] not in ("open", "partially_resolved"):
                 continue
             seen_questions.add(m["id"])
             candidates.append({
@@ -913,17 +980,37 @@ def _build_inspect_recall_view(
 
     # Sort logical neighbors into upstream / downstream / lateral.
     # Upstream: outgoing edges — the inspected node uses/cites/resolves/supersedes
-    #   the neighbor (outgoing derives_from, supported_by, supersedes, resolves, subtask_of).
+    #   the neighbor (outgoing members of _UPSTREAM_OUTGOING, defined below --
+    #   named here rather than re-enumerated, since the prior hand-listed
+    #   enumeration went stale the moment predicted_by was added to the set
+    #   without this comment being touched, #2252 W6; a specific line-count
+    #   claim would only repeat the same mistake under a different name).
     # Downstream: incoming edges — the neighbor uses/cites/resolves/supersedes the
     #   inspected node (incoming versions of the same relations, including incoming
     #   subtask_of children).
-    # Lateral: contradicts (both dirs), tensions, exemplifies, retracts.
+    # Lateral: contradicts (both dirs), tensions, exemplifies, retracts
+    #   (== _LATERAL_RELATIONS, defined below; verified live to still match,
+    #   #2252 W6 -- this one recites members and is accurate today, left
+    #   as-is rather than converted for its own sake).
     upstream: list[dict] = []
     downstream: list[dict] = []
     lateral: list[dict] = []
 
+    # #2252 Stage 1.0b: DELIBERATELY LEFT ENUMERATED, not derived from
+    # CASCADE_RELATIONS or any EDGE_CLASSIFICATIONS flag. This set is a
+    # display-directionality decision (which relations read as "upstream" in
+    # engram_inspect) — a deliberate UX choice, not a computable property.
+    # A new cascade relation does not thereby deserve to render upstream, so
+    # do not "fix" this to derive from `cascade`.
     _UPSTREAM_OUTGOING = frozenset({
-        "derives_from", "supported_by", "supersedes", "resolves", "subtask_of"
+        "derives_from", "supported_by", "predicted_by", "supersedes", "resolves", "subtask_of"
+        # predicted_by (#2252 W6, blocker 1): the prediction-pairing edge
+        # split out of supported_by keeps supported_by's own directionality
+        # here — prediction is still the outgoing source, so an outgoing
+        # predicted_by edge still reads as upstream (the paired observation
+        # is the prediction's evidential basis). Missing this made
+        # engram_inspect report the pairing edge under downstream — the
+        # exact inversion of the direction this PR's own commit asserts.
     })
     _LATERAL_RELATIONS = frozenset({
         "contradicts", "tensions", "exemplifies", "retracts"
@@ -1159,11 +1246,17 @@ def _build_inspect_edges_view(
 
 
 def _extract_warnings(
-    metadata: Union[str, dict, None],
+    node_id: Optional[str],
     conn: sqlite3.Connection,
 ) -> Optional[dict]:
-    """Convert metadata.tainted_by / metadata.stale_by into a structured
+    """Convert node_id's pending cascade markers into a structured
     warnings object for surface-level exposure (MECH-5).
+
+    Migrated off metadata.tainted_by / metadata.stale_by to the
+    cascade_markers table (#2013/#2009 slice 1 — the cascade machine).
+    Takes node_id rather than a metadata blob now, since the marker table
+    is keyed on node_id and no longer reachable from a node's own metadata
+    JSON at all.
 
     Previously these fields were buried inside the raw metadata JSON blob,
     so agents reading a tainted derivation saw the original confidence and
@@ -1185,20 +1278,10 @@ def _extract_warnings(
             ],
         }
     """
-    if metadata is None:
-        return None
-    if isinstance(metadata, str):
-        if not metadata:
-            return None
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            return None
-    if not isinstance(metadata, dict):
+    if not node_id:
         return None
 
-    tainted_ids = metadata.get("tainted_by") or []
-    stale_ids = metadata.get("stale_by") or []
+    tainted_ids, stale_ids = core._classify_pending_markers(conn, node_id)
     if not tainted_ids and not stale_ids:
         return None
 
@@ -1602,7 +1685,12 @@ def _search_nodes(
                 continue
             if not include_superseded and not r["is_current"]:
                 continue
-            if r["confidence"] is not None and r["confidence"] < min_confidence:
+            # min_confidence is a CB-only predicate (#2252 stage 1.7): ask
+            # "is this claim-bearing" before applying the threshold, rather
+            # than treating NULL confidence as a number. NCB nodes and CB
+            # nodes with a NULL confidence always pass.
+            is_cb = core._is_claim_bearing(r["type"])
+            if is_cb and r["confidence"] is not None and r["confidence"] < min_confidence:
                 continue
             if tier2_threshold > 0 and (r["importance_score"] or 0) < tier2_threshold:
                 continue
@@ -1653,7 +1741,9 @@ def _search_nodes(
         for s in sem_results:
             sim_lookup[s["id"]] = s["similarity"]
             if s["id"] not in fts_ids:
-                if s["confidence"] is not None and s["confidence"] < min_confidence:
+                # Same CB-only predicate as the FTS branch above (#2252 stage 1.7).
+                is_cb = core._is_claim_bearing(s["type"])
+                if is_cb and s["confidence"] is not None and s["confidence"] < min_confidence:
                     continue
                 semantic_only.append(s)
 
@@ -2471,8 +2561,7 @@ def _surface_impl(
         # drift structurally impossible.
         warned_nodes: dict[str, dict] = {}
         for n in results:
-            meta_str = n.get("metadata", "")
-            w = _extract_warnings(meta_str, conn)
+            w = _extract_warnings(n["id"], conn)
             if w:
                 warned_nodes[n["id"]] = w
         stale_count = sum(1 for w in warned_nodes.values() if w.get("stale_by"))
@@ -2717,7 +2806,7 @@ def _inspect_impl(
             node["last_assessed_ago"] = core._humanized_ago(node.get("last_assessed_at"), now=now_utc)
 
         # MECH-5: surface taint / stale as a top-level warning.
-        warnings = _extract_warnings(meta, conn)
+        warnings = _extract_warnings(node_id, conn)
 
         # Refresh recall on the target node ONLY (skip in dream mode)
         if not dream_mode:
@@ -2772,7 +2861,7 @@ def _query_impl(
         for node in search["results"]:
             # MECH-5: extract warnings BEFORE popping metadata so agents
             # reading query results see taint / stale status.
-            w = _extract_warnings(node.get("metadata"), conn)
+            w = _extract_warnings(node.get("id"), conn)
             # #1940: extract the typed relational fields BEFORE popping
             # metadata, same ordering discipline as the warnings extraction
             # above. Gated on `not return_debug`: return_debug=True's

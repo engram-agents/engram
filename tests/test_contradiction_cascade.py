@@ -106,6 +106,40 @@ def _mk_ct(derive, node_a: str, node_b: str, description: str) -> str:
     return r["contradiction_id"]
 
 
+def _stale_by(core, node_id: str) -> set:
+    """root_node ids of node_id's pending supersede-severity markers.
+    Migrated off metadata.stale_by to cascade_markers (#2013/#2009 slice 1)
+    — same observable meaning (which roots this node is stale because of),
+    new storage.
+    """
+    conn = core._get_db()
+    try:
+        rows = conn.execute(
+            "SELECT root_node FROM cascade_markers WHERE node_id = ? "
+            "AND root_op = 'supersede' AND status = 'pending'",
+            (node_id,),
+        ).fetchall()
+        return {r["root_node"] for r in rows}
+    finally:
+        conn.close()
+
+
+def _tainted_by(core, node_id: str) -> set:
+    """root_node ids of node_id's pending retract-severity markers.
+    Migrated off metadata.tainted_by to cascade_markers.
+    """
+    conn = core._get_db()
+    try:
+        rows = conn.execute(
+            "SELECT root_node FROM cascade_markers WHERE node_id = ? "
+            "AND root_op = 'retract' AND status = 'pending'",
+            (node_id,),
+        ).fetchall()
+        return {r["root_node"] for r in rows}
+    finally:
+        conn.close()
+
+
 # ── Supersede cascade ──────────────────────────────────────────────────────
 
 
@@ -153,14 +187,12 @@ def test_supersede_same_type_marks_contradiction_stale():
     assert r["stale_contradiction_count"] == 1, r
     assert r["stale_contradictions"][0]["id"] == ct_id
 
-    # Inspect ct to confirm metadata (view="deep" for forensic field access)
-    ct_inspect = json.loads(qry._inspect_impl(node_id=ct_id, view="deep", dream_mode=True))
-    ct_meta = json.loads(ct_inspect["node"]["metadata"])
-    assert "stale_by" in ct_meta
-    assert ob_a in ct_meta["stale_by"]
-    stale_repl = ct_meta.get("stale_replacement")
-    assert isinstance(stale_repl, dict), f"stale_replacement should be dict, got {type(stale_repl)}"
-    assert stale_repl.get(ob_a) == ob_a_refined, f"expected {{{ob_a}: {ob_a_refined}}}, got {stale_repl}"
+    # Confirm the ct node picked up a pending supersede-severity marker
+    # rooted at ob_a (#2013/#2009 slice 1 — cascade_markers, not metadata).
+    # stale_replacement is retired: a downstream node's own replacement is
+    # no longer cached at marking time (see engram_revision.py's module
+    # docstring) — there's nothing to assert here anymore.
+    assert ob_a in _stale_by(core, ct_id)
 
 
 def test_supersede_unrelated_node_does_not_flag_contradiction():
@@ -181,10 +213,8 @@ def test_supersede_unrelated_node_does_not_flag_contradiction():
     assert r.get("status") == "superseded", r
     assert r["stale_contradiction_count"] == 0
 
-    # ct should still be clean (view="deep" for forensic field access)
-    ct_inspect = json.loads(qry._inspect_impl(node_id=ct_id, view="deep", dream_mode=True))
-    ct_meta = json.loads(ct_inspect["node"]["metadata"]) if ct_inspect["node"].get("metadata") else {}
-    assert ct_meta.get("stale_by", []) == []
+    # ct should still be clean — no pending marker at all.
+    assert _stale_by(core, ct_id) == set()
 
 
 def test_supersede_cascades_to_multiple_contradictions():
@@ -226,10 +256,7 @@ def test_retract_marks_contradiction_tainted_by():
     assert r["tainted_contradiction_count"] == 1, r
     assert r["tainted_contradictions"][0]["id"] == ct_id
 
-    ct_inspect = json.loads(qry._inspect_impl(node_id=ct_id, view="deep", dream_mode=True))
-    ct_meta = json.loads(ct_inspect["node"]["metadata"])
-    assert "tainted_by" in ct_meta
-    assert ob_a in ct_meta["tainted_by"]
+    assert ob_a in _tainted_by(core, ct_id)
 
 
 def test_retract_unrelated_node_does_not_taint_contradiction():
@@ -310,13 +337,22 @@ def test_ct_0006_shape_supersede_then_resolve():
 
 
 def test_both_sides_superseded_preserves_all_replacements():
-    """When both contradicting sides of a ct are superseded in sequence,
-    metadata.stale_replacement must be dict-keyed so both replacements survive.
-    metadata.stale_by correctly appends both old IDs (was already correct
-    pre-fix). This test documents the fixed behavior from issue #231.
+    """When both contradicting sides of a ct are superseded in sequence, both
+    supersedes must survive as INDEPENDENT markers — the two-markers-per-
+    event invariant (#2013 §9 / comment 2026-08-14T21:23:31Z), not one
+    record clobbering the other.
 
-    Previously named test_both_sides_superseded_clobbers_stale_replacement;
-    updated when issue #231 landed (PR: fix/stale-replacement-dict-keyed).
+    Originally about metadata.stale_replacement's dict-keyed fix (issue
+    #231, "both replacements survive as separate entries"). Migrated to
+    cascade_markers (#2013/#2009 slice 1): the mechanism issue #231 fixed
+    (a single stale_replacement dict entry per old_node_id, previously
+    clobbered on the second supersede) doesn't exist anymore in the same
+    shape — the marker table's UNIQUE(node_id, cascade_event) constraint
+    plus one cascade_event per _supersede_impl call makes clobbering
+    structurally unreachable: two supersedes on two different roots ALWAYS
+    produce two separate marker rows on ct_id, never a shared field two
+    writes could collide on. What survives to test is the observable
+    behavior issue #231 was about: both roots show up, independently.
     """
     rev, obs, derive, qry, core = _make_fresh_mods()
     ob_a = _mk_obs(obs, "Source A says X.")
@@ -337,17 +373,24 @@ def test_both_sides_superseded_preserves_all_replacements():
     ))
     assert sup_b["stale_contradiction_count"] == 1
 
-    ct_inspect = json.loads(qry._inspect_impl(node_id=ct_id, view="deep", dream_mode=True))
-    ct_meta = json.loads(ct_inspect["node"]["metadata"])
+    # Both roots survive as independent pending markers on ct_id — neither
+    # supersede's marker clobbered the other's.
+    assert _stale_by(core, ct_id) == {ob_a, ob_b}
 
-    # stale_by correctly appends both old IDs (unchanged from pre-fix)
-    assert set(ct_meta["stale_by"]) == {ob_a, ob_b}, ct_meta["stale_by"]
-
-    # Fixed dict-keyed behavior: both replacements survive as separate entries.
-    stale_repl = ct_meta.get("stale_replacement")
-    assert isinstance(stale_repl, dict), f"stale_replacement should be dict, got {type(stale_repl)}"
-    assert stale_repl.get(ob_a) == ob_a_refined, f"entry for {ob_a} wrong: {stale_repl}"
-    assert stale_repl.get(ob_b) == ob_b_refined, f"entry for {ob_b} wrong: {stale_repl}"
+    # And they really are two separate rows (two cascade_events), not one
+    # row somehow carrying both roots — confirms the UNIQUE(node_id,
+    # cascade_event) constraint is doing the work, not a coincidence of
+    # the set comparison above.
+    conn = core._get_db()
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM cascade_markers WHERE node_id = ? "
+            "AND status = 'pending'",
+            (ct_id,),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert n == 2, f"expected 2 independent markers on {ct_id}, found {n}"
 
 
 # ── #1654 — BLOCKED_CONTRADICTED premise guard ─────────────────────────────
@@ -363,11 +406,20 @@ def test_contradict_itself_is_cascade_free():
     ob_b = _mk_obs(obs, "Claim A does not hold.")
     _mk_ct(derive, ob_a, ob_b, "Disagreement about A.")
 
+    # Migrated off metadata to cascade_markers (#2013/#2009 slice 1) via this
+    # file's own _tainted_by/_stale_by helpers. 34d7428 added those helpers and
+    # converted four other call sites but missed this one, leaving the only
+    # guard of the #1654 cascade-free invariant asserting over a store nothing
+    # writes — permanently true, unable to fail.
     for nid in (ob_a, ob_b):
-        node = json.loads(qry._inspect_impl(node_id=nid, view="deep", dream_mode=True))
-        meta = json.loads(node["node"]["metadata"]) if node["node"].get("metadata") else {}
-        assert "tainted_by" not in meta, f"{nid} should not be tainted by mere contradiction: {meta}"
-        assert "stale_by" not in meta, f"{nid} should not be staled by mere contradiction: {meta}"
+        assert not _tainted_by(core, nid), (
+            f"{nid} should not be tainted by mere contradiction: "
+            f"{_tainted_by(core, nid)}"
+        )
+        assert not _stale_by(core, nid), (
+            f"{nid} should not be staled by mere contradiction: "
+            f"{_stale_by(core, nid)}"
+        )
 
 
 def test_derive_blocked_contradicted_on_open_dispute():
@@ -510,14 +562,30 @@ def test_stale_and_contested_are_independent_not_elif():
     """A premise can be BOTH superseded (stale) AND sitting on a still-open
     contradiction (contested) at the same time — supersede fires on one
     side of a live dispute without auto-resolving it (#229's documented
-    workflow). Both guards must be cleared independently; clearing only
-    use_contested must NOT silently bypass BLOCKED_STALE (or vice versa).
+    workflow). Both must be CLASSIFIED independently. Note "classified",
+    not "cleared" — pre-#2324 both had overrides and each had to be cleared
+    on its own; since #2324 stale cannot be cleared at all, so the invariant
+    survives only in its reporting form. See the TEST INTENT note below.
 
     Regression test for a reviewer-fairy-caught blocker on PR #1711: the
     original implementation used an elif chain that let 'contested' win
     over 'stale' for a single premise, discarding the stale classification
     (and the built_on_stale audit stamp) entirely once a premise was also
     contested.
+
+    TEST INTENT AFTER #2324 — the invariant is unchanged, the probe moved.
+    `use_stale` is retired, so the old proof ("clear one override, watch the
+    OTHER guard still fire") is no longer expressible: nothing clears stale.
+    Asserting through the derive API can therefore only ever observe the
+    first block, which would make an elif chain INVISIBLE again — exactly the
+    regression this test exists to catch.
+
+    So the independence assertion moved down to _validate_premises, where
+    both classifications are visible at once: it returns (block, stale_ids,
+    contested_ids), and under an elif chain one of those two lists would come
+    back empty for a premise that is genuinely both. That is a strictly
+    sharper probe than the original — it reads the classification directly
+    instead of inferring it from which override was needed.
     """
     rev, obs, derive, qry, core = _make_fresh_mods()
     ob_a = _mk_obs(obs, "Claim A holds.")
@@ -534,42 +602,53 @@ def test_stale_and_contested_are_independent_not_elif():
 
     ob_other = _mk_obs(obs, "An unrelated corroborating claim.")
 
-    # use_contested alone must NOT be enough — ob_a is still stale too.
+    # THE INDEPENDENCE ASSERTION (the point of this test). Ask the guard
+    # directly, with BOTH overrides on, so nothing can be attributed to one
+    # of them being off. An elif chain would return one of these two lists
+    # empty; both must name ob_a.
+    conn = core._get_db()
+    try:
+        block, stale_ids, contested_ids = core._validate_premises(
+            [ob_a, ob_other], conn, use_stale=True, use_contested=True
+        )
+    finally:
+        conn.close()
+    assert ob_a in stale_ids, (stale_ids, contested_ids)
+    assert ob_a in contested_ids, (stale_ids, contested_ids)
+
+    # And the guard still refuses, because stale is a HARD block since #2324
+    # — use_stale being True changes nothing except that it earns a notice.
+    assert block is not None and block["status"] == "blocked_stale", block
+
+    # Same through the public API. Both overrides passed; still refused.
     r1 = json.loads(derive._derive_impl(
-        claim="Building on ob_a with only the contested override.",
-        supporting_ids=f"{ob_a},{ob_other}",
-        logical_chain="Only opting into the contradiction override.",
-        reasoning_type="deductive_modus_ponens",
-        use_contested=True,
-        use_stale=False,
-    ))
-    assert r1.get("status") == "blocked_stale", r1
-    assert {p["id"] for p in r1["stale_premises"]} == {ob_a}, r1
-
-    # use_stale alone must NOT be enough — ob_a is still contested too.
-    r2 = json.loads(derive._derive_impl(
-        claim="Building on ob_a with only the stale override.",
-        supporting_ids=f"{ob_a},{ob_other}",
-        logical_chain="Only opting into the stale override.",
-        reasoning_type="deductive_modus_ponens",
-        use_contested=False,
-        use_stale=True,
-    ))
-    assert r2.get("status") == "blocked_contradicted", r2
-    assert {p["id"] for p in r2["contested_premises"]} == {ob_a}, r2
-
-    # Both overrides together clear it, and both audit stamps are written.
-    r3 = json.loads(derive._derive_impl(
-        claim="Building on ob_a with both overrides.",
+        claim="Building on ob_a with both (now-inert) overrides.",
         supporting_ids=f"{ob_a},{ob_other}",
         logical_chain="Opting into both.",
         reasoning_type="deductive_modus_ponens",
         use_contested=True,
         use_stale=True,
     ))
-    assert "derivation_id" in r3, r3
-    assert r3["built_on_contested"] == [ob_a], r3
-    assert r3["built_on_stale"] == [ob_a], r3
+    assert r1.get("status") == "blocked_stale", r1
+    assert {p["id"] for p in r1["stale_premises"]} == {ob_a}, r1
+    assert "derivation_id" not in r1, r1
+
+    # The retired parameter is LOUD, not silently ignored — a caller who
+    # passes it must be told it did nothing, or they keep a false belief
+    # about what is protecting their derivation.
+    assert "use_stale_retired" in r1, r1
+    assert "RETIRED" in r1["use_stale_retired"], r1
+
+    # ob_a is superseded, so this is the case-2 route: cite the successor.
+    # The route must NAME the successor, not merely say one exists.
+    routes = [
+        e["route"]
+        for p in r1["stale_premises"]
+        for e in p["stale_because"]
+        if e["case"] == "superseded_premise"
+    ]
+    assert routes, r1
+    assert any(ob_a2 in r for r in routes), routes
 
 
 def test_extra_meta_cannot_spoof_or_remove_auto_stamps():
@@ -615,7 +694,15 @@ def test_extra_meta_cannot_spoof_or_remove_auto_stamps():
 def test_use_contested_true_with_no_contested_premise_is_a_no_op():
     """use_contested=True is harmless when no premise is actually contested
     — no built_on_contested stamp gets written just because the flag was
-    passed (mirrors use_stale's existing no-op-when-clean behavior)."""
+    passed.
+
+    The parenthetical here used to read "mirrors use_stale's existing
+    no-op-when-clean behavior". Dropped as of #2324, because it is now wrong
+    twice over: use_stale is a no-op ALWAYS rather than only when clean, and
+    passing it on a clean call is no longer silent — it adds a
+    use_stale_retired notice to the payload. So the two flags no longer
+    mirror each other in either half of that sentence, and use_contested is
+    the only one this test's shape still describes."""
     rev, obs, derive, qry, core = _make_fresh_mods()
     ob_a = _mk_obs(obs, "An uncontested claim.")
     ob_b = _mk_obs(obs, "Another uncontested claim.")

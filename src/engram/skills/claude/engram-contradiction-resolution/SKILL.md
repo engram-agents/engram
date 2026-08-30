@@ -11,7 +11,9 @@ The skill exists because the chain-dilution contradiction-resolution saga (2026-
 1. **Chain dilution**: each resolution attempt cited the prior resolution chain, compounding confidence drop until threshold-based status couldn't fire.
 2. **Substrate blindness to supersede**: a contradiction whose contradicting node had already been superseded continued to read as `open` / `partially_resolved` because the substrate didn't cascade supersede to the contradiction node.
 
-The 2026-05-20 substrate change (issue #229) closes both: supersede/retract now cascade to contradictions (`stale_by_premise` / `tainted_by`), and `engram_resolve` is now pure-wire (callers compose the resolving derivation via `engram_derive` first, then wire it).
+The 2026-05-20 substrate change (issue #229) closes both: supersede/retract now cascade to contradictions, and `engram_resolve` is now pure-wire (callers compose the resolving derivation via `engram_derive` first, then wire it).
+
+**Detection surface (updated 2026-08-16, engram-alpha#2013/#2009 — the cascade machine):** cascade state moved off `metadata.stale_by` / `metadata.tainted_by` into a `cascade_markers` table; nothing reads or writes those metadata fields anymore. The agent-facing shape you actually check is unchanged in spirit — `engram_inspect`'s response still carries a `warnings` object with `tainted_by` / `stale_by` keys — but the source and the entry shape both changed. `warnings.tainted_by` is now a list of `{retracted_id, retracted_claim_excerpt, retracted_at, retraction_reason_excerpt}`; `warnings.stale_by` is a list of `{superseded_id, replaced_by_id, superseded_at}` — `replaced_by_id` is the replacement, so the separate `metadata.stale_replacement` lookup this skill used to instruct is gone; it's already in the same entry. Every `engram_inspect` call below already returns `warnings` (both `view="recall"`, the default, and `view="deep"` attach it) — no extra call needed, just read the right key of the response you already have.
 
 ---
 
@@ -94,7 +96,7 @@ A contradiction is `stale_by_premise` when one of its contradicting nodes was su
 engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
 ```
 
-Read `metadata.stale_by` (list of superseded contradicting nodes) and `metadata.stale_replacement` (the new node that supersedes the old). Then:
+Read `warnings.stale_by` from the response — a list of `{superseded_id, replaced_by_id, superseded_at}`; `superseded_id` names the superseded contradicting node, `replaced_by_id` its replacement. Then:
 
 ```
 engram_inspect(payload_json=json.dumps({"node_id": stale_replacement_id, "dream_mode": True}))
@@ -159,7 +161,7 @@ engram_inspect(payload_json=json.dumps({"node_id": ct_id, "dream_mode": True}))
 engram_inspect(payload_json=json.dumps({"node_id": retracted_node_id, "dream_mode": True}))
 ```
 
-Read `metadata.tainted_by` to confirm which node was retracted. Read the retracted node's `metadata.error_type` and `metadata.retraction_reason` to understand WHY it was invalidated.
+Read `warnings.tainted_by` from the response to confirm which node was retracted (`retracted_id`) and why (`retraction_reason_excerpt` is included in the same entry; `retracted_claim_excerpt` gives the retracted claim itself) — the second `engram_inspect` call on the retracted node above is useful for full context but the excerpt alone is often enough to decide.
 
 ### Step 2 — Decide: does the contradiction still hold?
 
@@ -217,10 +219,10 @@ This is rare and usually means the area shifted significantly. Consider whether 
 
 ## For dream-fairy-2
 
-When you scan for contradictions ripe for resolution, your decision tree:
+When you scan for contradictions ripe for resolution, your decision tree — driven off `engram_inspect(ct_id)`'s `warnings` object, not metadata (see the detection-surface note near the top of this skill):
 
-1. `metadata.tainted_by` present? → tainted-contradiction path.
-2. `metadata.stale_by` present? → stale-contradiction path. Decide case 1 (substantive resolve) vs case 2 (preserve and rewire).
-3. `status == "open"` or `"partially_resolved"` with no cascade flags? → standard resolution path. But first check: has either contradicting node been superseded since the contradiction was created? If yes, the supersede may have happened BEFORE the cascade landed — treat as stale-contradiction path anyway.
+1. `warnings.tainted_by` non-empty (present at all — the key is omitted entirely on a clean node, never present-but-empty)? → tainted-contradiction path.
+2. `warnings.stale_by` non-empty? → stale-contradiction path. Decide case 1 (substantive resolve) vs case 2 (preserve and rewire).
+3. `status == "open"` or `"partially_resolved"` with no `warnings` key at all? → standard resolution path. But first check: has either contradicting node been superseded since the contradiction was created? If yes, the supersede may have happened BEFORE the cascade landed — treat as stale-contradiction path anyway.
 
 Always cite root nodes in any new resolving derivation. Never chain off a prior weak resolution.

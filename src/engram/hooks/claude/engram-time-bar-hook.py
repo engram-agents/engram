@@ -208,7 +208,7 @@ def _is_human_prompt(payload: dict) -> bool:
     The prompt body is HTML-unescaped before the prefix check, so a marker
     mangled into its escaped form (e.g. &lt;loop-wake&gt; instead of real
     angle brackets) still classifies as non-human rather than falling through
-    to a false "human" stamp (gh#1646).
+    to a false "human" stamp (gh#1649).
 
     Fail-safe: on any parsing problem, returns False (no stamp) rather than
     risking a false "human" classification.

@@ -17,6 +17,10 @@ Coverage:
   7. ct_0006-shape regression — high-conf existing derivation resolves contradiction
      in a single call without chain-dilution.
   8. Internal helper — _resolve_impl works with named kwargs.
+  10. #1777 — a real (non-idempotent) resolve flags needs_tightening=1 on a target
+      that already has a recall_summary (invalidate-via-flag, text untouched); a
+      summary-absent target is left alone; the idempotent no_op path does not
+      re-flip it.
 """
 
 import atexit
@@ -817,3 +821,140 @@ def test_resolve_chain_walk_names_final_successor():
         f"intermediate successor must not be presented as the resolution "
         f"target, got: {res['error']}"
     )
+
+
+# ── 10. #1777: needs_tightening flag on status change ──────────────────────
+#
+# recall_summary was never touched by engram_resolve — a summary authored
+# while a question was still open (e.g. "Open: is Y the case?") kept
+# rendering that stale framing forever after resolution. Per the #1952 PR3
+# design-of-record (kepler-somnium, 2026-08-19, folding #1777): a
+# status-changing resolve flags needs_tightening=1 when the target already
+# has a recall_summary, queuing it for the batch-summary fairy's
+# reviewer-of-outliers cohort rather than leaving it silently stale. A
+# target with no recall_summary yet is left alone — it's already correctly
+# tracked via summary_missing, nothing new to flag.
+
+
+def test_resolve_flags_needs_tightening_when_summary_exists():
+    """A target with an existing (now-stale) recall_summary gets
+    needs_tightening=1 after a real (non-idempotent) resolve. The summary
+    TEXT itself is left untouched — #1952 PR3's fix is invalidate-via-flag,
+    not synchronous regeneration (no precedent in this codebase for an LLM
+    call inside a synchronous MCP tool handler)."""
+    import sqlite3
+    server = fresh_server()
+    q_id, _, dv_id = _seed_strong_resolution(server)
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.execute(
+        "UPDATE nodes SET recall_summary = ? WHERE id = ?",
+        ("Open: is Y the case?", q_id),
+    )
+    conn.commit()
+    conn.close()
+
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert r.get("status") == "resolution_created", r
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, needs_tightening FROM nodes WHERE id = ?",
+            (q_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["recall_summary"] == "Open: is Y the case?", (
+        "recall_summary text must be left unchanged — invalidate-via-flag, not regenerate"
+    )
+    assert row["needs_tightening"] == 1, (
+        f"needs_tightening must flip to 1 on resolve, got {row['needs_tightening']}"
+    )
+
+
+def test_resolve_no_needs_tightening_flag_when_summary_absent():
+    """A target with NO recall_summary (recall_summary IS NULL — already
+    tracked via summary_missing) is left alone: resolve does not spuriously
+    set needs_tightening=1 when there is nothing stale to flag."""
+    import sqlite3
+    server = fresh_server()
+    q_id, _, dv_id = _seed_strong_resolution(server)
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT recall_summary FROM nodes WHERE id = ?", (q_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["recall_summary"] is None, "fixture question must start with no recall_summary"
+
+    r = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert r.get("status") == "resolution_created", r
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, needs_tightening FROM nodes WHERE id = ?",
+            (q_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["recall_summary"] is None
+    assert row["needs_tightening"] in (0, None), (
+        f"needs_tightening must stay unset, got {row['needs_tightening']}"
+    )
+
+
+def test_resolve_idempotent_no_op_does_not_touch_needs_tightening():
+    """The idempotent no_op path (duplicate resolves edge) must not re-run
+    the needs_tightening flip — it only self-heals resolved_by when NULL."""
+    import sqlite3
+    server = fresh_server()
+    q_id, _, dv_id = _seed_strong_resolution(server)
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.execute(
+        "UPDATE nodes SET recall_summary = ? WHERE id = ?",
+        ("Open: is Y the case?", q_id),
+    )
+    conn.commit()
+    conn.close()
+
+    first = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert first.get("status") == "resolution_created", first
+
+    # Manually clear the flag to prove the no_op path doesn't re-set it.
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.execute("UPDATE nodes SET needs_tightening = 0 WHERE id = ?", (q_id,))
+    conn.commit()
+    conn.close()
+
+    second = json.loads(server.engram_resolve(payload_json=json.dumps({
+        "target_id": q_id,
+        "resolving_node_id": dv_id,
+    })))
+    assert second.get("status") == "no_op", second
+
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT needs_tightening FROM nodes WHERE id = ?", (q_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["needs_tightening"] == 0, "no_op path must not re-flip needs_tightening"

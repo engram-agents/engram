@@ -401,10 +401,14 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
       re-entrancy guard (no category's ``last_run_turn`` gets stamped, so
       a same-turn re-run is never detected).
     - ``--interrupt-threshold < 1``: REJECTED. ``interrupt_fired =
-      cascade_count >= interrupt_threshold`` is unconditionally true for
-      any ``threshold <= 0`` (cascade_count is never negative), which is
-      also the exact value someone would plausibly type meaning "no
-      threshold" -- the opposite of what it actually does.
+      bool(interrupt_types) and cascade_count >= interrupt_threshold`` is
+      unconditionally true for any ``threshold <= 0`` *when a force-set is
+      configured* (cascade_count is never negative) -- the exact value
+      someone would plausibly type meaning "no threshold", the opposite of
+      what it actually does. On the default empty ``interrupt_types`` this
+      guard is currently inert (nothing to force-include either way), but
+      it stays for anyone who passes ``--interrupt-types``, which is
+      exactly the configuration #2013 will restore.
     - ``--limit`` (history subcommand, not draw): deliberately NOT a
       reject case. ``<= 0`` is a documented sentinel meaning "no limit"
       (issue #1911) -- handled in ``tally_history``, not here.
@@ -423,10 +427,12 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
     if args.interrupt_threshold < 1:
         return (
             f"--interrupt-threshold must be >= 1 (got {args.interrupt_threshold}). "
-            "interrupt_fired = cascade_count >= interrupt_threshold is "
-            "unconditionally true for threshold <= 0, silently forcing the "
-            "interrupt-mapped categories in every night regardless of real "
-            "cascade activity."
+            "interrupt_fired = bool(interrupt_types) and cascade_count >= "
+            "interrupt_threshold is unconditionally true for threshold <= 0 "
+            "when a force-set is configured (--interrupt-types), silently "
+            "forcing the interrupt-mapped categories in every night regardless "
+            "of real cascade activity. On the default empty interrupt_types "
+            "this has no effect."
         )
     return None
 

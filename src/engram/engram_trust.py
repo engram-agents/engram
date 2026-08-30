@@ -188,6 +188,7 @@ def _add_person_impl(
         # Resolve trust_tier column: use provided value or fall back to 'unknown'.
         tier_col = trust_tier.strip() if trust_tier and trust_tier.strip() else "unknown"
 
+        core._refuse_ncb_confidence("person", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at,
                status, metadata, trust_tier)
@@ -207,16 +208,50 @@ def _add_person_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Pass importance_base directly so _stamp_new_node writes
+        # the anchor in one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "person_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         result = {
             "status": "created",
@@ -407,10 +442,16 @@ def _update_person_impl(
         })
 
         # Emit field-value-changed cascade flags to all nodes that cite this person.
-        # Coarse-emit: node-scoped — any node with a cites or about edge to this
-        # person gets flagged. Carries field + prior_value in each flag entry.
-        # trust_tier changes → elevated (review_required=True, non-dismissible).
-        # All other changes → cheap (dismissible on prior→new triage).
+        # Coarse-emit: node-scoped — any node with a cites, about, or
+        # derives_from edge to this person gets flagged. Carries field +
+        # prior_value in each flag entry. trust_tier changes → elevated
+        # (review_required=True, non-dismissible). All other changes → cheap
+        # (dismissible on prior→new triage).
+        # #2255 colleague-review fix: this three-relation set is deliberately
+        # its own, distinct from core.CITATION_SUPPORT_RELATIONS
+        # ({derives_from, supported_by}) — do not unify the two. This asks a
+        # person-citation question ("what cites this person") that legitimately
+        # includes 'about' and excludes 'supported_by'.
         flagged_nodes = []
         citing_rows = conn.execute(
             "SELECT DISTINCT source_id FROM edges "
@@ -1048,6 +1089,7 @@ def _add_trust_signal_impl(
         ts_id = core._next_id(conn, "trust_signal")
         now = core._now()
 
+        core._refuse_ncb_confidence("trust_signal", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status,
                trust_signal_kind, trust_signal_polarity, trust_signal_weight)
@@ -1074,6 +1116,42 @@ def _add_trust_signal_impl(
             "weight": weight,
         })
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, ts_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "trust_signal_id": ts_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         return json.dumps({"status": "created", "trust_signal_id": ts_id})
     except Exception:

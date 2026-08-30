@@ -1,13 +1,13 @@
-"""Edge tier audit: completeness gate + soft dag_check/tier drift warning.
+"""Edge tier audit: completeness gate + soft temporal_causal/tier drift warning.
 
 Design (issue #1080, Lei 2026-06-10 decision):
-  - The per-edge dag_check flags in EDGE_CLASSIFICATIONS are INDEPENDENT design
-    dimensions. This test does NOT auto-couple dag_check to tier.
+  - The per-edge temporal_causal flags in EDGE_CLASSIFICATIONS are INDEPENDENT design
+    dimensions. This test does NOT auto-couple temporal_causal to tier.
   - HARD assert (completeness gate): every relation in EDGE_CLASSIFICATIONS
     has an entry in EDGE_TIERS and vice-versa. Also asserts every tier value
     is one of the three valid strings. A relation added without a deliberate
     tier decision fails the build immediately — no silent drift.
-  - SOFT warn (NON-blocking): for each relation, compares its dag_check flag
+  - SOFT warn (NON-blocking): for each relation, compares its temporal_causal flag
     against the tier's expectation (dependency→True; relational/classification→
     False). If they diverge AND the relation is NOT in EDGE_TIER_DIVERGENCE_ACK,
     emits warnings.warn for human review. The test still PASSES — divergence is
@@ -29,7 +29,7 @@ from engram_core import (
 # The three valid tier strings (the three-tier edge taxonomy).
 _VALID_TIERS = {"dependency", "relational", "classification"}
 
-# Tier → expected dag_check value.
+# Tier → expected temporal_causal value.
 _TIER_DAG_EXPECTATION: dict[str, bool] = {
     "dependency":     True,
     "relational":     False,
@@ -82,12 +82,12 @@ def test_all_tier_values_are_valid():
     )
 
 
-# ── SOFT dag_check / tier drift warning (NON-blocking) ───────────────────────
+# ── SOFT temporal_causal / tier drift warning (NON-blocking) ───────────────────────
 
-def test_dag_check_tier_drift_warn():
-    """Emit warnings.warn for any unacknowledged dag_check/tier divergence.
+def test_temporal_causal_tier_drift_warn():
+    """Emit warnings.warn for any unacknowledged temporal_causal/tier divergence.
 
-    For each relation: compares its dag_check flag in EDGE_CLASSIFICATIONS
+    For each relation: compares its temporal_causal flag in EDGE_CLASSIFICATIONS
     against the expected value for its tier (dependency→True; relational/
     classification→False). If they diverge AND the relation is not in
     EDGE_TIER_DIVERGENCE_ACK, emits a warnings.warn describing the drift.
@@ -111,15 +111,15 @@ def test_dag_check_tier_drift_warn():
                 continue
 
             expected_dag = _TIER_DAG_EXPECTATION[tier]
-            actual_dag = EDGE_CLASSIFICATIONS[relation]["dag_check"]
+            actual_dag = EDGE_CLASSIFICATIONS[relation]["temporal_causal"]
 
             if actual_dag != expected_dag and relation not in EDGE_TIER_DIVERGENCE_ACK:
                 warnings.warn(
-                    f"Edge tier/dag_check drift for '{relation}': "
-                    f"tier='{tier}' expects dag_check={expected_dag}, "
-                    f"but EDGE_CLASSIFICATIONS has dag_check={actual_dag}. "
+                    f"Edge tier/temporal_causal drift for '{relation}': "
+                    f"tier='{tier}' expects temporal_causal={expected_dag}, "
+                    f"but EDGE_CLASSIFICATIONS has temporal_causal={actual_dag}. "
                     f"If intentional, add '{relation}' to EDGE_TIER_DIVERGENCE_ACK "
-                    f"in engram_core.py with a reason. Otherwise, align dag_check "
+                    f"in engram_core.py with a reason. Otherwise, align temporal_causal "
                     f"or reconsider the tier assignment.",
                     stacklevel=2,
                 )

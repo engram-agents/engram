@@ -112,13 +112,11 @@ except ImportError:
 
 try:
     from engram_query import (  # noqa: E402
-        _LOGICAL_SUBSTRATE_RELATIONS,
         _CONTEXTUAL_RELATIONS,
     )
     _SCHEMA_QUERY_AVAILABLE = True
 except ImportError:
     _SCHEMA_QUERY_AVAILABLE = False
-    _LOGICAL_SUBSTRATE_RELATIONS = frozenset()  # type: ignore[assignment]
     _CONTEXTUAL_RELATIONS = frozenset()  # type: ignore[assignment]
 
 
@@ -129,13 +127,25 @@ def get_schema_data() -> dict:
     No DB access required — the schema is static.  Called by the
     /api/schema endpoint and directly by the CI drift gate.
     """
-    # Logical-substrate set: the 9 from engram_query plus instantiates
-    # (instantiates is in VALID_RELATIONS but in neither _LOGICAL_SUBSTRATE_RELATIONS
-    # nor _CONTEXTUAL_RELATIONS — treat as logical-substrate per spec §Deliverable 1).
-    logical_substrate = sorted(
-        set(_LOGICAL_SUBSTRATE_RELATIONS) | {"instantiates"}
-    )
+    # Logical-substrate set: DERIVED as the residual of VALID_RELATIONS after
+    # the contextual set, so the two groups partition VALID_RELATIONS BY
+    # CONSTRUCTION and a new relation lands in one of them automatically.
+    #
+    # This replaces a hand-union of {"instantiates"} — a relation that sits in
+    # VALID_RELATIONS but in neither underlying constant, and was patched in by
+    # name. That patch was correct and unmaintainable in the same breath: the
+    # next such relation needed a second hand-edit, and #2013 §12.5's
+    # `acknowledged_derives_from` is exactly that next one. Deriving the
+    # residual makes the union-equals-VALID_RELATIONS property true by
+    # construction rather than by remembering (§12.6 — the edge declaration is
+    # the SSoT at every call site).
+    #
+    # Equivalent to the old expression today: the test this replaces asserted
+    # that the hand-union plus the contextual set already covered
+    # VALID_RELATIONS exactly, so the residual is the same set — it just stops
+    # needing an editor.
     contextual = sorted(_CONTEXTUAL_RELATIONS)
+    logical_substrate = sorted(set(VALID_RELATIONS) - set(_CONTEXTUAL_RELATIONS))
 
     relations_detail = {
         rel: {
@@ -965,6 +975,8 @@ const NODE_LABEL_OVERRIDE = {
 const EDGE_COLOR_OVERRIDE = {
   cites:         '#7799bb',
   supported_by:  '#5cb85c',
+  predicted_by:  '#5cb85c', // #2252 W6: mirrors supported_by -- the pairing
+                            // edge split out of it, same visual family.
   contradicts:   '#e05252',
   resolves:      '#4a90d9',
   derives_from:  '#b05ce6',
@@ -1223,19 +1235,13 @@ function isRetracted(d) {
 }
 
 function isTainted(d) {
-  if (!d.metadata) return false;
-  try {
-    const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
-    return meta && Array.isArray(meta.tainted_by) && meta.tainted_by.length > 0;
-  } catch(e) { return false; }
+  // #2013/#2009 slice 1: tainted_by is a top-level field the /api/graph
+  // payload attaches from cascade_markers now — metadata never carries it.
+  return Array.isArray(d.tainted_by) && d.tainted_by.length > 0;
 }
 
 function isStale(d) {
-  if (!d.metadata) return false;
-  try {
-    const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
-    return meta && Array.isArray(meta.stale_by) && meta.stale_by.length > 0;
-  } catch(e) { return false; }
+  return Array.isArray(d.stale_by) && d.stale_by.length > 0;
 }
 
 function nodeClasses(d) {
@@ -1574,29 +1580,19 @@ function selectNode(d) {
     body.insertAdjacentHTML('beforeend', '<div class="superseded-badge">Superseded</div>');
   }
   if (isTainted(d)) {
-    try {
-      const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
-      const by = meta.tainted_by || [];
-      body.insertAdjacentHTML('beforeend',
-        `<div class="tainted-badge">⚠ Tainted by: ${by.join(', ')}</div>`);
-    } catch(e) {
-      body.insertAdjacentHTML('beforeend', '<div class="tainted-badge">⚠ Tainted</div>');
-    }
+    const by = d.tainted_by || [];
+    body.insertAdjacentHTML('beforeend',
+      `<div class="tainted-badge">⚠ Tainted by: ${by.join(', ')}</div>`);
   }
   if (isStale(d)) {
-    try {
-      const meta = typeof d.metadata === 'string' ? JSON.parse(d.metadata) : d.metadata;
-      const by = meta.stale_by || [];
-      // stale_replacement is dict-keyed since PR #281 (multi-cascade safety).
-      // Legacy nodes may still have scalar form; handle both.
-      const repl = (meta.stale_replacement && typeof meta.stale_replacement === 'object')
-          ? Object.values(meta.stale_replacement).join(', ') || '?'
-          : (meta.stale_replacement || '?');
-      body.insertAdjacentHTML('beforeend',
-        `<div class="stale-badge">⚠ Stale — premise ${by.join(', ')} superseded by ${repl}</div>`);
-    } catch(e) {
-      body.insertAdjacentHTML('beforeend', '<div class="stale-badge">⚠ Stale</div>');
-    }
+    const by = d.stale_by || [];
+    // stale_replacement is a plain {root: replacement_id} object, attached
+    // server-side per node (#2013/#2009 slice 1) — one entry per pending
+    // stale marker's root, not the old per-downstream-node cache.
+    const repl = d.stale_replacement || {};
+    const replStr = by.map(r => repl[r] || '?').join(', ') || '?';
+    body.insertAdjacentHTML('beforeend',
+      `<div class="stale-badge">⚠ Stale — premise ${by.join(', ')} superseded by ${replStr}</div>`);
   }
 
   function field(label, value, mono) {
@@ -2054,6 +2050,9 @@ function edgeDirectionLabel(relation, isOutgoing) {
     derives_from: ['derives from', 'derived by'],
     cites:        ['cites', 'cited by'],
     supported_by: ['supported by', 'supports'],
+    predicted_by: ['predicted by', 'predicts'], // #2252 W6: pairing edge
+                                                 // split out of supported_by,
+                                                 // same direction/shape.
     contradicts:  ['contradicts', 'contradicted by'],
     resolves:     ['resolves', 'resolved by'],
     supersedes:   ['supersedes', 'superseded by'],
@@ -2343,8 +2342,12 @@ async function fetchSchema() {
     });
     EDGE_STYLE = {};
     Object.entries(EDGE_COLOR_OVERRIDE).forEach(([rel, color]) => {
-      // Fallback dash: use the cascade/provenance heuristic based on known types
-      const solidRels = new Set(['cites', 'derives_from', 'retracts', 'supersedes', 'supported_by']);
+      // Fallback dash: hand-maintained mirror of EDGE_CLASSIFICATIONS'
+      // cascade/provenance flags, used only when /api/schema is unreachable.
+      // Must be kept in sync by hand with EDGE_CLASSIFICATIONS whenever the
+      // cascade/provenance flags change — it is not derived dynamically on
+      // purpose, since it exists precisely for when the dynamic path failed.
+      const solidRels = new Set(['cites', 'derives_from', 'supported_by', 'predicted_by']); // #2252 W6: predicted_by carries provenance:True, same as supported_by
       EDGE_STYLE[rel] = { color, dash: solidRels.has(rel) ? '' : '4,3' };
     });
     activeTypes = new Set(Object.keys(NODE_STYLE));
@@ -3016,6 +3019,49 @@ def get_graph(db_path: str) -> dict:
                     n["recall_keywords"] = []
             nodes.append(n)
 
+        # Cascade markers (#2013/#2009 slice 1): tainted_by / stale_by used
+        # to live in metadata and were rendered client-side straight off
+        # d.metadata. They're in cascade_markers now — attach them here as
+        # top-level node fields (one bulk query, not one per node) so the
+        # JS below reads d.tainted_by / d.stale_by directly instead of
+        # trying to parse them out of a metadata blob that no longer
+        # carries them. stale_replacement (the JS "superseded by" hint) is
+        # reconstructed the same way as engram_lifecycle's reflect report:
+        # a stale marker's root_node IS the directly-superseded node under
+        # slice 1's uniform severity, so its own superseded_by column names
+        # the replacement — no per-downstream cache needed.
+        marker_rows = cur.execute(
+            "SELECT node_id, root_node, root_op FROM cascade_markers WHERE status = 'pending'"
+        ).fetchall()
+        tainted_map: dict = {}
+        stale_map: dict = {}
+        stale_roots: set = set()
+        for mr in marker_rows:
+            target = tainted_map if mr["root_op"] == "retract" else stale_map
+            bucket = target.setdefault(mr["node_id"], [])
+            if mr["root_node"] not in bucket:
+                bucket.append(mr["root_node"])
+            if mr["root_op"] == "supersede":
+                stale_roots.add(mr["root_node"])
+        replacement_of = {}
+        if stale_roots:
+            placeholders = ",".join("?" for _ in stale_roots)
+            for r in cur.execute(
+                f"SELECT id, superseded_by FROM nodes WHERE id IN ({placeholders})",
+                tuple(stale_roots),
+            ).fetchall():
+                replacement_of[r["id"]] = r["superseded_by"]
+        for n in nodes:
+            tb = tainted_map.get(n["id"])
+            if tb:
+                n["tainted_by"] = tb
+            sb = stale_map.get(n["id"])
+            if sb:
+                n["stale_by"] = sb
+                n["stale_replacement"] = {
+                    root: replacement_of.get(root) for root in sb
+                }
+
         # All edges
         cur.execute("""
             SELECT source_id, target_id, relation, created_at
@@ -3092,12 +3138,20 @@ def get_health_data(db_path: str) -> dict:
             else: conf_buckets["0.8-1.0"] += 1
         data["confidence_distribution"] = conf_buckets
 
-        # Issue counts
+        # Issue counts. Migrated off metadata.tainted_by/stale_by to
+        # cascade_markers (#2013/#2009 slice 1) — this is exactly the class
+        # of drift Borges flagged on #2013 (a raw metadata LIKE-pattern
+        # count silently going stale the moment the write path changes);
+        # querying the real table structurally can't drift the same way.
         data["tainted"] = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"tainted_by\"%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
         ).fetchone()["c"]
         data["stale"] = conn.execute(
-            "SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND metadata LIKE '%\"stale_by\"%'"
+            "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
+            "JOIN nodes n ON n.id = cm.node_id "
+            "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
         ).fetchone()["c"]
         data["retracted"] = conn.execute(
             "SELECT COUNT(*) as c FROM nodes WHERE status = 'retracted'"

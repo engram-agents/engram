@@ -375,17 +375,17 @@ class TestDeriveOwnStatusPresenceIntegration:
         """Configure _status_derive module paths at tmp_path.
 
         #1608: _held_baton_turns/_fetch_held_batons now hit the live forum HTTP
-        API rather than PROJECTS_DIR — mock urlopen to an empty project list so
-        these presence-integration tests stay hermetic (no real network call,
-        no dependency on a forum server happening to be reachable) and so
-        "no baton held" continues to mean what these tests assert.
+        API rather than a local baton-projects directory — mock urlopen to an
+        empty project list so these presence-integration tests stay hermetic
+        (no real network call, no dependency on a forum server happening to
+        be reachable) and so "no baton held" continues to mean what these
+        tests assert. #2316 removed the now-dead PROJECTS_DIR constant this
+        fixture used to monkeypatch defensively (nothing has read it since
+        #1608); nothing here depended on the actual directory existing.
         """
         lm_path = tmp_path / "loop-mode.json"
-        projects_dir = tmp_path / "projects"
-        projects_dir.mkdir(exist_ok=True)
         activity_path = tmp_path / "last-user-activity"
         monkeypatch.setattr(mod, "LOOP_MODE_PATH", str(lm_path))
-        monkeypatch.setattr(mod, "PROJECTS_DIR", str(projects_dir))
         monkeypatch.setattr(mod, "ENGRAM_HOME", str(tmp_path))
         monkeypatch.setattr(mod, "LAST_USER_ACTIVITY_PATH", str(activity_path))
         monkeypatch.delenv("FORUM_URL", raising=False)

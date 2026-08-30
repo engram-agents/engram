@@ -36,9 +36,9 @@
 
 **3. engram-nap** — Pre-compaction shallow consolidation, no turn advance; arms nap_checkpoint feeling nudge. Activation: explicit; drowsiness-meter integration. Status: PROD-VERIFIED (daily live use).
 
-**4. engram-retract** — Error-correction workflow (6 error classes → engram_retract → cascade-taint). Activation: explicit / "I found an error"; referenced in template.CLAUDE.md write discipline. Status: PROD-VERIFIED.
+**4. engram-revise** — The two write verbs that open a cascade: engram_retract (6 error classes, "was I wrong") and engram_supersede ("did I learn more"), including the #2343 refusal when the target is itself already mid-cascade. Activation: explicit / "I found an error" / "my understanding has evolved"; referenced in template.CLAUDE.md write discipline. Formerly engram-retract (renamed engram-alpha#2389 when supersede guidance was folded in). Status: PROD-VERIFIED.
 
-**5. engram-resolve-cascade** — Clears cascade markers (tainted_by/stale_by/support_lost) by node type after retract/supersede. Activation: explicit; dream-cycle discovery. Status: PROD-VERIFIED.
+**5. engram-resolve-cascade** — Adjudicates cascade markers (tainted_by/stale_by via engram_cascade_frontier + engram_cascade_resolve: retracted/superseded/acknowledged) plus the separate support_lost pattern for cornerstones/lessons. Activation: explicit; dream-cycle discovery; also reached whenever engram-revise's plain verbs are refused. Status: PROD-VERIFIED.
 
 **6. engram-contradiction-resolution** — Drives ct_ nodes to clean state via pure-wire engram_resolve (#229 chain-dilution fix). Activation: explicit; dream-fairy flags. Status: PROD-VERIFIED.
 

@@ -7,13 +7,16 @@ Coverage (all branches of classify()):
   4. detached HEAD (branch=None) + clean → PRUNE
   5. branch "worktree-agent-xyz" + clean → PRUNE
   6. branch "review-123" + clean → PRUNE
-  7. normal branch + _pr_state→"MERGED" → PRUNE
+  7. normal branch + _pr_state→"MERGED" + not in use → PRUNE
   8. normal branch + _pr_state→"CLOSED" → PRUNE
   9. normal branch + _pr_state→"OPEN" → KEEP
  10. normal branch + _pr_state→None (no PR) → KEEP
+ 11. normal branch + _pr_state→"MERGED" + IN USE → SKIP (in-use guard on the
+     PR-state prune path — a fairy can still be writing to a worktree whose
+     PR just merged; see worktree-gc.py's classify() comment at the fix site).
 
-All tests monkeypatch _is_clean and _pr_state on the loaded module so no real
-git or gh calls are made.
+All tests monkeypatch _is_clean, _pr_state, and _is_in_use on the loaded
+module so no real git or gh calls are made.
 """
 
 from __future__ import annotations
@@ -150,7 +153,7 @@ def test_classify_review_branch(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 7. normal branch + PR MERGED → PRUNE
+# 7. normal branch + PR MERGED + not in use → PRUNE
 # ---------------------------------------------------------------------------
 
 
@@ -159,6 +162,7 @@ def test_classify_pr_merged(tmp_path):
     with (
         patch.object(_mod, "_is_clean", return_value=True),
         patch.object(_mod, "_pr_state", return_value="MERGED"),
+        patch.object(_mod, "_is_in_use", return_value=False),
     ):
         action, reason = _mod.classify(t, ROOT)
     assert action == "PRUNE"
@@ -166,7 +170,7 @@ def test_classify_pr_merged(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 8. normal branch + PR CLOSED → PRUNE
+# 8. normal branch + PR CLOSED + not in use → PRUNE
 # ---------------------------------------------------------------------------
 
 
@@ -175,6 +179,7 @@ def test_classify_pr_closed(tmp_path):
     with (
         patch.object(_mod, "_is_clean", return_value=True),
         patch.object(_mod, "_pr_state", return_value="CLOSED"),
+        patch.object(_mod, "_is_in_use", return_value=False),
     ):
         action, reason = _mod.classify(t, ROOT)
     assert action == "PRUNE"
@@ -214,7 +219,58 @@ def test_classify_no_pr(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 11. _prune_orphan_agent_refs — deletes orphans, keeps checked-out refs
+# 11. normal branch + PR MERGED + IN USE → SKIP (in-use guard on the
+#     PR-state prune path — a fairy can still be writing to a worktree whose
+#     PR just merged).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_pr_merged_but_in_use_skips(tmp_path):
+    """A worktree whose PR merged is still SKIPped, not PRUNEd, if a live
+    process (the fairy) still has its CWD inside it."""
+    t = _make_worktree(str(tmp_path), branch="feat/still-running")
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_pr_state", return_value="MERGED"),
+        patch.object(_mod, "_is_in_use", return_value=True),
+    ):
+        action, reason = _mod.classify(t, ROOT)
+    assert action == "SKIP"
+    assert "process active" in reason
+    assert "merged" in reason.lower()
+
+
+def test_classify_pr_merged_but_in_use_is_never_removed(tmp_path):
+    """Stronger than the classification-string check above: mirror main()'s
+    own --apply gate (`if match["action"] != "PRUNE": continue`) and assert
+    that the removal call (`git worktree remove`, which remove_worktree()
+    issues via _run) never fires for a clean, PR-merged, still-in-use
+    worktree -- an absent removal, not just a SKIP-shaped reason string.
+
+    Mutation sensitivity: with the in-use guard removed from classify()'s
+    PR-state path, this worktree reclassifies as PRUNE, the mirrored gate
+    below calls remove_worktree(), and _run is invoked -- so
+    mock_run.assert_not_called() catches the regression directly, the same
+    way main()'s real --apply loop would actually delete the worktree.
+    """
+    t = _make_worktree(str(tmp_path), branch="feat/still-running")
+    with (
+        patch.object(_mod, "_is_clean", return_value=True),
+        patch.object(_mod, "_pr_state", return_value="MERGED"),
+        patch.object(_mod, "_is_in_use", return_value=True),
+        patch.object(_mod, "_run") as mock_run,
+    ):
+        action, _reason = _mod.classify(t, ROOT)
+        # Mirror main()'s apply-loop gate exactly (see worktree-gc.py main()).
+        if action == "PRUNE":
+            _mod.remove_worktree(t, ROOT)
+    assert action == "SKIP"
+    mock_run.assert_not_called()
+    assert tmp_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# 12. _prune_orphan_agent_refs — deletes orphans, keeps checked-out refs
 # ---------------------------------------------------------------------------
 
 

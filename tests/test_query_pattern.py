@@ -30,6 +30,7 @@ import atexit
 import importlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -386,6 +387,92 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
     assert deriv_id in result_ids
 
 
+def test_tainted_still_valid_min_confidence_is_cb_only():
+    """#2252 stage 1.7 regression (site 3, _pattern_tainted_still_valid).
+
+    Before the fix, `conf = conf or 0` coerced a NULL confidence to 0
+    *before* the threshold check, so any NULL-confidence node -- CB or NCB
+    -- was silently dropped whenever min_confidence > 0. The fix asks
+    "is this claim-bearing" first: an NCB node (cornerstone) with NULL
+    confidence must survive regardless of threshold, while a CB node
+    (observation) with a genuinely low, non-null confidence below
+    threshold must still be filtered.
+
+    The `tainted_by` marker is set directly via SQL rather than through a
+    real retraction cascade -- the query itself has no type gate (it is a
+    Layer-C graph-conformance read over metadata, not a re-derivation of
+    the cascade walker), so this exercises the filter's actual contract.
+    Note: today's cascade walker has an explicit cornerstone/lesson skip
+    rule (PR-A-SPEC Sec2.0, engram_revision.py's `_walk_cascade_downstream`)
+    that means a cornerstone would not naturally acquire `tainted_by` via
+    the live write path -- flagged here rather than silently assumed.
+
+    A third fixture covers the CB-side NULL case (reviewer-fairy suggestion,
+    round 1): before the fix, `conf = conf or 0` dropped ANY NULL-confidence
+    node regardless of type, so a CB node (observation) that happens to carry
+    NULL confidence -- exceptional, since observations normally get a real
+    confidence at write time, but not schema-enforced -- must also survive,
+    exercising the "CB and confidence is None" branch of the gate distinctly
+    from the NCB-null and CB-low-non-null cases already covered above.
+    """
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+
+    cst_result = json.loads(cst._add_cornerstone_impl(
+        tag="test-min-confidence-axis",
+        title="Test cornerstone for min_confidence CB-only gate",
+        new_frame="New frame for regression fixture.",
+    ))
+    cst_id = cst_result["cornerstone_id"]
+
+    low_conf_obs_id = _add_observation(obs, "Low-confidence tainted observation fixture")
+    null_conf_obs_id = _add_observation(obs, "NULL-confidence CB tainted observation fixture")
+
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT confidence FROM nodes WHERE id=?", (cst_id,)).fetchone()
+        assert row["confidence"] is None  # sanity: cornerstones never carry confidence
+
+        # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+        # slice 1). Test INTENT unchanged — this fixture exists to prove
+        # min_confidence is a CB-only predicate (#2252 Stage 1.7) — but the
+        # taint it stamps must live where the scan now reads it. Stamped
+        # directly rather than via a real retract because the point is the
+        # filter, not the cascade walk (which would refuse to mark the NCB
+        # cornerstone at all, per the Stage 1.3 derived-skip).
+        def _mark(node_id):
+            conn.execute(
+                "INSERT OR IGNORE INTO cascade_markers "
+                "(node_id, cascade_event, root_node, root_op, status, created_at) "
+                "VALUES (?, ?, ?, 'retract', 'pending', ?)",
+                (node_id, "cev_min_conf_cb_only_fixture", "some_upstream_id",
+                 core._now()),
+            )
+
+        _mark(cst_id)
+        conn.execute("UPDATE nodes SET confidence=0.10 WHERE id=?", (low_conf_obs_id,))
+        _mark(low_conf_obs_id)
+        conn.execute("UPDATE nodes SET confidence=NULL WHERE id=?", (null_conf_obs_id,))
+        _mark(null_conf_obs_id)
+        conn.commit()
+
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])  # min_confidence 0.50
+        candidates = qry._pattern_tainted_still_valid(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert cst_id in ids, (
+        "NULL-confidence NCB node (cornerstone) must survive min_confidence filtering"
+    )
+    assert null_conf_obs_id in ids, (
+        "NULL-confidence CB node (observation) must also survive min_confidence filtering"
+    )
+    assert low_conf_obs_id not in ids, (
+        "genuinely low, non-null CB confidence must still be filtered"
+    )
+
+
 # ── cornerstone_candidate ─────────────────────────────────────────────────
 
 
@@ -699,6 +786,111 @@ def test_cornerstone_candidate_exclusion_is_relation_agnostic():
     )
 
 
+def test_cornerstone_candidate_excludes_predicted_by_from_citation_count():
+    """#2252 W6 design decision (coordinator-ruled, not a judgement call):
+    `predicted_by` must NOT count toward cornerstone-candidate cite_count.
+
+    Pins the exclusion so a future 'why isn't predicted_by in this tuple'
+    cleanup cannot silently add it back: a prediction-paired observation
+    with exactly 2 real citations (below min_citations=3) plus its one
+    predicted_by edge must NOT become a candidate (3 total edges would
+    cross the threshold if predicted_by counted, but it must not count).
+    Adding a 3rd real citation must then cross the threshold on its own,
+    proving the pattern still works normally and the miss above wasn't an
+    unrelated scoring quirk.
+    """
+    core = _fresh_mods()
+    qry, obs, *_ = _mods()
+    now = "2026-08-27T00:00:00Z"
+
+    citer_a = _add_observation(obs, "Citer A for predicted_by-exclusion fixture")
+    citer_b = _add_observation(obs, "Citer B for predicted_by-exclusion fixture")
+    citer_c = _add_observation(obs, "Citer C for predicted_by-exclusion fixture")
+
+    # The candidate: a predictive observation (mints a paired prediction via
+    # a predicted_by edge targeting this node).
+    r = json.loads(obs._add_observation_impl(
+        url="https://example.com/predicted-by-exclusion",
+        title="Predictive source for exclusion fixture",
+        quoted_text="G predicts H will occur.",
+        interpretation="G predicts H.",
+        claim="H will occur.",
+        quote_type="hard_data",
+        is_predictive=True,
+        predicted_event="H occurs within 10 days (predicted_by-exclusion fixture).",
+    ))
+    assert "error" not in r, r
+    node_id = r["observation_id"]
+    pred_id = r["prediction_id"]
+
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET importance_base=2.0, importance_score=2.0 WHERE id=?",
+            (node_id,),
+        )
+        # Exactly 2 real citations — below min_citations=3 on their own.
+        for src in (citer_a, citer_b):
+            conn.execute(
+                "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+                " VALUES (?, ?, 'cites', ?)",
+                (src, node_id, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Sanity: the predicted_by edge from pred_id -> node_id really exists.
+    conn = core._get_db()
+    try:
+        pairing = conn.execute(
+            "SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND relation='predicted_by'",
+            (pred_id, node_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert pairing is not None, f"expected a predicted_by edge {pred_id} -> {node_id}"
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+    result_ids = [c["id"] for c in candidates]
+    assert node_id not in result_ids, (
+        f"{node_id} has only 2 real citations plus 1 predicted_by edge; "
+        f"predicted_by must not count toward cite_count, so this must stay "
+        f"below min_citations=3. Got candidates: {result_ids}"
+    )
+
+    # Add the 3rd real citation — must now cross the threshold on its own.
+    conn = core._get_db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO edges (source_id, target_id, relation, created_at)"
+            " VALUES (?, ?, 'cites', ?)",
+            (citer_c, node_id, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])
+        params["top_k"] = 100
+        candidates = qry._pattern_cornerstone_candidate(conn, params)
+    finally:
+        conn.close()
+    result_ids = [c["id"] for c in candidates]
+    assert node_id in result_ids, (
+        f"{node_id} now has 3 real citations and should cross min_citations=3 "
+        f"on its own merit. Got candidates: {result_ids}"
+    )
+
+
 # ── open_question_answerable + recent_resolution_echo ─────────────────────
 
 def test_open_question_answerable_dispatches_cleanly():
@@ -712,6 +904,85 @@ def test_open_question_answerable_dispatches_cleanly():
     assert isinstance(r["results"], list)
 
 
+def test_open_question_answerable_min_confidence_is_cb_only(monkeypatch):
+    """#2252 stage 1.7 regression (site 2, _pattern_open_question_answerable).
+
+    Before the fix, `(m.get("confidence") or 0) >= min_conf` coerced a NULL
+    confidence to 0, so a NULL-confidence candidate derivation was silently
+    dropped whenever min_confidence > 0 -- the LIVE DEFECT named in the
+    issue. This pattern's inner semantic search is hardcoded to
+    ``type_filter={"derivation"}`` (derivation is claim-bearing), so an NCB
+    node can never appear in ``matches`` here -- there is no NCB case to
+    exercise at this site. What the fix does change: a NULL-confidence CB
+    candidate (an unresolved derivation) must now survive, while a
+    genuinely low, non-null CB confidence must still be filtered.
+
+    core._semantic_search is monkeypatched to return a controlled fixture
+    because ENGRAM_NO_EMBEDDINGS=1 (set by _fresh_mods) makes the real
+    semantic search always return [] in this test environment.
+    """
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+
+    q_result = json.loads(drv._ask_impl(
+        question="What causes the min_confidence NULL-coercion bug?",
+    ))
+    q_id = q_result["question_id"]
+
+    null_conf_premise = _add_observation(obs, "Premise for the NULL-confidence derivation")
+    low_conf_premise = _add_observation(obs, "Premise for the low-confidence derivation")
+    deriv_null = json.loads(drv._derive_impl(
+        claim="NULL-confidence CB candidate for the site-2 regression",
+        supporting_ids=null_conf_premise,
+        logical_chain="Trivial chain for fixture.",
+        reasoning_type="deductive_modus_ponens",
+    ))["derivation_id"]
+    deriv_low = json.loads(drv._derive_impl(
+        claim="Low, non-null-confidence CB candidate for the site-2 regression",
+        supporting_ids=low_conf_premise,
+        logical_chain="Trivial chain for fixture.",
+        reasoning_type="deductive_modus_ponens",
+    ))["derivation_id"]
+
+    conn = core._get_db()
+    try:
+        conn.execute("UPDATE nodes SET confidence=NULL WHERE id=?", (deriv_null,))
+        conn.execute("UPDATE nodes SET confidence=0.10 WHERE id=?", (deriv_low,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    fake_matches = [
+        {"id": deriv_null, "type": "derivation", "claim": "NULL-confidence candidate",
+         "confidence": None, "similarity": 0.90},
+        {"id": deriv_low, "type": "derivation", "claim": "Low-confidence candidate",
+         "confidence": 0.10, "similarity": 0.85},
+    ]
+
+    def fake_semantic_search(conn, query_text, top_k=5, min_similarity=0.0,
+                              type_filter=None, importance_threshold=0.0,
+                              include_superseded=False):
+        return list(fake_matches)
+
+    monkeypatch.setattr(core, "_semantic_search", fake_semantic_search)
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["balanced"])  # min_confidence 0.50
+        candidates = qry._pattern_open_question_answerable(conn, params)
+    finally:
+        conn.close()
+
+    cand = next(c for c in candidates if c["id"] == q_id)
+    assert cand["candidate_resolution"]["id"] == deriv_null, (
+        "NULL-confidence CB candidate must survive min_confidence filtering"
+    )
+    alt_ids = [a["id"] for a in cand["alternates"]]
+    assert deriv_low not in alt_ids, (
+        "genuinely low, non-null CB confidence must still be filtered"
+    )
+
+
 def test_recent_resolution_echo_dispatches_cleanly():
     _fresh_mods()
     qry, *_ = _mods()
@@ -720,7 +991,304 @@ def test_recent_resolution_echo_dispatches_cleanly():
     ))
     assert "results" in r
     assert "total_matches" in r
-    assert isinstance(r["results"], list)
+
+
+# ── #1860: category 1/6 status-filter widening (open -> open + partially_resolved) ──
+#
+# Both _pattern_open_question_answerable and _pattern_recent_resolution_echo
+# match candidates via core._semantic_search, which has NO fts/keyword
+# fallback (engram_core.py:4008-4009 returns [] unconditionally once
+# _embedder.is_available() is False) — unlike the tests elsewhere in this
+# suite that combine semantic + FTS. This whole file runs under
+# ENGRAM_NO_EMBEDDINGS=1 for determinism, so a genuine positive-match test
+# for either pattern needs a deterministic stand-in for _semantic_search
+# rather than a real embedding model. _stub_semantic_search below scores by
+# simple word-overlap (Jaccard) against the real claim text in the DB —
+# still exercises the real SQL/status-filter/type-filter code path in the
+# pattern functions themselves, just replaces the embedding-similarity step.
+
+
+def _words(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _stub_semantic_search(conn, query_text, top_k=10, min_similarity=0.3,
+                           type_filter=None, importance_threshold=0.0,
+                           include_superseded=False):
+    query_words = _words(query_text)
+    rows = conn.execute(
+        "SELECT id, type, claim, confidence, quote_type FROM nodes "
+        "WHERE is_current=1 AND (status IS NULL OR status != 'retracted')"
+    ).fetchall()
+    scored = []
+    for r in rows:
+        if type_filter and r["type"] not in type_filter:
+            continue
+        claim = r["claim"] or ""
+        claim_words = _words(claim)
+        if not claim_words or not query_words:
+            continue
+        overlap = len(query_words & claim_words) / len(query_words | claim_words)
+        if overlap >= min_similarity:
+            scored.append({
+                "id": r["id"], "type": r["type"], "claim": claim,
+                "confidence": r["confidence"], "quote_type": r["quote_type"],
+                "similarity": round(overlap, 4),
+            })
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:top_k]
+
+
+def test_open_question_answerable_admits_partially_resolved_question(monkeypatch):
+    """A partially_resolved question (some evidence landed, but below the
+    0.7 resolution-confidence threshold) must be a candidate, not silently
+    excluded — #1860. Previously the filter was status='open' only."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    q_result = json.loads(drv._ask_impl(
+        question="What causes the recall-hook habituation-decay slip on the sixth fire?",
+        category="research",
+    ))
+    q_id = q_result["question_id"]
+
+    # A low-confidence (editorial, ~0.35) observation resolves the question
+    # PARTIALLY -- below DEFAULT_RESOLUTION_THRESHOLD (0.7), so status lands
+    # on partially_resolved rather than resolved (engram_revision.py:429-432).
+    partial_obs = _add_observation(
+        obs, "The habituation-decay slip on the sixth fire may relate to render-length keying"
+    )
+    conn = core._get_db()
+    conn.execute("UPDATE nodes SET confidence=0.35 WHERE id=?", (partial_obs,))
+    conn.commit()
+    conn.close()
+    rev._resolve_impl(target_id=q_id, resolving_node_id=partial_obs)
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (q_id,)).fetchone()
+    assert status_row[0] == "partially_resolved", (
+        f"test fixture assumption broken: expected partially_resolved, got {status_row[0]!r}"
+    )
+    conn.close()
+
+    # A derivation with closely-overlapping claim text -- the candidate a
+    # real dream-fairy pass should surface for this now-partially-resolved
+    # question.
+    deriv_result = json.loads(drv._derive_impl(
+        claim="The recall-hook habituation-decay slip on the sixth fire is caused by render-length keying",
+        supporting_ids=partial_obs,
+        logical_chain="The partial-resolution observation directly names the mechanism.",
+        reasoning_type="abductive_best_explanation",
+    ))
+    deriv_id = deriv_result["derivation_id"]
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_open_question_answerable(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert q_id in ids, (
+        "partially_resolved question was excluded from the candidate set -- "
+        "the #1860 filter widening regressed"
+    )
+    matched = next(c for c in candidates if c["id"] == q_id)
+    assert matched["candidate_resolution"]["id"] == deriv_id
+
+
+def test_open_question_answerable_still_admits_open_question(monkeypatch):
+    """Regression guard: widening the filter to include partially_resolved
+    must not accidentally drop plain open questions."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    q_result = json.loads(drv._ask_impl(
+        question="Why does the surface daemon leak file handles on restart?",
+        category="research",
+    ))
+    q_id = q_result["question_id"]
+
+    obs_id = _add_observation(obs, "File handle leak on restart traces to a missing close() in the reap path")
+    deriv_result = json.loads(drv._derive_impl(
+        claim="The surface daemon leaks file handles on restart because reap() skips close()",
+        supporting_ids=obs_id,
+        logical_chain="The observation directly names the missing call.",
+        reasoning_type="abductive_best_explanation",
+    ))
+    deriv_id = deriv_result["derivation_id"]
+
+    conn = core._get_db()
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_open_question_answerable(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert q_id in ids
+    matched = next(c for c in candidates if c["id"] == q_id)
+    assert matched["candidate_resolution"]["id"] == deriv_id
+
+
+def test_recent_resolution_echo_admits_partially_resolved_question(monkeypatch):
+    """Same #1860 widening, category 6: a partially_resolved question
+    semantically close to a just-landed resolution must be surfaced as a
+    candidate echo, not silently excluded."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    # The resolution that will anchor the echo search. Wording deliberately
+    # mirrors echo_q's question below closely -- the stub scores by plain
+    # word-overlap (no real embedder in this test harness), so the fixture
+    # needs strong lexical overlap to stand in for semantic similarity.
+    resolved_q = json.loads(drv._ask_impl(
+        question="does category three correctly exempt seed axioms via the basis string check",
+        category="research",
+    ))
+    resolved_q_id = resolved_q["question_id"]
+    resolver_obs = _add_observation(
+        obs, "category three correctly exempts seed axioms via the basis string check"
+    )
+    rev._resolve_impl(target_id=resolved_q_id, resolving_node_id=resolver_obs)
+
+    # A DIFFERENT, still-open-ish question, semantically close to the
+    # resolution above, but only partially_resolved.
+    echo_q = json.loads(drv._ask_impl(
+        question="does category three correctly exempt seed axioms via the basis string check for cornerstones too",
+        category="research",
+    ))
+    echo_q_id = echo_q["question_id"]
+    partial_obs = _add_observation(
+        obs, "category three may also need to exempt cornerstones, unconfirmed"
+    )
+    conn = core._get_db()
+    conn.execute("UPDATE nodes SET confidence=0.35 WHERE id=?", (partial_obs,))
+    conn.commit()
+    conn.close()
+    rev._resolve_impl(target_id=echo_q_id, resolving_node_id=partial_obs)
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (echo_q_id,)).fetchone()
+    assert status_row[0] == "partially_resolved", (
+        f"test fixture assumption broken: expected partially_resolved, got {status_row[0]!r}"
+    )
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_recent_resolution_echo(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert echo_q_id in ids, (
+        "partially_resolved question was excluded from the resolution-echo "
+        "candidate set -- the #1860 filter widening regressed"
+    )
+
+
+def test_recent_resolution_echo_still_admits_open_question(monkeypatch):
+    """Regression guard: widening category 6's status check to include
+    partially_resolved must not accidentally drop plain open questions --
+    mirrors test_open_question_answerable_still_admits_open_question's
+    coverage for category 1."""
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+    monkeypatch.setattr(qry.core, "_semantic_search", _stub_semantic_search)
+
+    resolved_q = json.loads(drv._ask_impl(
+        question="does the surface daemon correctly reap stray file handles on restart",
+        category="research",
+    ))
+    resolved_q_id = resolved_q["question_id"]
+    resolver_obs = _add_observation(
+        obs, "the surface daemon correctly reaps stray file handles on restart"
+    )
+    rev._resolve_impl(target_id=resolved_q_id, resolving_node_id=resolver_obs)
+
+    # A different, plain OPEN question (never resolved at all) that's
+    # semantically close to the resolution above.
+    echo_q = json.loads(drv._ask_impl(
+        question="does the surface daemon correctly reap stray file handles on restart for the voice service too",
+        category="research",
+    ))
+    echo_q_id = echo_q["question_id"]
+
+    conn = core._get_db()
+    status_row = conn.execute("SELECT status FROM nodes WHERE id=?", (echo_q_id,)).fetchone()
+    assert status_row[0] == "open", (
+        f"test fixture assumption broken: expected open, got {status_row[0]!r}"
+    )
+    try:
+        params = dict(qry.PATTERN_QUERY_PRESETS["high_recall"])
+        candidates = qry._pattern_recent_resolution_echo(conn, params)
+    finally:
+        conn.close()
+
+    ids = [c["id"] for c in candidates]
+    assert echo_q_id in ids, (
+        "plain open question was excluded from the resolution-echo candidate "
+        "set -- the #1860 filter widening accidentally narrowed instead of widened"
+    )
+
+
+# ── min_confidence CB-only predicate, main hybrid-search path ─────────────
+# (#2252 stage 1.7, site 1 -- engram_query._search_nodes, the plumbing behind
+# query_hybrid / engram_recall's main path, not a _pattern_* function. Kept
+# in this file per the spec's "extend rather than create a parallel file"
+# instruction, since this file already carries the family-module fixtures
+# and the sibling min_confidence regression tests for sites 2/3 above.)
+
+
+def test_search_nodes_min_confidence_is_cb_only():
+    """#2252 stage 1.7 regression (site 1, FTS branch of _search_nodes).
+
+    This site never had the NULL-coerces-to-zero defect (`r["confidence"]
+    is not None and ... < min_confidence` already kept NULL) -- so this is
+    a no-regression check: the CB-only gate must preserve that NULL is kept
+    for an NCB node (goal), not incidentally narrow it. A genuinely low,
+    non-null CB confidence must still be filtered, matching pre-fix
+    behavior for that case.
+    """
+    core = _fresh_mods()
+    qry, obs, rev, drv, epi, tsk, cst, core = _mods()
+
+    goal_result = json.loads(tsk._add_goal_impl(
+        claim="Xenoglot calibration goal for min_confidence regression",
+        motivation="Testing #2252 stage 1.7",
+    ))
+    goal_id = goal_result["goal_id"]
+
+    low_conf_obs_id = _add_observation(obs, "Xenoglot calibration observation with low confidence")
+
+    conn = core._get_db()
+    try:
+        row = conn.execute("SELECT confidence FROM nodes WHERE id=?", (goal_id,)).fetchone()
+        assert row["confidence"] is None  # sanity: goals never carry confidence
+
+        conn.execute("UPDATE nodes SET confidence=0.10 WHERE id=?", (low_conf_obs_id,))
+        conn.commit()
+
+        result = qry._search_nodes(
+            conn,
+            query="Xenoglot calibration",
+            use_semantic=False,
+            top_k=10,
+            min_confidence=0.90,
+        )
+    finally:
+        conn.close()
+
+    ids = [n["id"] for n in result["results"]]
+    assert goal_id in ids, (
+        "NULL-confidence NCB node (goal) must survive min_confidence filtering"
+    )
+    assert low_conf_obs_id not in ids, (
+        "genuinely low, non-null CB confidence must still be filtered"
+    )
 
 
 def test_telemetry_log_writes_entry_per_call():

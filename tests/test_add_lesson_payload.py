@@ -9,12 +9,16 @@ Coverage:
   6. #1864 situation_pattern prose-shape gate — dead-prose patterns blocked by
      default, bypassable with an audit stamp, real regexes unaffected,
      malformed regexes always rejected regardless of bypass.
+  7. importance_base anchor (#2268) — lessons are importance-anchored at 2.0
+     via _stamp_new_node's importance_base override (one-pass write, no
+     interim confidence/surprise-derived value + follow-up UPDATE).
 """
 
 import atexit
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -372,3 +376,48 @@ def test_mutation_check_prose_gate_actually_blocks():
     r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
     assert "error" in r, r
     assert "lesson_id" not in r, r
+
+
+# ── 7. importance_base anchor (#2268 dead-write cleanup) ────────────────────
+
+
+def _read_importance(server, node_id):
+    """Read node importance_base/importance_score directly from the DB."""
+    conn = sqlite3.connect(str(server.core.DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(
+            "SELECT importance_base, importance_score FROM nodes WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def test_lesson_importance_base_anchored_at_2_0():
+    """Lesson creation ends at importance_base=2.0 with the matching
+    decay-anchored importance_score, even though the interim
+    confidence=0.5/surprise=0.0 write (#2268) is no longer performed.
+
+    This is the correctness invariant that actually matters — the final
+    stored values are unchanged from before the cleanup, not an assertion
+    on the removed dead write itself.
+    """
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+
+    row = _read_importance(server, lesson_id)
+    assert row["importance_base"] == 2.0, (
+        f"Expected importance_base=2.0 (unchanged anchor value), got {row['importance_base']}"
+    )
+    expected_score = server.core._compute_importance(2.0, server.core._get_current_turn())
+    assert row["importance_score"] == expected_score, (
+        f"Expected importance_score={expected_score} (2.0 decayed to current "
+        f"turn), got {row['importance_score']}"
+    )
+    # Never left at the interim confidence=0.5/surprise=0.0 value.
+    assert row["importance_base"] != 0.5

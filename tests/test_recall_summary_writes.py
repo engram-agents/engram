@@ -21,6 +21,10 @@ Batch tool tests (engram_set_recall_summaries):
                                              valid current node applies (applied=1, failed=1)
   10. test_batch_passes_through_pre_flight_failures — failures key passes through as
                                              pre_flight_failures; missing key → empty list
+  11. test_batch_apply_clears_needs_tightening_flag — #1952 PR3: a needs_tightening=1
+                                             node clears to 0 on successful apply
+  12. test_batch_apply_clears_summary_missing_flag — #1952 PR3: a summary_missing=1
+                                             node clears to 0 on successful apply
 
 Validator unit tests (tools.recall_summary_validator.validate_summary_entry):
   9.  test_validator_valid_entry           — all-good entry → None
@@ -373,6 +377,119 @@ def test_batch_passes_through_pre_flight_failures():
     r2 = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps(payload_no_failures)))
     assert "pre_flight_failures" in r2, r2
     assert r2["pre_flight_failures"] == [], r2
+
+
+# ---------------------------------------------------------------------------
+# Test 11 (batch): needs_tightening/summary_missing cleared on successful apply
+# ---------------------------------------------------------------------------
+#
+# #1952 PR3: the batch-summary fairy's cohort now includes needs_tightening-
+# flagged nodes (not just summary-absent ones — see engram-sleep SKILL.md
+# Step 5 and engram-batch-summary-fairy.md). Without clearing these flags on
+# a successful apply, an already-fixed node would be re-selected into the
+# cohort forever, defeating the "near-zero most nights" design goal. This is
+# the corollary fix that makes the broadened cohort query correct.
+
+def test_batch_apply_clears_needs_tightening_flag():
+    """A node soft-accepted needs_tightening=1 at write time (over the 140-char
+    target, under the 280-char hard-reject gate) gets needs_tightening cleared
+    to 0 once the fairy's tightened summary is applied via this batch tool."""
+    srv = fresh_server()
+    over_140 = (
+        "This recall summary is deliberately written to exceed the one "
+        "hundred forty character write-time target so it soft-accepts "
+        "flagged for tightening review."
+    )
+    assert 140 < len(over_140) < 280, len(over_140)
+    payload = {
+        "url": "https://example.com/needs-tightening",
+        "title": "Needs tightening fixture",
+        "quoted_text": "test quote",
+        "interpretation": "test interpretation",
+        "claim": "A claim whose write-time summary was too long.",
+        "quote_type": "personal_communication",
+        "recall_summary": over_140,
+        "recall_keywords": ["kw-one", "kw-two"],
+    }
+    obs = json.loads(srv.engram_add_observation(payload_json=json.dumps(payload)))
+    assert "error" not in obs, obs
+    obs_id = obs["observation_id"]
+
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (obs_id,),
+        ).fetchone()
+        assert row["needs_tightening"] == 1, "fixture must land needs_tightening=1"
+        assert row["summary_missing"] in (0, None)
+    finally:
+        conn.close()
+
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": [_valid_entry(obs_id, "Tightened summary, under the target.")]})
+    ))
+    assert r["applied"] == 1, r
+
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (obs_id,),
+        ).fetchone()
+        assert row["recall_summary"] == "Tightened summary, under the target."
+        assert row["needs_tightening"] == 0, "needs_tightening must clear on successful apply"
+        assert row["summary_missing"] == 0
+    finally:
+        conn.close()
+
+
+def test_batch_apply_clears_summary_missing_flag():
+    """A node written with no recall_summary at all (summary_missing=1, the
+    legacy-straggler/AUTHOR-mode case) gets summary_missing cleared to 0 once
+    a first summary is applied via this batch tool."""
+    srv = fresh_server()
+    payload = {
+        "url": "https://example.com/summary-missing",
+        "title": "Summary missing fixture",
+        "quoted_text": "test quote",
+        "interpretation": "test interpretation",
+        "claim": "A claim filed with no recall_summary at write time.",
+        "quote_type": "personal_communication",
+        # recall_summary omitted entirely — clean-accepts, summary_missing=1.
+    }
+    obs = json.loads(srv.engram_add_observation(payload_json=json.dumps(payload)))
+    assert "error" not in obs, obs
+    obs_id = obs["observation_id"]
+
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (obs_id,),
+        ).fetchone()
+        assert row["recall_summary"] is None
+        assert row["summary_missing"] == 1, "fixture must land summary_missing=1"
+        assert row["needs_tightening"] in (0, None)
+    finally:
+        conn.close()
+
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": [_valid_entry(obs_id, "Freshly authored summary.")]})
+    ))
+    assert r["applied"] == 1, r
+
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT recall_summary, needs_tightening, summary_missing FROM nodes WHERE id = ?",
+            (obs_id,),
+        ).fetchone()
+        assert row["recall_summary"] == "Freshly authored summary."
+        assert row["summary_missing"] == 0, "summary_missing must clear on successful apply"
+        assert row["needs_tightening"] == 0
+    finally:
+        conn.close()
 
 
 # ===========================================================================

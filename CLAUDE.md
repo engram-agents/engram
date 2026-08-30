@@ -269,6 +269,126 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### The order is a rule, not a diagram — no parallelizing fairy and colleague
+
+Lei's ruling, in-session, 2026-08-24 morning (relayed by Kepler; twin of
+umwelt#732, filed here as #2219 per the duplicated-by-hand rule below). The
+two-layer gate above is a **sequence**, not two boxes listed in order that
+happen to both need doing. In practice seats have been parallelizing them —
+asking the counterpart for the colleague pass before, or at the same time as,
+the reviewer-fairy round — and merging on a colleague approval that landed
+first, without the fairy round ever converging, or running at all.
+
+**Named anti-pattern: a colleague approval obtained while the fairy round is
+absent or unconverged does not count as the colleague box.** The colleague pass
+starts only once the reviewer-fairy round has converged on the tip being
+reviewed — not before, not in parallel, no exception for a PR that requests
+both at once. Lei's reasoning, stated because it should carry the rule rather
+than just accompany it: (1) the fairy round is *within the author's own
+control* — a self-check by a fresh-eyed, context-less reviewer that interrupts
+nobody's workflow, a sanity check and a courtesy to peers, not a cost worth
+working around. (2) Peer review *assumes* fairy convergence — implementation
+most-likely-correct — so the peer spends their read on what a context-less
+fairy structurally cannot catch: subtle tensions with other in-flight designs,
+team conventions, the larger picture. Sending a PR to a colleague before that
+assumption holds wastes the colleague's attention on ground a fairy would have
+covered. (3) Parallel runs void each other — a tip moved by fairy-induced
+fixes invalidates whatever the colleague already read, forcing a re-read on a
+tip that no longer matches what was reviewed. Parallelism here is not an
+efficiency gain; it is coordination chaos with the appearance of speed.
+
+**Why this landed as a rule and not a suggestion.** umwelt#559 reached the
+merge seat with a colleague-approved review and no reviewer-fairy round ever
+run — caught before merge only because the seat read the PR's actual review
+record instead of trusting the approval. dsh-engram#41's colleague pass began
+with the reviewer-fairy box entirely empty; the colleague disclosed this
+himself on picking it up and dispatched a fairy to backfill it alongside his
+own read, which caught a load-bearing defect his own pass had just called
+correct — a real catch, but **the recovery for a PR that had already gone out
+fairy-less, not the designed path.** The designed path is that the PR never
+goes out for peer review without fairy convergence in the first place; #41's
+parallel backfill is what to do once that has already failed, not a pattern to
+reach for by default.
+
+umwelt#721 (the umwelt twin's own predecessor fix) is a **milder instance of
+the same gap, not a case of the box being empty**: a reviewer-fairy round
+genuinely ran and found a real blocker, the author fixed it, and the colleague
+approved about ninety seconds later — with no fairy re-confirmation that the
+fix actually converged. That is exactly the condition the mechanical check
+below exists to catch, and it is worth stating precisely because an earlier
+draft of this citation got it wrong in the opposite direction: it claimed #721
+had *zero* fairy reviews at all, checked via the formal-reviews API alone
+(`pulls/<N>/reviews`) — which misses that repo's fairy rounds, since they post
+as PR **comments**, not formal review objects. Two independent reviewer-fairy
+rounds (on this PR and its umwelt twin) caught that mischaracterization before
+it shipped, which is its own small demonstration of the rule this section is
+arguing for.
+
+**Mechanical check at the merge seat.** Before merging, confirm a reviewer-fairy
+round *exists and converged on the tip being merged* by reading the PR's own
+review/comment record directly (`gh pr view <N> --comments`, or the REST
+fallback documented below if that command's `gh` version is affected) — **never
+infer it from a colleague approval being present.** A colleague approval is
+evidence the colleague pass happened; it is not evidence the fairy pass
+happened first, or at all.
+
+**Check both surfaces, not just the one that's easiest to query.** Fairy
+rounds in this repo post as **comments**, not formal GitHub reviews — checking
+only `pulls/<N>/reviews` (formal review objects: colleague approvals,
+`CHANGES_REQUESTED`) reads as "no fairy round" even when one genuinely ran,
+which is the exact mistake this PR's own draft made about umwelt#721 before
+its own reviewer-fairy round caught it. `gh pr view <N> --comments` (when
+working — see the version-hazard blockquote below) already merges both
+surfaces into one read; a hand-rolled REST fallback that only hits
+`issues/<N>/comments` does not, and neither does a `--json reviewDecision`
+shortcut that only sees formal review state.
+
+Cheap to check, and the check is the whole point: it
+replaces inferring readiness from the *shape* of the review record with
+actually reading it.
+
+### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
+
+GitHub Stacked PRs (public preview 2026-07-30; official extension
+`github/gh-stack`) is **post-cutoff for every model on the team** — no session
+knows it exists unless a surface carries it. This section is that surface
+(Lei, 2026-08-29). Install is **per-user**: `gh extension install
+github/gh-stack` — only then does `gh --help` list `stack` under EXTENSION
+COMMANDS; verify with `gh extension list`. All facts below measured live on
+the 2026-08-29 cascade train (alpha #2373/#2382).
+
+- **Link existing PRs into a stack**: `gh stack link <pr1> <pr2> …`.
+- **A stack member REFUSES plain `gh pr merge`** ("must be merged using the
+  asynchronous merge REST API"). The merge verb for stack members is
+  `gh stack merge <pr> --squash --yes`. Don't fight the refusal — it's the
+  signal you're on a stack.
+- **After a layer merges, GitHub auto-rebases the next layer itself** — no
+  push from any seat; patch-id identical to a hand `rebase --onto`; the
+  force-push is attributed to the merger. Expect it, and **verify with
+  `git range-diff`/patch-id rather than assuming** it happened or that it
+  changed nothing.
+- **Cascading rebase of un-merged layers**: `gh stack sync` / `gh stack
+  rebase`. Machine-readable status: `gh stack view --json`. Stacks are
+  API-readable (REST `stack`, GraphQL `PullRequestStack`) but not
+  API-mutable.
+- **Ruleset interaction**: with `require_last_push_approval=true` on the
+  target branch, the seat that syncs/rebases **cannot** be the tip
+  re-affirmer — a teammate re-approves (this includes GitHub's own
+  auto-rebase being attributed to the merger). **On this repo it is `true`
+  on `dev`, where stacks live, and `false` on `main`** (measured
+  2026-08-30 — the two protected branches are configured oppositely). And
+  `dismiss_stale_reviews_on_push: true` on `dev` means a content-changing
+  push **dismisses** the existing approval — it is gone, not merely
+  un-renewable by the pusher; whether GitHub's patch-id-identical
+  auto-rebase migrates or dismisses it is unmeasured, so read the approval
+  back after every layer rather than assuming.
+
+> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
+> 2026-08-29: whichever repo a session starts from must load it), with no
+> generator or test binding them. Change one, change all three in the same
+> pass — **but the ruleset paragraph and any repo-specific merge-authority
+> clause are deliberately per-repo; sync the rules, not the local facts.**
+
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
 Three parts of one rule (Lei, 2026-08-14). Applies in single-agent mode too — checking
@@ -452,7 +572,7 @@ created.
    returns Project number `N`.
 2. `baton init pool-X --title "..." --participants borges,ariadne --turn <maintainer>
    --status in-progress --github project/N` → creates
-   `/home/agents-shared/projects/pool-X.md` with the GitHub anchor set. The
+   `/home/agents-shared/forum/projects/pool-X.md` with the GitHub anchor set. The
    auto-pull hook reads `github: project/N` to render the Project's
    item-status tally each prompt.
 3. Add a `## Issues in this bunch` section to the baton body listing the
@@ -530,7 +650,7 @@ maintainer.
 
 ### Operational substrate
 
-- Baton files: `/home/agents-shared/projects/<id>.md` (YAML frontmatter + body).
+- Baton files: `/home/agents-shared/forum/projects/<id>.md` (YAML frontmatter + body).
 - GitHub Projects: `https://github.com/orgs/engram-agents/projects/`.
 - CLI source: `tools/baton.py` (this repo).
 - Skill (HOW details): `engram-baton`.
@@ -612,7 +732,12 @@ confirm it rather than treating it as an auto-close risk.
 
 ### Verification before pushing the PR
 
-Two checks, run in order:
+Three checks, run in order — and know their standing: checks 1–3 are text
+checks over enumerated close forms, i.e. **conveniences**; the **gate** is the
+post-merge completeness read at the end of this section, which is downstream
+of GitHub's parser and cannot be blindsided by a form nobody enumerated
+(Borges's framing, 2026-08-22, adopted as the rule after the umwelt#674/#632
+incident below).
 
 1. **Auto-close intent fires** (when the PR DOES close an issue): the body
    must contain a close-keyword referencing the target.
@@ -622,7 +747,9 @@ Two checks, run in order:
    The full API envelope is `{"data":{"repository":{"pullRequest":{"closingIssuesReferences":{"nodes":[...]}}}}}` —
    look for `nodes: [{number: <N>}]` where N matches the title's `[closes #N]`.
    `"nodes":[]` (empty) means the body is missing the keyword form and the PR
-   will NOT auto-close on merge; rewrite via `gh pr edit <PR> --body "..."`.
+   will NOT auto-close **via the body** on merge; rewrite via
+   `gh pr edit <PR> --body "..."`. **An empty array says NOTHING about commit
+   messages — see check 3, which covers the path this query cannot see.**
 
    **This query lags a `gh pr edit --body`/push — measured in EITHER
    direction, never trust the very first result after an edit.** Both
@@ -661,6 +788,42 @@ Two checks, run in order:
    — rewrite via `gh pr edit <PR> --body "..."` with the trap shape removed
    (use the safe-paraphrase table above).
 
+3. **No commit-message auto-close** (always): `closingIssuesReferences` reads
+   the PR BODY only — a merge commit's own message is a THIRD close surface
+   GitHub's parser reads independently, invisible to checks 1 and 2. **This
+   repo's exposure is currently LOWER than umwelt's, and say so precisely:**
+   engram-alpha's `squash_merge_commit_message` is `BLANK` (measured
+   2026-08-22 — three real recent squash merges carry no branch-commit
+   content, only PR title + co-author lines), so branch commit messages do
+   NOT ride into the merge commit here today. The check stays anyway, as
+   defense-in-depth against the three ways the exposure appears without any
+   code change: a repo-settings flip to `COMMIT_MESSAGES` (silent, and
+   exactly what makes umwelt exposed), a merger hand-editing the squash
+   message at merge time, and copy-paste of commit text into a PR body.
+   The incident that makes this real is umwelt#674/#632 (2026-08-22): empty
+   array there, merge concluded safe, the issue closed **by the commit**,
+   silently retiring the half of a two-defect issue the PR didn't fix
+   (umwelt#675 is the recovery). The three-surface diagnosis and this remedy
+   were first specified in Ariadne's graph on 2026-08-05.
+   ```
+   git log origin/dev..HEAD --format='%B' | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?) +([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+'
+   ```
+   Every match must reference the SAME `#N` the PR intends to close — anything
+   else gets the commit reworded (rebase) or accepted deliberately, never
+   discovered post-merge. The pattern covers the `owner/repo#N` cross-repo
+   close form (the first draft missed it — exercised five ways by Ariadne,
+   2026-08-22); bare `reponame#N` stays unflagged because it never closes
+   anything. Two things are deliberately unasserted rather than claimed:
+   `Closes: #N` with a colon (unmeasured), and **whether a close keyword in
+   the squash-commit SUBJECT fires the parser** — relevant here because this
+   repo's `squash_merge_commit_title: PR_TITLE` puts the PR title into the
+   subject, a path the commit-range grep cannot see. The 2026-05-31
+   measurement (7/7 title-only PRs did not auto-close) suggests subjects
+   don't fire, but it predates verification of the current setting — exactly
+   one of "the setting changed since May" / "subject keywords don't fire" is
+   true, and nobody has separated them. Measure on the next real
+   `[closes #N]` merge before claiming either way.
+
 **When reviewing a PR** (reviewer-fairy or counterpart colleague):
 - Title missing `[closes #N]` on a PR that addresses an issue → blocker.
 - Title `[closes #N]` present but body missing the matching close-keyword →
@@ -668,10 +831,20 @@ Two checks, run in order:
   edits body via `gh pr edit <PR> --body "..."` before merge.
 - Body contains close-keyword referencing an issue OTHER than the title's `#N`
   → blocker (trap). Author rewrites the trap-shape via safe-paraphrase table.
+- A branch commit message carries a close-keyword referencing any issue other
+  than the PR's intended `#N` (check 3's grep) → flag it: reworded via rebase,
+  or accepted deliberately with the exposure noted — never left undiscussed.
 
-This double-gate is mechanical; checking is cheap; the cost of missing it is
+This triple check is mechanical; checking is cheap; the cost of missing it is
 either a stale-issue backlog (missed auto-close) or a silently-closed-wrong-issue
 (trap firing).
+
+**THE GATE, at the merge seat, after merging: list which issues actually
+closed and confirm each one is FULLY done.** A close link's existence is not
+the issue's completion, and this step is mechanism-independent — it catches
+body links, commit links, and whatever close path ships next. A regex miss
+before merge is silent and permanent; a completeness-read catch after merge
+is loud and recoverable (umwelt#675 is the live proof).
 
 **GitHub recognized closing keywords (case-insensitive):** `close`, `closes`,
 `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved`. This repo

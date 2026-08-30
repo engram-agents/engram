@@ -86,8 +86,23 @@ def _get_meta(server, node_id):
 
 
 def _is_tainted(server, node_id, by_id):
-    meta = _get_meta(server, node_id)
-    return by_id in meta.get("tainted_by", [])
+    """Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+    slice 1). This helper was left behind by the migration and had gone
+    SILENTLY VACUOUS: nothing writes metadata.tainted_by any more, so it
+    returned False unconditionally and the one `assert not _is_tainted(...)`
+    in this file — the file's only cascade-skip-rule check — could no longer
+    fail. Note support_lost is NOT part of this migration and still lives in
+    metadata; only tainted_by/stale_by moved.
+    """
+    conn = server._get_db()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM cascade_markers WHERE node_id = ? AND root_node = ? "
+            "AND root_op = 'retract' AND status = 'pending'",
+            (node_id, by_id),
+        ).fetchone() is not None
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

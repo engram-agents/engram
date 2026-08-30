@@ -191,6 +191,21 @@ _DEFAULT_PROSE_THRESHOLD = 400
 # Verb suffixes that constitute an ENGRAM write. The engram tool name has the
 # form: mcp__engram__engram_<verb> or mcp__plugin_engram_engram__engram_<verb>.
 # Verified against production transcripts (2026-06-05).
+#
+# This set is hand-maintained (there is no import path from this hook, which
+# runs as a standalone script outside the package, into server.py's live
+# tool registry at hook-runtime) and MUST be kept in sync with server.py's
+# write-capable tool set (every @mcp.tool() whose annotations= carries
+# readOnlyHint: False) by hand whenever a tool is added, removed, or its
+# read-only-ness changes. #2273 found this set 7 tools behind: activate_goal,
+# deactivate_goal, add_special_moment, set_person_lineage, update_lesson,
+# update_person, and reflect were all write-capable in server.py but absent
+# here, so a turn whose only ENGRAM write was one of those 7 silently read as
+# zero writes and never triggered the write-check nudge. The 7 are restored
+# below. tests/test_stop_hook_write_verbs_ssot.py binds this set to
+# server.py's TOOL_ANNOTATIONS registry (the SSoT — populated at
+# @mcp.tool() decoration time) so a future drift fails a test instead of
+# silently degrading the nudge again.
 _ENGRAM_WRITE_VERBS = frozenset({
     "add_observation",
     "add_observation_batch",
@@ -228,6 +243,16 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "focus_swap",
     "focus_delete_set",
     "set_trust_tier",
+    # --- #2273: the 7 missing write-capable tools, restored ---
+    "activate_goal",
+    "deactivate_goal",
+    "add_special_moment",
+    "set_person_lineage",
+    "update_lesson",
+    "update_person",
+    "reflect",
+    # --- #2013 slice 4 (PR #2342): the cascade adjudication verb ---
+    "cascade_resolve",
 })
 
 # Known engram tool name prefixes from production transcripts. Both forms are

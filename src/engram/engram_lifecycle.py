@@ -31,6 +31,14 @@ from pathlib import Path
 import engram_core as core
 
 
+# #2252 Stage 1.0b: citation-coverage relation set (NOT cascade — see
+# engram_core.CITATION_SUPPORT_RELATIONS's own comment for why this is
+# deliberately its own enumerated constant rather than derived from
+# `cascade`). Stable sorted() order for the SQL IN-clause placeholders below.
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(core.CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_PLACEHOLDERS = ",".join("?" * len(_CITATION_SUPPORT_RELATIONS_SORTED))
+
+
 # ---------------------------------------------------------------------------
 # Reflect-output shaping constants (family-local — single consumer: _reflect_impl
 # / _slim_reflect_briefing)
@@ -45,6 +53,7 @@ _REFLECT_TOP_N = {
     "tainted_nodes": 5,
     "stale_nodes": 5,
     "support_lost_nodes": 5,
+    "support_lost_cleared": 5,
     "overdue_predictions": 5,
     "open_conjectures": 5,
     "recent_feeling_reports": 5,
@@ -65,7 +74,7 @@ _REFLECT_TRUNC_FIELDS = {
 _REFLECT_LIST_ORDER = [
     "active_goals", "active_tasks", "active_lessons",
     "unresolved_goal_tensions", "unresolved_contradictions",
-    "tainted_nodes", "stale_nodes", "support_lost_nodes",
+    "tainted_nodes", "stale_nodes", "support_lost_nodes", "support_lost_cleared",
     "overdue_predictions", "open_conjectures",
     "recent_feeling_reports",
     "weakly_grounded", "thin_support_derivations", "open_questions",
@@ -216,9 +225,10 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
 
     Computes graph stats, appends to session_log, snapshots + commits.
-    If advance_turn is True, increments the global turn counter (driving the
-    forgetting mechanism). If False, leaves the turn counter alone (nap mode)
-    and arms a nap_checkpoint feeling nudge.
+    If advance_turn is True, increments the global turn counter (subsequent
+    writes/recalls are then stamped at a correspondingly higher
+    importance_score). If False, leaves the turn counter alone (nap mode) and
+    arms a nap_checkpoint feeling nudge.
 
     The two public tools (engram_nap and engram_advance_turn) exist as
     distinct MCP entry points so a missed kwarg cannot accidentally promote
@@ -763,8 +773,17 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # 8. Uncited observations (in queryable memory, not referenced by any derivation)
         # HIGH-VOLUME: tiered by importance_score DESC. Top summary_top_k get
         # summary-style; remainder get keyword-style.
+        # #2252 W6: prediction-pairing exemption unified into a shared helper
+        # (core.prediction_pairing_exemption_sql) — was verbatim-duplicated
+        # here and in engram_stats.py with a hardcoded 'supported_by' literal
+        # before the pairing edge split to `predicted_by`.
+        _pred_pairing_sql, _pred_pairing_params = core.prediction_pairing_exemption_sql("n.id")
         uncited = conn.execute(
-            """SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
+            # #2252 Stage 1.0b: relation set here is citation-coverage
+            # (CITATION_SUPPORT_RELATIONS), NOT cascade — deliberately
+            # enumerated, not derived from `cascade`. See the constant's
+            # comment in engram_core.py.
+            f"""SELECT n.id, n.claim, n.recall_summary, n.recall_keywords,
                       n.confidence, COALESCE(n.importance_score, 0) AS imp
                FROM nodes n
                WHERE n.type IN ('observation_factual', 'observation_predictive')
@@ -772,17 +791,13 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                AND COALESCE(n.importance_score, 0) >= ?
                AND NOT EXISTS (
                    SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation IN ('derives_from', 'supported_by')
+                   WHERE e.target_id = n.id AND e.relation IN ({_CITATION_SUPPORT_PLACEHOLDERS})
                    AND e.source_id IN (SELECT id FROM nodes WHERE type IN ('derivation', 'theory'))
                )
-               AND NOT EXISTS (
-                   SELECT 1 FROM edges e
-                   WHERE e.target_id = n.id AND e.relation = 'supported_by'
-                   AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')
-               )
+               AND {_pred_pairing_sql}
                ORDER BY imp DESC, n.id ASC
                LIMIT 15""",
-            (t2,),
+            (t2, *_CITATION_SUPPORT_RELATIONS_SORTED, *_pred_pairing_params),
         ).fetchall()
         uncited_observations = []
         for i, u in enumerate(uncited):
@@ -802,56 +817,67 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
                 uncited_observations.append(entry)
         report["uncited_observations"] = uncited_observations
 
-        # 9. Tainted nodes (downstream of retracted nodes)
-        tainted_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"tainted_by": [%'"""
+        # 9. Tainted nodes (downstream of retracted nodes).
+        # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
+        # slice 1) — one row per node with >=1 pending taint-severity
+        # marker, tainted_by = every such marker's root_node.
+        tainted_rows = conn.execute(
+            """SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n
+               JOIN cascade_markers cm ON cm.node_id = n.id
+               WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"""
         ).fetchall()
         report["tainted_nodes"] = []
-        for t in tainted_nodes:
-            meta = json.loads(t["metadata"] or "{}")
+        for t in tainted_rows:
+            tainted_by, _ = core._classify_pending_markers(conn, t["id"])
             report["tainted_nodes"].append({
                 "id": t["id"],
                 "type": t["type"],
                 "claim": t["claim"],
                 "confidence": t["confidence"],
-                "tainted_by": meta.get("tainted_by", []),
+                "tainted_by": tainted_by,
             })
 
-        # 10. Stale nodes (downstream of superseded premises)
-        stale_nodes = conn.execute(
-            # Anchor to JSON list opening — metadata written with default json.dumps separators.
-            """SELECT id, type, claim, confidence, metadata FROM nodes
-               WHERE is_current = 1 AND metadata LIKE '%"stale_by": [%'"""
+        # 10. Stale nodes (downstream of superseded premises). Same
+        # migration. replacement_hint(s) is reconstructed from each root's
+        # OWN superseded_by column rather than a cached downstream field
+        # (metadata.stale_replacement is retired — see engram_revision.py's
+        # module docstring): under slice 1's uniform severity, root_node IS
+        # the node that was directly superseded, so its own superseded_by
+        # column already names the replacement — no per-downstream cache
+        # needed. Ordered by marker created_at so the most recent cascade's
+        # hint wins, same "latest cascade wins" semantics the old dict-
+        # insertion-order trick relied on.
+        stale_rows = conn.execute(
+            """SELECT DISTINCT n.id, n.type, n.claim, n.confidence FROM nodes n
+               JOIN cascade_markers cm ON cm.node_id = n.id
+               WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"""
         ).fetchall()
         report["stale_nodes"] = []
-        for s in stale_nodes:
-            meta = json.loads(s["metadata"] or "{}")
-            _sr = meta.get("stale_replacement")
-            if isinstance(_sr, dict):
-                # Python 3.7+ dicts preserve insertion order, so reversed() returns
-                # the most-recent entry first. For re-supersede-same-key cases (same
-                # old_node_id cascaded twice), dict update behavior overwrites — only
-                # the latest replacement survives for that specific old_node_id. This
-                # is correct: the older cascade's replacement was itself superseded,
-                # so the chain naturally points to the most-recent.
-                _replacement_hint = next(reversed(_sr.values())) if _sr else None
-                _replacement_hints_all = _sr
-            elif isinstance(_sr, str):
-                _replacement_hint = _sr
-                _replacement_hints_all = {"_legacy": _sr}
-            else:
-                _replacement_hint = None
-                _replacement_hints_all = {}
+        for s in stale_rows:
+            stale_markers = [
+                m for m in core._pending_markers_for_node(conn, s["id"])
+                if core._cascade_marker_severity(m["root_op"]) == "stale"
+            ]
+            stale_by = [m["root_node"] for m in stale_markers]
+            replacement_hints_all = {}
+            for m in stale_markers:
+                root = m["root_node"]
+                rrow = conn.execute(
+                    "SELECT superseded_by FROM nodes WHERE id = ?", (root,)
+                ).fetchone()
+                replacement_hints_all[root] = rrow["superseded_by"] if rrow else None
+            replacement_hint = (
+                replacement_hints_all[stale_markers[-1]["root_node"]]
+                if stale_markers else None
+            )
             report["stale_nodes"].append({
                 "id": s["id"],
                 "type": s["type"],
                 "claim": s["claim"],
                 "confidence": s["confidence"],
-                "stale_by": meta.get("stale_by", []),
-                "replacement_hint": _replacement_hint,
-                "replacement_hints_all": _replacement_hints_all,
+                "stale_by": stale_by,
+                "replacement_hint": replacement_hint,
+                "replacement_hints_all": replacement_hints_all,
             })
 
         # 11. Retracted nodes (for audit visibility) — slim entries; the
@@ -873,17 +899,57 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         # dream-master to find cs/ls that lost all live empirical support.
         # Trivial rewires handled inside the dream; non-trivial cases surface
         # to awake state via the flagged-for-user mechanism.
+        #
+        # #2252 Stage 1.1 Part 1 (LOAD-BEARING — do not reduce this to a
+        # write-time hook). The marker above is set by an event
+        # (retract/supersede settling in engram_revision._detect_zero_support,
+        # or historically by code that predates this discharge entirely).
+        # A hook keyed on that event cannot repair a marker whose setting
+        # event is already in the past — the one lesson in this graph
+        # currently carrying the marker is exactly that case, re-wired
+        # 2026-08-16/17, before any discharge code existed. Worse,
+        # event-keyed discharge would need every edge-writing surface
+        # enumerated correctly, and that enumeration was already wrong:
+        # engram_add_edge can create a live-support 'exemplifies' edge
+        # directly (relation is in core._ADDABLE_AFTER_CREATION_RELATIONS,
+        # gated only for 'instantiates'->lesson, not for 'exemplifies') —
+        # a third surface alongside supported_by wiring — with no hook on
+        # that path at all. So: recompute state on every reflect run instead
+        # of trusting the flag. This is a state-based recompute, not a
+        # backfill migration — it needs no one-time pass because every run
+        # re-evaluates state from scratch, and it stays correct as new
+        # edge-writing surfaces get added without anyone updating a list.
         support_lost_rows = conn.execute(
             # Anchor to serialized boolean — metadata written with default json.dumps separators.
-            """SELECT id, type, claim FROM nodes
+            """SELECT id, type, claim, metadata FROM nodes
                WHERE is_current = 1
                  AND type IN ('cornerstone', 'lesson')
                  AND metadata LIKE '%"support_lost": true%'"""
         ).fetchall()
-        report["support_lost_nodes"] = [
-            {"id": r["id"], "type": r["type"], "claim": r["claim"]}
-            for r in support_lost_rows
-        ]
+        report["support_lost_nodes"] = []
+        report["support_lost_cleared"] = []
+        support_lost_discharged_any = False
+        for r in support_lost_rows:
+            live_count = core._count_live_exemplars(conn, r["id"], r["type"])
+            if live_count > 0:
+                meta = json.loads(r["metadata"] or "{}")
+                meta.pop("support_lost", None)
+                conn.execute(
+                    "UPDATE nodes SET metadata = ? WHERE id = ?",
+                    (json.dumps(meta), r["id"]),
+                )
+                core._log_edit(conn, "support_lost_cleared", r["id"], r["type"],
+                          {"live_exemplars": live_count, "trigger": "reflect_recompute"})
+                report["support_lost_cleared"].append(
+                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+                )
+                support_lost_discharged_any = True
+            else:
+                report["support_lost_nodes"].append(
+                    {"id": r["id"], "type": r["type"], "claim": r["claim"]}
+                )
+        if support_lost_discharged_any:
+            conn.commit()
 
         # Summary counts (two-tier: queryable vs faded; tier-1 retired)
         total_current = conn.execute(
@@ -909,6 +975,7 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
             "stale_nodes": len(report["stale_nodes"]),
             "retracted_nodes": len(report["retracted_nodes"]),
             "support_lost_nodes": len(report["support_lost_nodes"]),
+            "support_lost_cleared": len(report["support_lost_cleared"]),
             "recent_feeling_reports": len(report["recent_feeling_reports"]),
         }
         report["memory_tiers"] = {

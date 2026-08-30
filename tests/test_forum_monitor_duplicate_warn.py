@@ -28,7 +28,7 @@ path without ever making a real production process a pgrep candidate. The
 two collab monitors ADD a second isolation axis: each test also points their
 watched directory (BATON_DIR / INTER_AGENT_DIR) at an empty per-test scratch
 dir, rather than the real shared production dirs
-(/home/agents-shared/projects, /home/agents-shared/inter-agent) — the
+(/home/agents-shared/forum/projects, /home/agents-shared/inter-agent) — the
 duplicate-detection code path runs before directory resolution either way,
 so this is belt-and-suspenders isolation, not a correctness requirement.
 
@@ -87,7 +87,7 @@ _SCRIPTS = {
     # take a watched-directory env override (unlike the forum scripts, which
     # poll a URL) -- "dir_env" names it so each test below can point the
     # watched dir at an empty per-test scratch directory instead of the real
-    # shared production dir (/home/agents-shared/projects,
+    # shared production dir (/home/agents-shared/forum/projects,
     # /home/agents-shared/inter-agent), keeping this suite's live-host
     # isolation property (see the module docstring) intact for these two too.
     "collab-baton-monitor.sh": {
@@ -456,6 +456,116 @@ def test_no_reap_env_suppresses_the_warning(tmp_path, script_name):
             _terminate(primary)
     finally:
         _terminate(dup_proc)
+
+
+# ---------------------------------------------------------------------------
+# 4. ps-fallback branch (round-2 fix for #2134's macOS port): ENGRAM_PROC_DIR
+#    is the env-indirected override that lets this suite force the fallback
+#    branch (CHANGE 2's os.path.exists(_PROC + "/self/cmdline") discriminator)
+#    on this Linux test host, by pointing it at an empty directory that has
+#    no self/cmdline entry. Only the two forum monitors are in scope for
+#    this round's fix (the collab monitors are untouched) -- so, unlike the
+#    tests above, these two are NOT parametrized over the full _SCRIPTS map.
+# ---------------------------------------------------------------------------
+
+_FORUM_SCRIPTS_ONLY = ["forum-updates-monitor.sh", "forum-mention-monitor.sh"]
+
+
+def _empty_proc_dir(tmp_path: Path, tag: str) -> Path:
+    """A directory with no self/cmdline entry, forcing the ps-fallback branch
+    even on this Linux test host. Passed as $ENGRAM_PROC_DIR."""
+    d = tmp_path / f"empty-proc-{tag}"
+    d.mkdir()
+    return d
+
+
+@pytest.mark.parametrize("script_name", _FORUM_SCRIPTS_ONLY)
+def test_ps_fallback_positive_genuine_duplicate_reported_weak(tmp_path, script_name):
+    """POSITIVE control: with ENGRAM_PROC_DIR pointed at a directory with no
+    self/cmdline, the platform discriminator routes to the ps fallback even
+    on Linux, and a genuine duplicate is still detected -- reported via the
+    rc=3 weaker-match wording, distinct from the rc=0 /proc-verified one."""
+    meta = _SCRIPTS[script_name]
+    purpose = _unique_purpose("psfallback")
+    port = _free_port()
+    home_a = _make_home(tmp_path, "dup-instance", port)
+    home_b = _make_home(tmp_path, "primary", port)
+    proc_dir = _empty_proc_dir(tmp_path, "positive")
+    extra_env = {"ENGRAM_PROC_DIR": str(proc_dir)}
+
+    dup_proc, dup_reader = _start_monitor(meta["path"], home_a, purpose, extra_env)
+    try:
+        time.sleep(_START_STAGGER)
+        assert dup_proc.poll() is None, "the prior instance exited before it could be detected"
+
+        primary, reader = _start_monitor(meta["path"], home_b, purpose, extra_env)
+        try:
+            time.sleep(_DETECT_WINDOW)
+            assert dup_proc.poll() is None, (
+                f"genuine duplicate pid {dup_proc.pid} was killed under the ps "
+                f"fallback; expected warn-not-kill. stdout: {reader.lines!r}\n"
+                f"dup stderr: {dup_reader.lines!r}"
+            )
+            reported = [l for l in reader.lines if str(dup_proc.pid) in l]
+            assert reported, (
+                f"genuine duplicate pid {dup_proc.pid} was never reported via "
+                f"the ps fallback. stdout: {reader.lines!r}"
+            )
+            assert any("WEAK match" in l for l in reported), (
+                f"fallback report should carry the rc=3 weaker-match wording, "
+                f"got: {reported!r}"
+            )
+            # The two confidence classes (rc=0 /proc-verified vs rc=3
+            # ps-fallback) must never be conflated into one channel -- the
+            # plain rc=0 wording must not appear here.
+            assert not any("duplicate instance —" in l for l in reported), (
+                f"fallback report should never carry the plain rc=0 "
+                f"/proc-verified wording: {reported!r}"
+            )
+        finally:
+            _terminate(primary)
+    finally:
+        _terminate(dup_proc)
+
+
+@pytest.mark.parametrize("script_name", _FORUM_SCRIPTS_ONLY)
+def test_ps_fallback_negative_decoy_not_reported(tmp_path, script_name):
+    """NEGATIVE control: with the ps fallback forced via ENGRAM_PROC_DIR, a
+    non-matching decoy (argv merely quotes the script path as an argument,
+    same shape as test 1 above) is still filtered out -- layer-2 verification
+    (interpreter + exact-token check) rejects it regardless of which
+    verification path (/proc or ps) is doing the checking."""
+    meta = _SCRIPTS[script_name]
+    purpose = _unique_purpose("psfallbackneg")
+    port = _free_port()
+    home = _make_home(tmp_path, "primary", port)
+    proc_dir = _empty_proc_dir(tmp_path, "negative")
+    extra_env = {"ENGRAM_PROC_DIR": str(proc_dir)}
+
+    decoy = _start_decoy(script_name, purpose)
+    try:
+        time.sleep(_START_STAGGER)
+        assert decoy.poll() is None, "decoy exited before the primary could even arm"
+
+        primary, reader = _start_monitor(meta["path"], home, purpose, extra_env)
+        try:
+            time.sleep(_DETECT_WINDOW)
+            assert decoy.poll() is None, (
+                f"decoy pid {decoy.pid} was killed under the ps fallback — "
+                f"the substring-match false positive is back. "
+                f"stdout: {reader.lines!r}"
+            )
+            reported = [l for l in reader.lines if str(decoy.pid) in l]
+            assert not reported, (
+                f"decoy pid {decoy.pid} was reported as a suspect duplicate "
+                f"via the ps fallback (should be filtered by the "
+                f"argv[0]-interpreter check regardless of verification "
+                f"path): {reported!r}"
+            )
+        finally:
+            _terminate(primary)
+    finally:
+        _terminate(decoy)
 
 
 if __name__ == "__main__":

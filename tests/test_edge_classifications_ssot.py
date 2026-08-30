@@ -34,8 +34,14 @@ def test_dag_exempt_matches_pre_refactor_set():
     # `serves` added 2026-06-10 (issue #1076, three-tier edge taxonomy):
     # classification tier — a goal can be articulated after the node that serves
     # it, same shape as instantiates (already exempt).
+    # `acknowledged_derives_from` added 2026-08-29 (#2357): the dag_check flag
+    # was renamed temporal_causal (this constant's semantics are unchanged —
+    # it names the CREATION-ORDER exemption set) and this new relation is
+    # deliberately temporal_causal=False despite carrying dag=True (real
+    # acyclicity, checked separately — see EDGE_TIER_DIVERGENCE_ACK).
     expected = frozenset({"contradicts", "about", "exemplifies", "instantiates",
-                          "resolves", "tensions", "serves"})
+                          "resolves", "tensions", "serves",
+                          "acknowledged_derives_from"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (
@@ -54,8 +60,8 @@ def test_removable_matches_pre_refactor_set():
     )
 
 def test_all_relations_have_full_field_set():
-    """Every entry has all 5 fields set (catches typos / partial edits)."""
-    expected_fields = {"cascade", "dag_check", "removable",
+    """Every entry has all 6 fields set (catches typos / partial edits)."""
+    expected_fields = {"cascade", "temporal_causal", "dag", "removable",
                        "addable_after_creation", "provenance"}
     for relation, classification in EDGE_CLASSIFICATIONS.items():
         missing = expected_fields - set(classification.keys())
@@ -71,9 +77,16 @@ def test_no_unclassified_relations_in_schema():
     remove-edge / DAG behavior is undefined.
     """
     # Hardcoded — extend when adding a relation.
+    # `acknowledged_derives_from` added 2026-08-29 (#2013 §12.5) — a premise
+    # edge established by adjudication rather than at authorship.
     known_relations = {
+        "acknowledged_derives_from",
         "about", "cites", "contradicts", "derives_from", "exemplifies",
         "instantiates",  # #530 c1 (2026-06-07)
+        "predicted_by",  # #2252 W6 (2026-08-27) — prediction pairing edge,
+                         # split out of supported_by.
+        "acknowledged_derives_from",  # #2357 (2026-08-29) — cascade-frontier
+                         # acknowledgement edge, part of #2013.
         "resolves", "retracts", "serves", "subtask_of", "supersedes",
         "supported_by", "tensions",
     }

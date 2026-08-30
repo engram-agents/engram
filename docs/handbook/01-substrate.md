@@ -160,6 +160,8 @@ Observation confidence computed in `_add_observation_impl()` in `engram_observat
 
 ## **8. Supersede & Retract Cascade Machinery**
 
+> **⚠ This section was NOT verified by the pass that corrected Sections 10 and 17, and its unverified defects are not limited to citations — see #2198.** The body below (in both **what** and **key constants**) claims `retracts` and `supersedes` are DAG-exempt; **that is a factual error, not a stale citation** — both have `dag_check=True` in `EDGE_CLASSIFICATIONS`. The actual DAG-exempt set (`dag_check=False`) is: `about`, `contradicts`, `exemplifies`, `instantiates`, `resolves`, `serves`, `tensions` (seven relations — `retracts`/`supersedes` are not among them). (`DAG_EXEMPT_RELATIONS` is at `engram_core.py:709`, not `:506`.)
+
 **what** — Immutability via supersession: old versions are never deleted, only marked superseded (is_current→0, superseded_by field set). A new derivation can supersede an older one; retraction removes a node from all query results and the FTS index but preserves it for audit. Cascade deletion is NOT used; instead, edges to superseded/retracted nodes are preserved (ancestors remain visible for forensics). The "cascade" edge relation (`retracts`, `supersedes`) is not confidence-propagating (DAG-exempt).
 
 **how** — Supersede entry: `engram_supersede()` (server.py wrapper at :4552 → `_supersede_impl()` in `engram_revision.py:440`) creates a supersedes edge, updates is_current/superseded_by on old node. Retract entry: `engram_retract()` (server.py wrapper at :4647 → `_retract_impl()` in `engram_revision.py:783`) sets status='retracted', removes from FTS via trigger. Cascade downstream walk: `_walk_cascade_downstream()` in `engram_revision.py:97` traverses edges to find dependent nodes, but does NOT auto-cascade retract/supersede (manual sweep only).
@@ -196,20 +198,20 @@ Query pattern `_pattern_contradiction_obsolescence_ready()` (18206–18290) iden
 
 ## **10. Edge Relations & Semantic Bidirectionality**
 
-**what** — Directed edges (source→target, relation) form a DAG with strict relationship types. The edge-classification table (`EDGE_CLASSIFICATIONS` in `engram_core.py:418`) is the single source of truth: each relation type is a dict entry specifying dag_check (bool), removable (bool), and addable_after_creation (bool). Semantically symmetric relations (about, serves, exemplifies) have symmetric queryability even though the underlying edge is unidirectional.
+**what** — Directed edges (source→target, relation) form a DAG with strict relationship types. The edge-classification table (`EDGE_CLASSIFICATIONS` in `engram_core.py:551`) is the single source of truth: each relation type is a dict entry specifying dag_check (bool), removable (bool), and addable_after_creation (bool). Semantically symmetric relations (about, serves, exemplifies) have symmetric queryability even though the underlying edge is unidirectional.
 
-**how** — `EDGE_CLASSIFICATIONS` is a dict keyed by relation name (`engram_core.py:418`) defining every valid relation. Derived constants in `engram_core.py`:
-- `DAG_EXEMPT_RELATIONS` (:506): relations treated as non-confidence-propagating (dag_check=False).
-- `_ADDABLE_AFTER_CREATION_RELATIONS` (:511): edges addable post-creation via `engram_add_edge`.
-- `_REMOVABLE_EDGE_RELATIONS` (:2785): edges removable via `engram_remove_edge`.
+**how** — `EDGE_CLASSIFICATIONS` is a dict keyed by relation name (`engram_core.py:551`) defining every valid relation. Derived constants in `engram_core.py`:
+- `DAG_EXEMPT_RELATIONS` (:709): relations treated as non-confidence-propagating (dag_check=False).
+- `_ADDABLE_AFTER_CREATION_RELATIONS` (:714): edges addable post-creation via `engram_add_edge`.
+- `_REMOVABLE_EDGE_RELATIONS` (:4858): edges removable via `engram_remove_edge`.
 
-Validation: `engram_add_edge()` (server.py wrapper :3432 → `_add_edge_impl()` in `engram_cornerstone.py:474`), `engram_remove_edge()` (server.py wrapper :3346 → `_remove_edge_impl()` in `engram_cornerstone.py:389`) check against `EDGE_CLASSIFICATIONS`. Traversal: neighbors are fetched via `_get_neighbors()` in `engram_query.py:598`, which handles symmetric relation wrapping.
+Validation: `engram_add_edge()` (server.py wrapper :4454 → `_add_edge_impl()` in `engram_cornerstone.py:571`), `engram_remove_edge()` (server.py wrapper :4367 → `_remove_edge_impl()` in `engram_cornerstone.py:465`) check against `EDGE_CLASSIFICATIONS`. Traversal: neighbors are fetched via `_get_neighbors()` in `engram_query.py:782`, which handles symmetric relation wrapping.
 
 **status-candidate** — **prod-presumed** (every DAG operation validates against this table; extensible design for new relation types).
 
-**files** — `engram_core.py` (`EDGE_CLASSIFICATIONS` :418; derived constants `DAG_EXEMPT_RELATIONS` :506, `_ADDABLE_AFTER_CREATION_RELATIONS` :511, `_REMOVABLE_EDGE_RELATIONS` :2785). `engram_cornerstone.py` (`_add_edge_impl()` :474; `_remove_edge_impl()` :389). `engram_query.py` (`_get_neighbors()` :598). server.py (wrappers: `engram_add_edge` :3432; `engram_remove_edge` :3346).
+**files** — `engram_core.py` (`EDGE_CLASSIFICATIONS` :551; derived constants `DAG_EXEMPT_RELATIONS` :709, `_ADDABLE_AFTER_CREATION_RELATIONS` :714, `_REMOVABLE_EDGE_RELATIONS` :4858). `engram_cornerstone.py` (`_add_edge_impl()` :571; `_remove_edge_impl()` :465). `engram_query.py` (`_get_neighbors()` :782). server.py (wrappers: `engram_add_edge` :4454; `engram_remove_edge` :4367).
 
-**key constants** — All 16+ relation types defined in EDGE_CLASSIFICATIONS (e.g., derives_from, cites, supports, contradicts, supersedes, about, exemplifies, etc.).
+**key constants** — All 13 relation types defined in EDGE_CLASSIFICATIONS (and mirrored in VALID_RELATIONS): `about`, `cites`, `contradicts`, `derives_from`, `exemplifies`, `instantiates`, `resolves`, `retracts`, `serves`, `subtask_of`, `supersedes`, `supported_by`, `tensions`.
 
 **tests** — test_link_about_payload.py, test_add_edge_*.py (in test directory), test_remove_edge_payload.py.
 
@@ -339,20 +341,20 @@ Marker protocol: written at checkpoint (nap 7757–7767); read by engram_report_
 
 ## **17. Trust Tiers (Layer-1 Person Node Classification)**
 
-**what** — Person nodes (pn_*) are classified into trust tiers on creation: user_family, our_side, known_external, unknown, suspect. Trust signals (ts_*) are interpretive metadata nodes linking to person nodes (polarity: positive/negative, weight: 0.0–1.0). Backfill: on startup, all existing pn_* with NULL trust_tier get trust_tier='unknown'. Trust tier affects salience in agent-facing recalls (future filtering/weighting).
+**what** — Person nodes (pn_*) are classified into trust tiers on creation: self, primary_user, user_family, our_side, known_external, unknown, suspect — ranked highest to lowest (`TIER_RANK` in `engram_trust.py`), with `our_side` marking the internal/external boundary. Trust signals (ts_*) are interpretive metadata nodes linking to person nodes (polarity: positive/negative, weight: 0.0–1.0). Backfill: on startup, all existing pn_* with NULL trust_tier get trust_tier='unknown'. Trust tier affects salience in agent-facing recalls (future filtering/weighting).
 
-**how** — Columns (added via migration 1517–1525): trust_tier (TEXT), trust_signal_kind, trust_signal_polarity, trust_signal_weight. Backfill (1531–1533): UPDATE nodes SET trust_tier='unknown' WHERE type='person' AND trust_tier IS NULL.
+**how** — Columns added via migration (`engram_core.py:2091–2094`): trust_tier (TEXT), trust_signal_kind, trust_signal_polarity, trust_signal_weight. Backfill (`engram_core.py:2129–2131`): UPDATE nodes SET trust_tier='unknown' WHERE type='person' AND trust_tier IS NULL.
 
 Entry points:
-- `engram_add_person()` (10021–10235) creates pn_* with trust_tier param.
-- `engram_set_trust_tier()` (10236–10493) updates tier on existing node.
-- `engram_add_trust_signal()` (10494–10713) creates ts_* node linking to person.
+- `engram_add_person()` (server.py:3587–3642) creates pn_* with trust_tier param.
+- `engram_set_trust_tier()` (server.py:3855–3907) updates tier on existing node.
+- `engram_add_trust_signal()` (server.py:4010–4068) creates ts_* node linking to person.
 
 **status-candidate** — **prod-presumed** (infrastructure in place; trust-tier filtering in agent recalls not yet implemented as of current snapshot).
 
-**files** — server.py (columns 1517–1525; backfill 1531–1533; engram_add_person 10021–10235; engram_set_trust_tier 10236–10493; engram_add_trust_signal 10494–10713).
+**files** — server.py (engram_add_person 3587–3642; engram_set_trust_tier 3855–3907; engram_add_trust_signal 4010–4068); engram_core.py (columns 2091–2094; backfill 2129–2131).
 
-**key constants** — Valid tiers: {user_family, our_side, known_external, unknown, suspect}.
+**key constants** — Valid tiers, ranked via `TIER_RANK` in `engram_trust.py`: self=6, primary_user=5, user_family=4, our_side=3, known_external=2, unknown=1, suspect=0 (`INTERNAL_THRESHOLD=3` — our_side and above is internal).
 
 **tests** — test_goal.py (implicit); explicit trust-tier tests may be sparse.
 
