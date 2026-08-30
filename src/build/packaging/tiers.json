@@ -526,6 +526,10 @@
       "tier": "convenience"
     },
     {
+      "path": "hooks/claude/engram-solo-wakeup-guard-hook.py",
+      "tier": "convenience"
+    },
+    {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
       "tier": "convenience"
     },
