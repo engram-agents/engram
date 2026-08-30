@@ -336,6 +336,32 @@ def test_supersede_relational():
         print("  T14 PASS — edit_history audit trail entry created")
         passed += 1
 
+        # ---- Test 15a: #2396 — retract of an already-SUPERSEDED node is
+        #      blocked, and the error names the current successor ----
+        ob15 = _mk_observation("Premise for #2396 sibling test")
+        dv15_old = _mk_derivation("Claim to be superseded", [ob15])
+        dv15_new = _mk_derivation("Replacement claim", [ob15])
+        sup15 = json.loads(engram_revision._supersede_impl(dv15_old, dv15_new))
+        assert sup15["status"] == "superseded", f"T15a setup: {sup15}"
+        r = json.loads(engram_revision._retract_impl(
+            node_id=dv15_old, error_type="other", reason="T15a plain retract of superseded node",
+        ))
+        assert "error" in r and "not current" in r["error"], f"T15a: {r}"
+        assert dv15_new in r["error"], f"T15a: error should name the successor: {r}"
+        assert r.get("successor_id") == dv15_new, f"T15a: successor_id should be {dv15_new}: {r}"
+        print("  T15a PASS — retract of already-superseded node blocked, names successor (#2396)")
+        passed += 1
+
+        # ---- Test 15b: #2396 — retract of an already-RETRACTED node is
+        #      blocked (idempotency); no successor_id since none exists ----
+        r2 = json.loads(engram_revision._retract_impl(
+            node_id=ob_retracted, error_type="other", reason="T15b second retract of retracted node",
+        ))
+        assert "error" in r2 and "not current" in r2["error"], f"T15b: {r2}"
+        assert "successor_id" not in r2, f"T15b: a purely-retracted node has no successor: {r2}"
+        print("  T15b PASS — second retract of already-retracted node blocked (idempotency, #2396)")
+        passed += 1
+
     print(f"\n{'='*56}")
     print(f"  {passed} passed, {failed} failed")
     print('='*56)

@@ -2552,6 +2552,13 @@ def _retract_impl(
     (derivations, theories) that depend on the retracted node are flagged as
     tainted so they can be reviewed and corrected.
 
+    Two refusals guard the target node, checked in order: (1) #2396 — a plain
+    retract of a NON-CURRENT node (already superseded or retracted) is refused,
+    mirroring _supersede_impl's is_current check; retract the current successor
+    or record a contradiction/observation against the historical record instead.
+    (2) #2343 / #2013 invariant 7 — a plain retract of a CURRENT node that still
+    carries a pending cascade marker is refused and pointed at mode C.
+
     Cascade behavior (#2013/#2009 slice 1 — the cascade machine):
       - Derivation cascade: every node reachable via CASCADE_RELATIONS
         edges (today just derives_from — supported_by lost its cascade
@@ -2661,12 +2668,87 @@ def _retract_impl(
         if not node:
             return json.dumps({"error": f"Node '{node_id}' not found."})
 
+        # #2396: mirror _supersede_impl's :2128 refusal — a plain retract of a
+        # NON-CURRENT node is refused, UNGATED by cascade_triggering (same as
+        # supersede's sibling check). Without this, retracting an already-
+        # superseded/retracted node reopens #2343's double-adjudication
+        # through a second door and is not idempotent (retract twice -> two
+        # markers on every descendant, unbounded). Real-graph incidence of
+        # "both superseded and retracted": zero in 8454 nodes. The steelman
+        # (retract-after-supersede as a genuine "I later learned it was
+        # fabricated" reclassification) is real but has never occurred; wait
+        # for a real instance and design against that, rather than building
+        # machinery for a case that practice has never produced.
+        #
+        # This is intentionally NOT gated on cascade_triggering. The only
+        # cascade_triggering=False caller is _cascade_resolve_impl, whose
+        # targets are frontier nodes; frontier membership requires a pending
+        # cascade marker, and every path that writes a cascade_markers row
+        # filters is_current = 1 (_walk_cascade_downstream's WHERE clause,
+        # the contradiction-cascade fetches, and the #2324 backfill's source
+        # query) — so the resolution route never passes a non-current node
+        # today. If a future change ever made it do so, refusing would be
+        # the correct outcome, not a regression.
+        if node["is_current"] != 1:
+            _actual_status = "retracted" if node["status"] == "retracted" else "superseded"
+            _successor = node["superseded_by"]
+            # Named parts for readability (#2396 round 2, refined round 4).
+            # _remedy branches on whether a successor exists: with one,
+            # retract-the-successor and contradict-the-successor are both
+            # actionable (engram_contradict itself refuses a non-current
+            # target and redirects to the successor, so pointing there
+            # directly matches what the next call will actually accept);
+            # with none (a purely-retracted node has no successor),
+            # "retract the successor" is not actionable advice and neither
+            # is contradiction (engram_contradict refuses unconditionally
+            # with no redirect) — offer only the observation remedy.
+            _state = f"is not current (already {_actual_status})" + (
+                f", superseded by '{_successor}'" if _successor else ""
+            )
+            _why = (
+                f"A plain engram_retract on a non-current node is refused — "
+                f"retracting an already-{_actual_status} node would reopen "
+                f"descendants that were already adjudicated (#2013/#2396) "
+                f"and is not idempotent."
+            )
+            if _successor:
+                _remedy = (
+                    f"To fix this: retract the current successor "
+                    f"'{_successor}' instead, or, if the point is that this "
+                    f"historical record itself was invalid, record a "
+                    f"contradiction against its successor '{_successor}' "
+                    f"(engram_contradict refuses a non-current target and "
+                    f"will redirect you there anyway), or file an "
+                    f"observation (engram_add_observation) against the "
+                    f"record."
+                )
+            else:
+                _remedy = (
+                    f"To fix this: if the point is that this historical "
+                    f"record itself was invalid, file an observation "
+                    f"(engram_add_observation) against the record — "
+                    f"engram_contradict is not an option here, since it "
+                    f"refuses any non-current target outright and this "
+                    f"node has no successor to redirect to."
+                )
+            _result = {
+                "error": f"Node '{node_id}' {_state}. {_why} {_remedy}",
+                "next_call": f"engram_history(node_id={node_id!r})",
+            }
+            if _successor:
+                _result["successor_id"] = _successor
+            return json.dumps(_result)
+
         # #2343 / #2013 invariant 7: same refusal as _supersede_impl — a PLAIN
         # retract of a node that already carries a pending cascade marker is
         # refused and pointed at mode C; the resolution route (cascade_
         # triggering=False, via engram_cascade_resolve) is the only way to
         # retract a marked node. See the sibling comment in _supersede_impl.
-        if cascade_triggering and node["is_current"] == 1:
+        # The `and node["is_current"] == 1` clause that used to guard this
+        # check is now unnecessary rather than merely dead (#2395): the
+        # refusal immediately above already excludes non-current input, so
+        # every node that reaches this line is already known to be current.
+        if cascade_triggering:
             _pending_here = core._pending_markers_for_node(conn, node_id)
             if _pending_here:
                 _events = sorted({m["cascade_event"] for m in _pending_here})

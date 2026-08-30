@@ -72,5 +72,6 @@ not against the harness: every transition went through `engram_revision.py`.
 | `test_cd07_cycle_guard.py` | supersede C with E (its own descendant) is refused; graph unchanged |
 | `test_cd08_supersede_marked_node.py` | plain supersede of an already-marked C must not open a second event — **xfail #2343** |
 | `test_cd09_drive_to_empty.py` | resolving frontier-by-frontier terminates with nothing pending and no anomaly flag |
+| `test_cd10_retract_non_current.py` | plain retract of a NON-CURRENT node is refused — adjudicated descendants stay put, retract-twice is not idempotent, the unacknowledged door stays shut (#2396) |
 
 Run: `python -m pytest tests/cascade_scenarios -q`
