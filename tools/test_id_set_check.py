@@ -49,6 +49,22 @@ Collected, for every `*.py` under `tests/`:
   - LIMIT (by design): the PR-body marker parser's inline-code strip has its
     own unterminated-backtick swallow limit — see `parse_removed_test_markers`'s
     docstring.
+  - LIMIT (by design, not yet oversight): #2421's widened marker anchor
+    accepts unordered-list markers (`-`, `*`, `+`) only — an ORDERED list
+    (`1.`, `2)`), a GFM task-list checkbox (`- [ ] `), or a BLOCKQUOTE
+    (`> `) still hits the same root as #2421 (a shape-list standing in
+    for a site-list) and would each be a further variant. Borges's
+    colleague pass on PR#2422 drove the parser against a numbered-list
+    line and a blockquoted line directly: both currently parse 0 and
+    warn 1 (same graceful-degradation the anchor already gives any
+    unrecognized prefix — no fabricated accounted-for id, but no
+    recognition either). A numbered list is at least as natural a
+    choice as a bullet for an itemized removed-test list. Scoped to the
+    three forms actually observed in practice (#2393's two, plus
+    #2421's bulleted case on the live v0.5.0 release PR); the ordered/
+    checkbox/blockquote forms are follow-up-shaped, not yet observed,
+    and noted here so the next incident is recognized against this
+    line rather than re-discovered as a surprise.
 
 The base/head comparison reads git objects directly (`git ls-tree` +
 `git show <rev>:<path>`) — it never checks anything out.
@@ -267,8 +283,22 @@ def collect_ids(sources: Mapping[str, str]) -> set[str]:
 # hyphen appearing inside a free-text reason can never be mistaken for the
 # separator — the id (\S+) cannot itself contain whitespace, so this bounds
 # it cleanly without needing to special-case hyphens inside ids.
+#
+# #2421 — an optional leading markdown list marker (`- `, `* `, `+ `) is
+# permitted between the line-start whitespace and the key. Measured live on
+# the v0.5.0 release PR: an author wrote 15 markers as a bullet list (the
+# obvious way to write fifteen of anything in a PR body), and the pre-#2421
+# anchor -- whitespace only, no list marker -- silently dropped all 15. This
+# is the THIRD confirmed variant of one root (a shape-list standing in for a
+# site-list): #2393's own glued-mid-line and malformed-separator cases were
+# the first two. The fix widens the SAME anchor both `parse_removed_test_
+# markers` and `find_unparsed_removed_test_lines` share, so a bulleted
+# marker now genuinely parses (accounts for the disappearance) rather than
+# merely stopping the fail-loud warning from firing on it -- the warning
+# path is untouched and still catches variants 1 and 2, which a bulleted
+# marker was never the shape of anyway.
 _MARKER_RE = re.compile(
-    r"^[ \t]*removed-test:[ \t]+(?P<id>\S+)[ \t]+[—-][ \t]*(?P<reason>.*?)[ \t]*$",
+    r"^[ \t]*(?:[-*+][ \t]+)?removed-test:[ \t]+(?P<id>\S+)[ \t]+[—-][ \t]*(?P<reason>.*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
