@@ -347,6 +347,48 @@ Cheap to check, and the check is the whole point: it
 replaces inferring readiness from the *shape* of the review record with
 actually reading it.
 
+### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
+
+GitHub Stacked PRs (public preview 2026-07-30; official extension
+`github/gh-stack`) is **post-cutoff for every model on the team** — no session
+knows it exists unless a surface carries it. This section is that surface
+(Lei, 2026-08-29). Install is **per-user**: `gh extension install
+github/gh-stack` — only then does `gh --help` list `stack` under EXTENSION
+COMMANDS; verify with `gh extension list`. All facts below measured live on
+the 2026-08-29 cascade train (alpha #2373/#2382).
+
+- **Link existing PRs into a stack**: `gh stack link <pr1> <pr2> …`.
+- **A stack member REFUSES plain `gh pr merge`** ("must be merged using the
+  asynchronous merge REST API"). The merge verb for stack members is
+  `gh stack merge <pr> --squash --yes`. Don't fight the refusal — it's the
+  signal you're on a stack.
+- **After a layer merges, GitHub auto-rebases the next layer itself** — no
+  push from any seat; patch-id identical to a hand `rebase --onto`; the
+  force-push is attributed to the merger. Expect it, and **verify with
+  `git range-diff`/patch-id rather than assuming** it happened or that it
+  changed nothing.
+- **Cascading rebase of un-merged layers**: `gh stack sync` / `gh stack
+  rebase`. Machine-readable status: `gh stack view --json`. Stacks are
+  API-readable (REST `stack`, GraphQL `PullRequestStack`) but not
+  API-mutable.
+- **Ruleset interaction**: with `require_last_push_approval=true` on the
+  target branch, the seat that syncs/rebases **cannot** be the tip
+  re-affirmer — a teammate re-approves (this includes GitHub's own
+  auto-rebase being attributed to the merger). **On this repo it is `true`
+  on `dev`, where stacks live, and `false` on `main`** (measured
+  2026-08-30 — the two protected branches are configured oppositely). And
+  `dismiss_stale_reviews_on_push: true` on `dev` means a content-changing
+  push **dismisses** the existing approval — it is gone, not merely
+  un-renewable by the pusher; whether GitHub's patch-id-identical
+  auto-rebase migrates or dismisses it is unmeasured, so read the approval
+  back after every layer rather than assuming.
+
+> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
+> 2026-08-29: whichever repo a session starts from must load it), with no
+> generator or test binding them. Change one, change all three in the same
+> pass — **but the ruleset paragraph and any repo-specific merge-authority
+> clause are deliberately per-repo; sync the rules, not the local facts.**
+
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
 Three parts of one rule (Lei, 2026-08-14). Applies in single-agent mode too — checking

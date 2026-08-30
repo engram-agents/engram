@@ -34,6 +34,21 @@ LOG_DIR="$HOME/.engram/logs"
 LOG="$LOG_DIR/autostart-launch.log"
 mkdir -p "$LOG_DIR"
 
+# gh-stack ensure (#2391): the stacked-PR merge verb must be discoverable via
+# `gh --help` on every seat, and the extension is per-user — a seat without it
+# cannot merge a stack member at all. Idempotent (list-then-install), quiet,
+# and NON-FATAL by design: a seat with no network or no gh still boots, and
+# the CLAUDE.md rule section remains the knowledge carrier either way.
+# `timeout` is GNU coreutils (absent on stock macOS); the command -v guard
+# makes its absence skip the ensure rather than error — acceptable because
+# this script is reached only via agentctl, which today runs on Linux seats.
+if command -v gh >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 \
+        && ! timeout 10 gh extension list 2>/dev/null | grep -q 'github/gh-stack'; then
+    echo "[$(date -Is)] [$AGENT_NAME] gh-stack extension absent — installing (30s cap)" >> "$LOG"
+    timeout 30 gh extension install github/gh-stack >>"$LOG" 2>&1 \
+        || echo "[$(date -Is)] [$AGENT_NAME] WARN: gh-stack extension install failed or timed out (non-fatal; see CLAUDE.md 'Stacked PRs')" >> "$LOG"
+fi
+
 platform="$(agentctl __detect-platform-as-self)" || {
     echo "[$(date -Is)] [$AGENT_NAME] ERROR: could not detect platform for boot session" >> "$LOG"
     echo "[autostart] could not detect the agent platform; refusing to guess boot arguments" >&2
