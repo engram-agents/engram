@@ -20,6 +20,62 @@ state drift silently. The release also carries the CB/NCB claim-bearing
 partition groundwork (#2252 stage 1) it builds on, and a wide CI-gate wave that
 grew out of shipping both.
 
+### rc2 addendum (2026-08-30 afternoon — between rc1 and rc2)
+
+Documentation, discoverability, and hardening landed after the rc1 tag, cut as
+rc2 so the first upgraded fleet runs a self-consistent state:
+
+- **`docs/cascade-machine.md`** — the cascade machine's design of record,
+  extracted from the epic at close (#2348): marker model, the three processes
+  and the frontier-as-topological-order, all nine invariants with their
+  measurements, the three propagations and their different rules, the
+  acknowledgement-edge story in full, the derived-set SSoT rule, the backfill,
+  and the five build defects. Bound to the code by
+  `tests/test_cascade_machine_doc_binding.py` (with a can-it-fail control) —
+  which earned its keep before it existed: its author-fairy refused to write it
+  against the doc's first draft and surfaced a real membership error.
+- **Cascade skills corrected from the maintainer's first full read**
+  (engram-resolve-cascade, engram-revise): mode C described as the restricted
+  moving frontier it is (self-inclusive — your own target in the list is the
+  mechanism working); the acknowledged shape's `acknowledged_derives_from`
+  wiring stated (creation-order-exempt by design, cycle-guarded); the worked
+  example split into retracted-premise (acknowledge never eligible) and
+  superseded-premise (eligible, edge wired) cases; the "When in doubt" section
+  rewritten to the agent-agency authority model — resolve by default, leave
+  open honestly, escalate rarely and only for named shapes.
+- **`engram-support-lost` skill (new, essential tier)** — support_lost handling
+  extracted from Pattern B into its own skill, with a dream-fairy scan category
+  (11 — the shared lottery namespace's 10 belongs to person-node maintenance)
+  and dream-master adjudication hookup; category counts across dream surfaces
+  now defer to `dream_lottery.py`'s `CATEGORIES` dict as the roster SSoT.
+- **Private-repo issue/PR numbers scrubbed from shipping cascade surfaces**
+  (skills, agent specs, refusal/notice strings) — dead references for users
+  without repo access; messages are now self-contained, with the design doc as
+  the named deeper reference. Repo-wide backlog sweep tracked separately.
+- **Solo-ScheduleWakeup swallowed-reply guard** (new PreToolUse hook, #2427) —
+  denies a solo arm only when the turn answers a genuine human message and has
+  no sibling tool call; the fix is always "add a sibling call", so no
+  stuck-deny is possible. Goes live per-seat on the post-upgrade restart.
+- **CI-green rule amendment** (CLAUDE.md + `baton.py` docstrings) — the
+  measured statusCheckRollup semantics (head-scoped, un-deduped, same-SHA
+  re-runs) with `_pr_ci_state()` as the named reference implementation.
+- **gh-stack linking made mandatory at PR creation** (CLAUDE.md, three-repo
+  pass) — with the measured recoverability discriminator: the close survives,
+  the post-close force-push is the point of no return; restore the base ref
+  before rebasing anything.
+- **Cycle-guard and marked-node remedy texts now name the resolution route**
+  (#2405 ruled wording-only by the maintainer; fixed in #2424) — the refusals
+  on plain supersede/retract of a marked node point at the frontier/resolve
+  flow instead of a call the guards refuse. The rc1 "ruling pending" caveat
+  for this is retired: ruled, fixed, shipped.
+- **Removed-test markers parse in bulleted form** (#2421 → #2422) — the
+  census gate's line-anchored parser now accepts `- Removed-test:` list
+  items; closes the fail-loud-warning thread one PR further than rc1's note.
+- **Redundant non-author-approval workflow deleted** (#2423) — dev's ruleset
+  is the enforcement; the maintainer deliberately declined an
+  all-reviewers-approved gate (a token-blocked or sleeping reviewer must not
+  hard-block a merge).
+
 ### Added — the cascade machine (#2013)
 
 - **`cascade_markers` + the frontier/resolve verbs** (#2338, #2342, #2349) —
@@ -103,8 +159,6 @@ grew out of shipping both.
   (reflect / health-score / viz) still read the legacy `stale_by` fields and
   undercount post-migration. #2339: the cascade walk's `max_depth` is a node
   budget, not a depth limit. #2003: superseded nodes keep `status='active'`.
-- #2405: `engram_cascade_resolve`'s cycle-guard remedy text may name a call
-  the guards refuse; ruling pending.
 
 ## [v0.4.0] - 2026-08-19
 
