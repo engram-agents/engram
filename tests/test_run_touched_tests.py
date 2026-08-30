@@ -699,6 +699,244 @@ class TestLayer2ConventionMap:
         assert is_full
         assert any("hooks/danger.sh" in r for r in reasons)
 
+    def test_src_engram_prefixed_hook_path_resolves(self, tmp_path: Path):
+        """#2439: a REAL git-diff path for a hooks/claude/*.py change is
+        src/engram/hooks/claude/<f>.py (no repo-root shim exists for hooks at
+        all), but every mapping entry is written bare (hooks/claude/<f>.py) --
+        matching tiers.json's own convention and TestMappingCompleteness's
+        bare-path coverage comparison. Without de-prefixing the query side,
+        this entry can never match a real changed-file path and silently
+        falls back to the full suite on every hook-file touch."""
+        repo = _make_tmp_repo(tmp_path)
+
+        (repo / "hooks").mkdir()
+        (repo / "hooks" / "myhook.py").write_text("# hook", encoding="utf-8")
+        (repo / "tests" / "test_myhook.py").write_text(
+            "def test_hook(): pass", encoding="utf-8"
+        )
+
+        test_map = {
+            "schema_version": 1,
+            "mappings": [
+                {
+                    "path_prefix_or_glob": "hooks/myhook.py",
+                    "test_globs": ["tests/test_myhook.py"],
+                }
+            ],
+            "unmapped": [],
+        }
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
+            json.dumps(test_map), encoding="utf-8"
+        )
+
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
+            ["src/engram/hooks/myhook.py"], str(repo)
+        )
+
+        assert not is_full
+        sel_names = {Path(p).name for p in selected}
+        assert "test_myhook.py" in sel_names, f"Expected test_myhook.py; got {sel_names}"
+
+    def test_src_build_prefixed_path_resolves(self, tmp_path: Path):
+        """Same class as the src/engram/ case, for the src/build/ symlink
+        target (e.g. tools/build-plugin.sh -> ../src/build/build-plugin.sh)."""
+        repo = _make_tmp_repo(tmp_path)
+        (repo / "tests" / "test_myhook.py").write_text(
+            "def test_hook(): pass", encoding="utf-8"
+        )
+
+        test_map = {
+            "schema_version": 1,
+            "mappings": [
+                {
+                    "path_prefix_or_glob": "tools/build-plugin.sh",
+                    "test_globs": ["tests/test_myhook.py"],
+                }
+            ],
+            "unmapped": [],
+        }
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
+            json.dumps(test_map), encoding="utf-8"
+        )
+
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
+            ["src/build/build-plugin.sh"], str(repo)
+        )
+
+        assert not is_full
+        sel_names = {Path(p).name for p in selected}
+        assert "test_myhook.py" in sel_names, f"Expected test_myhook.py; got {sel_names}"
+
+    def test_literal_bare_path_still_matches_unprefixed(self, tmp_path: Path):
+        """Control: the de-prefix candidate is additive, not a replacement --
+        a literal bare-path changed-file (the common repo-root-tool case)
+        still matches on its own, unaffected by the new candidate set."""
+        repo = _make_tmp_repo(tmp_path)
+
+        (repo / "tools").mkdir()
+        (repo / "tools" / "real_tool.py").write_text("# tool", encoding="utf-8")
+        (repo / "tests" / "test_myhook.py").write_text(
+            "def test_hook(): pass", encoding="utf-8"
+        )
+
+        test_map = {
+            "schema_version": 1,
+            "mappings": [
+                {
+                    "path_prefix_or_glob": "tools/real_tool.py",
+                    "test_globs": ["tests/test_myhook.py"],
+                }
+            ],
+            "unmapped": [],
+        }
+        (repo / "src" / "engram" / "packaging" / "test-map.json").write_text(
+            json.dumps(test_map), encoding="utf-8"
+        )
+
+        selected, is_full, reasons, _map_sel = _runner.select_tests(
+            ["tools/real_tool.py"], str(repo)
+        )
+
+        assert not is_full
+        sel_names = {Path(p).name for p in selected}
+        assert "test_myhook.py" in sel_names
+
+    def test_every_hooks_and_tools_mapping_resolves_against_a_realistic_path(self):
+        """Class-level regression guard for #2439: every REAL mapping entry
+        in the shipped test-map.json must resolve (or explicitly
+        full-suite-fallback) when queried with the path shape git actually
+        reports for its own file. Covers every prefix family, not just
+        hooks/claude/* and tools/* -- a reviewer-fairy round on the fix's own
+        PR found that ``packaging/tiers.json`` (real location src/build/) was
+        left unresolved by a version of this guard scoped to only two
+        families, which is exactly the kind of gap a narrowly-scoped
+        completeness check exists to prevent recurring. Real location is
+        determined empirically per entry (existence-checked / symlink-
+        resolved), never assumed from the bare prefix alone -- packaging/
+        itself splits across two source trees by filename (see
+        _shipped_path_candidates' docstring), so prefix alone is not a
+        reliable predictor.
+
+        Directory-prefix entries (e.g. skills/claude/) are exercised too, not
+        skipped: a colleague-review finding on this fix's own PR noted that
+        skipping them entirely made the guard's own coverage narrower than
+        its docstring claimed ("the guard exists to catch a mapping that can
+        never fire" applies to dir-prefix entries exactly as much as file
+        entries) -- picking any one real file under the entry's resolved
+        source tree and querying with THAT exercises the same de-prefixing
+        path a real touch under that prefix would take. .github/ needs no
+        such resolution -- it is real at repo root, so its own bare path
+        (any file directly under the prefix) already works.
+
+        A silently-empty, non-full-suite result here is exactly the "added a
+        mapping, it can never actually fire" gap this issue closed --
+        catching it structurally rather than per-instance."""
+        test_map = _runner._load_test_map(str(REPO_ROOT))
+        unresolved: list[str] = []
+        no_real_file: list[str] = []
+
+        for entry in test_map.get("mappings", []):
+            pattern = entry.get("path_prefix_or_glob", "")
+            # An entry can deliberately carry zero test_globs and no
+            # full_suite_fallback (e.g. .github/workflows/ -- "no test
+            # surface for this family, acknowledged explicitly"). Its
+            # _resolve_convention_map result is indistinguishable from
+            # "never matched" by return value alone (empty selected, is_full
+            # False either way) -- so for these, "does it resolve" isn't the
+            # right question; only "does the pattern still match at all"
+            # would be, which this guard isn't built to check separately.
+            # Correctly matching-but-empty is the DESIGNED behavior here.
+            deliberately_empty = not entry.get("test_globs") and not entry.get(
+                "full_suite_fallback"
+            )
+            if pattern.endswith("/"):
+                # Directory-prefix entry: find one real file under whichever
+                # source tree actually holds it (repo-root directly, or
+                # nested under src/engram/ / src/build/), and query with
+                # THAT file's real path -- exercising the same de-prefixing
+                # a genuine touch under this prefix would need.
+                bare_dir = REPO_ROOT / pattern
+                if bare_dir.is_dir():
+                    real_file = next(
+                        (p for p in sorted(bare_dir.rglob("*")) if p.is_file()),
+                        None,
+                    )
+                    if real_file is None:
+                        no_real_file.append(pattern)
+                        continue
+                    query_path = str(real_file.relative_to(REPO_ROOT))
+                else:
+                    resolved = None
+                    for src_root in ("src/engram", "src/build"):
+                        candidate_dir = REPO_ROOT / src_root / pattern
+                        if candidate_dir.is_dir():
+                            real_file = next(
+                                (p for p in sorted(candidate_dir.rglob("*")) if p.is_file()),
+                                None,
+                            )
+                            if real_file is not None:
+                                query_path = str(real_file.relative_to(REPO_ROOT))
+                                resolved = True
+                                break
+                    if not resolved:
+                        no_real_file.append(pattern)
+                        continue
+
+                selected, is_full = _runner._resolve_convention_map(
+                    query_path, test_map, str(REPO_ROOT)
+                )
+                if not selected and not is_full and not deliberately_empty:
+                    unresolved.append(f"{pattern} (queried as {query_path})")
+                continue
+            if any(ch in pattern for ch in "*?["):
+                continue  # glob entries (e.g. tools/perf/*.py) match many real
+                # files under a real directory, not one path to existence-check
+
+            bare_path = REPO_ROOT / pattern
+            if bare_path.is_symlink():
+                # Resolve the symlink target relative to its own dir, then
+                # re-root at REPO_ROOT to get the real repo-relative path.
+                real_target = Path(os.readlink(bare_path))
+                real_abs = (bare_path.parent / real_target).resolve()
+                query_path = str(real_abs.relative_to(REPO_ROOT))
+            elif bare_path.exists():
+                # Genuine repo-root file (e.g. tools/stray_baton_path_check.py,
+                # or a real non-shim-needing family like .github/) -- its own
+                # bare path IS the real changed-file path.
+                query_path = pattern
+            else:
+                # No repo-root shim at all. Determine which source tree
+                # actually holds the file -- empirically, not by prefix,
+                # since e.g. packaging/ splits across both.
+                engram_candidate = REPO_ROOT / "src" / "engram" / pattern
+                build_candidate = REPO_ROOT / "src" / "build" / pattern
+                if engram_candidate.exists():
+                    query_path = f"src/engram/{pattern}"
+                elif build_candidate.exists():
+                    query_path = f"src/build/{pattern}"
+                else:
+                    no_real_file.append(pattern)
+                    continue
+
+            selected, is_full = _runner._resolve_convention_map(
+                query_path, test_map, str(REPO_ROOT)
+            )
+            if not selected and not is_full and not deliberately_empty:
+                unresolved.append(f"{pattern} (queried as {query_path})")
+
+        assert not no_real_file, (
+            "these test-map.json entries have no real file at their own bare "
+            "path, nor under src/engram/ or src/build/ -- likely stale "
+            "entries for a removed/renamed file:\n"
+            + "\n".join(f"  {u}" for u in no_real_file)
+        )
+        assert not unresolved, (
+            "these test-map.json entries do not resolve against the real "
+            "changed-file path shape for their own file "
+            "(silently falls back to full suite instead):\n"
+            + "\n".join(f"  {u}" for u in unresolved)
+        )
+
 
 class TestFailOpenTriggers:
     """Fail-open triggers → full suite, naming the cause."""
