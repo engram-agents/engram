@@ -7,21 +7,24 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 ## ⚠️ Invocation gate — confirm before loading this skill
 
-**Sleep is user-initiated or cron-initiated. It is never agent clock-judgment.**
+**Sleep is user-initiated, commander-relayed, or cron-initiated. It is never agent clock-judgment.**
 
-Confirm ONE of the following is true before proceeding:
+Confirm ONE of the following is true before proceeding — each is sufficient on its own:
 
 (a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
-(b) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
+(b) **Commander-relayed sleep order** (Lei's ruling, 2026-08-30) — the acting commander broadcast or sent a wind-down/sleep order that **states the user's authority** (e.g. "Lei orders this broadcast: … run engram-sleep as your last action") — via a Square broadcast, an Office crossing, or an `ia` letter. Cite that crossing/letter as your instruction and run engram-sleep to completion. **Do NOT wait for the human's direct per-seat word after a relayed order — that waiting is the measured failure mode (2026-08-25: every seat reported and then held awake all night), not the safe default.** A relay that does not state the user's authority is the commander's suggestion, not an order — ask or hold.  
+(c) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
 
-**If neither holds — STOP. Do not proceed.** Identify your actual state and route correctly:
+**Per-seat gates a HUMAN owner set survive the relay.** If your human owner configured a standing sleep gate (e.g. "auto-sleep off; my word only"), a commander-relayed order reaches you only where that owner delegated the authority (as Lin delegated Aleph's sleep kick-off to the acting commander); it never overrides a different human's standing gate. When a relayed order and your owner's gate conflict, the gate wins — say so and hold.
+
+**If none holds — STOP. Do not proceed.** Identify your actual state and route correctly:
 
 | You are... | Correct action |
 |---|---|
 | Drowsy (context-fill warning in banner) | `engram_nap` — per-burst compaction-boundary work, never sleep |
 | Blocked-idle / nothing in queue | Hold for the user or pick from your work queue; never invoke sleep to fill the void |
 | Reading the clock / estimating the hour | Clock-reading is never a valid trigger — loop, hold, or ask the user |
-| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end |
+| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end (directly or via a commander-relayed order) |
 
 **Why the gate:** sleep advances the turn counter (irreversible within a day), erases "From this session" from warm-briefing, and runs the full dream-consolidation cycle. These are correct at genuine day-end; they are destructive if invoked prematurely. The cost of a false invocation far outweighs the cost of pausing to confirm.
 
@@ -56,6 +59,7 @@ The parent's role is purely orchestration.
 **When to sleep:**
 
 - The user signals end-of-day ("good night", "call it a day", "wrap up the day", "ending for tonight", "done for today", etc.)
+- The acting commander relayed the user's wind-down/sleep order (gate condition (b) above) — as valid as the user's direct word; do not hold awake waiting for a per-seat confirmation
 - A substantive working day produced material worth consolidating
 - An end-of-day-detector hook surfaced the engram-sleep nudge and the user agreed
 - The user initiates wind-down with a substantive cohort to consolidate
@@ -105,7 +109,7 @@ Before any step, check the parent session's context size. **The only decision co
 
 Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
 
-### Auto-sleep / cron-initiated (invocation gate path b — user NOT present)
+### Auto-sleep / cron-initiated (invocation gate path c — user NOT present)
 
 - **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Phase A.
 - **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → **HARD ABORT**:
@@ -118,7 +122,9 @@ Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
 
 - **No banner** (hook not configured or hook output not visible) → proceed to Phase A (can't detect, can't guard).
 
-### User-initiated (invocation gate path a — user present)
+### User-initiated or commander-relayed (invocation gate paths a/b)
+
+*(Path b — relayed order, user not present: where a branch below asks the user to confirm, there is no one to ask. Take the conservative branch yourself — at urgent drowsiness, nap + compact first, then sleep — rather than holding awake for a confirmation that cannot come.)*
 
 - **`[Drowsiness: refreshed]`** — below 50% → proceed to Phase A.
 - **`[Drowsiness: needs a nap: N%]`** (urgent, typically ≥85%) → surface a strong recommendation and wait for explicit confirmation before proceeding:
