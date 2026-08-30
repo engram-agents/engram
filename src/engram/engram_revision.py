@@ -1399,14 +1399,26 @@ def _cascade_resolve_impl(node_id: str = "", resolution_kind: str = "",
                              f"to {exc.replacement_id!r}, which already "
                              f"transitively derives from {exc.node_id!r} — "
                              f"closing a cycle over CASCADE_RELATIONS. "
-                             f"Supersede or retract this node instead of "
-                             f"acknowledging it.",
+                             f"Acknowledgement is not allowed here. Resolve "
+                             f"{exc.node_id!r} through engram_cascade_resolve "
+                             f"instead, with resolution_kind='superseded' "
+                             f"(supplying a replacement_id) or "
+                             f"resolution_kind='retracted' — that resolution "
+                             f"route's own supersede/retract stays open by "
+                             f"design; only acknowledgement is refused here.",
                     "guard": "acknowledgement_would_close_cascade_cycle",
                     "node_id": exc.node_id,
                     "replacement_id": exc.replacement_id,
                     "relation": "acknowledged_derives_from",
-                    "remedy": "supersede or retract this node instead of "
-                              "acknowledging it",
+                    "remedy": "resolve through engram_cascade_resolve with "
+                              "resolution_kind='superseded' (supplying a "
+                              "replacement_id) or resolution_kind='retracted' "
+                              "— acknowledgement is not allowed here. That "
+                              "resolution route's own supersede/retract "
+                              "stays open by design.",
+                    "next_call": f"engram_cascade_frontier(node_id={exc.node_id!r})",
+                    "then": f"engram_cascade_resolve(node_id={exc.node_id!r}, "
+                            f"resolution_kind=...)",
                     "phase": "apply",
                     "markers_unchanged": True,
                 })
@@ -2118,12 +2130,12 @@ def _supersede_impl(
       - Both nodes must exist and be is_current=1 (no resurrecting
         superseded/retracted nodes).
       - old.type must equal new.type (cross-type "promotion" is not
-        supersede — use retract + create fresh instead).
+        supersede — use engram_retract + create a fresh node instead).
       - new.created_at must be >= old.created_at (DAG invariant).
       - new.supersedes must be NULL (a node can't already be the
         successor of a different supersede chain).
       - old.type cannot be feeling_report (terminal type — file a new
-        report or retract).
+        report or use engram_retract).
 
     Evidence nodes (ev_XXXX) are supersede-capable in principle but
     usually the wrong tool — if a URL is wrong or a source is bad, use

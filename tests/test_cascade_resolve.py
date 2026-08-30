@@ -592,7 +592,25 @@ def test_acknowledgement_cannot_close_a_cascade_cycle():
     assert a2["guard"] == "acknowledgement_would_close_cascade_cycle", a2
     assert a2["relation"] == "acknowledged_derives_from", a2
     assert a2["node_id"] == dv5, a2
-    assert "supersede or retract" in a2["remedy"], a2
+    # #2405: the remedy must NAME the resolution route (engram_cascade_resolve
+    # with resolution_kind='superseded'/'retracted'), not the bare organic
+    # verbs — "supersede or retract" alone is exactly the wording that got
+    # misread as those organic verbs. Pin both the error string AND the
+    # remedy key (the trap this replaces: a fix that rewords only one of the
+    # two passes a remedy-only assertion while the error string — the one an
+    # agent reads first — still ships the stale sentence).
+    # What these two checks actually deliver: the exact phrase "supersede or
+    # retract", case-insensitively, absent from both fields. They do NOT
+    # catch whitespace variants (a doubled space, a line break between the
+    # words) or paraphrases ("supersede/retract", "supersede or to retract")
+    # — production text already uses "supersede/retract" elsewhere and
+    # correctly does not trip this check.
+    assert "engram_cascade_resolve" in a2["error"], a2
+    assert "engram_cascade_resolve" in a2["remedy"], a2
+    assert "supersede or retract" not in a2["error"].lower(), a2
+    assert "supersede or retract" not in a2["remedy"].lower(), a2
+    assert "next_call" in a2 and "engram_cascade_frontier" in a2["next_call"], a2
+    assert "then" in a2 and "engram_cascade_resolve" in a2["then"], a2
 
     # THE PROPERTY: acyclic over the WHOLE derived cascade set, not merely
     # "the two edges the old test happened to check for".
