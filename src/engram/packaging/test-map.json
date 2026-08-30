@@ -239,13 +239,6 @@
       "note": "2026-07-31-loop-arm-nudge-SPEC.md PR-B: new Stop hook, tested via direct subprocess invocation (same _run_hook pattern as test_stop_hook_prose_gate.py), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
     },
     {
-      "path_prefix_or_glob": "hooks/claude/engram-solo-wakeup-guard-hook.py",
-      "test_globs": [
-        "tests/test_solo_wakeup_guard_hook.py"
-      ],
-      "note": "#2427: new PreToolUse hook, tested via direct subprocess invocation (same _run_hook pattern as test_loop_arm_stop_hook.py's own sibling entry above), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping."
-    },
-    {
       "path_prefix_or_glob": "hooks/claude/start-engram-daemon.sh",
       "full_suite_fallback": true,
       "note": "No dedicated test file for start-engram-daemon.sh"
