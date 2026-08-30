@@ -558,6 +558,10 @@
       "tier": "essential"
     },
     {
+      "path": "skills/claude/engram-support-lost",
+      "tier": "essential"
+    },
+    {
       "path": "skills/claude/engram-contradiction-resolution",
       "tier": "essential"
     },

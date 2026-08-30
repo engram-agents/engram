@@ -1,6 +1,6 @@
 ---
 name: engram-resolve-cascade
-description: Resolve cascade markers (tainted_by, stale_by, support_lost) on nodes flagged by a retract or supersede. Use during dream cycle, whenever engram_cascade_frontier shows eligible nodes, or whenever a plain engram_retract/engram_supersede is refused and points here. Read the frontier, then adjudicate each eligible node via engram_cascade_resolve — retracted, superseded, or acknowledged. Cornerstones/lessons with support_lost use a separate exemplar-rewire/pattern-retract pattern.
+description: Resolve cascade markers (tainted_by, stale_by) on nodes flagged by a retract or supersede. Use during dream cycle, whenever engram_cascade_frontier shows eligible nodes, or whenever a plain engram_retract/engram_supersede is refused and points here. Read the frontier, then adjudicate each eligible node via engram_cascade_resolve — retracted, superseded, or acknowledged. Cornerstones/lessons with support_lost are handled by the separate engram-support-lost skill.
 ---
 
 # When to use this skill
@@ -48,7 +48,8 @@ After a retract or supersede, the engine walks downstream and marks:
   flag written by `_detect_zero_support`), not part of the cascade-marker
   system at all — cornerstones and lessons accumulate votes rather than
   derive_from premises, so individual instance retractions never give them
-  `tainted_by` / `stale_by` markers. See Pattern B.
+  `tainted_by` / `stale_by` markers. Handling lives in the
+  **[engram-support-lost](../engram-support-lost/SKILL.md)** skill.
 
 Retracted/superseded nodes are preserved, not deleted — the engine checks
 `is_current` when walking edges.
@@ -255,44 +256,17 @@ there is nothing to judge.
 
 # Pattern B — Cornerstone or lesson with support_lost
 
-When you see `cs_X.support_lost = true` or `ls_X.support_lost = true` (this
-path is unchanged by the cascade-frontier machine — support_lost is the
-separate mechanism described above, not a cascade marker):
-
-1. `engram_inspect(cs_X / ls_X)` — read the cornerstone/lesson claim
-2. `engram_query` for similar patterns in the graph — are there live
-   observations or derivations that exemplify this cornerstone's claim?
-
-   **If YES — trivial rewire:**
-
-   3a. Register the exemplar against the pattern node:
-       ```
-       engram_register_exemplar(payload_json=json.dumps({
-           "target_id": "<cs_X or ls_X>",
-           "exemplar_id": "<ob_or_dv_id>",
-           "note": "<why this instance fits the pattern>",
-       }))
-       ```
-       The tool handles both cornerstones and lessons; for lesson targets,
-       the tripwire cache refresh fires automatically.
-
-   3b. The `support_lost` flag clears automatically once at least one live
-       exemplar edge exists.
-
-   **If NO — the pattern has lost its empirical basis:**
-
-   4a. Decide whether the cornerstone/lesson still merits existing.
-
-   4b. If the pattern still holds in principle but is currently un-exemplified:
-       leave the `support_lost` flag in place. The next exemplifying experience
-       can link it via the trivial-rewire path above. `support_lost` is not an
-       error — it is an honest signal that the pattern is currently unanchored.
-
-   4c. If the pattern no longer applies (the underlying belief has been
-       superseded or retracted): retract the cornerstone/lesson. Load the
-       **[engram-revise](../engram-revise/SKILL.md) skill** for the
-       classification discipline (it is a skill, not an MCP tool — the
-       actual verb you end up calling is `engram_retract`).
+`support_lost` is a plain `metadata.support_lost` boolean set when a
+cornerstone's or lesson's live support edges all drop to zero — it never
+appears on `engram_cascade_frontier` and is never adjudicated via
+`engram_cascade_resolve`; the acting verb is `engram_register_exemplar`, not
+a cascade-resolution shape, and the flag clears automatically once a live
+exemplar edge exists rather than by explicit adjudication. This section
+stays only so inbound references from `Background` and elsewhere keep
+resolving — the full handling (inspect → search for live exemplars →
+trivial rewire, leave honestly unanchored, or retract via `engram-revise`)
+now lives in the **[engram-support-lost](../engram-support-lost/SKILL.md)**
+skill. Load it directly rather than following this pointer twice.
 
 # Pattern C — Observation with a cascade marker (rare, audit upstream)
 

@@ -8,10 +8,10 @@ refined same night to a three-class split (comment on #1901):
      scales with the day's new-node cohort and is essential whenever nodes
      were created. NOT touched by this module — cohort_dispatch.py's
      ``prev-sleep`` cadence is already correct for an every-night step.
-  2. **Lottery-rotated** — the 9 dream-fairy scan categories (open-questions,
-     contradictions, stale-load-bearing, cornerstone-candidates,
-     tainted-valid, resolution-echoes, missing-edges, stale-task-refs,
-     coverage-gaps). Exactly ONE type is drawn per sleep (``--count`` can
+  2. **Lottery-rotated** — the scan categories in CATEGORIES below (the
+     dream-fairy set plus person-node-maintenance and support-lost; the
+     dict is the count's single source of truth — prose counts here have
+     drifted twice). Exactly ONE type is drawn per sleep (``--count`` can
      raise this later; the design note says "maybe two later"). All-8-nightly
      was the heaviest recurring token spend for a mostly-zero-findings scan
      at current graph sizes.
@@ -135,6 +135,7 @@ CATEGORIES: dict[int, str] = {
     8: "stale-task-refs",
     9: "coverage-gaps",
     10: "person-node-maintenance",
+    11: "support-lost",
 }
 
 # Categories whose scan is genuinely window-scoped (per the #1901 audit --

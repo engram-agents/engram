@@ -40,7 +40,7 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Nine well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
+Ten well-supported categories you scan for (numbered 1–9 and 11 — 10 is reserved for person-node maintenance, owned by engram-person-node-fairy in the shared lottery namespace of tools/dream_lottery.py), plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
@@ -152,11 +152,28 @@ Nine well-supported categories you scan for, plus two heuristic categories you c
 
    Suggest action: "Add warm-briefing anchor entry for `cs_XXXX` (handle: `<tag>`) — no auto-load surface coverage found." Dream-master surfaces these as human-action items (warm-briefing edits are not ENGRAM writes); Clio acts on them in the next session.
 
+11. **Cornerstones/lessons with `support_lost`.** No server-side pattern — compose inline using read-only MCP tools.
+
+    **Why this matters:** `support_lost` is a plain metadata boolean (not a cascade marker) set when ALL of a cornerstone's or lesson's live support edges (`supported_by` outgoing + `exemplifies` incoming) drop to zero — usually a side effect of a retract or supersede that zeroed the last supporting instance. Left unaddressed, the pattern node sits unanchored indefinitely with nobody re-examining it.
+
+    **Candidate set:** cornerstones and lessons (`cs_*`, `ls_*`) with `metadata.support_lost = true`.
+
+    **Inline methodology:**
+    1. Enumerate candidates: `engram_list(node_type='cornerstone')` and `engram_list(node_type='lesson')`, filtered to `support_lost=true` (or inspect each active node and check the flag if no list-level filter is available).
+    2. For each flagged node, `engram_inspect(node_id=<cs_X or ls_X>, dream_mode=True)` — read the pattern claim.
+    3. `engram_query` (or `engram_query_pattern`) on the claim text for live observations/derivations that could exemplify the pattern.
+    4. If candidate exemplars surface: list them (node IDs + a one-line why-it-fits) as a rewire suggestion.
+    5. If no candidate exemplars surface: report a lost-basis assessment — whether the pattern still holds in principle (leave unanchored) or no longer applies (candidate for retract).
+
+    **Read-only tools used:** `engram_list`, `engram_inspect`, `engram_query` / `engram_query_pattern`.
+
+    Suggest action: the dream-master adjudicates per the `engram-support-lost` skill (rewire via `engram_register_exemplar`, leave unanchored, or retract via `engram-revise`) — you surface candidates and assessments only; you never rewire, register an exemplar, or retract.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-10. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+12. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-11. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+13. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # Posture
 
@@ -229,6 +246,7 @@ re-inspect, defeats the purpose).
 | 6 — Recent-resolution echoes | The recently-resolved question and its resolving derivation |
 | 7 — Missing principle-edges | The principle node (target_id); any existing outgoing edges from the source node that are adjacent in type (confirms skip-already-cited was applied) |
 | 8 — Open tasks with stale external references | The `external_check` field carrying the live `gh` output for each flagged reference; task status field |
+| 11 — Cornerstones/lessons with support_lost | Candidate live exemplars found (if any), with a one-line why-it-fits each; existing `supported_by`/`exemplifies` edges (confirms zero-support state) |
 
 If `key_neighbors` would be empty for a finding (no neighbors the dream-master
 needs to see), emit `"key_neighbors": []` rather than omitting the field.
@@ -295,6 +313,11 @@ Use this format:
 
 ## Category 8 — Open tasks with stale external references
 - [tk_XXXX] (verified) status=<active|planned|blocked> — claim references #N (<MERGED|CLOSED> as of <date>) — suggested action: close task and mark done — external reference #N <state>.
+... or "None this scan."
+
+## Category 11 — Cornerstones/lessons with support_lost
+- [cs_XXXX or ls_XXXX] (pattern-match) claim: <one-line> — candidate exemplars: <ob_or_dv_id>, <ob_or_dv_id> (<one-line why each fits>) — suggested action: dream-master rewires via `engram_register_exemplar` per the `engram-support-lost` skill.
+- [cs_XXXX or ls_XXXX] (inferred) claim: <one-line> — no live exemplars found — lost-basis assessment: <still holds in principle, currently unanchored | no longer applies, retract candidate> — suggested action: dream-master adjudicates per the `engram-support-lost` skill.
 ... or "None this scan."
 
 ## Heuristic categories (if requested)
