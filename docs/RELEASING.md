@@ -256,11 +256,26 @@ git ls-remote --tags origin "vMAJOR.MINOR.PATCH-rc<N>"   # verify the tag landed
 
 ### 5. Publish the GitHub Release (private repo)
 
-GitHub auto-creates a Releases entry when you push a tag. Edit it to:
-- Copy the relevant CHANGELOG section into the release notes
-- Mark as "Pre-release" (it's an rc — the public repo's clean tag is the
-  non-prerelease surface)
-- Confirm the auto-generated source-code tarball link is present
+**A tag push does NOT create a Releases entry here either — create it explicitly.**
+This section claimed the opposite until 2026-08-27; the public-repo half of the
+same mistake is documented under *Announcing the public release* below. Measured
+on this private repo 2026-08-27: **16 tags, 3 releases** — eleven version tags
+(`v0.1.0`, `v0.1.3`, `v0.1.4`, `v0.2.0-rc1/rc2`, `v0.3.2`, `v0.3.2-rc1` among
+them) carry no entry at all. Those are the releases nobody noticed were missing,
+which is what the false claim cost. Both figures are a snapshot supporting the
+sentence above them, not a live count.
+
+Create it:
+
+```bash
+gh release create <tag> --repo engram-agents/engram-alpha \
+  --notes-file <changelog-section> --prerelease
+```
+
+`--prerelease` is the flag, not a follow-up edit: an rc is a pre-release because
+the public repo's clean tag is the non-prerelease surface. Then open the entry and
+confirm two things render — the CHANGELOG notes you passed, and the source-code
+tarball link GitHub attaches on its own.
 
 ## Dogfood-before-public
 
@@ -370,8 +385,17 @@ not a substitute for actually reading the dry-run output.
 
 ### Announcing the public release
 
-After `--push`, the public repo has the clean `vMAJOR.MINOR.PATCH` tag and
-GitHub auto-creates its Releases entry (same as the private-repo flow).
+After `--push`, the public repo has the clean `vMAJOR.MINOR.PATCH` tag.
+
+**⚠️ A tag push does NOT create a Releases entry — you must create it
+explicitly.** This document claimed otherwise until 2026-08-20, when the
+v0.4.0 cut proved it: the tag pushed and no entry appeared, and the release
+had to be created by hand with the CHANGELOG section as its notes. Measured
+on the public repo the same day: **10 tags, 9 releases** — `v0.1.0` still
+carries a tag with no release, which is the residue of exactly this
+mistake. Create it with `gh release create <tag> --repo engram-agents/engram
+--notes-file <changelog-section>` and confirm it renders before announcing
+anything that links to it.
 Notify users (see below) pointing at the **public** repo's release page, not
 the private rc.
 
@@ -388,6 +412,123 @@ For alpha-tester pool (agents, users, or counterparts on other hosts):
 For on-host agents, surface in `ask-{{USER_NAME}}.md` after the cut. For the
 internal family dogfood window, a forum post to the relevant thread (with
 `@mentions`) reaches cross-host agents in real time.
+
+### Tell the public — website Versions entry, then the newsletter
+
+Everything above reaches the **internal** pool. These two steps reach everyone
+else: people who are not on this host, do not watch the repo, and will never
+see a forum post.
+
+**Write the release note ONCE.** The website's Versions entry and the
+newsletter body are the same artifact published to two surfaces — a short
+prose account of what this version is for. Do not write it twice and let the
+two drift; draft it once and adapt the framing.
+
+**Order: website first, newsletter second.** The newsletter can then link a
+Versions entry that is already live, and the site is the durable record that
+outlives the email.
+
+#### 1. Website — add the Versions entry
+
+Repo `engram-agents/website`, file `src/i18n/versions.js`. Add one entry to
+**both** `versions.en.releases` and `versions.zh.releases`:
+
+```js
+{ id: 'v0-4-0', version: 'v0.4.0', title: 'the short framing',
+  date: '2026-08-20', body: "One or two paragraphs, plain language." }
+```
+
+- **The Chinese entry is not optional.** CI (`tools/check-locale-content.mjs`)
+  requires the en and zh release arrays to align by `id`/`version`; a missing
+  or misaligned zh entry fails the build. That gate exists because a Chinese
+  paragraph once landed in the English array.
+- **The prose goes straight into `versions.js` — there is no drafts directory.**
+  Both prior entries were written that way: website PRs #14 (v0.3.2) and #17
+  (v0.4.0) each put the release prose directly into `src/i18n/versions.js`.
+  #17 touched that file and nothing else; #14 also added the locale-check
+  tooling cited in the bullet above, which is already in place and is not
+  work you repeat. If you want a draft to circulate first, open the PR and
+  iterate on it there.
+- **Merging is deploying** — Cloudflare (Git-connected Workers Builds)
+  auto-deploys on push to `main`. Confirm the entry is live at
+  [engram-agents.org/versions](https://engram-agents.org/versions) before the
+  newsletter links it.
+
+**An agent can do this step end to end** — it is an ordinary PR.
+
+#### 2. Newsletter — send to public subscribers
+
+**Where:** Buttondown, newsletter *ENGRAM Communications* — compose and send
+from `https://buttondown.com/sptopen`. The public signup page
+(`engram-agents.org/subscribe`, and `/zh/subscribe`) is where subscribers come
+from, not where you send.
+
+**⚠️ ORDER MATTERS — send AFTER the public release exists, never before.**
+The email links the public repo's Releases entry, which you created by hand
+under *Announcing the public release* above (the subsection carrying the
+`gh release create` command) — it is not created by the tag push. Announcing first produces an email
+whose main link 404s, and unlike a broken doc link **you cannot edit an email
+after it is sent.** Load every link once before sending.
+
+**What to include:**
+
+- The version and a one-line framing of what this release is *for*.
+- The two or three changes a user would actually notice. Not the changelog —
+  that is what the link is for.
+- **The upgrade line, VERBATIM — do not rewrite it and do not list commands:**
+
+  > **Upgrading:** ask your agent to upgrade ENGRAM. It will walk the full upgrade
+  > routine — which is more than the mechanical commands — and it can answer any
+  > questions you have about what changed and whether anything affects you.
+
+  **Why this is fixed text and not a style preference** (Lei, 2026-08-20). The
+  alpha-tester pool above DOES get commands; a public subscriber must not. Listing
+  them does not merely duplicate the `engram-upgrade` skill — it actively invites
+  the mechanical-only path, because a reader handed four commands runs four commands
+  and never reaches the routine's verification checkpoints, identity-template gate,
+  or reconnect steps. The harm is SUBSTITUTION, not redundancy, and it lands hardest
+  on the users least able to notice what was skipped.
+- Links to the **public** GitHub Release page (`engram-agents/engram`), not
+  the private rc, and to the Versions entry from step 1.
+
+**Do NOT hand-roll an unsubscribe link.** Buttondown states that every email
+it sends is one-click-unsubscribe compliant (RFC 8058) and injects the headers
+itself. Adding your own produces two unsubscribe links, one of which does not
+work.
+
+**CAN-SPAM postal address: CHECKED, and the answer is that it is missing.**
+CAN-SPAM requires a valid physical postal address in commercial email.
+Buttondown's docs say *"Buttondown is compliant with the CAN-SPAM Act"*, but
+that is a claim about the platform, **not** a promise that it inserts *your*
+address into *your* sends. Measured on the delivered v0.4.0 newsletter
+(2026-08-21): the footer carries the issue line, subscribe / unsubscribe /
+view-online links, and a "Powered by Buttondown" line — **no postal address
+anywhere in the message.** So the unsubscribe half of CAN-SPAM is satisfied and
+the postal half is not.
+
+**What that means for you:** nothing today, because the subscriber list is us.
+It becomes a **hard blocker on the first send that reaches a genuinely external
+subscriber**, and the fix is configuration — set a mailing address in the
+Buttondown newsletter settings — not code. Check that it is set before that
+send, not after.
+
+*Method note, because it decides how you re-check this: the API's footer field
+returns empty, which is equally consistent with "no address" and with "the
+platform injects one at send time outside that field." Only a delivered email
+in a real inbox discriminates between the two. Re-verify by reading a send, not
+by reading the API.*
+
+**⚠️ Drafting IS agent-executable; SENDING is a separate question.** As of
+2026-08-20 an API key is installed, so an agent can read the subscriber list and
+create the email as a real `draft` — Buttondown's `status` field is a server-side
+enum (`draft` → `about_to_send` → `sent`), so a staged draft is genuine state the
+maintainer can open and read before anything leaves.
+
+**Capability moved; permission did not.** A send reaches external people, so it
+stays inform-before regardless of who *can* press it: draft it, show the
+maintainer the actual text, send on their word. And note the asymmetry that makes
+this worth the extra step — a merge can be reverted, a sent email cannot be edited
+or recalled.
 
 ## After the cut
 
