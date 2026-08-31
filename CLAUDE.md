@@ -460,6 +460,27 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   force-push is attributed to the merger. Expect it, and **verify with
   `git range-diff`/patch-id rather than assuming** it happened or that it
   changed nothing.
+- **`range-diff`/patch-id is NECESSARY BUT NOT SUFFICIENT — it answers "did
+  the patch change?", never "does the result still work?"** A rebase can be
+  conflict-free and still produce broken code, because the patch is intact
+  while the BASE UNDER IT moved. Measured 2026-08-31 on the engram-alpha
+  #1991 health-score stack: PR2 removed `import json` as dead code — correct
+  within PR2's own scope — while PR3 added a `json.loads()` caller elsewhere
+  in the same file. No textual overlap, so git rebased cleanly; the result
+  imports fine, `py_compile`s fine, and raises `NameError: name 'json' is
+  not defined` the moment the new function is called. **Note what range-diff
+  actually did here: it worked.** It correctly reported PR3's commits as
+  content-changed, as expected for commits rebased onto a different PR2 tip.
+  The defect was never in its output — it was in treating a diff-level check
+  as an answer to a question about the RESULTING TREE. Nothing that compares
+  patches can see a semantic conflict, because there is no conflict in the
+  patches. **The check has to read the RESULTING TREE, and running the tests
+  on each rebased tip is the general form of that** — general because a
+  narrower static pass catches only the subset it models (an undefined name
+  here; nothing about behaviour), while `py_compile` catches neither, since
+  Python resolves globals at call time. Origin: engram-alpha `cbda7d55`,
+  found by Luria running the full suite post-rebase instead of trusting a
+  clean rebase.
 - **Cascading rebase of un-merged layers**: `gh stack sync` / `gh stack
   rebase`. Machine-readable status: `gh stack view --json`. Stacks are
   API-readable (REST `stack`, GraphQL `PullRequestStack`) but not
