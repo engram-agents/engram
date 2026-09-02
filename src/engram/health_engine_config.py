@@ -80,17 +80,24 @@ UNAVAILABLE = _Unavailable()
 # ---------------------------------------------------------------------------
 #
 # Known denominator populations this engine can ever compute a metric over.
-# This PR ships a PLACEHOLDER set: no real aspect/metric definitions exist
-# yet (that's PR2/PR3), so these names exist only so that a *test* config in
-# tests/test_health_engine_config.py has real population strings to
-# reference when proving the "denominator must be a declared population"
-# check works against a live frozenset object (not a string/regex proxy —
-# see the Borges-regression test). PR2/PR3 should extend this set with the
-# real aspect-A/B/C populations from the design doc (stale derivations,
-# tainted claim-bearing nodes, open contradictions, coverage candidates,
-# etc.) as those signal functions are actually built. Do not try to
-# enumerate the real design-doc populations here — that is out of scope for
-# this PR.
+# PR1 shipped a PLACEHOLDER set (claim_bearing_nodes / observations /
+# derivations / contradictions / edges) with no real aspect/metric
+# definitions to back them yet — those names existed only so PR1's own
+# schema tests had real population strings to exercise the "denominator must
+# be a declared population" check against a live frozenset object.
+#
+# PR2 (aspects A + C, engram-alpha#1991) is the first PR to actually BACK
+# those names with real signal functions (see health_engine_metrics.py /
+# health_engine.py) — claim_bearing_nodes / observations / derivations /
+# contradictions are now load-bearing, not placeholders. PR2 also adds
+# "evidence_nodes" (dangling-evidence rate's denominator — aspect C has no
+# existing placeholder for it) and "not_yet_implemented" (the honest stand-in
+# denominator for aspect B's stub metric, per the design doc §7's "PR2 ships
+# a stub AspectDef for B" choice — see health_engine.py's module docstring
+# for the reasoning). Aspect B's REAL populations (recall_summary/keywords/
+# embedding coverage candidates, giant-component projection) remain PR3's job
+# — do not enumerate them here ahead of that PR building the signal functions
+# they'd back.
 
 DECLARED_POPULATIONS: frozenset[str] = frozenset({
     "claim_bearing_nodes",
@@ -98,6 +105,8 @@ DECLARED_POPULATIONS: frozenset[str] = frozenset({
     "derivations",
     "contradictions",
     "edges",
+    "evidence_nodes",
+    "not_yet_implemented",
 })
 
 

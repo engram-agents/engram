@@ -310,6 +310,48 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # succeeds and the version_control field reports why.
         version_control = core._commit_snapshot(conn, message, mode)
 
+        # Health-score engine snapshot (engram-alpha#1991 PR2) — piggybacked
+        # on this exact call site because this is "where the graph is
+        # already checkpointed and committed" (design doc §4.4): the
+        # knowledge.sql dump + git commit just above has already happened,
+        # so `conn` reflects a fresh, already-durable state.
+        #
+        # checkpoint_mode mapping: this function's own two modes are "nap"
+        # (advance_turn=False) and "session" (advance_turn=True). "nap" maps
+        # directly. "session" maps to "post_dream" because engram_advance_turn
+        # is documented [Sleep/first-session only] and the codebase states
+        # outright that "turn advance is reserved for post-dream session
+        # checkpoints" (engram-nap/SKILL.md) — the dream master's own Step 8
+        # calls engram_advance_turn as its LAST action, after all consolidation
+        # writes. The one other legitimate caller (first-session bootstrap) is
+        # a once-ever edge case that would also get labelled "post_dream" here;
+        # flagged in the PR2 report rather than special-cased silently.
+        #
+        # The THIRD checkpoint ("pre_sleep") is deliberately NOT wired — the
+        # PR2 investigation found no concrete hook point for it (see PR2
+        # report); guessing one would risk a wiring point that silently never
+        # fires, which the design doc explicitly calls worse than leaving it
+        # unwired and reporting the gap.
+        #
+        # Best-effort, mirrors core._commit_snapshot's own posture just above:
+        # a health-snapshot failure must never break the underlying nap/
+        # advance_turn checkpoint tool it's piggybacked onto.
+        _health_checkpoint_mode = "nap" if mode == "nap" else "post_dream"
+        try:
+            import health_engine
+            _health_snapshot = health_engine.write_snapshot(conn, _health_checkpoint_mode)
+            health_snapshot_summary = {
+                "checkpoint_mode": _health_checkpoint_mode,
+                "composed_score": _health_snapshot["scores"]["composed"],
+                "aspect_scores": _health_snapshot["scores"]["aspects"],
+                "path": _health_snapshot.get("_snapshot_path"),
+            }
+        except Exception as e:
+            health_snapshot_summary = {
+                "checkpoint_mode": _health_checkpoint_mode,
+                "error": str(e),
+            }
+
         result = {
             "status": "checkpoint_saved",
             "mode": mode,
@@ -330,6 +372,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "tier3_total": current_count,
                 "decay_base": mem.get("decay_base", 1.014),
             },
+            "health_snapshot": health_snapshot_summary,
             "version_control": version_control,
         }
 
