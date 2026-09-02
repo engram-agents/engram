@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """codex-umwelt-wake — same-thread Umwelt wake bridge for Codex app-server.
 
-Local watcher only: polls Umwelt for addressed crossings / granted mentions,
+Local watcher only: polls one agent-wide Umwelt crossings stream for addressed
+crossings / granted mentions (with a route-unavailable per-place fallback),
 queues stable event IDs durably, and starts a new SAME-THREAD Codex turn over
 an already-running local app-server when the target thread is idle.
 
@@ -43,6 +44,7 @@ import struct
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -58,8 +60,8 @@ DEFAULT_APP_SERVER = os.environ.get("CODEX_APP_SERVER", "unix://")
 DEFAULT_INTERVAL = float(os.environ.get("CODEX_UMWELT_WAKE_INTERVAL", "2.0"))
 DEFAULT_UMWELT_CONFIG = Path(os.environ.get("UMWELT_CONFIG", Path.home() / ".umwelt" / "config.json"))
 DEFAULT_THREAD_OVERRIDE = os.environ.get("CODEX_THREAD_ID")
-STATUS_VERSION = 1
-STATE_VERSION = 5
+STATUS_VERSION = 2
+STATE_VERSION = 6
 MAX_RECENT_DELIVERED = 256
 MAX_MONITOR_RECOVERY_TURNS = 32
 MAX_MONITOR_RECOVERY_ITEMS = 256
@@ -73,6 +75,11 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CODEX_NOTIFICATION_DRAIN_TIMEOUT = 0.001
 MAX_PENDING_RPC_NOTIFICATIONS = 256
 TERMINAL_COLLAB_AGENT_STATUSES = {"completed", "errored", "interrupted", "shutdown", "notFound"}
+
+# One cursor covers the whole addressee stream.  Umwelt place identifiers are
+# ``place_*``, so this reserved key cannot collide with a real place cursor.
+_AGENT_CURSOR_KEY = "_agent_seq"
+_AGENT_ENDPOINT_FALLBACK_CODES = {404, 405, 501}
 
 _STOP_REQUESTED = False
 
@@ -125,6 +132,10 @@ class RpcError(RuntimeError):
 
 class RpcProtocolError(RuntimeError):
     """Malformed or out-of-order JSON-RPC message from the Codex app-server."""
+
+
+class AgentCrossingsUnavailable(RuntimeError):
+    """The world lacks the optional agent-wide crossings endpoint this cycle."""
 
 
 class Logger:
@@ -223,6 +234,7 @@ def default_state() -> dict[str, Any]:
         "state_version": STATE_VERSION,
         "seeded": False,
         "cursors": {},
+        "umwelt_coverage": "not-yet-polled",
         "queue": [],
         "delivered_event_ids": [],
         "inflight_batch": None,
@@ -238,6 +250,8 @@ def normalize_state(state: dict[str, Any]) -> dict[str, Any]:
     normalized.update(state)
     if not isinstance(normalized.get("cursors"), dict):
         normalized["cursors"] = {}
+    if normalized.get("umwelt_coverage") not in {"not-yet-polled", "agent-wide", "per-place-fallback"}:
+        normalized["umwelt_coverage"] = "not-yet-polled"
     if not isinstance(normalized.get("queue"), list):
         normalized["queue"] = []
     if not isinstance(normalized.get("delivered_event_ids"), list):
@@ -264,7 +278,7 @@ def default_status(paths: RuntimePaths) -> dict[str, Any]:
         "detail": None,
         "queue_depth": 0,
         "seeded": False,
-        "known_places": 0,
+        "umwelt_coverage": "not-yet-polled",
         "thread_id": None,
         "app_server": DEFAULT_APP_SERVER,
         "transport": None,
@@ -768,25 +782,117 @@ class WorldClient:
             payload["since"] = since
         return self._request("/umwelt/crossings_here", payload)
 
+    def crossings_for_agent(self, since: int | str | None = None) -> dict[str, Any]:
+        """Read this agent's crossings across all places through one cursor.
 
-def poll_umwelt(world: WorldClient, state: dict[str, Any], logger: Logger) -> str:
+        Only route-unavailable responses select the compatibility fallback.
+        Other HTTP failures still mean that this poll failed and must stay
+        visible to the managed bridge's ordinary outage handling.
+        """
+        payload: dict[str, Any] = {
+            "viewer": self.context.self_name,
+            "agent": self.context.self_name,
+        }
+        if since is not None:
+            payload["since"] = since
+        try:
+            return self._request("/umwelt/crossings_for_agent", payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code in _AGENT_ENDPOINT_FALLBACK_CODES:
+                raise AgentCrossingsUnavailable(
+                    f"HTTP {exc.code} from crossings_for_agent"
+                ) from exc
+            raise
+
+
+def newer_cursor(*candidates: int | str | None) -> int | str | None:
+    """Return the latest valid Umwelt sequence from cursor candidates.
+
+    The world API documents positions as integer sequence numbers.  Preserve
+    the originally persisted value so a legacy numeric-string cursor is still
+    sent back unchanged, but fail loudly rather than ordering opaque tokens
+    lexically and silently replaying or dropping crossings.
+    """
+    known = [candidate for candidate in candidates if candidate is not None]
+    if not known:
+        return None
+    try:
+        return max(known, key=int)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Umwelt cursor must be an integer sequence") from exc
+
+
+def older_cursor(*candidates: int | str | None) -> int | str | None:
+    """Return the earliest cursor, treating a present null as the origin."""
+    if any(candidate is None for candidate in candidates):
+        return None
+    try:
+        return min(candidates, key=int)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Umwelt cursor must be an integer sequence") from exc
+
+
+def fallback_reconciliation_since(cursors: dict[str, Any]) -> int | str | None:
+    """Return the safe agent-stream lower bound after per-place polling.
+
+    Per-place reads are not an atomic snapshot.  Resume the agent stream from
+    the oldest position and suppress crossings already covered by their own
+    place cursor below.  Starting at the newest place cursor would skip a
+    crossing written to an earlier-polled place during the fallback cycle.
+    """
+    bounds = [
+        cursor
+        for key, cursor in cursors.items()
+        if key == _AGENT_CURSOR_KEY or key.startswith("place_")
+    ]
+    return older_cursor(*bounds) if bounds else None
+
+
+def crossing_is_after_place_cursor(crossing: dict[str, Any], place_cursor: Any) -> bool:
+    """Whether a reconciled agent crossing was not already read per-place."""
+    if place_cursor is None:
+        return True
+    sequence = crossing.get("seq")
+    try:
+        return int(sequence) > int(place_cursor)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "cannot reconcile agent crossing without an integer sequence"
+        ) from exc
+
+
+def poll_umwelt_places(world: WorldClient, state: dict[str, Any], logger: Logger) -> str:
+    """Run the pre-agent-stream poller as a one-cycle compatibility fallback.
+
+    When an agent-wide cursor exists, it is the lower bound for a newly seen
+    place.  A retained per-place cursor can only narrow that read further.
+    """
     places = world.places()
     cursors = state.setdefault("cursors", {})
+    agent_cursor_present = _AGENT_CURSOR_KEY in cursors
+    agent_cursor = cursors.get(_AGENT_CURSOR_KEY)
     if not state.get("seeded"):
         for place_id in places:
             resp = world.crossings(place_id)
             cursors[place_id] = resp.get("to_position")
         state["seeded"] = True
+        state["umwelt_coverage"] = "per-place-fallback"
         logger.log(f"armed for {world.context.self_name}: seeded {len(places)} places")
         return "seeded"
 
     for place_id in places:
-        if place_id not in cursors:
+        place_cursor_present = place_id in cursors
+        effective_since = newer_cursor(agent_cursor, cursors.get(place_id))
+        # Without either cursor there is no safe lower bound, so retain the
+        # original forward-only per-place seed.  Once the agent stream has a
+        # real position, a missing place cursor must NOT become a new seed: it
+        # could otherwise swallow crossings newer than that agent-wide point.
+        if not place_cursor_present and (not agent_cursor_present or effective_since is None):
             resp = world.crossings(place_id)
             cursors[place_id] = resp.get("to_position")
             continue
 
-        resp = world.crossings(place_id, cursors.get(place_id))
+        resp = world.crossings(place_id, effective_since)
         for crossing in resp.get("crossings", []) or []:
             if not isinstance(crossing, dict):
                 continue
@@ -795,6 +901,66 @@ def poll_umwelt(world: WorldClient, state: dict[str, Any], logger: Logger) -> st
                 enqueue_event(state, event, logger)
         if "to_position" in resp:
             cursors[place_id] = resp.get("to_position")
+    state["umwelt_coverage"] = "per-place-fallback"
+    return "polled"
+
+
+def agent_crossing_place(crossing: dict[str, Any]) -> str:
+    """Return the same place identity used by the old per-place event IDs."""
+    return bounded_meta(crossing.get("destination") or crossing.get("place_id"))
+
+
+def poll_umwelt(world: WorldClient, state: dict[str, Any], logger: Logger) -> str:
+    """Poll one agent-wide stream, falling back only for a missing endpoint.
+
+    A state created by the v6 per-place fallback resumes through the oldest
+    fallback cursor, then uses the individual place cursors to suppress the
+    overlap.  That preserves crossings written while the fallback walked its
+    places without relying on the bounded delivery-ID dedupe cache.  A legacy
+    pre-v6 per-place-only state has no fallback coverage marker and still
+    migrates forward-only, without replaying its historical crossings.
+    """
+    cursors = state.setdefault("cursors", {})
+    agent_seeded = _AGENT_CURSOR_KEY in cursors
+    reconciling_fallback = state.get("umwelt_coverage") == "per-place-fallback"
+    since = (
+        fallback_reconciliation_since(cursors)
+        if reconciling_fallback
+        else cursors.get(_AGENT_CURSOR_KEY)
+    )
+    try:
+        response = world.crossings_for_agent(since)
+    except AgentCrossingsUnavailable:
+        return poll_umwelt_places(world, state, logger)
+
+    if not agent_seeded and not reconciling_fallback:
+        # Presence is the seed-complete marker; the legitimate cursor value
+        # may be None when the world has no crossings yet.  On the next poll
+        # we must process a newly appeared first crossing, not seed it away.
+        cursors[_AGENT_CURSOR_KEY] = response.get("to_position")
+        state["seeded"] = True
+        state["umwelt_coverage"] = "agent-wide"
+        logger.log(f"armed for {world.context.self_name}: seeded 1 agent-wide stream")
+        return "seeded"
+
+    for crossing in response.get("crossings", []) or []:
+        if not isinstance(crossing, dict):
+            continue
+        place_id = agent_crossing_place(crossing)
+        if reconciling_fallback and not crossing_is_after_place_cursor(
+            crossing, cursors.get(place_id)
+        ):
+            continue
+        event = build_event(place_id, crossing, world.context.self_name)
+        if event is not None:
+            enqueue_event(state, event, logger)
+    # Fallback recovery must establish the agent-stream marker even when the
+    # endpoint has no sequence yet.  Key presence, rather than a non-null
+    # cursor value, distinguishes that recovered empty stream from no stream.
+    if reconciling_fallback or response.get("to_position") is not None:
+        cursors[_AGENT_CURSOR_KEY] = response.get("to_position")
+    state["seeded"] = True
+    state["umwelt_coverage"] = "agent-wide"
     return "polled"
 
 
@@ -2138,7 +2304,7 @@ def run_cycle(
             "transport": transport_desc,
             "queue_depth": len(state.get("queue", [])),
             "seeded": bool(state.get("seeded")),
-            "known_places": len(state.get("cursors", {})),
+            "umwelt_coverage": state.get("umwelt_coverage", "not-yet-polled"),
         }
     )
 
@@ -2189,7 +2355,7 @@ def run_cycle(
                 or monitor_target_thread_id(state, sessions_dir, thread_override)[0],
                 "queue_depth": len(state.get("queue", [])),
                 "seeded": bool(state.get("seeded")),
-                "known_places": len(state.get("cursors", {})),
+                "umwelt_coverage": state.get("umwelt_coverage", "not-yet-polled"),
             }
         )
         update_status(paths, base_status)
@@ -2201,7 +2367,7 @@ def run_cycle(
                 "detail": str(exc),
                 "queue_depth": len(state.get("queue", [])),
                 "seeded": bool(state.get("seeded")),
-                "known_places": len(state.get("cursors", {})),
+                "umwelt_coverage": state.get("umwelt_coverage", "not-yet-polled"),
             }
         )
         update_status(paths, base_status)
