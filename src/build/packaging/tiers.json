@@ -104,6 +104,10 @@
       "tier": "essential"
     },
     {
+      "path": "health_engine_curves.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_query.py",
       "tier": "essential"
     },
