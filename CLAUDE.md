@@ -493,15 +493,55 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   2026-08-30 — the two protected branches are configured oppositely). And
   `dismiss_stale_reviews_on_push: true` on `dev` means a content-changing
   push **dismisses** the existing approval — it is gone, not merely
-  un-renewable by the pusher; whether GitHub's patch-id-identical
-  auto-rebase migrates or dismisses it is unmeasured, so read the approval
-  back after every layer rather than assuming.
+  un-renewable by the pusher. **The auto-rebase case is no longer
+  unmeasured: it DISMISSES.** Measured 2026-09-02 on the #1991 health-score
+  stack — when #2187 merged as `aa7275dd`, GitHub's own auto-rebase moved
+  #2189 from `0871821a` to `9f6b6cfe`, and the approval on the old tip was
+  dismissed rather than migrated; both pre-rebase reviews read `DISMISSED`
+  in `pulls/2189/reviews`, against three distinct SHAs. **It dismissed even
+  though the PR's net diff against its own base was byte-identical across
+  the rebase** — `git diff 0f8999b8 0871821a` and `git diff aa7275dd
+  9f6b6cfe`, 81577 bytes each, with a can-it-fail control (the old base is
+  #2187's pre-merge branch tip, NOT `dev` and not the squash commit; name it
+  explicitly, because a reviewer who reaches for a plausible-looking base
+  instead gets a different number). Approval-migration HAS been seen on a
+  diff-against-base-identical push — #2338, where review `5055356943` was
+  **submitted 2026-08-28T21:50:49Z against commit `990de705`, whose
+  `.commit.committer.date` is 2026-08-29T17:49:54Z**: an approval predating by
+  ~20h the commit it claims. That is the migration signature because a review's
+  `commit_id` must name a commit that already existed when it was submitted —
+  so if the named commit came into being later, GitHub silently re-pointed the
+  review onto a newer object. **Read `.commit.committer.date`, NOT
+  `.commit.author.date`** — a rebase preserves the author date and stamps a
+  fresh committer date, and here the author date is 2026-08-28T21:47:22Z, three
+  minutes BEFORE the review, so a reader who grabs that field first reaches the
+  opposite conclusion. **Read `submitted_at`
+  against the commit's own creation time, never the review STATE** — that PR
+  also carries two genuinely fresh approvals on the same commit, so a
+  state-based read (dismiss-then-approve) cannot tell migration from
+  re-approval and looks ambiguous. So identical diff-against-base is **not**
+  what preserves an approval, and **no known property predicts migration.** Plan for
+  dismissal, read the approval back off `pulls/<N>/reviews` after every
+  layer, and never reason about whether it ought to have survived.
 
 > **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
+>
+> **⚠ The two siblings are currently out of sync ON A RULE, not a local fact**
+> (found in colleague review of #2497). Both assert flat dismissal —
+> umwelt `CLAUDE.md:745` *"**any** push … dismisses the prior approval
+> outright"*, soma `CLAUDE.md:201`/`:238` similarly — and both were written
+> with no measurement behind them. The paragraph above now says migration has
+> also been measured and that nothing predicts which occurs, so after this
+> lands a seat in umwelt or soma reads "dismissed outright," skips the
+> read-back, and hits the migration case. Tracked as **umwelt#772** and
+> **soma#48** with the replacement text; soma's copy additionally still
+> phrases this very footer as pending ("**To be** duplicated… **Once** all
+> three carry it"), which is what would stop a soma seat propagating a change
+> outward in the first place.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 

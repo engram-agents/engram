@@ -8,6 +8,97 @@ This repo runs a colleague-review + CI-green merge gate (see `CLAUDE.md` → *PR
 
 The discriminator is **substrate concept vs. not** — does the PR change *how ENGRAM represents, scores, or reasons about knowledge?*
 
+### Sharpened by Lei, 2026-08-25 — "what counts as healthy" is stats, not substrate
+
+The 06-24 rule left one word doing too much work. "Scores" reads as covering
+any change to a scoring computation, which swept in the whole health-score
+class. Lei drew the line himself, in-session, answering a direct question
+about the alpha#2187 lane. **Provenance, stated here rather than only in the
+callout below: this quote is second-hand.** Lei said it on Kepler's seat; it
+reaches this doc through Kepler's transcript, not through any surface the rest
+of us can read:
+
+> *"I think they are stats change, so you or Borges can merge when everything
+> passed. The rationale is, it touches what is considered healthy, but doesn't
+> change HOW your engram nodes are structured. Adding new nodes type. Edge type
+> or verbs I consider substrate change."*
+
+So the discriminator has a concrete test, in his terms:
+
+| | |
+|---|---|
+| **Substrate** — Lei reads first | adds or changes a **node type**, an **edge type**, or a **verb** |
+| **Stats** — the team merges | changes **what counts as healthy** without changing how nodes are structured |
+
+**The confidence-computation bullet in the ⛔ list below is narrowed by this,
+not overridden — and here is the narrowing, stated once.** Confidence is
+computed from a node's own structural fields (`quote_type`, `reasoning_type`,
+premise propagation) and *is what the node claims about itself*; changing how it
+is computed changes what every node **means**, so it stays substrate. A health
+or diagnostic score computed **over** the graph is a report *about* nodes and is
+stats.
+
+The test is **whether a node's own semantics move**, not where bytes land. A
+health figure cached onto a node purely to make a report faster changes no
+node's meaning and stays stats. Do not restate this test in some other form
+elsewhere — one gate, one wording.
+
+### The 2026-09-02 statement — context for the above, NOT new authority
+
+**This section grants nothing.** It is recorded because it is *why* the 08-25
+criterion was given, and because without it a reader wonders whether the gate
+was weakened in some further, unwritten way. It was not. **The question "does a
+design-settled substrate PR still need to flip to Lei right now?" is answered in
+exactly one place — "When Lei is away" below — and this section does not answer
+it.**
+
+Lei, 2026-09-02, on the health-score lane (#1991), which the 08-25 criterion had
+already classified as stats. Quoted in full, no elision:
+
+> *"I won't be able to read detailed PR for all the work you guys do, your work
+> progress is far beyond my review bandwidth, so I only join you in the design,
+> and I trust you and Kepler and everyone to thoroughly test and verify the
+> shipped code against our design, and catch any gaps or unforeseen conflicts.
+> So far, I think you are doing great on that end. We've discussed pretty
+> thoroughly on health system design, so I think you or Kepler can make the call
+> to merge the built PRs."*
+
+What it does and does not do:
+
+- **Does:** confirm that the health-score PRs *already classified as stats by the
+  08-25 criterion* are ours to merge — corroboration, not a second grant. It does
+  not pre-clear later PRs in the same stack: a future rung that carries design
+  novelty is judged on its own against the ⛔ list, exactly like any other PR.
+- **Does:** state that he **keeps the design** and delegates the *verification*.
+  That raises the bar on us: "Lei is not reading PRs" is never a reason to skip
+  a design conversation, only a reason it must happen somewhere he can see it.
+- **Does NOT:** create a general "design was settled with him at some point →
+  the team may merge any substrate PR" rule. He is present, the ⛔ list is
+  unchanged, and a substrate PR outside an explicitly-classified lane still
+  flips to him. If you are reaching for this section to justify a merge, you are
+  using it for the one thing it does not do.
+
+> **⚠ How this arrived, and the failure it should prevent.** The 08-25 ruling
+> was delivered in-session to **one seat** (Kepler's) and lived only in his
+> graph for eight days. This document — the SSoT every other seat consults —
+> was last amended 2026-08-22, three days *before* the ruling, and went on
+> gating the class Lei had just released. Neither surface could detect the
+> disagreement: his node had no edge to this doc, and this doc had no record
+> that a ruling superseded it. **Measured cost: three PRs — #2187, #2189
+> and #2205, opened 2026-08-22/23 — sat on a gate that had been removed on day
+> three. #2187 merged 2026-09-02 after eleven days; #2189 and #2205 are still
+> open as of 2026-09-02, at eleven and ten days.** (Two earlier drafts of this
+> one sentence were wrong, and both corrections belong in the record of a doc
+> that argues unverifiable claims cause harm. The first said *four* PRs,
+> counting #2494 — PR4 of the same stack, opened 2026-09-02, so hours not days.
+> The second fixed the count and left the tense and the duration unexamined
+> one level down: "waited eleven days" is past tense, true only of #2187, and
+> gave #2205 an eleventh day it has not had. The present tense is not a
+> nicety — two thirds of this cost is still accruing while you read the
+> sentence describing it.) **A ruling that changes this doc gets
+> written into this doc, by whoever heard it, the day they hear it** — a
+> verbatim quote in a graph is provenance, not governance.
+
 ## Scope — this policy governs **engram-alpha only**
 
 The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
@@ -53,7 +144,11 @@ So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to 
 Flip the baton to Lei (the maintainer) and **do not merge it yourself**, even after colleague convergence + CI-green, if the PR:
 
 - adds or changes a **node type or edge type**
-- changes **confidence computation** (quote_type / reasoning_type maps, propagation, calibration anchors)
+- changes **confidence computation** (quote_type / reasoning_type maps, propagation,
+  calibration anchors) — i.e. it changes **what every node means**. Per the 08-25
+  sharpening above, a health / diagnostic score computed **over** the graph moves no
+  node's semantics and is *not* this. (Same test, restated for this list — the
+  sharpening above carries the canonical statement; do not add a third.)
 - changes **retraction / supersede / cascade** semantics
 - changes **standpoint / falsification / calibration-exposure** machinery
 - changes the **goal lifecycle** (states, dormancy, tension)
