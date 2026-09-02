@@ -17,9 +17,9 @@
 #   2  usage error — missing or invalid argument
 #   3  UNKNOWN — gh unavailable; fall back to manual check
 #
-# Multi-agent mode: if /home/agents-shared/projects/ exists (or $BATON_PROJECTS_DIR),
-# baton files are scanned for exact-token matches (#NN).  Dir absent → single-agent
-# mode, baton check skipped.
+# Multi-agent mode: if /home/agents-shared/forum/projects/ exists (or
+# $BATON_PROJECTS_DIR), baton files are scanned for exact-token matches
+# (#NN).  Dir absent → single-agent mode, baton check skipped.
 
 set -u
 # NOT -e: we capture gh failures explicitly rather than dying on them.
@@ -108,7 +108,13 @@ fi
 # ---------------------------------------------------------------------------
 BATON_HITS=""
 BATON_NOTE=""
-BATON_DIR="${BATON_PROJECTS_DIR:-/home/agents-shared/projects}"
+# #2316: the pre-2026-06-27 path (/home/agents-shared/projects, no /forum/
+# segment) is STALE but still populated (frozen at the cutover, never
+# removed) -- a caller with $BATON_PROJECTS_DIR unset used to resolve here
+# silently and search the wrong, incomplete tree (measured: 56% of live
+# batons invisible) rather than either finding the real ones or genuinely
+# skipping. The live path is the correct default now.
+BATON_DIR="${BATON_PROJECTS_DIR:-/home/agents-shared/forum/projects}"
 
 if [ -d "$BATON_DIR" ]; then
     # grep for exact-token "#NN" not followed by an alphanumeric/underscore across *.md files

@@ -47,7 +47,6 @@ from _status_derive import (  # noqa: E402
     ON_CALL_SENTINEL,
     _UNSET,
     LOOP_MODE_PATH,
-    PROJECTS_DIR,
 )
 
 # ---------------------------------------------------------------------------

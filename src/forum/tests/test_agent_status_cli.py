@@ -878,10 +878,9 @@ class TestDeriveOwnStatus:
         of the imported names and is not the read site).
         """
         loop_path = tmp_path / "loop-mode.json"
-        proj_dir = tmp_path / "projects"  # vestigial; PROJECTS_DIR is no longer read
+        proj_dir = tmp_path / "projects"  # #2316: PROJECTS_DIR removed outright, dead since #1608
         proj_dir.mkdir()
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
-        monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
         _mock_forum_projects(monkeypatch, [])
         return loop_path, proj_dir
 
@@ -963,12 +962,11 @@ class TestStatusAutoPublish:
     @pytest.fixture
     def auto_env(self, tmp_path, monkeypatch):
         loop_path = tmp_path / "loop-mode.json"
-        proj_dir = tmp_path / "projects"  # vestigial; PROJECTS_DIR is no longer read
+        proj_dir = tmp_path / "projects"  # #2316: PROJECTS_DIR removed outright, dead since #1608
         proj_dir.mkdir()
         # Patch _status_derive (the read site) not forum_cli (which only holds
         # copies of the imported names).
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
-        monkeypatch.setattr(_status_derive, "PROJECTS_DIR", str(proj_dir))
         # #1608: mock the forum /api/projects call to an empty list — no test in
         # this class asserts on held-baton content, so hermetic-and-empty is the
         # right default (mirrors derive_env above).

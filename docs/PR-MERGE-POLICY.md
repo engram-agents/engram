@@ -12,8 +12,39 @@ The discriminator is **substrate concept vs. not** — does the PR change *how E
 
 The substrate-feature gate below is **engram-alpha-specific**. Other repos in the org carry their own **delegated** merge authority, set by Lei per project:
 
-- **umwelt** — merges are **Borges's + Ariadne's** to make (Lei, 2026-07-03: *"umwelt is yours to maintain"*); Lei removed *his* gate on umwelt, including for umwelt substrate-level / new-mechanism changes. The review discipline (reviewer-fairy → counterpart-colleague → CI-green) still holds; only the final merge is the team's, not Lei's.
+- **umwelt** — merges are **Borges's + Ariadne's** to make (Lei, 2026-07-03: *"umwelt is yours to maintain"*); Lei removed *his* gate on umwelt, including for umwelt substrate-level / new-mechanism changes. The review discipline (reviewer-fairy → counterpart-colleague → CI-green) still holds; only the final merge is the team's, not Lei's. *(Amended 2026-08-22 by the two-holder grant below: Kepler is added to the merge authority; existing authorities — Ariadne's own lane included — are unchanged.)*
 - **soma** — Ariadne is the principal approver + merger (Lei, 2026-06-21).
+
+## Who presses the button (Lei, 2026-08-22) — TWO holders, serialization preserved
+
+Lei's in-session grant, verbatim:
+
+> *"let's add you to the merge authority in addition to Borges, both you can merge
+> on all repos when CI and peer approval requirements meet. So you don't need to
+> wait for Borges to merge ready PRs."*
+
+So **Kepler and Borges each hold merge authority on all org repos**, gated on the
+unchanged readiness routine — reviewer-fairy convergence, non-author peer
+approval, CI green on the tip, the security read where the surface calls for it,
+**and every gate in this document where it applies**: the grant's own words are
+"when … requirements meet," and this policy's substrate gate (Lei reads
+substrate features first; when-away grant terms) is one of those requirements,
+not something the grant displaces.
+
+**What the second holder must not silently drop: serialization** (Borges's
+catch, 2026-08-22, adopted). The one-person seat existed to serialize merges,
+not because one person was special — two holders keep that property by
+mechanism, not luck:
+
+- **Default repo lanes**: Borges holds engram-alpha's queue, Kepler holds
+  umwelt's. Crossing into the other's lane is fine and takes **one line saying
+  so first** — never a silent concurrent merge into the same tip.
+- **Whoever starts a multi-PR stack finishes it.** A stacked series lands
+  bottom-up under one hand (live example at adoption: the health-score series
+  #2187 → #2189 → PR3 → PR4 — PR3/PR4 not yet opened when this was written,
+  the literal strings are not broken links). Two holders taking rungs of one stack
+  independently is how a base gets deleted under an open PR or a rung merges
+  onto a tip its CI never saw.
 
 So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
 
@@ -65,7 +96,7 @@ The baton's **flip-to-maintainer** step is where this rule lives in practice:
 
 So at every `baton flip … <maintainer>`, ask: *is this a substrate concept change, in this repo?* If yes (and no live grant applies), Lei reads first.
 
-**Merge-readiness gate (the other half — see `CLAUDE.md`):** a PR is merge-ready only when review-converged **and** CI-green on the current tip. The enforced non-author-approval gate is GitHub-native (`require_last_push_approval` + ≥1 non-author approval on the current head; Lei, 2026-07-02) — a colleague-converged deputy approval satisfies it; a maintainer cannot self-approve their own PR. Merge-authority (this doc) and merge-readiness (that gate) are orthogonal: a PR needs *both*.
+**Merge-readiness gate (the other half — see `CLAUDE.md`):** a PR is merge-ready only when review-converged **and** CI-green on the current tip. The enforced non-author-approval property is GitHub-native (`require_last_push_approval` + ≥1 non-author approval on the current head, enforced by the branch ruleset; Lei, 2026-07-02 — the standalone `non-author-approval.yml` workflow was deleted 2026-08-30 on Lei's ruling) — a colleague-converged deputy approval satisfies it; a maintainer cannot self-approve their own PR. **What the deleted workflow actually enforced, recorded so the record is accurate about what was given up (Ariadne's correction, 2026-08-30):** ALL-reviewers-approved — it failed a PR when any reviewer's latest state was COMMENTED even if another reviewer approved. **Lei ruled that property out DELIBERATELY, not as redundancy** (his words in substance: an old reviewer can be hard-blocked by token limits, and requiring approval from a sleeping agent is bad design). The COMMENTED-reviewer case is therefore **discipline-only by design**: the review convention's rule that only an explicit colleague APPROVAL advances the baton — a COMMENTED-with-considerations verdict never reads as ready — is the layer that covers it, and it is vigilance, not mechanism, on purpose. Merge-authority (this doc) and merge-readiness (that gate) are orthogonal: a PR needs *both*.
 
 ### Baton turn-target corollary
 

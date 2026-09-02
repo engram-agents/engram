@@ -9,11 +9,19 @@ tree here would add startup latency and failure surface.
 
 #1608: ``_held_baton_turns`` (via the private ``_fetch_held_batons`` helper)
 reads the live forum coordination API (``GET /api/projects``) instead of
-globbing the local ``PROJECTS_DIR`` — the local ``projects/*.md`` files went
-dead at the 2026-06-27 UCS cutover, when ``baton.py`` moved to writing
-exclusively through the forum API. The HTTP call is ``urllib``-only (stdlib,
-no ``forum.py`` import-back) and fails soft (empty queue) on any error, per
-this module's existing never-break-a-wake contract.
+globbing the local baton-projects directory — the local ``projects/*.md``
+files went dead at the 2026-06-27 UCS cutover, when ``baton.py`` moved to
+writing exclusively through the forum API. The HTTP call is ``urllib``-only
+(stdlib, no ``forum.py`` import-back) and fails soft (empty queue) on any
+error, per this module's existing never-break-a-wake contract.
+
+#2316: the ``PROJECTS_DIR`` constant this docstring used to describe was
+removed outright rather than merely deprecated — it had exactly one
+remaining reader (``tools/forum.py``'s import, itself unused past the
+import line) and its value was the STALE pre-cutover path
+(``/home/agents-shared/projects``, no ``/forum/`` segment), still silently
+resolvable because that directory is frozen-but-populated rather than
+deleted. A dead constant holding a wrong value is worse than no constant.
 
 Exported surface
 ----------------
@@ -34,7 +42,7 @@ _read_engaged_window()
 
 Constants
 ---------
-LOOP_MODE_PATH, PROJECTS_DIR, ON_CALL_SENTINEL, _UNSET, ENGRAM_HOME,
+LOOP_MODE_PATH, ON_CALL_SENTINEL, _UNSET, ENGRAM_HOME,
 LAST_USER_ACTIVITY_PATH
 """
 
@@ -61,14 +69,6 @@ LOOP_MODE_PATH: str = os.path.join(ENGRAM_HOME, "loop-mode.json")
 # last-user-activity — epoch-seconds stamp written by the time-bar hook on
 # genuine human-typed prompts. Used to derive "engaged" state.
 LAST_USER_ACTIVITY_PATH: str = os.path.join(ENGRAM_HOME, "last-user-activity")
-
-# Shared baton/project dir — turn-state files (one .md per project/PR).
-# #1608: no longer read by _held_baton_turns (dead since the 2026-06-27 UCS
-# cutover — see the module docstring). Kept as a constant only for back-compat:
-# tools/forum.py still imports it, and existing tests monkeypatch it.
-PROJECTS_DIR: str = (
-    os.environ.get("ENGRAM_PROJECTS_DIR") or "/home/agents-shared/projects"
-)
 
 # Default forum server URL — mirrors tools/forum.py::_DEFAULT_FORUM_URL.
 _DEFAULT_FORUM_URL: str = "http://localhost:5002"

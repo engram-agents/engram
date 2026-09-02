@@ -5,7 +5,7 @@ description: Use when sending or reading inter-agent turn-state via the `baton` 
 
 # Inter-Agent Turn-State — `baton` Workflow
 
-The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is the sanctioned interface to the multi-agent turn-state system at `/home/agents-shared/projects/`. Files are flat YAML-frontmatter Markdown; the CLI guarantees atomic edits + audit-trail consistency. The auto-pull hook (`engram-baton-prompt-hook.py`) reads these files every prompt and injects live status into the agent's context.
+The `baton` CLI (`tools/baton.py`, shared at `/home/agents-shared/bin/baton`) is the sanctioned interface to the multi-agent turn-state system at `/home/agents-shared/forum/projects/`. Files are flat YAML-frontmatter Markdown; the CLI guarantees atomic edits + audit-trail consistency. The auto-pull hook (`engram-baton-prompt-hook.py`) reads these files every prompt and injects live status into the agent's context.
 
 ## When to use
 
@@ -135,6 +135,6 @@ Pass `--help` to any subcommand for the full flag list.
 - **CLI source**: `tools/baton.py` (single Python 3 stdlib file)
 - **Tests**: `tests/test_baton.py` (56+ tests across all subcommands)
 - **Hook integration**: `hooks/claude/engram-baton-prompt-hook.py` — surfaces in-court batons + live GitHub status every prompt
-- **Project files**: `/home/agents-shared/projects/<id>.md` (YAML frontmatter + audit-log body)
+- **Project files**: `/home/agents-shared/forum/projects/<id>.md` (YAML frontmatter + audit-log body)
 - **Auto-pull cache**: `$ENGRAM_HOME/baton-status-cache.json` (30s TTL)
 - **Marker for self-paced loops**: `~/.engram/loop-mode.json` (see `engram-loop` skill for lifecycle)

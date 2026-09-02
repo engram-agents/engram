@@ -9,6 +9,182 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-08-30
+
+**The cascade-machine release.** One epic dominates the 100-commit range since
+v0.4.0 (2026-08-19 through 2026-08-30): the #2013 cascade machine — a single
+repair engine for retract and supersede that replaces the field-based
+`stale_by`/`tainted_by` cascade with durable per-event markers, an explicit
+adjudication frontier, and hard guards on every path that used to let revision
+state drift silently. The release also carries the CB/NCB claim-bearing
+partition groundwork (#2252 stage 1) it builds on, and a wide CI-gate wave that
+grew out of shipping both.
+
+### rc3 addendum (2026-08-30 evening — between rc2 and rc3)
+
+- **The solo-ScheduleWakeup guard is REVERTED** (shipped in rc2, removed in
+  rc3 by the maintainer's ruling after its first live field day): PreToolUse
+  hooks receive each tool call in isolation, so the guard's batch-sibling
+  detection false-positive-denied every properly-batched arm on
+  human-answering turns, and its Stop-hook escape hatch was bypassed by
+  origin-walking classification. Five fires, one true positive; full record
+  on the original PR. The underlying swallowed-reply defect is a harness
+  bug, reported upstream with the field record; the batching discipline in
+  engram-loop remains the working mitigation. The rc2 addendum's guard
+  bullet is superseded by this one.
+- **Stop-hook re-invocations classify as non-human in the time-bar hook**
+  — the missing prefix that let two hooks oppose each other on one turn.
+- **Touched-test selection resolves hooks/skills/tools shipped paths**
+  (dir-prefix normalization; 99% of test-map entries now exercised by the
+  class guard, with a can-it-fail control).
+
+### rc2 addendum (2026-08-30 afternoon — between rc1 and rc2)
+
+Documentation, discoverability, and hardening landed after the rc1 tag, cut as
+rc2 so the first upgraded fleet runs a self-consistent state:
+
+- **`docs/cascade-machine.md`** — the cascade machine's design of record,
+  extracted from the epic at close (#2348): marker model, the three processes
+  and the frontier-as-topological-order, all nine invariants with their
+  measurements, the three propagations and their different rules, the
+  acknowledgement-edge story in full, the derived-set SSoT rule, the backfill,
+  and the five build defects. Bound to the code by
+  `tests/test_cascade_machine_doc_binding.py` (with a can-it-fail control) —
+  which earned its keep before it existed: its author-fairy refused to write it
+  against the doc's first draft and surfaced a real membership error.
+- **Cascade skills corrected from the maintainer's first full read**
+  (engram-resolve-cascade, engram-revise): mode C described as the restricted
+  moving frontier it is (self-inclusive — your own target in the list is the
+  mechanism working); the acknowledged shape's `acknowledged_derives_from`
+  wiring stated (creation-order-exempt by design, cycle-guarded); the worked
+  example split into retracted-premise (acknowledge never eligible) and
+  superseded-premise (eligible, edge wired) cases; the "When in doubt" section
+  rewritten to the agent-agency authority model — resolve by default, leave
+  open honestly, escalate rarely and only for named shapes.
+- **`engram-support-lost` skill (new, essential tier)** — support_lost handling
+  extracted from Pattern B into its own skill, with a dream-fairy scan category
+  (11 — the shared lottery namespace's 10 belongs to person-node maintenance)
+  and dream-master adjudication hookup; category counts across dream surfaces
+  now defer to `dream_lottery.py`'s `CATEGORIES` dict as the roster SSoT.
+- **Private-repo issue/PR numbers scrubbed from shipping cascade surfaces**
+  (skills, agent specs, refusal/notice strings) — dead references for users
+  without repo access; messages are now self-contained, with the design doc as
+  the named deeper reference. Repo-wide backlog sweep tracked separately.
+- **Solo-ScheduleWakeup swallowed-reply guard** (new PreToolUse hook, #2427) —
+  denies a solo arm only when the turn answers a genuine human message and has
+  no sibling tool call; the fix is always "add a sibling call", so no
+  stuck-deny is possible. Goes live per-seat on the post-upgrade restart.
+- **CI-green rule amendment** (CLAUDE.md + `baton.py` docstrings) — the
+  measured statusCheckRollup semantics (head-scoped, un-deduped, same-SHA
+  re-runs) with `_pr_ci_state()` as the named reference implementation.
+- **The rc-upgrade verify script + runbook now SHIP IN THE REPO,
+  host-neutral** (`tools/rc-upgrade-verify.py`, `docs/rc-upgrade-runbook.md`)
+  — the per-host `/home/agents-shared/` distribution made the upgrade
+  instructions silently unexecutable on off-host (macOS) seats, measured on
+  #2411. The committed script carries the WAL-companion fix and a widened
+  checkout probe list, and was validated end-to-end on a macOS seat; this is
+  the release's own upgrade tooling, so it ships with the release.
+- **gh-stack linking made mandatory at PR creation** (CLAUDE.md, three-repo
+  pass) — with the measured recoverability discriminator: the close survives,
+  the post-close force-push is the point of no return; restore the base ref
+  before rebasing anything.
+- **Cycle-guard and marked-node remedy texts now name the resolution route**
+  (#2405 ruled wording-only by the maintainer; fixed in #2424) — the refusals
+  on plain supersede/retract of a marked node point at the frontier/resolve
+  flow instead of a call the guards refuse. The rc1 "ruling pending" caveat
+  for this is retired: ruled, fixed, shipped.
+- **Removed-test markers parse in bulleted form** (#2421 → #2422) — the
+  census gate's line-anchored parser now accepts `- Removed-test:` list
+  items; closes the fail-loud-warning thread one PR further than rc1's note.
+- **Redundant non-author-approval workflow deleted** (#2423) — dev's ruleset
+  is the enforcement; the maintainer deliberately declined an
+  all-reviewers-approved gate (a token-blocked or sleeping reviewer must not
+  hard-block a merge).
+
+### Added — the cascade machine (#2013)
+
+- **`cascade_markers` + the frontier/resolve verbs** (#2338, #2342, #2349) —
+  a retract or supersede now mints one pending marker per affected node per
+  cascade event; `engram_cascade_frontier` reads the adjudication frontier
+  (modes A/B/C) and `engram_cascade_resolve` adjudicates each entry as
+  `superseded` / `retracted` / `acknowledged`, with confidence recompute
+  transitive and unconditional. Cycle guards on acknowledgements; dag vs
+  `temporal_causal` split with a real cycle detector (#2357, #2360).
+- **Revision guards, each Lei-ruled** — a plain supersede or retract of a
+  node carrying pending markers is REFUSED with a machine-readable pointer to
+  the frontier (#2343, #2392); a plain retract of a NON-current node is
+  refused, ungated, mirroring supersede (#2395, #2396, #2410); `engram_derive`'s
+  MECH-5 refusals carry the same `next_call`/`then` route fields (#2394, #2404).
+- **Cascade playbox + behaviour scenarios CD-01..CD-10** (#2356, #2373, #2382,
+  #2397, #2410) — a real-topology test harness and an end-to-end scenario
+  suite for the machine, run in full CI and (1.6s, stdlib-only) on every dev PR.
+- **Nightly mode-B cascade sweep in the dream master** (#2390, #2401) — the
+  dream record's cascade-sweep section is mandatory, so a sweep that never ran
+  is loudly distinguishable from a clean frontier.
+- **Marker migration at upgrade (rung 5, #2324; verified under #2411)** — the
+  pre-#2013 field-based `stale_by`/`tainted_by` state converts to marker rows
+  automatically at first server start on this version; idempotent, timestamps
+  recovered from `edit_history`. Verified two-signal (independent pre-count ==
+  migration's reported count) before release on four seats, of which **two had
+  real payload** (135/241/61 and 32/37/25 nodes/markers/events) — the two
+  zero-payload seats exercise fire-and-report only, not the conversion logic.
+- **Axiom surfacing gate** (#2406, #2415) — an axiom's markers never
+  auto-resolve trivially; they always surface. (The shipped gate is exactly
+  `frozenset({"axiom"})`: cornerstones and goals cannot carry a marker at all.)
+
+### Changed
+
+- **Revising a node with historical stale/taint state now routes through the
+  frontier** — the migration makes old field-based debt visible as markers, so
+  previously freely-revisable nodes refuse plain revision and point at
+  `engram_cascade_frontier` (migrate-all ruling, 2026-08-30). The refusal
+  self-explains; the nightly sweep drains the backlog.
+- **Skills rewritten for the shipped machine** (#2337, #2389, #2402) —
+  `engram-retract` folds into `engram-revise`; `engram-resolve-cascade`
+  rewritten around the real frontier/resolve verbs.
+- **A commander-relayed sleep order is a sufficient sleep trigger**
+  (#2398, #2403) — seats no longer gate on the human's direct per-seat word
+  when the acting commander relays it with the user's authority stated;
+  human-owner standing gates survive the relay.
+- **gh-stack (GitHub Stacked PRs) rules** (#2391, #2407) — CLAUDE.md carries
+  the post-cutoff knowledge (linked stack members refuse plain merge;
+  `gh stack merge` is the verb; GitHub auto-rebases the next layer), and seat
+  provisioning ensures the extension at boot. Duplicated by hand across
+  engram-alpha, umwelt, soma.
+
+### CI / gates
+
+- Playbox scenarios per dev PR (#2397); scrub checks run on stacked PRs and on
+  `edited` (#2361, #2362); five stdlib-only guards wired into pr-checks
+  (#2376, #2377); test-id census gate (#2350, #2358) with fail-loud parse
+  warnings for malformed `Removed-test` lines (#2393, #2416); fairy-brief
+  class-scope rules in the orchestration skill (#2369, #2370).
+
+### Fixed
+
+- Stop-hook write-verb SSoT derived from the server, `cascade_resolve`
+  included (#2273, #2368, #2384); cohort verify-in no longer hard-fails on
+  prediction nodes (#1966, #2325); `importance_base` unified across 7 sites
+  (#2268, #2367); shared `_proc_identity` for both forum monitors with a
+  portable /proc-primary check (#2134, #2314, #2321, #2365); dead baton store
+  path retired with an advisory scanner (#2316, #2372); template/component
+  parity restored for the Codex wake path (#2385, #2412); EDGE_TIERS duplicate
+  key consolidated (#2387, #2414); dream-master spec no longer names calls the
+  verbs refuse (#2408 comment half, #2414).
+
+### Known caveats
+
+- **Migration rung 5's `tainted_by`→retract branch and anomaly path ship
+  unexercised on real data**: every measured seat has zero live (current-node)
+  `tainted_by`. The fail-safe direction is over-blocking, so untested ≠ unsafe
+  — but it ships untested, stated plainly.
+- #2193: a write during WAL-index displacement can report created and not
+  land; the durability verifier reads through the same connection and cannot
+  see this class (dual-read-back design is post-rc). #2012: some readers
+  (reflect / health-score / viz) still read the legacy `stale_by` fields and
+  undercount post-migration. #2339: the cascade walk's `max_depth` is a node
+  budget, not a depth limit. #2003: superseded nodes keep `status='active'`.
+
 ## [v0.4.0] - 2026-08-19
 
 **A reliability-and-hygiene release.** No single forcing incident drove this

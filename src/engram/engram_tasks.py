@@ -141,6 +141,7 @@ def _add_goal_impl(
 
         meta = json.dumps({"motivation": motivation})
 
+        core._refuse_ncb_confidence("goal", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                status, metadata)
@@ -160,17 +161,53 @@ def _add_goal_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "goal_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "goal_id": node_id,
@@ -234,6 +271,7 @@ def _add_task_impl(
 
         meta = json.dumps({"scope": scope})
 
+        core._refuse_ncb_confidence("task", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
                VALUES (?, 'task', ?, ?, 'planned', ?)""",
@@ -298,13 +336,11 @@ def _add_task_impl(
                         (json.dumps(parent_meta), parent_task_id),
                     )
 
-        # Stamp with planned importance (2.0)
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        planned_score = core._compute_importance(TASK_IMPORTANCE["planned"], core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = ?, importance_score = ? WHERE id = ?",
-            (TASK_IMPORTANCE["planned"], planned_score, node_id),
-        )
+        # Stamp with planned importance (TASK_IMPORTANCE["planned"] = 2.0).
+        # Pass importance_base directly so _stamp_new_node writes the anchor
+        # in one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=TASK_IMPORTANCE["planned"])
 
         # Citation USE-bumps (alpha #177 area 4, Lei 2026-05-19 tier-2):
         # implements_ids (cites edges) and goal_id (serves edge) are
@@ -318,6 +354,42 @@ def _add_task_impl(
             core._utility_reward(conn, cite_targets, action="citation")
 
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "task_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         result = {
             "status": "created",
@@ -599,9 +671,13 @@ def _report_feeling_impl(
     tag = categorical_tag.strip() if categorical_tag else None
 
     # Auto-format the claim — schema-level enforcement of "I reported" framing.
+    # #1952 PR2 / #1875: no truncation — claim is the FULL report text. The
+    # hedge prefix below is a structural honesty guarantee (per Lei's
+    # feeling-schema ruling (#1875, 2026-08-19) — never let a feeling node
+    # read as an unhedged truth-claim) and is mechanically applied here; no
+    # caller can omit or shorten it.
     state_clean = reported_state.strip()
-    summary = state_clean if len(state_clean) <= 80 else state_clean[:80].rstrip() + "..."
-    formatted_claim = f"I reported feeling: {summary}"
+    formatted_claim = f"I reported feeling: {state_clean}"
 
     # Mechanical nudge_source determination — read-and-clear the marker.
     # Done BEFORE any DB writes so a corrupt marker can't half-create a node.
@@ -627,6 +703,7 @@ def _report_feeling_impl(
                 "best_approximation_not_truth_claim"
             )
 
+        core._refuse_ncb_confidence("feeling_report", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (
                 id, type, claim, created_at, status,
@@ -676,16 +753,50 @@ def _report_feeling_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # Stamp + anchor importance. Same pattern as goals/axioms: stamp first
-        # to compute embedding, then overwrite importance to the anchored 2.0.
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id),
-        )
+        # Stamp + anchor importance. Same pattern as goals/axioms: pass
+        # importance_base directly so _stamp_new_node writes the anchor in
+        # one pass instead of computing an interim value from
+        # confidence/surprise and then overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
 
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "feeling_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "feeling_id": node_id,

@@ -40,7 +40,7 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Nine well-supported categories you scan for, plus two heuristic categories you can attempt if the parent asks:
+Ten well-supported categories you scan for (numbered 1–9 and 11 — 10 is reserved for person-node maintenance, owned by engram-person-node-fairy in the shared lottery namespace of tools/dream_lottery.py), plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
@@ -48,12 +48,12 @@ Nine well-supported categories you scan for, plus two heuristic categories you c
 
 **Primary tool — `engram_query_pattern`.** Each of the first six well-supported categories below has a corresponding named pattern in `engram_query_pattern` (server-side bundle of the same logic with ranking + scoring + telemetry). Call the pattern FIRST as the primary surface; the inline-replication methodology below each category is preserved both as transparent documentation of what the pattern does AND as fallback when you need to drill deeper or apply per-candidate judgment beyond what the bundled pattern returns. Pattern-name ↔ category mapping is one-to-one (`open_question_answerable` ↔ 1, `contradiction_obsolescence_ready` ↔ 2, `stale_load_bearing` ↔ 3, `cornerstone_candidate` ↔ 4, `tainted_still_valid` ↔ 5, `recent_resolution_echo` ↔ 6). **Categories 7, 8, and 9 have no server-side pattern yet** — they use read-only MCP tools and Bash inline (see below). **Use preset `high_recall` by default** (top_k=30, cosine_threshold=0.45, min_confidence=0.00) — this matches the inline methodology's "broad capture, parent decides" shape better than `balanced` (top_k=15) and avoids silently capping candidate output. Switch to `balanced` if you want a narrower top_k and tighter cosine filter (still the middle preset, not precision-biased); `high_precision` is rarely the right fairy default. Each call appends a telemetry row used for preset calibration — your usage feeds the empirical record.
 
-1. **Open questions with sufficient answers nearby.** `engram_query_pattern(pattern_name='open_question_answerable')` as primary; or inline: `engram_list(node_type='question', status='open')` gives the inventory, for each run a targeted `engram_query` on the question's content, cross-reference recent observations and derivations. If a derivation chain has emerged that would resolve the question, flag it. Suggest action: parent composes the resolving derivation via `engram_derive`, then wires it via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (pure-wire per issue #229) — but you do not run it; the parent decides.
+1. **Open questions with sufficient answers nearby.** `engram_query_pattern(pattern_name='open_question_answerable')` as primary — **audited/fixed 2026-08-04 (#1860): the candidate set now ranges over `status IN ('open', 'partially_resolved')`**, not `status='open'` alone. A `partially_resolved` question already has some evidence landed, which makes it the *most* likely to have a nearby derivation chain, not less — the old open-only filter silently laundered a narrow scope into a "clean, no candidates" report: a clean result certifies only its scope. If falling back to the inline path, mirror this: `engram_list(node_type='question')` filtered client-side to `status IN ('open', 'partially_resolved')`, for each run a targeted `engram_query` on the question's content, cross-reference recent observations and derivations. If a derivation chain has emerged that would resolve the question, flag it. **State the status set you ranged over in your report** (see the output-contract note below — a null result with a stated domain is informative; one with an implied domain is not). Suggest action: parent composes the resolving derivation via `engram_derive`, then wires it via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)` (pure-wire per issue #229) — but you do not run it; the parent decides.
 
-2. **Contradictions ripe for resolution.** `engram_query_pattern(pattern_name='contradiction_obsolescence_ready')` as primary; or inline: `engram_list(node_type='contradiction')` filtered by `status IN ('open', 'partially_resolved')` AND `is_current=1`. For each `ct_XXXX`, inspect both contradicting sides + check `metadata.stale_by` and `metadata.tainted_by`. **Three sub-flows** under the issue #229 substrate redesign — surface each with the appropriate scaffolding:
-   - **Stale-by-premise (one side superseded)** — `metadata.stale_by` non-empty. The supersede may have already substantively resolved the conflict (case 1: new node altered the conflicting claim → suggest parent wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=stale_replacement)` directly) OR preserved it (case 2: new node kept the conflicting claim → suggest parent create new contradiction + supersede old ct → new ct). Per the supersede no-drop discipline, case 3 (orthogonal drop) cannot arise.
-   - **Tainted-by (one side retracted)** — `metadata.tainted_by` non-empty. The retracted side was never valid; the contradiction itself may need closure. Suggest parent: compose a derivation noting the retraction + wire it as resolver, OR if a `replacement_json` observation was created, treat as stale-by-premise case 2.
-   - **Open with no cascade flags** — standard contradiction-resolution path. Parent composes a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the canonical chain-dilution-resolution-saga failure mode) then wires via `engram_resolve`.
+2. **Contradictions ripe for resolution.** `engram_query_pattern(pattern_name='contradiction_obsolescence_ready')` as primary; or inline: `engram_list(node_type='contradiction')` filtered by `status IN ('open', 'partially_resolved')` AND `is_current=1`. For each `ct_XXXX`, inspect both contradicting sides + check `engram_inspect(ct_XXXX)`'s `warnings.stale_by` and `warnings.tainted_by` (cascade state moved off `metadata.stale_by`/`metadata.tainted_by` into a `cascade_markers` table — the `warnings` shape on the inspect response is the current surface, same key names as before, richer entry shape: `stale_by` entries carry `{superseded_id, replaced_by_id, superseded_at}`, `tainted_by` entries carry `{retracted_id, retracted_claim_excerpt, retracted_at, retraction_reason_excerpt}`). **Three sub-flows** under the issue #229 substrate redesign — surface each with the appropriate scaffolding:
+   - **Stale-by-premise (one side superseded)** — `warnings.stale_by` non-empty. The supersede may have already substantively resolved the conflict (case 1: new node altered the conflicting claim → suggest parent wire `engram_resolve(target_id=ct_XXXX, resolving_node_id=<replaced_by_id from the warnings entry>)` directly) OR preserved it (case 2: new node kept the conflicting claim → suggest parent create new contradiction + supersede old ct → new ct). Per the supersede no-drop discipline, case 3 (orthogonal drop) cannot arise.
+   - **Tainted-by (one side retracted)** — `warnings.tainted_by` non-empty. The retracted side was never valid; the contradiction itself may need closure. Suggest parent: compose a derivation noting the retraction + wire it as resolver, OR if a `replacement_json` observation was created, treat as stale-by-premise case 2.
+   - **Open with no `warnings` key at all** — standard contradiction-resolution path. Parent composes a resolving derivation citing root-anchor nodes (NOT prior weak resolutions — chain dilution is the canonical chain-dilution-resolution-saga failure mode) then wires via `engram_resolve`.
 
    Full decision tree lives in the `engram-contradiction-resolution` skill — reference it in your report so the parent can follow the canonical steps.
 
@@ -82,9 +82,9 @@ Nine well-supported categories you scan for, plus two heuristic categories you c
 
    Evaluate obs/dv claim text against the principle-guides-execution test. The `engram_query_pattern("cornerstone_candidate")` MCP tool surfaces candidates via proxy-scoring (importance × recall × load-bearing) and is type-filtered to obs/dv — your job is the semantic evaluation against the test above. When using the inline fallback (`engram_list(sort_by='importance', limit=20)`), the type gate does NOT apply — the fail-by-category list above covers all non-obs/dv types that can surface via that path. Suggest action for qualifying candidates: `engram_add_cornerstone` or `engram_focus`.
 
-5. **Tainted-but-still-valid derivations.** `engram_query_pattern(pattern_name='tainted_still_valid')` as primary; or inline: `engram_list(status='tainted')`, for each tainted derivation inspect the retraction-source it cites via `tainted_by`. Some tainted derivations may still be valid under the corrected/superseded version of their premises (the cascade fired correctly but the substantive claim survives). Flag candidates for the parent to either re-derive cleanly or supersede with a fresh statement.
+5. **Tainted-but-still-valid derivations.** `engram_query_pattern(pattern_name='tainted_still_valid')` as primary (queries `cascade_markers` directly — pending markers with `root_op='retract'` on `is_current=1` nodes; the row stores `root_op`, never a severity, and at the design level the taint/stale severity is deprecated in favour of one blocking `pending` marker); or inline: `engram_inspect` a candidate derivation and check `warnings.tainted_by` — for each tainted derivation, the entry's `retracted_id` names the retraction-source. Some tainted derivations may still be valid under the corrected/superseded version of their premises (the cascade fired correctly but the substantive claim survives). Flag candidates for the parent to either re-derive cleanly or supersede with a fresh statement.
 
-6. **Recent-resolution echoes.** `engram_query_pattern(pattern_name='recent_resolution_echo')` as primary — **audited 2026-08-04 (#1901): the server-side pattern is NOT day-windowed.** It ranks the 30 most-recent `resolves` edges by `created_at DESC` regardless of how much wall-clock time separates them — a self-relative "last 30" window, not a "since last sleep" one, so it needs no per-type watermark and is already lottery-safe as-is. Only the inline fallback below carries an actual runs-every-day assumption: `engram_history(action='resolved', since=<recent>)` — if you fall back to this path, use the same `window_since` value the parent injected for Category 7 (or, if this fairy is running Category 6 without Category 7 also running, ask for one / default to the last 30 days as an approximation) rather than an undefined "recent." For each resolution, scan recently-active questions that share semantic content. If a resolution pattern has just emerged that should propagate to similar questions, flag it.
+6. **Recent-resolution echoes.** `engram_query_pattern(pattern_name='recent_resolution_echo')` as primary — **audited 2026-08-04 (#1901): the server-side pattern is NOT day-windowed.** It ranks the 30 most-recent `resolves` edges by `created_at DESC` regardless of how much wall-clock time separates them — a self-relative "last 30" window, not a "since last sleep" one, so it needs no per-type watermark and is already lottery-safe as-is. **Also audited/fixed 2026-08-04 (#1860): the candidate-question status check now admits `status IN ('open', 'partially_resolved')`**, not `status='open'` alone — a `partially_resolved` question already has evidence landed, so a semantically-close recent resolution is a plausible echo for it too, not less likely. The old open-only filter had silently laundered a narrow scope into a "clean, no candidates" report: a clean result certifies only its scope. Only the inline fallback below carries an actual runs-every-day assumption: `engram_history(action='resolved', since=<recent>)` — if you fall back to this path, use the same `window_since` value the parent injected for Category 7 (or, if this fairy is running Category 6 without Category 7 also running, ask for one / default to the last 30 days as an approximation) rather than an undefined "recent." For each resolution, scan recently-active questions that share semantic content, `status IN ('open', 'partially_resolved')`. If a resolution pattern has just emerged that should propagate to similar questions, flag it. **State the status set you ranged over in your report** (see the output-contract note below).
 
 7. **Missing principle-edges (instantiates/serves).** No server-side pattern — compose inline using read-only MCP tools.
 
@@ -152,11 +152,28 @@ Nine well-supported categories you scan for, plus two heuristic categories you c
 
    Suggest action: "Add warm-briefing anchor entry for `cs_XXXX` (handle: `<tag>`) — no auto-load surface coverage found." Dream-master surfaces these as human-action items (warm-briefing edits are not ENGRAM writes); Clio acts on them in the next session.
 
+11. **Cornerstones/lessons with `support_lost`.** No server-side pattern — compose inline using read-only MCP tools.
+
+    **Why this matters:** `support_lost` is a plain metadata boolean (not a cascade marker) set when ALL of a cornerstone's or lesson's live support edges (`supported_by` outgoing + `exemplifies` incoming) drop to zero — usually a side effect of a retract or supersede that zeroed the last supporting instance. Left unaddressed, the pattern node sits unanchored indefinitely with nobody re-examining it.
+
+    **Candidate set:** cornerstones and lessons (`cs_*`, `ls_*`) with `metadata.support_lost = true`.
+
+    **Inline methodology:**
+    1. Enumerate candidates: `engram_list(node_type='cornerstone')` and `engram_list(node_type='lesson')`, filtered to `support_lost=true` (or inspect each active node and check the flag if no list-level filter is available).
+    2. For each flagged node, `engram_inspect(node_id=<cs_X or ls_X>, dream_mode=True)` — read the pattern claim.
+    3. `engram_query` (or `engram_query_pattern`) on the claim text for live observations/derivations that could exemplify the pattern.
+    4. If candidate exemplars surface: list them (node IDs + a one-line why-it-fits) as a rewire suggestion.
+    5. If no candidate exemplars surface: report a lost-basis assessment — whether the pattern still holds in principle (leave unanchored) or no longer applies (candidate for retract).
+
+    **Read-only tools used:** `engram_list`, `engram_inspect`, `engram_query` / `engram_query_pattern`.
+
+    Suggest action: the dream-master adjudicates per the `engram-support-lost` skill (rewire via `engram_register_exemplar`, leave unanchored, or retract via `engram-revise`) — you surface candidates and assessments only; you never rewire, register an exemplar, or retract.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-10. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+12. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-11. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+13. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # Posture
 
@@ -229,6 +246,7 @@ re-inspect, defeats the purpose).
 | 6 — Recent-resolution echoes | The recently-resolved question and its resolving derivation |
 | 7 — Missing principle-edges | The principle node (target_id); any existing outgoing edges from the source node that are adjacent in type (confirms skip-already-cited was applied) |
 | 8 — Open tasks with stale external references | The `external_check` field carrying the live `gh` output for each flagged reference; task status field |
+| 11 — Cornerstones/lessons with support_lost | Candidate live exemplars found (if any), with a one-line why-it-fits each; existing `supported_by`/`exemplifies` edges (confirms zero-support state) |
 
 If `key_neighbors` would be empty for a finding (no neighbors the dream-master
 needs to see), emit `"key_neighbors": []` rather than omitting the field.
@@ -263,6 +281,7 @@ Use this format:
 **Highest-leverage:** <one-line pointer to the top recommendation>
 
 ## Category 1 — Open questions with sufficient answers nearby
+**Status scope this scan:** `open, partially_resolved` (or the actual set you ranged over, if you fell back to a narrower query — state it plainly, never let a null result imply full-domain coverage it didn't have; #1860).
 - [qu_XXXX] (verified) <one-line question summary> — RESOLVES via <evidence chain> — suggest parent composes resolving derivation via `engram_derive`, then wires via `engram_resolve(target_id=qu_XXXX, resolving_node_id=dv_YYYY)`.
 ... or "None this scan."
 
@@ -280,10 +299,11 @@ Use this format:
 ... or "None this scan."
 
 ## Category 5 — Tainted-but-still-valid derivations
-- [dv_XXXX] (verified taint, inferred validity) tainted by <retraction>; substantive claim may survive under <corrected premise> — suggested action: re-derive cleanly or supersede with fresh statement.
+- [dv_XXXX] (verified taint, inferred validity) tainted by <retraction>; substantive claim may survive under <corrected premise> — suggested action: the parent adjudicates via `engram_cascade_resolve` once `engram_cascade_frontier` shows this node eligible (`superseded` with a fresh derivation if the corrected premise changes the claim, `acknowledged` if the claim survives untouched) — see `engram-resolve-cascade` for the full decision tree. You are flagging the candidate, not resolving it — the parent's frontier sweep is the acting-on surface.
 ... or "None this scan."
 
 ## Category 6 — Recent-resolution echoes
+**Status scope this scan:** `open, partially_resolved` (or the actual set you ranged over — state it plainly; #1860).
 - [qu_XXXX similar to recently-resolved qu_YYYY] (pattern-match) — same resolution pattern may apply.
 ... or "None this scan."
 
@@ -293,6 +313,11 @@ Use this format:
 
 ## Category 8 — Open tasks with stale external references
 - [tk_XXXX] (verified) status=<active|planned|blocked> — claim references #N (<MERGED|CLOSED> as of <date>) — suggested action: close task and mark done — external reference #N <state>.
+... or "None this scan."
+
+## Category 11 — Cornerstones/lessons with support_lost
+- [cs_XXXX or ls_XXXX] (pattern-match) claim: <one-line> — candidate exemplars: <ob_or_dv_id>, <ob_or_dv_id> (<one-line why each fits>) — suggested action: dream-master rewires via `engram_register_exemplar` per the `engram-support-lost` skill.
+- [cs_XXXX or ls_XXXX] (inferred) claim: <one-line> — no live exemplars found — lost-basis assessment: <still holds in principle, currently unanchored | no longer applies, retract candidate> — suggested action: dream-master adjudicates per the `engram-support-lost` skill.
 ... or "None this scan."
 
 ## Heuristic categories (if requested)

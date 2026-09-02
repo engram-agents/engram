@@ -24,6 +24,10 @@
       "tier": "essential"
     },
     {
+      "path": "template_component_render.py",
+      "tier": "dev"
+    },
+    {
       "path": "launch-engram-server.sh",
       "tier": "essential"
     },
@@ -77,6 +81,14 @@
     },
     {
       "path": "engram_stats.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_conformance.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_dag_conformance.py",
       "tier": "essential"
     },
     {
@@ -194,6 +206,12 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/rc-upgrade-verify.py",
+      "tier": "convenience",
+      "source": "tools/rc-upgrade-verify.py",
+      "note": "cascade-marker migration verification for the rc1->rc2 upgrade cycle (#2411). Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/rc-upgrade-verify.py) would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above)."
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
@@ -266,6 +284,12 @@
       "path": "tools/forum-updates-monitor.sh",
       "tier": "convenience",
       "multi_agent": true
+    },
+    {
+      "path": "tools/_proc_identity.py",
+      "tier": "convenience",
+      "multi_agent": true,
+      "reason": "shared process-identity verification (#2321), extracted from forum-mention-monitor.sh/forum-updates-monitor.sh -- ships alongside both, same tier"
     },
     {
       "path": "tools/codex-umwelt-wake.py",
@@ -528,11 +552,19 @@
       "tier": "essential"
     },
     {
-      "path": "skills/claude/engram-retract",
+      "path": "skills/claude/engram-observe",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-revise",
       "tier": "essential"
     },
     {
       "path": "skills/claude/engram-resolve-cascade",
+      "tier": "essential"
+    },
+    {
+      "path": "skills/claude/engram-support-lost",
       "tier": "essential"
     },
     {
@@ -663,6 +695,14 @@
       "tier": "essential"
     },
     {
+      "path": "templates/components",
+      "tier": "dev"
+    },
+    {
+      "path": "templates/manifests",
+      "tier": "dev"
+    },
+    {
       "path": "templates/template.AGENTS.md",
       "tier": "essential"
     },
@@ -699,6 +739,48 @@
       "path": "templates/agents.json.example",
       "tier": "convenience",
       "multi_agent": true
+    },
+    {
+      "path": "src/build/instruction_manifestation/__init__.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/__init__.py",
+      "note": "instruction-manifestation engine PR2 (#2140): package init. Lives directly under src/build/ (not source_root=src/engram), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above). Developer (T3): a build-time schema/lint/generator system for authoring instruction templates, not something that runs at agent session time -- removing it doesn't break epistemic identity or continuity."
+    },
+    {
+      "path": "src/build/instruction_manifestation/schema.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/schema.py",
+      "note": "instruction-manifestation engine PR2 (#2140): component-file + harness-contract schema parsing and validator. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/builder.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/builder.py",
+      "note": "instruction-manifestation engine PR2 (#2140): flat-composition render/build logic. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/lints.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/lints.py",
+      "note": "instruction-manifestation engine PR2 (#2140): the three PR2-scope build-time lints (base-never-names-a-tool, unresolved-variable, extension_required coverage). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "note": "instruction-manifestation engine PR2 (#2140): generator for the GENERATED tool-policy pilot component, sourced from deploy/tool_policy_facts.py. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+    },
+    {
+      "path": "src/build/instruction_manifestation/components",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/components",
+      "note": "instruction-manifestation engine PR2 (#2140): the two new-schema pilot components (identity-self-reference-example, tool-policy + its claude extension) in a fresh location, entirely separate from and additive to #2145's untouched src/engram/templates/components/ (different schema, different directory). Directory-level entry, same granularity precedent as the templates/components entry above. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3): build-time authoring content, not shipped/consumed at session time."
+    },
+    {
+      "path": "src/build/instruction_manifestation/harnesses",
+      "tier": "dev",
+      "source": "src/build/instruction_manifestation/harnesses",
+      "note": "instruction-manifestation engine PR2 (#2140): harness-contract directory (claude.yaml pilot only -- codex/dsh contracts are PR3's job). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
     }
   ],
   "excluded": [
@@ -795,6 +877,14 @@
       "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's stray-master-ref-check step (#1884, warn-only whole-tree scan); runs in GitHub Actions, not shipped in any install tier"
     },
     {
+      "path": "tools/stray_baton_path_check.py",
+      "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's stray-baton-path-check step (#2316, warn-only whole-tree scan); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
+      "path": "tools/test_id_set_check.py",
+      "reason": "repo-CI infrastructure consumed only by .github/workflows/pr-checks.yml's test-id-set-check step (#2350, blocking base-vs-head test-id set diff); runs in GitHub Actions, not shipped in any install tier"
+    },
+    {
       "path": "src/forum/",
       "reason": "separately-deployed forum community service — second deploy target, see src/forum/deploy/; ships via its own build path, not through build-plugin.sh (issue #868)"
     },
@@ -827,6 +917,10 @@
       "reason": "one-shot cleanup: re-roots cs/ls supported_by edges stranded before PR #1281 landed (issue #1587); not a recurring shipped mechanism"
     },
     {
+      "path": "src/engram/tools/migrate_prediction_pairing_edges.py",
+      "reason": "one-shot backfill: writes a parallel predicted_by edge for each existing prediction/observation_predictive pairing that carries only supported_by, after the #2252 W6 edge split (issue #2252). Additive — never deletes the supported_by edge; dry-run by default, --apply to write; re-apply is a clean no-op. Same shape as tools/migrate_stranded_supported_by.py's excluded[] entry: idempotent, safe to re-run, but not a recurring shipped mechanism."
+    },
+    {
       "path": "src/engram/tools/migrate_person_nodes.py",
       "reason": "one-shot dry-run guide: extracts typed fields from legacy free-form person node prose; produces a human-review report, never auto-applies; not a recurring shipped mechanism"
     },
@@ -843,6 +937,14 @@
     {
       "path": "tests/",
       "reason": "dev test suite — never shipped in any install tier; CI-only"
+    },
+    {
+      "path": "tests/cascade_playbox.py",
+      "reason": "cascade test harness (#2356) — dev tier (T3) by design-time decision per project CLAUDE.md's Install-tiers discipline: it is a test-suite support module, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\")."
+    },
+    {
+      "path": "tests/test_cascade_playbox.py",
+      "reason": "pytest suite for the cascade playbox harness (#2356) — same dev-tier (T3) rationale and blanket-coverage note as tests/cascade_playbox.py above."
     },
     {
       "path": ".github/",

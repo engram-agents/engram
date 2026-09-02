@@ -22,6 +22,19 @@
 #     forum-unreachable; skip the cycle and preserve $SEEN. Otherwise the next
 #     recovery would flood every historical mention as "new" (#743 / 2026-06-03
 #     forum cutover incident).
+#   - "failed poll" is BROADER than curl (#2225). curl --fail only rejects HTTP
+#     >= 400, so a maintenance page / truncated body reaches ids() intact; and a
+#     body can parse cleanly and still never REPORT a mentions list (`{}`, an
+#     error envelope, a JSON array, `"mentions"` set to a non-list). Both look
+#     identical to "zero mentions" and would overwrite $SEEN empty. ids() signals
+#     both by EXIT STATUS and the callers skip the cycle.
+#     `{"mentions":[]}` is the ONE that is genuinely empty — it parses AND it
+#     reports, it just reports nothing — so it still rewrites $SEEN as it always
+#     has. That is the whole boundary: reported-zero rewrites, failed-to-report
+#     preserves. Note `{}` sits on the PRESERVE side, matching as_of()'s reading
+#     of the same body in the sibling script; a healthy forum cannot send it on a
+#     200 anyway (src/forum/server.py returns {"mentions": ...} on 200 and 400 on
+#     both error paths, which curl --fail already rejects).
 #   - engaged-suppression (#1077 part 2): while last-user-activity is within
 #     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
 #     mentions accumulate as unseen and are emitted after the window expires.
@@ -155,42 +168,36 @@ URL="$BASE/api/agent/$SELF/mentions?kind=at_mention"   # #1040: at_mention only 
 # claim than "verified not a match" and must not be silently folded into it —
 # say so loudly so the agent knows this candidate needs a manual look.
 #
+# Portability (#2134): /proc does not exist on macOS, so the whole
+# verification pass above used to raise ENOENT on the FIRST open() and land
+# in the "process gone" branch — dead and SILENT, byte-identical to "checked,
+# found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process` fix
+# (umwelt #205): when /proc is absent, fall back to the portable
+# `ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+# reported as such: `ps -o args=` returns a space-JOINED string, not true
+# NUL-separated argv, so a wrapper whose script path sits inside a single
+# quoted argument (e.g. `bash -c "... forum-mention-monitor.sh ..."`) can
+# manufacture a false token boundary and over-match — measured on Linux
+# (issue #2134 comments) against a `bash -c` wrapper. Kept anyway because a
+# weaker-but-labeled detector beats no detection at all on the one platform
+# that has no /proc to fall back on. rc 3 (below) marks this weaker verdict
+# distinctly from rc 0's /proc-verified one so the two warning classes don't
+# get conflated into a single alarm-fatigue channel.
+#
 # Set $FORUM_MENTION_NO_REAP to any non-empty value to disable (now disables
 # the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
 _check_forum_mention_dup() {
-    # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
-    # argv). Exit codes:
-    #   0 = confirmed duplicate — stdout is the cmdline (argv joined on
-    #       spaces, truncated to ~100 chars — the boot charge alone runs
-    #       ~2.5KB and must not flood the Monitor event stream).
-    #   1 = not a duplicate, including "process gone mid-read" (a race, not
-    #       an error) — silent, nothing on stdout.
-    #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
-    #       denied) — stdout is a short reason string; caller must warn, not
-    #       silently skip.
-    python3 -c '
-import errno, os, sys
-pid, script = sys.argv[1], sys.argv[2]
-try:
-    with open("/proc/" + pid + "/cmdline", "rb") as f:
-        raw = f.read()
-except OSError as e:
-    if e.errno in (errno.ENOENT, errno.ESRCH):
-        sys.exit(1)  # process gone mid-read: not a match, not an error
-    print(str(e) or type(e).__name__)
-    sys.exit(2)  # could not verify — do not silently treat as "not a match"
-argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-if not argv:
-    sys.exit(1)
-interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
-if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
-    sys.exit(1)
-if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
-    sys.exit(1)
-cmd = " ".join(argv)
-print(cmd[:100])
-' "$1" "$2" 2>/dev/null
+    # $1=pid $2=script-basename. Delegates to the shared _proc_identity.py
+    # (#2321 -- extracted from a 1629-byte block that used to be
+    # byte-identical, hand-synced, in this file and
+    # forum-updates-monitor.sh). See that module's own docstring for the
+    # full exit-code table and the /proc-vs-ps-fallback reasoning; this
+    # wrapper's only job is finding the sibling script and forwarding argv.
+    local _self _proc_identity
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    _proc_identity="$(dirname "$_self")/_proc_identity.py"
+    python3 "$_proc_identity" "$1" "$2" 2>/dev/null
 }
 
 if [ -z "${FORUM_MENTION_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
@@ -227,6 +234,9 @@ if [ -z "${FORUM_MENTION_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
         if [ "$_rc" -eq 0 ]; then
             echo "⚠️  forum-mention-monitor.sh: possible duplicate instance — pid $_pid cmdline: ${_out}"
             echo "⚠️  forum-mention-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
+        elif [ "$_rc" -eq 3 ]; then
+            echo "⚠️  forum-mention-monitor.sh: possible duplicate instance (WEAK match — no /proc on this platform, verified via \`ps\` string-split only; may false-positive on wrapper processes, #2134) — pid $_pid cmdline: ${_out}"
+            echo "⚠️  forum-mention-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
         elif [ "$_rc" -eq 2 ]; then
             echo "⚠️  forum-mention-monitor.sh: could not verify candidate pid $_pid (${_out}) — NOT auto-flagged as a duplicate; check it by hand if you suspect a stale instance."
         fi
@@ -247,20 +257,66 @@ fi
 SEEN="${FORUM_MENTION_SEEN_FILE:-$HOME/.engram/.forum-mention-seen.$(printf '%s' "$URL" | cksum | cut -d' ' -f1)}"
 
 # helper: extract "post_id\tthread_title" lines from JSON stdin
+#
+# EXIT STATUS answers "did this body REPORT a mentions list?" (#2225) — the
+# same shape as as_of()'s "did I obtain a usable watermark", and deliberately
+# NOT the weaker "did the body parse".
+#   - exit 0: `mentions` is present and is a list. An EMPTY list is a real
+#     answer — the forum is telling us there are none right now — so it still
+#     rewrites $SEEN, which is what keeps the seen-set a true snapshot.
+#   - exit non-zero: the body did not parse, OR it parsed without reporting
+#     (`{}`, `{"error":...}`, a top-level array, `"mentions"` set to a string
+#     or null). A body with no `mentions` key has not reported zero mentions;
+#     it has FAILED TO REPORT, and writing an empty seen-set from it hands the
+#     next good poll every historical mention as new.
+# The distinction between those two is exactly the distinction as_of() draws
+# between a served `as_of: 0` and a missing one. `{}` must not mean "authoritative
+# zero" here while meaning "we never learned" there — one changeset cannot read
+# the same body two opposite ways.
+# Everything AFTER that check keeps its old blanket-except,
+# degrade-to-fewer-lines behaviour and exits 0.
 ids() {
     python3 -c 'import json,sys
 try:
-    for m in json.load(sys.stdin).get("mentions",[]): print(str(m.get("post_id"))+"\t"+m.get("thread_title","?"))
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or not isinstance(d.get("mentions"), list):
+    sys.exit(1)
+try:
+    for m in d["mentions"]: print(str(m.get("post_id"))+"\t"+m.get("thread_title","?"))
 except Exception: pass'
 }
 
+# Poll cadence override — tests only (mirrors $FORUM_MENTION_SEEN_FILE's
+# test-only role above); default of 30 is unchanged for real arms. Defined
+# ABOVE the seed (not with COALESCE_SECONDS below) because the seed-retry sleep
+# uses it too.
+POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
+
 # ---------------------------------------------------------------------------
-# seed — retry until first SUCCESSFUL poll
+# seed — retry until the first poll that both SUCCEEDS and PARSES
 # Handles: arm-while-forum-down (waits), arm-while-up (seeds now), and
 # genuine-zero-mentions (empty baseline on a *successful* poll).
+#
+# The parse half is the seed-side twin of the poll-path guard below (#2225): a
+# 200 whose body does not parse passes curl --fail, yields no id lines, and
+# would seed an EMPTY baseline — so the first good poll then reports every
+# historical mention as new, the same clobber-replay the poll path guards
+# against, just arriving at arm time. An empty seen-set from a body we could
+# not read is not "genuine zero mentions"; wait for a body we can read.
 # ---------------------------------------------------------------------------
-until RESP="$(curl -s --fail "$URL" 2>/dev/null)"; do sleep 30; done
-printf '%s' "$RESP" | ids | sort > "$SEEN"
+while true; do
+    # Stage through $SEEN.now and mv, exactly as the poll loop does, so a
+    # retrying seed never truncates a prior run's baseline on its way past.
+    if RESP="$(curl -s --fail "$URL" 2>/dev/null)" \
+       && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+        mv "$SEEN.now" "$SEEN"
+        break
+    fi
+    rm -f "$SEEN.now"
+    sleep "$POLL_SECONDS"
+done
 
 # ---------------------------------------------------------------------------
 # cross-cycle coalesce window (#1616 / UCS rc2 F10)
@@ -280,9 +336,7 @@ printf '%s' "$RESP" | ids | sort > "$SEEN"
 # loses nothing.
 # ---------------------------------------------------------------------------
 COALESCE_SECONDS="${FORUM_MENTION_COALESCE_SECONDS:-120}"
-# Poll cadence override — tests only (mirrors $FORUM_MENTION_SEEN_FILE's
-# test-only role above); default of 30 is unchanged for real arms.
-POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
+# ($POLL_SECONDS is defined above the seed, which needs it for its retry sleep.)
 BUF="$SEEN.buf"
 : > "$BUF"          # fresh arm — no pending burst carried over from a prior run
 _WINDOW_OPEN_TS=""  # empty = no window currently open
@@ -340,7 +394,18 @@ while true; do
     # PRESERVE $SEEN (the fix for the seed-clobber flood, #743) AND the
     # coalesce buffer/window (nothing below this line runs).
     RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
-    printf '%s' "$RESP" | ids | sort > "$SEEN.now"
+    # A 200 whose body does not parse is NOT "zero mentions" (#2225). Left
+    # alone it produces an empty $SEEN.now, and the unconditional mv below
+    # overwrites $SEEN empty — after which the next GOOD poll marks every
+    # historical mention new. ids() exits non-zero there; run it under a
+    # pipefail SUBSHELL so that status survives the `| sort` (a plain
+    # pipeline reports sort's status, which is always 0), then skip the cycle
+    # exactly as a failed curl does. Remove $SEEN.now so no half-written
+    # scratch file is left for a later cycle to pick up.
+    if ! ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
+        rm -f "$SEEN.now"
+        continue
+    fi
     _new_pids="$(comm -13 "$SEEN" "$SEEN.now" | cut -f1)"
     mv "$SEEN.now" "$SEEN"
     if [ -n "$_new_pids" ]; then

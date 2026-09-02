@@ -50,9 +50,14 @@ engram-stop-hook.py. Pure refactor: this hook's own string-branch dispatch
 (the isinstance(last_msg_content, str) case) is left untouched inline
 rather than routed through the shared walker, to avoid a subtle divergence
 on an empty-string content edge case (see the inline comment at that
-branch). If _stophooklib somehow fails to import, this hook degrades to a
-silent no-op (matches the established _prompthooklib precedent on the
-UserPromptSubmit side).
+branch). If _stophooklib somehow fails to import, only the JSONL-fallback
+path degrades: `_last_assistant_structure` (gated by
+`if not _STOPHOOKLIB_OK: return None`) returns None instead of scanning
+the transcript. The primary stdin-based scan in main() -- the normal path,
+per this module's own "stdin is primary" doctrine above -- reads
+`last_assistant_message` straight from the stdin payload and does not call
+`_last_assistant_structure` at all, so it keeps working unaffected. A
+failed import degrades the fallback, not the hook.
 """
 
 import json

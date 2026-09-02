@@ -20,6 +20,15 @@ from datetime import datetime, timezone
 import engram_core as core
 
 
+# #2252 W6 colleague review, round 5: computed once here rather than inline
+# in both _remove_edge_impl and _add_edge_impl's blocked-relation error
+# messages (was duplicated verbatim in both, the exact "same-concept logic
+# scattered across two call sites" shape that let earlier rounds' mislabels
+# survive). Derived from EDGE_CLASSIFICATIONS' `provenance` flag via
+# core.PROVENANCE_RELATIONS -- never hand-listed.
+_PROVENANCE_LIST_STR = ", ".join(sorted(core.PROVENANCE_RELATIONS))
+
+
 # ---------------------------------------------------------------------------
 # L-family impl functions
 # ---------------------------------------------------------------------------
@@ -96,6 +105,7 @@ def _add_cornerstone_impl(
             "triggering_experience": triggering_experience,
         })
 
+        core._refuse_ncb_confidence("cornerstone", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
                VALUES (?, 'cornerstone', ?, ?, 'active', ?)""",
@@ -123,15 +133,53 @@ def _add_cornerstone_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Cornerstones are importance-anchored at a fixed value (2.0) rather
+        # than derived from confidence/surprise — identity structures are as
+        # durable as goals and axioms. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence=0.5 and then overwriting it
+        # [alpha#2250].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if linked:
             core._utility_reward(conn, linked, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "cornerstone_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         result = {
             "status": "created",
             "cornerstone_id": node_id,
@@ -225,6 +273,7 @@ def _outgrow_cornerstone_impl(
             "outgrew": old_cornerstone_id,
         })
 
+        core._refuse_ncb_confidence("cornerstone", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
                supersedes, is_current)
@@ -306,18 +355,59 @@ def _outgrow_cornerstone_impl(
             (new_id, old_cornerstone_id),
         )
 
-        core._stamp_new_node(conn, new_id, confidence=0.5, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, new_id),
-        )
+        # Cornerstones are importance-anchored at a fixed value (2.0) rather
+        # than derived from confidence/surprise — identity structures are as
+        # durable as goals and axioms. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence=0.5 and then overwriting it
+        # [alpha#2250].
+        core._stamp_new_node(conn, new_id, importance_base=2.0)
 
         core._log_edit(conn, "superseded", old_cornerstone_id, "cornerstone",
                   {"replaced_by": new_id, "via": "engram_outgrow_cornerstone",
                    "rolled_prior_frame": new_prior_frame[:200]})
 
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability. Note: this site's SUCCESS status
+        # is "outgrown", not "created" (unlike the other 13 guarded sites),
+        # but its failure statuses match the shared convention.
+        _verdict, _durability = core.verify_write_durability(conn, new_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "old_cornerstone_id": old_cornerstone_id,
+                "new_cornerstone_id": new_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "outgrown",
             "old_cornerstone_id": old_cornerstone_id,
@@ -478,14 +568,29 @@ def _remove_edge_impl(
         return json.dumps({"error": "relation is required and cannot be empty."})
 
     if relation not in core._REMOVABLE_EDGE_RELATIONS:
+        # #2255 round-2/4 review fixes + #2252 W6 rounds 3-5 (colleague
+        # review, round 5): this bucket has now been mislabeled TWICE --
+        # first "cascade-bearing" (false for supported_by/predicted_by,
+        # both provenance:True but cascade:False), then "provenance/
+        # dependency-bearing" naming only 3 of the 4 provenance:True
+        # relations while `cites` sat in its own bucket one line down with
+        # an IDENTICAL EDGE_CLASSIFICATIONS profile -- no field distinguishes
+        # them, so the split was unencoded semantics, not a real boundary.
+        # FIX: derive the list from PROVENANCE_RELATIONS (EDGE_CLASSIFICATIONS'
+        # `provenance` flag) at call time, built into the message below --
+        # never hand-list membership again. structural mutations
+        # (supersedes, retracts) and structural commitments (contradicts,
+        # resolves) are provenance:False and correctly stay their own
+        # buckets.
+        _provenance_list = _PROVENANCE_LIST_STR
         return json.dumps({
             "error": (
                 f"Relation '{relation}' is not removable via engram_remove_edge. "
                 f"Allowed: {sorted(core._REMOVABLE_EDGE_RELATIONS)}. "
-                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
-                f"retracts), structural commitments (contradicts, resolves), "
-                f"and provenance (cites) are blocked. Use engram-surgical if "
-                f"removal is truly required."
+                f"Provenance-bearing edges ({_provenance_list}), "
+                f"structural mutations (supersedes, retracts), and "
+                f"structural commitments (contradicts, resolves) are "
+                f"blocked. Use engram-surgical if removal is truly required."
             )
         })
 
@@ -584,14 +689,30 @@ def _add_edge_impl(
         return json.dumps({"error": "relation is required and cannot be empty."})
 
     if relation not in core._ADDABLE_AFTER_CREATION_RELATIONS:
+        # #2255 round-2/4 review fixes + #2252 W6 rounds 3-5 (colleague
+        # review, round 5): this bucket has now been mislabeled TWICE --
+        # first "cascade-bearing" (false for supported_by/predicted_by,
+        # both provenance:True but cascade:False), then "provenance/
+        # dependency-bearing" naming only 3 of the 4 provenance:True
+        # relations while `cites` sat in its own bucket one line down with
+        # an IDENTICAL EDGE_CLASSIFICATIONS profile -- no field distinguishes
+        # them, so the split was unencoded semantics, not a real boundary.
+        # FIX: derive the list from PROVENANCE_RELATIONS (EDGE_CLASSIFICATIONS'
+        # `provenance` flag) at call time, built into the message below --
+        # never hand-list membership again. structural mutations
+        # (supersedes, retracts) and structural commitments (contradicts,
+        # resolves) are provenance:False and correctly stay their own
+        # buckets.
+        _provenance_list = _PROVENANCE_LIST_STR
         return json.dumps({
             "error": (
                 f"Relation '{relation}' is not addable via engram_add_edge. "
                 f"Allowed: {sorted(core._ADDABLE_AFTER_CREATION_RELATIONS)}. "
-                f"Cascade-bearing edges (derives_from, supported_by, supersedes, "
-                f"retracts), structural commitments (contradicts, resolves), "
-                f"and provenance (cites) are blocked from after-creation addition. "
-                f"Edges that participate in cascade semantics or carry structural "
+                f"Provenance-bearing edges ({_provenance_list}), "
+                f"structural mutations (supersedes, retracts), and "
+                f"structural commitments (contradicts, resolves) are "
+                f"blocked from after-creation addition. Edges that "
+                f"participate in cascade semantics or carry structural "
                 f"epistemic stance must be created at node-add time via the "
                 f"source node's payload, or via the dedicated mutation tool."
             )
@@ -651,7 +772,7 @@ def _add_edge_impl(
                         f"for incident→lesson membership use `exemplifies`."
                     )
                 })
-            if source["type"] not in core.CLAIM_BEARING_TYPES:
+            if not core._is_claim_bearing(source["type"]):
                 return json.dumps({
                     "error": (
                         f"'instantiates' sources must be claim-bearing "
@@ -660,15 +781,26 @@ def _add_edge_impl(
                     )
                 })
 
-        # DAG guard: among addable-after-creation relations, only `subtask_of` has
-        # dag_check=True today. `serves` and `tensions` were exempted in #1076
-        # (three-tier edge taxonomy — those edges are cross-temporal by design).
-        # This guard also covers any future addable relations that gain dag_check=True.
+        # Temporal-causal guard (#2357 renamed dag_check -> temporal_causal;
+        # semantics unchanged): among addable-after-creation relations, only
+        # `subtask_of` has temporal_causal=True today. `serves` and `tensions`
+        # were exempted in #1076 (three-tier edge taxonomy — those edges are
+        # cross-temporal by design). This guard also covers any future
+        # addable relations that gain temporal_causal=True.
         # Convention (from startup check at _ensure_data_dir and engram_inspect):
         # a violation is source.created_at < target.created_at — i.e. the source
         # is OLDER than the target. Valid edges have source newer-or-equal.
+        #
+        # TODO(#2349): a `dag: True` relation also needs a real reachability
+        # check here (would this edge close a cycle?), independent of the
+        # temporal check above. No addable-after-creation relation carries
+        # dag=True and temporal_causal=False today (acknowledged_derives_from,
+        # the one relation where they diverge, is never addable via this
+        # generic tool — see its EDGE_CLASSIFICATIONS entry), so there is no
+        # live gap yet. Wire in once #2349's reachability walker merges to
+        # dev; do not duplicate it here in the meantime (#2357 design thread).
         classification = core.EDGE_CLASSIFICATIONS.get(relation, {})
-        if classification.get("dag_check", False):
+        if classification.get("temporal_causal", False):
             if source["created_at"] < target["created_at"]:
                 return json.dumps({
                     "error": (

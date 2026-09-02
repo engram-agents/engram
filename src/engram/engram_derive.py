@@ -107,6 +107,8 @@ def _derive_impl(
     use_stale: bool = False,
     use_contested: bool = False,
     warrant: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_derive MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -150,11 +152,16 @@ def _derive_impl(
             Kept for backward compatibility: "chain" or "corroboration".
         context_ids: Optional comma-separated node IDs for context references (e.g. definitions).
             Creates 'cites' edges (not 'derives_from') — these don't affect confidence computation.
-        use_stale: Opt-in override for MECH-5 stale-premise guard. Set to True ONLY when
-            you've judged that the upstream supersede does not affect the logic of your
-            derivation — the new derivation will carry a metadata.built_on_stale audit
-            marker so future maintenance tools can auto-redirect edges to replacements.
-            Has no effect on tainted premises (taint is always a hard block — no override).
+        use_stale: RETIRED (#2324) — accepted for compatibility, but it has NO EFFECT.
+            A stale premise is now a hard block, and passing this flag returns a loud
+            `use_stale_retired` notice on both the refusal and the success payload
+            rather than silently doing nothing. The cascade machine replaced the
+            force-through with resolution: for a premise that carries a cascade
+            marker, read its frontier (mode C) and adjudicate with
+            engram_cascade_resolve — a plain supersede/retract is refused while
+            markers are pending — or cite the successor of a premise that is itself
+            superseded. It no longer writes metadata.built_on_stale — that stamp is
+            read-only history now. Removed from this signature in #2013 slice 2.
         use_contested: Opt-in override for MECH-5 contradicted-premise guard (#1654).
             Set to True ONLY when you're deliberately building on a premise that sits
             on an open, unresolved contradiction (a live ct_ node with no resolves
@@ -167,13 +174,20 @@ def _derive_impl(
             inference (why do these premises support this claim?). Stored in derive_meta
             for audit. Leave blank if the bridging principle is fully captured in
             logical_chain.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new derivation node ID, computed confidence, reasoning type, and supporting nodes.
         If premises are compromised, returns a structured block response:
           - BLOCKED_TAINTED: any premise was retracted; no override path.
           - BLOCKED_CONTRADICTED: premise(s) sit on an open contradiction and use_contested=False.
-          - BLOCKED_STALE: premise(s) have superseded upstream and use_stale=False.
+          - BLOCKED_STALE: premise(s) carry an unresolved cascade marker, or have
+            themselves been superseded. Hard block since #2324 — no override; each
+            entry carries a per-case `route`.
     """
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python; without this check, a use_stale: "false"
@@ -200,6 +214,12 @@ def _derive_impl(
     if warrant and not isinstance(warrant, str):
         return json.dumps({"error": f"warrant must be a string, got {type(warrant).__name__}"})
 
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
+
     if reasoning_type and reasoning_type not in REASONING_TYPES:
         return json.dumps({
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
@@ -223,7 +243,7 @@ def _derive_impl(
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
                 missing.append(sid)
-            elif row["type"] not in core.CLAIM_BEARING_TYPES:
+            elif not core._is_claim_bearing(row["type"]):
                 wrong_type.append(f"{sid} (type: {row['type']})")
         if missing:
             return json.dumps({"error": f"Supporting node(s) not found: {', '.join(missing)}"})
@@ -253,6 +273,10 @@ def _derive_impl(
             use_stale=use_stale,
             use_contested=use_contested,
             extra_meta={"warrant": warrant} if warrant else None,
+            recall_summary=_recall_summary,
+            recall_keywords=_recall_keywords,
+            needs_tightening=_needs_tightening,
+            summary_missing=_summary_missing,
         )
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
@@ -274,6 +298,42 @@ def _derive_impl(
 
         conn.commit()
 
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, success["node_id"])
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "derivation_id": success["node_id"],
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         result = {
             "status": "created",
             "derivation_id": success["node_id"],
@@ -289,8 +349,13 @@ def _derive_impl(
             result["utility_bumped_count"] = success["bumped_count"]
         if success["structure_warnings"]:
             result["structure_warnings"] = success["structure_warnings"]
-        if use_stale and success["stale_ids"]:
-            result["built_on_stale"] = success["stale_ids"]
+        # Success path with use_stale=True: the premises were clean, so the
+        # flag changed nothing — but say so LOUDLY rather than accepting a
+        # retired parameter in silence. A caller still passing it holds a
+        # false belief about what protects their derivation, and the only
+        # moment we can correct that is the call where they passed it.
+        if use_stale:
+            result["use_stale_retired"] = core.USE_STALE_RETIRED_NOTICE
         if use_contested and success["contested_ids"]:
             result["built_on_contested"] = success["contested_ids"]
         if independence_advisory:
@@ -358,13 +423,13 @@ def _contradict_impl(
             return json.dumps({"error": f"Node '{node_id_a}' not found."})
         if not node_b:
             return json.dumps({"error": f"Node '{node_id_b}' not found."})
-        if node_a["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(node_a["type"]):
             return json.dumps({
                 "error": f"Protocol violation: contradictions can only link claim-bearing nodes "
                          f"(observations, derivations, theories, axioms, conjectures). Node '{node_id_a}' is type '{node_a['type']}'. "
                          f"Extract observations from evidence sources first, then flag contradictions between those observations.",
             })
-        if node_b["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(node_b["type"]):
             return json.dumps({
                 "error": f"Protocol violation: contradictions can only link claim-bearing nodes "
                          f"(observations, derivations, theories, axioms, conjectures). Node '{node_id_b}' is type '{node_b['type']}'. "
@@ -401,6 +466,7 @@ def _contradict_impl(
         node_id = core._next_id(conn, "contradiction")
         now = core._now()
 
+        core._refuse_ncb_confidence("contradiction", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status)
                VALUES (?, 'contradiction', ?, ?, 'active')""",
@@ -420,6 +486,42 @@ def _contradict_impl(
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         core._utility_reward(conn, [node_id_a, node_id_b], action="contradict")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "contradiction_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
         # target_id captures both conflicting nodes; the new contradiction node
@@ -506,6 +608,7 @@ def _ask_impl(
         node_id = core._next_id(conn, "question")
         now = core._now()
 
+        core._refuse_ncb_confidence("question", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, status,
                        question_category, question_lacks, last_assessed_turn, last_assessed_at)
@@ -532,6 +635,42 @@ def _ask_impl(
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "question_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         result = {
             "status": "created",

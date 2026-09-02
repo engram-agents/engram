@@ -2,9 +2,14 @@
 """baton — Multi-Agent Turn-State CLI
 
 A thin CLI wrapping the baton file protocol at
-/home/agents-shared/projects/. Provides explicit turn declarations for
+/home/agents-shared/forum/projects/. Provides explicit turn declarations for
 shared projects (PRs, designs, etc.) so agents always know whose move it
 is next.
+
+Note: the old path /home/agents-shared/projects/ (pre-2026-06-27) may still
+exist on some hosts and greps clean against it — that misdirection produced
+a real wrong census (issue #2290). Always point at the forum/projects/ path
+above.
 
 Thirteen subcommands:
   init        Create a new project baton file
@@ -348,10 +353,19 @@ _CI_PENDING_STATUSES = frozenset({
 def _dedupe_checks_by_latest(checks: list) -> list:
     """Keep only the latest run per check name.
 
-    GitHub's statusCheckRollup contains ALL runs for a PR, including
-    superseded ones from earlier commits.  When a check is re-run after a
-    new push, both the old FAILURE and the new SUCCESS appear in the list.
-    Iterating naively finds the stale FAILURE and false-blocks the gate.
+    statusCheckRollup is scoped to the PR's head commit, but it carries
+    EVERY run on that commit, not just the latest.  Two runs of one check
+    can land on the same SHA: the workflow fires on `edited` as well as
+    `synchronize`, so a trigger that changes no code can start a second run
+    on a SHA already checked.  What the earlier run leaves behind turns on
+    whether it was still in flight — if it was, `cancel-in-progress` on the
+    per-PR concurrency group kills it and it concludes CANCELLED; if it had
+    already finished, nothing is cancelled and its own conclusion (a FAILURE,
+    say) simply stays.  Either way a stale entry sits beside the current
+    SUCCESS, and iterating naively finds it and false-blocks the gate.  Runs
+    on superseded SHAs never enter the rollup at all, so there is no
+    cross-SHA case (measured 2026-08-30; this docstring claimed one until
+    then).
 
     ISO-8601 completedAt strings compare correctly as plain strings
     (lexicographic == chronological).  A null/missing completedAt (check
@@ -440,8 +454,8 @@ def _pr_ci_state(pr_number: str, repo: str) -> tuple:
         # No checks registered — treat as green
         return ("green", "no checks registered")
 
-    # Dedupe: keep only the latest run per check name so stale superseded
-    # runs (e.g. FAILURE from a pre-push commit) don't false-block (#1366).
+    # Dedupe: keep only the latest run per check name so a superseded same-SHA
+    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block (#1366).
     checks = _dedupe_checks_by_latest(checks)
 
     for check in checks:
@@ -2109,7 +2123,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Protocol docs: docs/baton-protocol.md\n"
-            "Projects dir:  /home/agents-shared/projects/ (manual deploy)\n"
+            "Projects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n"
         ),
     )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")

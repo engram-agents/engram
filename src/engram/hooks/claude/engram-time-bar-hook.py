@@ -94,6 +94,7 @@ _NON_HUMAN_PREFIXES = (
     "<command-message",
     "<command-name",
     "<local-command",
+    "Stop hook feedback",
     _LOOP_WAKE_MARKER,
 )
 
@@ -203,12 +204,12 @@ def _is_human_prompt(payload: dict) -> bool:
          - absent = loop self-wake (ScheduleWakeup) carrying a <command-*> body
       2. Fallback when promptSource absent: check whether the prompt body starts
          with any known non-human prefix (<task-notification>, <command-message>,
-         <command-name>, <local-command>). If yes → not human.
+         <command-name>, <local-command>, "Stop hook feedback"). If yes → not human.
 
     The prompt body is HTML-unescaped before the prefix check, so a marker
     mangled into its escaped form (e.g. &lt;loop-wake&gt; instead of real
     angle brackets) still classifies as non-human rather than falling through
-    to a false "human" stamp (gh#1646).
+    to a false "human" stamp (gh#1649).
 
     Fail-safe: on any parsing problem, returns False (no stamp) rather than
     risking a false "human" classification.

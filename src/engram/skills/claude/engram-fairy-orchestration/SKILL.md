@@ -23,10 +23,16 @@ Fairies are contractors, not colleagues. The spec is the contract. A fairy has n
     ```
     Exit 0 (CLEAR) → safe to proceed. Exit 1 (DUPLICATE RISK) → review the listed hits before dispatching. Exit 3 (UNKNOWN) → gh unavailable; fall back to manual check. The script handles both checks — open PRs via `gh` and in-flight baton files — and uses an exact-token match so `#100` does not falsely hit when you search for `#1006`.
   - Skipping this is the failure mode that produced PR-517 (issue #486) on 2026-05-30 — a duplicate of the counterpart's PR-502, which had already converged. Same lines, guaranteed merge conflict. The pre-check would have caught it in 5 seconds.
-  - Single-agent mode: the script notes "baton check skipped" when `/home/agents-shared/projects/` is absent; the PR check still runs.
+  - Single-agent mode: the script notes "baton check skipped" when `/home/agents-shared/forum/projects/` is absent; the PR check still runs.
 - **Self-contained prompt.** Include repo path, branch baseline, template commit/PR to read, scope, validation step. Inline (don't link to) any node IDs or context-laden references the fairy needs.
 - **Hard scope bounds.** Explicit "DO NOT modify X" for adjacent surfaces. Anti-patterns enumerated. Stop conditions named.
+- **A class fixed one member at a time is invisible from inside any single round.** Each round can return APPROVE, each fix be correct, and each find *the next member*. The tell is cross-round, so only whoever holds all the rounds sees it — the orchestrator's job by construction, unreachable by fairy quality.
+- **So brief at the CLASS, not the instance you were handed.** Scope the spec to the class the finding belongs to, plus the sweep that enumerates it (`grep -rn <token>`, repo-wide — not scoped to the files the finding named). Same dispatch, different question.
+  - *Measured, engram-alpha #2342, 2026-08-29.* Round 5 fixed the stale-flag reference it was pointed at; **rounds 6 and 7 were the same class**, one `grep -rn dag_check` finding four instances — one of them **live MCP response text an agent reads at runtime**, not a docstring. Drafting round 7's brief I caught myself scoping the sweep to the three files the finding had named, and wrote "repo-wide" into the brief in those words: the instance-level error one level up, self-caught rather than caught by a round.
+  - *Relayed, not first-hand:* a counterpart agent reports independently measuring the same shape days earlier and names the detection tell above, which is hers. I cannot check her measurement; the first-hand half here is #2342. **Each half is weak alone** — the tell without a remedy sat unused; the remedy without the tell has no reason attached.
 - **Escape valve.** Always include some form of: *"if you hit anything that doesn't match the template, STOP and report back."* Silent improvisation is the failure mode.
+- **The spec's numbers bind the fairy only where the spec's scope equals the tool's scope.** "Trust my count over your own output" is a legitimate instruction — it stops a fairy improvising around a decision you made deliberately — and it is *catastrophic* when your count was taken over a narrower surface than the fairy is measuring. A correct implementation then reports a different number, is told its collector is wrong, and gets debugged into a wrong one: **the instruction disarms the escape valve for exactly the case the escape valve exists to catch**, because a fairy that obeys it cannot report the mismatch that would prove the spec wrong. Nor does a later round recover it — reviewer rounds audit whether the CODE matches the spec, not whether the spec's own reference numbers match the world. So: state the **scope the number was taken over in the same sentence as the number**, and say explicitly that a mismatch is a STOP-and-report, never a defer-to-spec.
+- **When the spec says "behave like tool X," RUN tool X and diff against your prose BEFORE dispatching.** A spec describing a target behaviour in words is a *hypothesis* about that tool; running it is the test, and it is usually one command. Same incident: the spec encoded pytest's naming *convention* (`def test_*`, `class Test*`) as though it were pytest's collection *rule*, which also collects `unittest.TestCase` subclasses — so a collector built faithfully to spec was blind to 29 real tests. No amount of review **of the spec** would have surfaced it, because the spec was internally consistent; only `pytest --collect-only` disagreed. Review catches specs that contradict themselves, not specs that confidently describe the wrong world.
 - **Always run in background** (`run_in_background: true`). Never wait synchronously. Completion notifications arrive automatically and re-invoke you.
 - **Typed Codex fairies get no conversation fork.** When dispatching with an
   explicit fairy `agent_type`, set `fork_turns: "none"`. Codex full-history
@@ -70,6 +76,32 @@ The failure mode this prevents: holding specs because their *implementation* wou
 When PR-B consumes PR-A's API, branch PR-B off PR-A's tip (not `dev`). Rebase after PR-A merges; GitHub auto-retargets stacked PRs when the base merges. Don't gate throughput on the user's merge cadence.
 
 **The deeper insight**: this is how git is meant to be used. The branch graph mirrors the dependency map. Clean dependency thinking produces clean branch graph naturally; mess in the branch graph is evidence of unclear dependency thinking.
+
+### A stack that renames and un-renames has no single correct prose
+
+In a stack where PR *n* defers/renames something and PR *n+1* un-defers/renames it
+back, **the same docstring, comment or response-field name is true in opposite
+directions on the two layers.** There is no text that is correct on both, so
+"fix the docstring" is not a fix that can be made once — and nothing tests prose,
+so it survives fairy rounds, colleague passes and CI on both PRs.
+
+Consequences for orchestration:
+
+- **A fix on one layer becomes a defect on the other.** Measured on the #2013
+  cascade stack, 2026-08-29: correcting a response-field name on the lower PR
+  made the upper PR's copy wrong, in the opposite direction, and the upper PR
+  had never touched that line — so the defect was invisible until the layer
+  below was fixed.
+- **Re-stack conflicts in this shape are not mechanical.** Resolving them
+  "toward the base" or "toward the branch" is wrong by construction: in two of
+  three conflicts on that re-stack, neither side alone was right and the correct
+  result was a merge. A blanket resolution rule is what produces a silently
+  false surface here.
+- **So brief the re-stack round at the merges, not at the diff.** Name each
+  hand-merge and ask whether the resulting text is true *of that tip's code* —
+  read the response dict / the constant / the `def`, not the diff. A merged
+  docstring is where a false claim hides best, because it reads as if someone
+  already reconciled it.
 
 ### Spec quality is the lever
 

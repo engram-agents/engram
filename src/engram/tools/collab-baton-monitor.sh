@@ -11,7 +11,7 @@
 #   Self-reap is scoped to same-purpose instances only.
 # --once (optional): run one poll iteration and exit (testing / one-shot use).
 # DIR (optional): baton directory to watch.
-#   Resolution order: first positional arg > $BATON_DIR > /home/agents-shared/projects
+#   Resolution order: first positional arg > $BATON_DIR > /home/agents-shared/forum/projects
 #
 # Discipline notes (load-bearing — do not remove):
 #   - to-me filter: emit only when the LATEST turn-log entry is "FROM → SELF: reason"
@@ -56,7 +56,7 @@ Usage: collab-baton-monitor.sh [--purpose <key>] [--once] [DIR]
   --once           Run one poll iteration and exit (no sleep, no seeding).
                    Intended for testing and one-shot checks.
   DIR              Path to the baton directory to watch.
-                   Default: $BATON_DIR, then /home/agents-shared/projects
+                   Default: $BATON_DIR, then /home/agents-shared/forum/projects
 
 Resolves SELF from ~/.engram/config.json agent_name. Exits with error if
 agent_name is not set (to prevent filter-inversion mis-arm).
@@ -223,7 +223,10 @@ fi
 # ---------------------------------------------------------------------------
 # resolve watch directory
 # ---------------------------------------------------------------------------
-BATON_DIR="${_dir_arg:-${BATON_DIR:-/home/agents-shared/projects}}"
+# #2316: the pre-2026-06-27 path (no /forum/ segment) is STALE but still
+# populated (frozen at the cutover, never removed) -- the live path is the
+# correct default now. See pre-dispatch-check.sh's identical fix/comment.
+BATON_DIR="${_dir_arg:-${BATON_DIR:-/home/agents-shared/forum/projects}}"
 
 # ---------------------------------------------------------------------------
 # seen-set — keyed to the watched BATON_DIR so concurrent instances (e.g. a

@@ -97,8 +97,24 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
                             "error": "node is not current (superseded)",
                         })
                         continue
+                    # Clear needs_tightening/summary_missing on successful apply
+                    # (#1952 PR3): both flags exist to queue a node into the
+                    # batch-summary fairy's reviewer-of-outliers cohort
+                    # (engram-sleep SKILL.md Step 5). Before PR3 the cohort
+                    # query never consulted needs_tightening, so a stuck flag
+                    # was inert; now that it does, an un-cleared flag would
+                    # re-select an already-fixed node forever, defeating the
+                    # "near-zero most nights" design goal. Treat a
+                    # successfully-applied summary as fully reviewed
+                    # regardless of its exact length (this tool's own
+                    # 200-char hard cap already bounds it) — the 140-char
+                    # write-time target/280 hard-reject gate is a distinct,
+                    # deliberately-not-unified regime (see engram_core.py's
+                    # RECALL_SUMMARY_TARGET comment) that this path does not
+                    # re-derive.
                     conn.execute(
-                        "UPDATE nodes SET recall_summary = ?, recall_keywords = ? WHERE id = ?",
+                        "UPDATE nodes SET recall_summary = ?, recall_keywords = ?, "
+                        "needs_tightening = 0, summary_missing = 0 WHERE id = ?",
                         (recall_summary, json.dumps(recall_keywords), node_id),
                     )
                     ok.append({"node_id": node_id})

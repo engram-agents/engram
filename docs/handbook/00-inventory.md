@@ -222,7 +222,7 @@
 | `skills/claude/engram-nap/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-research-report/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-resolve-cascade/SKILL.md` | shipped | essential | _?_ | _unswept_ |
-| `skills/claude/engram-retract/SKILL.md` | shipped | essential | _?_ | _unswept_ |
+| `skills/claude/engram-revise/SKILL.md` | shipped | essential | _?_ | _unswept_ |
 | `skills/claude/engram-school-day/SKILL.md` | shipped | convenience | _?_ | _unswept_ |
 | `skills/claude/engram-self-improve/SKILL.md` | shipped | dev | _?_ | _unswept_ |
 | `skills/claude/engram-sleep/SKILL.md` | shipped | essential | _?_ | _unswept_ |
@@ -384,7 +384,6 @@
 | `tests/test_skill_server_sync.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_source_class.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_special_type_bypass.py` | dev-only | — | _?_ | _unswept_ |
-| `tests/test_stale_replacement_dict.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_starred_block.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_stop_hook_idle_suppression.py` | dev-only | — | _?_ | _unswept_ |
 | `tests/test_strip_agent_facing_fields.py` | dev-only | — | _?_ | _unswept_ |

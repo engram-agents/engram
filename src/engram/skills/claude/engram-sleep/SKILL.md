@@ -7,21 +7,24 @@ description: Use at the natural end-of-day moment when wrapping work. Single end
 
 ## ⚠️ Invocation gate — confirm before loading this skill
 
-**Sleep is user-initiated or cron-initiated. It is never agent clock-judgment.**
+**Sleep is user-initiated, commander-relayed, or cron-initiated. It is never agent clock-judgment.**
 
-Confirm ONE of the following is true before proceeding:
+Confirm ONE of the following is true before proceeding — each is sufficient on its own:
 
 (a) **User end-of-day phrase** — the user just said something like "good night", "call it a day", "wrap up the day", "done for today", "ending for tonight", or similar explicit day-close signal.  
-(b) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
+(b) **Commander-relayed sleep order** (Lei's ruling, 2026-08-30) — the acting commander broadcast or sent a wind-down/sleep order that **states the user's authority** (e.g. "Lei orders this broadcast: … run engram-sleep as your last action") — via a Square broadcast, an Office crossing, or an `ia` letter. Cite that crossing/letter as your instruction and run engram-sleep to completion. **Do NOT wait for the human's direct per-seat word after a relayed order — that waiting is the measured failure mode (2026-08-25: every seat reported and then held awake all night), not the safe default.** A relay that does not state the user's authority is the commander's suggestion, not an order — ask or hold.  
+(c) **Auto-sleep cron** — the configured `sleep_hour`/`sleep_minute` cron fired; you see an explicit sleep nudge from the end-of-day-detector hook in your current context.
 
-**If neither holds — STOP. Do not proceed.** Identify your actual state and route correctly:
+**Per-seat gates a HUMAN owner set survive the relay.** If your human owner configured a standing sleep gate (e.g. "auto-sleep off; my word only"), a commander-relayed order reaches you only where that owner delegated the authority (as Lin delegated Aleph's sleep kick-off to the acting commander); it never overrides a different human's standing gate. When a relayed order and your owner's gate conflict, the gate wins — say so and hold.
+
+**If none holds — STOP. Do not proceed.** Identify your actual state and route correctly:
 
 | You are... | Correct action |
 |---|---|
 | Drowsy (context-fill warning in banner) | `engram_nap` — per-burst compaction-boundary work, never sleep |
 | Blocked-idle / nothing in queue | Hold for the user or pick from your work queue; never invoke sleep to fill the void |
 | Reading the clock / estimating the hour | Clock-reading is never a valid trigger — loop, hold, or ask the user |
-| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end |
+| Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end (directly or via a commander-relayed order) |
 
 **Why the gate:** sleep advances the turn counter (irreversible within a day), erases "From this session" from warm-briefing, and runs the full dream-consolidation cycle. These are correct at genuine day-end; they are destructive if invoked prematurely. The cost of a false invocation far outweighs the cost of pausing to confirm.
 
@@ -56,6 +59,7 @@ The parent's role is purely orchestration.
 **When to sleep:**
 
 - The user signals end-of-day ("good night", "call it a day", "wrap up the day", "ending for tonight", "done for today", etc.)
+- The acting commander relayed the user's wind-down/sleep order (gate condition (b) above) — as valid as the user's direct word; do not hold awake waiting for a per-seat confirmation
 - A substantive working day produced material worth consolidating
 - An end-of-day-detector hook surfaced the engram-sleep nudge and the user agreed
 - The user initiates wind-down with a substantive cohort to consolidate
@@ -105,7 +109,7 @@ Before any step, check the parent session's context size. **The only decision co
 
 Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
 
-### Auto-sleep / cron-initiated (invocation gate path b — user NOT present)
+### Auto-sleep / cron-initiated (invocation gate path c — user NOT present)
 
 - **`[Drowsiness: refreshed]`** — below 50% of ceiling → proceed to Phase A.
 - **Any other level** (`energetic`, `a little drowsy`, `needs a nap: N%`) — at or above 50% → **HARD ABORT**:
@@ -118,7 +122,9 @@ Locate the `[Drowsiness: …]` banner injected by the context-tracker hook.
 
 - **No banner** (hook not configured or hook output not visible) → proceed to Phase A (can't detect, can't guard).
 
-### User-initiated (invocation gate path a — user present)
+### User-initiated or commander-relayed (invocation gate paths a/b)
+
+*(Path b — relayed order, user not present: where a branch below asks the user to confirm, there is no one to ask. Take the conservative branch yourself — at urgent drowsiness, nap + compact first, then sleep — rather than holding awake for a confirmation that cannot come.)*
 
 - **`[Drowsiness: refreshed]`** — below 50% → proceed to Phase A.
 - **`[Drowsiness: needs a nap: N%]`** (urgent, typically ≥85%) → surface a strong recommendation and wait for explicit confirmation before proceeding:
@@ -322,7 +328,14 @@ visible, not silent:
 Silence is never health on the identity substrate — a backup that fails quietly is
 only discovered when you reach for it and find it three days stale.
 
-**Skip if today's archive already exists** (the tool handles this automatically).
+**Skip is content-aware, not filename-aware** (the tool handles this automatically,
+#2151/#2235): it compares a live content watermark — row count + newest
+timestamp for `nodes`, `edges`, AND `edit_history` — against the last successful
+backup's sidecar, and additionally checks that the sidecar's named archive is
+still on disk. Only a genuine match on all counts skips; a same-day archive
+alone (no matching watermark, or a watermark match whose archive went missing)
+is never trusted as "already covers this state" and a fresh archive is written
+instead.
 
 **Backup layers**: `db-backup/` lives *inside* `~/.engram/` — git-independent
 (survives `.git` corruption, works without git) but **not off-disk** (a full
@@ -407,7 +420,7 @@ fi
 > **Phase B is MANDATORY whenever you reach it** (see the all-or-nothing invariant in
 > "When NOT to sleep"). The rule is: **skip the whole sleep, or none of it — never skip *part* of it.** The dream-fairy dispatch (Step 6) is the load-bearing part — the fairies are the ONLY pass that scans the fresh cohort while it is still the current turn.
 >
-> **As of #1901 (2026-08-04), the 9 dream-fairy scan categories are no longer
+> **As of #1901 (2026-08-04), the dream-fairy scan categories are no longer
 > all dispatched every night.** A weight-aging lottery (`tools/dream_lottery.py`)
 > draws a small subset each cycle — see Step 6 below for the mechanism. **The
 > all-or-nothing invariant still holds, just at a different grain: once the
@@ -428,12 +441,20 @@ fi
 >    5–7.5 below). Its work scales with the day's new-node cohort and is
 >    essential whenever nodes were created; it was never the mostly-zero-
 >    findings cost the lottery targets, and this feature does not touch it.
-> 2. **Lottery-rotated** — the 9 dream-fairy scan categories. Exactly one is
+> 2. **Lottery-rotated** — the scan categories (the Step 6b table below;
+>    `dream_lottery.py`'s `CATEGORIES` dict is the count's SSoT). Exactly one is
 >    drawn per sleep by default (`--count` can raise this later per the
 >    design note "maybe two later").
 > 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
 >    markers meet a threshold, cascade-sensitive categories are force-included
 >    regardless of the draw. Lottery = frequency; interrupt = urgency.
+>    **Currently unarmed pending #2013:** #2137 emptied the default
+>    force-include set (`DEFAULT_INTERRUPT_TYPES = frozenset()`), so on the
+>    default config there is nothing for the interrupt to force-include and
+>    it structurally cannot fire — the mechanism above describes what
+>    `--interrupt-types` re-arms, not the current default behavior. It
+>    re-arms when the #2013 cascade machine gives dreams a principled
+>    marker-resolution path.
 >
 > **Window semantics under rotation (the audit precondition #1901 asked for,
 > before wiring the lottery in):** a category that doesn't run every night
@@ -472,24 +493,56 @@ fi
 
 ### Step 5 — Compute the recall-summary cohort and run cohort_dispatch prepare
 
-Build the cohort from today's new nodes (since last sleep) + backfill from legacy NULL-summary candidates, capped at 50 total.
+**As of #1952 PR3, the batch-summary fairy is reviewer of outliers, not
+author of record.** Write-time `recall_summary`/`recall_keywords` (#1952 PR1)
+means most new nodes already carry a fine summary by the time sleep runs —
+the fairy's cohort is now the union of two outlier classes, capped at 50
+total, and should be near-zero most nights:
+
+1. **`needs_tightening`-flagged** — a write-time summary was soft-accepted
+   over the 140-char target (under the 280-char hard-reject gate), OR a
+   status-changing mutation (`engram_resolve`, #1777) flagged an existing
+   summary as potentially stale. These need an existing summary *tightened
+   or corrected*, not authored from scratch.
+2. **Legacy / summary-absent stragglers** — `recall_summary IS NULL`,
+   whether the node predates the #1952 PR1 write-time contract entirely, or
+   a post-PR1 write omitted the summary (flagged `summary_missing`). These
+   need a *first* summary authored, same as before PR1.
+
+A cohort that's non-trivial night after night is itself a signal (fairies or
+agents inflating past the presented 140 target, or an unusually
+resolve-heavy day) — not something to silently keep absorbing.
 
 ```bash
 # Previous sleep's cohort_end_at (your install's marker path may vary):
 PREV_SLEEP=$(python3 -c "import json; print(json.load(open('$HOME/.engram/sessions/last-sleep-success.json'))['cohort_end_at'])" 2>/dev/null || echo "")
 ```
 
-Use `engram_history(mode="edits", action="created", since=PREV_SLEEP)` to enumerate today's-cohort node IDs. Filter to nodes where `recall_summary IS NULL` (existing summaries aren't redone) and `type != 'evidence'` and `is_current = 1` (skip superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute).
+Use `engram_list` in structured-filter mode to enumerate today's-cohort node IDs directly: `created_at >= PREV_SLEEP` AND `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) (the `is_current` guard skips superseded tails — their chain-head carries the recall_summary, and summarizing a superseded node wastes fairy compute). Example `filters_json`:
 
-If today's-cohort count < 50, top up from legacy NULLs:
+```json
+{
+  "logic": "AND",
+  "conditions": [
+    {"field": "created_at", "op": "gte", "value": "<PREV_SLEEP>"},
+    {"field": "is_current", "op": "eq", "value": 1},
+    {"field": "type", "op": "ne", "value": "evidence"},
+    {"logic": "OR", "conditions": [
+      {"field": "needs_tightening", "op": "eq", "value": 1},
+      {"field": "recall_summary", "op": "is_null"}
+    ]}
+  ]
+}
+```
 
-- Use `engram_list` with a status filter for active (`is_current = 1`), sort by `created_at` ascending (oldest first), limit to fill to 50
-- Exclude `type='evidence'` from the topup (same rationale as the today's-new filter)
-- This is the attrition pattern: every cycle drains the oldest NULL-summary nodes
+If today's-cohort count < 50, top up from the backlog:
+
+- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter — DROP the `created_at` lower bound — sort by `created_at` ascending (oldest first), limit to fill to 50
+- This is the attrition pattern: every cycle drains the oldest outlier nodes, `needs_tightening` and legacy-NULL alike
 
 > Evidence nodes (`ev_*`) are URL + verbatim-quote citations, not claim-bearing — they don't render via `engram_surface` and don't benefit from a recall_summary. Excluding them from the cohort prevents wasted summary-fairy compute and lets the real backfill drain faster. The exclusion is applied client-side on the returned set — `ev_*` IDs are prefix-typed, so `type != 'evidence'` works even if a tool's return doesn't surface a `type` field.
 
-Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy NULL pool over many cycles.
+Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy-NULL pool over many cycles; the `needs_tightening` pool should stay small night-to-night by design (a growing one is worth investigating, not just draining).
 
 **If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
@@ -576,10 +629,11 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 | 8 | Open tasks with stale external references | stale-task-refs |
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
 | 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
+| 11 | Cornerstones/lessons with support_lost | support-lost |
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (10, 11).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (12, 13).
 > [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
@@ -765,17 +819,31 @@ Agent(
     - ... (one entry per category in tonight's types_to_run) ...
     [Or "Category N (<NAME>) TIMED OUT — proceeding without" for any fairy that didn't return]
 
-    COHORT METADATA:
-    - Today's new nodes since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
-    - Backfill from legacy NULL-summary: <L> IDs
+    COHORT METADATA (reviewer-of-outliers cohort, #1952 PR3 — needs_tightening
+    ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
+    - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
+    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
     - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
 
-    Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items. Execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Call engram_reflect first for your initial agenda. Read every dream-fairy report from disk (tonight's drawn set, listed above — NOT a fixed count; check the list, not a hardcoded number). Call bucket_findings() from tools/dream_master_batch.py to partition all findings into action-type buckets (single operation — snapshots are pre-packed in each finding, no re-inspection needed). Merge bucketed agenda with engram_reflect items.
 
-    FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
+    THEN, BEFORE THE BUCKET WALK: run the mode-B CASCADE SWEEP — engram_cascade_frontier({}) ->
+    engram_cascade_resolve per frontier entry -> re-read the frontier, looping until it is clear.
+    Your spec's cascade-sweep section is the driver loop; follow it there, it carries the parts a
+    prompt cannot. Three things that decide whether the sweep is real: iterate `frontier` (uncapped),
+    NOT `packets` (capped at `limit`, default 5); the frontier can legitimately GROW mid-loop when a
+    resolution marks contradictions, so never stop on 'it did not shrink'; and stop LOUD on
+    invariant_1_violation_suspected, a confidence convergence_warning, any verb error, or the
+    per-night pass cap — recording that state rather than reporting a clean sweep. The sweep runs
+    FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
+    (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
+
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+
+    FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
 )
 ```
@@ -821,7 +889,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
 - **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
-- **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one of 9 categories per dispatch, the lottery-drawn subset each night (was all 9 nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
+- **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one category per dispatch (roster SSoT: `dream_lottery.py`'s `CATEGORIES` dict), the lottery-drawn subset each night (was all-categories-nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 
 ## macOS auto-sleep timing

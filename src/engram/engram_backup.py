@@ -62,12 +62,24 @@ _DERIVED_TABLE_NAMES = ("vec_nodes",)
 # engram_core.py): it is the leaner, stdlib-only module several call sites
 # (engram-regenerate-embeddings.py, the server's own restore path) already
 # import without pulling in engram_core's full dependency chain.
+#
+# #1952 PR2 (engram-alpha#1817 / #1875): reported_state dropped, recall_summary
+# + recall_keywords added. reported_state is now redundant with the untruncated
+# claim (#1875 removes claim's 80-char cap for feeling_report nodes) plus
+# recall_summary — indexing it separately just duplicates content in the FTS
+# table. The column itself is NOT dropped from `nodes` (deliberately
+# conservative scoping, see #1952 PR2's PR description) — only removed from
+# the FTS column set. recall_summary/recall_keywords participate in FTS so a
+# curated summary/keyword set actually affects retrieval (#1817 — before this
+# they were write-only/display-only fields with zero effect on search hits).
+# See PRAGMA user_version rung 4 in engram_core.py for the paired migration.
 NODES_FTS_COLUMNS: tuple = (
     "claim",
     "quoted_text",
     "interpretation",
-    "reported_state",
     "trigger_text",
+    "recall_summary",
+    "recall_keywords",
 )
 
 
@@ -243,7 +255,27 @@ def rebuild_fts_index(db_path: str) -> bool:
     deliberate index-side deletion of retracted rows.  FTS5's 'integrity-check'
     therefore always reports "malformed" on a graph with retractions — this is
     expected by design (#781).
+
+    Guard (#2186): SQLite treats an empty string ``db_path`` as "open a
+    private temporary scratch database" rather than an error — it does not
+    raise. Callers that derive ``db_path`` from
+    ``conn.execute("PRAGMA database_list").fetchone()[2]`` get an empty
+    string for an in-memory connection (``:memory:``, or a temp DB never
+    attached to a file), so an unguarded ``rebuild_fts_index("")`` would
+    silently rebuild an unrelated scratch database while the real
+    connection stays under-indexed. Reject a falsy ``db_path`` up front,
+    loudly, so this is a named refusal rather than a silent no-op against
+    the wrong database.
     """
+    if not db_path:
+        raise ValueError(
+            "rebuild_fts_index: db_path is empty — refusing to open an "
+            "implicit SQLite scratch database. This usually means the "
+            "caller derived the path from PRAGMA database_list on an "
+            "in-memory connection (empty string for :memory: / an "
+            "unattached temp DB). Pass a real file path, or skip the "
+            "rebuild entirely for in-memory connections."
+        )
     conn = sqlite3.connect(db_path)
     try:
         # Bail early if this isn't an ENGRAM-shaped DB.

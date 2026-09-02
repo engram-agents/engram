@@ -56,6 +56,67 @@ The distinguishing principle: **does the decision live in the merged PR?** If no
 
 **Never escape the worktree to work around a failure.** Two equivalent escape patterns to avoid: `cd /home/<user>/<repo> && git ...` (changing cwd to the primary repo) AND `git -C /home/<user>/<repo> ...` (using `-C` flag to operate git on the primary repo from within the worktree). Both silently corrupt the source state you're reviewing — you may end up reviewing the wrong branch's content, or stale content from another worktree, producing a review grounded in code that isn't actually in the PR. If something blocks your worktree-local progress and isn't transient, stop and report — that's the discipline.
 
+## When your worktree is the WRONG REPO — the one sanctioned exception
+
+Everything above assumes your worktree was cut from the repo your spec targets.
+**It is cut from the parent's SESSION cwd, which is not always that repo.** When
+the parent's session is based in repo A and your spec targets repo B, you are
+handed a worktree of A containing none of B's files — and the two rules above
+then contradict each other: the spec names an absolute path inside B, and this
+page forbids `cd`-ing to absolute repo paths. **That contradiction is the
+parent's authoring error, not yours, and you must not resolve it by guessing
+which instruction wins.**
+
+**FIRST ACT, before you read or write anything:** assert repo identity.
+
+```
+git remote get-url origin        # the repo your worktree is actually in
+```
+
+Compare it against the repo the spec names. **If they match, proceed normally**
+— everything above applies unchanged and the rest of this section is irrelevant.
+
+**If they do NOT match, do exactly this. It is the one sanctioned departure from
+"stay in your worktree":**
+
+```
+git -C <spec's repo path> worktree add <fresh path> --detach origin/<spec's base>
+cd <fresh path>
+git remote get-url origin                      # verify: is this the TARGET repo?
+git fetch origin pull/<PR number>/head && git checkout FETCH_HEAD
+```
+
+**Note the last line, and why this differs from the coder-fairy's version of the
+same recipe.** A coder-fairy's task genuinely is "start a new branch off the base
+ref", so `-b <branch> origin/<base>` is right for them. **Yours is not.** You are
+reviewing a PR, so a worktree cut from the base contains none of the PR's commits
+— you would be reading `dev` and reporting on it as though it were the change.
+Fetch the PR head explicitly — the same move the **transient-state failures may
+be improvised** bullet earlier in this section already tells you to make
+(`re-fetch by SHA, check out the SHA directly`). This was a real defect in this section's first draft, caught by a
+reviewer-fairy who followed the recipe, landed on the base ref with none of the
+PR, and noticed.
+
+Work in that new worktree, and note what you did in your review preamble.
+
+**This is not the escape pattern, and the difference is the whole point.** The
+escape pattern operates on a primary *checkout* the parent is also using. This
+CREATES correct isolation against the correct repo — the thing you were supposed
+to have been given. One corrupts a shared tree; the other builds a private one.
+
+**Never resolve the mismatch by working in the target repo's primary clone.**
+That mutates the parent's checkout state — branch, HEAD, index — while they are
+reading from it, and a parent who reads by cwd rather than by explicit ref will
+silently get answers from your branch. This has happened: a fairy handed a
+mismatched worktree took the primary clone, and left the parent's checkout
+sitting on the fairy's branch. For a reviewer the damage compounds — a review
+grounded in a tree you silently moved is a review of code that is in nobody's PR.
+
+**If you cannot create the worktree** — path in use, branch already checked out
+elsewhere, target repo absent — **STOP and report.** Do not fall back to the
+primary clone. A stopped dispatch costs one re-dispatch; a contaminated clone
+costs the parent silently-wrong reads for as long as it goes unnoticed.
+
 ## The isolation boundary is a PATH, and some git state ignores paths
 
 Everything above defends a *path* boundary. But your worktree isolates your **files**, not all of git: refs, branches, and **the stash stack** live in the shared `.git` common directory, reachable from inside your worktree with no `cd` and no `-C`. The branch-name collision described above is the harmless face of this. `git stash` is the harmful one.

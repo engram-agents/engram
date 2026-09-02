@@ -343,6 +343,61 @@ def _is_contract_test(basename: str, allowlist: set[str]) -> bool:
     return fnmatch.fnmatch(basename, "test_*_payload.py") or basename in allowlist
 
 
+def _shipped_path_candidates(changed_file: str) -> tuple[str, ...]:
+    """Return changed_file plus its de-prefixed logical/shipped-path form.
+
+    test-map.json's ``path_prefix_or_glob`` entries are written in the
+    manifest's logical (shipped) path convention -- bare ``hooks/claude/...``,
+    ``skills/claude/...``, ``agents/...``, ``packaging/...``, ``templates/...``,
+    ``tools/...`` -- the same convention tiers.json uses and the one
+    TestMappingCompleteness's coverage check compares against directly.
+    ``hooks/``, ``skills/``, ``agents/``, ``packaging/`` and ``templates/``
+    have NO repo-root existence at all (confirmed: none of these directories
+    exist at repo root); the real file for MOST of these lives one level
+    deeper under ``src/engram/<same-path>`` -- but not all: ``packaging/`` in
+    particular splits across TWO source trees by filename
+    (``packaging/release-gates.json`` -> ``src/engram/packaging/...``,
+    ``packaging/tiers.json`` -> ``src/build/packaging/...`` -- caught in
+    review, #2439). ``tools/`` is its own mixed case: most entries ARE
+    repo-root symlinks (``tools/baton.py -> ../src/engram/tools/baton.py``,
+    ``tools/build-plugin.sh -> ../src/build/build-plugin.sh``), and the
+    symlink's own unchanged presence in git means an edit to the real content
+    is reported at the symlink's TARGET path, not the bare shim path itself
+    -- ``src/engram/tools/...`` for most, ``src/build/...`` (mapping back to
+    ``tools/...``) for the handful of build-tooling entries (``build-plugin.sh``,
+    ``engine/*``).
+
+    Rather than hardcode which specific sub-path lives under which source
+    tree (a mapping that can grow a new split at any time, as ``packaging/``
+    already did once), every ``src/engram/`` OR ``src/build/`` prefixed path
+    gets BOTH a stripped-to-bare candidate and (for ``src/build/`` only,
+    since ``src/engram/`` never remaps into ``tools/``) a ``tools/``-prepended
+    candidate. Whichever candidate matches an actual manifest entry wins; an
+    unrelated real entry accidentally colliding with a wrong candidate is not
+    a concern in practice, since manifest entries are 1:1 with specific
+    filenames.
+
+    Without this normalization, every mapping entry under one of the five
+    shim-less prefixes (no import-graph fallback either, for anything that
+    isn't a directly-imported .py module -- hooks are invoked as subprocesses,
+    never imported; skills/agents/templates are data, not code) and every
+    non-import-graph-reachable symlinked tools/* entry (esp. *.sh scripts,
+    which layer 1's Python-AST walk cannot see at all) can never match a real
+    changed-file path -- silently falling back to the FULL MAIN SUITE on every
+    touch (#2439). Matching against both the literal path and its de-prefixed
+    form closes this for the whole class in one place, rather than rewriting
+    every affected manifest entry (which would itself break
+    TestMappingCompleteness's bare-path coverage comparison).
+    """
+    candidates = [changed_file]
+    for prefix in ("src/engram/", "src/build/"):
+        if changed_file.startswith(prefix):
+            candidates.append(changed_file[len(prefix) :])
+    if changed_file.startswith("src/build/"):
+        candidates.append("tools/" + changed_file[len("src/build/") :])
+    return tuple(candidates)
+
+
 def _resolve_convention_map(
     changed_file: str,
     test_map: dict,
@@ -355,15 +410,19 @@ def _resolve_convention_map(
     """
     mappings = test_map.get("mappings", [])
     selected: set[str] = set()
+    candidates = _shipped_path_candidates(changed_file)
 
     for entry in mappings:
         pattern = entry.get("path_prefix_or_glob", "")
         test_globs = entry.get("test_globs", [])
         full_fallback = entry.get("full_suite_fallback", False)
 
-        # Match: prefix match OR fnmatch glob
-        matched = changed_file.startswith(pattern) or fnmatch.fnmatch(
-            changed_file, pattern
+        # Match: prefix match OR fnmatch glob, against the literal changed
+        # path or its de-prefixed shipped-path form (see
+        # _shipped_path_candidates).
+        matched = any(
+            c.startswith(pattern) or fnmatch.fnmatch(c, pattern)
+            for c in candidates
         )
         if not matched:
             continue

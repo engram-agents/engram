@@ -2531,14 +2531,61 @@ def main() -> None:
             "energy is refreshed. Any drowsiness figure carried in the summary is "
             "stale-on-arrival; disregard it. You have a full window to work."
         )
+
+    # ── Focus list surface (cheap: single local DB read) ───────────────────
+    # Render the live focus list verbatim at EVERY session start (startup,
+    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
+    # fresh new session, knowing what's focused is a good thing"), not just
+    # post-compaction. This is the deterministic focus channel's actual
+    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
+    # additionalContext at all (confirmed against CC docs, forum #241); moving
+    # it here is the fix. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _focus = focus_block(ENGRAM_HOME)
+        if _focus:
+            lines.append(_focus)
+    except Exception:
+        pass
+
+    # ── Saved focus-sets listing (cheap: single local DB read) ─────────────
+    # #1975 layer 1 — noetic "these exist" signal every session, directly
+    # after the live focus block. Pure read; same never-fail discipline as
+    # focus_block(). Empty table / DB-missing / any exception → nothing.
+    try:
+        _saved_sets = saved_focus_sets_block(ENGRAM_HOME)
+        if _saved_sets:
+            lines.append(_saved_sets)
+    except Exception:
+        pass
+
+    # ── Starred letters surface (cheap: local read) ────────────────────────
+    # Inject starred-letter pointers at both fresh-session (startup) and
+    # post-compaction (compact/resume) so load-bearing cross-session agreements
+    # survive the experiential reset. Pointer-not-injection: one line each,
+    # NOT full content. Silent skip on any failure — hook must not block
+    # session start.
+    try:
+        _starred = starred_block(ENGRAM_HOME)
+        if _starred:
+            lines.append(_starred)
+    except Exception:
+        pass
+
+    if source != "startup":
         # History-arc injection (#2026 WS2) — pure filesystem read, does NOT
         # depend on `marker` (unlike the WS1 checkpoint block below), so it
-        # is called unconditionally here. Rendered adjacent to WS1's
-        # checkpoint block by design (no shared header — see
-        # history_arc_block()'s docstring); both stay in the cheap tier,
-        # before the #1819 ordering-invariant divider, since recovering
-        # session context is the point of this epic and must not be at the
-        # mercy of blocks that are conveniences layered on top of it.
+        # is called unconditionally within this branch. Gated on
+        # `source != "startup"` explicitly (pulled out of the source
+        # if/else's `else:` arm by #2150, so it can be positioned after the
+        # focus/saved-sets/starred blocks — the SIZE-axis fix — while
+        # keeping the exact same non-startup-only rendering condition it
+        # always had). Rendered adjacent to WS1's checkpoint block by design
+        # (no shared header — see history_arc_block()'s docstring); both
+        # stay in the cheap tier, before the #1819 ordering-invariant
+        # divider, since recovering session context is the point of this
+        # epic and must not be at the mercy of blocks that are conveniences
+        # layered on top of it.
         try:
             _history_text = history_arc_block(ENGRAM_HOME)
         except Exception:
@@ -2585,15 +2632,45 @@ def main() -> None:
         if not _injected_through_before or source == "compact":
             _persist_injected_through(ENGRAM_HOME, marker["session_id"], _checkpoint_advance_now)
 
-    # ══ ORDERING INVARIANT (#1819) ═════════════════════════════════════════
+    # ══ ORDERING INVARIANT (#1819, extended #2150) ══════════════════════════
     # This hook runs under a 5s harness timeout. If it overruns, the process is
     # KILLED and the ENTIRE additionalContext is lost — there is no partial
     # delivery and no error surfaced to the agent. Emission order is therefore a
     # PRIORITY decision, not a cosmetic one.
     #
-    # Rule: cheap, purely-local, load-bearing blocks are appended FIRST; blocks
-    # that are expensive or depend on runtime state come LAST. A timeout then
-    # costs only the optional tail instead of everything.
+    # Emission order now serves TWO failure modes, not one. Both are covered
+    # below; neither is a special case of the other, and — because focus,
+    # saved-sets, and starred all sit on the cheap side of BOTH axes — there is
+    # no trade between them to make:
+    #
+    #   1. TIMEOUT KILL (#1819, original) — cheap before expensive. A timeout
+    #      costs only the optional tail instead of everything.
+    #   2. HEAD-TRUNCATION / BUDGET (#127's axis, new here) — must-survive
+    #      before already-lived. Nothing caps this hook's TOTAL emission size,
+    #      so whatever a downstream reader truncates — a harness preview
+    #      today, a context budget tomorrow — takes it from the END. The
+    #      block explicitly labelled "must survive compaction" (focus_block())
+    #      must not sit behind a block explicitly labelled "already lived, not
+    #      a to-do list" (history_arc_block()) for exactly this reason.
+    #      Measured on a real post-compact injection (#2150, 2026-08-19):
+    #      62,859 bytes total, a ~2KB harness preview, focus block starting at
+    #      line 164 of 264 — well past the cut. The history arc's own
+    #      HISTORY_ARC_CHAR_CAP (32,000 chars) and focus_block()'s measured
+    #      30,139-char post-dedup size (below) together account for
+    #      essentially the whole injection, so which of the two goes first is
+    #      the decision that matters most on this axis.
+    #
+    # Rule (axis 1, TIME): cheap, purely-local, load-bearing blocks are
+    # appended FIRST; blocks that are expensive or depend on runtime state come
+    # LAST.
+    #
+    # Rule (axis 2, SIZE): among the cheap-on-axis-1 blocks, the one that MUST
+    # survive a truncating reader (focus, saved-sets, starred) is appended
+    # BEFORE the one that is a convenience even when complete (the history arc
+    # + session checkpoint) — see main()'s emission order, changed #2150.
+    # Ordering is a partial, free mitigation on this axis: it protects the
+    # must-survive blocks from a truncation of any size, but it does not cap
+    # the hook's TOTAL emission, which is still #127's open question.
     #
     # Measured on a real install:
     #     focus_block() TIME         ~0.002s   (2026-07-25 — still free; this
@@ -2603,9 +2680,14 @@ def main() -> None:
     #                                pre-dedup -> 30,139 chars post-dedup
     #                                (2026-08-15, real graph, 15 focused nodes
     #                                carrying only 10 distinct reasons) —
-    #                                SIZE is a token-budget concern, NOT what
-    #                                this invariant guards; tracked separately
-    #                                at engram-alpha#127. Repeated-reason
+    #                                SIZE is a token-budget concern that this
+    #                                invariant did NOT originally guard against;
+    #                                ordering (axis 2, above, #2150) now partly
+    #                                addresses it by protecting must-survive
+    #                                blocks from truncation, but a total-
+    #                                emission CAP is still not in place and
+    #                                remains tracked separately at
+    #                                engram-alpha#127. Repeated-reason
     #                                dedup (this function, see docstring)
     #                                cuts the duplicated-reason bytes but
     #                                does not cap SIZE outright.
@@ -2622,55 +2704,21 @@ def main() -> None:
     #                                embedding model and can block for seconds
     #                                on a cold cache; see #1819)
     #
-    # Before this change, calibration ran FIRST, so on a cold start it consumed
-    # the whole budget and the 2ms focus list — the "deterministic focus
-    # channel" the identity layer depends on across compaction — was never
-    # reached. Observed on two independent installs at 5018ms and 5016ms
-    # against the 5000ms budget.
+    # Before the #1819 fix, calibration ran FIRST, so on a cold start it
+    # consumed the whole budget and the 2ms focus list — the "deterministic
+    # focus channel" the identity layer depends on across compaction — was
+    # never reached. Observed on two independent installs at 5018ms and
+    # 5016ms against the 5000ms budget. Before the #2150 fix, focus/
+    # saved-sets/starred ran AFTER the history arc + checkpoint, so a
+    # truncating reader (harness preview, not a timeout) could lose the
+    # must-survive blocks the same way, by a different mechanism — see the
+    # 62,859-byte measurement above.
     #
-    # If you add a block here, put it on the correct side of the divider and ask:
-    # "if this hook is killed halfway, does the important part survive?"
+    # If you add a block here, put it on the correct side of BOTH dividers and
+    # ask: "if this hook is killed halfway, does the important part survive?"
+    # AND "if this hook's output is truncated from the tail, does the
+    # important part survive?"
     # ═══════════════════════════════════════════════════════════════════════
-
-    # ── Focus list surface (cheap: single local DB read) ───────────────────
-    # Render the live focus list verbatim at EVERY session start (startup,
-    # compact, resume — Lei's 2026-07-09 scope call on #1732: "even for a
-    # fresh new session, knowing what's focused is a good thing"), not just
-    # post-compaction. This is the deterministic focus channel's actual
-    # mechanism — #1655/#1710 shipped it at PostCompact, which cannot inject
-    # additionalContext at all (confirmed against CC docs, forum #241); moving
-    # it here is the fix. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _focus = focus_block(ENGRAM_HOME)
-        if _focus:
-            lines.append(_focus)
-    except Exception:
-        pass
-
-    # ── Saved focus-sets listing (cheap: single local DB read) ─────────────
-    # #1975 layer 1 — noetic "these exist" signal every session, directly
-    # after the live focus block. Pure read; same never-fail discipline as
-    # focus_block(). Empty table / DB-missing / any exception → nothing.
-    try:
-        _saved_sets = saved_focus_sets_block(ENGRAM_HOME)
-        if _saved_sets:
-            lines.append(_saved_sets)
-    except Exception:
-        pass
-
-    # ── Starred letters surface (cheap: local read) ────────────────────────
-    # Inject starred-letter pointers at both fresh-session (startup) and
-    # post-compaction (compact/resume) so load-bearing cross-session agreements
-    # survive the experiential reset. Pointer-not-injection: one line each,
-    # NOT full content. Silent skip on any failure — hook must not block
-    # session start.
-    try:
-        _starred = starred_block(ENGRAM_HOME)
-        if _starred:
-            lines.append(_starred)
-    except Exception:
-        pass
 
     # ── Tool-capability index (cheap: single local static-file read) ───────
     # Issue #1958: Claude Code defers MCP tool schemas, so an agent sees tool

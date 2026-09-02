@@ -44,7 +44,7 @@ Cluster keys that plausibly denote the same person (a `pn_` id + free-text
 variants + namespaced variants; use person-node names/aliases as the join
 vocabulary). Every multi-key person is a finding. Suggested action per
 cluster: supersede-based backfill toward the canonical `pn_` key —
-**NEVER raw-DB edits** (the `engram-retract`/`engram-resolve-cascade` skill
+**NEVER raw-DB edits** (the `engram-revise`/`engram-resolve-cascade` skill
 discipline binds the executor, not you; cite it in the suggestion).
 
 **P2 — Personless recurring authors.**

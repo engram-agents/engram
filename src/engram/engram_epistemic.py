@@ -163,6 +163,7 @@ def _add_axiom_impl(
         node_id = core._next_id(conn, "axiom")
         now = core._now()
 
+        core._refuse_ncb_confidence("axiom", 1.0)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
                confidence, confidence_history, status, metadata)
@@ -183,14 +184,53 @@ def _add_axiom_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=1.0, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "axiom_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "axiom_id": node_id,
@@ -206,6 +246,8 @@ def _add_definition_impl(
     term: str = "",
     definition: str = "",
     context_ids: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_definition MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server callers.
@@ -221,6 +263,11 @@ def _add_definition_impl(
         term: The term being defined (e.g. "recession").
         definition: What the term means (e.g. "Two consecutive quarters of negative GDP growth").
         context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new definition node ID.
@@ -230,6 +277,12 @@ def _add_definition_impl(
     if not definition or not definition.strip():
         return json.dumps({"error": "definition is required and cannot be empty."})
 
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
+
     conn = core._get_db()
     try:
         node_id = core._next_id(conn, "definition")
@@ -238,10 +291,18 @@ def _add_definition_impl(
         combined_claim = f"{term}: {definition}"
         meta = json.dumps({"term": term, "definition": definition})
 
+        core._refuse_ncb_confidence("definition", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
-            """INSERT INTO nodes (id, type, claim, created_at, status, metadata)
-               VALUES (?, 'definition', ?, ?, 'active', ?)""",
-            (node_id, combined_claim, now, meta),
+            """INSERT INTO nodes (id, type, claim, created_at, status, metadata,
+               recall_summary, recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'definition', ?, ?, 'active', ?, ?, ?, ?, ?)""",
+            (
+                node_id, combined_claim, now, meta,
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
+            ),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -256,14 +317,53 @@ def _add_definition_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
-        # Importance-anchored — elevated base (2.0) with current turn's inflation.
-        # Not true forgetting-exemption: survival still requires recall past ~50 turns.
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute("UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?", (anchored_score, node_id,))
+        # Importance-anchored — elevated base (2.0) with current turn's
+        # inflation. Not true forgetting-exemption: survival still requires
+        # recall past ~50 turns. Pass importance_base directly so
+        # _stamp_new_node writes the anchor in one pass instead of computing
+        # an interim value from confidence/surprise and then overwriting it
+        # [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         if context:
             core._utility_reward(conn, context, action="citation")
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "definition_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "definition_id": node_id,
@@ -280,6 +380,8 @@ def _add_conjecture_impl(
     basis: str = "",
     initial_confidence: float = core.CONJECTURE_CONFIDENCE_DEFAULT,
     context_ids: str = "",
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_conjecture MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server callers.
@@ -307,6 +409,11 @@ def _add_conjecture_impl(
         basis: Why this conjecture is worth investigating.
         initial_confidence: Starting confidence, default 0.40, range [0.10, 0.60].
         context_ids: Optional comma-separated node IDs for context. Creates cites edges.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
         JSON with the new conjecture node ID and confidence.
@@ -315,6 +422,12 @@ def _add_conjecture_impl(
         return json.dumps({"error": "claim is required and cannot be empty."})
     if not basis or not basis.strip():
         return json.dumps({"error": "basis is required and cannot be empty."})
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     # Type-coerce initial_confidence — payload_json may deliver it as a string
     # (e.g. "0.55" instead of 0.55), and the float type hint isn't enforced
@@ -335,12 +448,18 @@ def _add_conjecture_impl(
         node_id = core._next_id(conn, "conjecture")
         now = core._now()
 
+        core._refuse_ncb_confidence("conjecture", conf)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, status, metadata)
-               VALUES (?, 'conjecture', ?, ?, ?, ?, ?, 'active', '{}')""",
+               confidence, confidence_history, status, metadata, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'conjecture', ?, ?, ?, ?, ?, 'active', '{}', ?, ?, ?, ?)""",
             (node_id, claim, now, basis, conf,
-             json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}])),
+             json.dumps([{"confidence": conf, "reason": f"conjecture — initial hypothesis", "timestamp": now}]),
+             _recall_summary or None,
+             json.dumps(_recall_keywords) if _recall_keywords else None,
+             1 if _needs_tightening else 0,
+             1 if _summary_missing else 0),
         )
 
         context = [s.strip() for s in core._as_csv(context_ids).split(",") if s.strip()]
@@ -362,18 +481,11 @@ def _add_conjecture_impl(
 
         # Durability read-back guard (alpha#2097, #1947 incident) — verify the
         # commit actually landed on THIS connection before reporting
-        # status:created. See core._verify_durable_write.
-        if not core._verify_durable_write(conn, node_id):
-            return json.dumps({
-                "status": "failed_not_durable",
-                "conjecture_id": node_id,
-                "error": (
-                    "Write did not verify as durable on read-back after commit — "
-                    "the row is missing or its claim is empty. Do NOT retry "
-                    "automatically; a retry after a partial commit risks a "
-                    "double-write. See alpha#1947, #2097."
-                ),
-            })
+        # status:created. See core.verify_write_durability (dual read, alpha#2193).
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            return json.dumps(core.durability_failure_response(
+                _verdict, _durability, "conjecture_id", node_id, "#2097"))
 
         return json.dumps({
             "status": "created",
@@ -688,6 +800,7 @@ def _goal_tension_impl(
         node_id = core._next_id(conn, "goal_tension")
         now = core._now()
 
+        core._refuse_ncb_confidence("goal_tension", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain, status)
                VALUES (?, 'goal_tension', ?, ?, ?, 'open')""",
@@ -706,6 +819,43 @@ def _goal_tension_impl(
 
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=1.0)
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "tension_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
+
         return json.dumps({
             "status": "created",
             "tension_id": node_id,
@@ -729,6 +879,8 @@ def _add_lesson_impl(
     context_ids: str = "",
     situation_pattern: str = "",
     bypass_prose_check: bool = False,
+    recall_summary: str = "",
+    recall_keywords: list = None,
 ) -> str:
     """Internal implementation — see engram_add_lesson MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -750,9 +902,11 @@ def _add_lesson_impl(
       the matching surface area grows — each new incident is another way
       the lesson can fire.
 
-    Lessons are CLAIM-BEARING and IMPORTANCE-ANCHORED (base 2.0, like goals).
-    They participate in derivations, can be superseded (consolidation), and
-    can serve as premises for higher-order reasoning about error patterns.
+    Lessons are NON-CLAIM-BEARING and IMPORTANCE-ANCHORED (base 2.0, like
+    goals) (alpha#2252). They carry no confidence score and cannot serve as
+    derivation premises or exemplar sources — the honest maturity signal is
+    `core._count_live_exemplars`, not a numeric confidence. They can still
+    be superseded (consolidation).
 
     Consolidation: When creating a new lesson, the tool checks for similar
     existing lessons. If a match is found, consider superseding the old lesson
@@ -782,9 +936,14 @@ def _add_lesson_impl(
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             situation_pattern — see engram_add_lesson's docstring for the
             discriminator + audit-stamp contract.
+        recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
+            Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
+            (flagged needs_tightening); rejected at 280+ chars.
+        recall_keywords: Always provide when you can — 3-6 short content keywords.
+            Never rejected regardless of count.
 
     Returns:
-        JSON with lesson ID, confidence, linked incidents, and similar existing
+        JSON with lesson ID, linked incidents, and similar existing
         lessons for consolidation hints. Returns {"error": "..."} if
         situation_pattern fails to compile as a regex, or looks like prose and
         bypass_prose_check is not set.
@@ -802,6 +961,13 @@ def _add_lesson_impl(
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
             "valid_types": sorted(core.REASONING_TYPES),
         })
+
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
+
     # Per the bool-string-truthy lesson: bool-string truthy trap at wrapper boundary. JSON-string
     # "false" is truthy in Python; without this check, a bypass_prose_check: "false"
     # payload would silently bypass the #1864 prose-shape guard.
@@ -841,7 +1007,7 @@ def _add_lesson_impl(
             row = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (sid,)).fetchone()
             if not row:
                 missing.append(sid)
-            elif row["type"] not in core.CLAIM_BEARING_TYPES:
+            elif not core._is_claim_bearing(row["type"]):
                 wrong_type.append(f"{sid} (type: {row['type']})")
         if missing:
             return json.dumps({"error": f"Incident node(s) not found: {', '.join(missing)}"})
@@ -862,16 +1028,21 @@ def _add_lesson_impl(
             extra_metadata_keys=("scaffolding_nudge",),
         )
 
-        # Compute confidence (same as derivation)
-        confidence = core._compute_confidence(
-            conn, "derivation", supporting_ids=ids,
-            reasoning_type=reasoning_type,
-        )
+        # Lessons are non-claim-bearing (alpha#2252) — no confidence is
+        # computed or stored. confidence/confidence_history are omitted from
+        # the INSERT below, matching the house convention for NCB types
+        # (cornerstone/goal): confidence defaults to NULL (no column
+        # DEFAULT), confidence_history defaults to '[]' (schema DEFAULT).
+        # The honest maturity signal for a lesson is
+        # core._count_live_exemplars, not a numeric confidence — see Q2 in
+        # the epic's design doc.
         node_id = core._next_id(conn, "lesson")
         now = core._now()
 
+        # reasoning_type/reasoning_class are unrelated metadata (still worth
+        # keeping) — only the confidence computation that used to consume
+        # reasoning_type + the discount table is dead now.
         rclass = core.REASONING_CLASS.get(reasoning_type, "unknown")
-        discount = core.REASONING_DISCOUNT.get(reasoning_type, 0.95)
 
         meta = {
             "reasoning_type": reasoning_type,
@@ -888,19 +1059,22 @@ def _add_lesson_impl(
             # that an override was exercised against a real block condition).
             meta["bypass_prose_check"] = True
 
+        core._refuse_ncb_confidence("lesson", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-               confidence, confidence_history, metadata)
-               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?)""",
+               metadata, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, 'lesson', ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 claim,
                 now,
                 logical_chain,
-                confidence,
-                json.dumps([{"timestamp": now, "value": confidence,
-                             "reason": f"Lesson ({reasoning_type}, discount={discount}) from {len(ids)} incident(s)"}]),
                 json.dumps(meta),
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
             ),
         )
 
@@ -928,14 +1102,49 @@ def _add_lesson_impl(
                 except sqlite3.IntegrityError:
                     pass
 
-        # Stamp importance, then anchor (like goals — lessons persist)
-        core._stamp_new_node(conn, node_id, confidence=confidence, surprise=0.0)
-        anchored_score = core._compute_importance(2.0, core._get_current_turn())
-        conn.execute(
-            "UPDATE nodes SET importance_base = 2.0, importance_score = ? WHERE id = ?",
-            (anchored_score, node_id,),
-        )
+        # Lessons are importance-anchored at a fixed value (2.0), like goals
+        # and cornerstones — lessons persist. Pass importance_base directly
+        # so _stamp_new_node writes the anchor in one pass instead of
+        # computing an interim value from confidence/surprise and then
+        # overwriting it [alpha#2266, alpha#2268].
+        core._stamp_new_node(conn, node_id, importance_base=2.0)
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            _indeterminate = _verdict == core.DURABILITY_INDETERMINATE
+            return json.dumps({
+                "status": (
+                    "durability_indeterminate" if _indeterminate
+                    else "failed_not_durable"
+                ),
+                "lesson_id": node_id,
+                "durability": _durability,
+                "error": (
+                    (
+                        "Write COMMITTED but its durability cannot be "
+                        "confirmed: the writing connection and a fresh "
+                        "connection DISAGREE about whether the row is "
+                        "present, and nothing available here says which "
+                        "view is correct. The node id above may or may not "
+                        "resolve. Do NOT cite it until re-verified, and do "
+                        "NOT retry automatically -- a retry risks a "
+                        "double-write if the row did land. Re-read after a "
+                        "checkpoint, or escalate. See alpha#2193."
+                    ) if _indeterminate else (
+                        "Write did not verify as durable on read-back after "
+                        "commit -- the row is missing or its claim is empty "
+                        "on BOTH the writing connection and a fresh one. Do "
+                        "NOT retry automatically; a retry after a partial "
+                        "commit risks a double-write. See alpha#1947, #2142."
+                    )
+                ),
+            })
 
         # Update the incident index (best-effort, outside transaction)
         _update_incident_index(node_id, claim, scaffolding_nudge, ids)
@@ -944,7 +1153,6 @@ def _add_lesson_impl(
             "status": "created",
             "lesson_id": node_id,
             "claim": claim,
-            "confidence": confidence,
             "reasoning_type": reasoning_type,
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
@@ -976,9 +1184,11 @@ def _add_lesson_impl(
 # 2026-08-03 per Lei: situation_pattern is a tunable machine-matching cue;
 # scaffolding_nudge is the paired "what to do when it fires" text, same
 # non-epistemic class). Do not widen further without a fresh issue: claim,
-# logical_chain, confidence, reasoning_type remain supersede-only — those ARE
-# the load-bearing content, and reasoning_type specifically feeds confidence
-# computation, so editing it in-place would silently drift a derived value.
+# logical_chain, reasoning_type remain supersede-only — those ARE the
+# load-bearing content. (Pre-alpha#2252, reasoning_type also fed a
+# now-removed confidence computation; lessons are non-claim-bearing and
+# store no confidence, so that no longer applies — the supersede-only
+# rule stands on the load-bearing-content rationale alone.)
 _LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
@@ -1011,7 +1221,7 @@ def _update_lesson_impl(
     Mutable fields (#1826, widened 2026-08-03): situation_pattern and
     scaffolding_nudge — both mechanical/actionability metadata tunable from
     real firing experience, not the lesson's epistemic content (claim,
-    logical_chain, confidence, reasoning_type stay supersede-only).
+    logical_chain, reasoning_type stay supersede-only).
 
     situation_pattern, when set to a non-empty value, runs the SAME #1864
     validation _add_lesson_impl runs at creation time — must compile as a
@@ -1251,7 +1461,7 @@ def _register_exemplar_impl(
         ).fetchone()
         if not exemplar_row:
             return json.dumps({"error": f"Exemplar node not found: {exemplar_id}"})
-        if exemplar_row["type"] not in core.CLAIM_BEARING_TYPES:
+        if not core._is_claim_bearing(exemplar_row["type"]):
             return json.dumps({
                 "error": (
                     f"Exemplar must be claim-bearing. {exemplar_id} has type "
@@ -1287,6 +1497,30 @@ def _register_exemplar_impl(
 
         # Live count via SSoT helper — no cached field needed (closes #442).
         exemplar_count = core._count_live_exemplars(conn, target_id, target_row["type"])
+
+        # #2252 Stage 1.1 Part 3 — cheap write-time discharge: registering
+        # this exemplar IS a re-wire event against target_id, so clear a
+        # stale support_lost marker right here instead of waiting for the
+        # next reflect run. Convenience only, same as engram_revision's
+        # Part 2 hook — engram_lifecycle._reflect_impl's state-based
+        # recompute (Part 1) is the load-bearing discharge and covers this
+        # target even if this hook is ever skipped or bypassed. It IS
+        # bypassable: engram_add_edge can create an 'exemplifies' edge
+        # directly without going through this function (the relation is in
+        # core._ADDABLE_AFTER_CREATION_RELATIONS, gated only for
+        # 'instantiates'->lesson) — a third exemplar-creation surface
+        # alongside this one and the initial-creation path in
+        # _add_lesson_impl, neither of which routes through this hook.
+        target_meta = json.loads(target_row["metadata"] or "{}")
+        if target_meta.get("support_lost") and exemplar_count > 0:
+            target_meta.pop("support_lost", None)
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(target_meta), target_id),
+            )
+            core._log_edit(conn, "support_lost_cleared", target_id, target_row["type"],
+                      {"trigger": exemplar_id})
+            conn.commit()
     finally:
         conn.close()
 

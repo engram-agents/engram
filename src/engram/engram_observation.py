@@ -939,6 +939,7 @@ def _add_evidence_impl(
         # Used by the dedup heuristic to grade action_hints by artifact kind.
         source_type = core._infer_source_type(url)
 
+        core._refuse_ncb_confidence("evidence", None)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, created_at, source_url, source_title,
                source_domain, source_date, source_accessed, content_snippet, metadata,
@@ -951,6 +952,20 @@ def _add_evidence_impl(
 
         core._stamp_new_node(conn, node_id, confidence=0.5, surprise=0.0)
         conn.commit()
+
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability. Evidence nodes never populate a
+        # `claim` column (#2234) -- `source_url` stands in as the
+        # always-populated column instead, since url is required and
+        # validated non-empty before the INSERT above.
+        _verdict, _durability = core.verify_write_durability(
+            conn, node_id, claim_field="source_url")
+        if _verdict != core.DURABILITY_DURABLE:
+            return json.dumps(core.durability_failure_response(
+                _verdict, _durability, "evidence_id", node_id, "#2234"))
 
         result = {
             "status": "created",
@@ -1044,6 +1059,37 @@ def _resolve_session_transcript(session_id: str) -> dict:
     }
 
 
+# Stage 1.4 (#2252) — predictive-hint affordance. Trigger A only
+# (predicted_event / resolution_timeframe present without is_predictive).
+# Deliberately small and boring: this is a discoverability nudge for the
+# pairing invariant (SETTLED Q1), not an NLP classifier. Err toward
+# silence — a missed hint costs nothing (the observation still files
+# normally); a false-positive hint on every other claim would train agents
+# to ignore it. The claim-text regex trigger (Trigger B) was removed
+# pre-merge on measured zero precision (0/22 sampled fires were genuine
+# predictions — Ariadne's #2260 colleague pass); redesign tracked in #2264.
+
+
+def _predictive_hint(is_predictive: bool,
+                      predicted_event: str, resolution_timeframe: str) -> Optional[str]:
+    """Advisory-only nudge toward the pairing invariant (#2252 Q1) — never
+    blocks, never changes what gets written. Returns the hint string when
+    warranted, else None. Trigger A only: fires when predicted_event or
+    resolution_timeframe is present without is_predictive=true.
+    """
+    if is_predictive:
+        return None
+    if not (predicted_event or resolution_timeframe):
+        return None
+    return (
+        "You passed predicted_event/resolution_timeframe without "
+        "is_predictive=true. If this claim predicts a checkable event, "
+        "refile or follow up with is_predictive=true + predicted_event — "
+        "the paired prediction node is what joins the calibration ledger "
+        "(pairing invariant, #2252 Q1)."
+    )
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1069,6 +1115,8 @@ def _add_observation_impl(
     source_repo: str = "",
     repo_path: str = "",
     session_id: str = "",
+    recall_summary: str = "",
+    recall_keywords: Optional[list] = None,
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1099,6 +1147,18 @@ def _add_observation_impl(
                 "JSON encodes `true`/`false` not `\"true\"`/`\"false\"`."
             )
         })
+
+    # Write-time recall_summary/recall_keywords validation (#1952 PR1) — runs
+    # early, before any DB/network work, so an over-long recall_summary
+    # hard-rejects with zero side effects (no evidence node, no observation
+    # row). Presence is soft (Resolution 1): omission normalizes to 0 chars /
+    # empty list and clean-accepts; only an explicitly-provided recall_summary
+    # >= 280 chars errors.
+    _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
+        core._validate_recall_fields(recall_summary, recall_keywords)
+    )
+    if _recall_error:
+        return json.dumps({"error": _recall_error})
 
     # session_id resolution — precedence evidence_id > url > session_id.
     # Runs BEFORE the required-field check below because it may supply
@@ -1353,12 +1413,14 @@ def _add_observation_impl(
         if source_class != "external":
             conf_reason += f" (source_class: {source_class})"
 
+        core._refuse_ncb_confidence(node_type, confidence)  # #2252 Stage 1.3 write-path guard
         conn.execute(
             """INSERT INTO nodes (id, type, claim, created_at, evidence_id, quoted_text,
                interpretation, quote_type, confidence, confidence_history, metadata,
                standpoint_author_id, standpoint_collection_id, standpoint_override_tag,
-               standpoint_lineage, standpoint_architecture, fs_class)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               standpoint_lineage, standpoint_architecture, fs_class, recall_summary,
+               recall_keywords, needs_tightening, summary_missing)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node_id,
                 node_type,
@@ -1377,6 +1439,10 @@ def _add_observation_impl(
                 standpoint_lineage or None,
                 standpoint_architecture or None,
                 fs_class if fs_class in ("re-executable", "frozen") else None,
+                _recall_summary or None,
+                json.dumps(_recall_keywords) if _recall_keywords else None,
+                1 if _needs_tightening else 0,
+                1 if _summary_missing else 0,
             ),
         )
 
@@ -1421,6 +1487,7 @@ def _add_observation_impl(
                 result["prediction_status"] = "linked_to_existing"
             else:
                 prediction_id = core._next_id(conn, "prediction")
+                core._refuse_ncb_confidence("prediction", None)  # #2252 Stage 1.3 write-path guard
                 conn.execute(
                     """INSERT INTO nodes (id, type, predicted_event, resolution_timeframe,
                        status, created_at, confidence)
@@ -1431,10 +1498,13 @@ def _add_observation_impl(
                 core._log_edit(conn, "created", prediction_id, "prediction",
                           {"predicted_event": predicted_event[:200]})
 
-            # Edge: prediction supported_by observation
+            # Edge: prediction predicted_by observation (#2252 W6 — split
+            # out of supported_by; prediction is still the SOURCE, the
+            # predictive observation is still the TARGET, same direction
+            # supported_by used for this pairing).
             try:
                 conn.execute(
-                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'supported_by', ?)",
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'predicted_by', ?)",
                     (prediction_id, node_id, now),
                 )
             except sqlite3.IntegrityError:
@@ -1566,23 +1636,25 @@ def _add_observation_impl(
         if _author_id_warning:
             result["warnings"] = result.get("warnings", []) + [_author_id_warning]
 
+        # Stage 1.4 (#2252) — predictive-hint affordance. Advisory only:
+        # never blocks node creation, never changes any existing key.
+        # Suppressed whenever is_predictive is true (the caller already used
+        # the pairing path). See _predictive_hint for trigger definitions.
+        _pred_hint = _predictive_hint(is_predictive, predicted_event, resolution_timeframe)
+        if _pred_hint:
+            result["predictive_hint"] = _pred_hint
+
         conn.commit()
 
-        # Durability read-back guard (alpha#2074, #1947 incident) — verify the
-        # commit actually landed on THIS connection before reporting
-        # status:created. A fresh-connection read-back would only exercise
-        # the path that already works; see core._verify_durable_write.
-        if not core._verify_durable_write(conn, node_id):
-            return json.dumps({
-                "status": "failed_not_durable",
-                "observation_id": node_id,
-                "error": (
-                    "Write did not verify as durable on read-back after commit — "
-                    "the row is missing or its claim is empty. Do NOT retry "
-                    "automatically; a retry after a partial commit risks a "
-                    "double-write. See alpha#1947, #2074."
-                ),
-            })
+        # Durability dual read-back (alpha#2193; supersedes the single
+        # same-connection read of #2074/#1947). Same-conn alone is BLIND to
+        # writer-side displacement; fresh-conn alone FALSE-ALARMS on
+        # reader-side corruption. Disagreement is reported, not guessed.
+        # See core.verify_write_durability.
+        _verdict, _durability = core.verify_write_durability(conn, node_id)
+        if _verdict != core.DURABILITY_DURABLE:
+            return json.dumps(core.durability_failure_response(
+                _verdict, _durability, "observation_id", node_id, "#2074"))
 
         # --- Stage 1 auto-suggest: person-mention detection (§4 of person typed schema) ---
         # Scan the new claim text against name + aliases of every current person node.
@@ -1710,6 +1782,8 @@ def _add_observation_batch_impl(
             - standpoint_override_tag (optional): Free-form standpoint label when the cluster key is insufficient.
             - standpoint_lineage (optional): Training lineage "provider:family" (e.g. "anthropic:opus") for the source claim's producer. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes; lineage differs only when citing another agent's or a human's evidence.
             - standpoint_architecture (optional): Cognitive architecture of the source's producer. Enum: transformer | vision-spatial | embodied-sensorimotor | graph-neural | human | other. Tracks architectural (not just training) diversity — Class A calibration exposure.
+            - recall_summary (optional but always provide when you can): ≤140-char agent-facing recall scent — compress interpretation/claim, don't start from a blank line. Not content preservation (the full claim renders on inspect); for a multi-fact observation, name the load-bearing fact or file separate observations instead. Soft-accepted up to 279 chars (flagged needs_tightening for later cleanup); rejected at 280+ chars for that one item (other items in the batch are unaffected).
+            - recall_keywords (optional but always provide when you can): JSON array of 3-6 short content keywords (never rejected regardless of count).
         url: URL of the source document. The evidence node is auto-created or reused.
         title: Title of the source document (required if url is provided).
         domain: Source domain (auto-extracted from URL if omitted).
@@ -1781,6 +1855,8 @@ def _add_observation_batch_impl(
             fs_class=obs.get("fs_class"),
             source_repo=source_repo,
             repo_path=repo_path,
+            recall_summary=obs.get("recall_summary", ""),
+            recall_keywords=obs.get("recall_keywords"),
         ))
         r["index"] = i
         results.append(r)

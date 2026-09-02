@@ -441,16 +441,20 @@
     },
     {
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for forum-mention-monitor.sh"
+      "test_globs": [
+        "tests/test_forum_mention_monitor_coalesce.py",
+        "tests/test_forum_monitor_malformed_200.py"
+      ],
+      "note": "Both spawn the real script as a subprocess against a mock HTTP server. test_forum_mention_monitor_coalesce.py covers the cross-cycle coalesce window (#1616); test_forum_monitor_malformed_200.py covers ids()'s reported-vs-failed-to-report boundary and the seed/poll seen-set guards (#2225)."
     },
     {
       "path_prefix_or_glob": "tools/forum-updates-monitor.sh",
       "test_globs": [
         "tests/test_forum_monitor_duplicate_warn.py",
-        "tests/test_pgrep_liveness_reap_patterns.py"
+        "tests/test_pgrep_liveness_reap_patterns.py",
+        "tests/test_forum_monitor_malformed_200.py"
       ],
-      "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table."
+      "note": "test_forum_monitor_duplicate_warn.py spawns the real script as a subprocess (duplicate-instance warn behavior against real processes); test_pgrep_liveness_reap_patterns.py does not spawn it, instead extracting its _pgrep_pattern literal from the script text and matching it in pure Python against a synthetic process table; test_forum_monitor_malformed_200.py spawns it against a mock HTTP server for as_of()'s usable-watermark boundary and the seed/poll cursor guards (#2225)."
     },
     {
       "path_prefix_or_glob": "tools/codex-umwelt-wake.py",
@@ -547,6 +551,10 @@
     {
       "path": "tools/compute_task_time.py",
       "reason": "No dedicated test file found"
+    },
+    {
+      "path": "tools/rc-upgrade-verify.py",
+      "reason": "rc1->rc2 upgrade operational tooling (#2411); no dedicated test file. Verified manually against a live graph (byte copy, never the live DB) and via a direct build-plugin.sh --tier dev dry run rather than an automated test, since it exercises the actual migration subprocess + a real knowledge.db copy end-to-end."
     },
     {
       "path": "tools/deference_baseline.py",

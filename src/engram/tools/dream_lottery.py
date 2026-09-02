@@ -8,10 +8,10 @@ refined same night to a three-class split (comment on #1901):
      scales with the day's new-node cohort and is essential whenever nodes
      were created. NOT touched by this module — cohort_dispatch.py's
      ``prev-sleep`` cadence is already correct for an every-night step.
-  2. **Lottery-rotated** — the 9 dream-fairy scan categories (open-questions,
-     contradictions, stale-load-bearing, cornerstone-candidates,
-     tainted-valid, resolution-echoes, missing-edges, stale-task-refs,
-     coverage-gaps). Exactly ONE type is drawn per sleep (``--count`` can
+  2. **Lottery-rotated** — the scan categories in CATEGORIES below (the
+     dream-fairy set plus person-node-maintenance and support-lost; the
+     dict is the count's single source of truth — prose counts here have
+     drifted twice). Exactly ONE type is drawn per sleep (``--count`` can
      raise this later; the design note says "maybe two later"). All-8-nightly
      was the heaviest recurring token spend for a mostly-zero-findings scan
      at current graph sizes.
@@ -135,6 +135,7 @@ CATEGORIES: dict[int, str] = {
     8: "stale-task-refs",
     9: "coverage-gaps",
     10: "person-node-maintenance",
+    11: "support-lost",
 }
 
 # Categories whose scan is genuinely window-scoped (per the #1901 audit --
@@ -401,10 +402,14 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
       re-entrancy guard (no category's ``last_run_turn`` gets stamped, so
       a same-turn re-run is never detected).
     - ``--interrupt-threshold < 1``: REJECTED. ``interrupt_fired =
-      cascade_count >= interrupt_threshold`` is unconditionally true for
-      any ``threshold <= 0`` (cascade_count is never negative), which is
-      also the exact value someone would plausibly type meaning "no
-      threshold" -- the opposite of what it actually does.
+      bool(interrupt_types) and cascade_count >= interrupt_threshold`` is
+      unconditionally true for any ``threshold <= 0`` *when a force-set is
+      configured* (cascade_count is never negative) -- the exact value
+      someone would plausibly type meaning "no threshold", the opposite of
+      what it actually does. On the default empty ``interrupt_types`` this
+      guard is currently inert (nothing to force-include either way), but
+      it stays for anyone who passes ``--interrupt-types``, which is
+      exactly the configuration #2013 will restore.
     - ``--limit`` (history subcommand, not draw): deliberately NOT a
       reject case. ``<= 0`` is a documented sentinel meaning "no limit"
       (issue #1911) -- handled in ``tally_history``, not here.
@@ -423,10 +428,12 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
     if args.interrupt_threshold < 1:
         return (
             f"--interrupt-threshold must be >= 1 (got {args.interrupt_threshold}). "
-            "interrupt_fired = cascade_count >= interrupt_threshold is "
-            "unconditionally true for threshold <= 0, silently forcing the "
-            "interrupt-mapped categories in every night regardless of real "
-            "cascade activity."
+            "interrupt_fired = bool(interrupt_types) and cascade_count >= "
+            "interrupt_threshold is unconditionally true for threshold <= 0 "
+            "when a force-set is configured (--interrupt-types), silently "
+            "forcing the interrupt-mapped categories in every night regardless "
+            "of real cascade activity. On the default empty interrupt_types "
+            "this has no effect."
         )
     return None
 

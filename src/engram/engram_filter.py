@@ -105,6 +105,17 @@ ALLOWED_NODE_COLUMNS: frozenset[str] = frozenset(
         "standpoint_architecture",
         # Falsification-sensitivity class (re-executable | frozen).
         "fs_class",
+        # Soft-accept quality flag for a write-time recall_summary that was
+        # over the 140-char target but under the 280-char hard cap (#1952
+        # PR1). Filterable on purpose — the summary-fairy sweep needs
+        # engram_list(needs_tightening=1) to find candidates to tighten.
+        "needs_tightening",
+        # Fail-loud-surface flag for a write-time recall_summary that was
+        # entirely absent/omitted (#1952 PR1 round 4, Kepler's ruling) —
+        # distinct from needs_tightening (present but over-limit).
+        # Filterable on purpose — the dream/backfill sweep needs
+        # engram_list(summary_missing=1) to find candidates to fill in.
+        "summary_missing",
     }
 )
 

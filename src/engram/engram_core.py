@@ -497,8 +497,60 @@ CLAIM_BEARING_TYPES = {
     "theory",
     "axiom",
     "conjecture",
-    "lesson",
 }
+
+
+def _is_claim_bearing(node_type: str) -> bool:
+    """Is `node_type` claim-bearing (asserts something truth-evaluable)?
+
+    Canonical home for the #2252 "derive from the classification, never
+    re-enumerate it" check — callers that need to know whether a node's
+    confidence is meaningful (e.g. whether a `min_confidence` predicate
+    should apply to it at all) call this instead of re-deriving the
+    membership test inline. (Sol Montaigne, stage 1.6/1.6a reconciliation
+    — offered during PR #2261's colleague review after independently
+    building the same helper for the mirror-image case.)
+    """
+    return node_type in CLAIM_BEARING_TYPES
+
+
+def _refuse_ncb_confidence(node_type: str, confidence) -> None:
+    """Raise if `node_type` is non-claim-bearing (NCB) and `confidence` is
+    non-NULL.
+
+    #2252 Stage 1.3 write-path guard. Today the partition holds by
+    convention, not enforcement: most NCB `INSERT INTO nodes` sites simply
+    never name the `confidence` column, which is structural luck rather
+    than a guard — a new NCB write path that happened to pass a confidence
+    would get it silently. Every node-creation call site is expected to
+    call this, with the confidence value it is about to write (or `None`
+    where the column isn't set), immediately before its `INSERT INTO
+    nodes`.
+
+    Deliberately routed through `_is_claim_bearing` — never an inline type
+    list — so the check tracks `CLAIM_BEARING_TYPES` automatically as the
+    partition's membership declaration changes. `_stamp_new_node` is
+    deliberately NOT this guard's home: it feeds the *importance* formula,
+    not the stored `confidence` column, and conflating the two is the
+    trap #2252's W0 doc names (the "importance-seeding path" paragraph).
+
+    Call sites that pass a literal `None` are audit markers, not live
+    guards: they record that the site was reviewed and its type carries no
+    confidence column, and — because `confidence is not None` is
+    independent of partition membership — they cannot fire, under any
+    future change to `CLAIM_BEARING_TYPES`. Do not copy the `None` idiom
+    onto a new NCB write path believing it adds enforcement; if the new
+    site can ever receive a non-NULL confidence, pass that value through
+    instead so the guard is actually armed (round-2 colleague review on
+    PR #2289, Ariadne — "the call-site corpus otherwise teaches the
+    placebo idiom").
+    """
+    if confidence is not None and not _is_claim_bearing(node_type):
+        raise ValueError(
+            f"non-claim-bearing type '{node_type}' cannot carry a "
+            f"non-NULL confidence ({confidence!r}) — the CB/NCB partition"
+        )
+
 
 # Valid TARGET types for the `instantiates` relation (#530): the principle-family
 # nodes a claim-bearing source can realize. Lessons are deliberately ABSENT —
@@ -518,6 +570,22 @@ VALID_RELATIONS = {
     "contradicts",
     "resolves",
     "derives_from",
+    "acknowledged_derives_from",  # #2013 §12.5. A premise edge established by
+                     # ADJUDICATION rather than at authorship: when an agent
+                     # acknowledges that its claim survives a premise being
+                     # superseded, the machine records that the node now also
+                     # rests on the REPLACEMENT. Written only by
+                     # engram_cascade_resolve — never agent-supplied, and
+                     # `addable_after_creation: False` keeps engram_add_edge
+                     # from reaching it (cascade relations are never
+                     # agent-addable; that disjointness is load-bearing).
+                     #
+                     # DAG-EXEMPT BY CONSTRUCTION, not by preference: the
+                     # acknowledging node exists BEFORE the replacement it
+                     # comes to rest on — that is what an acknowledgement IS —
+                     # so this edge always inverts creation order. Filing it as
+                     # `derives_from` produced one time-ordering violation per
+                     # acknowledgement, which is the defect §12.1 records.
     "supersedes",
     "retracts",
     "tensions",
@@ -545,110 +613,332 @@ VALID_RELATIONS = {
                      # that realizes it). The dream-master's post-hoc wiring
                      # tool; also the axiom-grounding shape for practice
                      # observations ("ob_X instantiates ax_Y").
+    "predicted_by",  # #2252 W6: prediction <-predicted_by- observation_predictive
+                     # pairing edge, split out of `supported_by`. Prediction is
+                     # the SOURCE (the dependent claim), the predictive
+                     # observation is the TARGET (the premise) — same direction
+                     # `supported_by` used for this pairing. Minted once, at
+                     # node-add time (engram_observation.py); never hand-addable
+                     # (see _ADDABLE_AFTER_CREATION_RELATIONS below).
+    "acknowledged_derives_from",  # #2357/#2013: cascade-frontier acknowledgement
+                     # edge — a node whose stale premise resolved as
+                     # "acknowledged" records this edge to the resolving
+                     # replacement, so a LATER supersede of the replacement
+                     # doesn't leave the acknowledgement silently stranded.
+                     # Deliberately backwards in creation time (see its
+                     # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
+                     # by the cascade-resolution machinery once #2349 lands.
 }
 
 
+# #2357: dag_check used to do two jobs under one name. It was a sound proxy
+# for real acyclicity only as long as every DAG-bearing edge also pointed
+# backwards in creation time — which held for every relation below UNTIL
+# `acknowledged_derives_from` (see its entry), whose whole point is to point
+# forward. Split into two independent per-relation flags:
+#   temporal_causal — PURE RENAME of the old dag_check semantics (creation-
+#     order: source created at-or-after target). This is what every existing
+#     call site (the supersede/add_edge timestamp guards, the startup scan)
+#     actually measures, honestly named.
+#   dag — the real, structural property: is this relation safe from cycles?
+#     For every relation that existed before this split, dag == temporal_causal
+#     (the two never diverged until now, so no relation needed re-judging).
+#     `acknowledged_derives_from` is the first and so far only relation where
+#     they differ: dag=True (a cycle through it would be genuinely bad — see
+#     its entry), temporal_causal=False (it is deliberately backwards in time,
+#     by construction).
+# dag is per-relation, not scoped to CASCADE_RELATIONS — structural relations
+# like supersedes/retracts/subtask_of need cycle protection too and are not
+# cascade relations, so a walk limited to CASCADE_RELATIONS would miss a cycle
+# among them entirely.
 EDGE_CLASSIFICATIONS = {
     "about": {
         "cascade": False,
-        "dag_check": False,
+        "temporal_causal": False,
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "cites": {
         "cascade": False,
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # provenance load-bearing; removal would orphan claims
         "addable_after_creation": False,  # legacy dual-use; PR 3 introduces new relation for relevance-marking
         "provenance": True,
     },
     "contradicts": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
+        "temporal_causal": False,    # advisory check exempts contradicts (the contradicts-dag-exempt observation)
+        "dag": False,
         "removable": False,    # structural commitment; alters epistemic stance
         "addable_after_creation": False,
         "provenance": False,
     },
     "derives_from": {
         "cascade": True,       # taint/stale propagation
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # cascade-bearing
         "addable_after_creation": False,
-        "provenance": False,
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
+    },
+    "acknowledged_derives_from": {
+        # #2357: the acknowledgement edge (#2013's cascade-frontier machine,
+        # slice 3/4 — deferred there pending this split, see engram_revision.py
+        # on the feature branch). An acknowledging node X necessarily exists
+        # BEFORE the replacement P′ it comes to rest on — that is what an
+        # acknowledgement IS — so `X --acknowledged_derives_from--> P′` is
+        # always backwards in creation time: temporal_causal=False, by design,
+        # not an oversight.
+        #
+        # But it is NOT exempt from acyclicity. Constructed through public
+        # verbs only: base → P, X derives_from P, P′ derives_from X (legal —
+        # X is unmarked at that moment), supersede P → P′, then acknowledge X.
+        # The ack edge closes X → P′ → X. A real per-relation dag flag is what
+        # catches that a plain "cascade relations are acyclic because they're
+        # temporal_causal" argument cannot: dag=True, checked by a real edge
+        # walk (see engram_dag_conformance.check_dag_conformance and the
+        # write-time guard that #2349 lands at §12.7), independent of the
+        # temporal direction.
+        "cascade": True,        # must participate in cascade walks — that is
+                                 # the entire reason this relation exists.
+        "temporal_causal": False,
+        "dag": True,
+        "removable": False,     # cascade-bearing, mirrors derives_from.
+        "addable_after_creation": False,
+        "provenance": True,
     },
     "exemplifies": {
         "cascade": False,
-        "dag_check": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
+        "temporal_causal": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "instantiates": {
         "cascade": False,      # pure relevance marker — no confidence propagation
-        "dag_check": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
+        "temporal_causal": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
+    "predicted_by": {
+        "cascade": False,      # #2252 W6: settled, not a judgement call — Q1 FINAL on
+                                # #2252 settles predictions as non-claim-bearing, so
+                                # cascade reaching one has nothing to re-adjudicate.
+                                # An earlier cascade:True clause was withdrawn by its
+                                # own author; do not restore it.
+        "temporal_causal": True,      # same provenance-chain shape as supported_by, which
+                                # this edge is split out of.
+        "dag": True,
+        "removable": False,    # provenance load-bearing, mirrors supported_by.
+        "addable_after_creation": False,  # minted once at node-add time
+                                           # (engram_observation.py); never hand-addable.
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
+    },
     "resolves": {
         "cascade": False,      # not a confidence-propagating edge
-        "dag_check": False,    # back-reference edge: resolver legitimately pre-dates the question
+        "temporal_causal": False,    # back-reference edge: resolver legitimately pre-dates the question
                                # (a question filed and immediately resolved by a pre-existing node
                                # has resolver.created_at < question.created_at — correct, not a
                                # violation). Exemption added 2026-06-10, issue #1076.
+        "dag": False,
         "removable": False,    # structural commitment
         "addable_after_creation": False,
         "provenance": False,
     },
     "retracts": {
-        "cascade": True,       # cascade marker for downstream taint
-        "dag_check": True,
+        "cascade": False,      # #2252 Stage 1.0a: a retracts edge marks the CORRECTION of a
+                                # wrong node, not a dependency on it — its source exists BECAUSE
+                                # the target was found wrong. The retract-with-replacement path in
+                                # `_retract_impl` (engram_revision.py) inserts
+                                # `replacement —retracts→ retracted_node`; walking this relation
+                                # would make a retract cascade's first taint target the
+                                # replacement that same retract just created.
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,
         "addable_after_creation": False,
         "provenance": False,
     },
     "serves": {
         "cascade": False,
-        "dag_check": False,    # same shape as instantiates: a goal can be articulated after the node
+        "temporal_causal": False,    # same shape as instantiates: a goal can be articulated after the node
                                # that serves it — serves.source legitimately pre-dates serves.target.
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
+        "dag": False,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "subtask_of": {
         "cascade": False,
-        "dag_check": True,
+        "temporal_causal": True,
+        "dag": True,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
     "supersedes": {
-        "cascade": True,
-        "dag_check": True,
+        "cascade": False,      # #2252 Stage 1.0a: same family as retracts — revision history,
+                                # not evidential dependency. The widening this correction
+                                # prevents is latent rather than loud: a current node cannot
+                                # carry an incoming supersedes edge, and the cascade walk stops
+                                # at non-current nodes, so a stale cascade:True here would only
+                                # ever fire on invariant-violating data.
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,    # structural mutation; use engram-surgical for emergencies
         "addable_after_creation": False,
         "provenance": False,
     },
     "supported_by": {
-        "cascade": True,
-        "dag_check": True,
+        "cascade": False,      # #2252 Stage 1.3: post-1.3 supported_by is NCB
+                                # accumulation (W0 doc: 99.2% of live instances are
+                                # cornerstone-sourced vote edges). An NCB target has
+                                # no claim to re-adjudicate, so cascade reaching it
+                                # accomplishes nothing. provenance/temporal_causal/dag/removable
+                                # deliberately UNCHANGED — this is a cascade-only flip.
+        "temporal_causal": True,
+        "dag": True,
         "removable": False,
         "addable_after_creation": False,
-        "provenance": False,
+        "provenance": True,    # traced by _trace_evidence_roots in engram_core.py
     },
     "tensions": {
         "cascade": False,
-        "dag_check": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
+        "temporal_causal": False,    # relational tier (dependency/relational/classification): symmetric/cross-temporal
                                # like contradicts (already exempt). A tension between nodes has no causal
                                # direction; either can pre-date the other legitimately.
+        "dag": False,
                                # Exemption added 2026-06-10, issue #1076 (three-tier edge taxonomy).
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
     },
 }
+
+
+# Derived from EDGE_CLASSIFICATIONS above — #2252 Stage 1.0b makes `cascade`
+# and `provenance` load-bearing by deriving the walked-relation sets from the
+# declaration instead of hardcoding them as SQL literals at each call site.
+CASCADE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["cascade"])
+PROVENANCE_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["provenance"])
+
+# Stable, sorted SQL IN-clause placeholder sets — parameterised (never
+# string-interpolated), and sorted so set iteration order never leaks into
+# generated SQL. Used by the provenance-root walk (engram_core.py, below).
+_PROVENANCE_RELATIONS_SORTED = sorted(PROVENANCE_RELATIONS)
+_PROVENANCE_RELATION_PLACEHOLDERS = ",".join("?" * len(_PROVENANCE_RELATIONS_SORTED))
+
+# Same pattern, for the upstream (premise-direction) cascade walk used by
+# _walk_cascade_upstream / _trace_observation_leaves below. engram_revision.py
+# has its own copy (`_CASCADE_RELATIONS_SORTED`) for the downstream taint
+# walker — this is engram_core's own derivation of the same upstream
+# constant, not an import of revision's, since core has no dependency on
+# revision (#2298, superseding #2255's "leave enumerated" doctrine for this
+# specific walk — see _walk_cascade_upstream's docstring).
+_CASCADE_RELATIONS_SORTED = sorted(CASCADE_RELATIONS)
+_CASCADE_RELATION_PLACEHOLDERS = ",".join("?" * len(_CASCADE_RELATIONS_SORTED))
+
+# Relations by which a claim-bearing node CONSUMES another as support. Used for
+# citation-coverage ("is this observation cited by anything?"), NOT for cascade.
+# DELIBERATELY ENUMERATED, NOT DERIVED FROM `cascade` — see #2252 Stage 1.0b.
+# These two sites (engram_lifecycle.py, engram_stats.py) ask a citation-coverage
+# question that ONLY COINCIDENTALLY SHARED, pre-#2252-Stage-1.3, the same tuple
+# as CASCADE_RELATIONS. #2252 Stage 1.3 (now landed) removed `cascade` from
+# `supported_by`, so the two sets are no longer even numerically equal —
+# CASCADE_RELATIONS is now the strict subset {derives_from}, while this
+# constant deliberately still includes `supported_by` for citation-coverage
+# purposes. Had this constant been derived from CASCADE_RELATIONS instead of
+# hand-enumerated, the uncited-observation metric would have silently changed
+# meaning on the day Stage 1.3 landed, with no test to catch it — the
+# now-realized divergence is exactly why it stays hand-enumerated.
+# TODO(#1991): whether "uncited by derives_from/supported_by" is even a GOOD
+# health metric is deliberately deferred to the health-score epic's design.
+#
+# #2349 blocker 2: also the ONE-HOP PREMISE relation set — `_direct_premise_ids`
+# below ranges over this constant (not a second, separately-hand-enumerated
+# `('derives_from', 'supported_by')` literal, which is what it did before this
+# fix and which is why it could not see an `acknowledged_derives_from` premise).
+# `acknowledged_derives_from` belongs here for the same reason `derives_from`
+# and `supported_by` do: it is a genuine one-hop premise relation (the
+# acknowledgement path writes it, and its EDGE_CLASSIFICATIONS entry carries
+# `provenance: True`) — a node that has acknowledged once holds a real premise
+# that neither the citation-coverage query nor `_direct_premise_ids` could see
+# without this addition. Do NOT narrow this constant to CASCADE_RELATIONS
+# instead (that is a DIFFERENT, narrower question — "which edges conduct a
+# cascade" — and would drop `supported_by`, which citation-coverage needs).
+CITATION_SUPPORT_RELATIONS = frozenset(
+    {"derives_from", "supported_by", "acknowledged_derives_from"}
+)
+_CITATION_SUPPORT_RELATIONS_SORTED = sorted(CITATION_SUPPORT_RELATIONS)
+_CITATION_SUPPORT_RELATION_PLACEHOLDERS = ",".join(
+    "?" * len(_CITATION_SUPPORT_RELATIONS_SORTED)
+)
+
+
+# Relation minted for the prediction -> observation_predictive pairing edge
+# (#2252 W6, split out of supported_by). Single-relation frozenset, defined
+# here so the string 'predicted_by' has exactly one home — consumers read
+# this constant (or the helper below), never a hand-listed literal.
+PREDICTION_PAIRING_RELATIONS = frozenset({"predicted_by"})
+_PREDICTION_PAIRING_RELATIONS_SORTED = sorted(PREDICTION_PAIRING_RELATIONS)
+_PREDICTION_PAIRING_PLACEHOLDERS = ",".join("?" * len(_PREDICTION_PAIRING_RELATIONS_SORTED))
+
+
+def prediction_pairing_exemption_sql(target_col: str = "n.id") -> "tuple[str, tuple[str, ...]]":
+    """NOT-EXISTS SQL fragment + params: is `target_col` prediction-paired?
+
+    Shared by the citation-coverage checks in engram_stats.py
+    (``uncited_observations``) and engram_lifecycle.py (weak-grounding
+    sweep) — #2252 W6. A prediction-paired observation counts as cited even
+    though nothing points at it via CITATION_SUPPORT_RELATIONS (predictions
+    are non-claim-bearing and never derive_from / cite anything back). This
+    exemption clause was verbatim-duplicated across both modules with a
+    hardcoded ``relation = 'supported_by'`` literal before the W6 split;
+    unified here on PREDICTION_PAIRING_RELATIONS so a future rename of the
+    pairing relation cannot silently break either site.
+
+    Args:
+        target_col: the column reference for the observation node's id in
+            the caller's query (both current callers alias the node table
+            as ``n``, so the default ``"n.id"`` covers both). A column
+            reference cannot be a bound SQL parameter, so it is interpolated
+            via f-string rather than passed as data — the identifier-shape
+            guard below is the substitute for parameterization on this one
+            argument (colleague review, #2252 W6): both current callers pass
+            a constant and the default is a literal, so there is no live
+            exposure today, but the guard closes the door on a future caller
+            passing something dynamic that would look ordinary at the call
+            site.
+
+    Returns:
+        (sql_fragment, params) — embed the fragment (already-parenthesized
+        ``NOT EXISTS (...)``) into the caller's larger query via an f-string,
+        and append `params` to the caller's own params tuple in the position
+        the fragment appears.
+
+    Raises:
+        ValueError: if `target_col` is not a bare SQL identifier or
+            `table.column` reference.
+    """
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?", target_col):
+        raise ValueError(
+            f"target_col must be a bare SQL identifier or table.column, got {target_col!r}"
+        )
+    sql = (
+        "NOT EXISTS (\n"
+        "                  SELECT 1 FROM edges e\n"
+        f"                  WHERE e.target_id = {target_col} AND e.relation IN ({_PREDICTION_PAIRING_PLACEHOLDERS})\n"
+        "                  AND e.source_id IN (SELECT id FROM nodes WHERE type = 'prediction')\n"
+        "              )"
+    )
+    return sql, tuple(_PREDICTION_PAIRING_RELATIONS_SORTED)
 
 
 # ── Edge tier taxonomy ───────────────────────────────────────────────────────
@@ -657,58 +947,86 @@ EDGE_CLASSIFICATIONS = {
 # (the three-tier edge taxonomy: dependency / relational / classification).
 # Maintained as a SEPARATE dict from
 # EDGE_CLASSIFICATIONS so that existing consumers of that dict (which iterate
-# its schema of {cascade, dag_check, removable, addable_after_creation,
-# provenance}) are not affected.
+# its schema of {cascade, temporal_causal, dag, removable,
+# addable_after_creation, provenance}) are not affected.
 #
-# Tier→dag_check expectation:
-#   dependency     ⇒ dag_check=True   (causal / provenance chain; temporal order matters)
-#   relational     ⇒ dag_check=False  (symmetric or cross-temporal; no causal direction)
-#   classification ⇒ dag_check=False  (realization / membership; no temporal constraint)
+# Tier→temporal_causal expectation (#2357 renamed dag_check→temporal_causal;
+# this tier map is about creation-order, not the newer `dag` acyclicity flag
+# — see EDGE_CLASSIFICATIONS's own header comment for why the two split):
+#   dependency     ⇒ temporal_causal=True   (causal / provenance chain; temporal order matters)
+#   relational     ⇒ temporal_causal=False  (symmetric or cross-temporal; no causal direction)
+#   classification ⇒ temporal_causal=False  (realization / membership; no temporal constraint)
 #
-# NOTE on subtask_of: tiered "dependency" (dag_check=True) deliberately.
+# NOTE on subtask_of: tiered "dependency" (temporal_causal=True) deliberately.
 # A subtask generally post-dates its parent goal/task, making the DAG check
 # correct in the common case. The rare task-reorg inversion (old task becomes
 # subtask of a newer umbrella) has 0 current violations, so it stays checked.
 # This is a watch item, not a divergence requiring acknowledgment.
 #
 # AUDIT SURFACE (not enforcement): test_edge_tier_audit.py uses this map to
-# warn on unintended drift between dag_check flags and tier expectations.
+# warn on unintended drift between temporal_causal flags and tier expectations.
 # Divergence emits a warnings.warn for human review — never a hard failure.
 # A relation MAY intentionally diverge (see EDGE_TIER_DIVERGENCE_ACK below).
 EDGE_TIERS: dict[str, str] = {
-    # dependency tier: causal / provenance edges; dag_check=True expected
+    # dependency tier: causal / provenance edges; temporal_causal=True expected
     "cites":        "dependency",
     "derives_from": "dependency",
+    "acknowledged_derives_from": "dependency",  # #2013 §12.5: a genuine
+                                    # provenance edge (it records where a
+                                    # node's ground now sits), so the tier
+                                    # is right — but it's deliberately
+                                    # temporal_causal=False (#2357 renamed
+                                    # the old dag_check flag to
+                                    # temporal_causal), an INTENTIONAL
+                                    # divergence acknowledged in
+                                    # EDGE_TIER_DIVERGENCE_ACK below.
     "retracts":     "dependency",
     "supersedes":   "dependency",
     "supported_by": "dependency",
     "subtask_of":   "dependency",
-    # relational tier: symmetric / cross-temporal; dag_check=False expected
+    "predicted_by": "dependency",  # #2252 W6: same provenance-chain shape as
+                                    # supported_by, which it is split out of.
+    # relational tier: symmetric / cross-temporal; temporal_causal=False expected
     "contradicts":  "relational",
     "tensions":     "relational",
     "about":        "relational",
     "resolves":     "relational",   # epistemic-stance edge: a resolution closes a question/contradiction (pairs with contradicts), not a realization/membership
-    # classification tier: realization / membership; dag_check=False expected
+    # classification tier: realization / membership; temporal_causal=False expected
     "instantiates": "classification",
     "serves":       "classification",
     "exemplifies":  "classification",
 }
 
 # Intentional-divergence acknowledgment table.
-# If a relation's dag_check flag intentionally diverges from its tier's
+# If a relation's temporal_causal flag intentionally diverges from its tier's
 # expectation, add it here with a short reason string. The audit test
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
-# Currently empty — there are no intentional divergences.
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
-    # "<relation>": "<reason for intentional divergence>"
-    # Example (hypothetical):
-    #   "about": "temporarily dag_check=True pending refactor #NNNN"
+    "acknowledged_derives_from": (
+        "#2357: deliberately backwards in creation time — the acknowledging "
+        "node necessarily predates the replacement it acknowledges. Real "
+        "acyclicity is still enforced via dag=True, checked by an edge walk "
+        "rather than the temporal_causal timestamp comparison."
+    ),
 }
 
+# DAG_EXEMPT_RELATIONS: relations exempt from the CREATION-ORDER (temporal_causal)
+# check — the name predates #2357's dag/temporal_causal split and is kept for
+# call-site stability, but every current reader (the startup consistency scan,
+# the generic add_edge_impl timestamp guard) wants the temporal_causal set, not
+# the newer real-acyclicity `dag` set. Do not repoint this at `dag` without
+# updating every reader — the two sets differ (acknowledged_derives_from is
+# temporal_causal=False but dag=True).
 DAG_EXEMPT_RELATIONS = frozenset(
-    r for r, c in EDGE_CLASSIFICATIONS.items() if not c["dag_check"]
+    r for r, c in EDGE_CLASSIFICATIONS.items() if not c["temporal_causal"]
 )
+
+# The set of relations that must be walked for real acyclicity (#2357). Unlike
+# CASCADE_RELATIONS (walked for taint/stale propagation), this set exists
+# purely to bound the cycle-detection walk — see
+# engram_dag_conformance.check_dag_conformance.
+DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
 
 
 _ADDABLE_AFTER_CREATION_RELATIONS = frozenset(
@@ -1621,6 +1939,296 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
+# The four nodes_fts sync-trigger names, single-sourced so
+# _recreate_fts_sync_triggers and any standalone DROP-before-rebuild step
+# (migration rung 4, below) can't drift apart on the name list itself.
+_FTS_SYNC_TRIGGER_NAMES = (
+    "nodes_fts_insert",
+    "nodes_fts_delete",
+    "nodes_retract_remove_from_fts",
+    "nodes_fts_supersede_remove",
+)
+
+
+def _recreate_fts_sync_triggers(
+    conn: sqlite3.Connection, cols: list[str], drop_first: bool
+) -> None:
+    """Build and (re)create the four nodes_fts sync triggers for `cols`.
+
+    Shared by two call sites that used to carry independently-written copies
+    of these four CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
+    reviewer-flagged duplication):
+
+      - the always-run setup block above (`drop_first=False` — no DROP here;
+        uses `CREATE TRIGGER IF NOT EXISTS` so a trigger already created by a
+        prior call/process is left alone rather than being blindly recreated).
+      - migration rung 4 below (`drop_first=True` — the caller has ALREADY
+        dropped the four triggers via `_FTS_SYNC_TRIGGER_NAMES` before
+        delegating to `engram_backup.rebuild_fts_index` — see the ordering
+        comment at that call site for why the drop must happen before, not
+        during, this function's own call, which runs only after the FTS
+        table has actually been rebuilt to `cols`' shape. `drop_first=True`
+        here re-drops (idempotent no-op — the triggers are already gone) and
+        then issues a plain, non-`IF NOT EXISTS` `CREATE TRIGGER`, so a stale
+        trigger body from an earlier, differently-shaped `cols` cannot survive
+        under an `IF NOT EXISTS` no-op the way it could at the always-run
+        site.
+
+    Every OperationalError from an individual CREATE TRIGGER call is
+    swallowed, matching the always-run block's pre-existing per-trigger
+    try/except (a trigger that already exists in the exact target shape is
+    not an error worth surfacing here).
+    """
+    trig_cols_sql = ", ".join(cols)
+    new_vals_sql = ", ".join(f"new.{c}" for c in cols)
+    old_vals_sql = ", ".join(f"old.{c}" for c in cols)
+    old_coalesce_sql = ", ".join(f"COALESCE(OLD.{c}, '')" for c in cols)
+
+    if drop_first:
+        for _trig_name in _FTS_SYNC_TRIGGER_NAMES:
+            conn.execute(f"DROP TRIGGER IF EXISTS {_trig_name}")
+
+    create_clause = "CREATE TRIGGER" if drop_first else "CREATE TRIGGER IF NOT EXISTS"
+
+    trigger_sqls = [
+        f"""
+        {create_clause} nodes_fts_insert AFTER INSERT ON nodes BEGIN
+            INSERT INTO nodes_fts(rowid, {trig_cols_sql})
+            VALUES (new.rowid, {new_vals_sql});
+        END
+        """,
+        f"""
+        {create_clause} nodes_fts_delete AFTER DELETE ON nodes BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', old.rowid, {old_vals_sql});
+        END
+        """,
+        # Retract trigger (#274, round-2 #280; design rev 2026-07-02 #195 adds
+        # the OLD.is_current=1 guard — see the always-run block's own comment
+        # above for the full rationale, kept there rather than duplicated here).
+        f"""
+        {create_clause} nodes_retract_remove_from_fts
+        AFTER UPDATE OF status ON nodes
+        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
+          AND OLD.is_current = 1
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+        # Supersede trigger (#195, design rev 2026-07-02) — see the
+        # always-run block's own comment above for the full rationale.
+        f"""
+        {create_clause} nodes_fts_supersede_remove
+        AFTER UPDATE OF is_current ON nodes
+        WHEN NEW.is_current = 0 AND OLD.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+    ]
+
+    for trigger_sql in trigger_sqls:
+        try:
+            conn.execute(trigger_sql)
+        except sqlite3.OperationalError:
+            pass
+
+
+# ── #2181: pre-migration backup ─────────────────────────────────────────────
+# A migration-keyed binary copy taken because a migration is ABOUT TO RUN —
+# not merely whenever the agent last napped. Migration rung 4 (#2170)
+# rewrites row data in place (claim UPDATE on every feeling_report,
+# drop+rebuild of nodes_fts, full re-embed of every node — measured
+# 5919/7769 blobs changed on a real 7769-node graph), and the existing
+# daily binary ladder (_write_binary_backup, called only from the nap/
+# sleep paths) can be hours stale by the time a migration actually fires.
+def _take_pre_migration_backup_if_pending(
+    conn: sqlite3.Connection,
+    current_user_version: int,
+    latest_version: int,
+) -> bool:
+    """Take a migration-keyed binary backup if `conn` is about to be
+    migrated and has data worth protecting; return whether the caller may
+    proceed with the rungs gated on `current_user_version < latest_version`.
+
+    Contract (the return value IS the guard — callers consult it, they do
+    not re-derive it):
+    - Returns True when it is safe to proceed with the rungs gated on
+      `current_user_version < latest_version` this call: no migration is
+      pending, there is no data yet worth protecting (fresh/empty `nodes`),
+      the backup succeeded, the backup was deliberately skipped via the
+      ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1 escape hatch, or `conn` is an
+      in-memory connection with nothing on disk to copy.
+    - Returns False ONLY when a REQUIRED pre-migration backup was attempted
+      and FAILED. The caller MUST then skip every rung gated on
+      `current_user_version < latest_version` this call (add
+      `and _pre_migration_backup_ok` to each `if current_user_version < N:`
+      rung check) and must NOT advance PRAGMA user_version, so the whole
+      migration retries on the next process startup — current_user_version
+      itself is never mutated by this function; only the caller's own rung
+      bodies ever write PRAGMA user_version, and this return value is what
+      keeps them from doing so on a failed backup.
+
+    This deliberately INVERTS _write_binary_backup's own contract: that
+    function never raises because it must never block a nap. A
+    pre-migration copy is the opposite — the irreversible rewrite the
+    caller is about to run must not proceed without a restore point. A
+    guard placed upstream of an irreversible effect, which the effect can
+    proceed past anyway, is not a guard — it is false assurance.
+    """
+    # Local import (matches this file's established pattern of function-
+    # local `import sys` -- see e.g. lines 174/779/833). No top-of-file
+    # `import sys` exists in this module.
+    import sys
+
+    backup_ok = True
+
+    if current_user_version >= latest_version:
+        return backup_ok
+
+    # Fresh-DB gate: only take the copy when there is data worth
+    # protecting. Every new install, every test fixture, and every CI
+    # run starts at user_version 0 with an empty `nodes` table — taking
+    # a copy on every one of those is pure noise, not safety, and would
+    # fire on every install and every CI run. The `nodes` table is
+    # guaranteed to already exist here: the caller's own CREATE TABLE IF
+    # NOT EXISTS executescript runs before this point, on every call.
+    #
+    # Unknown-therefore-protect: a FAILED read (e.g. a transient
+    # SQLITE_BUSY that would have cleared a moment later) must NOT be
+    # treated as "empty graph" -- that maps a read failure to "nothing
+    # worth protecting" and lets the irreversible rewrite proceed with no
+    # restore point, on exactly the populated graph this function exists
+    # to protect. So an exception here leaves the count unknown (None,
+    # never 0) and falls through to the backup attempt below rather than
+    # to the skip. This composes safely with the rest of the function: if
+    # the DB is genuinely broken (not just transiently locked), the
+    # backup attempt fails too, and the existing failure path
+    # (backup_ok=False -> caller skips its rungs -> user_version
+    # untouched -> clean retry next startup) is what actually protects
+    # the graph -- this is this function's designed safe path, not a new
+    # one. A deliberate override for a truly unreadable/read-only DB
+    # already exists: ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1.
+    try:
+        _pre_mig_row_count = conn.execute(
+            "SELECT COUNT(*) FROM nodes"
+        ).fetchone()[0]
+    except sqlite3.DatabaseError:
+        _pre_mig_row_count = None  # unknown, not "empty" -- see above
+
+    if _pre_mig_row_count == 0:
+        return backup_ok
+
+    if os.environ.get("ENGRAM_SKIP_PRE_MIGRATION_BACKUP") == "1":
+        print(
+            "[_take_pre_migration_backup_if_pending] ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1 "
+            "is set — proceeding with migration from "
+            f"user_version={current_user_version} WITHOUT a "
+            "pre-migration backup. This is a deliberate escape hatch "
+            "(read-only disk / CI); if this was not intentional, "
+            "unset the env var before the next migration attempt.",
+            file=sys.stderr,
+        )
+        return backup_ok
+
+    # Derive the backup SOURCE from `conn` itself, not the module-global
+    # DB_PATH -- `conn` is not guaranteed to be attached to DB_PATH (a
+    # caller may open its own connection to a different file, e.g. a test
+    # fixture). Backing up DB_PATH while migrating a DIFFERENT database
+    # produces a restore point for the wrong graph while the real one gets
+    # rewritten -- false assurance is worse than no assurance at all.
+    # Same idiom the #2080 self-heal above already uses for this exact
+    # reason (PRAGMA database_list, column index 2 = the file path of the
+    # 'main' database).
+    _pre_mig_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+
+    if not _pre_mig_db_path:
+        # Empty path = an in-memory database (":memory:" or a temp DB
+        # never attached to a file). Nothing on disk to copy, nothing to
+        # restore -- skip the backup and let the migration proceed. Do
+        # NOT fall back to DB_PATH here: that would silently reintroduce
+        # the exact bug this branch exists to close, for the one caller
+        # (an in-memory conn) most likely to hit it.
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup "
+            "SKIPPED — the connection being migrated is "
+            "in-memory (no on-disk file to copy). Proceeding "
+            f"with migration from user_version={current_user_version} "
+            "without a restore point; nothing durable is at risk.",
+            file=sys.stderr,
+        )
+        return backup_ok
+
+    _pre_mig_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    _pre_mig_filename = f"pre-migration-v{current_user_version}-{_pre_mig_ts}.db"
+    _pre_mig_result = _write_binary_backup(
+        _pre_mig_db_path,
+        DATA_DIR / "db-backup",
+        max_keep=3,
+        filename=_pre_mig_filename,
+        glob_pattern="pre-migration-*.db",
+    )
+    if "error" in _pre_mig_result:
+        backup_ok = False
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup FAILED "
+            f"({_pre_mig_result['error']!r}) — SKIPPING migration "
+            "rungs this startup, PRAGMA user_version stays at "
+            f"{current_user_version}. The migration will retry "
+            "automatically on the next startup once the backup "
+            "can succeed. To proceed anyway (e.g. read-only "
+            "disk, deliberate CI run), set "
+            "ENGRAM_SKIP_PRE_MIGRATION_BACKUP=1.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[_take_pre_migration_backup_if_pending] pre-migration backup "
+            f"written: {_pre_mig_result.get('path')} "
+            f"({_pre_mig_result.get('bytes')} bytes) before "
+            f"migrating from user_version={current_user_version}.",
+            file=sys.stderr,
+        )
+
+    return backup_ok
+
+
+def _rung_ready(conn: sqlite3.Connection, target: int, backup_ok: bool) -> bool:
+    """Whether migration rung `target` may run right now.
+
+    THE LADDER MUST BE A LADDER. Every rung is an independent `if` gated on
+    `current_user_version`, which is read ONCE at the top of
+    _run_db_one_time_setup — so a rung whose body raised (leaving the version
+    un-bumped, deliberately, so it retries) does NOT stop the rungs after it.
+    Before this helper, a failed rung 4 followed by a successful rung 5 left
+    PRAGMA user_version at 5: rung 4's own retry gate (`< 4`) could then never
+    be true again, and its migration was skipped FOREVER, silently.
+
+    That hazard was invisible while rung 4 was the last one — it needs a
+    successor to bite, which is why adding rung 5 (#2324) is what surfaced it,
+    via test_migration4_fault_injected_rebuild_stays_at_v3_and_does_not_crash_writes.
+    The same latent bug applies to rungs 2-4 over a failed rung 1-3; this
+    helper is applied to all of them, not only the new one.
+
+    Reads the version LIVE rather than trusting the caller's cached copy —
+    that cached value is precisely what cannot see a mid-run failure.
+    Requires `live == target - 1` (not `live < target`), which is the same
+    thing on a healthy ladder — each rung bumps by exactly one, in order — and
+    differs only in the case that matters: a predecessor that did not land.
+
+    EVERY FUTURE RUNG MUST USE THIS. A hand-written
+    `if current_user_version < N and _pre_migration_backup_ok:` reintroduces
+    the skip.
+    """
+    if not backup_ok:
+        return False
+    live = conn.execute("PRAGMA user_version").fetchone()[0]
+    return live == target - 1
+
+
 def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     """Run the one-shot backfill/migration/DAG-check block for `conn`.
 
@@ -1639,6 +2247,15 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     unmarked so the next _get_db() call retries the whole block
     (guard-after-success, not guard-after-attempt).
     """
+    # Local import (matches this file's established pattern of function-local
+    # `import sys` — see e.g. lines 174/779/833). Unconditional at the top of
+    # the function, not nested inside a rung's own `if` block below, because
+    # `sys.stderr` is also used by migration rung 4's own except handlers
+    # further down, which can run on a path (e.g. a fresh, zero-row DB) that
+    # never enters the pre-migration-backup branch that would otherwise be
+    # the only place binding it.
+    import sys
+
     # Create tables
     conn.executescript(
         """
@@ -1710,11 +2327,83 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             last_num INTEGER NOT NULL DEFAULT 0
         );
 
+        -- Cascade machine (engram-alpha#2013) — the unified retract/supersede
+        -- marker. One row per (node_id, cascade_event): every node reached by
+        -- a single retract/supersede's downstream walk gets exactly one
+        -- marker naming that event. Replaces the old ad-hoc
+        -- metadata.stale_by / metadata.tainted_by list fields (#2009).
+        --
+        -- Deliberately thin: severity, immediate_cause, and dead_premises are
+        -- NEVER stored here — all three are derived reads computed from
+        -- (root_op, direct-premise edges, sibling markers of the same event)
+        -- at query time. A cached copy drifts from its source; a derived
+        -- value cannot (Kepler, world crossing seq 1911 — "bind VALUES late;
+        -- record DEPENDENCIES eagerly"). Slice 1 (#2009) ships marking only,
+        -- uniform severity (severity(X, event) = taint if root_op == retract
+        -- else stale, no per-hop attenuation) — the reasoning_type-conductor
+        -- refinement in #2013 §1 is real design reasoning for a LATER slice,
+        -- deliberately deferred (Ariadne, 2026-08-16): narrowing the derive
+        -- function from f(root_op) to f(root_op, path) later touches only
+        -- the derive function + the _validate_premises gate, not this table.
+        --
+        -- resolved rows are NEVER deleted (invariant, not convention) — the
+        -- resolution-time scan for "which of my premises moved in this
+        -- event" works by finding this same event's marker on each premise
+        -- ALREADY resolved; deleting a resolved marker breaks that scan
+        -- silently (Lei, via #2013 comment 2026-08-14T21:23:31Z / Ariadne).
+        --
+        -- OPEN QUESTION, deliberately unresolved (Borges + Ariadne,
+        -- 2026-08-16): the event's marked set is computed once at cascade
+        -- time; if a later repair drops an edge, a node can keep a marker
+        -- for an event that no longer structurally reaches it — nagging
+        -- forever with nothing to adjudicate. One-sided: a newly-ADDED
+        -- premise simply lacks the marker and is correctly excluded, so the
+        -- scan self-heals in that direction only. No confident rule exists
+        -- yet for the drop direction. Do not invent one here — raise it to
+        -- Lei if a build forces the question.
+        CREATE TABLE IF NOT EXISTS cascade_markers (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id                 TEXT NOT NULL REFERENCES nodes(id),
+            cascade_event           TEXT NOT NULL,
+            root_node               TEXT NOT NULL,
+            root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+            status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+            resolution_kind         TEXT CHECK (resolution_kind IN ('superseded', 'acknowledged', 'retracted') OR resolution_kind IS NULL),
+            resolution_replacement_id TEXT,
+            created_at              TEXT NOT NULL,
+            resolved_at             TEXT,
+            -- Backfill provenance (#2324, rung 5). NULL on every marker
+            -- written by a live retract/supersede cascade. On a marker the
+            -- rung-5 migration wrote from retired metadata.stale_by /
+            -- metadata.tainted_by, one of:
+            --   'recovered'      created_at is the ORIGINAL cascade time,
+            --                    recovered from the edit_history
+            --                    stale_flagged/tainted row for this exact
+            --                    (node, root) pair.
+            --   'migration_time' no such row survived; created_at is the
+            --                    migration's own clock.
+            -- Two states rather than one boolean because the spec's demand
+            -- is "never a fabricated timestamp wearing an original's face"
+            -- (#2009 comment 5455009878 §3), and a single backfilled=1 flag
+            -- cannot answer WHICH of the two a given created_at is.
+            backfill_provenance     TEXT CHECK (backfill_provenance IN ('recovered', 'migration_time') OR backfill_provenance IS NULL),
+            -- 1 when the legacy entry this marker came from was unparseable
+            -- or named a root node that no longer exists. The marker is
+            -- written ANYWAY and blocks citation: over-blocking is the
+            -- fail-safe direction, silently skipping is the corruption
+            -- (spec §4). Enumerated in the migration report, never fatal.
+            backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(node_id, cascade_event)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id);
         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
         CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
         CREATE INDEX IF NOT EXISTS idx_nodes_current ON nodes(is_current);
         CREATE INDEX IF NOT EXISTS idx_nodes_evidence_id ON nodes(evidence_id);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status);
+        CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event);
     """
     )
 
@@ -1804,6 +2493,19 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         # cues and future-leverage for facet listing / keyword search / clustering.
         # Format: '["kw1", "kw2", "kw3"]'. NULL on existing rows.
         ("recall_keywords", "TEXT"),
+        # needs_tightening: set true when a write-time recall_summary was soft-accepted
+        # (over the 140-char target but under the 280-char hard cap). Non-blocking
+        # quality flag for the summary-fairy to review/tighten during sleep (#1952 PR1).
+        # NULL/0 on existing rows and on every node created before this field existed.
+        ("needs_tightening", "INTEGER"),
+        # summary_missing: set true when recall_summary was entirely absent/omitted
+        # at write time (distinct from needs_tightening, which means "present but
+        # over the soft limit" — different remediation). Fail-loud-surface flag
+        # (Kepler's ruling, #1952 PR1 round 4): without this, a node with no
+        # summary is silently indistinguishable from one with a fine short
+        # summary, and nothing ever surfaces the gap for the backfill sweep.
+        # NULL/0 on existing rows and on every node created before this field existed.
+        ("summary_missing", "INTEGER"),
         # ── trust tier columns (Layer-1 trust-tier mechanism) ──
         # trust_tier: persisted tier for person (pn_*) nodes. One of:
         #   user_family, our_side, known_external, unknown, suspect.
@@ -1851,6 +2553,26 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         "UPDATE nodes SET trust_tier = 'unknown' WHERE type = 'person' AND trust_tier IS NULL"
     )
 
+    # Lesson-confidence backfill (alpha#2252): lessons are non-claim-bearing
+    # going forward — _add_lesson_impl no longer computes or writes a
+    # confidence value (Q2 in the epic: the honest maturity signal is
+    # core._count_live_exemplars, not a numeric confidence). State-based,
+    # not event-keyed: this runs against every EXISTING lesson row on every
+    # startup, not just newly-created ones, so it actually repairs rows
+    # written before this change — a forward-only write-time-hook fix would
+    # leave pre-existing lesson rows with a stale non-NULL confidence
+    # forever. Idempotent — the WHERE clause skips rows already backfilled,
+    # so re-running is a no-op. Gated on confidence alone, NOT
+    # confidence_history: _add_lesson_impl's INSERT omits confidence_history,
+    # leaving freshly-created rows at the schema default '[]' (NOT NULL) —
+    # gating on either column would re-touch every new lesson on the next
+    # startup, flipping '[]' to NULL for no reason and making "idempotent"
+    # false for the steady state (reviewer-fairy finding on PR #2263).
+    conn.execute(
+        "UPDATE nodes SET confidence = NULL, confidence_history = NULL "
+        "WHERE type = 'lesson' AND confidence IS NOT NULL"
+    )
+
     # Edges migration: add metadata column for optional per-edge annotations
     # (e.g. `exemplifies` note explaining why an incident fits a lesson).
     edge_cols = {r[1] for r in conn.execute("PRAGMA table_info(edges)").fetchall()}
@@ -1886,7 +2608,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         import engram_backup
         _fts_cols_sql = ", ".join(engram_backup.NODES_FTS_COLUMNS)
     except ImportError:
-        _fts_cols_sql = "claim, quoted_text, interpretation, reported_state, trigger_text"
+        _fts_cols_sql = "claim, quoted_text, interpretation, trigger_text, recall_summary, recall_keywords"
     try:
         conn.execute(
             f"""
@@ -1919,25 +2641,47 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         _canonical_fts_cols = list(engram_backup.NODES_FTS_COLUMNS)
         if _existing_fts_cols is not None and _existing_fts_cols != _canonical_fts_cols:
             _fts_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
-            print(
-                f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
-                f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
-                f"canonical {_canonical_fts_cols} — delegating to "
-                "engram_backup.rebuild_fts_index."
-            )
-            # rebuild_fts_index opens its OWN connection to the same file, so
-            # `conn`'s own pending writes (the trust-tier backfill UPDATE
-            # above, and any ALTER TABLE ADD COLUMN backfills before it) must
-            # be flushed first — otherwise the two connections collide over
-            # WAL's single-writer lock and rebuild_fts_index's DROP/CREATE
-            # raises "database is locked", which would silently no-op the
-            # repair under this block's own except-Exception fallback below.
-            # Safe to commit early here: every statement `conn` has issued so
-            # far this call is independently idempotent (see this function's
-            # own docstring), so an early flush changes nothing about retry
-            # safety on a later failure.
-            conn.commit()
-            engram_backup.rebuild_fts_index(_fts_db_path)
+            if not _fts_db_path:
+                # #2186: an in-memory connection (:memory:, or a temp DB
+                # never attached to a file) reports an empty path here.
+                # rebuild_fts_index now refuses an empty path outright
+                # (rather than silently opening an unrelated scratch DB), so
+                # delegating would just raise. That's also the right call on
+                # the merits: this self-heal's whole purpose is repairing a
+                # stale ON-DISK nodes_fts table, which is meaningless for an
+                # in-memory DB — there is nothing to persist-repair; it
+                # either already has the right schema from the CREATE
+                # VIRTUAL TABLE IF NOT EXISTS above, or it doesn't and the
+                # next attempt against this same connection starts fresh
+                # anyway. Skip the delegation cleanly instead of calling
+                # into a guard that would only raise.
+                print(
+                    "[_run_db_one_time_setup] nodes_fts startup self-heal "
+                    "SKIPPED — in-memory or unattached-temp connection "
+                    f"(empty PRAGMA database_list path); existing columns "
+                    f"{_existing_fts_cols} != canonical {_canonical_fts_cols}, "
+                    "but there is no on-disk nodes_fts to repair. #2186."
+                )
+            else:
+                print(
+                    f"[_run_db_one_time_setup] repairing stale nodes_fts on startup "
+                    f"({_fts_db_path}): existing columns {_existing_fts_cols} != "
+                    f"canonical {_canonical_fts_cols} — delegating to "
+                    "engram_backup.rebuild_fts_index."
+                )
+                # rebuild_fts_index opens its OWN connection to the same file, so
+                # `conn`'s own pending writes (the trust-tier backfill UPDATE
+                # above, and any ALTER TABLE ADD COLUMN backfills before it) must
+                # be flushed first — otherwise the two connections collide over
+                # WAL's single-writer lock and rebuild_fts_index's DROP/CREATE
+                # raises "database is locked", which would silently no-op the
+                # repair under this block's own except-Exception fallback below.
+                # Safe to commit early here: every statement `conn` has issued so
+                # far this call is independently idempotent (see this function's
+                # own docstring), so an early flush changes nothing about retry
+                # safety on a later failure.
+                conn.commit()
+                engram_backup.rebuild_fts_index(_fts_db_path)
     except Exception as _fts_selfheal_err:
         # engram_backup unavailable, or the repair itself failed — non-fatal
         # (a startup self-heal must never block server startup), but LOUD:
@@ -1979,81 +2723,34 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             pass  # creation failed — fall back to Python cosine
 
     # Rebuild FTS triggers — safe to run multiple times
-    for trigger_sql in [
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_insert AFTER INSERT ON nodes BEGIN
-            INSERT INTO nodes_fts(rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES (new.rowid, new.claim, new.quoted_text, new.interpretation, new.reported_state, new.trigger_text);
-        END
-        """,
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_delete AFTER DELETE ON nodes BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', old.rowid, old.claim, old.quoted_text, old.interpretation, old.reported_state, old.trigger_text);
-        END
-        """,
-        # Retract trigger (#274, round-2 #280): remove retracted nodes from FTS.
-        # Fires on AFTER UPDATE OF status when status transitions INTO 'retracted',
-        # regardless of whether the node was current or already-superseded at the
-        # time of retraction. The COALESCE guard prevents double-delete on idempotent
-        # re-retracts (FTS5 'delete' magic-insert is NOT idempotent — double-delete
-        # raises "database disk image is malformed").
-        #
-        # Design rev 2026-07-02 (#195): add AND OLD.is_current = 1.
-        # In the new design nodes_fts_supersede_remove handles FTS eviction when
-        # is_current flips 1→0; by the time a superseded node (is_current already 0)
-        # is retracted, it is already absent from nodes_fts.  Without this guard the
-        # retract trigger would attempt a second FTS 'delete' on an absent rowid,
-        # raising "database disk image is malformed".
-        #
-        # FTS5 contentless-table mechanic: the 'delete' magic-insert requires
-        # OLD column values because the contentless table doesn't store them.
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_retract_remove_from_fts
-        AFTER UPDATE OF status ON nodes
-        WHEN NEW.status = 'retracted' AND COALESCE(OLD.status, '') != 'retracted'
-          AND OLD.is_current = 1
-        BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', OLD.rowid,
-                    COALESCE(OLD.claim, ''),
-                    COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''),
-                    COALESCE(OLD.reported_state, ''),
-                    COALESCE(OLD.trigger_text, ''));
-        END
-        """,
-        # Supersede trigger (#195, design rev 2026-07-02): remove superseded nodes
-        # from the FTS search index when is_current flips to 0.  FTS is a search
-        # index for active recall; superseded nodes remain in the graph and are
-        # reachable via graph traversal and engram_list, but should not surface in
-        # text search results.
-        #
-        # The extra AND COALESCE(NEW.status, '') != 'retracted' prevents a
-        # double-delete when retraction does a combined UPDATE with both
-        # status='retracted' and is_current=0 in one statement: without the guard
-        # both this trigger and nodes_retract_remove_from_fts would fire, and
-        # the second FTS 'delete' raises "database disk image is malformed".
-        """
-        CREATE TRIGGER IF NOT EXISTS nodes_fts_supersede_remove
-        AFTER UPDATE OF is_current ON nodes
-        WHEN NEW.is_current = 0 AND OLD.is_current = 1
-          AND COALESCE(NEW.status, '') != 'retracted'
-        BEGIN
-            INSERT INTO nodes_fts(nodes_fts, rowid, claim, quoted_text, interpretation, reported_state, trigger_text)
-            VALUES ('delete', OLD.rowid,
-                    COALESCE(OLD.claim, ''),
-                    COALESCE(OLD.quoted_text, ''),
-                    COALESCE(OLD.interpretation, ''),
-                    COALESCE(OLD.reported_state, ''),
-                    COALESCE(OLD.trigger_text, ''));
-        END
-        """,
-    ]:
-        try:
-            conn.execute(trigger_sql)
-        except sqlite3.OperationalError:
-            pass
+    #
+    # Column list is single-sourced from engram_backup.NODES_FTS_COLUMNS
+    # (#2077), same as the CREATE VIRTUAL TABLE block above — reuses the
+    # already-computed `_fts_cols_sql` string (split back into a list) rather
+    # than re-importing engram_backup, so this stays correct even on the
+    # (never-expected) import-failure fallback path above. Every nodes_fts
+    # column name is also a `nodes` column name, so new.<col>/old.<col>
+    # references resolve directly without a lookup table.
+    #
+    # Trigger bodies themselves (retract/supersede guards, the FTS5
+    # contentless-table 'delete' magic-insert mechanic, etc.) are built by
+    # the shared _recreate_fts_sync_triggers helper (round-3 fix; #2077's
+    # own duplication flag) — see that function's docstring for the full
+    # per-trigger rationale, previously inlined here and independently
+    # inlined again at migration rung 2 below (nodes_fts_insert,
+    # nodes_fts_delete, and nodes_retract_remove_from_fts, hand-written with
+    # a hardcoded 5-column list rather than routed through this helper) —
+    # NOT rung 4 as an earlier version of this comment said (#2408: the
+    # rung-4 gate opens ~125 lines after the surviving inline copy, so
+    # following this pointer there lands in the wrong block). No guard
+    # pins the two copies together against drifting on the next
+    # column-set change; #2408 tracks finishing the round-3 unification by
+    # routing rung 2 through this helper too.
+    # drop_first=False here: no DROP precedes this call, so CREATE TRIGGER
+    # IF NOT EXISTS is used, matching this block's pre-existing idempotent,
+    # safe-to-run-every-startup behavior.
+    _fts_trig_cols = [c.strip() for c in _fts_cols_sql.split(",")]
+    _recreate_fts_sync_triggers(conn, _fts_trig_cols, drop_first=False)
 
     # One-shot migration (#274): remove existing retracted nodes from the FTS
     # index. Pre-existing retracted nodes were indexed before the trigger above
@@ -2072,7 +2769,31 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # 'integrity-check' command always reports "malformed" on a graph that has
     # retractions — this is expected by design, not a sign of corruption (#781).
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if current_user_version < 1:
+
+    # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
+    # below (currently rung 5 -> PRAGMA user_version = 5). No single named
+    # constant exists elsewhere in this function for "the latest schema
+    # version" — each rung below hardcodes its own target inline — so this
+    # local mirrors that existing convention rather than inventing a new
+    # module-level constant this PR would be the only user of. Bump this
+    # alongside adding any future rung 6. (Mechanically checked against the
+    # rungs' own PRAGMA user_version = N literals by
+    # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
+    # — forgetting the bump fails loudly at test time instead of silently
+    # skipping the new rung's backup.)
+    _PRE_MIGRATION_LATEST_VERSION = 5
+
+    # See _take_pre_migration_backup_if_pending's docstring for the full
+    # contract (what True/False mean, why the failure posture is inverted
+    # from _write_binary_backup's own never-raise contract).
+    # `and _pre_migration_backup_ok` on every `if current_user_version < N:`
+    # rung check below is what makes a failed backup actually block the
+    # rungs it guards.
+    _pre_migration_backup_ok = _take_pre_migration_backup_if_pending(
+        conn, current_user_version, _PRE_MIGRATION_LATEST_VERSION
+    )
+
+    if _rung_ready(conn, 1, _pre_migration_backup_ok):
         try:
             conn.execute(
                 """
@@ -2106,7 +2827,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Strategy: drop vocab↔fts dependency chain, rebuild both, backfill all
     # non-retracted nodes into the new 5-column schema, recreate triggers.
     # Gated by user_version so it runs exactly once.
-    if current_user_version < 2:
+    if _rung_ready(conn, 2, _pre_migration_backup_ok):
         try:
             # Drop in dependency order: vocab depends on FTS, FTS is the target.
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
@@ -2193,7 +2914,7 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     #   b. Trigger: nodes_fts_supersede_remove is created at setup time (above)
     #      via CREATE TRIGGER IF NOT EXISTS; the CREATE here is a no-op safety net
     #      for the path where setup ran before this migration block was added.
-    if current_user_version < 3:
+    if _rung_ready(conn, 3, _pre_migration_backup_ok):
         try:
             conn.execute(
                 """
@@ -2230,6 +2951,488 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             conn.execute("PRAGMA user_version = 3")
         except sqlite3.DatabaseError:
             pass
+
+    # Migration version 4 (#1952 PR2 / #1817, #1875): fold recall_summary +
+    # recall_keywords into the FTS index and the embedding text (#1817), and
+    # backfill the full (untruncated) claim for feeling_report nodes (#1875).
+    # Paired schema+data rung per the team's migration contract (a schema
+    # change and its data migration ship on the SAME PRAGMA user_version
+    # rung, never separately).
+    #
+    # Three pieces, in dependency order — NOTE the order is claim-backfill
+    # THEN fts-reindex THEN re-embed, not the "a/b/c" issue-numbering order
+    # above: nodes_fts is an external-content FTS5 table (content='nodes')
+    # kept in sync only by the four sync triggers below, and NONE of them
+    # fire on a plain UPDATE OF claim — so if the FTS reindex below ran
+    # BEFORE the claim backfill, it would index the OLD (still-truncated)
+    # claim text and there is no later trigger to re-sync it. Caught by this
+    # rung's own migration-check script during implementation (see PR
+    # handoff), not by any pre-existing test.
+    #   1. Claim backfill (#1875) — recompute claim for every feeling_report
+    #      node from its (still-present, deliberately-kept — see #1952 PR2's
+    #      PR description) reported_state column: full text + hedge prefix,
+    #      no truncation. Must run BEFORE the FTS reindex below, or the
+    #      reindex captures stale (truncated) claim text with nothing to
+    #      correct it later.
+    #   2. FTS schema — drop+rebuild nodes_fts to the new 6-column canonical
+    #      set (claim, quoted_text, interpretation, trigger_text,
+    #      recall_summary, recall_keywords — reported_state dropped; see
+    #      NODES_FTS_COLUMNS in engram_backup.py) + recreate the four sync
+    #      triggers with the new column list. Runs against the
+    #      already-corrected claim text from step 1.
+    #   3. Full re-embed (#1817) — every existing embedding was computed
+    #      under the old claim-only formula and is now stale (recall_summary/
+    #      recall_keywords fold in as of this rung; feeling_report nodes
+    #      strip the hedge prefix before embedding). Kepler's design note: a
+    #      graph where some nodes embed summaries and others don't is harder
+    #      to reason about than either uniform state — so this re-embeds
+    #      EVERY node, not just NULL ones. Runs last so it sees both the
+    #      corrected claim (step 1) and the new FTS-adjacent columns.
+    #      Expect real wall-clock time on a large graph; that is expected
+    #      and correct, not a bug to route around.
+    if _rung_ready(conn, 4, _pre_migration_backup_ok):
+        try:
+            import engram_backup
+
+            # 1. #1875 claim backfill — full untruncated text + hedge
+            # prefix, using the SAME formatting _report_feeling_impl now
+            # writes at insert time (engram_tasks.py). reported_state
+            # already stores the stripped text (state_clean was written
+            # into it at insert time), so no additional trimming is needed
+            # here. Must run BEFORE the FTS reindex in step 2 — see the
+            # ordering note above.
+            conn.execute(
+                """
+                UPDATE nodes
+                SET claim = 'I reported feeling: ' || COALESCE(reported_state, '')
+                WHERE type = 'feeling_report'
+                """
+            )
+
+            # Drop the four FTS-sync triggers BEFORE delegating to
+            # rebuild_fts_index below (round-3 fix; reviewer-fairy
+            # fault-injection finding). rebuild_fts_index's own DROP
+            # TABLE/CREATE VIRTUAL TABLE is DDL — SQLite auto-commits DDL
+            # immediately, independent of any surrounding transaction, so it
+            # takes effect even if this rung later raises and the
+            # except-handler below leaves PRAGMA user_version at 3 for
+            # retry. Previously this drop happened AFTER rebuild_fts_index
+            # returned (at the trigger-recreation step further down): if
+            # rebuild_fts_index itself raised — or anything raised between
+            # its return and the old drop site — nodes_fts already had the
+            # new 6-column shape (auto-committed, can't be rolled back)
+            # while these triggers were still the OLD 5-column versions
+            # referencing `reported_state`, a column the rebuilt table no
+            # longer has, so EVERY subsequent node write in that process
+            # raised `OperationalError: table nodes_fts has no column named
+            # reported_state` — only a genuine process restart (which
+            # re-runs this whole rung from scratch against user_version=3)
+            # recovered. Mirrors migration rung 2 above, which already drops
+            # its old triggers before recreating the FTS table with the new
+            # schema: with no triggers active, a mid-rebuild failure leaves
+            # writes silently under-indexed until the retry succeeds — same
+            # failure profile as migration 2 — instead of hard-crashing on a
+            # stale-column reference.
+            for _fts4_trig in _FTS_SYNC_TRIGGER_NAMES:
+                conn.execute(f"DROP TRIGGER IF EXISTS {_fts4_trig}")
+
+            # 2. FTS schema — delegate the drop/detect-mismatch/rebuild/
+            # reindex to rebuild_fts_index, which is already
+            # NODES_FTS_COLUMNS-aware (#2077) and already used by the #2080
+            # startup self-heal above (same calling convention: flush
+            # `conn`'s own pending writes first, since rebuild_fts_index
+            # opens its OWN connection to the same file and the two would
+            # otherwise collide over WAL's single-writer lock — safe to
+            # commit early here for the same reason the self-heal block
+            # above is: every statement `conn` has issued so far this call,
+            # including the claim backfill just above, is independently
+            # idempotent).
+            conn.commit()
+            _fts4_db_path = conn.execute("PRAGMA database_list").fetchone()[2]
+            # Swallow rebuild_fts_index's own stdout print here — from THIS
+            # call site a "repairing under-indexed nodes_fts" mismatch is
+            # ROUTINE and expected (fixing exactly that mismatch is this
+            # rung's entire job), not an anomaly worth alarming callers
+            # about. Left loud for the #2080 self-heal above, where the same
+            # mismatch surfacing on an already-running server IS unexpected
+            # drift worth reporting. Concretely: on a from-scratch install,
+            # rungs 1-4 all fire in a single pass (current_user_version
+            # starts at 0), and rung 2's own frozen, hardcoded 5-column
+            # nodes_fts recreate (do not touch — see hard scope bounds)
+            # means THIS step legitimately finds a mismatch on every fresh
+            # install, not just real upgrades — an unsuppressed print here
+            # broke every caller that treats stdout as a clean
+            # machine-readable channel (e.g. the SessionStart hook's
+            # subprocess-style JSON contract — caught by
+            # tests/test_session_start_hook_mcp_health.py during
+            # implementation, not by any test named in the spec).
+            import contextlib
+            import io as _io
+            with contextlib.redirect_stdout(_io.StringIO()):
+                engram_backup.rebuild_fts_index(_fts4_db_path)
+
+            _fts4_cols = list(engram_backup.NODES_FTS_COLUMNS)
+            _fts4_cols_sql = ", ".join(_fts4_cols)
+
+            # rebuild_fts_index's 'rebuild' step repopulates FTS from every
+            # row in `nodes` (including is_current=0 ones) and its own
+            # cleanup only excludes status='retracted' rows — it has no
+            # is_current awareness. Migration 3 above additionally excludes
+            # superseded (is_current=0, non-retracted) rows from FTS, and
+            # that exclusion does not survive a rebuild_fts_index call
+            # untouched. Reassert it here with the same delete-insert
+            # migration 3 uses (now over the new column set) so this rung
+            # doesn't regress migration 3's guarantee. Safe to run every
+            # time this rung executes, including on a retry after an
+            # earlier failed attempt, because rebuild_fts_index's own
+            # 'rebuild' step, immediately above, unconditionally repopulates
+            # every row first — so the rows targeted below are always
+            # present in the index at this point, never already-absent (the
+            # specific condition that makes FTS5's 'delete' magic-insert
+            # raise "database disk image is malformed").
+            _fts4_select_sql = ", ".join(f"COALESCE({c}, '')" for c in _fts4_cols)
+            conn.execute(
+                f"""
+                INSERT INTO nodes_fts(nodes_fts, rowid, {_fts4_cols_sql})
+                SELECT 'delete', rowid, {_fts4_select_sql}
+                FROM nodes
+                WHERE is_current = 0 AND status != 'retracted'
+                """
+            )
+
+            # Triggers — rebuild_fts_index doesn't touch these, and they
+            # were already dropped above (BEFORE the rebuild, to close the
+            # crash window described there). Recreate them now, after the
+            # reindex work, with the new column set. Shared with the
+            # always-run block via _recreate_fts_sync_triggers (round-3 fix;
+            # was ~370 lines of independently-written duplicate CREATE
+            # TRIGGER bodies) so the two copies cannot drift apart on a
+            # future column-set change. drop_first=True here re-issues the
+            # (already-idempotent, already-no-op) DROP from the loop above,
+            # then a plain CREATE TRIGGER — not IF NOT EXISTS — so a stale
+            # trigger body cannot survive the way it could under the
+            # always-run block's idempotent IF-NOT-EXISTS semantics.
+            _recreate_fts_sync_triggers(conn, _fts4_cols, drop_first=True)
+
+            conn.commit()
+
+            # 3. #1817 full re-embed — must run after steps 1 and 2 so the
+            # embedding text reflects the corrected claim and the new
+            # recall_summary/recall_keywords folding.
+            _reembed_all_nodes(conn)
+
+            # Bump version INSIDE the try block, after every step above has
+            # completed, so a crash partway (e.g. mid re-embed on a large
+            # graph) leaves the gate at 3 and the whole rung retries next
+            # startup rather than being permanently half-applied — matches
+            # rungs 1-3's own retry-safety convention. Every step above is
+            # independently safe to re-run: rebuild_fts_index is idempotent;
+            # DROP+CREATE TRIGGER is idempotent; the claim backfill UPDATE
+            # recomputes the same value; the supersede-cleanup delete-insert
+            # is safe to re-run because rebuild_fts_index's own rebuild step
+            # always runs immediately before it (see above); re-embedding is
+            # idempotent by construction (it overwrites, never appends).
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration4_err:
+            print(
+                f"[_run_db_one_time_setup] migration 4 (#1952 PR2/#1817/#1875) "
+                f"FAILED, will retry on next startup: {_migration4_err!r}",
+                file=sys.stderr,
+            )
+        except ImportError as _migration4_import_err:
+            print(
+                f"[_run_db_one_time_setup] migration 4 FAILED — could not "
+                f"import engram_backup, will retry on next startup: "
+                f"{_migration4_import_err!r}",
+                file=sys.stderr,
+            )
+
+    # ── Migration version 5 (#2324): backfill cascade_markers from the
+    # retired metadata.stale_by / metadata.tainted_by fields ────────────────
+    #
+    # WHY THIS RIDES THE SAME PR AS THE SCHEMA (Lei's directive, relayed by
+    # Kepler on #2009 comment 5455009878): #2009 moves every cascade READER
+    # off metadata onto this table. Ship the schema without the backfill and
+    # there is a state — any graph upgraded from before #2009 — where the
+    # guard consults a marker table that has no rows for legacy taint. The
+    # failure is SILENT and in the dangerous direction: a derivation that
+    # would be blocked goes through, because the guard finds nothing rather
+    # than finding a marker. Measured on the author's own graph at spec
+    # time: 30 current nodes carrying stale_by (35 markers, 5 of them
+    # two-root), every one of them blocked before this PR and unblocked by
+    # a schema-only merge.
+    #
+    # "soft-blocked" is what that measurement said when it was taken, and
+    # it is why the wording here avoids it: those 30 were soft-blocked
+    # under the pre-#2324 world where use_stale could force them through.
+    # TWO rulings, not one — the distinction matters because the first
+    # explicitly PRESERVED the behaviour the second removed. Timestamps
+    # read from the API rather than recalled:
+    #   16:25:14Z  #2009 comment 5455009878 — the backfill spec. Its §7
+    #              required backfilled supersede-rooted markers to stay
+    #              use_stale-overridable, exactly as metadata.stale_by was.
+    #   16:29:55Z  comment 5455057267 — the spec REVISION, 4m41s later,
+    #              which overruled that §7: hard-block both root_ops, no
+    #              use_stale compatibility.
+    #   16:33:31Z  comment 5455098302 — "Reading B", a LATER and separate
+    #              ruling answering a different question: whether a premise
+    #              that is ITSELF superseded (no marker involved) also
+    #              hard-blocks. It does; use_stale retires entirely.
+    # Collapsing any of these into "the same ruling" would erase a
+    # reversal. So they are HARD blocks now. The gap's direction is unchanged and its
+    # severity is worse — a "today" in a comment ages into a lie the moment
+    # the thing it describes moves.
+    # So schema-without-backfill is the bug, and the
+    # migration ladder is the only place that runs exactly once, exactly at
+    # upgrade.
+    #
+    # HONEST RESIDUAL, stated rather than papered over: "atomic" here means
+    # the backfill either fully applies or fully rolls back, and the version
+    # gate only advances on success. It does NOT mean the process refuses to
+    # serve a partially-migrated graph — if the rung fails, the gate stays at
+    # 4, the rung retries next startup, and in between the guard reads an
+    # empty marker table for legacy-tainted nodes. Closing that would mean
+    # either aborting startup (a much larger policy call than this rung) or
+    # keeping a legacy-metadata fallback reader alive (which contradicts
+    # spec §8's "reads move to markers"). Neither is this rung's to decide;
+    # the failure is at least LOUD on stderr, which is what makes it
+    # reportable rather than silent.
+    if _rung_ready(conn, 5, _pre_migration_backup_ok):
+        try:
+            # Defensive column add. No RELEASED version has cascade_markers
+            # at all (it lands in #2009, same PR as this rung), so no user
+            # is owed an ALTER — but a peer who ran the branch before the
+            # provenance columns existed would have the table without them,
+            # and CREATE TABLE IF NOT EXISTS will not add a column to an
+            # existing table. Four lines that turn a hard "no such column"
+            # crash on a colleague's seat into a clean upgrade.
+            _cm_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(cascade_markers)").fetchall()
+            }
+            if "backfill_provenance" not in _cm_cols:
+                conn.execute(
+                    "ALTER TABLE cascade_markers ADD COLUMN backfill_provenance TEXT"
+                )
+            if "backfill_anomaly" not in _cm_cols:
+                conn.execute(
+                    "ALTER TABLE cascade_markers ADD COLUMN backfill_anomaly "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
+            _bf_now = _now()
+            _bf_anomalies: list = []
+
+            # Recover the ORIGINAL cascade timestamp per (node, root) pair
+            # from edit_history, which recorded each downstream marking as
+            # it happened: 'stale_flagged' carries details.stale_premise,
+            # 'tainted' carries details.tainted_by — in both cases the
+            # cascade ROOT, which is exactly the value that was appended to
+            # the metadata list. MIN(timestamp) because a node can be
+            # re-flagged for the same root; the first is the true origin.
+            # Guarded on table existence: edit_history is created further
+            # down in this same function, so on a genuinely fresh DB (which
+            # runs every rung) it does not exist yet. A fresh DB also has no
+            # nodes, so the map being empty there costs nothing.
+            _origin_ts: dict = {}
+            _has_edit_history = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edit_history'"
+            ).fetchone()
+            if _has_edit_history:
+                for _eh in conn.execute(
+                    "SELECT node_id, action, details, timestamp FROM edit_history "
+                    "WHERE action IN ('stale_flagged', 'tainted') ORDER BY id"
+                ).fetchall():
+                    try:
+                        _d = json.loads(_eh["details"] or "{}")
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(_d, dict):
+                        continue
+                    _root = (
+                        _d.get("stale_premise")
+                        if _eh["action"] == "stale_flagged"
+                        else _d.get("tainted_by")
+                    )
+                    if not isinstance(_root, str) or not _root:
+                        continue
+                    _k = (_eh["node_id"], _root)
+                    # ORDER BY id ascending + setdefault = earliest wins.
+                    _origin_ts.setdefault(_k, _eh["timestamp"])
+
+            # The population, per spec §2: is_current=1 nodes only.
+            # Non-current nodes are excluded — they are already uncitable,
+            # which matches the current-only conformance ruling, and marking
+            # them would be blocking something nothing can reach anyway.
+            #
+            # metadata.built_on_stale is NOT in this population, and the
+            # reason in the spec ("a derived echo of stale_by") is wrong
+            # even though the exclusion is right — verified per §2's own
+            # instruction to check rather than assume. built_on_stale lives
+            # on the DERIVING node, is written only by engram_derive's
+            # use_stale=True override path, and records an author's
+            # conscious opt-in. It is author-intent provenance, not cascade
+            # state: an echo could be regenerated from markers, this cannot
+            # be reconstructed from anything, and must survive §8's eventual
+            # removal of the legacy fields.
+            _legacy_rows = conn.execute(
+                "SELECT id, metadata FROM nodes "
+                "WHERE is_current = 1 AND metadata IS NOT NULL AND metadata != ''"
+            ).fetchall()
+
+            def _legacy_roots(meta_blob, node_id):
+                """(root_id, root_op, anomaly) triples for one node's retired
+                cascade metadata. Anomalies are RETURNED, never dropped —
+                spec §4's fail-safe direction: an entry we cannot parse still
+                earns a blocking marker, because over-blocking is recoverable
+                by a human and silent under-blocking is not.
+                """
+                out = []
+                try:
+                    m = json.loads(meta_blob)
+                except (ValueError, TypeError):
+                    return out
+                if not isinstance(m, dict):
+                    return out
+                for _key, _op in (("stale_by", "supersede"), ("tainted_by", "retract")):
+                    v = m.get(_key)
+                    if v is None:
+                        continue
+                    if isinstance(v, list):
+                        if not v:
+                            # An EMPTY list is not a population member. This
+                            # is the exact trap engram_query.py already
+                            # documents against a substring test — '"stale_by":
+                            # [' matches an empty list too. Counting it here
+                            # would make the §5 gate fail on a node that never
+                            # needed a marker.
+                            continue
+                        for x in v:
+                            if isinstance(x, str) and x:
+                                out.append((x, _op, False))
+                            else:
+                                out.append(("__unparseable__", _op, True))
+                    elif isinstance(v, str) and v:
+                        # Never written by any shipped code path, but a
+                        # hand-edited graph could carry it. Treat the string
+                        # as the root AND flag it — the marker blocks, and
+                        # the report names it for a human to confirm.
+                        out.append((v, _op, True))
+                    else:
+                        out.append(("__unparseable__", _op, True))
+                return out
+
+            _node_ids = {r["id"] for r in conn.execute("SELECT id FROM nodes")}
+            _expected_nodes = set()
+            for _r in _legacy_rows:
+                for _root, _op, _anom in _legacy_roots(_r["metadata"], _r["id"]):
+                    _expected_nodes.add(_r["id"])
+                    _dangling = _root not in _node_ids
+                    _anom = _anom or _dangling
+                    # cascade_event is keyed on (op, root), not root alone:
+                    # a root node that was superseded and later retracted can
+                    # reach the same dependent under BOTH ops, and a
+                    # root-only key would collide under UNIQUE(node_id,
+                    # cascade_event) — where OR IGNORE would drop the second
+                    # marker SILENTLY, and the §5 gate (which counts distinct
+                    # node_ids) would not notice.
+                    _event = f"backfill:{_op}:{_root}"
+                    _ts = _origin_ts.get((_r["id"], _root))
+                    conn.execute(
+                        "INSERT OR IGNORE INTO cascade_markers "
+                        "(node_id, cascade_event, root_node, root_op, status, "
+                        " created_at, backfill_provenance, backfill_anomaly) "
+                        "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                        (
+                            _r["id"],
+                            _event,
+                            _root,
+                            _op,
+                            _ts or _bf_now,
+                            "recovered" if _ts else "migration_time",
+                            1 if _anom else 0,
+                        ),
+                    )
+                    if _anom:
+                        _bf_anomalies.append(
+                            f"{_r['id']} {_op} root={_root!r} "
+                            f"({'root node absent from graph' if _dangling else 'unparseable legacy entry'})"
+                        )
+
+            # §5 count gate. _expected_nodes is built from the LEGACY side by
+            # the same scan that drove the inserts; _actual_nodes is read back
+            # out of the table. They are two different reads of two different
+            # stores, which is the point — a gate computed from the insert
+            # loop's own bookkeeping would agree with itself no matter what
+            # the table ended up holding. (This author shipped exactly that
+            # mistake this week on an unrelated sweep: a fix log reported
+            # 83/83 complete while six sites remained, because the site list
+            # was built with a filter that excluded them by construction.)
+            _actual_nodes = {
+                r["node_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT node_id FROM cascade_markers "
+                    "WHERE backfill_provenance IS NOT NULL"
+                ).fetchall()
+            }
+            if _expected_nodes != _actual_nodes:
+                _missing = sorted(_expected_nodes - _actual_nodes)
+                _extra = sorted(_actual_nodes - _expected_nodes)
+                conn.rollback()
+                print(
+                    "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                    "backfill) COUNT GATE FAILED — rolled back, user_version "
+                    f"stays at {current_user_version}, will retry on next "
+                    f"startup. expected {len(_expected_nodes)} nodes, table has "
+                    f"{len(_actual_nodes)}. missing={_missing[:20]} "
+                    f"extra={_extra[:20]}",
+                    file=sys.stderr,
+                )
+            else:
+                # Loud is not the same as fatal (spec §4): anomalies are
+                # enumerated and the migration COMPLETES, because every
+                # anomalous entry already got its blocking marker above.
+                if _bf_anomalies:
+                    print(
+                        "[_run_db_one_time_setup] migration 5 (#2324): "
+                        f"{len(_bf_anomalies)} legacy cascade entries were "
+                        "dangling or unparseable. Each still received a "
+                        "BLOCKING marker (backfill_anomaly=1) — over-blocking "
+                        "is the fail-safe direction. Review each:",
+                        file=sys.stderr,
+                    )
+                    for _a in _bf_anomalies:
+                        print(f"    anomaly: {_a}", file=sys.stderr)
+                _marker_count = conn.execute(
+                    "SELECT COUNT(*) FROM cascade_markers "
+                    "WHERE backfill_provenance IS NOT NULL"
+                ).fetchone()[0]
+                _recovered = conn.execute(
+                    "SELECT COUNT(*) FROM cascade_markers "
+                    "WHERE backfill_provenance = 'recovered'"
+                ).fetchone()[0]
+                print(
+                    "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                    f"backfill): {len(_expected_nodes)} nodes, {_marker_count} "
+                    f"markers ({_recovered} with original timestamps recovered "
+                    f"from edit_history, {_marker_count - _recovered} stamped at "
+                    f"migration time), {len(_bf_anomalies)} anomalies.",
+                    file=sys.stderr,
+                )
+                # Bump INSIDE the try and only after the gate passes, per
+                # rungs 1-4's retry-safety convention. Re-running is a no-op:
+                # every insert is OR IGNORE on UNIQUE(node_id, cascade_event)
+                # and every synthesized event id is deterministic.
+                conn.execute("PRAGMA user_version = 5")
+                conn.commit()
+        except sqlite3.DatabaseError as _migration5_err:
+            print(
+                "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
+                "backfill) FAILED, will retry on next startup: "
+                f"{_migration5_err!r}",
+                file=sys.stderr,
+            )
 
     # ── Diagnostic suite tables (append-only logs) ──────────────────────────
     # edit_history: chronological audit trail of every graph mutation.
@@ -2872,8 +4075,11 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     took literally (nap-only). That was an accidental scope gap, not the
     intent — "every nap" was shorthand for "every checkpoint." The sleep
     boundary is in fact the SINGLE MOST MEANINGFUL measurement point:
-    turn-advance triggers forgetting (decay -> tier demotion) PLUS
-    consolidation (retract/supersede/dream), so the Jaccard ACROSS sleep
+    a full day of new writes has displaced older nodes in the importance rank
+    (forgetting is driven by new writes and recalled reads outranking untouched
+    old ones, not by the turn counter itself — verified 2026-08-21:
+    advance_turn only sets the counter and mutates no node row), PLUS the day's
+    consolidation (retract/supersede/dream) — so the Jaccard ACROSS sleep
     directly answers whether a day's consolidation preserved mental
     continuity — exactly the question the metric exists to watch. Excluding
     it would blind the metric to its own primary use case, and it would
@@ -3014,9 +4220,19 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
 
 
 def _stamp_new_node(conn: sqlite3.Connection, node_id: str,
-                     confidence: float = 0.5, surprise: float = 0.0):
-    """Set importance and compute embedding on a freshly created node."""
-    base = _importance_base_for_node(confidence, surprise)
+                     confidence: float = 0.5, surprise: float = 0.0,
+                     importance_base: float = None):
+    """Set importance and compute embedding on a freshly created node.
+
+    By default, importance_base is derived from confidence/surprise via
+    _importance_base_for_node. Pass importance_base explicitly to anchor a
+    node at a fixed value instead (e.g. cornerstones anchor at 2.0) --
+    confidence/surprise are then ignored for the importance computation,
+    which avoids computing a throwaway interim value the caller would
+    otherwise immediately overwrite [alpha#2250].
+    """
+    base = (importance_base if importance_base is not None
+            else _importance_base_for_node(confidence, surprise))
     turn = _get_current_turn()
     score = _compute_importance(base, turn)
     conn.execute(
@@ -3169,27 +4385,65 @@ def _get_embedding_config() -> dict:
     return {"model": DEFAULT_EMBEDDING_MODEL, "enabled": True}
 
 
+# Mechanical hedge prefix _report_feeling_impl (engram_tasks.py) writes onto
+# every feeling_report claim ("I reported feeling: " + full state text, no
+# truncation as of #1952 PR2/#1875). Duplicated here (not imported from
+# engram_tasks.py — engram_core.py must not depend on engram_tasks.py) so the
+# embedding-text special case below can strip it before embedding; if
+# _report_feeling_impl's prefix ever changes, this literal must change with
+# it in lockstep.
+_FEELING_REPORT_HEDGE_PREFIX = "I reported feeling: "
+
+
 def _embedding_text_for_node(conn: sqlite3.Connection, node_id: str) -> str:
     """Determine the best text to embed for a node.
-    
+
     For observations/derivations/questions: the claim text.
     For evidence: the source title.
     For predictions: the predicted event.
+    For feeling_report: the claim with the mechanical hedge prefix
+        ("I reported feeling: ") stripped — #1817/#1875: the claim is now the
+        FULL untruncated report text, and embedding it WITH the hedge prefix
+        would cluster every feeling_report node on the boilerplate phrase
+        instead of their actual content (Kepler's design note, engram-alpha
+        #1875 comment 2026-08-19T21:52:16Z).
     For contradictions: the description.
+
+    #1817: recall_summary (and, if present, recall_keywords) are folded into
+    the base text computed above — a curated one-line summary/keyword set
+    written specifically to bridge vocabulary gaps previously had ZERO effect
+    on embedding-based retrieval; this makes it load-bearing. recall_keywords
+    is optional/weaker signal per #1817 but cheap to include, so it's folded
+    in whenever present.
     """
     row = conn.execute(
-        "SELECT type, claim, source_title, predicted_event FROM nodes WHERE id = ?",
+        "SELECT type, claim, source_title, predicted_event, "
+        "recall_summary, recall_keywords FROM nodes WHERE id = ?",
         (node_id,),
     ).fetchone()
     if not row:
         return ""
 
     if row["type"] == "evidence":
-        return row["source_title"] or ""
+        base = row["source_title"] or ""
     elif row["type"] == "prediction":
-        return row["predicted_event"] or row["claim"] or ""
+        base = row["predicted_event"] or row["claim"] or ""
+    elif row["type"] == "feeling_report":
+        base = (row["claim"] or "").removeprefix(_FEELING_REPORT_HEDGE_PREFIX)
     else:
-        return row["claim"] or ""
+        base = row["claim"] or ""
+
+    summary = row["recall_summary"]
+    if summary:
+        base = f"{base}\n{summary}" if base else summary
+
+    keywords = _reflect_keywords(row)
+    if keywords:
+        keywords_str = " ".join(str(kw) for kw in keywords if kw)
+        if keywords_str:
+            base = f"{base} {keywords_str}" if base else keywords_str
+
+    return base
 
 
 def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
@@ -3231,7 +4485,40 @@ def _compute_and_store_embedding(conn: sqlite3.Connection, node_id: str):
         pass  # Embedding computation failed — node works fine without it
 
 
-DEDUP_TOP_K = 15                          # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
+def _reembed_all_nodes(conn: sqlite3.Connection) -> int:
+    """One-time full re-embed pass: recompute the embedding for EVERY node.
+
+    Used by migration rung 4 (#1952 PR2 / #1817): _embedding_text_for_node's
+    formula changed (recall_summary/recall_keywords now fold in, and
+    feeling_report nodes strip the hedge prefix before embedding), so every
+    embedding computed under the old claim-only formula is stale. Kepler's
+    design note: a graph where some nodes embed summaries and others don't is
+    harder to reason about than either uniform state — so this touches EVERY
+    row in `nodes`, not just embedding IS NULL ones (unlike
+    tools/engram-regenerate-embeddings.py's restore-path backfill, which is
+    intentionally NULL-only and is_current=1-only).
+
+    Reuses _compute_and_store_embedding per node on the SAME connection (no
+    cross-connection WAL concern here, unlike the FTS rebuild delegation in
+    the migration rung above) rather than batching
+    (tools/engram-regenerate-embeddings.py batches embed_batch calls) —
+    expected to be slower on a large graph but simpler and already-tested.
+    Best-effort per node — silently a no-op when embeddings are disabled/
+    unavailable (ENGRAM_NO_EMBEDDINGS, missing sentence-transformers),
+    matching every other embedding call site.
+
+    Returns the number of node IDs processed (not the number successfully
+    embedded — _compute_and_store_embedding never raises and never reports
+    success/failure back to the caller).
+    """
+    node_ids = [r[0] for r in conn.execute("SELECT id FROM nodes").fetchall()]
+    for node_id in node_ids:
+        _compute_and_store_embedding(conn, node_id)
+    conn.commit()
+    return len(node_ids)
+
+
+DEDUP_TOP_K = 15                        # was 5; the dedup-top-k-floor derivation at sim 0.75 to the dedup-near-miss observation was cut by top_k floor, not similarity floor
 
 
 DEDUP_MIN_SIMILARITY = 0.40               # was 0.50; tight-group recall lifts 65% → 86% at this threshold (precision still 83%)
@@ -3400,38 +4687,233 @@ def _next_id(conn: sqlite3.Connection, node_type: str) -> str:
     return f"{prefix}_{num:04d}"
 
 
-def _verify_durable_write(conn: sqlite3.Connection, node_id: str, claim_field: str = "claim") -> bool:
-    """Post-commit read-back guard (alpha#2074 / #2097, gating v0.4.0-rc1).
+# Durability verdicts returned by verify_write_durability().
+DURABILITY_DURABLE = "durable"
+DURABILITY_NOT_DURABLE = "not_durable"
+DURABILITY_INDETERMINATE = "indeterminate"
 
-    Motivating incident: alpha#1947 (2026-08-07) — during a WAL/shm
-    split-brain window, two observations filed through the degraded server
-    returned full `status: created` success payloads (node id, evidence id,
-    confidence, dedup neighbours) and were then silently lost when the
-    server was replaced. A caller had no way to tell a durable write from a
-    doomed one purely from the returned payload.
 
-    This helper closes that gap: call it on the SAME connection, AFTER
-    conn.commit() returns, to confirm the just-written row is actually
-    readable back and carries real content — not merely that INSERT/commit
-    did not raise. A fresh connection would test the ordinary path (which
-    already works); the guard only matters read back through the connection
-    that did the write.
+def verify_write_durability(
+    conn: sqlite3.Connection, node_id: str, claim_field: str = "claim"
+) -> tuple:
+    """Post-commit dual read-back. Returns (verdict, detail).
 
-    Asserts content, not just existence: a row with an empty claim is what
-    the alpha#1947-class displacement bug produces, so an empty/whitespace
-    claim_field counts as MISSING, same as no row at all.
+    Replaces the boolean `_verify_durable_write` (alpha#2074 / #2097).
+    RENAMED DELIBERATELY: the old name returned a bool, and a caller written
+    as `if not _verify_durable_write(...)` would silently stop firing if this
+    returned a verdict string instead (every non-empty string is truthy). A
+    rename makes any un-updated caller raise AttributeError instead of
+    quietly losing its guard.
+
+    WHY TWO READS (alpha#2193). The single same-connection read this replaces
+    proves the row is VISIBLE to the connection that wrote it -- not that it
+    is DURABLE. Measured, two failure states exist and they are mirror
+    images, so neither read alone is honest:
+
+        state                     same-conn read      fresh-conn read
+        healthy                   sees it             sees it
+        writer-side displaced     sees it  (BLIND)    absent   (correct)
+        reader-side corrupt       sees it  (correct)  raises   (FALSE ALARM)
+
+    The writer-side row is the alpha#2193 incident: a full `status: created`
+    payload for a write that was rolled back, because the guard read back
+    through the one view that was displaced. The reader-side row is the
+    mirror measured on a long-lived connection with churned WAL/shm state:
+    225 consecutive genuinely-durable writes for which a fresh-connection
+    guard would have reported failure.
+
+    Every cell one read gets wrong, the other gets right, so the information
+    needed lives in whether they AGREE -- which a boolean cannot express.
+    Hence three verdicts, and INDETERMINATE is an honest answer rather than a
+    hedge: it means the two views conflict and nothing available at this
+    moment says which is lying. A caller can act on it (re-read after a
+    checkpoint, escalate, refuse to hand back an id it cannot vouch for);
+    it cannot act on a confident wrong answer.
+
+    DO NOT POOL OR CACHE THE SECOND CONNECTION. It is opened fresh per call
+    on purpose. A long-lived second connection is free to develop its own
+    displaced mapping over time -- which is precisely the failure the second
+    read exists to detect. The per-call connect is the mechanism, not an
+    unoptimised implementation detail. Measured cost is +0.139 ms per write
+    against a trivial harness write (5.13x of a 0.034 ms baseline); against a
+    real observation write, which also does embedding, dedup-neighbour search
+    and FTS work, it is noise.
+
+    REJECTED ALTERNATIVE, so it is not re-proposed as an obvious saving:
+    `PRAGMA data_version` is cheaper and does not work. Measured, it does not
+    move at all in the writer-side-displaced state (the incident), and in the
+    reader-side state it reads the same as a healthy write. It answers "has
+    another connection committed since I last looked" -- a foreign-commit
+    detector. The divergence we need to see happens when nobody else has
+    committed, which is exactly where the two questions come apart.
+
+    IN-MEMORY CONNECTIONS degrade to the same-conn read alone, and say so in
+    the detail payload. The path comes from the connection's own
+    `PRAGMA database_list` (column 2), the same idiom the pre-migration
+    backup uses, with the same reasoning: an empty path means in-memory, and
+    falling back to DB_PATH there would open a DIFFERENT database and report
+    every write indeterminate. This reads the connection's configured
+    FILENAME, not its page data, so a displaced mapping does not taint it.
+
+    OPEN QUESTION (alpha#2193, unresolved) -- AND THE MECHANISM IS NAMED
+    rather than merely conceded. A fourth state in which both reads agree and
+    both are wrong is not excluded, and it is not exotic, because THE TWO
+    READS ARE NOT INDEPENDENT INSTRUMENTS. In WAL mode both resolve through
+    the shared wal-index in the -shm file. Two halves, kept apart on purpose
+    because this docstring's whole subject is not overstating evidence:
+
+      MEASURED (the effect) -- 2026-08-25: a second connection saw the
+      first connection's UNCHECKPOINTED commit -- a row VERIFIABLY PRESENT
+      in the raw bytes of the -wal file and VERIFIABLY ABSENT from the raw
+      bytes of the main database file, with a -shm of the expected
+      wal-index size present when the second connection read it.
+      Re-runnable in about twenty lines against a scratch database; it
+      depends on nothing in this codebase's own schema.
+
+      INFERRED (the mechanism) -- from SQLite's documented WAL-index
+      architecture, not instrumented at the shared-memory level: resolving
+      that row is only possible through the shared index. The one competing
+      explanation, SQLite shared-cache mode, is ruled out by measurement
+      rather than by argument: no connection in this codebase sets
+      shared_cache or locking_mode=EXCLUSIVE anywhere.
+
+    The failure class this guard exists to catch is displacement of that very
+    shared component, so the two probes overlap exactly where the failure
+    lives. "The shared index lies to both readers identically" is therefore
+    the EXPECTED mode of a guard whose probes share a dependency, not a
+    strange residual -- where EXPECTED means STRUCTURALLY PREDICTABLE FROM
+    THE DEPENDENCY GRAPH, and explicitly NOT frequently-observed: this state
+    has never been observed at all. Two states ARE measured in which the
+    index misleads exactly one side; misleading both is a difference of
+    degree, not of kind.
+
+    THIS DOES NOT WEAKEN THE DESIGN, and the distinction is the point: the
+    dual read demonstrably discriminates both failure states anyone has
+    measured, so partial independence was sufficient for both real cases.
+    What is not established is EXHAUSTIVENESS. A reader who knows why the
+    hole exists can reason about whether their own situation is inside it; a
+    reader told only "not excluded by any evidence" cannot -- which is the
+    whole reason this paragraph is longer than the one it replaces.
+
+    ONE GENUINELY ORTHOGONAL PROBE EXISTS, recorded so it is not re-derived:
+    integrity_check does not route through the wal-index, and in the
+    alpha#2193 incident it returned ok while the writer's mapping was
+    corrupt. That makes it a candidate TIEBREAK ON THE INDETERMINATE BRANCH
+    ONLY. It is far too expensive for the write path and is not proposed for
+    one.
 
     Returns:
-        True if the row exists and its claim_field is non-empty after
-        stripping whitespace. False otherwise (row missing OR empty claim).
+        (verdict, detail) where verdict is one of DURABILITY_DURABLE,
+        DURABILITY_NOT_DURABLE, DURABILITY_INDETERMINATE, and detail carries
+        `same_conn` / `fresh_conn` (True | False | None-with-error) plus
+        `fresh_conn_error` and `in_memory` when they apply.
     """
-    row = conn.execute(
-        f"SELECT {claim_field} FROM nodes WHERE id = ?", (node_id,)
-    ).fetchone()
-    if row is None:
-        return False
-    value = row[claim_field]
-    return bool(value and str(value).strip())
+
+    def _row_present(c) -> bool:
+        row = c.execute(
+            f"SELECT {claim_field} FROM nodes WHERE id = ?", (node_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        value = row[claim_field] if isinstance(row, sqlite3.Row) else row[0]
+        return bool(value and str(value).strip())
+
+    detail = {}
+
+    # --- read 1: the connection that did the write ---
+    try:
+        same = _row_present(conn)
+    except Exception as exc:  # a writing connection too broken to read itself
+        detail["same_conn"] = None
+        detail["same_conn_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+    detail["same_conn"] = same
+
+    # --- resolve the on-disk path WITHOUT trusting the suspect connection's data ---
+    try:
+        _row = conn.execute("PRAGMA database_list").fetchone()
+        db_file = _row[2] if _row else ""
+    except Exception as exc:
+        # Path resolution FAILED -- which is NOT the same as "the path is
+        # empty because this is in-memory". Falling through to the in-memory
+        # branch here would return a verdict computed from `same` alone while
+        # flagging it `in_memory: True`, i.e. a silent guess wearing a
+        # confident label -- the exact failure this function exists to close.
+        # Found in review of alpha#2236; unreachable in practice (the
+        # same-conn read above already succeeded, so the connection answers
+        # queries), which is why it must be recorded rather than trusted.
+        detail["fresh_conn"] = None
+        detail["db_path_resolution_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+
+    if not db_file:
+        # In-memory: there is no second view to open. Report the degraded
+        # coverage rather than inventing one against the wrong database.
+        detail["in_memory"] = True
+        detail["fresh_conn"] = None
+        return (DURABILITY_DURABLE if same else DURABILITY_NOT_DURABLE), detail
+
+    # --- read 2: a connection that has never seen this write ---
+    fresh_conn = None
+    try:
+        fresh_conn = sqlite3.connect(db_file)
+        fresh_conn.row_factory = sqlite3.Row
+        fresh = _row_present(fresh_conn)
+        detail["fresh_conn"] = fresh
+    except Exception as exc:
+        detail["fresh_conn"] = None
+        detail["fresh_conn_error"] = f"{type(exc).__name__}: {exc}"
+        return DURABILITY_INDETERMINATE, detail
+    finally:
+        if fresh_conn is not None:
+            try:
+                fresh_conn.close()
+            except Exception:
+                pass
+
+    if same and fresh:
+        return DURABILITY_DURABLE, detail
+    if not same and not fresh:
+        return DURABILITY_NOT_DURABLE, detail
+    return DURABILITY_INDETERMINATE, detail
+
+
+def durability_failure_response(verdict: str, detail: dict, id_field: str,
+                                node_id: str, refs: str) -> dict:
+    """Build the caller-facing dict for a non-durable verdict.
+
+    Extracted in review of alpha#2236: the three-way branch and its two long
+    error strings were near-identical copies in _add_observation_impl and
+    _add_conjecture_impl, differing only in the id field name and the issue
+    numbers cited. The PR that introduced the third verdict grew that
+    duplicated surface from a one-line boolean check to a full branch, which
+    is where the next wording tweak would silently drift one copy from the
+    other.
+    """
+    indeterminate = verdict == DURABILITY_INDETERMINATE
+    if indeterminate:
+        error = (
+            "Write COMMITTED but its durability cannot be confirmed: the "
+            "writing connection and a fresh connection DISAGREE about "
+            "whether the row is present, and nothing available here says "
+            "which view is correct. The node id above may or may not "
+            "resolve. Do NOT cite it until re-verified, and do NOT retry "
+            "automatically -- a retry risks a double-write if the row did "
+            "land. Re-read after a checkpoint, or escalate. See alpha#2193."
+        )
+    else:
+        error = (
+            "Write did not verify as durable on read-back after commit -- "
+            "the row is missing or its claim is empty on BOTH the writing "
+            "connection and a fresh one. Do NOT retry automatically; a retry "
+            f"after a partial commit risks a double-write. See alpha#1947, {refs}."
+        )
+    return {
+        "status": "durability_indeterminate" if indeterminate else "failed_not_durable",
+        id_field: node_id,
+        "durability": detail,
+        "error": error,
+    }
 
 
 def _node_to_dict(row: sqlite3.Row) -> dict:
@@ -3549,12 +5031,20 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
                 quote_preview = (n["quoted_text"] or "")[:120]
                 lines.append(f"Source: {n['evidence_id']} | Quote: \"{quote_preview}\"")
                 # Show predictions that depend on this observation (incoming
-                # supported_by; post-direction-fix, observations are targets of
-                # supported_by edges sourced from the predictions they ground).
+                # predicted_by; post-direction-fix, observations are targets of
+                # predicted_by edges sourced from the predictions they ground).
+                # #2252 W6: reads PREDICTION_PAIRING_RELATIONS directly (same
+                # module, no need for the NOT-EXISTS-shaped
+                # prediction_pairing_exemption_sql helper — this is a plain
+                # SELECT, a different call shape) so a future rename of the
+                # pairing relation cannot silently break this display site
+                # the way the pre-W6 hardcoded 'supported_by' literal did
+                # (site missed by the original W6 spec's four-site list; see #2252).
                 edges = conn.execute(
-                    "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'supported_by' "
-                    "AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
-                    (n["id"],),
+                    f"SELECT source_id FROM edges WHERE target_id = ? "
+                    f"AND relation IN ({_PREDICTION_PAIRING_PLACEHOLDERS}) "
+                    f"AND source_id IN (SELECT id FROM nodes WHERE type = 'prediction')",
+                    (n["id"], *_PREDICTION_PAIRING_RELATIONS_SORTED),
                 ).fetchall()
                 for e in edges:
                     lines.append(f"Depended on by: {e['source_id']}")
@@ -3668,21 +5158,36 @@ def _write_binary_backup(
     src_db_path: str,
     backup_dir: Path,
     max_keep: int = 7,
+    filename: str | None = None,
+    glob_pattern: str = "knowledge-*.db",
 ) -> dict:
     """Write a timestamped binary hot-copy of knowledge.db to backup_dir.
 
     Uses sqlite3.Connection.backup() — the same WAL-safe hot-copy approach as
     engram_backup.dump_stripped — so the live database is never locked hard.
 
-    Naming: knowledge-YYYYMMDD.db (one file per calendar day). Idempotent: if a
-    file for today already exists, the write is skipped.
+    Naming: knowledge-YYYYMMDD.db (one file per calendar day) by default. Pass
+    `filename` to write under a caller-chosen name instead (e.g. a
+    migration-keyed pre-migration copy) — defaults to None, i.e. every
+    existing caller is byte-equivalent to before this parameter existed.
 
-    Rotation: after a successful write, all but the max_keep newest files (sorted
-    by mtime) are deleted.
+    Idempotent skip: when `filename` is None, a file for today already
+    existing skips the write. This same-day skip does NOT apply when
+    `filename` is supplied — a caller-supplied name carries its own
+    timestamp and is unique per run by construction, so an exists() skip
+    there could only ever fire on a pathological collision, not a
+    legitimate same-day repeat.
+
+    Rotation: after a successful write, all but the max_keep newest files
+    matching `glob_pattern` (sorted by mtime) are deleted. `glob_pattern`
+    defaults to the daily-ladder pattern; pass a caller-specific pattern
+    (with its own `max_keep`) to give a copy family its own rotation,
+    isolated from the daily ladder's.
 
     Returns:
         {"path": str, "bytes": int, "pruned": int}  — successful write
         {"skipped": "same-day copy exists", "path": str}  — idempotent skip
+            (default-naming mode only; never returned when `filename` is set)
         {"error": str}  — any failure (best-effort: never raises, never blocks nap)
 
     Note: backup_dir (DATA_DIR / "db-backup") should be listed in
@@ -3693,11 +5198,14 @@ def _write_binary_backup(
     dest_path: Path | None = None
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
-        today_str = date.today().strftime("%Y%m%d")
-        dest_path = backup_dir / f"knowledge-{today_str}.db"
+        if filename is not None:
+            dest_path = backup_dir / filename
+        else:
+            today_str = date.today().strftime("%Y%m%d")
+            dest_path = backup_dir / f"knowledge-{today_str}.db"
 
-        if dest_path.exists():
-            return {"skipped": "same-day copy exists", "path": str(dest_path)}
+            if dest_path.exists():
+                return {"skipped": "same-day copy exists", "path": str(dest_path)}
 
         src_conn = sqlite3.connect(src_db_path)
         try:
@@ -3711,9 +5219,9 @@ def _write_binary_backup(
 
         backup_bytes = dest_path.stat().st_size
 
-        # Prune: keep only the max_keep newest files by mtime.
+        # Prune: keep only the max_keep newest files matching glob_pattern, by mtime.
         all_backups = sorted(
-            backup_dir.glob("knowledge-*.db"),
+            backup_dir.glob(glob_pattern),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -4876,6 +6384,179 @@ def _compute_confidence(
     return 0.5  # default
 
 
+# ---------------------------------------------------------------------------
+# Confidence recompute from a node's OWN stored inputs (#2013 slice 4)
+# ---------------------------------------------------------------------------
+# _compute_confidence above is the CREATION-time formula: its caller supplies
+# the inputs (quote_type, supporting_ids, reasoning_type, ...) because at
+# creation the node does not exist yet. The cascade machine needs the same
+# arithmetic pointed at a node that ALREADY exists — #2013 §4, "confidence is
+# ALWAYS recomputed, on every affected node, however its marker resolves".
+#
+# This helper is the bridge: it reads a stored node's own formula inputs back
+# out of the graph and delegates the arithmetic to _compute_confidence. It
+# deliberately does NOT reimplement any of the math — a second copy of the
+# confidence formulas is exactly the divergence _supersede_impl's docstring
+# warns about ("the canonical creation tools are the single source of truth
+# for each node type's confidence math").
+
+# Types whose stored confidence has a runtime creation-time FORMULA that
+# _compute_confidence can reproduce from the node's own stored inputs.
+#
+# Deliberately NOT the whole of CLAIM_BEARING_TYPES, and the two exclusions
+# are different in kind:
+#   - `conjecture` is excluded BY DESIGN: its confidence is clamped at
+#     creation to [0.10, 0.60] and is a judgement, not a formula output
+#     (engram_confidence.py). There is no input set to recompute from.
+#   - `theory` is excluded because the runtime has NO theory creation tool,
+#     so no creation-time formula exists to be the SSoT. The only surviving
+#     implementation (tools/surgical.py::_compute_confidence_for_node, a T3
+#     dev tool) applies a theory-specific x0.90 discount that
+#     _compute_confidence does not. Recomputing a legacy theory node here
+#     would have to pick one of two numbers with no authority for either, so
+#     it picks neither and reports the skip instead. Tracked as a follow-up.
+#
+# Both are reported as `skipped`, never silently left at a stale value — the
+# caller surfaces the disposition so a node the machine did not touch is
+# visible rather than assumed-recomputed.
+CONFIDENCE_RECOMPUTABLE_TYPES = frozenset({
+    "observation_factual",
+    "observation_predictive",
+    "derivation",
+    "axiom",
+})
+
+
+def _recompute_node_confidence(conn: sqlite3.Connection, node_id: str,
+                               *, write: bool = True) -> dict:
+    """Recompute one existing node's confidence from its own stored formula
+    inputs, delegating the arithmetic to _compute_confidence.
+
+    Returns a disposition dict — ALWAYS, never None, and never raises for an
+    ordinary miss:
+        {"node_id", "type", "old": float|None, "new": float|None,
+         "changed": bool, "disposition": str, "reason": str|None}
+
+    `disposition` is one of:
+        "recomputed"       — a new value was computed (and written, if write)
+        "unchanged"        — recomputed to the identical stored value
+        "skipped"          — no creation-time formula for this type, or the
+                             node's own formula inputs are absent/unusable
+        "missing"          — no such node id
+
+    WHY A SKIP IS NOT A FAILURE, and why it is reported rather than swallowed:
+    the alternative to skipping is stamping a fallback number (both existing
+    implementations return a bare 0.5 when inputs are missing). A fallback
+    written into the graph is indistinguishable, afterwards, from a genuinely
+    computed one — so a node whose inputs were missing would end up asserting
+    a confidence nobody derived. Under-writing is visible and recoverable;
+    a silent 0.5 is neither.
+
+    `write=False` makes this a pure read — used to PREVIEW the value a node
+    would carry (#2013 §4's "the confidence the node would carry if
+    superseded — computed, never typed") without touching the graph.
+    """
+    row = conn.execute(
+        "SELECT id, type, confidence, quote_type, metadata FROM nodes WHERE id = ?",
+        (node_id,),
+    ).fetchone()
+    if not row:
+        return {"node_id": node_id, "type": None, "old": None, "new": None,
+                "changed": False, "disposition": "missing",
+                "reason": "no such node"}
+
+    ntype = row["type"]
+    old = row["confidence"]
+
+    def _skip(reason: str) -> dict:
+        return {"node_id": node_id, "type": ntype, "old": old, "new": None,
+                "changed": False, "disposition": "skipped", "reason": reason}
+
+    if ntype not in CONFIDENCE_RECOMPUTABLE_TYPES:
+        return _skip(
+            f"type '{ntype}' has no runtime creation-time confidence formula "
+            f"to recompute from (see CONFIDENCE_RECOMPUTABLE_TYPES)"
+        )
+
+    try:
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+
+    if ntype == "axiom":
+        new = 1.0
+    elif ntype in ("observation_factual", "observation_predictive"):
+        qt = row["quote_type"]
+        if not qt or qt not in CONFIDENCE_MAP:
+            # Guarding this explicitly matters: _compute_confidence falls
+            # THROUGH its quote_type branch when quote_type is absent or
+            # unrecognised, and would then answer from the supporting_ids
+            # branch (or the bare 0.5 default) — a derivation-shaped number
+            # silently stamped on an observation.
+            return _skip(
+                f"observation has no usable quote_type "
+                f"({qt!r}) — nothing to recompute from"
+            )
+        new = _compute_confidence(
+            conn, ntype,
+            quote_type=qt,
+            is_predictive=(ntype == "observation_predictive"),
+            source_class=meta.get("source_class", "external"),
+        )
+    else:  # derivation
+        # The CONFIDENCE formula's input set — deliberately NOT
+        # _direct_premise_ids, which also returns supported_by targets and
+        # answers the cascade's "which premises were affected" question.
+        #
+        # RANGES OVER THE DERIVED CASCADE SET (§12.6), not the `derives_from`
+        # literal, and the widening is load-bearing rather than cosmetic:
+        # `acknowledged_derives_from` is how an acknowledgement records that a
+        # node now also rests on the REPLACEMENT of a superseded premise. If
+        # this read stayed on the literal, that edge would be written and then
+        # never consulted — the recompute would run on the acknowledge path and
+        # find nothing to change, which is exactly the inert behaviour measured
+        # while the edge was deferred (0.833 -> 0.833, changed: []).
+        _rels = sorted(CASCADE_RELATIONS)
+        premise_ids = [
+            r["target_id"] for r in conn.execute(
+                f"SELECT target_id FROM edges "
+                f"WHERE source_id = ? AND relation IN "
+                f"({','.join('?' for _ in _rels)}) "
+                f"ORDER BY target_id",
+                (node_id, *_rels),
+            ).fetchall()
+        ]
+        if not premise_ids:
+            return _skip("derivation has no derives_from premises")
+        have_conf = conn.execute(
+            "SELECT COUNT(*) AS c FROM nodes "
+            f"WHERE confidence IS NOT NULL AND id IN "
+            f"({','.join('?' for _ in premise_ids)})",
+            tuple(premise_ids),
+        ).fetchone()["c"]
+        if not have_conf:
+            return _skip(
+                "no derives_from premise carries a confidence — "
+                "_compute_confidence would answer from its bare default"
+            )
+        new = _compute_confidence(
+            conn, ntype,
+            supporting_ids=premise_ids,
+            reasoning_type=meta.get("reasoning_type"),
+        )
+
+    changed = (old != new)
+    if write and changed:
+        _refuse_ncb_confidence(ntype, new)
+        conn.execute(
+            "UPDATE nodes SET confidence = ? WHERE id = ?", (new, node_id)
+        )
+    return {"node_id": node_id, "type": ntype, "old": old, "new": new,
+            "changed": changed,
+            "disposition": "recomputed" if changed else "unchanged",
+            "reason": None}
+
+
 def _rebuild_incidents_cache() -> dict:
     """Rebuild the error_incidents.json cache from the graph.
 
@@ -5278,6 +6959,202 @@ def _open_contradiction_ids(conn: sqlite3.Connection, node_id: str) -> list:
     return [r["id"] for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# Cascade marker primitives (engram-alpha#2013 / #2009 slice 1)
+# ---------------------------------------------------------------------------
+# Table schema + full design rationale: _init_db's cascade_markers block.
+# These are the CORE-layer primitives (raw table/edge access) — the
+# composed derived reads (_immediate_cause, _dead_premises) and the writer
+# (_write_cascade_marker, _new_cascade_event) live in engram_revision.py
+# (family E) and call back into these via core.X, per the acyclic
+# dependency rule (family imports core; core must never import family).
+
+
+def _direct_premise_ids(conn: sqlite3.Connection, node_id: str) -> list:
+    """The node ids node_id directly derives_from / is supported_by /
+    acknowledged_derives_from — i.e. node_id's own one-hop premises, ranged
+    over CITATION_SUPPORT_RELATIONS (not a second, separately hand-enumerated
+    literal — see that constant's comment for why `acknowledged_derives_from`
+    belongs here). No live caller in engram_core.py itself; the four callers
+    are engram_revision.py's `_immediate_cause`, `_dead_premises`,
+    `_cascade_frontier_node_summary`, and `_cascade_affected_premises`.
+    """
+    rows = conn.execute(
+        f"SELECT target_id FROM edges WHERE source_id = ? "
+        f"AND relation IN ({_CITATION_SUPPORT_RELATION_PLACEHOLDERS})",
+        (node_id, *_CITATION_SUPPORT_RELATIONS_SORTED),
+    ).fetchall()
+    return [r["target_id"] for r in rows]
+
+
+def _pending_markers_for_node(conn: sqlite3.Connection, node_id: str) -> list:
+    """All PENDING cascade markers on node_id, across every cascade_event
+    that has reached it and not yet resolved — the read _validate_premises
+    (MECH-5) gates derivation on. A node can carry markers from more than
+    one concurrent cascade (two markers, per-event not per-node — Lei's
+    model via #2013 §9 / comment 2026-08-14T21:23:31Z).
+    """
+    return conn.execute(
+        "SELECT * FROM cascade_markers WHERE node_id = ? AND status = 'pending' "
+        "ORDER BY created_at",
+        (node_id,),
+    ).fetchall()
+
+
+# Loud-inert shim for the retired use_stale override (#2324 spec revision,
+# commander's ruling 2026-08-28). The parameter is still ACCEPTED so existing
+# callers do not crash, but it has no effect — and a parameter that silently
+# does nothing is a silent fallback, which is the failure mode this notice
+# exists to prevent. Emitted on BOTH paths: in the refusal payload when the
+# guard blocks, and in the success payload when the premises happened to be
+# clean anyway. Full signature removal is #2013 §11 slice-2, which carries its
+# own enumerated reader sweep; it deliberately does not move into this PR.
+USE_STALE_RETIRED_NOTICE = (
+    "use_stale is RETIRED and had no effect on this call. The cascade machine "
+    "replaced the force-through: resolve the premise instead of citing over it "
+    "— for a marker-carrying premise, read its frontier (mode C) and "
+    "adjudicate with engram_cascade_resolve (a plain supersede/retract is "
+    "refused while markers are pending), or cite the successor of a "
+    "superseded one. (Parameter still accepted for compatibility; it is "
+    "removed in a future release.)"
+)
+
+
+def _cascade_marker_severity(root_op: str) -> str:
+    """Slice-1 severity: uniform per root_op, no per-hop conduction.
+    taint for retract, stale for supersede.
+
+    ⚠ THIS IS A CLASSIFICATION LABEL, NOT A BLOCK STRENGTH (#2324 spec
+    revision, 2026-08-28 16:29Z). Both labels now HARD-block a derivation —
+    `use_stale` was retired, so "stale" no longer means "soft". The split is
+    kept because readers genuinely need it: a query warning, the viz colour,
+    and the refusal's own route text all differ between "your premise is
+    downstream of a retraction" and "your premise is downstream of a
+    supersede". Do not re-read this function as answering "can the agent
+    override?" — nothing can, and _validate_premises no longer asks.
+
+    #2013 §1's reasoning_type-conductor
+    refinement (chain conducts taint fully; corroborative attenuates to
+    stale at the junction) is real design reasoning for a LATER slice —
+    deliberately deferred (Ariadne, 2026-08-16, ia seq 5835): this is a
+    strict subset of that richer read (f(root_op) vs f(root_op, path)),
+    and narrowing it later touches only this function and its caller
+    (_validate_premises), never the schema or the writer.
+    """
+    return "taint" if root_op == "retract" else "stale"
+
+
+def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
+    """node_id's pending cascade markers, classified into (tainted_by,
+    stale_by) — each a de-duplicated, order-preserving list of root_node
+    ids. Shared by every reader that needs "which roots is this node
+    tainted/stale because of" (_validate_premises, _extract_warnings,
+    the tainted_still_valid pattern, engram_reflect, health-score/diagnose
+    counts) so the classification logic (severity-per-marker, dedup) lives
+    in exactly one place — reviewer-fairy flagged this as duplicated
+    near-verbatim across 5 call sites in 3 files on #2009's first pass
+    (2026-08-16); this is the fix.
+    """
+    tainted_by: list = []
+    stale_by: list = []
+    for m in _pending_markers_for_node(conn, node_id):
+        root = m["root_node"]
+        if _cascade_marker_severity(m["root_op"]) == "taint":
+            if root not in tainted_by:
+                tainted_by.append(root)
+        else:
+            if root not in stale_by:
+                stale_by.append(root)
+    return tainted_by, stale_by
+
+# RECALL_SUMMARY_TARGET / _SOFT_CAP: the write-time recall_summary contract
+# (#1952 PR1). Distinct from RECALL_SUMMARY_HARD_CAP (200) in
+# tools/recall_summary_validator.py, which governs the OLDER
+# engram_set_recall_summaries batch tool on a separate path — the two are
+# deliberately not unified (see #1952 comment 5-6). Target: agents should aim
+# for ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
+# 280+.
+RECALL_SUMMARY_TARGET = 140
+RECALL_SUMMARY_HARD_REJECT_AT = 280
+
+# Write-time recall_keywords bounds (#1952 PR1) — distinct from the older
+# engram_set_recall_summaries RECALL_KEYWORDS_MIN/MAX (3-5) in
+# tools/recall_summary_validator.py. Never rejects regardless of count —
+# normalization only (trim, dedupe, cap).
+RECALL_KEYWORDS_WRITE_TIME_MAX = 6
+
+
+def _validate_recall_fields(recall_summary: str, recall_keywords) -> tuple:
+    """Validate + normalize write-time recall_summary/recall_keywords (#1952 PR1).
+
+    Returns (validated_summary, validated_keywords, needs_tightening,
+    summary_missing, error).
+
+    Resolution 1 (presence is soft, not a hard gate): an absent/omitted
+    recall_summary is treated as 0 characters, which clean-accepts through
+    the normal length check (0 < 140, no needs_tightening). The input is
+    .strip()'d before any length/absence check, so a whitespace-only summary
+    ("   ") is also treated as absent rather than dodging summary_missing by
+    virtue of a nonzero raw length (Kepler's colleague-review catch on
+    engram-alpha#2157). An absent/omitted recall_keywords normalizes to an
+    empty list — recall_keywords NEVER rejects, regardless of count, even 0
+    after normalization.
+
+    Only case that returns a non-None error: an explicitly-provided
+    recall_summary >= 280 chars (RECALL_SUMMARY_HARD_REJECT_AT) — a real hard
+    gate, unlike the presence question. On error, validated_summary and
+    validated_keywords are both None and the caller must create no node.
+
+    Round 4 (Kepler's ruling, #1952 PR1): absent is NOT clean-equivalent to a
+    fine short summary — it gets its own distinct summary_missing flag so the
+    gap is queryable (a worklist for the dream/backfill pass), the same role
+    needs_tightening plays for over-limit. summary_missing and
+    needs_tightening are mutually exclusive by construction (absence vs.
+    over-limit are different remediations for different states).
+
+    recall_summary three states (mutually exclusive):
+      absent/omitted (0 chars)               -> clean accept, summary_missing=True,  needs_tightening=False
+      1-140 (RECALL_SUMMARY_TARGET)           -> clean accept, summary_missing=False, needs_tightening=False
+      141-279                                 -> soft accept,  summary_missing=False, needs_tightening=True
+      >= 280 (RECALL_SUMMARY_HARD_REJECT_AT)  -> hard reject, error set
+
+    recall_keywords normalization: trim whitespace, drop empties, dedupe
+    (case-sensitive, first-occurrence-wins), cap at 6
+    (RECALL_KEYWORDS_WRITE_TIME_MAX). Non-string elements are dropped rather
+    than rejected (never-rejects contract). A non-list input (including None)
+    normalizes to []. recall_keywords behavior is unchanged from round 3 —
+    no distinct flag for absence; keywords are additive/asymmetric.
+    """
+    summary = (recall_summary if isinstance(recall_summary, str) else "").strip()
+    summary_len = len(summary)
+    needs_tightening = False
+    if summary_len >= RECALL_SUMMARY_HARD_REJECT_AT:
+        return (
+            None, None, False, False,
+            f"recall_summary is {summary_len} chars — the limit is "
+            f"{RECALL_SUMMARY_TARGET}: \"{summary}\""
+        )
+    summary_missing = summary_len == 0
+    if summary_len > RECALL_SUMMARY_TARGET:
+        needs_tightening = True
+
+    raw_keywords = recall_keywords if isinstance(recall_keywords, list) else []
+    keywords: list = []
+    seen: set = set()
+    for kw in raw_keywords:
+        if not isinstance(kw, str):
+            continue
+        trimmed = kw.strip()
+        if not trimmed or trimmed in seen:
+            continue
+        seen.add(trimmed)
+        keywords.append(trimmed)
+        if len(keywords) >= RECALL_KEYWORDS_WRITE_TIME_MAX:
+            break
+
+    return (summary, keywords, needs_tightening, summary_missing, None)
+
+
 def _validate_premises(
     supporting_ids: list,
     conn: sqlite3.Connection,
@@ -5291,8 +7168,11 @@ def _validate_premises(
     the diagnosed-pattern derivation diagnosed.
 
     Rules:
-      - Any premise with metadata.tainted_by → hard block (BLOCKED_TAINTED).
-        No override. Taint means an upstream was retracted (proven wrong).
+      - Any premise carrying a pending retract-rooted cascade marker →
+        hard block (BLOCKED_TAINTED). No override. Taint means an upstream
+        was retracted (proven wrong). Read from the cascade_markers table
+        via _classify_pending_markers, NOT from metadata.tainted_by — that
+        field was retired by #2013/#2009 slice 1 and nothing writes it.
       - Any premise sitting on the open side of an unresolved contradiction
         (a live ct_ node, no resolves closure) AND use_contested=False →
         soft block (BLOCKED_CONTRADICTED, #1654). Agent opts in with
@@ -5300,29 +7180,48 @@ def _validate_premises(
         refutation, so building on it is a deliberate, loudly-marked
         choice, not a hard wall. Checked before stale (a disputed claim is
         a more acute concern than a merely-superseded one).
-      - Any premise with metadata.stale_by AND use_stale=False →
-        soft block (BLOCKED_STALE). Agent opts in with use_stale=True
-        when the upstream update is judged irrelevant to current logic.
+      - Any premise carrying a pending supersede-rooted cascade marker, OR
+        any premise that has ITSELF been superseded → HARD block
+        (BLOCKED_STALE). No override: `use_stale` was retired by #2324 and
+        is accepted-but-inert. The two are reported as separate cases with
+        separate routes — a marker is resolved by superseding/retracting the
+        premise that carries it; a superseded premise is resolved by citing
+        its successor. Same marker-table source as the taint rule above;
+        metadata.stale_by is retired as a store.
       - Mixed taint + (contradicted|stale) → treated as tainted (taint
-        dominates — it is a hard block with no override, and short-
-        circuits both other checks for that premise).
+        dominates and short-circuits both other checks for that premise).
+        Stale is now equally hard, so the precedence between them is about
+        which refusal is most USEFUL to report, not which is stronger;
+        contested remains the only genuinely soft block.
       - Contested and stale are NOT mutually exclusive with each other: a
         premise can be both superseded AND sitting on a still-open
         contradiction (e.g. supersede fires on one side of a live dispute
         without auto-resolving it — issue #229's documented workflow).
-        Both are classified independently, so BOTH overrides
-        (use_contested AND use_stale) must clear before such a premise is
-        allowed through — clearing only one would silently drop the
-        other's guard.
+        Both are still classified independently — see the test that reads
+        stale_ids and contested_ids together — but since #2324 that no
+        longer means "both overrides must clear". There is only ONE
+        override left: such a premise is refused on its staleness no matter
+        what use_contested says, and use_stale cannot lift it. The
+        independence is now about REPORTING (neither classification
+        silently drops the other) rather than about clearing.
 
     Returns:
         (block_response, stale_ids, contested_ids)
-        - block_response: None if premises are clean (or opt-ins cover
-          them). Otherwise a dict ready for json.dumps with a structured
-          block error.
-        - stale_ids: list of premise IDs that are stale (for the caller
-          to stamp metadata.built_on_stale when use_stale=True lets us
-          proceed).
+        - block_response: None if premises are clean, or if the ONE
+          surviving override (use_contested) covers the only thing wrong
+          with them. Singular since #2324: tainted and stale premises
+          block unconditionally. Otherwise a dict ready for json.dumps
+          with a structured block error.
+        - stale_ids: list of premise IDs that are stale. Since #2324 this
+          is ONLY ever non-empty alongside a block_response — the caller
+          that used to stamp metadata.built_on_stale from it no longer
+          exists, because nothing proceeds past a stale premise. NO CALLER
+          READS IT TODAY: _create_derivation is the only production caller
+          and it stopped forwarding the value when the always-empty
+          success-dict key was dropped. It is kept in the return tuple for
+          ONE forward-looking reason — slice 4's acknowledge verb needs
+          exactly this list — so if that plan changes, this becomes dead
+          and should go with it.
         - contested_ids: list of premise IDs sitting on an open
           contradiction (for the caller to auto-stamp
           metadata.built_on_contested when use_contested=True lets us
@@ -5336,19 +7235,21 @@ def _validate_premises(
     contested_ids: list = []
     for sid in supporting_ids:
         row = conn.execute(
-            "SELECT metadata, status, is_current, superseded_by FROM nodes WHERE id = ?",
+            "SELECT status, is_current, superseded_by FROM nodes WHERE id = ?",
             (sid,),
         ).fetchone()
         if not row:
             continue
-        meta = {}
-        if row["metadata"]:
-            try:
-                meta = json.loads(row["metadata"])
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-        tainted_by = list(meta.get("tainted_by") or [])
-        stale_by = list(meta.get("stale_by") or [])
+        # Cascade machine (#2013/#2009 slice 1): tainted_by/stale_by are no
+        # longer read from metadata — they're derived from pending markers
+        # in cascade_markers, uniform severity per root_op (slice-1 scope;
+        # see _cascade_marker_severity's docstring). Reporting root_node
+        # here matches TODAY's shipped semantics exactly: the pre-marker
+        # code always wrote the cascade ROOT's id into tainted_by/stale_by
+        # for every downstream node, never a closer intermediate — so this
+        # is a like-for-like restatement (Borges, #2013 comment
+        # 2026-08-13T19:39:45Z), not a behavior change.
+        tainted_by, stale_by = _classify_pending_markers(conn, sid)
 
         # The premise itself may be the retracted or superseded node (not
         # just downstream of one) — the cascade markers only hit dependents.
@@ -5362,8 +7263,13 @@ def _validate_premises(
             and row["superseded_by"] is not None
             and row["status"] != "retracted"
         )
-        if is_superseded_here and sid not in stale_by:
-            stale_by.insert(0, sid)
+        # Case 2 is tracked SEPARATELY from case 1 (the marker list) rather
+        # than folded into it. Before #2324 both were "stale" with one shared
+        # guidance string, so conflating them cost nothing. Now the refusal
+        # must name a route PER CASE — case 1 resolves by supersede/retract of
+        # the premise itself, case 2 by citing the successor that already
+        # exists — and a single merged list cannot say which applies.
+        superseded_itself = bool(is_superseded_here)
 
         # Taint dominates unconditionally, so only compute contested/stale
         # when the premise isn't already tainted. But contested and stale
@@ -5405,15 +7311,47 @@ def _validate_premises(
                     "open_contradictions": open_ct_ids,
                 })
                 contested_ids.append(sid)
-            if stale_by:
+            if stale_by or superseded_itself:
                 replacement_info = []
+                # Case 1 — sid is DOWNSTREAM of one or more supersedes and
+                # carries their pending markers. Route: resolve sid itself.
                 for old_id in stale_by:
                     drow = conn.execute(
                         "SELECT superseded_by FROM nodes WHERE id = ?", (old_id,)
                     ).fetchone()
                     replacement_info.append({
+                        "case": "cascade_marker",
                         "superseded_id": old_id,
                         "replaced_by_id": drow["superseded_by"] if drow else None,
+                        "route": (
+                            f"a plain supersede/retract on {sid} is refused "
+                            "while it carries pending cascade markers — read "
+                            f"the frontier for {sid} (mode C) and adjudicate "
+                            "each entry with engram_cascade_resolve instead."
+                        ),
+                        "next_call": f"engram_cascade_frontier(node_id={sid!r})",
+                        # resolution_kind is the caller's adjudication choice —
+                        # unknowable at refusal time (unlike the revision-verb
+                        # refusals, which know their own kind). keyword=Ellipsis
+                        # keeps the call-text parseable, unlike a bare `...`.
+                        "then": f"engram_cascade_resolve(node_id={sid!r}, "
+                                f"resolution_kind=...)",
+                    })
+                # Case 2 — sid IS the superseded node. No marker is ever
+                # written here: the cascade walker seeds the superseded node
+                # into `visited` so it cannot mark itself. The route needs no
+                # machine at all, because the successor already exists.
+                if superseded_itself:
+                    replacement_info.append({
+                        "case": "superseded_premise",
+                        "superseded_id": sid,
+                        "replaced_by_id": row["superseded_by"],
+                        "route": (
+                            f"cite the successor {row['superseded_by']} instead "
+                            f"of {sid}. If the successor does not support your "
+                            "derivation, that is information about the "
+                            "derivation, not an obstacle to route around."
+                        ),
                     })
                 stale_premises.append({
                     "id": sid,
@@ -5421,7 +7359,10 @@ def _validate_premises(
                 })
                 stale_ids.append(sid)
 
-    # Taint dominates — block even if use_stale/use_contested=True.
+    # Taint dominates — blocks regardless of any flag. Since #2324 that
+    # is a weaker statement than it used to be: stale blocks regardless
+    # too, and use_stale does nothing at all, so the only flag this line
+    # is really overriding is use_contested.
     if tainted_premises:
         return ({
             "status": "blocked_tainted",
@@ -5436,10 +7377,46 @@ def _validate_premises(
             ),
         }, stale_ids, contested_ids)
 
+    # HARD block since #2324 — `use_stale` is gone as a semantic. Placed
+    # ABOVE the contested check, which inverts the previous order and the
+    # rationale that went with it ("a disputed claim is a more acute concern
+    # than a merely-superseded one"). That rationale was written when stale
+    # was the SOFT one; now stale is hard and contested is the only
+    # remaining soft block, so reporting contested first would hand the
+    # agent an override that cannot actually unblock the call — they would
+    # set use_contested=True and walk straight into a wall nothing clears.
+    # Hard blocks report first because they are the ones that decide the
+    # outcome.
+    if stale_premises:
+        resp = {
+            "status": "blocked_stale",
+            "error": (
+                "BLOCKED_STALE: premise(s) carry an unresolved cascade marker, "
+                "or have themselves been superseded."
+            ),
+            "stale_premises": stale_premises,
+            "guidance": (
+                "This is a hard block — there is no override. Each entry in "
+                "stale_premises carries a per-case `route`: a premise that "
+                "carries a cascade marker is resolved by superseding or "
+                "retracting it; a premise that is itself superseded is resolved "
+                "by citing its successor. Resolving the premise is the point — "
+                "the old force-through let a derivation record a dependency on "
+                "a claim its author already knew had moved."
+            ),
+        }
+        if use_stale:
+            resp["use_stale_retired"] = USE_STALE_RETIRED_NOTICE
+        return (resp, stale_ids, contested_ids)
+
     # #1654 — a premise under an open, unresolved contradiction is a live
     # dispute, not (yet) a refutation. Block by default so new derivations
     # don't silently compound on contested ground; the override is a
-    # deliberate, loudly-marked choice (mirrors use_stale/BLOCKED_STALE).
+    # deliberate, loudly-marked choice. This is now the ONLY soft block:
+    # #2324 retired use_stale, but deliberately did NOT reach use_contested —
+    # a contradiction is a dispute under adjudication, not a cascade
+    # consequence, and nobody has ruled on it (commander's ruling
+    # 2026-08-28, endorsing the distinction explicitly).
     if contested_premises and not use_contested:
         return ({
             "status": "blocked_contradicted",
@@ -5455,18 +7432,6 @@ def _validate_premises(
             ),
         }, stale_ids, contested_ids)
 
-    if stale_premises and not use_stale:
-        return ({
-            "status": "blocked_stale",
-            "error": "BLOCKED_STALE: premise(s) have superseded upstream.",
-            "stale_premises": stale_premises,
-            "guidance": (
-                "Either retry with use_stale=True (writes a "
-                "metadata.built_on_stale audit marker — use when the upstream "
-                "update does not affect your logic), OR cite the replacement "
-                "premise(s) directly via their IDs."
-            ),
-        }, stale_ids, contested_ids)
 
     return (None, stale_ids, contested_ids)
 
@@ -5501,10 +7466,13 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
             roots.add(current)
             continue
 
-        # Follow citation edges backward
+        # Follow citation edges backward. #2252 Stage 1.0b: walked-relation
+        # set DERIVED from PROVENANCE_RELATIONS (the `provenance` flag in
+        # EDGE_CLASSIFICATIONS) instead of hardcoded.
         edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('cites', 'derives_from', 'supported_by')",
-            (current,),
+            "SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND relation IN ({_PROVENANCE_RELATION_PLACEHOLDERS})",
+            (current, *_PROVENANCE_RELATIONS_SORTED),
         ).fetchall()
         for e in edges:
             queue.append(e["target_id"])
@@ -5512,13 +7480,96 @@ def _trace_evidence_roots(conn: sqlite3.Connection, node_id: str, max_depth: int
     return roots
 
 
+def _walk_cascade_upstream(
+    conn: sqlite3.Connection,
+    node_id: str,
+    *,
+    collect_if,
+    descend_if,
+    max_depth: int = 4096,
+) -> set:
+    """Shared upstream (premise-direction) walk over ``CASCADE_RELATIONS``:
+    follows each visited node's own outgoing cascade edges back toward its
+    origins. Mirrors ``engram_revision._walk_cascade_downstream``'s shape
+    (visited-set dedup, per-dequeue budget decrement, caller-supplied
+    per-node decision) for the inverse direction — that walker finds who
+    DEPENDS ON a node (``target_id = node_id``); this one finds what a node
+    DEPENDS ON (``source_id = node_id``).
+
+    For every node reached (starting at ``node_id`` itself), ``collect_if(row)``
+    decides whether to add it to the returned set, and ``descend_if(row)``
+    decides whether to continue the walk past it (query its own outgoing
+    ``CASCADE_RELATIONS`` edges). Both receive the node's ``(id, type)`` row.
+    A dangling/missing node is skipped without collecting or descending.
+
+    ``visited`` dedup happens before either predicate runs, so a node already
+    reached (via any path) is neither re-collected nor re-descended —
+    ``collect_if``/``descend_if`` fire at most once per node, same guarantee
+    ``_walk_cascade_downstream`` documents for ``on_live_node``.
+
+    Two shapes in use:
+      - **Leaf-trace** (``_trace_observation_leaves``, below): ``collect_if`` /
+        ``descend_if`` = is-observation / is-not-observation — terminates AT
+        each observation, reproducing the walk's historical
+        ``{derives_from, supported_by}``-enumerated behavior observably (the
+        walked relation set itself is narrower now — see that function's
+        docstring for the #2298 doctrine this supersedes).
+      - **Full ancestor set** (``collect_if=descend_if=lambda row: True``):
+        the raw transitive closure via ``CASCADE_RELATIONS`` — the shape
+        the #2013 cascade machine's mode-C travel (``ancestors(X) ∩
+        pending``) filters down to a pending-marker subset once the marker
+        table lands (slice 1). That intersection is NOT built here — it is
+        the #2013 slice-3 row (derived reads: frontier, ``ancestors(X) ∩
+        pending``) — this function only supplies the shared ``ancestors(X)``
+        primitive both callers walk with, per #2298 §2's "one traversal, two
+        filters" unification. See ``tests/test_cascade_derived_sets.py``.
+
+    Cost, inherited unchanged from the pre-#2298 ``_trace_observation_leaves``
+    (not a regression here, but worth flagging for the full-ancestor-set
+    consumer above, which may walk far larger subgraphs than a single leaf
+    trace): one SQL query per visited node, and ``queue.pop(0)`` on a plain
+    Python list is O(n) per dequeue. Fine at leaf-trace scale; worth
+    revisiting (indexed deque, batched node lookups) if slice-3's
+    ``ancestors(X)`` runs hot over large subgraphs.
+    """
+    visited: set = set()
+    queue = [node_id]
+    collected: set = set()
+
+    while queue and max_depth > 0:
+        max_depth -= 1
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+
+        node = conn.execute("SELECT id, type FROM nodes WHERE id = ?", (current,)).fetchone()
+        if not node:
+            continue
+
+        if collect_if(node):
+            collected.add(current)
+        if not descend_if(node):
+            continue
+
+        edges = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? "
+            f"AND relation IN ({_CASCADE_RELATION_PLACEHOLDERS})",
+            (current, *_CASCADE_RELATIONS_SORTED),
+        ).fetchall()
+        for e in edges:
+            queue.append(e["target_id"])
+
+    return collected
+
+
 def _trace_observation_leaves(
     conn: sqlite3.Connection, node_id: str, max_depth: int = 4096
 ) -> set:
     """Trace a node back to the OBSERVATION leaves it rests on.
 
-    Walks the derivation spine (``derives_from`` / ``supported_by``) backward
-    and collects nodes of ``type LIKE 'observation_%'`` — the layer where the
+    Walks the premise spine backward via ``_walk_cascade_upstream`` and
+    collects nodes of ``type LIKE 'observation_%'`` — the layer where the
     standpoint axes (author/collection/lineage) and ``quote_type``/``fs_class``
     actually live. Terminates AT each observation: it does NOT descend past an
     observation into its own ``cites``→evidence hops, because evidence nodes
@@ -5532,42 +7583,52 @@ def _trace_observation_leaves(
     The standpoint/F-S leaves are observations, one layer up from evidence.
     (Ariadne #49 — the prior ``_trace_evidence_roots`` reuse was the wrong layer.)
 
-    Mirrors ``_trace_evidence_roots``'s per-visit-budget semantics (``max_depth``
-    decremented per dequeued node, NOT a depth limit; termination guaranteed by
-    ``visited``) for behavioral parity — including the raised budget (#1186): at
-    the former 10 a deep derivation spine truncated the leaf set, which on this
-    (all-or-omit-gated) consumer caused silent under-credit rather than a
+    ``max_depth`` semantics (decremented per dequeued node, NOT a depth limit;
+    termination guaranteed by the walk's own visited-set) are inherited from
+    ``_walk_cascade_upstream`` unchanged, preserving the #1186 raised budget:
+    at the former 10 a deep derivation spine truncated the leaf set, which on
+    this (all-or-omit-gated) consumer caused silent under-credit rather than a
     false-positive, but is the same latent defect.
+
+    **Edge set: derives from ``CASCADE_RELATIONS``, not hand-enumerated
+    (#2298, ruled 2026-08-28) — this SUPERSEDES the #2252 Stage 1.0b / #2255
+    "leave enumerated" doctrine for this walk specifically.** #2255 argued
+    "what counts as a premise" and "does taint propagate here" were different
+    questions that only coincidentally shared a tuple, and that deriving one
+    from the other would let a future ``cascade``-flag change silently
+    redefine premise-hood. Lei's #2298 ruling (aware of that doctrine, per
+    Kepler's #2298 comment) is that post-partition the two questions are the
+    SAME one by construction: a node's evidential lineage is exactly its
+    cascade ancestry, so "premise" should derive from ``cascade``, not merely
+    coincide with it. ``supported_by`` drops out of the walked set as a
+    consequence (``CASCADE_RELATIONS`` is now the strict subset
+    ``{derives_from}``) — behavior-preserving today, though the reason is
+    about the edge's SOURCE, not its target (reviewer-fairy catch, PR #2329:
+    an earlier draft of this note wrongly reasoned from the target side).
+    Every ``supported_by`` edge is minted with a cornerstone or lesson as its
+    SOURCE (``engram_cornerstone.py``'s ``add_cornerstone``/exemplar wiring;
+    the person-supersede migration in ``engram_revision.py``) — its target
+    can be an observation, a derivation, a prior cornerstone, or even a
+    person, so "exemplar" is not a target-type guarantee. What actually
+    matters: cornerstone/lesson are NON-claim-bearing, and ``engram_derive``
+    rejects non-claim-bearing ``supporting_ids`` (``engram_derive.py``'s
+    claim-bearing check), so no ``derives_from`` edge can ever TARGET a
+    cornerstone/lesson. Since this walk only ever visits claim-bearing nodes
+    reached via ``derives_from``, it can never land on a cornerstone/lesson
+    to descend into its own outgoing ``supported_by`` edges — regardless of
+    what those edges point at. Independently re-verified against source, not
+    just the issue's own claim, before this landed.
+    ``CITATION_SUPPORT_RELATIONS`` (the citation-coverage constant) is
+    UNCHANGED and stays hand-enumerated per #2298 §1 — that is a genuinely
+    different question (health-metric semantics), not this one.
     """
-    visited = set()
-    queue = [node_id]
-    leaves = set()
-
-    while queue and max_depth > 0:
-        max_depth -= 1
-        current = queue.pop(0)
-        if current in visited:
-            continue
-        visited.add(current)
-
-        node = conn.execute("SELECT type FROM nodes WHERE id = ?", (current,)).fetchone()
-        if not node:
-            continue
-        if node["type"].startswith("observation"):
-            leaves.add(current)
-            continue  # terminate AT the observation — do not follow its cites→evidence
-
-        # Non-observation (derivation / goal / etc.): follow the premise spine
-        # only — NOT 'cites' (an observation's cites→evidence is the layer we
-        # stop above; a derivation's cites→context is not a premise).
-        edges = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'supported_by')",
-            (current,),
-        ).fetchall()
-        for e in edges:
-            queue.append(e["target_id"])
-
-    return leaves
+    return _walk_cascade_upstream(
+        conn,
+        node_id,
+        collect_if=lambda row: row["type"].startswith("observation"),
+        descend_if=lambda row: not row["type"].startswith("observation"),
+        max_depth=max_depth,
+    )
 
 
 _LINEAGE_RE = re.compile(r"[a-z0-9_-]+:[a-z0-9._-]+")
@@ -6198,6 +8259,10 @@ def _create_derivation(
     use_contested: bool = False,
     extra_meta: Optional[dict] = None,
     history_reason: Optional[str] = None,
+    recall_summary: str = "",
+    recall_keywords: Optional[list] = None,
+    needs_tightening: bool = False,
+    summary_missing: bool = False,
 ) -> tuple:
     """Shared derivation-creation core for engram_derive and engram_resolve.
 
@@ -6219,7 +8284,9 @@ def _create_derivation(
             → reasoning_type default before calling
         context_ids: optional 'cites' targets; missing IDs are silently
             filtered (legacy engram_derive behavior)
-        use_stale: MECH-5 opt-in for stale premises
+        use_stale: RETIRED (#2324) — accepted, inert, and loud about it.
+            NOT an opt-in: stale premises block unconditionally. Passing
+            it only attaches a use_stale_retired notice to the response.
         use_contested: MECH-5 opt-in for premises under an open,
             unresolved contradiction (#1654) — the resolution-pressure
             valve. metadata.built_on_contested is auto-stamped by this
@@ -6229,15 +8296,32 @@ def _create_derivation(
             resolution_status)
         history_reason: optional confidence_history reason string;
             defaults to a generic "Derived (reasoning_type, ...)" line
+        recall_summary: pre-validated write-time recall summary (#1952 PR1) —
+            caller must run it through _validate_recall_fields first; this
+            function does not re-validate, only persists.
+        recall_keywords: pre-validated write-time recall keywords (list),
+            same caveat as recall_summary.
+        needs_tightening: pre-computed soft-accept flag from
+            _validate_recall_fields (140 < len(recall_summary) < 280).
+        summary_missing: pre-computed absent-summary flag from
+            _validate_recall_fields (recall_summary was 0 chars at write
+            time) — mutually exclusive with needs_tightening (#1952 PR1
+            round 4, Kepler's ruling).
 
     Returns:
         (block, success) — exactly one is non-None.
           block: MECH-5 guard response ready for json.dumps when a
-            premise was tainted, contradicted, or stale without opt-in
+            premise was tainted, stale, or contradicted-without-opt-in.
+            Note the opt-in clause attaches ONLY to contradicted since
+            #2324: taint never had an override and stale no longer does.
           success: dict with node_id, confidence, reasoning_type,
-            reasoning_class, stale_ids, contested_ids, structure_warnings,
-            bumped_count, context_nodes
+            reasoning_class, contested_ids, structure_warnings,
+            bumped_count, context_nodes.
+            NO stale_ids — removed in #2324; see the comment on the return
+            dict itself for why, and do not re-add it from this list.
     """
+    # stale_ids is unpacked for position only — see the success dict below
+    # for why this function no longer forwards it anywhere.
     block, stale_ids, contested_ids = _validate_premises(
         supporting_ids, conn, use_stale=use_stale, use_contested=use_contested,
     )
@@ -6257,8 +8341,16 @@ def _create_derivation(
     discount = REASONING_DISCOUNT.get(reasoning_type, 0.95)
 
     derive_meta = {"reasoning_type": reasoning_type, "reasoning_class": rclass}
-    if use_stale and stale_ids:
-        derive_meta["built_on_stale"] = stale_ids
+    # metadata.built_on_stale is NO LONGER WRITTEN (#2324). Its only writer
+    # was the use_stale=True override, and stale is now a hard block — so
+    # stale_ids is non-empty only on a path that already returned a refusal
+    # and never reaches here. The stamp is retired as a WRITE; it stays fully
+    # readable, because every stamp already in a graph records a real past
+    # opt-in and retiring the writer must not retire the record.
+    # NOTE the strip below deliberately still lists built_on_stale: an
+    # author-supplied stamp must stay impossible. Retiring the legitimate
+    # writer would otherwise quietly make the key forgeable through
+    # extra_meta — the opposite of what retiring it is for.
     if use_contested and contested_ids:
         derive_meta["built_on_contested"] = contested_ids
     if extra_meta:
@@ -6280,10 +8372,12 @@ def _create_derivation(
         f"Derived ({reasoning_type}, discount={discount}) from {len(supporting_ids)} premises"
     )
 
+    _refuse_ncb_confidence("derivation", confidence)  # #2252 Stage 1.3 write-path guard
     conn.execute(
         """INSERT INTO nodes (id, type, claim, created_at, logical_chain,
-           confidence, confidence_history, metadata)
-           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?)""",
+           confidence, confidence_history, metadata, recall_summary,
+           recall_keywords, needs_tightening, summary_missing)
+           VALUES (?, 'derivation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             node_id,
             claim,
@@ -6292,6 +8386,10 @@ def _create_derivation(
             confidence,
             json.dumps([{"timestamp": now, "value": confidence, "reason": reason_line}]),
             json.dumps(derive_meta),
+            recall_summary or None,
+            json.dumps(recall_keywords) if recall_keywords else None,
+            1 if needs_tightening else 0,
+            1 if summary_missing else 0,
         ),
     )
 
@@ -6326,7 +8424,19 @@ def _create_derivation(
         "confidence": confidence,
         "reasoning_type": reasoning_type,
         "reasoning_class": rclass,
-        "stale_ids": stale_ids,
+        # "stale_ids" is DELIBERATELY ABSENT (#2324). It used to carry the
+        # premises a use_stale=True override let through; with stale now a
+        # hard block, _validate_premises returns a refusal whenever
+        # stale_premises is non-empty, so this path can only ever have been
+        # reached with an EMPTY list. Shipping an always-[] field reads as
+        # live signal ("we checked, none were stale") when it is really a
+        # tautology, so it is removed rather than left to mislead. Its only
+        # reader — engram_derive's built_on_stale stamp — died with the
+        # override in this same change. Do not re-add it: the list slice 4's
+        # acknowledge verb needs is the one in _validate_premises' RETURN
+        # TUPLE, which is still there and still populated on the block path.
+        # contested_ids stays because use_contested survives, so it can
+        # genuinely be non-empty here.
         "contested_ids": contested_ids,
         "structure_warnings": structure_warnings,
         "bumped_count": bumped_count,

@@ -78,7 +78,14 @@ DEFAULT_DB = Path.home() / ".engram" / "knowledge.db"
 # Node fields fetched from SQLite (read-only)
 # ---------------------------------------------------------------------------
 
-_NODE_COLUMNS = "id, type, claim, quoted_text, interpretation"
+# recall_summary added (#1952 PR3): the cohort now includes needs_tightening
+# nodes (an existing over-limit summary flagged for review), not just
+# summary-absent stragglers — the fairy needs to SEE the existing summary to
+# tighten it rather than regenerate blind. See _build_payload_entry below.
+_NODE_COLUMNS = (
+    "id, type, claim, quoted_text, interpretation, recall_summary, "
+    "predicted_event, resolution_timeframe"
+)
 
 
 class ForeignOwnedFileError(RuntimeError):
@@ -140,17 +147,86 @@ def _fetch_nodes(db_path: Path, node_ids: list[str]) -> list[dict]:
     return [by_id[nid] for nid in node_ids if nid in by_id]
 
 
+
+# Safely-degrading type map for claim fallback (#1966): some node types store
+# their real content in a different column than `claim` — predictions predate
+# the claim-keyed convention the rest of the graph uses, and store their
+# content in `predicted_event` instead. "Safely-degrading" (not
+# "property-based" — a type absent from this map degrades to the pre-#1966
+# behavior, an empty claim, rather than being resolved from some inferred
+# property): extend this map for future types with the same shape; never
+# special-case a type inline in _resolve_claim itself.
+#
+# Upstream coupling, worth stating explicitly: this map's completeness
+# depends on the sleep skill's cohort-selection filter (`type != 'evidence'`,
+# engram-sleep Step 5) already excluding evidence nodes before a payload
+# entry is ever built — evidence nodes are legitimately claim-less by design
+# and are not, and must not become, an entry in this map. If that filter is
+# ever rewritten to be property-based (selecting on claim-emptiness rather
+# than an enumerated type list), it must not key on "claim is empty" alone —
+# that would re-admit evidence nodes into the cohort with no real content to
+# summarize, the opposite of what #1966 fixes for predictions.
+_CLAIM_FALLBACK_FIELD = {"prediction": "predicted_event"}
+
+
+def _resolve_claim(node: dict) -> str:
+    """Resolve the claim-equivalent text for a payload entry (#1966).
+
+    Prefers `claim`. Falls back to a per-type alternate field (see
+    _CLAIM_FALLBACK_FIELD) only when `claim` is empty/NULL and the node's
+    type has a known fallback mapping. A type with no fallback mapping and
+    an empty claim returns "" exactly as before — the required-fields check
+    in cmd_verify_in is what should catch a genuinely claim-less node; this
+    function must not silently invent content for a type nobody has mapped.
+
+    When a fallback fires and the node carries `resolution_timeframe`
+    (predictions only, today), the timeframe is appended to the resolved
+    text — "predicted X, resolves by DATE" is exactly the recall-scent a
+    summary should carry as the resolution window approaches (Kepler,
+    engram-alpha#2226 comment). This folds the timeframe into the claim text
+    rather than adding a separate payload field, since the summary fairy
+    already just reads `claim` and needs no change to pick this up.
+    """
+    claim = node.get("claim") or ""
+    if claim:
+        return claim
+    fallback_field = _CLAIM_FALLBACK_FIELD.get(node.get("type"))
+    if not fallback_field:
+        return ""
+    fallback_value = node.get(fallback_field) or ""
+    if not fallback_value:
+        return ""
+    timeframe = node.get("resolution_timeframe")
+    if timeframe:
+        return f"{fallback_value} (resolves by {timeframe})"
+    return fallback_value
+
+
 def _build_payload_entry(node: dict) -> dict:
-    """Strip fields the fairy must not see (recall_summary, recall_keywords)."""
+    """Build one payload entry, signaling review-mode vs author-mode (#1952 PR3).
+
+    recall_keywords is never included — the fairy always generates fresh
+    keywords regardless of cohort reason.
+
+    recall_summary is included ONLY when the node already has one (a
+    needs_tightening node: an existing over-limit summary flagged for
+    review). Its presence in the payload IS the signal to the fairy: TIGHTEN
+    this existing summary rather than author a fresh one from scratch (see
+    the fairy's agent spec, "Reviewing vs authoring"). A legacy-straggler /
+    summary_missing node (recall_summary IS NULL) gets no recall_summary key
+    at all — author-mode, same as pre-#1952-PR3 behavior.
+    """
     entry: dict = {
         "id": node["id"],
         "type": node["type"],
-        "claim": node["claim"] or "",
+        "claim": _resolve_claim(node),
     }
     if node.get("quoted_text"):
         entry["quoted_text"] = node["quoted_text"]
     if node.get("interpretation"):
         entry["interpretation"] = node["interpretation"]
+    if node.get("recall_summary"):
+        entry["recall_summary"] = node["recall_summary"]
     return entry
 
 
@@ -426,7 +502,13 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
         for entry_idx, entry in enumerate(entries):
             entry_label = f"{chunk_label}/entry[{entry_idx}]"
 
-            # Check 2: required fields
+            # Check 2: required fields. This must NOT gate id-registration
+            # below (#1966): a required-fields failure on e.g. 'claim' used
+            # to silently starve the content-integrity check (Check 3) of
+            # this node's id via a for/else construct, which then made the
+            # content-integrity check misreport a node that was never looked
+            # up as "not found in DB — may have been retracted". Registration
+            # and required-fields validation are now independent passes.
             for field in _VERIFY_REQUIRED_FIELDS:
                 if field not in entry or not isinstance(entry[field], str) or not entry[field].strip():
                     errors.append({
@@ -440,23 +522,24 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                     })
                     break
 
-            else:
-                node_id = entry["id"]
-
-                # Check 4: no duplicate IDs across chunks
-                if node_id in all_ids_seen:
+            # Check 4: no duplicate IDs across chunks. Registration is
+            # unconditional on the entry carrying a usable id string —
+            # independent of whether required_fields (above) passed.
+            entry_id = entry.get("id")
+            if isinstance(entry_id, str) and entry_id.strip():
+                if entry_id in all_ids_seen:
                     errors.append({
                         "chunk": chunk_label,
                         "check": "no_duplicates",
                         "error": (
-                            f"duplicate id '{node_id}' in {chunk_label} also seen in "
-                            f"{all_ids_seen[node_id]}"
+                            f"duplicate id '{entry_id}' in {chunk_label} also seen in "
+                            f"{all_ids_seen[entry_id]}"
                         ),
-                        "node_id": node_id,
-                        "first_seen_in": all_ids_seen[node_id],
+                        "node_id": entry_id,
+                        "first_seen_in": all_ids_seen[entry_id],
                     })
                 else:
-                    all_ids_seen[node_id] = chunk_label
+                    all_ids_seen[entry_id] = chunk_label
 
     # Check 4b: intra-chunk duplicates — targeted per-chunk pass to complement the
     # cross-chunk pass above (which catches the first occurrence in a different chunk
@@ -536,6 +619,11 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
 
         for node_id, (chunk_label, payload_claim) in payload_claims.items():
             if node_id not in db_by_id:
+                # Row genuinely absent from the fetch. After the #1966 fix
+                # above (id-registration decoupled from required-fields),
+                # this branch is only reachable when the row truly isn't in
+                # the DB result set — no longer a false-negative path for a
+                # node whose payload claim happened to be empty.
                 errors.append({
                     "chunk": chunk_label,
                     "check": "content_integrity",
@@ -543,8 +631,30 @@ def cmd_verify_in(args: argparse.Namespace) -> int:
                     "node_id": node_id,
                 })
             else:
-                db_claim = db_by_id[node_id].get("claim") or ""
-                if db_claim.strip() != payload_claim.strip():
+                # Resolve the DB side through the same fallback path as the
+                # payload (#1966): a raw db_by_id[node_id]["claim"] is NULL
+                # for a prediction node by design, which would otherwise
+                # false-fire "claim mismatch" against every payload claim
+                # correctly resolved from predicted_event.
+                db_claim = _resolve_claim(db_by_id[node_id])
+                if not payload_claim.strip() and not db_claim.strip():
+                    # Both sides genuinely empty: a claim-less-by-design node
+                    # (e.g. an unmapped type with no _CLAIM_FALLBACK_FIELD
+                    # entry) reaching this check with nothing to compare.
+                    # This is a cohort-membership question (required_fields
+                    # already flags it), never a retraction/lifecycle claim
+                    # — say so plainly rather than alarming the reader.
+                    errors.append({
+                        "chunk": chunk_label,
+                        "check": "content_integrity",
+                        "error": (
+                            f"node '{node_id}' has no comparable claim content "
+                            f"(type={db_by_id[node_id].get('type', '?')}) — "
+                            f"nothing to verify"
+                        ),
+                        "node_id": node_id,
+                    })
+                elif db_claim.strip() != payload_claim.strip():
                     errors.append({
                         "chunk": chunk_label,
                         "check": "content_integrity",

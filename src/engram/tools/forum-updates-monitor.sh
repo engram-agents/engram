@@ -27,6 +27,18 @@
 #   - never-advance-cursor on failed poll: curl --fail returns non-zero on
 #     forum-unreachable; skip the cycle and PRESERVE the cursor. Advancing past a
 #     window we never emitted would silently drop those wakes.
+#   - "failed poll" is BROADER than curl (#2225). curl --fail only rejects HTTP
+#     >= 400, so a 200 maintenance page / truncated body reaches as_of() intact;
+#     and a body that parses perfectly well can still carry no watermark (`{}`,
+#     a missing or null as_of, a JSON array). as_of() exits non-zero for BOTH,
+#     because the question it answers is "did I obtain a usable watermark", not
+#     the narrower "did the body parse" — and every caller treats that exactly
+#     like a non-zero curl. Both call sites want that same predicate, for
+#     different reasons: the POLL has the -ge monotonicity guard and merely
+#     declines the write, while the SEED has no guard to lean on, so a missing
+#     watermark there baselines at 0 and replays the entire backlog on the very
+#     next poll. NOTE 0 IS A VALID WATERMARK — a fresh forum genuinely serves
+#     as_of: 0 — so the test is presence-and-coercibility, NEVER truthiness.
 #   - engaged-suppression (#1077 part 2): while last-user-activity is within the
 #     engaged window (default 360s), skip the emit cycle entirely AND do not
 #     advance the cursor — events accumulate in (cursor, as_of] and emit once the
@@ -149,42 +161,36 @@ URL_BASE="$BASE/api/updates?agent=$SELF&kinds=$KINDS"
 # claim than "verified not a match" and must not be silently folded into it —
 # say so loudly so the agent knows this candidate needs a manual look.
 #
+# Portability (#2134): /proc does not exist on macOS, so the whole
+# verification pass above used to raise ENOENT on the FIRST open() and land
+# in the "process gone" branch — dead and SILENT, byte-identical to "checked,
+# found no duplicates." Mirrors umwelt-bell.py's `_is_bell_process` fix
+# (umwelt #205): when /proc is absent, fall back to the portable
+# `ps -p <pid> -o args=`. That fallback is WEAKER than the /proc read and is
+# reported as such: `ps -o args=` returns a space-JOINED string, not true
+# NUL-separated argv, so a wrapper whose script path sits inside a single
+# quoted argument (e.g. `bash -c "... forum-updates-monitor.sh ..."`) can
+# manufacture a false token boundary and over-match — measured on Linux
+# (issue #2134 comments) against a `bash -c` wrapper. Kept anyway because a
+# weaker-but-labeled detector beats no detection at all on the one platform
+# that has no /proc to fall back on. rc 3 (below) marks this weaker verdict
+# distinctly from rc 0's /proc-verified one so the two warning classes don't
+# get conflated into a single alarm-fatigue channel.
+#
 # Set $FORUM_UPDATES_NO_REAP to any non-empty value to disable (now disables
 # the detection/warning pass, not a kill).
 # ---------------------------------------------------------------------------
 _check_forum_updates_dup() {
-    # $1=pid $2=script-basename. Reads /proc/<pid>/cmdline ONCE (NUL-separated
-    # argv). Exit codes:
-    #   0 = confirmed duplicate — stdout is the cmdline (argv joined on
-    #       spaces, truncated to ~100 chars — the boot charge alone runs
-    #       ~2.5KB and must not flood the Monitor event stream).
-    #   1 = not a duplicate, including "process gone mid-read" (a race, not
-    #       an error) — silent, nothing on stdout.
-    #   2 = could NOT verify (a non-ENOENT/ESRCH OSError, e.g. permission
-    #       denied) — stdout is a short reason string; caller must warn, not
-    #       silently skip.
-    python3 -c '
-import errno, os, sys
-pid, script = sys.argv[1], sys.argv[2]
-try:
-    with open("/proc/" + pid + "/cmdline", "rb") as f:
-        raw = f.read()
-except OSError as e:
-    if e.errno in (errno.ENOENT, errno.ESRCH):
-        sys.exit(1)  # process gone mid-read: not a match, not an error
-    print(str(e) or type(e).__name__)
-    sys.exit(2)  # could not verify — do not silently treat as "not a match"
-argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
-if not argv:
-    sys.exit(1)
-interp = os.path.basename(argv[0]).lstrip("-")  # login shell: argv[0] == "-bash"
-if interp not in ("bash", "sh", "dash", "ksh", "zsh", "ash"):
-    sys.exit(1)
-if not any(a == script or a.endswith("/" + script) for a in argv[1:]):
-    sys.exit(1)
-cmd = " ".join(argv)
-print(cmd[:100])
-' "$1" "$2" 2>/dev/null
+    # $1=pid $2=script-basename. Delegates to the shared _proc_identity.py
+    # (#2321 -- extracted from a 1629-byte block that used to be
+    # byte-identical, hand-synced, in this file and
+    # forum-mention-monitor.sh). See that module's own docstring for the
+    # full exit-code table and the /proc-vs-ps-fallback reasoning; this
+    # wrapper's only job is finding the sibling script and forwarding argv.
+    local _self _proc_identity
+    _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    _proc_identity="$(dirname "$_self")/_proc_identity.py"
+    python3 "$_proc_identity" "$1" "$2" 2>/dev/null
 }
 
 if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
@@ -215,6 +221,9 @@ if [ -z "${FORUM_UPDATES_NO_REAP:-}" ] && command -v pgrep >/dev/null 2>&1; then
         _rc=$?
         if [ "$_rc" -eq 0 ]; then
             echo "⚠️  forum-updates-monitor.sh: possible duplicate instance — pid $_pid cmdline: ${_out}"
+            echo "⚠️  forum-updates-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
+        elif [ "$_rc" -eq 3 ]; then
+            echo "⚠️  forum-updates-monitor.sh: possible duplicate instance (WEAK match — no /proc on this platform, verified via \`ps\` string-split only; may false-positive on wrapper processes, #2134) — pid $_pid cmdline: ${_out}"
             echo "⚠️  forum-updates-monitor.sh: if pid $_pid is a stale duplicate, inspect it and \`kill $_pid\` by hand — a live duplicate double-delivers every event."
         elif [ "$_rc" -eq 2 ]; then
             echo "⚠️  forum-updates-monitor.sh: could not verify candidate pid $_pid (${_out}) — NOT auto-flagged as a duplicate; check it by hand if you suspect a stale instance."
@@ -257,18 +266,105 @@ for u in d.get("updates", []):
 }
 
 # helper: read /api/updates JSON on stdin, print the served as_of watermark.
+#
+# EXIT STATUS answers "did I obtain a usable watermark?" (#2225) — deliberately
+# NOT the narrower "did the body parse?". A sentinel VALUE could collide with
+# real data, and the layer above already uses exit status for the same class of
+# question (curl --fail).
+#   - exit 0, print the int: "as_of" is present and is a NON-NEGATIVE,
+#     NON-BOOLEAN, int-coercible value. That INCLUDES A GENUINE 0 — a fresh
+#     forum with nothing in the feed yet serves as_of: 0, and that is a
+#     perfectly good baseline. NEVER test this value for truthiness: a
+#     `-gt 0` guard would spin the seed forever on a healthy empty feed. What
+#     must be rejected is the ABSENCE of a watermark, not a watermark that
+#     happens to be zero.
+#     The bool and negative rungs are not pedantry, they are the same site-3
+#     flood by other doors. `bool` IS AN `int` SUBCLASS in Python, so a JSON
+#     `"as_of": false` passes an `is None` check AND an `int()` call and
+#     arrives as 0 — seeding the baseline at 0 and replaying the entire
+#     backlog on the next poll. A negative watermark does the same by a
+#     different route: per src/forum/coordination/updates.py, a negative
+#     `since` "simply admits everything <= as_of", so it is a full replay
+#     wearing a plausible number.
+#     The 2**63-1 ceiling is the same rule, not a new one: that is EXACTLY the
+#     domain the consumer — bash's `[ -ge ]` in the poll loop below — can
+#     evaluate, and a watermark our own comparison cannot evaluate is not a
+#     usable watermark. Measured: `[ 9223372036854775807 -ge 0 ]` succeeds,
+#     `[ 9223372036854775808 -ge 0 ]` exits 2. Without this rung a body like
+#     `{"as_of": 1e29}` goes PERMANENTLY DEAF WITH NO ERROR ANYWHERE: the seed
+#     has no numeric test so it writes the 29-digit value; the poll's
+#     `[ <big> -ge $_cur ]` exits 2 and that failure is swallowed by the
+#     existing `2>/dev/null`; and once seeded, every later REAL watermark
+#     fails the same comparison against it, so the cursor never recovers.
+#   - exit non-zero, print nothing: EITHER the body did not parse (200
+#     maintenance page, truncated JSON, empty string) OR it parsed and carries
+#     no usable watermark (a JSON array, a missing "as_of", a null one, a
+#     non-coercible one). Both mean the same thing to a caller — we did not
+#     learn where this window ends — so neither may move state.
+#
+# Folding those two into one predicate is the point. The SEED has no
+# monotonicity guard to fall back on, so baselining 0 from a body that never
+# said 0 makes the next poll ask since=0 and replay the whole backlog. On the
+# POLL path the -ge guard already declined every one of these bodies, so
+# skipping the write there is behaviourally what already happened.
 as_of() {
     python3 -c 'import json,sys
-try: print(int(json.load(sys.stdin).get("as_of",0)))
-except Exception: print(0)'
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or d.get("as_of") is None:
+    sys.exit(1)
+v = d["as_of"]
+if isinstance(v, bool):
+    sys.exit(1)
+try:
+    v = int(v)
+except Exception:
+    sys.exit(1)
+if v < 0:
+    sys.exit(1)
+if v > 2**63 - 1:
+    sys.exit(1)
+print(v)'
 }
 
+# Poll cadence override — tests only (mirrors forum-mention-monitor.sh's
+# $FORUM_MENTION_POLL_SECONDS); the default of 30 is unchanged for real arms.
+# Used for BOTH the seed-retry sleep and the poll-loop sleep so a test can
+# exercise the seed retry below without a 30s wall-clock wait.
+POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
+
 # ---------------------------------------------------------------------------
-# seed — retry until first SUCCESSFUL poll; baseline cursor = current as_of so
-# arming does NOT replay history. Handles arm-while-forum-down (waits).
+# seed — retry until the first poll that SUCCEEDS and hands back a USABLE
+# WATERMARK; that watermark is the baseline, so arming does NOT replay history.
+# Handles arm-while-forum-down (waits).
+#
+# The second half of that condition is not decoration (#2225), and it is
+# strictly stronger than "the body parsed". curl --fail passes a 200 carrying a
+# maintenance page; a clean `{}` or a null as_of passes a JSON parse. Either
+# way we never learned where the window ends, and seeding from it lands 0 — so
+# the very next poll asks since=0 and emit() runs the ENTIRE dm+baton backlog.
+# emit() has no aggregation (one printed line per update, unlike
+# forum-mention-monitor's flush_buffer), so that is a genuine per-update flood:
+# precisely the history replay this seed exists to prevent.
+#
+# Unlike the poll loop below there is NO monotonicity guard here to catch it —
+# 0 simply becomes the baseline. That asymmetry is why as_of() rejects a
+# missing watermark rather than reporting 0: the poll can afford to shrug at
+# these bodies and the seed cannot, so the helper answers for the stricter
+# caller. A watermark of 0 that the feed actually SERVED is still accepted —
+# see as_of() above; a fresh forum's as_of: 0 is a real baseline, not an
+# absence.
 # ---------------------------------------------------------------------------
-until RESP="$(curl -s --fail "$URL_BASE&since=0" 2>/dev/null)"; do sleep 30; done
-printf '%s' "$RESP" | as_of > "$CURSOR"
+while true; do
+    if RESP="$(curl -s --fail "$URL_BASE&since=0" 2>/dev/null)" \
+       && _seed="$(printf '%s' "$RESP" | as_of)"; then
+        printf '%s\n' "$_seed" > "$CURSOR"
+        break
+    fi
+    sleep "$POLL_SECONDS"
+done
 
 # Path to the last-user-activity stamp (written by the time-bar hook on each
 # genuine human-typed prompt) — same engaged-detection source as the
@@ -280,7 +376,7 @@ _ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
 # poll loop
 # ---------------------------------------------------------------------------
 while true; do
-    sleep 30
+    sleep "$POLL_SECONDS"
     # engaged-suppression: while the user is actively conversing, skip the emit
     # cycle AND leave the cursor put — events accumulate in (cursor, as_of] and
     # emit once the engaged window expires.
@@ -296,7 +392,19 @@ while true; do
     # PRESERVE the cursor (never advance past an un-emitted window).
     RESP="$(curl -s --fail "$URL_BASE&since=$_cur" 2>/dev/null)" || continue
     printf '%s' "$RESP" | emit
-    # advance the cursor to the served watermark only after a successful poll
-    _new="$(printf '%s' "$RESP" | as_of)"
-    [ -n "$_new" ] && [ "$_new" -ge "$_cur" ] 2>/dev/null && printf '%s' "$_new" > "$CURSOR"
+    # Advance the cursor only when this poll actually handed back a watermark.
+    # `$( )` swallows the command's status into the assignment, so the status
+    # has to be READ — hence `if _new="$(...)"` rather than a bare assignment
+    # plus a value test (#2225). The old `[ -n "$_new" ]` here was dead code:
+    # as_of() printed on every path, so _new was never empty and the guard it
+    # advertised did not exist. The real guard is the exit status; the `-ge`
+    # monotonicity check stays as-is.
+    #
+    # For a body that parses with no usable watermark this is behaviourally
+    # what already happened — as_of() used to report 0 and `-ge` declined the
+    # write — so nothing about ordinary quiet polling changes here. The
+    # stricter helper exists for the SEED, which has no such guard.
+    if _new="$(printf '%s' "$RESP" | as_of)"; then
+        [ "$_new" -ge "$_cur" ] 2>/dev/null && printf '%s' "$_new" > "$CURSOR"
+    fi
 done
