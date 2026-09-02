@@ -377,6 +377,38 @@ python3 tools/release-cutover.py --version v0.2.0 --target /path/to/public/engra
   --source-ref v0.2.0-rc2 --push
 ```
 
+**Two footguns measured on the v0.5.0 cut (2026-09-02), both in the dry-run
+step, both silent:**
+
+- **A re-run stacks a SECOND release commit on the first.** The tool commits
+  on top of whatever the target clone's `main` currently is; after one dry
+  run that is your own first "Release vX.Y.Z" commit, so a second run (for
+  example after adding a minus-set entry) leaves the clone `ahead 2` — two
+  commits for one version, which `--push` would publish as-is. `--force`
+  only re-points the tag; it does not undo the earlier commit. Before every
+  re-run: `git -C <target> tag -d vX.Y.Z; git -C <target> reset --hard
+  origin/main`, then read `git status -sb` back and require `ahead 1`.
+- **`source sha` in the Final summary is the annotated TAG object, not the
+  commit.** With `--source-ref v0.5.0-rc3` it printed `12da9347` (the tag)
+  while the release commit everyone was quoting was `4ae2b947`
+  (`git rev-parse v0.5.0-rc3^{commit}`). Both are correct; they are
+  different objects. Compare against `^{commit}`, not the summary line.
+
+**Reproduce the tree from a second seat before pushing.** The artifact is
+deterministic from `<source-ref>` + the minus-set, so a colleague can rebuild
+it into a scratch clone (never the real remote, never `--push`) and compare
+`git rev-parse vX.Y.Z^{tree}`. Commits will differ (author, date); the tree
+must not. **Two runs, because they cannot be combined:** (a) **roster-less**
+(`--leak-roster /nonexistent/none.json`) produces the tree to compare;
+(b) **with your own roster** the gate fires on every roster hit and aborts
+*before the target is written* — that run yields the personal-name axis and
+deliberately produces no tree. Expect the abort in (b); it is the gate
+working, not a mistake in the recipe. Measured on v0.5.0 (2026-09-02): two
+colleagues reproduced `874087b9` byte-identically from run (a), and each ran
+the can-it-fail control themselves (one appended character in the scratch
+clone changes the tree hash) — a control that was executed, not inferred
+from how git works.
+
 The scan-leaks gate is **fail-closed**: any hit aborts before the target is
 touched. Per the tool's own docstring, it is *necessary-but-not-sufficient*
 — it skips extensionless files and doesn't carry all personal-name patterns
