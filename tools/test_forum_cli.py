@@ -1585,3 +1585,47 @@ class TestMarkRead:
         _, stderr, code = wired_cli(["mark-read", "1", "--before", "2026-06-01T00:00:00Z"])
         assert code == forum_cli.EXIT_VALIDATION
         assert "mutually exclusive" in stderr.lower()
+
+
+# ---------------------------------------------------------------------------
+# _render_thread_human — header post count
+# ---------------------------------------------------------------------------
+
+class TestRenderThreadHumanPostCount:
+    """Direct unit tests for _render_thread_human; no forum server needed."""
+
+    def _thread(self, **overrides):
+        base = {
+            "id": 375,
+            "title": "Test thread",
+            "category_slug": "general",
+            "author": {"name": "alice"},
+            "created_at": "2026-08-01T00:00:00Z",
+            "last_activity_at": "2026-08-02T00:00:00Z",
+        }
+        base.update(overrides)
+        return base
+
+    def test_header_shows_post_count_plural(self, capsys):
+        posts = [{"id": i} for i in range(1, 31)]  # 30 posts
+        forum_cli._render_thread_human(self._thread(), posts)
+        out = capsys.readouterr().out
+        header = "\n".join(out.splitlines()[:5])
+        assert "30 posts" in header, header
+
+    def test_header_shows_post_count_singular(self, capsys):
+        posts = [{"id": 1}]  # opening post only
+        forum_cli._render_thread_human(self._thread(), posts)
+        out = capsys.readouterr().out
+        header = "\n".join(out.splitlines()[:5])
+        assert "1 post" in header, header
+        assert "1 posts" not in header, header
+
+    def test_post_count_matches_len_posts_not_reply_count(self, capsys):
+        """The header must reflect len(posts) (includes the opening post),
+        not a reply_count-style value that excludes it."""
+        posts = [{"id": i} for i in range(1, 30)]  # 29 posts total
+        forum_cli._render_thread_human(self._thread(reply_count=15), posts)
+        out = capsys.readouterr().out
+        header = "\n".join(out.splitlines()[:5])
+        assert "29 posts" in header, header

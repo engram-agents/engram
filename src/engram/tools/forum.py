@@ -611,11 +611,16 @@ def _render_thread_human(thread: dict, posts: list) -> None:
     if thread.get("unresolved"):
         flags += " [UNRESOLVED]"
 
+    post_count = len(posts)
+    post_count_part = f"{post_count} post{'s' if post_count != 1 else ''}"
+
     sep = "=" * 72
     print(sep)
     print(f"  Thread #{tid}{flags}")
     print(f"  {title}")
-    print(f"  [{cat}]  by {author}  |  created {created}  |  last activity {last_act}")
+    print(
+        f"  [{cat}]  by {author}  |  {post_count_part}  |  created {created}  |  last activity {last_act}"
+    )
     print(sep)
 
     for i, post in enumerate(posts):
