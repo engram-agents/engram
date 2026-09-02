@@ -1446,6 +1446,58 @@ def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> s
     return ""
 
 
+# Wrapper-line shape emitted by loop_prompt.format_loop_prompt()'s optional
+# machine-readable second line, e.g. `<loop-meta {"kind":"heartbeat"}>`.
+# Mirrors loop_prompt._META_PREFIX / _META_SUFFIX (not imported — see
+# _strip_loop_meta_lines docstring for why loop_prompt.py itself stays
+# untouched).
+_LOOP_META_LINE_PREFIX = "<loop-meta "
+_LOOP_META_LINE_SUFFIX = ">"
+
+
+def _strip_loop_meta_lines(prompt: str) -> str:
+    """Strip machine-readable ``<loop-meta ...>`` wrapper lines from prompt.
+
+    ``format_loop_prompt()`` (loop_prompt.py) emits an optional second line
+    carrying JSON-encoded meta kwargs (e.g. ``kind="heartbeat"``, ``seq=3``)
+    when a loop-wake prompt is armed with them. That line is machine-readable
+    wrapper metadata, not agent-authored content — the self-anchoring gate in
+    ``_should_prepend`` asks "does this prompt self-anchor?", and the wrapper
+    is not part of what a wake is *about*, whatever keys/values it happens to
+    carry (see #2482).
+
+    Measured on two seats, the wrapper's tokens ("meta", "kind", "heartbeat",
+    "seq", ...) trip the IDF-keyword self-anchoring rule on one seat's
+    vocabulary and not the other's, and the *specific* token that trips it
+    differs seat to seat — so no fixed stopword list can cover every seat.
+    Excluding the whole wrapper line from the gate's input is the only fix
+    that generalizes across vocabularies.
+
+    Only whole lines matching the wrapper's exact shape are removed: a line
+    whose stripped form starts with ``<loop-meta `` and ends with ``>``. A
+    malformed/unclosed wrapper line (no closing ``>``) is left alone —
+    treated as ordinary content, never over-stripped. Lines that don't match
+    (including the plain ``<loop-wake>`` marker line, which carries no
+    parenthetical metadata) are kept as-is. The span between the delimiters
+    is never validated as JSON (or anything else) before the line is
+    dropped — a deliberate choice, not an oversight: this is a scoring-input
+    filter, not a parser, and the real ``prompt`` (below) is never touched,
+    so an over-broad match can only shift the prepend-gate verdict, never
+    corrupt content.
+
+    This is used ONLY to decide whether to prepend the prev-response tail —
+    the raw ``prompt`` used everywhere else (the FTS query, the
+    ``embed_query`` concatenation, etc.) is untouched.
+    """
+    kept = []
+    for line in prompt.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(_LOOP_META_LINE_PREFIX) and stripped.endswith(_LOOP_META_LINE_SUFFIX):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
     """IDF-based prepending gate. Returns True if prev_response_tail should be
     prepended to the embedding query.
@@ -1457,12 +1509,22 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         the legacy char-length heuristic. Preserves previous behavior on infra
         failure.
 
+    Before either rule runs, any ``<loop-meta ...>`` wrapper lines (see
+    ``_strip_loop_meta_lines``) are stripped from the prompt for scoring
+    purposes only — machine-readable loop-wake metadata is not content the
+    gate should judge self-anchoring on (#2482). ``prompt`` itself (the
+    caller's copy) is never mutated; only the local copy used for scoring is
+    affected, so this has no effect on any use of ``prompt`` outside this
+    function.
+
     Note: only called when cfg["idf_gate_enabled"] is True. The feature-flag
     check lives in the call site (main()), not here, so the function contract
     is clean for tests.
     """
+    scored_prompt = _strip_loop_meta_lines(prompt)
+
     # Rule 1: very short prompts can't self-anchor — always prepend.
-    if len(prompt) < cfg["idf_gate_short_prompt_floor_chars"]:
+    if len(scored_prompt) < cfg["idf_gate_short_prompt_floor_chars"]:
         return True
 
     # Rule 2: if prompt has high-IDF non-stopword tokens, it self-anchors — skip.
@@ -1479,7 +1541,7 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         from engram_idf import extract_keywords
         keywords = extract_keywords(
             conn,
-            prompt,
+            scored_prompt,
             min_idf=cfg["idf_gate_min_idf"],
             top_k=5,
         )
@@ -1490,7 +1552,7 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         # Fallback to legacy char-length heuristic if engram_idf unavailable
         # (ImportError) or any DB error occurs (vocab table missing, mode=ro
         # conflict, etc). Preserves previous behavior on infra failure.
-        return len(prompt) < cfg["short_prompt_threshold_chars"]
+        return len(scored_prompt) < cfg["short_prompt_threshold_chars"]
 
 
 def query_daemon(prompt: str, top_k: int = 10, embed_query: str | None = None) -> dict | None:
