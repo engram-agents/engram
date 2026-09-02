@@ -7335,42 +7335,192 @@ def engram_embedding_cluster(payload_json: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _prewarm_embeddings(model_name: str) -> None:
-    """Pre-warm the embedding model from the HuggingFace local cache.
+def _embedding_cache_status(model_name: str) -> bool:
+    """Cheap, synchronous filesystem check: is `model_name` in the local
+    HuggingFace cache?
 
-    Called on a daemon thread at startup (#276). If the model is not cached,
-    semantic search is disabled for the session without blocking mcp.run().
-    If the model IS cached, it is loaded in the background so the first
-    engram_query call hits a warm model rather than paying the load cost.
+    #345: embeddings are mandatory, so this check now runs on the MAIN
+    thread, before mcp.run() — a cache miss must fail startup loudly rather
+    than let the server come up and silently file nodes with NULL
+    embeddings (permanently excluded from semantic recall). It is safe to
+    run synchronously precisely because it is a `try_to_load_from_cache`
+    filesystem lookup, NOT a model load — the expensive part (the actual
+    model load) stays on the daemon thread in `_prewarm_embeddings` below,
+    per the #276 constraint (synchronous pre-warm can exceed Claude Code's
+    30s MCP connection timeout).
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    # Mirror SentenceTransformer's own prefixing rule (verified against the
+    # installed sentence_transformers 5.3.0: SentenceTransformer.__init__
+    # only prepends the "sentence-transformers/" org prefix when the
+    # configured name contains no "/"). A name that already contains "/"
+    # (e.g. an org-qualified model like "BAAI/bge-small-en") is used as-is
+    # by the loader, so the cache-check key must match -- prefixing it here
+    # would look up a repo id that was never the one actually loaded,
+    # producing a guaranteed cache-miss false negative for any such model.
+    if "/" in model_name:
+        cache_repo_id = model_name
+    else:
+        cache_repo_id = f"sentence-transformers/{model_name}"
+
+    cached = try_to_load_from_cache(cache_repo_id, "config.json")
+    return cached is not None
+
+
+def _prewarm_embeddings(model_name: str) -> None:
+    """Load the embedding model in the background (daemon thread).
+
+    Called on a daemon thread at startup (#276), AFTER the synchronous
+    startup gate in __main__ has already confirmed (via
+    `_embedding_cache_status`) that the model is present in the local
+    HuggingFace cache — so a cache miss can no longer reach this function.
+    This function does only the expensive part (the actual model load), off
+    the main thread so mcp.run() can start serving connections immediately
+    rather than blocking on it.
+
+    A failure here (the gate already passed) is genuinely unexpected and
+    must be visible: it is logged to stderr, never swallowed silently. This
+    runs on a daemon thread, so it must NOT exit the process — a fatal
+    embedding failure can only be enforced from the main thread's
+    synchronous gate, before this thread is ever started.
     """
     import sys
 
     try:
-        from huggingface_hub import try_to_load_from_cache
-        cached = try_to_load_from_cache(
-            f"sentence-transformers/{model_name}", "config.json"
-        )
-        if cached is None:
+        _embedder._load_model(model_name)
+        if _embedder._model is not None:
             print(
-                f"[engram] Embedding model '{model_name}' not cached locally. "
-                f"Disabling semantic search for this session.\n"
-                f"  To enable: run this in PowerShell first:\n"
-                f"  python -c \"from sentence_transformers import SentenceTransformer; "
-                f"SentenceTransformer('{model_name}')\"",
+                f"[engram] Embedding model '{model_name}' loaded (background).",
                 file=sys.stderr,
             )
-            _embedder._failed_models.add(model_name)
         else:
-            _embedder._load_model(model_name)
-            if _embedder._model is not None:
-                print(
-                    f"[engram] Embedding model '{model_name}' loaded (background).",
-                    file=sys.stderr,
-                )
-    except ImportError:
-        pass  # huggingface_hub not available, let it try normally
-    except Exception:
+            # _load_model() already logs its own ImportError/Exception cases
+            # to stderr (engram_core.py). This branch covers the residual
+            # case where it returns cleanly with the model still unset, so
+            # that outcome is never silent either.
+            print(
+                f"[engram] Embedding model '{model_name}' failed to load on "
+                f"the background thread, after the startup cache check had "
+                f"already passed. Semantic search is disabled for this "
+                f"session.",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(
+            f"[engram] Unexpected error loading embedding model "
+            f"'{model_name}' on background thread: {e!r}",
+            file=sys.stderr,
+        )
         _embedder._failed_models.add(model_name)
+
+
+def _embedding_startup_gate() -> None:
+    """Fail-loud startup gate for the embedding model (#345).
+
+    Embeddings are mandatory: a node with a NULL embedding is excluded from
+    the semantic-recall candidate set entirely (both the sqlite-vec path and
+    the pure-Python cosine fallback filter `embedding IS NOT NULL`), at any
+    threshold, for any query. So unlike a normal degrade-and-continue guard,
+    an unavailable or uncached model here must fail startup loudly (print an
+    actionable message to stderr + `sys.exit(1)`) rather than let the server
+    come up and silently file permanently-unrecallable nodes.
+
+    The gate is split in two on purpose:
+      - the cache-presence check (`_embedding_cache_status`) is a cheap
+        filesystem lookup and runs HERE, synchronously — blocking startup on
+        it is fine.
+      - the actual model LOAD stays on the daemon thread
+        (`_prewarm_embeddings`, started at the end of this function) per the
+        #276 constraint: synchronous pre-warm can exceed Claude Code's 30s
+        MCP connection timeout and leave every engram_* tool unavailable for
+        the session. Do NOT collapse that split — it is load-bearing.
+
+    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
+    scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
+    for an operator who must start deliberately degraded.
+
+    `embedding.enabled: false` also bypasses this gate — see the comment at
+    that check below for why this is deliberately NOT also-fatal.
+    """
+    import sys
+
+    if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
+        return
+
+    # config["embedding"]["enabled"] (default True) is a real, still-active,
+    # documented toggle (README-AGENT.md, viz UI affordance) honored by 5
+    # call sites in engram_core.py / engram_query.py. Retiring it entirely is
+    # a *separate* slice of #345 (not landed here). Bypass rather than
+    # also-fatal is deliberate, not an oversight: an operator who has
+    # deliberately set `enabled: false` -- plausibly because they never
+    # installed the ~500MB sentence_transformers dependency -- previously
+    # got a clean boot with semantic search cleanly disabled at every query
+    # site. Making this fatal would change a documented, currently-honored
+    # configuration's behavior without the documentation, migration note, or
+    # release-note that the toggle's eventual retirement will carry. This
+    # gate closes the *unintentional* hole (a missing or uncached model);
+    # the *deliberate* opt-out keeps working as documented until it is
+    # retired on purpose. Checked before is_available() so an operator who
+    # disabled embeddings never sees a fatal about sentence_transformers.
+    emb_config = _get_embedding_config()
+    if not emb_config.get("enabled", True):
+        return
+
+    if not _embedder.is_available():
+        print(
+            "[engram] FATAL: embeddings are mandatory (#345) and "
+            "sentence_transformers is not importable. Starting anyway would "
+            "file nodes with NULL embeddings, permanently excluded from "
+            "semantic recall at any threshold, for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  Run Phase 0 setup:", file=sys.stderr)
+        print("    python3 -m venv ~/.engram/venv", file=sys.stderr)
+        print("    source ~/.engram/venv/bin/activate", file=sys.stderr)
+        print("    pip install -r requirements/requirements.txt", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    import threading
+
+    model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
+
+    if not _embedding_cache_status(model_name):
+        print(
+            f"[engram] FATAL: embedding model '{model_name}' is not cached "
+            f"locally. Embeddings are mandatory (#345) — starting anyway "
+            f"would file nodes with NULL embeddings, permanently excluded "
+            f"from semantic recall at any threshold, for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  To fix, pre-warm the cache once:", file=sys.stderr)
+        print(
+            f"  python -c \"from sentence_transformers import "
+            f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    threading.Thread(
+        target=_prewarm_embeddings,
+        args=(model_name,),
+        daemon=True,
+        name="engram-prewarm",
+    ).start()
 
 
 def _write_mcp_ready_marker() -> None:
@@ -7426,23 +7576,14 @@ if __name__ == "__main__":
         )
 
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
-    # serving connections immediately. On cold caches under concurrent system
-    # load, synchronous pre-warm can exceed Claude Code's 30s MCP connection
-    # timeout and leave all engram_* tools unavailable for the session (#276).
-    # If a query arrives during pre-warm, _load_model() handles the late-bind
-    # path via the existing lazy code path.
-    if _embedder.is_available():
-        import sys, threading
+    # serving connections immediately (or exit non-zero first -- see
+    # _embedding_startup_gate). On cold caches under concurrent system load,
+    # synchronous pre-warm can exceed Claude Code's 30s MCP connection
+    # timeout and leave all engram_* tools unavailable for the session
+    # (#276). If a query arrives during pre-warm, _load_model() handles the
+    # late-bind path via the existing lazy code path.
+    _embedding_startup_gate()
 
-        emb_config = _get_embedding_config()
-        model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-
-        threading.Thread(
-            target=_prewarm_embeddings,
-            args=(model_name,),
-            daemon=True,
-            name="engram-prewarm",
-        ).start()
 
     _write_mcp_ready_marker()   # two-signal liveness: written after init, before serve
     mcp.run()
