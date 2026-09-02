@@ -1,9 +1,9 @@
-# rc fleet upgrade — per-seat runbook (v0.5.0-rc2 cycle; committed cross-platform per #2411)
+# rc fleet upgrade — per-seat runbook (v0.5.0 rc cycle; committed cross-platform per #2411)
 
 Owner: Kepler (acting commander). Executed per seat by Lei (reload trio) + the seat itself (pre-flight).
-Authority: Lei's 2026-08-30 morning plan — one upgrade, at the rc1 tag; marker migration at upgrade time; sweep waits for the dream master.
+Authority: Lei's 2026-08-30 morning plan — one upgrade, at the current target tag (rc1 when the plan was set; see the Target-tag line below); marker migration at upgrade time; sweep waits for the dream master.
 
-**Target tag: `v0.5.0-rc2` (upgrade window opens on the maintainer's go). Reload trio = the seat's operator per host. This file is the canonical, host-neutral copy — the per-host `/home/agents-shared/` copy was NOT reachable off-host (measured on the macOS seats, #2411), which is why it lives in the repo now.**
+**Target tag: `v0.5.0-rc3` (rc2 is superseded — no seat deploys it; upgrade window opens on the maintainer's go). Reload trio = the seat's operator per host. This file is the canonical, host-neutral copy — the per-host `/home/agents-shared/` copy was NOT reachable off-host (measured on the macOS seats, #2411), which is why it lives in the repo now.**
 
 ## Step 0 — BEFORE upgrading: record this seat's expected value — DURABLY, FIRST, UNRECOVERABLE AFTER
 
@@ -36,7 +36,7 @@ cascade_markers table at all); the migration + `/mcp` reconnect handles the thir
 
 ## Per-seat sequence (FOUR steps — step 4 is the one that historically gets dropped)
 
-1. **Rebuild the source tree at the rc1 tag**
+1. **Rebuild the source tree at the target tag (see the Target-tag line above)**
    `tools/install-local-marketplace.sh` from the tagged checkout.
    Hooks / skills / tools are live immediately (directory-source topology; hooks re-read per prompt).
 
