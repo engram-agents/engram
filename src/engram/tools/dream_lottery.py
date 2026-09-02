@@ -32,6 +32,48 @@ Algorithm (weight-aging lottery, issue #1901 design 1):
     near-certainty); no phase-locking with any fixed-period external rhythm,
     because the draw is a function of accumulated skips, not calendar day.
 
+**Pre-registered constraint (2026-08-31, before this mechanism existed):
+health-score metric deltas may never influence which categories the lottery
+selects, through any route by which that influence could travel.** Binding this
+rule to a mechanism has left a route open on every prior draft (see PR #2468
+for the drafting history): a wording bound to the shape of the data -- inputs
+and parameters -- missed logic folded straight into ``run_draw``'s own body
+without ever becoming a parameter; a wording bound instead to a call boundary
+("no code inside ``run_draw``, or any function it calls") closed that gap but
+missed tuning inserted upstream of the call, in ``cmd_draw``'s own window
+between ``load_state`` and the ``run_draw`` call -- so this wording binds to
+the outcome directly, deliberately, rather than to whichever mechanism it might
+travel through next. Four routes are named here as covered illustrations of
+that outcome, not as its boundary: (1) any input ``run_draw`` receives; (2) any
+code inside ``run_draw`` or the functions it calls; (3) any code that loads,
+prepares, or mutates the state, config, or arguments handed to it -- including
+``cmd_draw``'s own window between ``load_state`` and ``run_draw``, and any
+helper it calls there; and (4) any direct edit of a file this module reads that
+feeds selection -- the persisted state file (``~/.engram/dream-lottery.json``)
+or the cascade-marker history in ``knowledge.db`` that feeds the interrupt
+channel -- including by a process entirely outside this module. The weights,
+the interrupt channel, the RNG source, and the draw count illustrate what the
+constraint already covers, not its boundary -- a later parameter, folded-in
+logic, or a new preparation step is covered on arrival, without needing its own
+amendment here. The health-score redesign (issue #1991 §4) makes the score its
+own falsifier, which makes every metric a target -- three structural brakes
+guard against that: (1) the delta is diagnostic, never itself a score; (2)
+flags have no cheap gradient; (3) this lottery decouples category selection
+from the score entirely -- because category selection is drawn, not scored,
+the score's gradient must never reach it, confining optimisation pressure to
+within-category suggestion adjudication. Tuning any of the above
+from score deltas would remove that confinement and reopen the hazard the
+lottery exists to close -- the interrupt channel is the sharpest existing
+instance, since it bypasses the draw entirely; it is currently disarmed
+(``DEFAULT_INTERRUPT_TYPES`` is empty) but issue #2013 is expected to re-arm
+it, so the rule must already be live for that channel before it goes back on.
+The failure mode is not misconduct -- it is a well-intentioned maintainer
+improving a number, including a maintainer's own judgment, informed by having
+looked at the metric, encoded as an ordinary code edit -- which is why the rule
+had to be written down in advance, before anyone had a result to justify
+reaching for it. Prescribed by Kepler in his consultant pass on DESIGN v3,
+accepted by Borges, both on issue #1991.
+
 State file: ``~/.engram/dream-lottery.json`` — schema in DEFAULT_STATE below.
 Written eagerly at draw time (weights-in -> weights-out is one atomic
 event, matching the issue's own "logged draws" framing: weights-in, type
@@ -77,10 +119,13 @@ commits before we even attempt to log it, and a history-write failure is
 caught and downgraded to a stderr warning: it must never fail the command
 or imply the draw itself didn't happen. See ``cmd_draw``.
 
-The `INTERRUPT_TYPES` default ({2, 5} -- contradictions + tainted-valid) is
-this module's own reading of the issue's "cascade/contradiction fairy"
-phrase, not literally specified there (Kepler's formal spec had not landed
-as of #1901's filing). Flagged for Kepler/Lei's read; override via
+The `INTERRUPT_TYPES` default is currently empty (``DEFAULT_INTERRUPT_TYPES``
+= ``frozenset()``) -- the channel has been disarmed since 2026-08-19 per Lei
++ #1992. Before that it was {2, 5} (contradictions + tainted-valid), this
+module's own reading of the issue's "cascade/contradiction fairy" phrase,
+not literally specified there (Kepler's formal spec had not landed as of
+#1901's filing); issue #2013 is expected to re-arm it with a principled
+marker-resolution path. Flagged for Kepler/Lei's read; override via
 --interrupt-types if the call should differ.
 
 Usage:
