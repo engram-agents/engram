@@ -1,14 +1,19 @@
-"""Tests for health_engine_metrics.py — the aspect A/C signal + scoring
-function catalogue (engram-alpha#1991, PR2 of 4).
+"""Tests for health_engine_metrics.py — the aspect A/B/C signal + scoring
+function catalogue (engram-alpha#1991, PR2+PR3 of 4).
 
-Builds a small, real, throwaway SQLite fixture DB (the ``nodes`` table's real
-column shape, a subset of engram_core.py's CREATE TABLE) per test, and
-asserts each signal function returns the EXACT expected rate against it —
-not just "doesn't crash". Explicitly covers the empty_denominator UNAVAILABLE
-case (zero derivations -> stale_derivation_rate is UNAVAILABLE, not 0 or a
-ZeroDivisionError) and the empty_denominator "clean" case (zero
-contradictions -> open_contradiction_rate is 0.0, not UNAVAILABLE) per the
-PR2 spec's explicit test requirements.
+Builds a small, real, throwaway SQLite fixture DB (the ``nodes``/``edges``
+tables' real column shape, a subset of engram_core.py's CREATE TABLE) per
+test, and asserts each signal function returns the EXACT expected rate
+against it — not just "doesn't crash". Explicitly covers the
+empty_denominator UNAVAILABLE case (zero derivations -> stale_derivation_rate
+is UNAVAILABLE, not 0 or a ZeroDivisionError) and the empty_denominator
+"clean" case (zero contradictions -> open_contradiction_rate is 0.0, not
+UNAVAILABLE) per the PR2 spec's explicit test requirements.
+
+Aspect B's four metrics (PR3) all return the badness-rate COMPLEMENT of
+their coverage-style names (see health_engine_metrics.py's module docstring
+"SIGN CONVENTION" note) — every test below asserts against that complement,
+not a plain coverage percentage.
 """
 
 from __future__ import annotations
@@ -17,11 +22,13 @@ import json
 import os
 import sqlite3
 import sys
+from unittest import mock
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import engram_core  # noqa: E402
 import health_engine_metrics as hem  # noqa: E402
 from health_engine_config import UNAVAILABLE  # noqa: E402
 
@@ -34,13 +41,24 @@ from health_engine_config import UNAVAILABLE  # noqa: E402
 
 _NODES_DDL = """
 CREATE TABLE nodes (
-    id          TEXT PRIMARY KEY,
-    type        TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    evidence_id TEXT,
-    status      TEXT DEFAULT 'active',
-    is_current  INTEGER DEFAULT 1,
-    metadata    TEXT DEFAULT '{}'
+    id             TEXT PRIMARY KEY,
+    type           TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    evidence_id    TEXT,
+    status         TEXT DEFAULT 'active',
+    is_current     INTEGER DEFAULT 1,
+    metadata       TEXT DEFAULT '{}',
+    recall_summary  TEXT,
+    recall_keywords TEXT,
+    embedding       TEXT
+);
+
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   TEXT NOT NULL,
+    target_id   TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    created_at  TEXT NOT NULL
 );
 
 CREATE TABLE cascade_markers (
@@ -69,12 +87,25 @@ def _make_conn() -> sqlite3.Connection:
 
 
 def _insert(conn, id, type, created_at="t0", evidence_id=None, status="active",
-            is_current=1, metadata=None):
+            is_current=1, metadata=None, recall_summary=None,
+            recall_keywords=None, embedding=None):
     conn.execute(
-        "INSERT INTO nodes (id, type, created_at, evidence_id, status, is_current, metadata)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO nodes (id, type, created_at, evidence_id, status, is_current,"
+        " metadata, recall_summary, recall_keywords, embedding)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (id, type, created_at, evidence_id, status, is_current,
-         json.dumps(metadata) if metadata is not None else "{}"),
+         json.dumps(metadata) if metadata is not None else "{}",
+         recall_summary,
+         json.dumps(recall_keywords) if recall_keywords is not None else None,
+         embedding),
+    )
+    conn.commit()
+
+
+def _insert_edge(conn, source_id, target_id, relation, created_at="t0"):
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
+        (source_id, target_id, relation, created_at),
     )
     conn.commit()
 
@@ -361,16 +392,253 @@ class TestDanglingEvidenceRate:
 
 
 # ---------------------------------------------------------------------------
-# Aspect B stub — not_yet_available_signal
+# Aspect B — recall_summary_coverage
 # ---------------------------------------------------------------------------
 
 
-class TestNotYetAvailableSignal:
-    def test_always_unavailable(self):
+class TestRecallSummaryCoverage:
+    def test_empty_denominator_is_unavailable(self):
         conn = _make_conn()
-        assert hem.not_yet_available_signal(conn) is UNAVAILABLE
+        assert hem.recall_summary_coverage(conn) is UNAVAILABLE
+
+    def test_mixed_covered_and_missing_returns_missing_rate(self):
+        """Badness-rate convention: return value is the MISSING fraction,
+        not the coverage fraction."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="a short summary")
+        _insert(conn, "ob_1", "observation_factual", recall_summary=None)
+        assert hem.recall_summary_coverage(conn) == 0.5
+
+    def test_all_covered_is_zero(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="s1")
+        _insert(conn, "ob_1", "observation_factual", recall_summary="s2")
+        assert hem.recall_summary_coverage(conn) == 0.0
+
+    def test_all_missing_is_one(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
         _insert(conn, "ob_1", "observation_factual")
-        assert hem.not_yet_available_signal(conn) is UNAVAILABLE
+        assert hem.recall_summary_coverage(conn) == 1.0
+
+    def test_whitespace_only_summary_counts_as_missing(self):
+        """Mirrors engram_core._validate_recall_fields's own .strip() check
+        — a whitespace-only summary is absent, not a real one."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="   ")
+        assert hem.recall_summary_coverage(conn) == 1.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        """A definition node (recall_summary-capable at write time, but NOT
+        claim-bearing) must not affect the rate either way."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary=None)
+        _insert(conn, "df_1", "definition", recall_summary="covered")
+        assert hem.recall_summary_coverage(conn) == 1.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary=None, is_current=0)
+        _insert(conn, "ob_1", "observation_factual", recall_summary="s")
+        assert hem.recall_summary_coverage(conn) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — recall_keywords_coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRecallKeywordsCoverage:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.recall_keywords_coverage(conn) is UNAVAILABLE
+
+    def test_mixed_covered_and_missing_returns_missing_rate(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=["kw1", "kw2"])
+        _insert(conn, "ob_1", "observation_factual", recall_keywords=None)
+        assert hem.recall_keywords_coverage(conn) == 0.5
+
+    def test_empty_list_counts_as_missing(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=[])
+        assert hem.recall_keywords_coverage(conn) == 1.0
+
+    def test_malformed_json_counts_as_missing(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        conn.execute(
+            "UPDATE nodes SET recall_keywords = ? WHERE id = ?",
+            ("{not valid json", "dv_1"),
+        )
+        conn.commit()
+        assert hem.recall_keywords_coverage(conn) == 1.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=None)
+        _insert(conn, "df_1", "definition", recall_keywords=["kw"])
+        assert hem.recall_keywords_coverage(conn) == 1.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=None, is_current=0)
+        _insert(conn, "ob_1", "observation_factual", recall_keywords=["kw"])
+        assert hem.recall_keywords_coverage(conn) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — embedding_coverage
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingCoverage:
+    """All tests below except the two in the 'embedder structurally
+    unavailable' block patch ``core._embedder.is_available`` to True — the
+    real test suite runs with ENGRAM_NO_EMBEDDINGS=1, under which it's
+    False, and these tests are exercising the per-node coverage-counting
+    logic, not the availability gate itself (that's covered separately
+    below, per Borges's PR3 colleague review 2026-08-23 blocker 1)."""
+
+    def test_empty_denominator_is_unavailable(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_default_fixture_state_is_all_missing(self):
+        """Mirrors the real ENGRAM_NO_EMBEDDINGS=1 test-suite gotcha flagged
+        in the PR3 build spec: without explicitly setting the embedding
+        column, every node reads as uncovered."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation")
+            _insert(conn, "ob_1", "observation_factual")
+            assert hem.embedding_coverage(conn) == 1.0
+
+    def test_mixed_covered_and_missing_returns_missing_rate(self):
+        """A real populated embedding column (set directly in the fixture,
+        not via the real embedding pipeline) proves the 'has coverage'
+        branch actually works, not just the always-missing default."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1, 0.2, 0.3]))
+            _insert(conn, "ob_1", "observation_factual", embedding=None)
+            assert hem.embedding_coverage(conn) == 0.5
+
+    def test_all_covered_is_zero(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.2]))
+            assert hem.embedding_coverage(conn) == 0.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=None)
+            _insert(conn, "df_1", "definition", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) == 1.0
+
+    def test_non_current_excluded(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=None, is_current=0)
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) == 0.0
+
+    # -- embedder structurally unavailable: a CONFIGURATION state, must gate
+    #    to UNAVAILABLE regardless of what the embedding column holds
+    #    (Borges, PR3 colleague review, 2026-08-23, blocker 1) --------------
+
+    def test_embedder_unavailable_is_unavailable_even_with_real_data(self):
+        """Even a graph with real, populated embeddings must read as
+        UNAVAILABLE (not a real coverage number) when the embedder is
+        structurally unavailable in THIS install -- the column contents are
+        irrelevant to a metric that can't be trusted to reflect a live
+        install's actual retrievability."""
+        with mock.patch("engram_core._embedder.is_available", return_value=False):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.2]))
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_embeddings_disabled_in_config_is_unavailable(self):
+        """The other half of the compound gate: is_available() True but
+        embeddings disabled via config still reads as UNAVAILABLE."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_default_test_suite_state_is_unavailable(self):
+        """No patching at all -- the real ENGRAM_NO_EMBEDDINGS=1 test-suite
+        default. Documents the gate is actually active under the same
+        conditions every other test in this module runs under."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — giant_component_fraction
+# ---------------------------------------------------------------------------
+
+
+class TestGiantComponentFraction:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.giant_component_fraction(conn) is UNAVAILABLE
+
+    def test_single_node_is_fully_connected(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        assert hem.giant_component_fraction(conn) == 0.0
+
+    def test_disconnected_nodes_are_fully_fragmented(self):
+        """Two claim-bearing nodes, no edge between them -> each is its own
+        singleton component -> largest=1/total=2 -> fragmentation 0.5."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        assert hem.giant_component_fraction(conn) == 0.5
+
+    def test_edge_between_claim_bearing_nodes_connects_them(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert_edge(conn, "dv_1", "ob_1", "derives_from")
+        assert hem.giant_component_fraction(conn) == 0.0
+
+    def test_edge_through_non_claim_bearing_node_does_not_bridge(self):
+        """The induced subgraph only counts an edge if BOTH endpoints are
+        claim-bearing — a path through a non-claim-bearing node (e.g.
+        evidence) must NOT connect the two claim-bearing nodes either side
+        of it."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "ev_1", "evidence")
+        _insert_edge(conn, "dv_1", "ev_1", "derives_from")
+        _insert_edge(conn, "ev_1", "ob_1", "cites")
+        # dv_1 and ob_1 remain disconnected in the induced claim-bearing
+        # subgraph -> still fully fragmented, same as no edges at all.
+        assert hem.giant_component_fraction(conn) == 0.5
+
+    def test_three_node_chain_all_claim_bearing_is_fully_connected(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "dv_2", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert_edge(conn, "dv_1", "dv_2", "derives_from")
+        _insert_edge(conn, "dv_2", "ob_1", "derives_from")
+        assert hem.giant_component_fraction(conn) == 0.0
+
+    def test_non_current_nodes_excluded_from_population(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", is_current=0)
+        _insert(conn, "ob_1", "observation_factual")
+        assert hem.giant_component_fraction(conn) == 0.0
 
 
 # ---------------------------------------------------------------------------

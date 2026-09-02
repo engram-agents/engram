@@ -1,52 +1,53 @@
 """health_engine — the real production engine: CONFIG, composition, and the
-snapshot writer for the health-score redesign (engram-alpha#1991, PR2 of 4).
+snapshot writer for the health-score redesign (engram-alpha#1991, PR2+PR3 of
+4).
 
 Design-of-record: engram-alpha#1991, issue comment 5372283060 (Borges,
 2026-08-21, "Health-score redesign — DESIGN v2 (build basis)") §2 (aspects),
 §3 (composition), §4 (snapshot), §5 (engine contract).
 
 Scope of this module:
-  1. The real production ``CONFIG`` (an ``EngineConfig``) — aspect A
-     (epistemic integrity, weight 40) and aspect C (provenance integrity,
-     weight 25) are REAL, built from health_engine_metrics.py's signal
-     functions. Aspect B (retrievability, weight 35) is a STUB — see the
-     "aspect B" section below for why a stub ships in this PR rather than
-     deferring the whole CONFIG object.
+  1. The real production ``CONFIG`` (an ``EngineConfig``) — all three scored
+     aspects are now REAL: A (epistemic integrity, weight 40), C (provenance
+     integrity, weight 25), and B (retrievability, weight 35, PR3), all
+     built from health_engine_metrics.py's signal functions. PR2 shipped a
+     stub AspectDef for B (see the historical "judgment call" note below,
+     kept for context); PR3 replaces it with the 4 real metrics.
   2. The top-level composition function (design doc §3's weighted geometric
      mean across aspects).
   3. The snapshot writer (design doc §4.1) — ``build_snapshot`` (pure
      computation) and ``write_snapshot`` (computation + best-effort JSON
-     persistence under ``DATA_DIR/health-snapshots/``).
+     persistence under ``DATA_DIR/health-snapshots/``). PR3 also populates
+     the previously-empty ``diagnostics`` block (activity metrics +
+     cascade-marker age — design doc §2 "Out of scoring, deliberately");
+     these are informational only and never feed ``compose_aspect_scores``.
 
-Explicitly OUT of scope (per the PR2 spec): aspect B's real signals (PR3),
-red flags / unscored diagnostics beyond bare empty placeholders (PR3/PR4),
-dual-formula transition + consumer wiring / engram_stats.py itself (PR4).
+Explicitly OUT of scope (per the PR3 spec): lambda-2 / algebraic
+connectivity (design doc's own "unscored" item — no numpy/scipy/networkx
+dependency exists in this codebase and this PR does not add one, and a
+hand-rolled eigenvalue solver is exactly the kind of numerically-subtle code
+this project's contract-over-discipline philosophy argues against writing
+informally); DAG violations as a ``red_flags`` entry (``red_flags`` stays
+``[]``, exactly as PR2 left it — the design doc's build slicing doesn't
+explicitly assign this to PR3, and PR2's own stub comment already scoped it
+to "PR3/PR4" ambiguously, so this PR leaves it for the next slice rather
+than silently absorbing it); ``pre_sleep`` checkpoint wiring (PR2 left this
+deliberately unwired, not PR3's job either); ``engram_stats.py`` / the OLD
+formula (never touched through the whole redesign).
 
 --------------------------------------------------------------------------
-Judgment call — "what to do about the third aspect (B) not existing yet"
+Historical judgment call (PR2) — "what to do about the third aspect (B) not
+existing yet" — kept for context; B is real as of PR3, see above.
 --------------------------------------------------------------------------
 PR1's EngineConfig requires aspect weights to sum to 100 (``_check_weights_
 sum``). With only A (40) and C (25) built, a real production CONFIG summing
 to 65 would fail PR1's own validator — CORRECTLY (an incomplete config
 should fail loud, not silently declare itself valid at the wrong total).
-
-Two honest options (both discussed in the PR2 spec):
-  (a) Don't ship a real production CONFIG at all this PR — defer the whole
-      object to PR3/PR4, use only fixture configs in this PR's own tests.
-  (b) Ship a real CONFIG now, with an explicit "not yet real" stub AspectDef
-      for B (weight 35, one signal function that always returns
-      UNAVAILABLE) — the config validates AND correctly reports the WHOLE
-      engine as degraded (via UNAVAILABLE propagation through both the
-      aspect-level and top-level composition) until PR3 lands.
-
-This module takes option (b), matching the spec author's stated mild
-preference: it is more honest about "the composed score isn't trustworthy
-yet" than deferring the whole CONFIG object, and it means the snapshot
-writer + checkpoint wiring this PR also builds can be exercised against a
-REAL (if partially-degraded) production config rather than only fixtures —
-closer to the actual PR3/PR4 end state, and closer to design doc §5.1's
-point that a contract should make the wrong state hard to reach silently,
-not merely possible to reach correctly later.
+PR2 shipped a real CONFIG with an explicit "not yet real" stub AspectDef for
+B (weight 35, one signal function that always returned UNAVAILABLE) rather
+than deferring the whole CONFIG object — the config validated AND correctly
+reported the WHOLE engine as degraded (via UNAVAILABLE propagation) until
+this PR replaced the stub with real metrics.
 """
 
 from __future__ import annotations
@@ -54,6 +55,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import health_engine_metrics as metrics
@@ -76,11 +78,11 @@ from health_engine_config import (
 # order — its own functions re-resolve engram_core lazily per call too.
 
 SCHEMA_VERSION = "1"
-# PR2 of 4: aspects A + C are real signal functions; aspect B is a stub
-# (always UNAVAILABLE) until PR3. Bump when the CONFIG's aspect/metric shape
+# PR3 of 4: aspects A + B + C are all real signal functions now (B replaces
+# PR2's always-UNAVAILABLE stub). Bump when the CONFIG's aspect/metric shape
 # changes in a way that would make an old stored snapshot's `config` block
 # non-comparable to a fresh one.
-ENGINE_VERSION = "0.2.0-pr2"
+ENGINE_VERSION = "0.3.0-pr3"
 
 
 # ---------------------------------------------------------------------------
@@ -153,23 +155,61 @@ ASPECT_C_PROVENANCE_INTEGRITY = AspectDef(
 
 
 # ---------------------------------------------------------------------------
-# Aspect B — Retrievability (weight 35, design doc §2) — STUB, see module
-# docstring's "what to do about the third aspect" section. PR3's real job.
+# Aspect B — Retrievability (weight 35, design doc §2) — real as of PR3.
+# Denominator for all four is "claim_bearing_nodes" (same population aspect
+# A's taint_rate already uses) — see health_engine_config.py's
+# DECLARED_POPULATIONS comment and health_engine_metrics.py's aspect-B
+# section docstring for why. Every raw signal below is the badness-rate
+# COMPLEMENT of its coverage-style name — see health_engine_metrics.py's
+# module docstring "SIGN CONVENTION" note before reading `signals` values
+# from a snapshot as plain coverage percentages.
 # ---------------------------------------------------------------------------
 
-_RETRIEVABILITY_NOT_YET_AVAILABLE = MetricDef(
-    name="retrievability_not_yet_available",
-    signal_fn=metrics.not_yet_available_signal,
-    denominator_population="not_yet_implemented",
+_RECALL_SUMMARY_COVERAGE = MetricDef(
+    name="recall_summary_coverage",
+    signal_fn=metrics.recall_summary_coverage,
+    denominator_population="claim_bearing_nodes",
     empty_denominator="unavailable",
     scored=True,
     state_valued=True,
 )
 
-ASPECT_B_RETRIEVABILITY_STUB = AspectDef(
+_RECALL_KEYWORDS_COVERAGE = MetricDef(
+    name="recall_keywords_coverage",
+    signal_fn=metrics.recall_keywords_coverage,
+    denominator_population="claim_bearing_nodes",
+    empty_denominator="unavailable",
+    scored=True,
+    state_valued=True,
+)
+
+_EMBEDDING_COVERAGE = MetricDef(
+    name="embedding_coverage",
+    signal_fn=metrics.embedding_coverage,
+    denominator_population="claim_bearing_nodes",
+    empty_denominator="unavailable",
+    scored=True,
+    state_valued=True,
+)
+
+_GIANT_COMPONENT_FRACTION = MetricDef(
+    name="giant_component_fraction",
+    signal_fn=metrics.giant_component_fraction,
+    denominator_population="claim_bearing_nodes",
+    empty_denominator="unavailable",
+    scored=True,
+    state_valued=True,
+)
+
+ASPECT_B_RETRIEVABILITY = AspectDef(
     name="retrievability",
     weight=35.0,
-    metrics=(_RETRIEVABILITY_NOT_YET_AVAILABLE,),
+    metrics=(
+        _RECALL_SUMMARY_COVERAGE,
+        _RECALL_KEYWORDS_COVERAGE,
+        _EMBEDDING_COVERAGE,
+        _GIANT_COMPONENT_FRACTION,
+    ),
     scoring_fn=metrics.aspect_geometric_mean_scoring,
 )
 
@@ -184,7 +224,7 @@ CONFIG = EngineConfig(
     aspects=(
         ASPECT_A_EPISTEMIC_INTEGRITY,
         ASPECT_C_PROVENANCE_INTEGRITY,
-        ASPECT_B_RETRIEVABILITY_STUB,
+        ASPECT_B_RETRIEVABILITY,
     ),
 )
 
@@ -361,18 +401,264 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "denominator": "total current evidence nodes",
         "why_that_denominator": "Evidence with zero citing observations is orphaned provenance.",
     },
-    "retrievability_not_yet_available": {
+    "recall_summary_coverage": {
         "meaning": (
-            "STUB. Aspect B's real signals (recall_summary/keywords/"
-            "embedding coverage, giant-component fraction) are PR3's job; "
-            "this always returns UNAVAILABLE so the engine validates at "
-            "weight-100 total while honestly reporting the whole engine as "
-            "degraded until PR3 lands."
+            "Fraction of current claim-bearing nodes MISSING a "
+            "recall_summary (badness rate — 0=all covered, 1=none covered; "
+            "see health_engine_metrics.py's module docstring 'SIGN "
+            "CONVENTION' note). Reads the recall_summary column's actual "
+            "content directly rather than nodes.summary_missing: that flag "
+            "is set only at node-creation time, and whether any given "
+            "backfill route (e.g. the sleep-cycle batch-summary-fairy's "
+            "engram_set_recall_summaries apply path) re-clears it on write "
+            "is an implementation detail of that route, not a property this "
+            "metric can rely on staying fixed across the codebase's "
+            "lifetime. Reading the column's actual content is immune to "
+            "that either way, and immune to future backfill routes that "
+            "don't clear the flag — the direct read is the only version of "
+            "this metric that can't go stale as write paths change."
         ),
-        "denominator": "not yet implemented",
-        "why_that_denominator": "n/a — stub, see health_engine.py module docstring.",
+        "denominator": (
+            "total current claim-bearing nodes (engram_core."
+            "CLAIM_BEARING_TYPES)"
+        ),
+        "why_that_denominator": (
+            "Design doc §2's 'claim-bearing projection' framing — only "
+            "claim-bearing content's retrievability matters for recall "
+            "failures."
+        ),
+    },
+    "recall_keywords_coverage": {
+        "meaning": (
+            "Fraction of current claim-bearing nodes with no non-empty "
+            "recall_keywords list (badness rate, same convention as "
+            "recall_summary_coverage)."
+        ),
+        "denominator": (
+            "total current claim-bearing nodes (engram_core."
+            "CLAIM_BEARING_TYPES)"
+        ),
+        "why_that_denominator": "Same reasoning as recall_summary_coverage.",
+    },
+    "embedding_coverage": {
+        "meaning": (
+            "Fraction of current claim-bearing nodes with a NULL embedding "
+            "column (badness rate, same convention). UNAVAILABLE — not a "
+            "real coverage number — when the embedder is structurally "
+            "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, "
+            "sentence-transformers not installed, or embeddings disabled "
+            "in config): that state is a CONFIGURATION fact, not a HEALTH "
+            "fact, and scoring it as a coverage number would make the "
+            "composed score swing on whether a Python package happens to "
+            "be installed. Test fixtures run with ENGRAM_NO_EMBEDDINGS=1, "
+            "under which every node's embedding is structurally NULL — a "
+            "test proving the 'has coverage' branch must both populate "
+            "the column directly AND patch embedder availability, or it "
+            "will hit the UNAVAILABLE gate before ever reaching the "
+            "per-node count."
+        ),
+        "denominator": (
+            "total current claim-bearing nodes (engram_core."
+            "CLAIM_BEARING_TYPES)"
+        ),
+        "why_that_denominator": "Same reasoning as recall_summary_coverage.",
+    },
+    "giant_component_fraction": {
+        "meaning": (
+            "Fragmentation rate (1 - giant-component fraction) of the "
+            "induced subgraph on current claim-bearing nodes only (an "
+            "edge counts only if BOTH endpoints are claim-bearing) — "
+            "badness rate: 0=fully connected (best), 1=every claim-bearing "
+            "node its own singleton component (worst)."
+        ),
+        "denominator": (
+            "total current claim-bearing nodes (engram_core."
+            "CLAIM_BEARING_TYPES)"
+        ),
+        "why_that_denominator": (
+            "Design doc §2's explicit 'giant-component fraction on the "
+            "claim-bearing projection' language."
+        ),
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics (design doc §2 "Out of scoring, deliberately" — activity
+# metrics + cascade-marker age; PR3's job). Informational only: computed
+# directly into build_snapshot's returned "diagnostics" dict, never wired
+# into compose_aspect_scores or any AspectDef/MetricDef — no UNAVAILABLE
+# machinery needed here, a missing/degenerate value is just 0/null/empty,
+# documented inline rather than modeled as a config-declared metric.
+# ---------------------------------------------------------------------------
+
+# Histogram bucket scheme for cascade-marker age (design doc §2 item 2: "age
+# distribution (max, histogram) lives in diagnostics where it feeds fairy
+# targeting"). JUDGMENT CALL (spec: "bucket scheme is your call; document
+# your choice"): turn-equivalent units, buckets sized against the "1 turn ≈
+# 1 day" approximation this codebase already documents elsewhere
+# (engram_stats.py's own "Turn-unit → wall-clock approximation: 1 turn ≈
+# 24h" comment) — roughly this-week / this-fortnight / this-month /
+# this-quarter / older, the granularity a dream fairy triaging backlog age
+# would actually want.
+_CASCADE_MARKER_AGE_BUCKETS_TURNS: tuple[tuple[str, int, int | None], ...] = (
+    ("0-7", 0, 7),
+    ("8-14", 8, 14),
+    ("15-30", 15, 30),
+    ("31-60", 31, 60),
+    ("61-120", 61, 120),
+    ("121+", 121, None),
+)
+
+
+def _cascade_marker_age_diagnostics(conn: sqlite3.Connection, current_turn: int) -> dict:
+    """Max age + histogram (in turn-equivalent units) of live cascade markers.
+
+    "Cascade marker" = a ``cascade_markers`` row with ``status = 'pending'``
+    — the SAME population Aspect A's stale_derivation_rate/taint_rate
+    already score the BACKLOG SIZE of (design doc §2: "A keeps backlog SIZE
+    via its three state-valued rates; age distribution ... lives in
+    diagnostics"). Age of one marker = time since
+    ``cascade_markers.created_at``, converted to turn-equivalent units via
+    this codebase's own "1 turn ≈ 24h" approximation (engram_stats.py's
+    documented convention; also used by ``_activity_diagnostics`` above) —
+    whole days, floor-divided.
+
+    CORRECTION (post-#1991-sec1, PR #2205 colleague review): this function
+    originally read ``edit_history`` rows matching a fixed action-name tuple
+    with no status filter — correct against the substrate PR3 was written
+    against, since the cascade machine's own status column didn't exist
+    yet. #1991 sec1 re-pointed Aspect A's rates at ``cascade_markers WHERE
+    status = 'pending'``; this function kept reading the unfiltered
+    edit_history population, so it silently diverged from what its own
+    docstring claimed to measure — already-RESOLVED markers kept aging as
+    if still live backlog (measured on one graph: 270 diagnostics rows
+    against 14 scored nodes / 60 actually-pending marker rows, a 19.3x
+    overcount, 181 resolved markers included). Re-pointed at the same
+    ``cascade_markers WHERE status = 'pending'`` population Aspect A now
+    scores, restoring the equivalence this docstring has always claimed.
+
+    ``current_turn`` is accepted for call-site/signature stability with
+    ``_compute_diagnostics``'s other diagnostic, but is no longer used —
+    ``cascade_markers`` carries a wall-clock ``created_at``, not a turn
+    number, and there is no reliable join back to one (no FK from
+    cascade_markers to edit_history; a node/timing correlation exists for
+    some write paths but is not guaranteed 1:1 across all of them).
+
+    "Live": restricted to markers whose affected node
+    (``cascade_markers.node_id``) is still a CURRENT node
+    (``nodes.is_current = 1``) — unchanged reasoning from the original
+    docstring, matching the same current-node scoping every Aspect A/B/C
+    signal function already uses.
+    """
+    rows = conn.execute(
+        """SELECT m.created_at AS created_at FROM cascade_markers m
+           JOIN nodes n ON n.id = m.node_id
+           WHERE m.status = 'pending' AND n.is_current = 1"""
+    ).fetchall()
+
+    now = datetime.now(timezone.utc)
+    ages = []
+    for r in rows:
+        raw = r["created_at"]
+        try:
+            created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = max(int((now - created).total_seconds() // 86400), 0)
+        ages.append(age_days)
+
+    histogram = {label: 0 for label, _, _ in _CASCADE_MARKER_AGE_BUCKETS_TURNS}
+    for age in ages:
+        for label, lo, hi in _CASCADE_MARKER_AGE_BUCKETS_TURNS:
+            if age >= lo and (hi is None or age <= hi):
+                histogram[label] += 1
+                break
+
+    return {
+        "count": len(ages),
+        "max_age_turns": max(ages) if ages else 0,
+        "histogram_turns": histogram,
+    }
+
+
+def _activity_diagnostics(conn: sqlite3.Connection) -> dict:
+    """Question/prediction/conjecture/contradiction resolution rates + node
+    birth rate + supersede volume (design doc §2's "Activity metrics" —
+    "gaming the score and doing maintenance become the same act" is exactly
+    why these are diagnostics, never scored).
+
+    Resolution-rate shape adapted from engram_stats.py's ``_resolution_rate``
+    helper (~line 771) and its four call sites — same query shape (COUNT by
+    type, COUNT by type+status-in), reused here rather than reimplemented
+    from scratch. Matches that helper's own scoping exactly: NOT restricted
+    to ``is_current = 1`` (a resolved question/prediction/etc. is scored by
+    its own ``status`` field, not by current-ness).
+
+    Node birth rate / supersede volume: JUDGMENT CALL (flagged in the PR3
+    report) — computed over a fixed 24h window, mirroring engram_stats.py's
+    own documented "1 turn ≈ 24h" approximation (its window-filter code:
+    "Turn-unit → wall-clock approximation: 1 turn ≈ 24h (dream cycle
+    advances ~daily)"). The design doc names these as diagnostics without
+    specifying a window; a raw lifetime total isn't a "rate" at all (no time
+    denominator), so *some* window was required — 24h was chosen as the
+    smallest one this codebase already treats as meaningful, matching the
+    nap/pre_sleep/post_dream checkpoint cadence these diagnostics are
+    computed at.
+    """
+    def _resolution_rate(node_type: str, resolved_statuses: tuple[str, ...]) -> dict:
+        total = conn.execute(
+            "SELECT COUNT(*) as c FROM nodes WHERE type = ?", (node_type,)
+        ).fetchone()["c"]
+        if total == 0:
+            return {"total": 0, "resolved": 0, "rate": None}
+        status_placeholders = ",".join("?" * len(resolved_statuses))
+        resolved = conn.execute(
+            f"SELECT COUNT(*) as c FROM nodes WHERE type = ? AND status IN ({status_placeholders})",
+            (node_type, *resolved_statuses),
+        ).fetchone()["c"]
+        return {"total": total, "resolved": resolved, "rate": round(resolved / total, 3)}
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    nodes_created_last_24h = conn.execute(
+        "SELECT COUNT(*) as c FROM nodes WHERE created_at >= ?", (cutoff_iso,)
+    ).fetchone()["c"]
+    supersede_edges_last_24h = conn.execute(
+        "SELECT COUNT(*) as c FROM edges WHERE relation = 'supersedes' AND created_at >= ?",
+        (cutoff_iso,),
+    ).fetchone()["c"]
+
+    return {
+        "question_resolution": _resolution_rate(
+            "question", ("resolved", "partially_resolved")
+        ),
+        "conjecture_resolution": _resolution_rate(
+            "conjecture", ("resolved", "supported", "refuted")
+        ),
+        "prediction_resolution": _resolution_rate(
+            "prediction",
+            ("confirmed", "disconfirmed", "resolved", "partially_resolved"),
+        ),
+        "contradiction_resolution": _resolution_rate(
+            "contradiction", ("resolved", "partially_resolved")
+        ),
+        "nodes_created_last_24h": nodes_created_last_24h,
+        "supersede_edges_last_24h": supersede_edges_last_24h,
+    }
+
+
+def _compute_diagnostics(conn: sqlite3.Connection, current_turn: int) -> dict:
+    """The full ``diagnostics`` block (design doc §4.1) — activity metrics +
+    cascade-marker age. Never touches scoring; see module docstring.
+    """
+    return {
+        "activity": _activity_diagnostics(conn),
+        "cascade_marker_age": _cascade_marker_age_diagnostics(conn, current_turn),
+    }
 
 
 def build_snapshot(
@@ -392,6 +678,8 @@ def build_snapshot(
         )
 
     import engram_core as core  # lazy — see module-top NOTE
+
+    current_turn = core._get_current_turn()
 
     signals: dict[str, object] = {}
     scores_per_metric: dict[str, object] = {}
@@ -422,13 +710,12 @@ def build_snapshot(
             "aspects": scores_per_aspect,
             "composed": _to_jsonable(composed),
         },
-        # Out of scope for PR2 (design doc §2 "out of scoring, deliberately"
-        # + PR2 spec's explicit "empty for this PR" instruction) — DAG
-        # violations / unscored activity+age diagnostics land in PR3/PR4.
+        # DAG violations as a red_flags entry are explicitly OUT of scope for
+        # PR3 too (see module docstring) — left exactly as PR2 shipped it.
         "red_flags": [],
-        "diagnostics": {},
+        "diagnostics": _compute_diagnostics(conn, current_turn),
         "anchor": _anchor_commit_sha(),
-        "turn": core._get_current_turn(),
+        "turn": current_turn,
         "checkpoint_mode": checkpoint_mode,
     }
 

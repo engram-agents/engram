@@ -89,15 +89,21 @@ UNAVAILABLE = _Unavailable()
 # PR2 (aspects A + C, engram-alpha#1991) is the first PR to actually BACK
 # those names with real signal functions (see health_engine_metrics.py /
 # health_engine.py) — claim_bearing_nodes / observations / derivations /
-# contradictions are now load-bearing, not placeholders. PR2 also adds
+# contradictions are now load-bearing, not placeholders. PR2 also added
 # "evidence_nodes" (dangling-evidence rate's denominator — aspect C has no
-# existing placeholder for it) and "not_yet_implemented" (the honest stand-in
-# denominator for aspect B's stub metric, per the design doc §7's "PR2 ships
-# a stub AspectDef for B" choice — see health_engine.py's module docstring
-# for the reasoning). Aspect B's REAL populations (recall_summary/keywords/
-# embedding coverage candidates, giant-component projection) remain PR3's job
-# — do not enumerate them here ahead of that PR building the signal functions
-# they'd back.
+# existing placeholder for it) and a PR2-only "not_yet_implemented" stand-in
+# for aspect B's then-stub metric (design doc §7's "PR2 ships a stub AspectDef
+# for B" choice).
+#
+# PR3 backs aspect B's REAL metrics (recall_summary/keywords/embedding
+# coverage, giant-component fraction) — all four are scored over the SAME
+# "claim_bearing_nodes" population aspects A/C already use (design doc §2's
+# "claim-bearing projection" language; see health_engine_metrics.py's aspect-B
+# section for why), so no new population name was needed for them. PR3 also
+# retires "not_yet_implemented" — nothing references it once the aspect-B
+# stub metric it existed for is gone (a stale, unreferenced population name
+# left in this set would itself be the kind of "one fact drifting out of
+# sync" this module's own docstring warns against).
 
 DECLARED_POPULATIONS: frozenset[str] = frozenset({
     "claim_bearing_nodes",
@@ -106,7 +112,6 @@ DECLARED_POPULATIONS: frozenset[str] = frozenset({
     "contradictions",
     "edges",
     "evidence_nodes",
-    "not_yet_implemented",
 })
 
 
