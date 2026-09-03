@@ -34,7 +34,71 @@ TEST_DIR = tempfile.mkdtemp(prefix="engram_test_health_engine_checkpoint_wiring_
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))
 
 
+def _stop_leaked_snapshot_worker():
+    """Stop + reset any currently-loaded engram_snapshot_worker singleton before
+    tearing down TEST_DIR (alpha#2507).
+
+    _nap_impl / _advance_turn_impl can engage the real #1673 async snapshot
+    worker (a background daemon thread that regenerates knowledge.sql /
+    graph_snapshot.md and git-commits into engram_core.DATA_DIR -- read fresh
+    from the module global on every job, not captured once at thread start).
+    conftest.py's `_stop_snapshot_worker` autouse fixture stops it too, but only
+    ONCE per test FUNCTION, at the very end -- too late for a test that calls
+    fresh_server() more than once (e.g. test_checkpoint_internal_never_emits_
+    pre_sleep_mode, which calls it for the nap half and then again for the
+    advance_turn half). Without this, the worker thread started by the FIRST
+    fresh_server() call can still be mid-write into TEST_DIR (or into a
+    directory it lazily mkdir's, e.g. db-backup/.pending/) when the SECOND
+    fresh_server() call's shutil.rmtree(TEST_DIR) below is walking the same
+    directory -- a genuine TOCTOU race, not a flake: rmtree lists a directory's
+    entries then removes them, and a new entry created mid-walk raises
+    OSError: [Errno 39] Directory not empty (Linux; ENOTEMPTY, errno 66 on
+    macOS -- same symbolic error).
+
+    Evidence, precisely, so the claim doesn't overreach: (1) the worker
+    genuinely engages during this test -- a live run of this file logs
+    "[engram snapshot-worker] job turn=0,seq=1 raised, leaving pending: no
+    such table: nodes" from the background thread, confirming it is real and
+    unsynchronized with the main thread, not hypothetical; (2) the general
+    mechanism -- a background thread creating a new file in a directory while
+    shutil.rmtree() is walking it -- was reproduced in isolation (a threaded
+    writer racing shutil.rmtree() on a populated tempdir), reliably raising
+    the identical "Directory not empty" error, and a join()-before-rmtree
+    fix (exactly what stop_worker() below does) eliminated it across 5/5
+    trials. What was NOT reproduced locally is the exact ENOTEMPTY on THIS
+    test on this machine -- on macOS, with no git objects yet committed (the
+    worker's own job fails before reaching the commit step), rmtree's walk is
+    fast enough that a naive artificial delay in the worker overshoots the
+    real race window; CI's Linux runner, mid a 707s/7666-test full-suite run,
+    is evidently loaded enough to hit it. The fix closes the mechanism in the
+    common case: stop_worker() joins the thread (up to 2s) before TEST_DIR is
+    touched, so an in-flight write ordinarily finishes (or errors out) before
+    rmtree runs. Caveat, flagged by reviewer-fairy round 1 rather than
+    self-caught: join(timeout=2.0) can return with the thread still alive
+    (e.g. a slow git commit inside _process_job), and the reset below doesn't
+    check is_alive() afterward -- if that happens, the race isn't actually
+    closed for that call. This is inherited verbatim from conftest.py's own
+    _stop_snapshot_worker fixture (this helper mirrors it exactly), not a gap
+    introduced here; hardening both call sites together (e.g. logging/
+    asserting on a post-join is_alive()) is tracked as a follow-up rather than
+    done in this test-file-only PR.
+    """
+    _sw = sys.modules.get("engram_snapshot_worker")
+    if _sw is None:
+        return
+    try:
+        _sw.stop_worker(timeout=2.0)
+        _sw._started = False
+        _sw._worker_thread = None
+        _sw._seq_counter = 0
+        _sw._stop.clear()
+        _sw._work_event.clear()
+    except Exception:
+        pass
+
+
 def fresh_server():
+    _stop_leaked_snapshot_worker()
     if os.path.exists(TEST_DIR):
         shutil.rmtree(TEST_DIR)
     for key in list(sys.modules):
