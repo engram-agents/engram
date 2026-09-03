@@ -24,10 +24,11 @@ them** — that's the reason `tools/agentctl session` grew an `--as-self` mode
 | `agent-session@.service` | per-agent template unit (`User=agent-%i`); runs `agent-session-launch.sh %i` |
 | `agent-sessions.timer` | daily 09:30 America/New_York trigger, `Persistent=false` (see the unit's own comment for why) |
 | `agent-sessions.target` | grouping target the timer triggers; `Wants=` each Claude agent's instance |
-| `agent-session-launch.sh` | wrapper: sources optional per-agent `~/.engram/boot-env` first, resolves the boot-charge path + session cwd, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
-| `agent-session-run.sh` | runs INSIDE tmux: `agentctl session <name> -d [-r for Claude] --as-self --cd <dir> --charge-file <file>`, logs every launch/exit to `~/.engram/logs/autostart-launch.log`, holds a failed pane open for autopsy (2026-07-25 lesson: a dead launch must leave a corpse) |
-| `boot-charge-default.md` | default morning charge (orient, log in, check the charge board, hold quiet on-call) |
-| `boot-charge-quiet.md` | variant for zephyr/mira: same, plus skip heartbeat loops / minimize token spend / stand by |
+| `agent-session-launch.sh` | wrapper: sources optional per-agent `~/.engram/boot-env` first, passes the installed charge directory + session cwd to the runner, prepends `~/.local/bin` to PATH, pre-checks the CLI + agentctl `--charge-file` support, starts detached tmux running `agent-session-run.sh` |
+| `agent-session-run.sh` | runs INSIDE tmux: detects the platform as the target agent, selects and renders a harness-valid charge, then invokes `agentctl session <name> -d [-r for Claude] --as-self --cd <dir> --charge-file <file>`; logs every launch/exit and holds a failed pane open for autopsy |
+| `boot-charge-default.md` / `boot-charge-quiet.md` | common default / quiet charge framing, each with a harness-instruction placeholder |
+| `boot-charge-default-claude.md` / `boot-charge-quiet-claude.md` | Claude-specific heartbeat components for the matching common profile |
+| `boot-charge-codex.md` | single-sourced Codex heartbeat component, shared by both profiles |
 | `mira-codex-session@.service.example` | **RETIRED safety note**: explains why a direct app-server unit must not be installed; Codex uses the ordinary tmux launcher + daemon-managed remote TUI. |
 
 ## Install (operator/sudo actions — HOST-OWNER-ONLY)
@@ -45,8 +46,7 @@ sessions.
    sudo mkdir -p /usr/local/lib/agentctl/autostart
    sudo cp deploy/autostart/agent-session-launch.sh \
            deploy/autostart/agent-session-run.sh \
-           deploy/autostart/boot-charge-default.md \
-           deploy/autostart/boot-charge-quiet.md \
+           deploy/autostart/boot-charge-*.md \
            /usr/local/lib/agentctl/autostart/
    sudo chmod 0755 /usr/local/lib/agentctl/autostart/agent-session-launch.sh \
                    /usr/local/lib/agentctl/autostart/agent-session-run.sh
@@ -64,9 +64,15 @@ sessions.
    Optional per-agent session cwd: drop an absolute path into
    `~/.engram/boot-cwd` (one line) in the agent's home; default is `$HOME`.
 
-   Per-agent overrides (skip the shared default) go at `~/.engram/boot-charge.md`
-   in the agent's own home — no root needed for that step, the agent (or the
-   operator on the agent's behalf) can drop it in any time.
+   Per-agent overrides are harness-specific: use
+   `~/.engram/boot-charge-claude.md` or `~/.engram/boot-charge-codex.md`.
+   They are complete user-owned charges and are never rewritten by the
+   launcher. `~/.engram/boot-charge.md` remains a **Claude-only legacy
+   compatibility override**; a Codex launch ignores it, logs a visible warning,
+   and falls back to the installed Codex charge. This prevents an old generic
+   file from giving a Codex session Claude-only actions. To select the shipped
+   quiet common framing without a full override, put exactly `quiet` in
+   `~/.engram/boot-charge-profile` (default is `default`).
 
    Optional per-agent environment: `~/.engram/boot-env` (plain `VAR=value` /
    `export VAR=value` lines) is sourced by the launcher before any pre-check,
@@ -196,6 +202,7 @@ host): everything in "Install" and "Stagger" above, plus the dress-rehearsal
 reboot itself.
 
 **Not host-owner-only** (any agent, or the operator on an agent's behalf,
-can do these without root): dropping a per-agent
-`~/.engram/boot-charge.md` override; attaching to an already-running tmux
-session; reading this README.
+can do these without root): dropping a harness-specific per-agent
+`~/.engram/boot-charge-claude.md` or `~/.engram/boot-charge-codex.md`
+override (or selecting `~/.engram/boot-charge-profile`); attaching to an
+already-running tmux session; reading this README.

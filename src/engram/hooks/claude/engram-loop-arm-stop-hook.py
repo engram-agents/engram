@@ -125,13 +125,16 @@ unchanged; `_NUDGE_TEXT` carries a pointer to the batched shape so an
 agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
-Fire condition -- emit the nudge iff ALL of:
+Fire condition -- for Claude, emit the normal nudge iff ALL of:
   (a) `~/.engram/loop-mode.json` exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
       2026-07-31 round-6 note below), AND
   (c) this turn's transcript delta contains NO `tool_use` block that BOTH
       (i) names the wake-arming tool (`ScheduleWakeup`), AND (ii) carries
       the `<loop-wake>` marker in its `input.prompt`.
+
+For managed Codex, a `scheduleWakeup` marker emits only the Codex repair
+nudge; the normal Claude confirmation scan never runs.
 
 2026-07-31 round-6 review finding (colleague review, asking what happens
 on a non-Claude install): the marker's `pacer` field distinguishes a
@@ -144,14 +147,13 @@ EXISTENCE, never `pacer` -- so on a cron-paced loop, which has no reason to
 call `ScheduleWakeup` on any given turn, the gate could never be satisfied
 and the nudge fired every single turn, telling the agent to `ScheduleWakeup`
 -- actively the wrong action, and a pacer-mixing bug in its own right. The
-same gate also makes the codex-target question harmless by construction:
-the plugin bundle ships `hooks.json` AND `skills/` to codex, so a codex
-install gets this hook too, while `ScheduleWakeup` is a Claude-harness tool
-name -- gating on `pacer` means a non-`scheduleWakeup`-paced (or
-unreadable/foreign) install silently does nothing, with no need to assert
-anything about what tools a codex install does or doesn't have. This
-reasoning is unchanged by the 2026-08-12 retarget -- `pacer` gating is
-orthogonal to which tool-shape the confirmation check inspects.
+Codex needs one extra guard beyond pacer gating: a stale or misfiled
+`pacer: "scheduleWakeup"` marker is exactly the cross-harness state that
+would otherwise make this hook demand a Claude-only action. Runtime platform
+evidence therefore wins before the normal confirmation scan. On managed Codex,
+that erroneous marker gets a Codex-specific bridge/timer repair nudge; all
+other Codex markers stay silent. This preserves the original pacer gate for
+Claude while refusing to reinforce a wrong Codex pacer.
 
 `_pacer_is_schedule_wakeup` compares case-insensitively and
 whitespace-tolerantly (`scheduleWakeup` is camelCase in the skills; a
@@ -376,6 +378,45 @@ _WAKE_ARMING_TOOL_NAMES = frozenset({"ScheduleWakeup"})
 # lowercase form.
 _SCHEDULE_WAKEUP_PACER = "schedulewakeup"
 
+
+def _runtime_platform() -> str | None:
+    """Return a baked runtime platform when a plugin bundle provides one.
+
+    A baked profile is stronger evidence than an ambient environment variable:
+    a user shell can retain ``CODEX_PLUGIN_ROOT`` while a Claude bundle is the
+    hook's actual runtime. Source/dev hooks normally have no profile, so the
+    caller may use the Codex root variable as the documented fallback.
+    """
+    # The bundle containing this hook is the runtime actually executing this
+    # code. Its baked platform profile must win over every ambient root: a
+    # shell can retain either plugin-root variable after a harness switch.
+    # Environment roots are source/dev fallbacks only, when this colocated
+    # bundle has no profile.
+    candidates: list[Path] = [Path(__file__).resolve().parent.parent]
+    for env_name in ("ENGRAM_RUNTIME_DIR", "CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(Path(value))
+    for runtime_dir in candidates:
+        try:
+            with open(runtime_dir / "platform.json", encoding="utf-8") as f:
+                data = json.load(f)
+            platform = data.get("platform")
+            if isinstance(platform, str):
+                return platform.strip().lower()
+        except Exception:
+            continue
+    return None
+
+
+def _is_managed_codex_runtime() -> bool:
+    """Detect Codex from reliable bundle evidence, then its runtime root."""
+    platform = _runtime_platform()
+    if platform is not None:
+        return platform == "codex"
+    return bool(os.environ.get("CODEX_PLUGIN_ROOT", "").strip())
+
+
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
@@ -389,6 +430,13 @@ _NUDGE_TEXT = (
     "a solo arm ends the turn, a trailing arm swallows the reply (engram-"
     "loop Step 2 item 3, #2098). If a reply already rendered this turn, "
     "arm now and add nothing after.]"
+)
+
+_CODEX_PACER_NUDGE_TEXT = (
+    "[Loop Arm Check: managed Codex is active but this loop marker says "
+    "pacer scheduleWakeup. Do not use the Claude wake path. Verify the "
+    "managed codex-umwelt-wake.py bridge and this agent's systemd heartbeat "
+    "timer, then correct the marker to pacer systemd before continuing.]"
 )
 
 
@@ -554,12 +602,24 @@ def main() -> None:
     if not os.path.exists(LOOP_MARKER_PATH):
         return
 
+    # A stale scheduleWakeup marker is harmful on Codex: the normal nudge
+    # would demand a Claude-only tool. Detect the runtime before the regular
+    # pacer gate and provide only a concrete managed-bridge/systemd repair.
+    pacer_is_schedule_wakeup = _pacer_is_schedule_wakeup(LOOP_MARKER_PATH)
+    if _is_managed_codex_runtime():
+        if not pacer_is_schedule_wakeup:
+            return
+        print(json.dumps({"decision": "block", "reason": _CODEX_PACER_NUDGE_TEXT}))
+        if _STOPHOOKLIB_OK:
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        return
+
     # Round-6 fix: never nag a loop this hook can't positively identify as
     # scheduleWakeup-paced -- see _pacer_is_schedule_wakeup's docstring and
     # the module docstring's round-6 note for why silence, not emission,
     # is correct here. Also stateless, same reasoning as the marker-absent
     # check above.
-    if not _pacer_is_schedule_wakeup(LOOP_MARKER_PATH):
+    if not pacer_is_schedule_wakeup:
         return
 
     confirmed = False

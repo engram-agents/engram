@@ -38,6 +38,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -60,12 +61,20 @@ def _make_stop_payload(
     })
 
 
-def _run_hook(stdin_payload: str, engram_home: Path) -> tuple[str, int]:
+def _run_hook(
+    stdin_payload: str,
+    engram_home: Path,
+    *,
+    extra_env: dict[str, str] | None = None,
+    hook_path: Path = HOOK_PATH,
+) -> tuple[str, int]:
     """Run the hook, return (stdout_stripped, returncode)."""
     env = dict(os.environ)
     env["ENGRAM_HOME"] = str(engram_home)
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
-        [PYTHON, str(HOOK_PATH)],
+        [PYTHON, str(hook_path)],
         input=stdin_payload,
         capture_output=True,
         text=True,
@@ -73,6 +82,19 @@ def _run_hook(stdin_payload: str, engram_home: Path) -> tuple[str, int]:
         timeout=15,
     )
     return result.stdout.strip(), result.returncode
+
+
+def _copy_hook_into_baked_bundle(tmp_path: Path, platform: str) -> tuple[Path, Path]:
+    """Create a flat hook bundle with a baked platform profile."""
+    bundle = tmp_path / f"{platform}-bundle"
+    hooks_dir = bundle / "hooks"
+    hooks_dir.mkdir(parents=True)
+    hook_path = hooks_dir / HOOK_PATH.name
+    shutil.copy2(HOOK_PATH, hook_path)
+    (bundle / "platform.json").write_text(
+        json.dumps({"platform": platform}), encoding="utf-8"
+    )
+    return bundle, hook_path
 
 
 def _nudge_emitted(stdout: str) -> bool:
@@ -603,6 +625,79 @@ def test_tool_use_in_earlier_delta_does_not_bleed_into_later_turn(tmp_path):
         f"A ScheduleWakeup call from an earlier delta must not suppress "
         f"this later turn; stdout={stdout2!r}"
     )
+
+
+def test_codex_wrong_schedulewakeup_marker_gets_managed_repair_not_claude_arm(tmp_path):
+    """#2508: Codex must not be told to call Claude's wake tool when a stale
+    generic boot charge wrote the wrong pacer into loop-mode.json."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    _write_loop_marker(engram_home, pacer="scheduleWakeup")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+
+    stdout, rc = _run_hook(
+        _make_stop_payload(str(transcript)),
+        engram_home,
+        extra_env={"CODEX_PLUGIN_ROOT": str(tmp_path / "codex-plugin")},
+    )
+
+    assert rc == 0
+    parsed = json.loads(stdout)
+    assert parsed["decision"] == "block"
+    reason = parsed["reason"]
+    assert "managed Codex" in reason
+    assert "codex-umwelt-wake.py" in reason
+    assert "systemd heartbeat" in reason
+    assert "Arm now — ScheduleWakeup" not in reason
+
+
+def test_colocated_claude_profile_wins_over_stale_codex_plugin_root(tmp_path):
+    """#2508: a stale Codex root must not reclassify a Claude hook bundle."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    _write_loop_marker(engram_home, pacer="scheduleWakeup")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    _claude_bundle, hook_path = _copy_hook_into_baked_bundle(tmp_path, "claude-code")
+    codex_bundle, _unused = _copy_hook_into_baked_bundle(tmp_path, "codex")
+
+    stdout, rc = _run_hook(
+        _make_stop_payload(str(transcript)),
+        engram_home,
+        extra_env={"CODEX_PLUGIN_ROOT": str(codex_bundle)},
+        hook_path=hook_path,
+    )
+
+    assert rc == 0
+    parsed = json.loads(stdout)
+    assert parsed["decision"] == "block"
+    assert "Arm now — ScheduleWakeup" in parsed["reason"]
+    assert "managed Codex" not in parsed["reason"]
+
+
+def test_colocated_codex_profile_wins_over_stale_claude_plugin_root(tmp_path):
+    """#2508: a stale Claude root must not reclassify a Codex hook bundle."""
+    engram_home = tmp_path / "engram"
+    engram_home.mkdir()
+    _write_loop_marker(engram_home, pacer="scheduleWakeup")
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    claude_bundle, _unused = _copy_hook_into_baked_bundle(tmp_path, "claude-code")
+    _codex_bundle, hook_path = _copy_hook_into_baked_bundle(tmp_path, "codex")
+
+    stdout, rc = _run_hook(
+        _make_stop_payload(str(transcript)),
+        engram_home,
+        extra_env={"CLAUDE_PLUGIN_ROOT": str(claude_bundle)},
+        hook_path=hook_path,
+    )
+
+    assert rc == 0
+    parsed = json.loads(stdout)
+    assert parsed["decision"] == "block"
+    assert "managed Codex" in parsed["reason"]
+    assert "Arm now — ScheduleWakeup" not in parsed["reason"]
 
 
 # ===========================================================================

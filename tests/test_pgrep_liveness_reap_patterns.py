@@ -300,13 +300,13 @@ class TestDaemonReapPatternEngramHomeAnchored:
 
 
 # ===========================================================================
-# SAFE site 3: boot-charge-default.md / boot-charge-quiet.md's monitor-verify
+# SAFE site 3: harness-specific Claude boot-charge components' monitor-verify
 # pgrep -u "$USER" -af '...' step (#2029, #2028)
 # ===========================================================================
 
 
 class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
-    """Both boot-charge files instruct the booting agent to verify the forum
+    """Both Claude charge components instruct the booting agent to verify the forum
     monitors are actually running via `pgrep -u "$USER" -af
     '^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh'`. The charge
     text itself QUOTES both monitor names and this very pgrep pattern as
@@ -315,14 +315,14 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
     scripts, fixed here by #2028 via the leading `^(\\S*/)?bash` process-name
     anchor instead of an argv-verification second layer."""
 
-    _DEFAULT_MD = _AUTOSTART / "boot-charge-default.md"
-    _QUIET_MD = _AUTOSTART / "boot-charge-quiet.md"
+    _DEFAULT_MD = _AUTOSTART / "boot-charge-default-claude.md"
+    _QUIET_MD = _AUTOSTART / "boot-charge-quiet-claude.md"
 
     def test_both_boot_charge_files_carry_the_identical_pattern(self):
         default_pattern = _extract_boot_charge_pgrep_pattern(self._DEFAULT_MD)
         quiet_pattern = _extract_boot_charge_pgrep_pattern(self._QUIET_MD)
         assert default_pattern == quiet_pattern, (
-            "boot-charge-default.md and boot-charge-quiet.md must carry the "
+            "boot-charge-default-claude.md and boot-charge-quiet-claude.md must carry the "
             "IDENTICAL monitor-verify pattern -- a hand-edit to one without "
             "the other is exactly the drift this assertion exists to catch"
         )

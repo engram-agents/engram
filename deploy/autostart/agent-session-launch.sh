@@ -63,29 +63,11 @@ if [[ -r "$BOOT_ENV_FILE" ]]; then
     set +a
 fi
 
-# Per-agent override, else the shared default template. Judgment call: the
-# default lives at a fixed system-wide install path (mirrors agentctl's own
-# /usr/local/sbin/agent-bootstrap convention) rather than inside whichever
-# engram-alpha checkout happened to be used to install the units — see
-# deploy/autostart/README.md's install step for the corresponding `cp`.
-BOOT_CHARGE_OVERRIDE="$HOME/.engram/boot-charge.md"
-BOOT_CHARGE_DEFAULT="/usr/local/lib/agentctl/autostart/boot-charge-default.md"
-
-if [[ -r "$BOOT_CHARGE_OVERRIDE" ]]; then
-    charge_path="$BOOT_CHARGE_OVERRIDE"
-else
-    charge_path="$BOOT_CHARGE_DEFAULT"
-fi
-
-if [[ ! -r "$charge_path" ]]; then
-    echo "ERROR: no readable boot-charge template at '$charge_path' (checked override '$BOOT_CHARGE_OVERRIDE' first)" >&2
-    exit 1
-fi
-
-if [[ ! -s "$charge_path" ]]; then
-    echo "ERROR: boot-charge template '$charge_path' is empty" >&2
-    exit 1
-fi
+# The runner chooses the charge AFTER agentctl detects the platform as this
+# agent. Passing only the installed directory is intentional: a generic
+# legacy override cannot be allowed to select Claude-only instructions before
+# we know this is a Claude session.
+BOOT_CHARGE_DIR="/usr/local/lib/agentctl/autostart"
 
 if [[ ! -x "$RUNNER" ]]; then
     echo "ERROR: in-tmux runner '$RUNNER' missing or not executable (install step skipped?)" >&2
@@ -163,4 +145,4 @@ fi
 # longer apply — but we still pass argv words after a literal `--` so tmux
 # execs the runner directly with no intermediate shell re-parse.
 exec tmux new-session -d -s "$tmux_session" -- \
-    "$RUNNER" "$AGENT_NAME" "$charge_path" "$cd_target"
+    "$RUNNER" "$AGENT_NAME" "$BOOT_CHARGE_DIR" "$cd_target"

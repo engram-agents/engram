@@ -463,6 +463,26 @@
       ]
     },
     {
+      "path_prefix_or_glob": "deploy/autostart/",
+      "test_globs": [
+        "tests/test_agent_session_run.py",
+        "tests/test_boot_charge_template_glob.py",
+        "tests/test_pgrep_liveness_reap_patterns.py",
+        "tests/test_tool_policy_sync.py"
+      ],
+      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text."
+    },
+    {
+      "path_prefix_or_glob": "skills/claude/engram-loop/SKILL.md",
+      "test_globs": [
+        "tests/test_loop_skill_harness_selection.py",
+        "tests/test_skill_frontmatter_lint.py",
+        "tests/test_skill_server_sync.py",
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates."
+    },
+    {
       "path_prefix_or_glob": "skills/claude/",
       "test_globs": [
         "tests/test_skill_frontmatter_lint.py",
