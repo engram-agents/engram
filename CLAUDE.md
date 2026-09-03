@@ -585,57 +585,68 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   auto-rebase being attributed to the merger). **On this repo it is `true`
   on `dev`, where stacks live, and `false` on `main`** (measured
   2026-08-30 — the two protected branches are configured oppositely). And
-  `dismiss_stale_reviews_on_push: true` on `dev` means a content-changing
-  push **dismisses** the existing approval — it is gone, not merely
-  un-renewable by the pusher. **The auto-rebase case is no longer
-  unmeasured: it DISMISSES.** Measured 2026-09-02 on the #1991 health-score
-  stack — when #2187 merged as `aa7275dd`, GitHub's own auto-rebase moved
-  #2189 from `0871821a` to `9f6b6cfe`, and the approval on the old tip was
-  dismissed rather than migrated; both pre-rebase reviews read `DISMISSED`
-  in `pulls/2189/reviews`, against three distinct SHAs. **It dismissed even
-  though the PR's net diff against its own base was byte-identical across
-  the rebase** — `git diff 0f8999b8 0871821a` and `git diff aa7275dd
-  9f6b6cfe`, 81577 bytes each, with a can-it-fail control (the old base is
-  #2187's pre-merge branch tip, NOT `dev` and not the squash commit; name it
-  explicitly, because a reviewer who reaches for a plausible-looking base
-  instead gets a different number). Approval-migration HAS been seen on a
-  diff-against-base-identical push — #2338, where review `5055356943` was
-  **submitted 2026-08-28T21:50:49Z against commit `990de705`, whose
-  `.commit.committer.date` is 2026-08-29T17:49:54Z**: an approval predating by
-  ~20h the commit it claims. That is the migration signature because a review's
-  `commit_id` must name a commit that already existed when it was submitted —
-  so if the named commit came into being later, GitHub silently re-pointed the
-  review onto a newer object. **Read `.commit.committer.date`, NOT
-  `.commit.author.date`** — a rebase preserves the author date and stamps a
-  fresh committer date, and here the author date is 2026-08-28T21:47:22Z, three
-  minutes BEFORE the review, so a reader who grabs that field first reaches the
-  opposite conclusion. **Read `submitted_at`
-  against the commit's own creation time, never the review STATE** — that PR
-  also carries two genuinely fresh approvals on the same commit, so a
-  state-based read (dismiss-then-approve) cannot tell migration from
-  re-approval and looks ambiguous. So identical diff-against-base is **not**
-  what preserves an approval, and **no known property predicts migration.** Plan for
-  dismissal, read the approval back off `pulls/<N>/reviews` after every
-  layer, and never reason about whether it ought to have survived.
+  `dismiss_stale_reviews_on_push: true` on `dev` is meant to make a
+  content-changing push dismiss the existing approval outright, not merely
+  leave it un-renewable by the pusher — that is the distinction the setting
+  exists to draw, not a guarantee for every push: #2338 below is a
+  content-changing push on this same `dev` base whose approval survived. Under
+  gh-stack's own auto-rebase mechanism there is exactly one measurement to
+  date, and it dismissed: measured 2026-09-02 on the #1991 health-score stack —
+  when #2187 merged as `aa7275dd`, GitHub's own auto-rebase moved #2189 from
+  `0871821a` to `9f6b6cfe`, and the approval standing on the pre-rebase tip
+  `0871821a` was `DISMISSED`, read directly off `pulls/2189/reviews`. That
+  dismissal held even though the PR's net diff against its own base was
+  byte-identical across the rebase — `git diff --full-index 0f8999b8 0871821a`
+  vs `git diff --full-index aa7275dd 9f6b6cfe`, 82089 bytes each
+  (`--full-index` pins the SHA width, since plain `git diff` auto-abbreviates
+  and the byte total then varies by clone; `0f8999b8` is #2187's pre-merge
+  branch tip, NOT `dev` and not the squash commit — name it explicitly, because
+  a reviewer who reaches for a plausible-looking base instead gets a different
+  number). **n=1 — one observation is not a basis for asserting the auto-rebase
+  always dismisses; that is the whole reason the read-back below matters, not a
+  formality.** Separately, the same `dismiss_stale_reviews_on_push: true`
+  setting has been seen NOT to dismiss on this repo — but under a manual
+  force-push, not gh-stack's auto-rebase: on #2338, review `5055356943` was
+  submitted 2026-08-28T21:50:49Z against commit `990de705`, whose
+  `.commit.committer.date` is 2026-08-29T17:49:54Z — an approval predating by
+  ~20h the commit it names, which only happens if GitHub silently re-pointed
+  the review onto a newer commit object (a review's `commit_id` must name a
+  commit that already existed at submission time). But `pulls/2338` reads
+  `stack: null` — not a stack member — and its `head_ref_force_pushed` events
+  (2026-08-29T17:17:27Z and 2026-08-29T18:08:06Z, both `by=LeiShi`) are manual
+  force-pushes, not gh-stack's auto-rebase. So #2338 shows the
+  review-repointing machinery exists under this setting; it says nothing about
+  the auto-rebase path itself. One control worth naming, and its limit: the
+  same PR also carries review `5055246690` against commit `8aaf46ea`, whose
+  committer date (`2026-08-28T20:15:26Z`) sits seventy-six minutes *before*
+  that review's own `2026-08-28T21:31:28Z` submission, unlike `990de705`. So
+  `commit_id` is not uniformly the PR's current head — that much is solid. It
+  does not, on its own, rule out an artifact of how the field gets populated:
+  the two reviews also differ in dismissal state — `5055246690` was DISMISSED
+  at `2026-08-28T21:47:54Z`, before either force-push, while `5055356943` was
+  never dismissed — so freezing on dismissal rather than migrating on rebase is
+  not excluded, and if true it would make liveness itself the predicting
+  property this paragraph says nothing is known to be. What would decide it: a
+  live, never-dismissed approval whose `commit_id` does NOT move, or a
+  dismissed review whose `commit_id` DOES move. We have neither. Read
+  `.commit.committer.date`, NOT `.commit.author.date` — a rebase preserves the
+  author date and stamps a fresh committer date, and `990de705`'s author date
+  (2026-08-28T21:47:22Z, three minutes before the review) points the wrong way.
+  And read `submitted_at` against the commit's own creation time, never the
+  review STATE — #2338 also carries two genuinely fresh approvals on the same
+  commit, so a state-based read (dismiss-then-approve) cannot tell migration
+  from re-approval by itself. So: the auto-rebase path has exactly one
+  observation and it dismissed; the migration case belongs to a different
+  mechanism — a manual force-push, not the auto-rebase — and does not bear on
+  what the auto-rebase does. Plan for dismissal, read the approval back off
+  `pulls/<N>/reviews` after every layer, and never reason about whether it
+  ought to have survived.
 
 > **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
->
-> **⚠ The two siblings are currently out of sync ON A RULE, not a local fact**
-> (found in colleague review of #2497). Both assert flat dismissal —
-> umwelt `CLAUDE.md:745` *"**any** push … dismisses the prior approval
-> outright"*, soma `CLAUDE.md:201`/`:238` similarly — and both were written
-> with no measurement behind them. The paragraph above now says migration has
-> also been measured and that nothing predicts which occurs, so after this
-> lands a seat in umwelt or soma reads "dismissed outright," skips the
-> read-back, and hits the migration case. Tracked as **umwelt#772** and
-> **soma#48** with the replacement text; soma's copy additionally still
-> phrases this very footer as pending ("**To be** duplicated… **Once** all
-> three carry it"), which is what would stop a soma seat propagating a change
-> outward in the first place.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
