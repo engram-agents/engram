@@ -1248,6 +1248,23 @@ def _dream_projection_path() -> Path:
     return _snapshot_dir() / "health-snapshot-dream.json"
 
 
+def _dream_projection_error_path() -> Path:
+    """Sibling sentinel to ``_dream_projection_path()`` (engram-alpha#2519
+    Ruling 2, design authority, 2026-09-03): same directory, same base name,
+    ``.error`` instead of ``.json``. ``write_snapshot`` below writes this
+    file on a caught dream-projection exception, and DELETES it on the next
+    SUCCESSFUL dream-projection write. Its presence is what lets a reader
+    (the dream-master's own precondition check, "The repair pass" section of
+    ``engram-dream-master.md``) distinguish "the writer FAILED tonight" from
+    "the writer never ran at all" — a stale-or-absent
+    ``health-snapshot-dream.json`` alone cannot tell those two states apart,
+    which is exactly the gap Ruling 2 named: "a forward-compatible OR-branch
+    that reads a file nothing writes is dead surface." Before this round,
+    nothing wrote this file; this function's caller is the producer.
+    """
+    return _dream_projection_path().with_suffix(".error")
+
+
 def _read_previous_dream_projection() -> dict | None:
     """Best-effort read of whatever projection the PREVIOUS checkpoint left
     behind — ``None`` if it doesn't exist yet (first-ever write) or fails to
@@ -1397,6 +1414,18 @@ def write_snapshot(
     main-snapshot signal function is allowed to raise — but the asymmetry
     (main snapshot: computation raises; dream projection: nothing raises)
     is intentional, not an oversight.
+
+    [Round 2, engram-alpha#2519 Ruling 2] On a caught dream-projection
+    exception (computation OR write), also writes the
+    ``.error`` sentinel (``_dream_projection_error_path()``) — a sibling
+    JSON file ``{"turn": ..., "written_at": ..., "error": ...}`` — so a
+    reader of a stale/absent ``health-snapshot-dream.json`` can tell
+    "the writer failed tonight" from "the writer never ran." On a
+    SUCCESSFUL dream-projection write, that sentinel is deleted
+    (``Path.unlink(missing_ok=True)``) if present. The sentinel write/delete
+    step is ITSELF best-effort (wrapped in its own inner ``except OSError:
+    pass``) — a failure to write or delete the sentinel must never raise
+    here either, matching this whole function's best-effort posture.
     """
     snapshot = build_snapshot(conn, checkpoint_mode, config, model)
     turn = snapshot["turn"]
@@ -1416,7 +1445,351 @@ def write_snapshot(
             json.dumps(projection, indent=2, sort_keys=True), encoding="utf-8"
         )
         snapshot["_dream_projection_path"] = str(dream_path)
+        try:
+            _dream_projection_error_path().unlink(missing_ok=True)
+        except OSError:
+            pass  # sentinel cleanup is itself best-effort — see docstring
     except Exception as e:  # noqa: BLE001 — see docstring's JUDGMENT CALL
         snapshot["_dream_projection_write_error"] = str(e)
+        try:
+            _dream_projection_error_path().write_text(
+                json.dumps(
+                    {
+                        "turn": turn,
+                        "written_at": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "error": str(e),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # sentinel write is itself best-effort — see docstring
 
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Repair-pass provenance — engram-alpha#2519 (the health-v2 epic, #1991's
+# follow-up PR). This module's own "Explicitly OUT of scope" note above (and
+# PR5's own §7 item 6) named the repair pass itself as deliberately NOT this
+# module's job: "the repair pass itself (dispatching fairies to run a
+# `repair`) is ... the dream-master/sleep-skill change, a separate PR
+# against the fairy and master specs, after PR5 lands the fields it reads."
+# #2519 IS that follow-up — design-authority ruling (Kepler, after review):
+# the repair pass dispatches nothing and runs no new fairies. It is a
+# provenance-writing driver loop, owned by the dream-master AGENT (an LLM
+# sub-agent following src/engram/agents/claude/engram-dream-master.md's new
+# "# The repair pass" section), over work that same cycle's cascade sweep /
+# bucket walk / recall-summary cohort already did, plus exactly one direct
+# action (the embedding-backfill scan + tool call).
+#
+# This section holds the two pieces of #2519 that belong in CODE rather than
+# prose, so both sides of the eventual two-reader relationship (the dream-
+# master's write path here; a future panel PR, #2518, that will READ
+# `health-repair-record.json`) check against the SAME declared shape instead
+# of two hand-copied lists of field names that could silently drift apart —
+# design-authority instruction: "declared once in the engine next to the
+# projection writer, importable by both the writer and the panel that will
+# read it — a key-set mismatch must render as an explicit UNKNOWN state to
+# the panel, never a silently empty/clean-looking one."
+#
+#   1. The repair-pass provenance record's SCHEMA (field names + valid
+#      status values) + ``validate_repair_record`` — the schema-conformance
+#      check, mirroring ``health_engine_config.validate_config`` /
+#      ``health_engine_model.validate_model``'s "collect every violation
+#      into one pass, don't just raise on the first" contract (see those
+#      functions' docstrings; read one before changing this one).
+#   2. ``_count_null_embeddings`` — the ONE genuinely new read-only scanner
+#      the repair pass needs (``embedding_coverage``'s detector,
+#      ``scan:null-embeddings``). Every other repair kind is a RE-READ of
+#      work this same dream cycle already did elsewhere (the cascade sweep,
+#      the bucket walk's resolutions bucket, the parent's Step 7.5
+#      recall-summary cohort) — see the dream-master's own new section for
+#      the full per-metric dispatch logic. Nothing else here is executable:
+#      the record itself is produced and WRITTEN by the dream-master agent,
+#      not by this module.
+# ---------------------------------------------------------------------------
+
+# READER'S TURN-CHECK RULE (round 2, engram-alpha#2519, design-authority
+# fold-in, 2026-09-03 — moved here from the dream-master `.md` prose so a
+# future importer of these constants gets the interpretation rule bundled
+# with the field names, not only the names): a reader of this record — the
+# dream-master's own precondition step on a later night, or a future #2518
+# panel — MUST treat a record whose ``turn`` field does not match the
+# CURRENT graph turn as stale/unknown, never as tonight's real health state.
+# This schema carries no separate "freshness" flag; ``turn`` IS the
+# freshness signal, and it means nothing without a caller comparing it
+# against the graph's own current turn at read time.
+REPAIR_RECORD_TOP_LEVEL_FIELDS: tuple[str, ...] = (
+    "turn", "written_at", "status", "reason", "metrics",
+)
+
+# The WHOLE-PASS-level outcome (round 2 fold-in, engram-alpha#2519, design
+# authority, 2026-09-03 — corrects round 1's "skip night: write nothing,
+# leave whatever's on disk untouched" behavior, which left a stale record
+# looking current): "ran" = the driver loop actually executed tonight;
+# "skipped" = the WHOLE pass was skipped tonight per the dream-master's own
+# precondition check (stale/absent projection, or the ``.error`` sentinel —
+# see ``_dream_projection_error_path``/``write_snapshot`` below). This is a
+# DIFFERENT, coarser-grained enum than ``REPAIR_RECORD_STATUS_VALUES`` below,
+# which describes each METRIC's own per-entry outcome, not the whole pass.
+# A "skipped" top-level status always carries a non-null top-level
+# ``reason`` naming which precondition fired, and every metric STILL gets an
+# entry (status "skipped", findings_count/repairs_dispatched null) — no
+# metric is ever silently absent, on a skip night or otherwise (Kepler's
+# ruling: "every metric in the shipped model gets an entry, always").
+REPAIR_RECORD_RUN_STATUS_VALUES: frozenset[str] = frozenset({"ran", "skipped"})
+
+# JUDGMENT CALL (flagged in the #2519 report): ``detector``/``population``
+# are FLAT scalar fields (the detector's bare name string + its population
+# string), not a nested ``{"name": ..., "population": ...}`` dict the way
+# the dream projection's own per-metric ``detector`` field is shaped
+# (``_detector_ref_to_jsonable`` above). The #2519 spec's own field list
+# reads as six independent scalar-shaped fields; flattening here avoids
+# forcing every reader (including a future #2518 panel) to unwrap a nested
+# dict for a value that is only ever one string, and keeps this record's
+# shape visibly DIFFERENT from the dream projection's own per-metric shape
+# — a deliberate signal that this is a different artifact serving a
+# different purpose, not a re-export of the projection under a new name.
+#
+# ``reason`` (round 2, engram-alpha#2519, Kepler's ruling + design-authority
+# fold-in, 2026-09-03) is a ``str | None`` sibling to ``status``, added so an
+# ``"unavailable"``-status entry can say WHICH of its two possible causes
+# fired — round 1 gave both causes the same status and no way to tell them
+# apart. Populated with one of:
+#   - ``"no_repair_binding"`` — no registered repair exists for this metric
+#     at all (diagnostic-only; the metric may or may not be admitted).
+#   - ``"signal_unavailable_this_run"`` — a real repair mapping exists, but
+#     tonight's projection reports this metric's raw signal as
+#     ``"UNAVAILABLE"``.
+#   - on a whole-pass-skip night (status ``"skipped"``): the same reason
+#     string as the top-level ``reason`` field (naming which precondition
+#     fired) — JUDGMENT CALL: mirrored rather than left ``null``, so a
+#     panel reading one metric entry in isolation still knows why, without
+#     also having to read the top-level fields.
+# ``None`` otherwise — in particular, JUDGMENT CALL (flagged in the #2519
+# report): left ``null`` for the four repair-kind branches' own "done" /
+# "carried" outcomes below ([round 3, engram-alpha#2519, Kepler's ruling]
+# this now includes the embedding-backfill's own zero-findings "done" case,
+# which round 2 used to report as "skipped" here — see
+# ``REPAIR_RECORD_STATUS_VALUES`` below for why that was narrowed), rather
+# than inventing a distinct reason string per branch (e.g. a per-branch
+# ``"embedding_backfill_tool_failed"``) — Kepler's ruling explicitly leaves
+# that extension optional ("your call"), and the existing prose right next
+# to each branch (the dream-master `.md`'s own per-metric dispatch logic)
+# already names the specific cause in narrative form.
+REPAIR_RECORD_METRIC_FIELDS: tuple[str, ...] = (
+    "detector",
+    "population",
+    "findings_count",
+    "repairs_dispatched",
+    "delta_since_last",
+    "status",
+    "reason",
+)
+
+# The four outcomes a per-metric repair-pass entry can land in (dream-master
+# spec, "The repair pass" section):
+#   - "done" — the underlying work this cycle already did fully addressed
+#     tonight's findings. [Round 3, engram-alpha#2519, Kepler's ruling] This
+#     INCLUDES the embedding-backfill's own zero-findings case: the scan ran
+#     and found nothing, so the metric WAS fully examined tonight even
+#     though the repair tool itself was never dispatched (round 2 used to
+#     report this same case as "skipped" — see below for why that changed).
+#   - "carried" — a real repair mapping exists but tonight's underlying work
+#     was incomplete: a cascade sweep that hit its pass cap, a bucket-walk
+#     item skipped for snapshot divergence, an embedding-backfill tool-call
+#     failure, or a batch-summary cohort that left a materially non-zero
+#     residual.
+#   - "unavailable" (round 2: now TWO distinguishable causes, both resolving
+#     to this same status — see ``reason`` above) — no registered repair
+#     exists for this metric at all, OR a real repair mapping exists but
+#     tonight's signal is itself UNAVAILABLE.
+#   - "skipped" — [round 3, engram-alpha#2519, Kepler's ruling: "so `skipped`
+#     means exactly one thing"] ONLY the whole-pass skip-night case, see
+#     ``REPAIR_RECORD_RUN_STATUS_VALUES`` above: this metric was NOT examined
+#     tonight at all (the whole repair pass was skipped per the dream-
+#     master's own precondition check). Round 2's wording for this member
+#     also covered "a real repair mapping exists but there was nothing to do
+#     this run, e.g. zero null embeddings found" — that second meaning is
+#     REMOVED as of round 3 (it is now a "done" outcome, above), so a
+#     "skipped" entry means exactly one thing regardless of which metric or
+#     night produced it.
+REPAIR_RECORD_STATUS_VALUES: frozenset[str] = frozenset({
+    "done", "carried", "unavailable", "skipped",
+})
+
+
+def validate_repair_record(record: dict) -> list[str]:
+    """Validate a repair-pass provenance record (engram-alpha#2519) against
+    the schema declared above. Returns a list of violation strings — an
+    empty list means the record is valid. Mirrors ``health_engine_config.
+    validate_config`` / ``health_engine_model.validate_model``'s "collect
+    every violation found in one pass, not just the first" contract (see
+    those functions' docstrings for the reasoning) — a caller sees the
+    whole problem at once, not one field at a time across N re-runs. Does
+    NOT raise: the caller (the dream-master agent, or a future #2518 panel)
+    decides what "invalid" means in its own context (log-and-skip, or
+    render an explicit UNKNOWN state) — this function only names the
+    problem, mirroring ``EngineConfigError``/``ModelError``'s violation-list
+    shape without adopting their raise-on-collect behavior, since this
+    schema has no single privileged construction path to gate the way
+    ``EngineConfig.__post_init__`` gates its own class.
+
+    Checks:
+      1. ``record``'s top-level keys are EXACTLY ``REPAIR_RECORD_TOP_LEVEL_
+         FIELDS`` — no missing, no extra. A renamed/missing top-level field
+         is what makes this a loud, testable failure instead of a silently
+         empty-looking panel (the design-authority concern this validator
+         exists to satisfy).
+      2. ``record["metrics"]`` is a dict; every entry's keys are EXACTLY
+         ``REPAIR_RECORD_METRIC_FIELDS`` — no missing, no extra, no
+         misspelling.
+      3. Every entry's ``"status"`` is a member of ``REPAIR_RECORD_STATUS_
+         VALUES``.
+      4. [round 2, engram-alpha#2519] The top-level ``"status"`` (when
+         present) is a member of ``REPAIR_RECORD_RUN_STATUS_VALUES`` — the
+         WHOLE-PASS-level enum, distinct from check 3's per-metric one.
+         ``"reason"`` (top-level or per-metric) is not type/value-checked
+         beyond the generic key-set check above — it is a free-form
+         ``str | None`` explanatory field, not itself an enum.
+    """
+    violations: list[str] = []
+
+    if not isinstance(record, dict):
+        return [f"record must be a dict, got {type(record)!r}"]
+
+    top_keys = set(record.keys())
+    expected_top = set(REPAIR_RECORD_TOP_LEVEL_FIELDS)
+    missing_top = expected_top - top_keys
+    extra_top = top_keys - expected_top
+    if missing_top:
+        violations.append(
+            f"record is missing top-level field(s): {sorted(missing_top)!r}"
+        )
+    if extra_top:
+        violations.append(
+            f"record has unexpected top-level field(s): {sorted(extra_top)!r}"
+        )
+
+    if "status" in record and record["status"] not in REPAIR_RECORD_RUN_STATUS_VALUES:
+        violations.append(
+            f"record top-level status {record['status']!r} is not a member "
+            f"of REPAIR_RECORD_RUN_STATUS_VALUES "
+            f"{sorted(REPAIR_RECORD_RUN_STATUS_VALUES)!r}"
+        )
+
+    if "metrics" in record:
+        metrics_val = record["metrics"]
+        if not isinstance(metrics_val, dict):
+            violations.append(
+                f"record['metrics'] must be a dict, got {type(metrics_val)!r}"
+            )
+        else:
+            expected_metric_keys = set(REPAIR_RECORD_METRIC_FIELDS)
+            for signal_name, entry in metrics_val.items():
+                if not isinstance(entry, dict):
+                    violations.append(
+                        f"metrics[{signal_name!r}] must be a dict, got "
+                        f"{type(entry)!r}"
+                    )
+                    continue
+                entry_keys = set(entry.keys())
+                missing = expected_metric_keys - entry_keys
+                extra = entry_keys - expected_metric_keys
+                if missing:
+                    violations.append(
+                        f"metrics[{signal_name!r}] is missing field(s): "
+                        f"{sorted(missing)!r}"
+                    )
+                if extra:
+                    violations.append(
+                        f"metrics[{signal_name!r}] has unexpected field(s): "
+                        f"{sorted(extra)!r}"
+                    )
+                if "status" in entry and entry["status"] not in REPAIR_RECORD_STATUS_VALUES:
+                    violations.append(
+                        f"metrics[{signal_name!r}] status {entry['status']!r} "
+                        f"is not a member of REPAIR_RECORD_STATUS_VALUES "
+                        f"{sorted(REPAIR_RECORD_STATUS_VALUES)!r}"
+                    )
+
+    return violations
+
+
+def repair_record_missing_metric_names(
+    record: dict, model: ScoringModel = MODEL
+) -> list[str]:
+    """Metric ``signal`` names declared in ``model.metrics`` but ABSENT from
+    ``record["metrics"]`` — the COMPLETENESS half of Kepler's #2519 review
+    ruling ("every metric in the shipped model gets an entry, always").
+    JUDGMENT CALL (flagged in the round-2 report): added as a small,
+    cheap-to-write schema-level helper rather than judged out of scope —
+    after this round an absent entry must mean exactly one thing (the pass
+    did not run for that metric at all), and this is the mechanical way a
+    caller (the dream-master's own pre-write self-check, or a future #2518
+    panel) can detect that condition directly against the live model,
+    instead of eyeballing the metrics dict against ``MODEL_SPEC`` by hand.
+
+    Does NOT duplicate ``validate_repair_record``'s own structural checks —
+    a record that is itself malformed (not a dict, or ``"metrics"`` not a
+    dict) reports EVERY declared metric name as missing, since nothing
+    usable was found to compare against; pair this with
+    ``validate_repair_record`` for the full picture, not as a replacement
+    for it. Returns a SORTED list (stable, testable order) of signal names;
+    empty means the record is complete against ``model``.
+    """
+    declared = {m.signal for m in model.metrics}
+    if not isinstance(record, dict) or not isinstance(record.get("metrics"), dict):
+        return sorted(declared)
+    present = set(record["metrics"].keys())
+    return sorted(declared - present)
+
+
+def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
+    """Count of CURRENT nodes in ``population`` with a NULL ``embedding``
+    column — the repair pass's own read-only scanner for ``embedding_
+    coverage``'s detector (``scan:null-embeddings``, engram-alpha#2519).
+
+    Mirrors ``health_engine_metrics.embedding_coverage``'s own "missing"
+    query shape exactly (same ``is_current = 1 AND type IN (...) AND
+    embedding IS NULL`` predicate) — deliberately kept identical rather than
+    a fresh independent query, so this scanner's ``findings_count`` and that
+    metric's own raw signal are always counting the SAME thing. Unlike that
+    metric, this function does NOT gate on embedder availability
+    (``core._embedder.is_available()``) — by the time the dream-master's
+    repair pass reaches this call, tonight's dream projection has already
+    been read (the repair pass's own precondition step) and ``embedding_
+    coverage``'s raw signal has already been checked as "available this
+    run" before this scanner is ever invoked (an unavailable-this-run
+    metric is skipped entirely, per the dream-master spec's own per-metric
+    dispatch step 2) — so a second, redundant availability gate here would
+    only ever be reached in a state that step 2 has already excluded.
+
+    ``population`` is the metric's own declared ``denominator_population``
+    (``health_engine.CONFIG.metric("embedding_coverage").denominator_
+    population``) — today always ``"claim_bearing_nodes"``. Only that one
+    population is implemented; a different value raises ``ValueError``
+    rather than silently returning a wrong count, per this codebase's own
+    "loud guard, not silent workaround" discipline — a future population
+    value is a genuine code change here, not something to guess at.
+    """
+    if population != "claim_bearing_nodes":
+        raise ValueError(
+            f"_count_null_embeddings only implements the "
+            f"'claim_bearing_nodes' population, got {population!r}"
+        )
+
+    import engram_core as core  # lazy — see module-top NOTE
+
+    claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
+    placeholders = ",".join("?" * len(claim_bearing_types))
+    return conn.execute(
+        f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
+        f"({placeholders}) AND embedding IS NULL",
+        claim_bearing_types,
+    ).fetchone()["c"]

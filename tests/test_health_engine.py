@@ -1077,6 +1077,107 @@ class TestWriteSnapshot:
         assert snap.get("_snapshot_write_error")
         assert snap.get("_dream_projection_write_error")
 
+    def test_dream_projection_failure_writes_error_sentinel(self, tmp_path, monkeypatch):
+        """[engram-alpha#2519 Ruling 2] A caught dream-projection exception
+        (computation, not just persistence — forcing ``_build_dream_
+        projection`` itself to raise, so ``Path.write_text`` stays intact
+        and the sentinel write below can actually succeed) writes the
+        sibling ``.error`` sentinel with the shape Ruling 2 names:
+        ``{"turn": ..., "written_at": ..., "error": ...}``."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated dream-projection computation failure")
+
+        monkeypatch.setattr(health_engine, "_build_dream_projection", _boom)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")  # must not raise
+        assert snap.get("_dream_projection_write_error")
+
+        error_path = tmp_path / "health-snapshots" / "health-snapshot-dream.error"
+        assert error_path.exists()
+        payload = json.loads(error_path.read_text(encoding="utf-8"))
+        assert payload["turn"] == snap["turn"]
+        assert "written_at" in payload
+        assert "simulated dream-projection computation failure" in payload["error"]
+
+    def test_dream_projection_write_failure_writes_error_sentinel(self, tmp_path, monkeypatch):
+        """[round 3, engram-alpha#2519, reviewer-fairy suggestion] The
+        sibling test above (``test_dream_projection_failure_writes_error_
+        sentinel``) only exercises the COMPUTATION half of write_snapshot's
+        own docstring claim ("on a caught dream-projection exception
+        (computation OR write)") — it forces ``_build_dream_projection``
+        itself to raise. This test isolates the WRITE half: ``_build_dream_
+        projection`` succeeds normally, but the dream-projection file's OWN
+        ``write_text`` call fails, while the MAIN snapshot's own SEPARATE
+        ``write_text`` call still succeeds — proving the sentinel fires on
+        this genuinely different code path within the same ``except``
+        block, not merely a re-run of the computation-failure test."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        real_write_text = health_engine.Path.write_text
+
+        def _write_text_fails_only_for_dream_projection(self, *args, **kwargs):
+            if self.name == "health-snapshot-dream.json":
+                raise OSError("simulated dream-projection WRITE failure")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            health_engine.Path,
+            "write_text",
+            _write_text_fails_only_for_dream_projection,
+        )
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")  # must not raise
+
+        # The MAIN snapshot's own write succeeded — this is a WRITE-path
+        # failure isolated to the dream projection, distinct from the
+        # computation-failure test (where _build_dream_projection itself
+        # never returns, so neither write_text call for the dream
+        # projection is even reached).
+        assert "_snapshot_write_error" not in snap
+        main_path = snap.get("_snapshot_path")
+        assert main_path, f"no _snapshot_path in {snap}"
+        assert os.path.exists(main_path)
+
+        assert snap.get("_dream_projection_write_error")
+        assert (
+            "simulated dream-projection WRITE failure"
+            in snap["_dream_projection_write_error"]
+        )
+        # Distinguishable from the computation-failure test's own error text.
+        assert "computation failure" not in snap["_dream_projection_write_error"]
+
+        error_path = tmp_path / "health-snapshots" / "health-snapshot-dream.error"
+        assert error_path.exists()
+        payload = json.loads(error_path.read_text(encoding="utf-8"))
+        assert payload["turn"] == snap["turn"]
+        assert "written_at" in payload
+        assert "simulated dream-projection WRITE failure" in payload["error"]
+
+    def test_successful_write_clears_a_stale_error_sentinel(self, tmp_path, monkeypatch):
+        """[engram-alpha#2519 Ruling 2] The OTHER direction: a SUCCESSFUL
+        dream-projection write deletes a pre-existing ``.error`` sentinel
+        left behind by an earlier failed night — never leaves a stale
+        failure sentinel next to a fresh, healthy projection."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        snapshots_dir = tmp_path / "health-snapshots"
+        snapshots_dir.mkdir(parents=True, exist_ok=True)
+        error_path = snapshots_dir / "health-snapshot-dream.error"
+        error_path.write_text(
+            json.dumps({"turn": 1, "written_at": "2026-01-01T00:00:00Z", "error": "stale"}),
+            encoding="utf-8",
+        )
+
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")  # must not raise
+        assert "_dream_projection_write_error" not in snap
+        assert not error_path.exists()
+
 
 # ---------------------------------------------------------------------------
 # [PR5] The dream-side projection — draft-2 §2. Fixed filename, aspect-blind
@@ -1219,3 +1320,49 @@ class TestDreamProjection:
         assert entry["signal"] == "UNAVAILABLE"
         assert entry["score"] == "UNAVAILABLE"
         assert entry["delta_since_last"] is None
+
+
+# ---------------------------------------------------------------------------
+# [engram-alpha#2519] _count_null_embeddings — the repair pass's own ONE
+# genuinely new read-only scanner (embedding_coverage's detector,
+# scan:null-embeddings). Mirrors health_engine_metrics.embedding_coverage's
+# own "missing" query shape (same is_current=1 AND type IN (...) AND
+# embedding IS NULL predicate) — these tests exist to prove that mirroring
+# holds, not to re-test embedding_coverage itself.
+# ---------------------------------------------------------------------------
+
+
+class TestCountNullEmbeddings:
+    def test_counts_only_claim_bearing_nodes_with_null_embedding(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", embedding=None)
+        _insert(conn, "dv_2", "derivation", embedding="[0.1, 0.2]")
+        _insert(conn, "ob_1", "observation_factual", embedding=None)
+        assert health_engine._count_null_embeddings(conn, "claim_bearing_nodes") == 2
+
+    def test_non_claim_bearing_type_never_counted(self):
+        """A non-claim-bearing node type with a NULL embedding must not
+        inflate the count — this scanner counts the SAME population
+        embedding_coverage's own denominator does."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", embedding=None)
+        _insert(conn, "gl_1", "goal", embedding=None)
+        assert health_engine._count_null_embeddings(conn, "claim_bearing_nodes") == 1
+
+    def test_non_current_node_never_counted(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", embedding=None, is_current=0)
+        assert health_engine._count_null_embeddings(conn, "claim_bearing_nodes") == 0
+
+    def test_zero_when_nothing_missing(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", embedding="[0.1]")
+        assert health_engine._count_null_embeddings(conn, "claim_bearing_nodes") == 0
+
+    def test_unimplemented_population_raises_loud(self):
+        """A population value this scanner doesn't implement must fail
+        loud, not silently return a wrong count (this codebase's own
+        "loud guard, not silent workaround" discipline)."""
+        conn = _make_conn()
+        with pytest.raises(ValueError, match="observations"):
+            health_engine._count_null_embeddings(conn, "observations")
