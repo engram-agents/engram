@@ -179,8 +179,10 @@ For the things you *did* start, you already have a handle and never need to sear
 <output of any sandbox tests / dry-runs you executed>
 
 ## 🔵 Conclusion warrant (REQUIRED — never omit this section)
-1. Numbers re-measured: <what you re-ran from your own clone / API call, and the
-   values YOU got — never the PR's prose figures> ... or "No numeric claims."
+1. Numbers re-measured: <what you re-ran from your own clone / API call, the
+   values YOU got — never the PR's prose figures — and for each, what it RANGES
+   OVER and whether that population is the claim's subject> ... or "No numeric
+   claims."
 2. Disagreements: <any figure of yours that differs from the PR's, and what you
    ruled out about your OWN instrument's scope first> ... or "No disagreements."
 3. Load-bearing claims: <per claim — what observable would DIFFER if it were
@@ -204,10 +206,14 @@ canonical short form and never needs an omission.
 
 **Line 1 is the floor** because it is the only line that needs no judgement about
 what counts as load-bearing, and judgement steps are the ones that go quietly
-unexecuted under time pressure. **Line 2 exists because the step's own remedy can
-manufacture a false finding**, and in the direction that lands on another person:
-re-measuring your own number, a manufactured null reads as reassurance and you
-stop; re-measuring someone else's, it reads as a finding and you publish it. A
+unexecuted under time pressure. **Its scope statement is unconditional** — a true
+measurement of a *neighbouring* population agrees with itself, so a scope check
+gated on a disagreement is silent exactly where the danger is, which is why that
+requirement sits on line 1 rather than being left to line 2. **Line 2 exists
+because the step's own remedy can manufacture a false finding**, and in the
+direction that lands on another person: re-measuring your own number, a
+manufactured null reads as reassurance and you stop; re-measuring someone
+else's, it reads as a finding and you publish it. A
 different answer is evidence about two things — the PR's measurement and yours —
 and yours is the cheaper to rule out first. **Line 4 catches the case lines 1–3
 structurally cannot**: a bound stated correctly and violated four lines away in
@@ -266,8 +272,12 @@ None.
 
 ## 🔵 Conclusion warrant
 1. Numbers re-measured: re-ran `pytest tests/test_foo.py` in my own worktree at
-   head ae5719a — 42 passed, matching the PR body's 42. Diff size re-measured
-   with `git diff --full-index --stat`: +311/-4, PR body says +311/-4.
+   head ae5719a — 42 passed, matching the PR body's 42. RANGES OVER: that one
+   file, not the suite — the PR's "no regressions" sentence is about the suite,
+   so this number does NOT cover its subject; ran the full suite too (5544
+   passed) to close the gap. Diff size re-measured with `git diff --full-index
+   --stat`: +311/-4, PR body says +311/-4. RANGES OVER: the whole PR diff, which
+   is the claim's subject.
 2. Disagreements: No disagreements.
 3. Load-bearing claims: PR claims the retry path is now idempotent. What would
    differ if false — a second invocation would write a duplicate row; I ran it

@@ -375,7 +375,10 @@ needing no judgement about what "load-bearing" means, and judgement steps are
 exactly the ones that go quietly unexecuted under time pressure:
 
 1. **Re-measure the numbers from your own clone or your own API call** — never
-   from the PR's prose.
+   from the PR's prose — and for each, **state what it ranges over and whether
+   that population is the claim's subject.** Unconditionally: a true measurement
+   of a *neighbouring* population agrees with itself, so the scope check in
+   line 2 — which fires only on a disagreement — is silent exactly there.
 2. **If your re-measure DISAGREES with the PR's number, check your own
    instrument's scope before you write the finding.** A different answer is
    evidence about two things, and yours is the cheaper to rule out. The direction
