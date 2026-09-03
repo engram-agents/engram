@@ -928,21 +928,28 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     _parsed_anchor = _parse_github_anchor(github_anchor)
     _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
     if _pr_anchor_match and _is_pool_sentinel(to_agent) and _parsed_anchor[1] is None:
-        # #1918: unqualified pr/<N> anchor -- there is no default repo to
-        # guess against. Skip CI/approval/colleague verification entirely
-        # rather than querying a possibly-wrong repo (the old
-        # DEFAULT_GITHUB_REPO fallback here could false-block a legitimate
-        # flip, or worse, false-pass one against an unrelated same-numbered
-        # PR). Same "cannot verify, proceed with a warning" shape already
-        # used below for a genuine gh-query failure, just triggered before
-        # any gh call is made at all.
+        # #1918/#2511: unqualified pr/<N> anchor -- there is no default repo
+        # to guess against. A flip-to-the-pool-sentinel IS the merge-readiness
+        # signal the maintainer trusts (CLAUDE.md's baton-tracked
+        # merge-readiness convention) -- skipping the CI/approval/colleague
+        # gates here and merely warning left the artifact indistinguishable
+        # from one whose gates actually ran and passed, which is worse than
+        # refusing outright. REFUSE, matching the same repo-qualification
+        # gate cmd_merge already enforces (see its "refusing to guess which
+        # repo" comment) -- and matching what the header comment, the #1918
+        # note, and the `baton init` warning text have promised all along.
+        # This is not skippable with --force -- --force skips CI/approval
+        # QUALITY gates, it has never meant "proceed without knowing which
+        # repo," and this gate does not change that contract.
         print(
-            f"warning: baton flip: PR anchor 'pr/{_parsed_anchor[2]}' is not "
-            "repo-qualified — skipping CI/approval/colleague verification "
-            "(no default repo to guess against). Anchor it first: "
-            f"baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}",
+            f"baton flip: '{project_id}' has no repo-qualified github anchor "
+            f"-- refusing to guess which repo's PR #{_parsed_anchor[2]} to "
+            "verify CI/approval/colleague state against. Run "
+            f"'baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}' "
+            "first. This is not skippable with --force.",
             file=sys.stderr,
         )
+        sys.exit(EXIT_VALIDATION)
     elif _pr_anchor_match and _is_pool_sentinel(to_agent):
         _pr_num = _parsed_anchor[2]
         _pr_repo = _parsed_anchor[1]

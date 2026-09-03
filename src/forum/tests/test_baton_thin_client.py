@@ -227,6 +227,69 @@ class TestCmdFlip:
             _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_IO
 
+    # -----------------------------------------------------------------
+    # #2511: unqualified pr/<N> anchor + flip-to-pool-sentinel must REFUSE
+    # (not warn-and-proceed) -- see cmd_flip's gate comment for the design
+    # rationale and cmd_merge's identical-shape gate for the template.
+    # -----------------------------------------------------------------
+
+    def test_refuses_unqualified_anchor_flip_to_pool_sentinel(self, monkeypatch, capsys):
+        """Unqualified anchor + flip-to-sentinel refuses; the flip never happens."""
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(get_return={"raw": raw})
+        args = _ns(project_id="PR-99", to="casey", reason="ready")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        stderr = capsys.readouterr().err
+        assert "baton anchor PR-99 --github pr/<owner>/<repo>/42" in stderr
+
+    def test_refuses_unqualified_anchor_even_with_force(self, monkeypatch, capsys):
+        """--force does NOT override the unqualified-anchor refusal (not a quality gate)."""
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(get_return={"raw": raw})
+        args = _ns(project_id="PR-99", to="casey", reason="ready", force=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        stderr = capsys.readouterr().err
+        assert "baton anchor PR-99 --github pr/<owner>/<repo>/42" in stderr
+
+    def test_unqualified_anchor_unaffected_when_not_flipping_to_sentinel(self, monkeypatch):
+        """Unqualified anchor + flip to a non-sentinel participant is untouched by the gate."""
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(
+            post_return={"seq": 7},
+            get_return={"raw": raw},
+        )
+        args = _ns(project_id="PR-99", to="ariadne", reason="fairy-converged")
+
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+
+    def test_qualified_anchor_flip_to_pool_sentinel_still_works(self, monkeypatch):
+        """A repo-qualified anchor flip-to-sentinel is unaffected -- proceeds to post."""
+        raw = _make_raw_baton("PR-99", github="pr/engram-agents/engram-paper/42")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
+
+        client = _make_client(
+            post_return={"seq": 7},
+            get_return={"raw": raw},
+        )
+        args = _ns(project_id="PR-99", to="casey", reason="ready")
+
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # cmd_claim

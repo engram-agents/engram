@@ -2594,13 +2594,17 @@ class TestFlipRepoQualifiedGuard:
         assert ("ci", "9101", "engram-agents/engram-paper") in calls
         assert ("approval", "9101", "engram-agents/engram-paper") in calls
 
-    def test_flip_bare_anchor_skips_guard_never_guesses(self, monkeypatch, capsys):
-        """#1918: an unqualified bare pr/<N> anchor skips the CI/approval/
-        colleague guard entirely (no gh call, no guessed repo) rather than
-        resolving against a default -- the flip still succeeds, just
-        unverified, with a warning. Supersedes the old
-        test_flip_bare_anchor_still_resolves_default_repo, which asserted
-        the exact silent-guess behavior this issue fixes."""
+    def test_flip_bare_anchor_refuses_never_guesses(self, monkeypatch, capsys):
+        """#1918/#2511: an unqualified bare pr/<N> anchor REFUSES the flip
+        entirely (no gh call, no guessed repo, no CI/approval/colleague
+        verification, and the flip itself never happens) rather than
+        resolving against a default OR silently proceeding unverified.
+        Supersedes the old test_flip_bare_anchor_skips_guard_never_guesses,
+        which asserted the exact warn-and-proceed behavior #2511 fixes --
+        that assertion in turn superseded test_flip_bare_anchor_still_
+        resolves_default_repo, which asserted the original silent-guess
+        behavior #1918 fixed. The 'never guesses' half of the name still
+        holds; only the disposition of the ungaugeable flip changed."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         calls = []
 
@@ -2622,12 +2626,34 @@ class TestFlipRepoQualifiedGuard:
         args = argparse.Namespace(
             project_id="PR-9102", to="casey", reason="ready", force=False,
         )
-        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
 
-        client.post.assert_called_once()
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # the flip never happens
         assert calls == []  # no gh call at all -- never guessed a repo
         captured = capsys.readouterr()
-        assert "not repo-qualified" in captured.err
+        assert "has no repo-qualified github anchor" in captured.err
+
+    def test_flip_bare_anchor_refuses_even_with_force(self, monkeypatch, capsys):
+        """#2511: --force does not bypass the unqualified-anchor refusal --
+        force's contract is 'skip CI/approval quality gates', never 'proceed
+        without knowing which repo'. Companion to the no-force case above."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton("PR-9102", github="pr/9102")},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9102", to="casey", reason="ready", force=True,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "This is not skippable with --force" in captured.err
 
 
 # ===========================================================================
