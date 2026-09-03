@@ -208,6 +208,52 @@ class EngineConfig:
     def __post_init__(self) -> None:
         validate_config(self)
 
+    def metric(self, name: str) -> MetricDef | None:
+        """Look up a declared ``MetricDef`` by name across every aspect.
+
+        Added for engram-alpha#1991/#2520 round 3 (Kepler's ruling on PR5's
+        row-local population check): ``health_engine_model.validate_model``
+        cross-validates a ``MetricBinding``'s ``detector``/``additional_
+        detector`` population against THIS config's own real ``denominator_
+        population`` for the same-named metric — ``config.metric(row.signal)
+        .denominator_population`` is the real source of truth, per Kepler's
+        ruling verbatim. Returns ``None`` (not a raised exception) when no
+        metric with this name is declared anywhere in this config — the
+        caller treats a miss as a violation to collect, not an exception to
+        propagate, matching this module's own "collect every violation, not
+        just the first" discipline.
+
+        Deliberately a plain linear scan over ``self.aspects`` rather than a
+        cached name->MetricDef dict: the real config has 9 metrics total, so
+        an O(n) scan per lookup is not a performance concern at this scale,
+        and a frozen dataclass caching a derived index would add complexity
+        (bypassing ``__setattr__``, e.g. via ``object.__setattr__`` or
+        ``functools.cached_property``) for no measurable benefit here.
+
+        FIRST-MATCH SEMANTICS, STATED EXPLICITLY (reviewer-fairy suggestion,
+        PR5 round 3 review, #2520): ``validate_config`` does NOT currently
+        enforce that a metric name is unique across aspects — nothing stops
+        two different ``AspectDef``s from each declaring a ``MetricDef`` with
+        the same ``name``. If that ever happens, this method silently
+        returns whichever one it encounters first in ``self.aspects`` order,
+        which would mask exactly the kind of cross-module drift the caller
+        above uses this method to catch. Not exploitable under the real
+        9-metric config today (all 9 names are distinct); flagged here
+        rather than fixed with a raising check, because a hard uniqueness
+        constraint has real blast radius on this file's own test fixtures
+        (several pre-existing tests reuse the same default metric name
+        across multiple aspects for unrelated reasons, e.g. weight-sum
+        checks) that a narrow fast-follow shouldn't take on. If this class
+        of drift becomes a live concern, add the uniqueness check to
+        ``validate_config`` as its own deliberate change, not folded
+        silently into an unrelated commit.
+        """
+        for aspect in self.aspects:
+            for metric in aspect.metrics:
+                if metric.name == name:
+                    return metric
+        return None
+
 
 # ---------------------------------------------------------------------------
 # validate_config

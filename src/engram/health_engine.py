@@ -1,39 +1,210 @@
-"""health_engine — the real production engine: CONFIG, composition, and the
-snapshot writer for the health-score redesign (engram-alpha#1991, PR2+PR3 of
-4).
+"""health_engine — the real production engine: CONFIG, the dream-side
+scoring model, composition, and the snapshot writer for the health-score
+redesign (engram-alpha#1991, PR2+PR3+PR5 of 5).
 
 Design-of-record: engram-alpha#1991, issue comment 5372283060 (Borges,
 2026-08-21, "Health-score redesign — DESIGN v2 (build basis)") §2 (aspects),
-§3 (composition), §4 (snapshot), §5 (engine contract).
+§3 (composition), §4 (snapshot), §5 (engine contract) — PR2/PR3's basis —
+SUPERSEDED for the scoring/composition layer specifically by issue comment
+5527066386 (Kepler, 2026-09-03, "The dream-side contract for health-v2 —
+DRAFT 2"), §1 (the scoring model's shape) and §2 (the dream-side
+projection), plus Kepler's five follow-up clarifications (recorded in
+health_engine_model.py, inline at the field each one resolves).
 
-Scope of this module:
-  1. The real production ``CONFIG`` (an ``EngineConfig``) — all three scored
-     aspects are now REAL: A (epistemic integrity, weight 40), C (provenance
-     integrity, weight 25), and B (retrievability, weight 35, PR3), all
-     built from health_engine_metrics.py's signal functions. PR2 shipped a
-     stub AspectDef for B (see the historical "judgment call" note below,
-     kept for context); PR3 replaces it with the 4 real metrics.
-  2. The top-level composition function (design doc §3's weighted geometric
-     mean across aspects).
-  3. The snapshot writer (design doc §4.1) — ``build_snapshot`` (pure
+Scope of this module (PR5 additions marked):
+  1. The real production ``CONFIG`` (an ``EngineConfig``) — the RAW-SIGNAL-
+     COMPUTATION layer (health_engine_config.py's denominator-population /
+     empty-denominator-policy schema). UNCHANGED by PR5 — still declares all
+     nine metrics across three aspects with the SAME ``signal_fn`` callables
+     PR5's own health_engine_model.py's ``SIGNALS`` registry names. See "TWO
+     PARALLEL SYSTEMS, ON PURPOSE" below for exactly what CONFIG still does
+     and what it no longer does, post-PR5.
+  2. [PR5] ``MODEL`` (below) — the SCORING layer (draft-2 §1): which aspect
+     a signal belongs to, its curve, its importance, its detector/repair
+     binding. Read raw signals via CONFIG (1 above), turns them into scores
+     via THIS. [Round 3, engram-alpha#1991/#2520] Built here, right after
+     CONFIG, via ``health_engine_model.load(health_engine_model.MODEL_SPEC,
+     CONFIG)`` — not imported ready-made from health_engine_model.py
+     anymore, so ``load()`` can cross-validate every detector's declared
+     population against CONFIG's own real ``denominator_population``.
+  3. [PR5, replaces PR2/PR3] ``compose_aspect_scores`` and per-aspect
+     scoring — the weighted-ARITHMETIC-SUM formula (Kepler's clarification
+     1, below), replacing BOTH ``health_engine_metrics.
+     aspect_geometric_mean_scoring`` (per-aspect) and the OLD
+     ``compose_aspect_scores`` (across aspects), which were both geometric-
+     mean. Those two functions are UNCHANGED in health_engine_metrics.py
+     (out of this PR's touch scope) but are now DEAD CODE from this
+     module's perspective — nothing here calls them anymore; their own
+     tests (tests/test_health_engine_metrics.py) still exercise them
+     directly and stay green.
+  4. The snapshot writer (design doc §4.1) — ``build_snapshot`` (pure
      computation) and ``write_snapshot`` (computation + best-effort JSON
-     persistence under ``DATA_DIR/health-snapshots/``). PR3 also populates
-     the previously-empty ``diagnostics`` block (activity metrics +
-     cascade-marker age — design doc §2 "Out of scoring, deliberately");
-     these are informational only and never feed ``compose_aspect_scores``.
+     persistence under ``DATA_DIR/health-snapshots/``). PR3 populated the
+     ``diagnostics`` block (activity metrics + cascade-marker age); PR5
+     [NEW] also writes the aspect-blind DREAM PROJECTION (draft-2 §2) to a
+     FIXED path, ``DATA_DIR/health-snapshots/health-snapshot-dream.json``,
+     overwritten every checkpoint.
 
-Explicitly OUT of scope (per the PR3 spec): lambda-2 / algebraic
-connectivity (design doc's own "unscored" item — no numpy/scipy/networkx
-dependency exists in this codebase and this PR does not add one, and a
-hand-rolled eigenvalue solver is exactly the kind of numerically-subtle code
-this project's contract-over-discipline philosophy argues against writing
-informally); DAG violations as a ``red_flags`` entry (``red_flags`` stays
-``[]``, exactly as PR2 left it — the design doc's build slicing doesn't
-explicitly assign this to PR3, and PR2's own stub comment already scoped it
-to "PR3/PR4" ambiguously, so this PR leaves it for the next slice rather
-than silently absorbing it); ``pre_sleep`` checkpoint wiring (PR2 left this
-deliberately unwired, not PR3's job either); ``engram_stats.py`` / the OLD
-formula (never touched through the whole redesign).
+COMPOSITION FORMULA (Kepler's clarification 1, 2026-09-03, cited verbatim
+per the PR5 spec's instruction to cite it in the docstring): "engram-
+alpha#1991, issue comment thread, Lei's 2026-09-02T14:32Z ruling (four-level
+shape: aspects with point allotments summing to 100, metrics carrying
+in-aspect importance, arithmetic sums at both levels — 'the curve layer
+carries low-value sensitivity')."
+
+    aspect_score = Σ over AVAILABLE ADMITTED metrics in that aspect of
+                   (importance_i / Σ importance_available) × curve_i(signal_i)
+                   → range [0, 1]
+    composed     = Σ over SCORED aspects (a) of
+                   (points_a / points_in_play) × aspect_score_a × 100
+                   → range [0, 100]
+
+"Admitted" = ``importance > 0`` (today's ``scored=True`` is the same
+predicate under a new name — health_engine_config.py's ``MetricDef.scored``
+field is UNRELATED to this "admitted" predicate now; see "TWO PARALLEL
+SYSTEMS" below). A non-admitted metric's signal/score still appears in the
+snapshot as a diagnostic, never in either sum. "Available" (round 2 of
+engram-alpha#2520) = the metric's raw signal is not itself UNAVAILABLE
+THIS RUN. "Scored" aspect = it has at least one admitted-and-available
+metric this run; "points_in_play" = Σ points_a over scored aspects only —
+see the RESOLVED section below for the full "hold out, renormalize,
+report" mechanism this formula implements at BOTH levels.
+
+UNAVAILABLE PROPAGATION (RESOLVED — see below for the full history): draft-2
+states no NEW rule for the new formula, so PR5's first round PRESERVED the
+existing propagate-on-UNAVAILABLE behavior at face value. Round 2 (this
+round) REPLACES flat propagation with the "hold out, renormalize" mechanism
+below, applied at BOTH the metric level (within one aspect's own weighted
+mean) and the aspect level (within the top-level composed sum) — design doc
+§3's "degradation propagates, never silently composed over a hole" principle
+is honored differently now: a hole is never silently composed OVER (its
+allotment is excluded, not zeroed-and-averaged-in), but it also no longer
+poisons the WHOLE computation the way flat propagation did.
+
+***RESOLVED (was: LOAD-BEARING DISCOVERED CONSEQUENCE, flagged for design-
+authority review) — design ruling: Kepler, engram-alpha#2520 issue comment,
+2026-09-03, "Design ruling on the zero-admitted-aspect question" (co-design
+authority per Lei's 2026-09-02 charge, Lei's veto standing), GENERALIZED one
+level down by addendum 2 on engram-alpha#1991 (Kepler via Borges's colleague
+read of draft 2, same date).*** Under the v1 metric table shipped by PR5
+(health_engine_model.MODEL_SPEC, draft-2 §4, "ship all nine, unmerged" per
+clarification 5), ``provenance_integrity`` (25 of 100 points) has BOTH its
+metrics at importance 0 (diagnostic-only: no repair tool exists for either)
+— zero admitted metrics, structurally, on every graph, until it gets at
+least one admitted metric. PR5's first round discovered this made
+``composed`` STRUCTURALLY, ALWAYS UNAVAILABLE under flat propagation, and
+routed the question to design authority rather than resolving it
+unilaterally (this codebase's own "loud guard, not silent workaround"
+discipline).
+
+Kepler named what the absence MEANS first, before picking an answer: zero
+admitted metrics means "we cannot measure this aspect YET" — a true
+condition about the MODEL, not a missing VALUE. Of three candidate answers:
+(a) propagate UNAVAILABLE (PR5 round 1's behavior) turns a true condition
+into a FATAL one — "loud != fatal is a lesson this fleet has paid for
+repeatedly" (Kepler); (b) a neutral/perfect default FABRICATES a number for
+an aspect nobody can measure — the "false-clean" shape; (c) admit a metric
+anyway would require relaxing the admission rule or inventing a repair tool
+that doesn't exist — the design doc's BRAKE, not a knob. Kepler's ruling is
+a fourth answer, (d) "hold out, renormalize, report":
+
+  1. An aspect with zero admitted metrics is EXCLUDED from composition. Its
+     point allotment is HELD OUT, and ``composed`` is computed over the
+     remaining (scored) aspects only, with THEIR allotments renormalized to
+     sum to 100 — so ``composed`` stays a real number in [0,100], meaning
+     "health over the aspects we can currently measure," never UNAVAILABLE
+     purely because of this condition.
+  2. The snapshot reports this loudly — three fields, on BOTH the main
+     snapshot's ``scores`` block and the dream-side projection (JUDGMENT
+     CALL, flagged in the PR5-round-2 report: extending to the main
+     snapshot is not explicitly demanded by the ruling, which names only
+     the projection — done for the same "stay internally consistent
+     between the two files" reason PR5's own round-1 judgment call already
+     established for the ``scores.metrics``/``scores.aspects`` scale
+     change): ``unscored_aspects`` (the list of aspect names currently
+     excluded), ``points_in_play`` (the sum of point-allotments actually
+     used in the renormalized ``composed`` calculation, e.g. ``75.0`` when
+     ``provenance_integrity``'s 25 points are held out of 100), and
+     ``composed_coverage`` (``points_in_play / 100``, e.g. ``0.75``).
+  3. ``health_engine_model.validate_model`` WARNS (never raises) at
+     model-LOAD time (round 3: via ``health_engine_model.load()``, called
+     once below, right after CONFIG — no longer at bare ``ScoringModel``
+     construction time, see health_engine_model.py's own docstring for why)
+     for any aspect with zero admitted metrics, naming the aspect(s) — see
+     that function for the mechanism.
+  4. Extensibility, true by construction: the moment a provenance metric
+     gains a repair tool and its ``importance`` is raised above 0
+     (admitted), that aspect automatically re-enters composition on the
+     NEXT model construction — no code change beyond the model's own data.
+
+ADDENDUM 2's GENERALIZATION (round 2 of engram-alpha#2520, 2026-09-03,
+Kepler via Borges's colleague read of draft 2): the SAME hold-out-and-
+renormalize mechanism applies ONE LEVEL DOWN too. An aspect's own
+importance-weighted mean (``_score_aspect`` below) renormalizes over its
+CURRENTLY AVAILABLE admitted metrics — a metric's raw signal can be
+UNAVAILABLE on THIS graph/environment (e.g. the embedder disabled, or
+``open_contradiction_rate``'s own empty-population UNAVAILABLE, round 2's
+fold #2) even though it is structurally admitted (``importance > 0``) — not
+just over its full DECLARED admitted-metric set. If ALL of an aspect's
+admitted metrics are unavailable-right-now, that aspect is held out of
+composition exactly as ruled above for the zero-admitted case — SAME
+mechanism, different reason for reaching zero available metrics. This means
+``_score_aspect`` returning UNAVAILABLE now has exactly TWO causes (zero
+admitted, or zero CURRENTLY available), and BOTH resolve to "hold this
+aspect out of the top-level sum" — there is no longer a THIRD case where an
+aspect's own UNAVAILABLE score propagates to ``composed`` without being
+held out (see ``compose_aspect_scores``/``_composition_coverage`` below).
+Per-aspect ``metrics_in_play``/``coverage`` fields (main snapshot only, NOT
+the aspect-blind dream projection — see ``build_snapshot``'s own docstring
+for that scoping decision) report this one level down, mirroring the
+top-level ``points_in_play``/``composed_coverage`` pair.
+
+TWO PARALLEL SYSTEMS, ON PURPOSE (flagged plainly per the PR5 spec's
+explicit instruction, not silently left as unexplained duplication):
+health_engine_config.py's ``EngineConfig``/``AspectDef``/``MetricDef`` and
+health_engine_model.py's ``ScoringModel``/``AspectSpec``/``MetricBinding``
+are BOTH still declared, and BOTH still validate independently (each
+requires its own weight/points to sum to 100 — currently the SAME numbers,
+40/25/35, but nothing enforces they stay in sync beyond this docstring and
+code review). ROUND 3 (engram-alpha#1991/#2520, Kepler's ruling, 2026-09-03)
+adds the ONE mechanical exception to "nothing enforces": ``health_engine_
+model.load()`` (called below, right after ``CONFIG``) cross-validates every
+``MetricBinding``'s declared detector population against ``CONFIG``'s own
+real ``denominator_population`` for that same-named metric — a genuine
+cross-module check, not merely two independent declarations kept in sync by
+review. Everything else about the two systems (weight/points-sum-to-100,
+the rest of each schema) is still unenforced across the boundary. What each
+still DOES, post-PR5:
+  - ``health_engine_config.EngineConfig`` (``CONFIG`` below): declares the
+    denominator population + empty-denominator policy for each metric
+    (UNCHANGED, not superseded by draft-2, which is silent on denominators)
+    and provides the ``signal_fn`` callable ``_run_aspect`` calls to compute
+    a RAW signal. Its own weight-sum-to-100 / scored-implies-state_valued /
+    dive_target checks all still run, unchanged.
+  - ``health_engine_model.ScoringModel`` (``MODEL``): declares importance,
+    curve, aspect membership, detector/repair for the SAME nine signals, and
+    drives the actual ``aspect_score``/``composed`` arithmetic above.
+  - ``AspectDef.scoring_fn`` (still set to ``metrics.
+    aspect_geometric_mean_scoring`` below, unchanged) and ``MetricDef.
+    scored``/``state_valued`` are now VESTIGIAL for real composition — kept
+    ONLY because ``health_engine_config.py``'s own schema still requires
+    them (a required dataclass field / a validated invariant) and because
+    that module is out of this PR's touch scope (flagged, not deleted, per
+    the PR5 spec's explicit "do NOT delete health_engine_config.py's
+    validator/schema wholesale without flagging it first"). Nothing in this
+    module calls ``aspect.scoring_fn`` anymore.
+
+Explicitly OUT of scope (per the PR3 spec, still true): lambda-2 / algebraic
+connectivity; DAG violations as a ``red_flags`` entry (``red_flags`` stays
+``[]``); ``pre_sleep`` checkpoint wiring; ``engram_stats.py`` / the OLD
+formula (never touched through the whole redesign). [PR5, per draft-2 §7
+item 6]: the repair pass itself (dispatching fairies to run a ``repair``)
+is explicitly NOT this PR's job — that is the dream-master/sleep-skill
+change, a separate PR against the fairy and master specs, after PR5 lands
+the fields it reads. No scanner or repair-tool logic is implemented
+anywhere in this PR; the detector/repair registries
+(health_engine_model.REGISTERED_DETECTORS/REGISTERED_REPAIRS) are NAME-ONLY
+validation sets, never executables.
 
 --------------------------------------------------------------------------
 Historical judgment call (PR2) — "what to do about the third aspect (B) not
@@ -59,6 +230,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import health_engine_metrics as metrics
+import health_engine_model
 from health_engine_config import (
     AspectDef,
     EngineConfig,
@@ -66,6 +238,20 @@ from health_engine_config import (
     UNAVAILABLE,
     _Unavailable,
 )
+from health_engine_model import ScoringModel
+
+# ROUND 3 (engram-alpha#1991/#2520, Kepler's ruling, 2026-09-03): MODEL is no
+# longer imported ready-made from health_engine_model.py — it is built BELOW,
+# right after CONFIG, via ``health_engine_model.load(health_engine_model.
+# MODEL_SPEC, CONFIG)``. This is the fix for round 2's row-local population
+# check: health_engine_model.py can now cross-validate a detector's declared
+# population against CONFIG's own real ``denominator_population`` for that
+# metric, because construction (this module importing health_engine_model,
+# a plain module import with no import-time side effects) and validation
+# (via ``load()``, called only once CONFIG exists) are no longer forced to
+# happen at the same time. `import health_engine_model` (the module, not a
+# `from ... import MODEL`) is a genuinely ordinary top-of-file import now —
+# there is no more circularity to route around by deferring it.
 
 # NOTE on engram_core access: deliberately NOT `import engram_core as core` at
 # module top level here — see health_engine_metrics.py's module docstring for
@@ -78,11 +264,14 @@ from health_engine_config import (
 # order — its own functions re-resolve engram_core lazily per call too.
 
 SCHEMA_VERSION = "1"
-# PR3 of 4: aspects A + B + C are all real signal functions now (B replaces
-# PR2's always-UNAVAILABLE stub). Bump when the CONFIG's aspect/metric shape
-# changes in a way that would make an old stored snapshot's `config` block
-# non-comparable to a fresh one.
-ENGINE_VERSION = "0.3.0-pr3"
+# PR5 of 5: the scoring/composition layer is replaced wholesale (Kepler's
+# draft-2, "the dream-side contract") — weighted-arithmetic-sum aspect_score
+# and composed formulas, driven by MODEL (below), replace the PR2/PR3-era
+# geometric-mean composition. The raw-signal layer (CONFIG,
+# below) is unchanged. Bump when the CONFIG's aspect/metric shape OR the
+# scoring model's shape changes in a way that would make an old stored
+# snapshot's `config` block non-comparable to a fresh one.
+ENGINE_VERSION = "0.4.0-pr5"
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +300,18 @@ _OPEN_CONTRADICTION_RATE = MetricDef(
     name="open_contradiction_rate",
     signal_fn=metrics.open_contradiction_rate,
     denominator_population="contradictions",
-    empty_denominator="clean",
+    # CHANGED from "clean" (engram-alpha#2520 round 2, fold #2, Kepler via
+    # Borges, 2026-09-03) — the signal function itself now declines
+    # (UNAVAILABLE) rather than reporting a fabricated "clean" 0.0 on zero
+    # current contradiction nodes; this declared policy is updated to keep
+    # it honest against the signal function's actual behavior (see
+    # health_engine_metrics.open_contradiction_rate's docstring for the
+    # full reasoning — this module's own docstring notes the declared
+    # policy and the signal_fn's runtime behavior are correlated only by
+    # construction/code-review, never independently checked, so leaving
+    # this stale here would itself be exactly the kind of silent drift
+    # that discipline warns about).
+    empty_denominator="unavailable",
     scored=True,
     state_valued=True,
 )
@@ -230,32 +430,211 @@ CONFIG = EngineConfig(
 
 
 # ---------------------------------------------------------------------------
-# Top-level composition (design doc §3)
+# The real production model — round 3 (engram-alpha#1991/#2520, Kepler's
+# ruling, 2026-09-03): built HERE, textually AFTER CONFIG, not imported
+# ready-made from health_engine_model.py. This is the whole point of the
+# restructure — health_engine_model.load() cross-validates every detector's
+# declared population against CONFIG's own real denominator_population,
+# which requires a real CONFIG to already exist. health_engine_model.py
+# itself has no import-time side effects (see that module's own docstring);
+# MODEL_SPEC there is an unvalidated ScoringModel, and load() is what turns
+# it into this module's validated MODEL.
+# ---------------------------------------------------------------------------
+
+MODEL = health_engine_model.load(health_engine_model.MODEL_SPEC, CONFIG)
+
+
+# ---------------------------------------------------------------------------
+# Top-level composition — engram-alpha#1991 PR5, Kepler's draft-2 §1,
+# clarification 1 ("engram-alpha#1991, issue comment thread, Lei's
+# 2026-09-02T14:32Z ruling (four-level shape: aspects with point allotments
+# summing to 100, metrics carrying in-aspect importance, arithmetic sums at
+# both levels — 'the curve layer carries low-value sensitivity')"). REPLACES
+# BOTH health_engine_metrics.aspect_geometric_mean_scoring (per-aspect) and
+# this function's own former geometric-mean body (across aspects) — see this
+# module's docstring's "COMPOSITION FORMULA" section for the full formula,
+# the UNAVAILABLE-propagation rule, and the LOAD-BEARING DISCOVERED
+# CONSEQUENCE for provenance_integrity under the shipped v1 metric table.
+# Read that docstring section before changing anything below.
 # ---------------------------------------------------------------------------
 
 
-def compose_aspect_scores(
-    config: EngineConfig, aspect_scores: dict[str, float | _Unavailable]
-) -> float | _Unavailable:
-    """Weighted geometric mean across aspects: ``composed = 100 * Π
-    (aᵢ/100)^wᵢ``, weights normalized to 1 (design doc §3).
+def _admitted_metrics_for_aspect(aspect_name: str, model: ScoringModel):
+    """Every ``MetricBinding`` bound to ``aspect_name`` with ``importance >
+    0`` ("admitted", clarification 1's predicate — the new name for today's
+    ``scored=True``, see module docstring). STRUCTURAL only — does not look
+    at any particular graph's raw signals; see ``_available_admitted_
+    metrics_for_aspect`` below for the RUNTIME-availability-filtered
+    sibling (round 2 of engram-alpha#2520, addendum 2's generalization)."""
+    return [
+        m for m in model.metrics
+        if m.aspect == aspect_name and m.importance > 0
+    ]
 
-    Each aspect score is floored at 1 before composing (avoids the zero
-    singularity while keeping catastrophic visibly catastrophic). UNAVAILABLE
-    in ANY aspect propagates to the composed score — never silently composed
-    over a hole (design doc §3, "degradation propagates").
+
+def _available_admitted_metrics_for_aspect(
+    aspect_name: str,
+    raw_by_metric: dict[str, float | _Unavailable],
+    model: ScoringModel = MODEL,
+):
+    """Every admitted ``MetricBinding`` for ``aspect_name`` whose CURRENT
+    raw signal is not itself UNAVAILABLE this run — the RUNTIME half of the
+    hold-out mechanism (round 2 of engram-alpha#2520, addendum 2 on
+    #1991, Kepler via Borges's colleague read of draft 2, 2026-09-03): a
+    structurally-admitted metric (``importance > 0``) can still be
+    unavailable on THIS graph/environment (e.g. the embedder disabled, or
+    ``open_contradiction_rate``'s own empty-population UNAVAILABLE, round
+    2's fold #2) — that metric is excluded from THIS aspect's weighted
+    mean for THIS run, the same "hold out, renormalize" shape as the
+    aspect-level mechanism one level up (``_composition_coverage`` below),
+    applied one level down.
     """
-    if any(v is UNAVAILABLE for v in aspect_scores.values()):
+    return [
+        m for m in _admitted_metrics_for_aspect(aspect_name, model)
+        if raw_by_metric[m.signal] is not UNAVAILABLE
+    ]
+
+
+def _aspect_metric_coverage(
+    aspect_name: str,
+    raw_by_metric: dict[str, float | _Unavailable],
+    model: ScoringModel = MODEL,
+) -> tuple[list[str], float]:
+    """(metrics_in_play, coverage) for ONE aspect — the per-aspect sibling
+    of ``_composition_coverage`` below, one level down. ``metrics_in_play``
+    = signal names of admitted-and-available metrics used in THIS aspect's
+    weighted mean this run (MODEL declaration order). ``coverage`` = the
+    fraction of the aspect's OWN declared admitted importance that was
+    available this run (``available_importance / total_admitted_
+    importance``) — the aspect-level analog of the top-level
+    ``composed_coverage``.
+
+    Returns ``([], 0.0)`` for an aspect with ZERO admitted metrics declared
+    at all — that aspect is reported via ``unscored_aspects``, not this
+    pair; callers should only report ``metrics_in_play``/``coverage`` for a
+    SCORED aspect (see ``build_snapshot``'s own scoping).
+    """
+    admitted = _admitted_metrics_for_aspect(aspect_name, model)
+    if not admitted:
+        return [], 0.0
+    available = _available_admitted_metrics_for_aspect(aspect_name, raw_by_metric, model)
+    total_importance = sum(m.importance for m in admitted)
+    available_importance = sum(m.importance for m in available)
+    coverage = available_importance / total_importance if total_importance else 0.0
+    return [m.signal for m in available], coverage
+
+
+def _score_aspect(
+    aspect_name: str,
+    raw_by_metric: dict[str, float | _Unavailable],
+    model: ScoringModel = MODEL,
+) -> float | _Unavailable:
+    """One aspect's score: ``Σ (importance_i / Σ importance_available) ×
+    curve_i(signal_i)`` over its CURRENTLY AVAILABLE admitted metrics only
+    — range [0, 1].
+
+    UNAVAILABLE if EITHER: (a) the aspect has ZERO admitted metrics
+    DECLARED at all (direct analogy with the old ``aspect_geometric_mean_
+    scoring``'s own ``if not values: return UNAVAILABLE`` — an aspect with
+    nothing to sum over is UNAVAILABLE, not zero; see module docstring's
+    "RESOLVED" section for ``provenance_integrity``'s case today), OR (b)
+    every admitted metric's raw signal happens to be UNAVAILABLE THIS RUN
+    (round 2 of engram-alpha#2520, addendum 2's generalization — SAME
+    treatment, different reason for reaching zero available metrics). A
+    PARTIAL availability (some but not all admitted metrics UNAVAILABLE
+    this run) does NOT propagate to UNAVAILABLE — it RENORMALIZES the
+    weighted mean over whichever admitted metrics ARE available this run
+    (the "hold out, renormalize" mechanism, one level down from the
+    aspect-level version in ``compose_aspect_scores``). A NON-admitted
+    metric being UNAVAILABLE never affects this at all — it was never in
+    the sum.
+    """
+    admitted = _admitted_metrics_for_aspect(aspect_name, model)
+    if not admitted:
         return UNAVAILABLE
 
-    total_weight = sum(aspect.weight for aspect in config.aspects)
-    product = 1.0
-    for aspect in config.aspects:
-        score = aspect_scores[aspect.name]
-        floored = max(score, 1.0)
-        normalized_weight = aspect.weight / total_weight
-        product *= (floored / 100.0) ** normalized_weight
-    return 100.0 * product
+    available = _available_admitted_metrics_for_aspect(aspect_name, raw_by_metric, model)
+    if not available:
+        return UNAVAILABLE
+
+    total_importance = sum(m.importance for m in available)
+    aspect_score = 0.0
+    for m in available:
+        curve = model.curves[m.curve]
+        aspect_score += (m.importance / total_importance) * curve.curve_fn(
+            raw_by_metric[m.signal]
+        )
+    return aspect_score
+
+
+def _composition_coverage(
+    model: ScoringModel, aspect_scores: dict[str, float | _Unavailable]
+) -> tuple[list[str], float]:
+    """(unscored_aspects, points_in_play) — the "hold out" half of the
+    design ruling (Kepler, engram-alpha#2520 review comment, 2026-09-03,
+    "hold out, renormalize, report", generalized by addendum 2 on #1991,
+    2026-09-03). An aspect is UNSCORED — held out of composition, its
+    points excluded from the renormalization base — exactly when its OWN
+    ``aspect_score`` (as returned by ``_score_aspect``) is UNAVAILABLE:
+    today that happens for TWO reasons, both resolving to the SAME hold-out
+    treatment — (a) STRUCTURAL: zero admitted metrics declared at all
+    (``provenance_integrity`` under the v1 table), or (b) RUNTIME: every
+    currently-admitted metric's raw signal is itself unavailable this run.
+    This function does not need to distinguish (a) from (b) — both already
+    collapse to ``aspect_scores[name] is UNAVAILABLE`` by construction in
+    ``_score_aspect`` (see that function). Aspect declaration order
+    (MODEL order, not alphabetical — JUDGMENT CALL, flagged in the PR5-
+    round-2 report).
+    """
+    unscored = [
+        aspect.name for aspect in model.aspects
+        if aspect_scores.get(aspect.name) is UNAVAILABLE
+    ]
+    points_in_play = sum(
+        aspect.points for aspect in model.aspects if aspect.name not in unscored
+    )
+    return unscored, points_in_play
+
+
+def compose_aspect_scores(
+    model: ScoringModel, aspect_scores: dict[str, float | _Unavailable]
+) -> float | _Unavailable:
+    """``composed = Σ over SCORED aspects (a) of (points_a / points_in_play)
+    × aspect_score_a × 100`` — range [0, 100]. "Scored" excludes any aspect
+    whose own score is UNAVAILABLE (held out of composition entirely — see
+    ``_composition_coverage`` above and module docstring's "RESOLVED"
+    section); ``points_in_play`` = Σ points_a over scored aspects only, the
+    renormalization base — the excluded aspect's points never appear
+    anywhere in this arithmetic.
+
+    UNAVAILABLE only when EVERY aspect is held out (``points_in_play <=
+    0``) — nothing anywhere to compose over (direct analogy with
+    ``_score_aspect``'s own "nothing to sum over is UNAVAILABLE" rule, one
+    level up). There is otherwise no remaining "propagate an individual
+    aspect's UNAVAILABLE to the composed score" case as of round 2 of
+    engram-alpha#2520 — ANY aspect-level UNAVAILABLE now means "hold this
+    aspect out and renormalize the rest," never "poison the whole sum."
+
+    JUDGMENT CALL (flagged in the PR5 report): signature changed from the
+    old ``(config: EngineConfig, aspect_scores)`` to ``(model: ScoringModel,
+    aspect_scores)`` — the function NAME is kept (the PR5 spec explicitly
+    allows either; keeping the name minimizes caller churn since this
+    function's only real callers are internal to this module and its own
+    tests), but it now reads aspect ``points`` off the NEW scoring model,
+    not the old ``EngineConfig``'s ``weight`` field — the new formula is
+    points-driven, not weight-driven, even though the two currently carry
+    the same numeric values (40/25/35).
+    """
+    unscored, points_in_play = _composition_coverage(model, aspect_scores)
+    if points_in_play <= 0:
+        return UNAVAILABLE
+
+    composed = 0.0
+    for aspect in model.aspects:
+        if aspect.name in unscored:
+            continue
+        composed += (aspect.points / points_in_play) * aspect_scores[aspect.name] * 100.0
+    return composed
 
 
 # ---------------------------------------------------------------------------
@@ -264,13 +643,17 @@ def compose_aspect_scores(
 
 
 def _run_aspect(
-    conn: sqlite3.Connection, aspect: AspectDef
+    conn: sqlite3.Connection, aspect: AspectDef, model: ScoringModel = MODEL
 ) -> tuple[dict[str, float | _Unavailable], float | _Unavailable]:
-    """Run every metric in one aspect; return (raw_by_metric, aspect_score)."""
+    """Run every metric in one aspect (raw signal via CONFIG's ``AspectDef``
+    — the UNCHANGED raw-signal-computation layer, see module docstring);
+    return (raw_by_metric, aspect_score), where aspect_score is now computed
+    via ``_score_aspect`` against the NEW scoring model, NOT via ``aspect.
+    scoring_fn`` (vestigial as of PR5 — see module docstring)."""
     raw_by_metric: dict[str, float | _Unavailable] = {}
     for metric in aspect.metrics:
         raw_by_metric[metric.name] = metric.signal_fn(conn)
-    aspect_score = aspect.scoring_fn(raw_by_metric)
+    aspect_score = _score_aspect(aspect.name, raw_by_metric, model)
     return raw_by_metric, aspect_score
 
 
@@ -347,7 +730,27 @@ def _config_to_dict(config: EngineConfig) -> dict:
 # Human-readable per-metric definitions (design doc §4.1 "definitions" —
 # "each metric's meaning, denominator, and why that denominator"). Aspect B's
 # entry documents the stub, not a real metric — see module docstring.
+#
+# "_dive_target" (PR5, draft-2 §1's dive_target row / §7 item 3) is a
+# deliberate NON-metric sibling key — the leading underscore signals "not a
+# real metric name" the same way this codebase's other `_`-prefixed internal
+# markers do (``_snapshot_path``, ``_config_to_dict``). It documents a
+# SCHEMA FIELD (dive_target, emitted per-metric by _metric_def_to_dict
+# above), not a metric, so a global note here beats duplicating the same
+# text onto all nine metric entries (today none of them actually populate
+# dive_target — see CONFIG above).
 _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
+    "_dive_target": {
+        "status": "deprecated, not deleted (engram-alpha#1991 draft-2 §1)",
+        "note": (
+            "dive_target is emitted per-metric by _metric_def_to_dict "
+            "(health_engine.py, currently line 487) and read by NOTHING "
+            "downstream — retiring it is a snapshot-schema change, which is "
+            "not this PR's job. Kept on every MetricDef for a future schema "
+            "bump (Borges's correction to draft 1's 'dead field': it is "
+            "deprecated, not dead)."
+        ),
+    },
     "stale_derivation_rate": {
         "meaning": (
             "Fraction of current derivations carrying a stale marker "
@@ -359,6 +762,12 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "why_that_denominator": (
             "Scope is derivations only (stale-DERIVATION rate), not all "
             "node types, per design doc §2."
+        ),
+        "unit": (
+            "nodes, not marker rows — a node can carry more than one "
+            "pending marker row (see health_engine_metrics.py's "
+            "stale_derivation_rate docstring, 'UNIT' note); the OLD formula "
+            "shipped for months with the unit unstated, per draft-2 §4."
         ),
     },
     "taint_rate": {
@@ -376,6 +785,10 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
             "sense; a definition/person/task/goal node is never a "
             "candidate."
         ),
+        "unit": (
+            "nodes, not marker rows — same convention as "
+            "stale_derivation_rate (see that entry's 'unit' note)."
+        ),
     },
     "open_contradiction_rate": {
         "meaning": (
@@ -384,8 +797,15 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         ),
         "denominator": "total current contradiction nodes",
         "why_that_denominator": (
-            "Design doc §5 contract item 5's own worked example: a "
-            "contradiction-free graph is genuinely 0% open, not unknown."
+            "UPDATED (engram-alpha#2520 round 2, fold #2, 2026-09-03): "
+            "zero current contradiction nodes now reports UNAVAILABLE, "
+            "not a 'clean' 0.0 — design doc §5 contract item 5's original "
+            "worked example predates the 'hold out, renormalize, report' "
+            "design ruling (Kepler, engram-alpha#2520 review comment, "
+            "2026-09-03), which treats a metric with nothing to measure "
+            "as unmeasured, not as evidence of health. Matches taint_rate "
+            "/ stale_derivation_rate's existing empty-population "
+            "treatment (same aspect)."
         ),
     },
     "uncited_observation_rate": {
@@ -662,7 +1082,10 @@ def _compute_diagnostics(conn: sqlite3.Connection, current_turn: int) -> dict:
 
 
 def build_snapshot(
-    conn: sqlite3.Connection, checkpoint_mode: str, config: EngineConfig = CONFIG
+    conn: sqlite3.Connection,
+    checkpoint_mode: str,
+    config: EngineConfig = CONFIG,
+    model: ScoringModel = MODEL,
 ) -> dict:
     """Compute one health-score snapshot (design doc §4.1). Pure
     computation — persistence (writing it somewhere durable) is the
@@ -670,6 +1093,49 @@ def build_snapshot(
 
     ``checkpoint_mode`` must be one of "nap" / "pre_sleep" / "post_dream"
     (design doc §4.1).
+
+    Per-metric ``scores.metrics[name]`` (PR5 change): now ``curve_fn(raw)``
+    — range [0, 1] — via the metric's bound curve in ``model``, rather than
+    the old ``metrics.metric_goodness(raw)`` (range [1, 100]). JUDGMENT CALL
+    (flagged in the PR5 report): chosen so "score" means the SAME thing
+    everywhere it appears in this PR — the dream projection's own
+    ``score`` field (``_build_dream_projection`` below) is explicitly
+    defined as "``score`` (through its curve, i.e. ``curve_fn(signal)``)"
+    (draft-2 §2) — rather than inventing two different scaled meanings of
+    the same word in two sibling artifacts. For the shared ``badness_
+    default`` curve this is numerically consistent with the old value
+    divided by 100 (the curve was built to reproduce ``metric_goodness``
+    exactly, rescaled) — so this is a genuine but small, intentional scale
+    change from PR2/PR3's [1,100] display, not a behavior regression.
+    ``scores.aspects[name]`` similarly now reports the aspect_score literally
+    as clarification 1's formula defines it — range [0, 1] — rather than a
+    rescaled [0,100] display; see this module's docstring "COMPOSITION
+    FORMULA" section. Only ``scores.composed`` stays on the familiar [0,100]
+    scale (clarification 1's own formula multiplies by 100 there
+    explicitly).
+
+    [Round 2 of engram-alpha#2520] Three NEW top-level ``scores`` fields —
+    ``unscored_aspects``, ``points_in_play``, ``composed_coverage`` — report
+    the design ruling's "hold out, renormalize, report" mechanism (module
+    docstring's "RESOLVED" section). PLACEMENT (JUDGMENT CALL, flagged in
+    the PR5-round-2 report): inside ``scores``, alongside ``composed``,
+    rather than as top-level snapshot siblings — these three fields are
+    properties OF the composed calculation, so grouping them with it reads
+    more directly than scattering them at the snapshot's top level. ALSO
+    NEW: a ``scores.aspect_coverage`` dict, keyed by SCORED aspect name
+    only (an unscored aspect has no "coverage of what it can't measure" to
+    report — it's already named in ``unscored_aspects``), each entry
+    ``{"metrics_in_play": [...], "coverage": ...}`` — the addendum-2
+    generalization one level down (which admitted metrics were actually
+    available this run, within one aspect's own weighted mean; see
+    ``_aspect_metric_coverage``). Scoped to the MAIN snapshot only, NOT the
+    aspect-blind dream projection (``_build_dream_projection`` below) —
+    unlike the three top-level fields, which Kepler's original ruling
+    explicitly named the projection as a required destination for,
+    nothing asks for THIS aspect-keyed structure on the dream side, and
+    adding it there would be a materially bigger P2 ("aspect-blind")
+    violation than the three small global fields the ruling already
+    carved out an explicit exception for.
     """
     if checkpoint_mode not in ("nap", "pre_sleep", "post_dream"):
         raise ValueError(
@@ -685,19 +1151,48 @@ def build_snapshot(
     scores_per_metric: dict[str, object] = {}
     scores_per_aspect: dict[str, object] = {}
     aspect_raw_scores: dict[str, float | _Unavailable] = {}
+    aspect_raw_by_metric: dict[str, dict[str, float | _Unavailable]] = {}
+
+    # Local (signal -> MetricBinding) lookup for THIS model instance —
+    # deliberately not a cached attribute on ScoringModel (which is frozen
+    # and shared across calls): build_snapshot may be called with a
+    # non-default ``model`` (e.g. from tests), so this is recomputed per
+    # call rather than trusting health_engine_model.METRIC_BY_SIGNAL, which
+    # is only valid for the default MODEL instance.
+    metric_by_signal = {m.signal: m for m in model.metrics}
 
     for aspect in config.aspects:
-        raw_by_metric, aspect_score = _run_aspect(conn, aspect)
+        raw_by_metric, aspect_score = _run_aspect(conn, aspect, model)
         for metric_name, raw in raw_by_metric.items():
             signals[metric_name] = _to_jsonable(raw)
             if raw is UNAVAILABLE:
                 scores_per_metric[metric_name] = "UNAVAILABLE"
             else:
-                scores_per_metric[metric_name] = metrics.metric_goodness(raw)
+                binding = metric_by_signal[metric_name]
+                curve = model.curves[binding.curve]
+                scores_per_metric[metric_name] = curve.curve_fn(raw)
         scores_per_aspect[aspect.name] = _to_jsonable(aspect_score)
         aspect_raw_scores[aspect.name] = aspect_score
+        aspect_raw_by_metric[aspect.name] = raw_by_metric
 
-    composed = compose_aspect_scores(config, aspect_raw_scores)
+    composed = compose_aspect_scores(model, aspect_raw_scores)
+    unscored_aspects, points_in_play = _composition_coverage(model, aspect_raw_scores)
+    composed_coverage = points_in_play / 100.0
+
+    # Per-aspect metrics_in_play/coverage (addendum 2's one-level-down
+    # generalization) — SCORED aspects only, see build_snapshot's own
+    # docstring for why an unscored aspect has no entry here.
+    aspect_coverage: dict[str, dict[str, object]] = {}
+    for aspect in model.aspects:
+        if aspect.name in unscored_aspects:
+            continue
+        metrics_in_play, coverage = _aspect_metric_coverage(
+            aspect.name, aspect_raw_by_metric[aspect.name], model
+        )
+        aspect_coverage[aspect.name] = {
+            "metrics_in_play": metrics_in_play,
+            "coverage": coverage,
+        }
 
     return {
         "schema_version": config.schema_version,
@@ -709,6 +1204,10 @@ def build_snapshot(
             "metrics": scores_per_metric,
             "aspects": scores_per_aspect,
             "composed": _to_jsonable(composed),
+            "unscored_aspects": unscored_aspects,
+            "points_in_play": points_in_play,
+            "composed_coverage": composed_coverage,
+            "aspect_coverage": aspect_coverage,
         },
         # DAG violations as a red_flags entry are explicitly OUT of scope for
         # PR3 too (see module docstring) — left exactly as PR2 shipped it.
@@ -728,11 +1227,139 @@ def _snapshot_dir() -> Path:
     return d
 
 
+# ---------------------------------------------------------------------------
+# Dream-side projection — engram-alpha#1991 PR5, draft-2 §2. This is the
+# MECHANISM enforcing P2 ("aspect-blind" — draft-2 §0): a SEPARATE artifact
+# containing ONLY per-metric fields, never aspects/points/importances/the
+# composite. The dream-master prompt and fairy templates receive THIS
+# file's path, never the full snapshot's (draft-2 §2, last sentence) — that
+# wiring itself is explicitly NOT this PR's job (draft-2 §7 item 6).
+# ---------------------------------------------------------------------------
+
+
+def _dream_projection_path() -> Path:
+    """FIXED filename, overwritten every checkpoint (JUDGMENT CALL, flagged
+    in the PR5 report: draft-2 §2 says "the checkpoint also writes
+    health-snapshot-dream.json" as a singular artifact, not "a" projection
+    per timestamp like the main snapshot — read literally as one always-
+    current path, which is also what "the dream-master prompt and fairy
+    templates receive the projection's path" implies: a STABLE path to wire
+    once, not a moving target)."""
+    return _snapshot_dir() / "health-snapshot-dream.json"
+
+
+def _read_previous_dream_projection() -> dict | None:
+    """Best-effort read of whatever projection the PREVIOUS checkpoint left
+    behind — ``None`` if it doesn't exist yet (first-ever write) or fails to
+    parse (never raises; a corrupt/missing previous projection degrades
+    ``delta_since_last`` to ``None``, it does not break this checkpoint)."""
+    path = _dream_projection_path()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _detector_ref_to_jsonable(detector) -> dict | None:
+    """``health_engine_model.DetectorRef`` (addendum 3, engram-alpha#1991,
+    2026-09-03) is a plain dataclass, not natively JSON-serializable —
+    ``None`` passes through; otherwise ``{"name": ..., "population": ...}``.
+    Used ONLY for the dream projection's per-metric ``detector`` field
+    below (the MAIN snapshot never serializes a ``MetricBinding``/
+    ``DetectorRef`` at all — ``_config_to_dict`` walks
+    ``health_engine_config``'s OWN, unrelated ``MetricDef``/``AspectDef``
+    schema, which has no detector field)."""
+    if detector is None:
+        return None
+    return {"name": detector.name, "population": detector.population}
+
+
+def _build_dream_projection(snapshot: dict, model: ScoringModel = MODEL) -> dict:
+    """The aspect-blind per-metric projection (draft-2 §2): for EVERY metric
+    binding in ``model`` (admitted or diagnostic-only — draft-2's own table
+    includes both, differentiated by the ``admitted`` field) — ``signal``
+    (raw value), ``score`` (``curve_fn(signal)``), ``admitted``, ``detector``,
+    ``repair``, ``delta_since_last``. Deliberately NO aspects, NO points/
+    importances, NO composite anywhere in this dict — see module docstring
+    §6 item 1 (draft-2's forbidden list): "Reading scores.aspects, scores.
+    composed, allotments or importances anywhere on the dream side" is
+    explicitly forbidden, and P2 is enforced here by CONSTRUCTION (these
+    keys are never written), not by convention.
+
+    [Round 2 of engram-alpha#2520] Also carries ``unscored_aspects``/
+    ``points_in_play``/``composed_coverage`` at the TOP LEVEL, read straight
+    off ``snapshot["scores"]`` — single source of truth, computed once in
+    ``build_snapshot``, never re-derived here. Kepler's design ruling
+    explicitly names the projection as a REQUIRED destination for these
+    three fields (module docstring's "RESOLVED" section, item 2) even
+    though they name aspects / a point-based coverage fraction — in
+    TENSION with P2's "aspect-blind" rule for everything else in this
+    function (JUDGMENT CALL, flagged in the PR5-round-2 report: P2 is read
+    as "no aspects/points/importances/composite EXCEPT the three fields
+    this ruling explicitly carves out", not as an unconditional absolute).
+    The addendum-2 generalization's per-aspect ``aspect_coverage``/
+    ``metrics_in_play`` (build_snapshot's own new fields) are DELIBERATELY
+    NOT added here — that structure is aspect-KEYED, a materially bigger
+    P2 violation than three small global values, and nothing in the
+    addendum asks for it on the dream side; see ``build_snapshot``'s
+    docstring for the same scoping decision stated there.
+    """
+    previous = _read_previous_dream_projection()
+    previous_metrics = (previous or {}).get("metrics", {})
+
+    metrics_out: dict[str, dict] = {}
+    for binding in model.metrics:
+        raw = snapshot["signals"][binding.signal]
+        if raw == "UNAVAILABLE":
+            score: object = "UNAVAILABLE"
+        else:
+            curve = model.curves[binding.curve]
+            score = curve.curve_fn(raw)
+
+        prev_entry = previous_metrics.get(binding.signal)
+        prev_score = prev_entry.get("score") if isinstance(prev_entry, dict) else None
+        if isinstance(prev_score, (int, float)) and isinstance(score, (int, float)):
+            # delta_since_last: diagnostic; rendered for the morning read;
+            # NEVER a score, NEVER a lottery input, NEVER an
+            # importance-tuning input (draft-2 §2's own prohibition text,
+            # carried verbatim here so whoever meets this field first meets
+            # the rule with it — see also module docstring §6 item 5).
+            delta = score - prev_score
+        else:
+            delta = None
+
+        metrics_out[binding.signal] = {
+            "signal": raw,
+            "score": score,
+            "admitted": binding.importance > 0,
+            "detector": _detector_ref_to_jsonable(binding.detector),
+            "repair": binding.repair,
+            "delta_since_last": delta,
+        }
+
+    return {
+        "turn": snapshot["turn"],
+        "checkpoint_mode": snapshot["checkpoint_mode"],
+        "engine_version": snapshot["engine_version"],
+        "unscored_aspects": snapshot["scores"]["unscored_aspects"],
+        "points_in_play": snapshot["scores"]["points_in_play"],
+        "composed_coverage": snapshot["scores"]["composed_coverage"],
+        "metrics": metrics_out,
+    }
+
+
 def write_snapshot(
-    conn: sqlite3.Connection, checkpoint_mode: str, config: EngineConfig = CONFIG
+    conn: sqlite3.Connection,
+    checkpoint_mode: str,
+    config: EngineConfig = CONFIG,
+    model: ScoringModel = MODEL,
 ) -> dict:
     """Compute + persist a snapshot as JSON under
-    ``DATA_DIR/health-snapshots/<turn>-<checkpoint_mode>-<timestamp>.json``.
+    ``DATA_DIR/health-snapshots/<turn>-<checkpoint_mode>-<timestamp>.json``,
+    and [PR5] the aspect-blind dream-side projection at the FIXED path
+    ``DATA_DIR/health-snapshots/health-snapshot-dream.json`` (draft-2 §2).
 
     JUDGMENT CALL (flagged in the PR2 report): the design doc calls these
     "versioned snapshots as SSoT" and says several consumers will render
@@ -755,8 +1382,23 @@ def write_snapshot(
     Computation itself (``build_snapshot``) is allowed to raise — a bug in a
     signal function should be loud, not silently swallowed into an empty
     snapshot.
+
+    JUDGMENT CALL (flagged in the PR5 report, broader than the above): the
+    dream-projection step below (``_build_dream_projection`` COMPUTATION,
+    not just its write) is wrapped in a broad ``except Exception`` — wider
+    than the main snapshot's write-only best-effort scope. This is a
+    deliberate, more conservative choice for the NEW, less-proven P2
+    mechanism specifically: a bug in the new projection-building logic must
+    never be able to break the primary snapshot / the nap / advance_turn
+    checkpoint tool it's piggybacked onto, which is the dominant safety
+    property this whole subsystem is built around. A stricter reading of
+    "best-effort is for persistence, not computation" would let a
+    projection-computation bug raise here — exactly like a genuine bug in a
+    main-snapshot signal function is allowed to raise — but the asymmetry
+    (main snapshot: computation raises; dream projection: nothing raises)
+    is intentional, not an oversight.
     """
-    snapshot = build_snapshot(conn, checkpoint_mode, config)
+    snapshot = build_snapshot(conn, checkpoint_mode, config, model)
     turn = snapshot["turn"]
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     filename = f"{turn}-{checkpoint_mode}-{ts}.json"
@@ -766,4 +1408,15 @@ def write_snapshot(
         snapshot["_snapshot_path"] = str(path)
     except OSError as e:
         snapshot["_snapshot_write_error"] = str(e)
+
+    try:
+        projection = _build_dream_projection(snapshot, model)
+        dream_path = _dream_projection_path()
+        dream_path.write_text(
+            json.dumps(projection, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        snapshot["_dream_projection_path"] = str(dream_path)
+    except Exception as e:  # noqa: BLE001 — see docstring's JUDGMENT CALL
+        snapshot["_dream_projection_write_error"] = str(e)
+
     return snapshot

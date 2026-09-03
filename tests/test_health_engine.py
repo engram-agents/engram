@@ -1,17 +1,23 @@
-"""Tests for health_engine.py — the real production CONFIG, top-level
-composition, and the snapshot writer (engram-alpha#1991, PR2+PR3 of 4).
+"""Tests for health_engine.py — the real production CONFIG, the [PR5]
+dream-side scoring model wiring, composition, and the snapshot writer
+(engram-alpha#1991, PR2+PR3+PR5 of 5).
 
 Covers:
   1. CONFIG validates (weights sum to 100 across A/B/C, all real as of PR3)
      and its aspect shape matches the design doc (weight 40/25/35).
-  2. compose_aspect_scores — the top-level weighted geometric mean, floor at
-     1, UNAVAILABLE propagation.
+  2. [PR5, rewritten] compose_aspect_scores / _score_aspect — the NEW
+     weighted-arithmetic-sum formula (Kepler's draft-2 clarification 1),
+     UNAVAILABLE propagation (including the zero-admitted-metrics case),
+     and the load-bearing discovered consequence for provenance_integrity
+     under the real MODEL (see health_engine.py's module docstring).
   3. build_snapshot's full dict shape (schema_version, engine_version,
      config, definitions, signals, scores, red_flags, diagnostics, anchor,
      turn, checkpoint_mode) against a real (throwaway) SQLite conn.
   4. Contract item 3 — UNAVAILABLE serializes as the JSON string literal
      "UNAVAILABLE", never coerced to a number (no -1/null sentinel).
-  5. write_snapshot's on-disk persistence + best-effort failure handling.
+  5. write_snapshot's on-disk persistence + best-effort failure handling,
+     [PR5] plus the dream-side projection's own persistence + P2
+     aspect-blindness (negative-space assertions).
   6. PR3: the diagnostics block (activity metrics + cascade-marker age) —
      never wired into scoring, populated for real now.
 
@@ -36,6 +42,13 @@ import engram_core  # noqa: E402
 import health_engine  # noqa: E402
 import health_engine_metrics as hem  # noqa: E402
 from health_engine_config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
+from health_engine_curves import CurveSpec  # noqa: E402
+from health_engine_model import (  # noqa: E402
+    AspectSpec,
+    DetectorRef,
+    MetricBinding,
+    ScoringModel,
+)
 
 
 _NODES_DDL = """
@@ -202,62 +215,445 @@ class TestConfigShape:
 
 
 # ---------------------------------------------------------------------------
-# 2. compose_aspect_scores — top-level composition (design doc §3)
+# 2. [PR5] compose_aspect_scores / _score_aspect — the weighted-arithmetic-
+# sum formula (Kepler's draft-2 clarification 1). Fake ScoringModel
+# fixtures, never the real 9-metric MODEL (mirrors the OLD _fake_config's
+# own precedent, updated for the new model shape).
 # ---------------------------------------------------------------------------
 
 
-def _fake_config(weight_a=60.0, weight_b=40.0):
+def _fake_curve(fn=None):
+    return CurveSpec(
+        name="fake",
+        curve_fn=fn or (lambda x: 1.0 - x),
+        input_domain=(0.0, 1.0),
+        monotone_direction="decreasing",
+    )
+
+
+_FAKE_POP = "pop"
+
+
+def _fake_model(points_a=60.0, points_b=40.0):
+    """A minimal two-aspect, two-metric ScoringModel: one admitted metric
+    per aspect, sharing one trivial curve (``curve_fn(x) = 1 - x``)."""
     def _sig(conn):
         return 0.0
 
-    def _score(raw):
-        return 100.0
+    curves = {"fake": _fake_curve()}
+    signals = {"sa": _sig, "sb": _sig}
+    metric_a = MetricBinding(
+        signal="sa", aspect="a", curve="fake", importance=1.0,
+        detector=DetectorRef(name="reflect", population=_FAKE_POP), repair="tool:resolve",
+    )
+    metric_b = MetricBinding(
+        signal="sb", aspect="b", curve="fake", importance=1.0,
+        detector=DetectorRef(name="reflect", population=_FAKE_POP), repair="tool:resolve",
+    )
+    aspect_a = AspectSpec(name="a", points=points_a)
+    aspect_b = AspectSpec(name="b", points=points_b)
+    return ScoringModel(
+        curves=curves, signals=signals,
+        aspects=(aspect_a, aspect_b), metrics=(metric_a, metric_b),
+    )
 
-    metric_a = MetricDef(
-        name="ma", signal_fn=_sig, denominator_population="edges",
-        empty_denominator="clean", scored=True, state_valued=True,
+
+def _fake_model_three_aspects(points=(50.0, 30.0, 20.0)):
+    """A three-aspect, three-metric ScoringModel — one admitted metric per
+    aspect — used specifically to make the renormalization arithmetic
+    (Σ fractions over SCORED aspects == 1.0, with a held-out aspect's
+    points never appearing anywhere in the sum) legible with more than one
+    scored aspect remaining."""
+    def _sig(conn):
+        return 0.0
+
+    curves = {"fake": _fake_curve()}
+    signals = {"sa": _sig, "sb": _sig, "sc": _sig}
+    names = ("a", "b", "c")
+    metrics = tuple(
+        MetricBinding(
+            signal=f"s{n}", aspect=n, curve="fake",
+            importance=1.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+            repair="tool:resolve",
+        )
+        for n in names
     )
-    metric_b = MetricDef(
-        name="mb", signal_fn=_sig, denominator_population="edges",
-        empty_denominator="clean", scored=True, state_valued=True,
-    )
-    aspect_a = AspectDef(name="a", weight=weight_a, metrics=(metric_a,), scoring_fn=_score)
-    aspect_b = AspectDef(name="b", weight=weight_b, metrics=(metric_b,), scoring_fn=_score)
-    return EngineConfig(schema_version="t", engine_version="t", aspects=(aspect_a, aspect_b))
+    aspects = tuple(AspectSpec(name=n, points=p) for n, p in zip(names, points))
+    return ScoringModel(curves=curves, signals=signals, aspects=aspects, metrics=metrics)
 
 
 class TestComposeAspectScores:
     def test_all_aspects_perfect_composes_to_100(self):
-        config = _fake_config()
-        composed = health_engine.compose_aspect_scores(config, {"a": 100.0, "b": 100.0})
+        model = _fake_model()
+        composed = health_engine.compose_aspect_scores(model, {"a": 1.0, "b": 1.0})
         assert composed == pytest.approx(100.0)
 
-    def test_any_unavailable_aspect_propagates(self):
-        config = _fake_config()
-        composed = health_engine.compose_aspect_scores(config, {"a": 100.0, "b": UNAVAILABLE})
+    def test_unavailable_aspect_is_held_out_and_renormalized(self):
+        """BEHAVIOR CHANGE (round 2 of engram-alpha#2520, "hold out,
+        renormalize, report", generalized by addendum 2 to cover BOTH the
+        structural zero-admitted case and this runtime case): an
+        UNAVAILABLE aspect score is no longer propagated to the composed
+        score — it is HELD OUT, and the remaining aspect's points are
+        renormalized to fill the full 100. Here aspect "b" (40 points) is
+        held out, so aspect "a" alone (60 points) is renormalized to
+        100/100 of the composed sum: composed = (60/60) * 1.0 * 100 =
+        100.0 — NOT the old propagate-to-UNAVAILABLE behavior, and NOT the
+        naive un-renormalized (60/100)*1.0*100 = 60.0 either."""
+        model = _fake_model(points_a=60.0, points_b=40.0)
+        composed = health_engine.compose_aspect_scores(model, {"a": 1.0, "b": UNAVAILABLE})
+        assert composed == pytest.approx(100.0)
+
+    def test_all_aspects_unavailable_returns_unavailable(self):
+        """The one remaining UNAVAILABLE case: EVERY aspect held out ->
+        points_in_play == 0 -> nothing anywhere to compose over — direct
+        analogy with _score_aspect's own "nothing to sum over is
+        UNAVAILABLE" rule, one level up."""
+        model = _fake_model()
+        composed = health_engine.compose_aspect_scores(
+            model, {"a": UNAVAILABLE, "b": UNAVAILABLE}
+        )
         assert composed is UNAVAILABLE
 
-    def test_floors_at_one_not_zero(self):
-        """A fully-collapsed aspect (score 0) is floored to 1 before
-        composing — never a literal 0 (design doc §3's floor)."""
-        config = _fake_config(weight_a=50.0, weight_b=50.0)
-        composed_at_zero = health_engine.compose_aspect_scores(config, {"a": 0.0, "b": 100.0})
-        composed_at_one = health_engine.compose_aspect_scores(config, {"a": 1.0, "b": 100.0})
-        assert composed_at_zero == pytest.approx(composed_at_one)
+    def test_renormalization_arithmetic_excluded_points_never_appear(self):
+        """The renormalization arithmetic itself, spec'd explicitly: a
+        scored-aspects-only weighted sum where the EXCLUDED aspect's points
+        (aspect "c", 20 points, held out) don't appear anywhere in the
+        math. Σ renormalized fractions over the two SCORED aspects sums to
+        1.0, and composed lands in [0,100]."""
+        model = _fake_model_three_aspects(points=(50.0, 30.0, 20.0))
+        aspect_scores = {"a": 0.8, "b": 0.4, "c": UNAVAILABLE}
+        unscored, points_in_play = health_engine._composition_coverage(model, aspect_scores)
+        assert unscored == ["c"]
+        assert points_in_play == pytest.approx(80.0)  # 50 + 30, NOT 100
 
-    def test_weighted_toward_the_higher_weight_aspect(self):
-        """A collapsed HIGH-weight aspect drags the composed score down more
-        than a collapsed LOW-weight aspect would (design doc §3: 'dead
-        retrievability with perfect integrity reads in the 30s, not 65')."""
-        config = _fake_config(weight_a=80.0, weight_b=20.0)
-        collapsed_high_weight = health_engine.compose_aspect_scores(
-            config, {"a": 1.0, "b": 100.0}
+        fractions = [
+            aspect.points / points_in_play
+            for aspect in model.aspects
+            if aspect.name not in unscored
+        ]
+        assert sum(fractions) == pytest.approx(1.0)
+
+        composed = health_engine.compose_aspect_scores(model, aspect_scores)
+        expected = (50.0 / 80.0) * 0.8 * 100.0 + (30.0 / 80.0) * 0.4 * 100.0
+        assert composed == pytest.approx(expected)
+        assert 0.0 <= composed <= 100.0
+        # The naive (un-renormalized, divide-by-100) answer would have been
+        # different -- confirms c's 20 points are genuinely held OUT, not
+        # silently folded back in as a zero contribution.
+        naive = (50.0 / 100.0) * 0.8 * 100.0 + (30.0 / 100.0) * 0.4 * 100.0
+        assert composed != pytest.approx(naive)
+
+
+class TestCompositionCoverage:
+    def test_no_unscored_aspects_uses_full_100_points(self):
+        model = _fake_model(points_a=60.0, points_b=40.0)
+        unscored, points_in_play = health_engine._composition_coverage(
+            model, {"a": 1.0, "b": 1.0}
         )
-        config2 = _fake_config(weight_a=20.0, weight_b=80.0)
-        collapsed_low_weight = health_engine.compose_aspect_scores(
-            config2, {"a": 1.0, "b": 100.0}
+        assert unscored == []
+        assert points_in_play == pytest.approx(100.0)
+
+    def test_unscored_list_matches_unavailable_aspect_scores(self):
+        model = _fake_model_three_aspects()
+        unscored, points_in_play = health_engine._composition_coverage(
+            model, {"a": 1.0, "b": UNAVAILABLE, "c": UNAVAILABLE}
         )
-        assert collapsed_high_weight < collapsed_low_weight
+        assert unscored == ["b", "c"]
+        assert points_in_play == pytest.approx(50.0)  # only "a"'s points
+
+    def test_aspect_declaration_order_preserved(self):
+        """JUDGMENT CALL (flagged in the PR5-round-2 report): unscored_
+        aspects reports MODEL declaration order, not alphabetical."""
+        model = _fake_model_three_aspects()
+        unscored, _ = health_engine._composition_coverage(
+            model, {"a": UNAVAILABLE, "b": 1.0, "c": UNAVAILABLE}
+        )
+        assert unscored == ["a", "c"]  # MODEL order (a, b, c), not sorted
+
+
+class TestComposeAspectScoresArithmetic:
+    """Split out from TestComposeAspectScores above only for a clean file
+    structure after round 2's insertions — same class of test (compose_
+    aspect_scores' own arithmetic), UNCHANGED from PR5 round 1, since
+    _fake_model() never produces an unscored aspect in these particular
+    fixtures (both aspects always carry a real, non-UNAVAILABLE score)."""
+
+    def test_weighted_sum_arithmetic_shape(self):
+        """Direct arithmetic check of clarification 1's formula: composed =
+        Σ (points_a/100) × aspect_score_a × 100."""
+        model = _fake_model(points_a=40.0, points_b=60.0)
+        composed = health_engine.compose_aspect_scores(model, {"a": 0.5, "b": 0.8})
+        assert composed == pytest.approx(40.0 * 0.5 + 60.0 * 0.8)
+
+    def test_no_flooring_applied_at_this_level(self):
+        """BEHAVIOR CHANGE (flagged in the PR5 report): the OLD
+        compose_aspect_scores floored each aspect score at 1 before
+        composing (avoiding the zero singularity for its geometric mean).
+        The NEW arithmetic-sum formula has no floor at THIS level — where
+        flooring happens at all, it now lives inside the CURVE
+        (badness_default's own 0.01 floor) that produced the aspect_score
+        upstream; compose_aspect_scores itself sums whatever aspect_scores
+        it is given, including a literal 0.0, unmodified."""
+        model = _fake_model(points_a=50.0, points_b=50.0)
+        composed = health_engine.compose_aspect_scores(model, {"a": 0.0, "b": 1.0})
+        assert composed == pytest.approx(50.0)
+
+    def test_weighted_toward_the_higher_points_aspect(self):
+        """A collapsed HIGH-points aspect drags the composed score down more
+        than a collapsed LOW-points aspect would (design doc §3: 'dead
+        retrievability with perfect integrity reads in the 30s, not 65') —
+        same qualitative property as before, now via points not weight."""
+        model = _fake_model(points_a=80.0, points_b=20.0)
+        collapsed_high_points = health_engine.compose_aspect_scores(
+            model, {"a": 0.0, "b": 1.0}
+        )
+        model2 = _fake_model(points_a=20.0, points_b=80.0)
+        collapsed_low_points = health_engine.compose_aspect_scores(
+            model2, {"a": 0.0, "b": 1.0}
+        )
+        assert collapsed_high_points < collapsed_low_points
+
+
+class TestScoreAspect:
+    def test_weighted_average_of_admitted_metrics(self):
+        """Two admitted metrics with DIFFERENT importance, different raw
+        signals, verified against the formula by hand."""
+        curve = _fake_curve()  # curve_fn(x) = 1 - x
+        model = ScoringModel(
+            curves={"fake": curve},
+            signals={"sa": lambda c: 0.0, "sb": lambda c: 0.0},
+            aspects=(AspectSpec(name="a", points=100.0),),
+            metrics=(
+                MetricBinding(signal="sa", aspect="a", curve="fake",
+                              importance=3.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+                              repair="tool:resolve"),
+                MetricBinding(signal="sb", aspect="a", curve="fake",
+                              importance=1.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+                              repair="tool:resolve"),
+            ),
+        )
+        raw = {"sa": 0.2, "sb": 0.8}  # curve(0.2)=0.8, curve(0.8)=0.2
+        score = health_engine._score_aspect("a", raw, model)
+        # weighted avg = (3*0.8 + 1*0.2) / 4 = 2.6/4 = 0.65
+        assert score == pytest.approx(0.65)
+
+    def test_zero_admitted_metrics_is_unavailable(self):
+        """LOAD-BEARING CASE (see health_engine.py's module docstring): an
+        aspect whose every metric is importance=0 (diagnostic-only) has
+        nothing to sum over — UNAVAILABLE, not zero, not skipped."""
+        model = ScoringModel(
+            curves={"fake": _fake_curve()},
+            signals={"sa": lambda c: 0.0},
+            aspects=(AspectSpec(name="a", points=100.0),),
+            metrics=(
+                MetricBinding(signal="sa", aspect="a", curve="fake",
+                              importance=0.0),
+            ),
+        )
+        score = health_engine._score_aspect("a", {"sa": 0.0}, model)
+        assert score is UNAVAILABLE
+
+    def test_sole_admitted_metric_unavailable_holds_out_the_aspect(self):
+        """When an aspect has exactly ONE admitted metric and it is
+        UNAVAILABLE this run, zero admitted metrics remain AVAILABLE —
+        same "hold out" treatment as the zero-admitted-at-all case (round 2
+        of engram-alpha#2520, addendum 2's generalization), not a
+        "propagation" distinct from it."""
+        model = _fake_model()
+        raw = {"sa": UNAVAILABLE, "sb": 0.0}
+        score = health_engine._score_aspect("a", raw, model)
+        assert score is UNAVAILABLE
+
+    def test_unavailable_non_admitted_metric_does_not_propagate(self):
+        """A NON-admitted metric being UNAVAILABLE must NOT drag the aspect
+        down — it was never in the sum (clarification 1's propagation rule
+        is scoped to ADMITTED metrics only)."""
+        model = ScoringModel(
+            curves={"fake": _fake_curve()},
+            signals={"sa": lambda c: 0.0, "diag": lambda c: 0.0},
+            aspects=(AspectSpec(name="a", points=100.0),),
+            metrics=(
+                MetricBinding(signal="sa", aspect="a", curve="fake",
+                              importance=1.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+                              repair="tool:resolve"),
+                MetricBinding(signal="diag", aspect="a", curve="fake",
+                              importance=0.0),
+            ),
+        )
+        raw = {"sa": 0.0, "diag": UNAVAILABLE}
+        score = health_engine._score_aspect("a", raw, model)
+        assert score == pytest.approx(1.0)  # curve(0.0) = 1.0, unaffected by diag
+
+    # -------------------------------------------------------------------
+    # [round 2, addendum 2] Metric-level hold-out-and-renormalize — a
+    # PARTIAL availability case (some but not all admitted metrics
+    # unavailable this run) renormalizes rather than propagating.
+    # -------------------------------------------------------------------
+
+    def _two_admitted_metric_model(self):
+        curve = _fake_curve()  # curve_fn(x) = 1 - x
+        return ScoringModel(
+            curves={"fake": curve},
+            signals={"sa": lambda c: 0.0, "sb": lambda c: 0.0},
+            aspects=(AspectSpec(name="a", points=100.0),),
+            metrics=(
+                MetricBinding(signal="sa", aspect="a", curve="fake",
+                              importance=3.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+                              repair="tool:resolve"),
+                MetricBinding(signal="sb", aspect="a", curve="fake",
+                              importance=1.0, detector=DetectorRef(name="reflect", population=_FAKE_POP),
+                              repair="tool:resolve"),
+            ),
+        )
+
+    def test_partial_availability_renormalizes_not_propagates(self):
+        """BEHAVIOR CHANGE (round 2, addendum 2): TWO admitted metrics, ONE
+        currently unavailable — the aspect score renormalizes over the
+        remaining available metric alone, rather than propagating to
+        UNAVAILABLE. sa (importance 3) is unavailable; sb (importance 1,
+        raw=0.8, curve(0.8)=0.2) is the only one left, so aspect_score ==
+        curve(0.8) == 0.2 exactly (not the two-metric weighted average)."""
+        model = self._two_admitted_metric_model()
+        raw = {"sa": UNAVAILABLE, "sb": 0.8}
+        score = health_engine._score_aspect("a", raw, model)
+        assert score == pytest.approx(0.2)
+
+    def test_metric_level_extensibility_no_special_casing_by_name(self):
+        """Extensibility, proved rather than asserted (per the round-2
+        spec's explicit ask, mirrored one level down from the aspect-level
+        version in TestZeroAdmittedAspectExtensibility below): the SAME
+        two-admitted-metric model, unavailable then available again,
+        automatically renormalizes/re-includes with NO special-casing of
+        either metric's name anywhere in _score_aspect/_aspect_metric_
+        coverage."""
+        model = self._two_admitted_metric_model()
+
+        raw_before = {"sa": UNAVAILABLE, "sb": 0.8}
+        metrics_in_play_before, coverage_before = health_engine._aspect_metric_coverage(
+            "a", raw_before, model
+        )
+        assert metrics_in_play_before == ["sb"]
+        assert coverage_before == pytest.approx(1.0 / 4.0)  # 1 of (3+1) importance
+
+        raw_after = {"sa": 0.2, "sb": 0.8}
+        metrics_in_play_after, coverage_after = health_engine._aspect_metric_coverage(
+            "a", raw_after, model
+        )
+        assert metrics_in_play_after == ["sa", "sb"]
+        assert coverage_after == pytest.approx(1.0)
+
+        score_after = health_engine._score_aspect("a", raw_after, model)
+        assert score_after == pytest.approx(0.65)  # back to the full weighted average
+
+
+class TestRealModelCompositionConsequence:
+    """The real CONFIG/MODEL — RESOLVED (round 2 of engram-alpha#2520,
+    "hold out, renormalize, report"): provenance_integrity has ZERO
+    admitted metrics under the v1 table (STILL true — see
+    tests/test_health_engine_model.py's own model-level version of this
+    fact), but this NO LONGER makes the composed score structurally,
+    always UNAVAILABLE — its 25 points are held out and composed is
+    renormalized over the remaining 75. Supersedes this class's PR5-round-1
+    version, which asserted the OPPOSITE (composed IS UNAVAILABLE) — that
+    was the discovered consequence THIS round's design ruling resolves;
+    see health_engine.py's module docstring "RESOLVED" section."""
+
+    def test_composed_is_a_real_number_renormalized_over_scored_aspects(self):
+        conn = _make_conn()
+        # Give every OTHER admitted metric (epistemic_integrity,
+        # retrievability) a perfect, non-UNAVAILABLE signal, INCLUDING a
+        # resolved contradiction so open_contradiction_rate (round 2's
+        # fold #2: UNAVAILABLE on an EMPTY population, not just an open
+        # one) has a non-empty population to read a real rate from.
+        _insert(conn, "dv_1", "derivation", metadata={},
+                recall_summary="s1", recall_keywords=["k1"],
+                embedding=json.dumps([0.1]))
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_1",
+                recall_summary="s2", recall_keywords=["k2"],
+                embedding=json.dumps([0.2]))
+        _insert(conn, "ev_1", "evidence")
+        _insert_edge(conn, "dv_1", "ob_1", "derives_from")
+        _insert(conn, "ct_1", "contradiction", status="resolved")
+
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            snap = health_engine.build_snapshot(conn, "nap")
+
+        assert isinstance(snap["scores"]["aspects"]["epistemic_integrity"], float)
+        assert isinstance(snap["scores"]["aspects"]["retrievability"], float)
+        # provenance_integrity's OWN score is still UNAVAILABLE (nothing to
+        # measure) -- that determination is unchanged; what changed is
+        # whether it PROPAGATES to composed.
+        assert snap["scores"]["aspects"]["provenance_integrity"] == "UNAVAILABLE"
+        assert isinstance(snap["scores"]["composed"], float)
+        assert 0.0 <= snap["scores"]["composed"] <= 100.0
+        assert snap["scores"]["composed"] == pytest.approx(100.0)  # every scored metric perfect
+
+        assert snap["scores"]["unscored_aspects"] == ["provenance_integrity"]
+        assert snap["scores"]["points_in_play"] == pytest.approx(75.0)
+        assert snap["scores"]["composed_coverage"] == pytest.approx(0.75)
+        # provenance_integrity has NO entry in aspect_coverage (unscored,
+        # not scored -- see build_snapshot's own docstring for the scoping).
+        assert "provenance_integrity" not in snap["scores"]["aspect_coverage"]
+        assert set(snap["scores"]["aspect_coverage"].keys()) == {
+            "epistemic_integrity", "retrievability",
+        }
+        assert snap["scores"]["aspect_coverage"]["epistemic_integrity"]["coverage"] == pytest.approx(1.0)
+
+
+class TestZeroAdmittedAspectExtensibility:
+    """Extensibility, proved rather than asserted (round-2 spec's explicit
+    ask, item 4): the moment provenance_integrity gains an admitted metric
+    (importance > 0, valid detector+repair), it automatically re-enters
+    composition on the NEXT model construction — no special-casing of
+    "provenance_integrity" by name anywhere in health_engine.py's
+    composition logic or health_engine_model.py's validator. Builds a
+    MODIFIED model the same way tests/test_health_engine_model.py already
+    builds adversarial/fake models — via dataclasses.replace off the REAL
+    MODEL (round 3: ``health_engine.MODEL``, the validated model — no
+    longer importable ready-made from health_engine_model.py, see that
+    module's own docstring), never a hand-rewritten copy of the 9-metric
+    table (which would risk silently drifting from the real shape)."""
+
+    def _model_with_uncited_observation_rate_admitted(self):
+        import dataclasses
+
+        from health_engine import MODEL as real_model
+
+        new_metrics = tuple(
+            dataclasses.replace(
+                m,
+                importance=1.0,
+                # detector unchanged — uncited_observation_rate's real
+                # binding already carries a valid detector (DetectorRef(
+                # name="reflect", population="observations")), so this
+                # metric only needs importance/repair flipped to become
+                # admitted; round 3 removed MetricBinding.population, which
+                # this override used to (redundantly) re-derive.
+                repair="tool:resolve",
+            )
+            if m.signal == "uncited_observation_rate"
+            else m
+            for m in real_model.metrics
+        )
+        return dataclasses.replace(real_model, metrics=new_metrics)
+
+    def test_modified_model_no_longer_names_provenance_integrity_unscored(self):
+        model = self._model_with_uncited_observation_rate_admitted()
+        admitted = [
+            m for m in model.metrics
+            if m.aspect == "provenance_integrity" and m.importance > 0
+        ]
+        assert {m.signal for m in admitted} == {"uncited_observation_rate"}
+
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_1")
+
+        snap = health_engine.build_snapshot(conn, "nap", model=model)
+        assert snap["scores"]["unscored_aspects"] == []
+        assert snap["scores"]["points_in_play"] == pytest.approx(100.0)
+        assert snap["scores"]["composed_coverage"] == pytest.approx(1.0)
+        assert isinstance(snap["scores"]["composed"], float)
+        assert "provenance_integrity" in snap["scores"]["aspect_coverage"]
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +707,16 @@ class TestBuildSnapshot:
         aspect_names = {a["name"] for a in snap["config"]["aspects"]}
         assert aspect_names == {"epistemic_integrity", "provenance_integrity", "retrievability"}
 
-    def test_empty_graph_all_signals_unavailable_except_clean_contradiction(self):
+    def test_empty_graph_every_signal_and_aspect_and_composed_unavailable(self):
+        """RENAMED (round 2 of engram-alpha#2520, fold #2): open_
+        contradiction_rate no longer returns a "clean" 0.0 on zero current
+        contradiction nodes — it now declines (UNAVAILABLE) exactly like
+        its two epistemic_integrity siblings, so on a truly EMPTY graph
+        every one of the nine signals is UNAVAILABLE. With ZERO available
+        admitted metrics anywhere, all THREE aspects are held out (round 2,
+        addendum 2's generalization) and composed is UNAVAILABLE too — the
+        one remaining case where nothing anywhere is scored (see
+        compose_aspect_scores's own "all aspects unavailable" branch)."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
         assert snap["signals"]["stale_derivation_rate"] == "UNAVAILABLE"
@@ -323,9 +728,20 @@ class TestBuildSnapshot:
         assert snap["signals"]["recall_keywords_coverage"] == "UNAVAILABLE"
         assert snap["signals"]["embedding_coverage"] == "UNAVAILABLE"
         assert snap["signals"]["giant_component_fraction"] == "UNAVAILABLE"
-        # clean case: zero contradictions -> 0.0, not UNAVAILABLE
-        assert snap["signals"]["open_contradiction_rate"] == 0.0
+        # CHANGED (fold #2): zero contradiction NODES -> UNAVAILABLE, not a
+        # fabricated "clean" 0.0 — see health_engine_metrics.
+        # open_contradiction_rate's own docstring.
+        assert snap["signals"]["open_contradiction_rate"] == "UNAVAILABLE"
+        assert snap["scores"]["aspects"]["epistemic_integrity"] == "UNAVAILABLE"
+        assert snap["scores"]["aspects"]["retrievability"] == "UNAVAILABLE"
+        assert snap["scores"]["aspects"]["provenance_integrity"] == "UNAVAILABLE"
         assert snap["scores"]["composed"] == "UNAVAILABLE"
+        assert set(snap["scores"]["unscored_aspects"]) == {
+            "epistemic_integrity", "provenance_integrity", "retrievability",
+        }
+        assert snap["scores"]["points_in_play"] == 0
+        assert snap["scores"]["composed_coverage"] == 0.0
+        assert snap["scores"]["aspect_coverage"] == {}
 
     def test_unavailable_serializes_as_the_string_literal_not_a_number(self):
         """Contract item 3: UNAVAILABLE is unrepresentable as a number. This
@@ -343,12 +759,23 @@ class TestBuildSnapshot:
         assert '"stale_derivation_rate": "UNAVAILABLE"' in json.dumps(snap, indent=2) or \
             '"stale_derivation_rate":"UNAVAILABLE"' in raw
 
-    def test_populated_graph_produces_real_composed_score(self):
-        """As of PR3, aspect B is real (not a stub) — a graph that gives
-        every metric in all THREE aspects a clean, non-empty denominator now
-        produces a real numeric composed score end to end. Before PR3, this
-        same fixture would have left aspect B (and hence the composed score)
-        permanently UNAVAILABLE via the PR2 stub."""
+    def test_populated_graph_produces_real_aspect_scores(self):
+        """[PR5, updated; round 2 of engram-alpha#2520 changes composed's
+        outcome] A graph that gives every ADMITTED metric in
+        epistemic_integrity and retrievability a clean, non-empty
+        denominator produces real numeric aspect scores for THOSE two
+        aspects. provenance_integrity's OWN score stays UNAVAILABLE (zero
+        admitted metrics — unchanged by round 2), but round 2's "hold out,
+        renormalize, report" ruling means this NO LONGER propagates to the
+        top-level composed score — see TestRealModelCompositionConsequence
+        above for the dedicated test of that fact, and health_engine.py's
+        module docstring "RESOLVED" section for the full reasoning. This
+        fixture deliberately carries NO contradiction node, so open_
+        contradiction_rate (round 2's fold #2: UNAVAILABLE on an EMPTY
+        population) is one of epistemic_integrity's three admitted metrics
+        going unavailable this run — proving the metric-level renormalize
+        (addendum 2) lands a REAL epistemic_integrity score anyway, over
+        the remaining two available metrics."""
         conn = _make_conn()
         # Give every real metric a non-empty denominator with a clean signal
         # — including aspect B's four: both claim-bearing nodes carry a
@@ -371,33 +798,63 @@ class TestBuildSnapshot:
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             snap = health_engine.build_snapshot(conn, "nap")
         assert isinstance(snap["scores"]["aspects"]["epistemic_integrity"], float)
-        assert isinstance(snap["scores"]["aspects"]["provenance_integrity"], float)
         assert isinstance(snap["scores"]["aspects"]["retrievability"], float)
+        assert snap["scores"]["aspects"]["provenance_integrity"] == "UNAVAILABLE"
+        # CHANGED (round 2): composed is now a REAL number, renormalized
+        # over the two scored aspects (75 of 100 points in play).
         assert isinstance(snap["scores"]["composed"], float)
+        assert snap["scores"]["unscored_aspects"] == ["provenance_integrity"]
+        assert snap["scores"]["points_in_play"] == pytest.approx(75.0)
+        assert snap["scores"]["composed_coverage"] == pytest.approx(0.75)
+        # open_contradiction_rate's own UNAVAILABLE (empty population, no
+        # contradiction node in this fixture) does NOT drag epistemic_
+        # integrity down to UNAVAILABLE -- it renormalizes over the
+        # remaining two available admitted metrics (addendum 2).
+        assert snap["signals"]["open_contradiction_rate"] == "UNAVAILABLE"
+        epistemic_coverage = snap["scores"]["aspect_coverage"]["epistemic_integrity"]
+        assert set(epistemic_coverage["metrics_in_play"]) == {
+            "taint_rate", "stale_derivation_rate",
+        }
+        assert epistemic_coverage["coverage"] == pytest.approx(2.0 / 3.0)
 
         # Fully covered + connected -> all four aspect-B raw signals
         # (badness-rate convention) read as perfect (0.0), and the aspect
-        # score composes to 100.
+        # score is now on the [0,1] range (PR5 change — see build_snapshot's
+        # docstring), not the old [0,100] display scale.
         assert snap["signals"]["recall_summary_coverage"] == 0.0
         assert snap["signals"]["recall_keywords_coverage"] == 0.0
         assert snap["signals"]["embedding_coverage"] == 0.0
         assert snap["signals"]["giant_component_fraction"] == 0.0
-        assert snap["scores"]["aspects"]["retrievability"] == pytest.approx(100.0)
+        assert snap["scores"]["aspects"]["retrievability"] == pytest.approx(1.0)
+        assert snap["scores"]["aspect_coverage"]["retrievability"]["coverage"] == pytest.approx(1.0)
 
-    def test_per_metric_display_score_matches_the_shared_goodness_transform(self):
-        """Regression guard for the reviewer-fairy round-1 finding on PR2:
-        build_snapshot's per-metric display score (snap["scores"]["metrics"])
-        must be derived from the SAME metrics.metric_goodness helper that
-        aspect_geometric_mean_scoring uses internally to build the aspect
-        score those metrics feed into — not an independently re-implemented
-        copy of the same formula that could silently diverge."""
+    def test_per_metric_display_score_matches_the_shared_curve_transform(self):
+        """[PR5, rewritten] build_snapshot's per-metric display score
+        (snap["scores"]["metrics"]) must be derived from the SAME curve the
+        real scoring model binds to that metric (``badness_default`` for
+        every one of the nine real metrics today) — not an independently
+        re-implemented copy of the transform that could silently diverge.
+        Supersedes the PR2/PR3-era version of this test, which compared
+        against ``hem.metric_goodness`` (now dead code from health_engine.
+        py's perspective — see that module's docstring)."""
+        import health_engine_model as hem_model
+
         conn = _make_conn()
         _insert(conn, "ct_1", "contradiction", status="active")
         _insert(conn, "ct_2", "contradiction", status="resolved")
         snap = health_engine.build_snapshot(conn, "nap")
         raw = snap["signals"]["open_contradiction_rate"]
         assert raw == 0.5
-        assert snap["scores"]["metrics"]["open_contradiction_rate"] == hem.metric_goodness(raw)
+        binding = hem_model.METRIC_BY_SIGNAL["open_contradiction_rate"]
+        curve = health_engine.MODEL.curves[binding.curve]
+        assert snap["scores"]["metrics"]["open_contradiction_rate"] == curve.curve_fn(raw)
+        # Numerically, badness_default's shape still matches the OLD
+        # metric_goodness transform divided by 100 (by construction — see
+        # health_engine_curves.py's BADNESS_DEFAULT_CURVE docstring) — this
+        # is the one place the old and new numbers stay directly comparable.
+        assert snap["scores"]["metrics"]["open_contradiction_rate"] == pytest.approx(
+            hem.metric_goodness(raw) / 100.0
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -600,3 +1057,165 @@ class TestWriteSnapshot:
         filename = os.path.basename(path)
         assert filename.startswith(f"{snap['turn']}-post_dream-")
         assert filename.endswith(".json")
+
+    def test_write_failure_also_surfaces_as_dream_projection_write_error(
+        self, tmp_path, monkeypatch
+    ):
+        """The SAME unwritable-directory failure that hits the main
+        snapshot also hits the dream projection's persistence step (both go
+        through ``Path.write_text``) — verifies the dream-projection write
+        is ALSO best-effort, not just the main snapshot's."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        def _boom(self, *args, **kwargs):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(health_engine.Path, "write_text", _boom)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")  # must not raise
+        assert snap.get("_snapshot_write_error")
+        assert snap.get("_dream_projection_write_error")
+
+
+# ---------------------------------------------------------------------------
+# [PR5] The dream-side projection — draft-2 §2. Fixed filename, aspect-blind
+# by construction (P2), delta_since_last read from the previous write.
+# ---------------------------------------------------------------------------
+
+
+class TestDreamProjection:
+    _FORBIDDEN_TOP_LEVEL_KEYS = {"aspects", "scores", "composed", "config", "red_flags"}
+    _FORBIDDEN_PER_METRIC_KEYS = {"importance", "points", "aspect", "curve"}
+
+    def test_writes_a_fixed_filename_not_timestamped(self, tmp_path, monkeypatch):
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")
+        assert "_dream_projection_write_error" not in snap
+        path = snap.get("_dream_projection_path")
+        assert path, f"no _dream_projection_path in {snap}"
+        assert os.path.basename(path) == "health-snapshot-dream.json"
+
+    def test_second_checkpoint_overwrites_the_same_fixed_path(self, tmp_path, monkeypatch):
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        snap1 = health_engine.write_snapshot(conn, "nap")
+        snap2 = health_engine.write_snapshot(conn, "nap")
+        assert snap1["_dream_projection_path"] == snap2["_dream_projection_path"]
+        # Exactly one dream-projection file on disk, regardless of how many
+        # timestamped MAIN snapshots accumulated in the same directory.
+        dream_files = list((tmp_path / "health-snapshots").glob("health-snapshot-dream.json"))
+        assert len(dream_files) == 1
+
+    def test_coverage_fields_present_and_match_the_main_snapshot(
+        self, tmp_path, monkeypatch
+    ):
+        """[round 2, engram-alpha#2520] Kepler's design ruling explicitly
+        names the dream projection as a REQUIRED destination for
+        unscored_aspects/points_in_play/composed_coverage (module
+        docstring's "RESOLVED" section, item 2) — an explicit, narrow
+        exception to P2 ("aspect-blind") for these three fields only. Read
+        straight off the main snapshot's own ``scores`` block — single
+        source of truth, so the two files can never silently disagree."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        snap = health_engine.write_snapshot(conn, "nap")
+        projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
+
+        assert projection["unscored_aspects"] == snap["scores"]["unscored_aspects"]
+        assert projection["points_in_play"] == snap["scores"]["points_in_play"]
+        assert projection["composed_coverage"] == snap["scores"]["composed_coverage"]
+        assert projection["unscored_aspects"] == ["provenance_integrity"]
+        assert projection["points_in_play"] == pytest.approx(75.0)
+        assert projection["composed_coverage"] == pytest.approx(0.75)
+        # The addendum-2 per-aspect metrics_in_play/coverage structure is
+        # DELIBERATELY NOT added here (JUDGMENT CALL — see
+        # _build_dream_projection's own docstring): aspect-keyed, a bigger
+        # P2 violation than the three small global fields above, and
+        # nothing in the addendum asks for it on the dream side.
+        assert "aspect_coverage" not in projection
+        assert "metrics_in_play" not in projection
+
+    def test_aspect_blind_no_aspects_scores_composed_importances_points(
+        self, tmp_path, monkeypatch
+    ):
+        """P2's mechanical enforcement, tested directly (not just "the
+        allowed fields are present" — the NEGATIVE space, per the PR5
+        spec's explicit instruction): scores.aspects / scores.composed /
+        importances / points must be ABSENT from the projection file, at
+        both the top level and inside every per-metric entry."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        snap = health_engine.write_snapshot(conn, "nap")
+        projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
+
+        assert set(projection.keys()) & self._FORBIDDEN_TOP_LEVEL_KEYS == set()
+        assert "metrics" in projection
+        assert len(projection["metrics"]) == 9
+        for metric_name, entry in projection["metrics"].items():
+            assert set(entry.keys()) & self._FORBIDDEN_PER_METRIC_KEYS == set()
+            assert set(entry.keys()) == {
+                "signal", "score", "admitted", "detector", "repair",
+                "delta_since_last",
+            }
+
+    def test_admitted_flag_matches_the_scoring_model(self, tmp_path, monkeypatch):
+        import engram_core as core
+        import health_engine_model as hem_model
+
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")
+        projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
+        for signal, entry in projection["metrics"].items():
+            expected_admitted = hem_model.METRIC_BY_SIGNAL[signal].importance > 0
+            assert entry["admitted"] == expected_admitted
+
+    def test_delta_since_last_is_none_on_first_write(self, tmp_path, monkeypatch):
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")
+        projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
+        for entry in projection["metrics"].values():
+            assert entry["delta_since_last"] is None
+
+    def test_delta_since_last_reflects_the_score_change_since_previous_write(
+        self, tmp_path, monkeypatch
+    ):
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        health_engine.write_snapshot(conn, "nap")  # first write: taint_rate score = 1.0 (clean)
+
+        _insert_marker(conn, "dv_1", root_op="supersede")  # now stale
+        snap2 = health_engine.write_snapshot(conn, "nap")
+        projection2 = json.loads(open(snap2["_dream_projection_path"], encoding="utf-8").read())
+        entry = projection2["metrics"]["stale_derivation_rate"]
+        assert entry["signal"] == 1.0
+        assert entry["score"] == pytest.approx(0.01)  # badness_default floor
+        assert entry["delta_since_last"] == pytest.approx(0.01 - 1.0)
+
+    def test_unavailable_signal_projects_as_the_string_literal(self, tmp_path, monkeypatch):
+        """Empty graph -> most metrics UNAVAILABLE — the projection must
+        carry the SAME string-literal contract as the main snapshot (never
+        coerced to a number)."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        conn = _make_conn()
+        snap = health_engine.write_snapshot(conn, "nap")
+        projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
+        entry = projection["metrics"]["taint_rate"]
+        assert entry["signal"] == "UNAVAILABLE"
+        assert entry["score"] == "UNAVAILABLE"
+        assert entry["delta_since_last"] is None

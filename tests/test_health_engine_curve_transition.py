@@ -1,22 +1,43 @@
-"""Transition-rule test — regression safety for PR1-3 (engram-alpha#1991,
-PR4 of 4, buildable slice, spec item 4).
+"""Curve-wiring test — REPURPOSED for PR5 (engram-alpha#1991, PR5 of 5,
+"the dream-side contract", §7 item 5).
 
-For each of the nine real metrics (read off health_engine.py's real
-``CONFIG``, never hand-copied), constructs a ``piecewise_linear`` curve
-reproducing ``metric_goodness``'s exact shape rescaled from its ``[1,100]``
-output range to the Layer-3 curve contract's ``[0,1]`` range, runs the
-metric's REAL ``signal_fn`` against a small realistic fixture database to
-get an actual current rate, and asserts the rescaled curve matches
-``metric_goodness(rate) / 100`` for that rate within a tight tolerance.
+WHY THIS FILE CHANGED: this file used to prove that a hand-built
+``piecewise_linear`` curve, rescaled from ``metric_goodness``'s exact shape,
+matched PR1-3's per-metric scoring behavior EXACTLY (``LEGACY_GOODNESS_
+TRANSITION_CURVE``'s own regression-safety role, still documented in
+health_engine_curves.py). That guarantee — "the first shipped curve-library
+model must reproduce today's nine scores" — was the design doc's transition
+rule for PR4's buildable slice, when the curve library was NOT YET wired
+into any real scoring path (PR4's own module docstring: "additive-only,
+this module is new and is not imported by health_engine.py ... in this
+PR"). PR5 wires curves into the REAL scoring path directly (health_engine.
+py's ``build_snapshot``, driven by health_engine.MODEL — round 3 moved
+construction here from ``health_engine_model.MODEL``, see that module's
+docstring) — so asserting
+"the curve reproduces the old formula" is no longer a meaningful regression
+guard for the real path: the real path never computes ``metric_goodness``
+anymore (health_engine_metrics.aspect_geometric_mean_scoring /
+metric_goodness are DEAD CODE from health_engine.py's perspective as of
+PR5 — see that module's docstring). Lei's ruling (via Borges, 2026-09-02):
+exact-score reproduction is not required for v2.
 
-This is the guard against a silent factor/formula error in the rescaling:
-if PR1-3's per-metric scoring behavior and this PR's curve-library
-rescaling of the SAME transform ever diverge, this test fails.
+REPURPOSED (option (b) of the PR5 spec's "retire vs repurpose" choice,
+preferred over deleting outright because this file's fixture-DB
+infrastructure — a realistic multi-metric, multi-aspect graph exercising
+all nine real signal functions at once — is worth reusing): this file now
+tests that health_engine.MODEL's ONE v1 curve (``badness_default``),
+wired through the REAL composition path (``health_engine.build_snapshot``),
+produces SANE results against this same realistic fixture — bounded scores,
+no NaN, and the documented (informational, not load-bearing) fact that
+``badness_default`` happens to numerically match ``metric_goodness``'s old
+shape, since it was built that way on purpose (health_engine_curves.py's
+``BADNESS_DEFAULT_CURVE`` docstring).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -28,15 +49,17 @@ import pytest  # noqa: E402
 
 import health_engine as he  # noqa: E402
 import health_engine_metrics as hem  # noqa: E402
+import health_engine_model as hem_model  # noqa: E402
 from health_engine_config import UNAVAILABLE  # noqa: E402
-from health_engine_curves import LEGACY_GOODNESS_TRANSITION_CURVE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Fixture DB — same DDL/helper shape as tests/test_health_engine_metrics.py
 # and tests/test_health_engine.py (this repo's established per-test-file
 # fixture-DDL convention; each health_engine* test file defines its own
-# copy rather than sharing one via conftest.py).
+# copy rather than sharing one via conftest.py). UNCHANGED from the pre-PR5
+# version of this file — this infrastructure is exactly what's worth
+# reusing (see module docstring).
 # ---------------------------------------------------------------------------
 
 _NODES_DDL = """
@@ -130,28 +153,8 @@ def _insert_marker(conn, node_id, root_op, status="pending", cascade_event=None)
 def _build_fixture_conn() -> sqlite3.Connection:
     """One small, realistic fixture DB exercising ALL NINE real metrics'
     signal functions at once, each landing on a non-degenerate,
-    non-UNAVAILABLE rate.
-
-    JUDGMENT CALL (flagged in the coder-fairy report, per the spec's
-    explicit "use your judgment and say which you picked and why"): a
-    FIXTURE DB was chosen over connecting to a real ENGRAM db. A fixture is
-    fully self-contained (no dependency on this test environment happening
-    to have a real ~/.engram database with the right shape of data
-    available, read-only or otherwise), deterministic (doesn't drift as a
-    real graph's content changes over time), and matches this test suite's
-    own established convention (every other health_engine* test file
-    builds a small real-shape SQLite fixture rather than touching a live
-    db). The trade-off, stated honestly: this proves "the rescaled curve
-    matches metric_goodness's transform for whatever rate a REAL signal_fn
-    produces against a plausible row shape" — it does NOT prove the curve
-    stays correct against every rate value a real, larger, messier
-    production graph might produce. That gap is acceptable for this test's
-    purpose: the transform itself (``max(1-rate, 0.01)``) is already
-    verified pointwise across the WHOLE [0,1] domain by the dense-sampled
-    property tests in tests/test_health_engine_curves.py. What THIS test
-    specifically adds beyond those is "does the wiring from a REAL
-    signal_fn's return value into curve/metric_goodness stay correct",
-    not "is the curve correct for all inputs" (already covered elsewhere).
+    non-UNAVAILABLE rate. UNCHANGED from the pre-PR5 version of this file —
+    see module docstring for why this infrastructure survives the repurpose.
 
     Layout (deliberately cross-cutting — the same 4 claim-bearing nodes
     dv_1/dv_2/ob_1/ob_2 feed taint_rate AND all four aspect-B metrics, per
@@ -203,57 +206,23 @@ def _build_fixture_conn() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# The rescaled curve under test (spec item 4, step 1): metric_goodness's
-# exact shape, ``max(100*(1-rate), 1.0)``, rescaled from its [1,100] output
-# range to the curve contract's [0,1] range by dividing by 100. Showing the
-# work, per the spec's explicit "get this rescaling right — show your work
-# in a comment" instruction:
-#
-#     metric_goodness(rate) / 100
-#   = max(100*(1-rate), 1.0) / 100
-#   = max(100*(1-rate)/100, 1.0/100)      [dividing max(a, b) by a positive
-#                                           constant c distributes over the
-#                                           max: max(a, b)/c == max(a/c, b/c)
-#                                           for c > 0, since dividing by a
-#                                           positive c preserves ordering]
-#   = max(1-rate, 0.01)
-#
-# ...which is exactly a decreasing piecewise-linear curve from (0.0, 1.0)
-# down to (0.99, 0.01): that segment's slope is
-# (0.01 - 1.0) / (0.99 - 0.0) == -1, i.e. curve(x) == 1 - x identically for
-# x in [0, 0.99] — matching (1 - rate) there exactly — then FLAT at the
-# 0.01 floor from (0.99, 0.01) to (1.0, 0.01), matching max(1-rate, 0.01)
-# for rate in [0.99, 1.0], where (1 - rate) <= 0.01 and the floor wins.
-# So this curve equals metric_goodness(rate)/100 EXACTLY (modulo float
-# rounding) for every rate in [0, 1], not just at a few sampled points —
-# the tight 1e-9 tolerance below is float-rounding headroom, not slack for
-# a formula mismatch.
-#
-# Round 2 (engram-alpha#1991 PR4, forum #382): this used to be an inline
-# ``functools.partial(piecewise_linear, knots=...)`` re-derivation, kept in
-# sync with health_engine_curves.py's shipped shape only by hand. It now
-# references the shipped ``LEGACY_GOODNESS_TRANSITION_CURVE`` constant
-# directly, so this test asserts against the actual shipped object rather
-# than a second local re-derivation that could silently drift from it.
-_TRANSITION_CURVE = LEGACY_GOODNESS_TRANSITION_CURVE.curve_fn
-
-
-# ---------------------------------------------------------------------------
-# The nine real metrics — read off health_engine.py's CONFIG, never
-# hand-copied (spec item 4: "do not hand-copy metric names").
+# The nine real metric bindings — read off health_engine.MODEL (round 3: the
+# validated model, built by health_engine.py via health_engine_model.load()
+# — no longer importable ready-made as health_engine_model.MODEL, see that
+# module's own docstring), never hand-copied (same discipline the pre-PR5
+# version of this file applied to health_engine.CONFIG).
 # ---------------------------------------------------------------------------
 
-_ALL_REAL_METRICS = tuple(
-    metric for aspect in he.CONFIG.aspects for metric in aspect.metrics
-)
+_ALL_REAL_BINDINGS = he.MODEL.metrics
 
 
-def test_config_has_exactly_nine_real_metrics():
+def test_model_has_exactly_nine_real_metric_bindings():
     """Sanity check on this test file's own premise — if this ever drifts
-    (a tenth metric added, one removed), the parametrize below would
-    silently test a different N; this makes that visible instead."""
-    assert len(_ALL_REAL_METRICS) == 9
-    assert {m.name for m in _ALL_REAL_METRICS} == {
+    (a tenth metric added, one removed, e.g. the pending_marker_ratio
+    merge), the parametrize below would silently test a different N; this
+    makes that visible instead."""
+    assert len(_ALL_REAL_BINDINGS) == 9
+    assert {m.signal for m in _ALL_REAL_BINDINGS} == {
         "stale_derivation_rate",
         "taint_rate",
         "open_contradiction_rate",
@@ -266,34 +235,87 @@ def test_config_has_exactly_nine_real_metrics():
     }
 
 
-@pytest.mark.parametrize("metric", _ALL_REAL_METRICS, ids=lambda m: m.name)
-def test_transition_curve_matches_metric_goodness_for_a_real_rate(metric):
-    """For each real metric: run its REAL signal_fn against the fixture db
-    to get an actual current rate, then assert the rescaled curve matches
-    metric_goodness's transform of that SAME rate, within tight float
-    tolerance (1e-9).
+@pytest.mark.parametrize("binding", _ALL_REAL_BINDINGS, ids=lambda m: m.signal)
+def test_badness_default_curve_produces_sane_scores_for_every_real_metric(binding):
+    """For each real metric binding: run its REAL signal function (via
+    health_engine_model.SIGNALS — the name registry, clarification 2)
+    against the fixture db to get an actual current rate, then assert its
+    bound curve (``badness_default`` for all nine today) produces a SANE
+    score: bounded to [0,1] (its declared output_range), never NaN.
 
     Wrapped in a mock of ``engram_core._embedder.is_available`` for every
     metric (not just embedding_coverage) — harmless for the other eight,
-    which never touch the embedder, and necessary for embedding_coverage,
-    which would otherwise read UNAVAILABLE under this test suite's default
-    ENGRAM_NO_EMBEDDINGS-equivalent environment (no embedder installed),
-    per the precedent in tests/test_health_engine_metrics.py's
-    TestEmbeddingCoverage class.
+    necessary for embedding_coverage — same precedent as
+    tests/test_health_engine_metrics.py's TestEmbeddingCoverage class.
     """
+    signal_fn = hem_model.SIGNALS[binding.signal]
     with mock.patch("engram_core._embedder.is_available", return_value=True):
         conn = _build_fixture_conn()
-        rate = metric.signal_fn(conn)
+        rate = signal_fn(conn)
 
     assert rate is not UNAVAILABLE, (
-        f"{metric.name}: fixture DB produced UNAVAILABLE — the fixture is "
+        f"{binding.signal}: fixture DB produced UNAVAILABLE — the fixture is "
         f"supposed to give every real metric a non-degenerate live rate; "
         f"this is a fixture-construction bug, not the thing under test"
     )
 
-    expected = hem.metric_goodness(rate) / 100.0
-    actual = _TRANSITION_CURVE(rate)
-    assert actual == pytest.approx(expected, abs=1e-9), (
-        f"{metric.name}: curve({rate!r})={actual!r} != "
-        f"metric_goodness({rate!r})/100={expected!r}"
-    )
+    curve = he.MODEL.curves[binding.curve]
+    score = curve.curve_fn(rate)
+    assert isinstance(score, float)
+    assert not math.isnan(score)
+    lo, hi = curve.output_range
+    assert lo <= score <= hi, f"{binding.signal}: score {score!r} outside {curve.output_range!r}"
+
+    # Informational, NOT the load-bearing guard anymore (see module
+    # docstring): badness_default was built to numerically reproduce
+    # metric_goodness's old shape on purpose (health_engine_curves.py's
+    # BADNESS_DEFAULT_CURVE docstring) — this documents that fact still
+    # holds, it does not assert it as a requirement going forward.
+    assert score == pytest.approx(hem.metric_goodness(rate) / 100.0, abs=1e-9)
+
+
+def test_full_build_snapshot_wired_through_the_new_model_produces_sane_results():
+    """End-to-end integration check (the PR5 spec's step 3 manual-sanity
+    ask, promoted to a committed test since the fixture already exists
+    here): run the REAL health_engine.build_snapshot against this
+    realistic, multi-metric fixture and assert the whole pipeline — signal
+    computation -> curve -> per-aspect weighted sum -> composed — produces
+    sane, bounded numbers with no NaN / no None-where-a-number-is-expected.
+
+    Also re-confirms, at the INTEGRATION level (not just the unit level in
+    tests/test_health_engine_model.py / tests/test_health_engine.py's
+    TestRealModelCompositionConsequence), the RESOLVED (round 2 of
+    engram-alpha#2520, "hold out, renormalize, report") consequence:
+    provenance_integrity has zero admitted metrics under the v1 table, so
+    its OWN score is UNAVAILABLE, but this no longer propagates to
+    ``composed`` — its 25 points are held out and ``composed`` is
+    renormalized over the remaining 75, landing on a REAL number even on
+    this healthy-ish fixture (PR5 round 1 asserted the OPPOSITE here; see
+    health_engine.py's module docstring "RESOLVED" section for why).
+    """
+    with mock.patch("engram_core._embedder.is_available", return_value=True):
+        conn = _build_fixture_conn()
+        snap = he.build_snapshot(conn, "nap")
+
+    for name, value in snap["scores"]["metrics"].items():
+        if value == "UNAVAILABLE":
+            continue
+        assert isinstance(value, float)
+        assert not math.isnan(value)
+        assert 0.0 <= value <= 1.0, f"{name}: score {value!r} outside [0,1]"
+
+    assert isinstance(snap["scores"]["aspects"]["epistemic_integrity"], float)
+    assert isinstance(snap["scores"]["aspects"]["retrievability"], float)
+    assert 0.0 <= snap["scores"]["aspects"]["epistemic_integrity"] <= 1.0
+    assert 0.0 <= snap["scores"]["aspects"]["retrievability"] <= 1.0
+
+    # provenance_integrity's OWN score is still UNAVAILABLE (zero admitted
+    # metrics, unchanged by round 2) -- what changed is that this no
+    # longer poisons the top-level composed score.
+    assert snap["scores"]["aspects"]["provenance_integrity"] == "UNAVAILABLE"
+    assert isinstance(snap["scores"]["composed"], float)
+    assert not math.isnan(snap["scores"]["composed"])
+    assert 0.0 <= snap["scores"]["composed"] <= 100.0
+    assert snap["scores"]["unscored_aspects"] == ["provenance_integrity"]
+    assert snap["scores"]["points_in_play"] == pytest.approx(75.0)
+    assert snap["scores"]["composed_coverage"] == pytest.approx(0.75)

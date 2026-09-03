@@ -160,22 +160,34 @@ def taint_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     return tainted / total
 
 
-def open_contradiction_rate(conn: sqlite3.Connection) -> float:
+def open_contradiction_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     """Fraction of current contradiction nodes that are still OPEN
     (``status IN ('active', 'partially_resolved')``), i.e. not resolved.
 
-    empty_denominator: CLEAN (0.0) — the design doc's own worked example
-    (§5 contract item 5): a contradiction-free graph has genuinely 0% open
-    contradictions, not an unknown rate. n=0 stays visible in the raw
-    signal via the caller (health_engine.build_snapshot); this function
-    itself only returns the rate.
+    empty_denominator: UNAVAILABLE (CHANGED — engram-alpha#2520 round 2,
+    fold #2: Kepler via Borges's colleague read of draft 2, addendum 2 on
+    #1991, 2026-09-03). PREVIOUSLY this returned CLEAN (0.0) on zero
+    current contradiction nodes, reasoning that a contradiction-free graph
+    has genuinely 0% open contradictions (design doc §5 contract item 5's
+    own worked example). That reasoning PREDATES the "hold out,
+    renormalize, report" design ruling (Kepler, engram-alpha#2520 review
+    comment, 2026-09-03) and, per Kepler, now FABRICATES a real number on
+    every brand-new/tiny graph: a graph with literally zero contradiction
+    NODES (not zero OPEN ones) hasn't demonstrated anything about its
+    open-contradiction rate at all, "clean" or otherwise — there is
+    nothing to report a rate over. This now matches taint_rate /
+    stale_derivation_rate's existing UNAVAILABLE-on-empty-population
+    convention exactly (same aspect, same treatment) — the prior asymmetry
+    (this one epistemic_integrity metric alone returning a "clean" 0.0 for
+    an empty population, its two siblings both returning UNAVAILABLE for
+    the same condition) was itself the inconsistency this fold closes.
     """
     rows = conn.execute(
         "SELECT status FROM nodes WHERE type = 'contradiction' AND is_current = 1"
     ).fetchall()
     total = len(rows)
     if total == 0:
-        return 0.0
+        return UNAVAILABLE
 
     open_count = sum(1 for r in rows if r["status"] in ("active", "partially_resolved"))
     return open_count / total

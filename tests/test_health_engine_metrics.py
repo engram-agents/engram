@@ -6,9 +6,15 @@ tables' real column shape, a subset of engram_core.py's CREATE TABLE) per
 test, and asserts each signal function returns the EXACT expected rate
 against it — not just "doesn't crash". Explicitly covers the
 empty_denominator UNAVAILABLE case (zero derivations -> stale_derivation_rate
-is UNAVAILABLE, not 0 or a ZeroDivisionError) and the empty_denominator
-"clean" case (zero contradictions -> open_contradiction_rate is 0.0, not
-UNAVAILABLE) per the PR2 spec's explicit test requirements.
+is UNAVAILABLE, not 0 or a ZeroDivisionError).
+
+UPDATED (engram-alpha#2520 round 2, fold #2, 2026-09-03): open_contradiction_
+rate's empty-denominator policy CHANGED from "clean" (0.0) to UNAVAILABLE —
+see health_engine_metrics.open_contradiction_rate's own docstring for the
+full reasoning (the "hold out, renormalize, report" design ruling makes the
+old "clean" reasoning fabricate a number for an unmeasured population). It
+now matches its two epistemic_integrity siblings' empty-population
+treatment exactly.
 
 Aspect B's four metrics (PR3) all return the badness-rate COMPLEMENT of
 their coverage-style names (see health_engine_metrics.py's module docstring
@@ -288,12 +294,15 @@ class TestTaintRate:
 
 
 class TestOpenContradictionRate:
-    def test_empty_denominator_is_clean_zero(self):
-        """Zero contradictions -> 0.0 (clean), not UNAVAILABLE — the design
-        doc's own worked example for empty_denominator='clean'."""
+    def test_empty_denominator_is_unavailable(self):
+        """Zero current contradiction nodes -> UNAVAILABLE, not a
+        fabricated 0.0 (CHANGED — engram-alpha#2520 round 2, fold #2,
+        2026-09-03: see this function's own docstring for why the design
+        doc's original 'clean' reasoning no longer holds). Matches
+        stale_derivation_rate / taint_rate's own empty-denominator
+        treatment exactly."""
         conn = _make_conn()
-        assert hem.open_contradiction_rate(conn) == 0.0
-        assert hem.open_contradiction_rate(conn) is not UNAVAILABLE
+        assert hem.open_contradiction_rate(conn) is UNAVAILABLE
 
     def test_active_counts_as_open(self):
         conn = _make_conn()

@@ -231,4 +231,74 @@ curve — it is the one natural-experiment range on record for the metric this
 constant's shape reproduces (stale-derivation rate), reused here for the
 same reason the curve shape itself is reused: one canonical definition
 instead of a second independent re-derivation.
+
+V1 SUCCESSOR (engram-alpha#1991 PR5, "the dream-side contract"): this
+constant is superseded, for REAL per-metric scoring purposes, by
+``BADNESS_DEFAULT_CURVE`` below — the same shape, under a name that does not
+claim to be "legacy" or "the goodness transition" but simply "the v1 default
+badness curve", per Kepler's PR5 clarification 3 ("Name it honestly ... and
+state in the model file that per-metric differentiation is post-v1"). This
+constant (``LEGACY_GOODNESS_TRANSITION_CURVE``) is kept, UNCHANGED, as the
+object tests/test_health_engine_curve_transition.py and
+tests/test_health_engine_curves.py already reference by name — it continues
+to serve its original regression-safety role (reproducing
+``metric_goodness``'s exact shape) and is not itself wired into the real
+scoring path health_engine_model.py builds. A new metric wanting the v1
+default badness curve should reference ``BADNESS_DEFAULT_CURVE``, not this
+one.
+"""
+
+
+# ---------------------------------------------------------------------------
+# BADNESS_DEFAULT_CURVE — engram-alpha#1991 PR5 ("the dream-side contract"),
+# Kepler's clarification 3, 2026-09-03.
+# ---------------------------------------------------------------------------
+
+BADNESS_DEFAULT_CURVE = CurveSpec(
+    name="badness_default",
+    curve_fn=functools.partial(
+        piecewise_linear,
+        knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
+    ),
+    input_domain=(0.0, 1.0),
+    monotone_direction="decreasing",
+    # JUDGMENT CALL (flagged in the PR5 report): no observed_range set here,
+    # unlike LEGACY_GOODNESS_TRANSITION_CURVE's (0.012, 0.105) — that range
+    # is the stale-derivation-rate natural experiment specifically, and this
+    # curve is now shared across the health-v2 model's SIX admitted metrics
+    # (health_engine_model.py), with plausibly very different natural
+    # ranges (embedding_coverage's typical badness rate is not
+    # stale_derivation_rate's). Stamping one metric's observed range onto a
+    # now general-purpose curve would misrepresent it as the shared
+    # normal-operating range for all six; leaving it unset is the honest
+    # default until real per-metric ranges are recorded (this PR's own
+    # "observed_range auto-population" carrier, still out of scope, per
+    # PR4's original deferral).
+    observed_range=None,
+)
+"""The v1 default curve for EVERY admitted metric in health_engine_model.py's
+``MODEL`` (engram-alpha#1991 PR5) — the SAME decreasing piecewise-linear
+shape as ``LEGACY_GOODNESS_TRANSITION_CURVE`` above (``(0.0,1.0) ->
+(0.99,0.01) -> (1.0,0.01)``), reproducing ``health_engine_metrics.
+metric_goodness``'s exact transform rescaled to this library's ``[0,1]``
+contract — see that constant's own docstring for the full derivation; it is
+not repeated here since the shape is byte-for-byte identical.
+
+WHY A SEPARATE CONSTANT rather than reusing ``LEGACY_GOODNESS_TRANSITION_
+CURVE`` directly (Kepler's clarification 3, "the judgment call, accepted"):
+one curve, shipped under an HONEST v1 name — "badness_default" says what it
+is (the default curve for badness-rate metrics, v1) rather than "legacy" or
+"transition", which would misdescribe its role once it is the REAL curve
+driving REAL scores, not a regression-safety artifact for a formula that no
+longer exists in the composition path. Building it as a genuinely separate
+object (not a ``dataclasses.replace`` of the legacy one) also means
+tests/test_health_engine_curves.py's existing property-contract suite,
+which imports ``LEGACY_GOODNESS_TRANSITION_CURVE`` by name, needs ZERO
+changes — "least churn", per the PR5 spec's explicit preference.
+
+WHAT THIS IS **NOT**: not a claim that one curve shape suits every metric
+forever — see health_engine_model.py's module docstring and its
+``CURVES``/``MetricBinding`` docstrings for the explicit "per-metric curve
+differentiation is future work" statement this constant's shared use is
+scoped by.
 """

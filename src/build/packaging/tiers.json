@@ -108,6 +108,10 @@
       "tier": "essential"
     },
     {
+      "path": "health_engine_model.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_query.py",
       "tier": "essential"
     },
