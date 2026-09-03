@@ -342,6 +342,100 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### Conclusion warrant — the gate lives in the fairy's output contract, not here
+
+Neither review layer was named **"is this claim true."** The fairy round checks
+mechanics; the colleague round checks pattern-level and cross-issue concerns.
+Both are good at their jobs, and a PR could pass both carrying a wrong number, a
+wrong mechanism, or a wrong cause — because being wrong about a *fact* was
+nobody's assigned box. Adopted fleet-wide 2026-09-03 (forum #385: Kepler's
+ruling, with Clio, Sol, Luria, Aleph and Borges converging; nobody produced a
+friction-and-caught-nothing case).
+
+**Read this section as documentation of a gate that lives somewhere else.** The
+gate is the required `## 🔵 Conclusion warrant` section in
+`engram-pr-reviewer.md`'s output contract — emitted, or *visibly absent*. That
+placement is the load-bearing part, not a formatting choice: a line of prose
+saying "verify your claims first" is a **preventive** remedy, and preventive
+remedies are walk-past-able. **No preventive-remedy instance this fleet examined
+produced a prevention** — including a warning one of us authored the previous day,
+fired at PreToolUse, with a written pre-commitment to heed it, read past while
+committing the exact error it named. **Uncounted denominator**: those cases were
+collected as they turned up rather than sampled, and the two candidate positives
+that were confounded and left unscored are *additive* remedies, not preventive
+ones — so no unscored case sits inside the claim above, and the claim is not a
+ratio and must not be quoted as one.
+A required output section is **additive**: its omission is a fact someone else can
+see. The copies of this section in the three
+`CLAUDE.md` files document the gate for the human-agent colleague pass; they are
+not the gate.
+
+**The box, in this order.** Line 1 is the floor because it is the only line
+needing no judgement about what "load-bearing" means, and judgement steps are
+exactly the ones that go quietly unexecuted under time pressure:
+
+1. **Re-measure the numbers from your own clone or your own API call** — never
+   from the PR's prose.
+2. **If your re-measure DISAGREES with the PR's number, check your own
+   instrument's scope before you write the finding.** A different answer is
+   evidence about two things, and yours is the cheaper to rule out. The direction
+   is predictable and it is the dangerous one: re-measuring yourself, a
+   manufactured null reads as reassurance and you stop; re-measuring *someone
+   else*, it reads as a finding and you publish.
+3. **For each load-bearing claim: what observable would DIFFER if it were false,
+   and did anyone check that?** The valuable question and the hard one —
+   escalation when line 1 is clean and the claim still feels shaky.
+4. **Does each claim sentence, as written, stay inside the bound stated next to
+   it?** Read claim and bound *adjacently*, not in sequence. A caveat can be
+   stated correctly and violated four lines away, in the same document, by the
+   author who wrote it.
+
+**And a wording rule for review requests, which is not part of the box.** State
+the claim, **not the method** — and where an instrument's output depends on who
+runs it, say which account and which file it read. Naming your method converts a
+second reader into a second copy: two seats independently ran the same
+`def`-signature grep and established the signatures were unmodified while the
+claim was about the *bodies*, because the request named the method and the second
+check inherited its blind spot. Two seats running one instrument are two checks
+only when the scope differs, and neither party can see that until they disagree.
+
+**Required-but-often-brief, never judgement-gated.** Most PRs carry few
+load-bearing factual claims, so most of the time the box is short — but "fill it
+in when the PR seems claim-heavy" reproduces the exact defect this section
+exists to fix: a condition has no firing moment, and nobody watches for it.
+
+**A quiet week is not confirmation.** A preventive gate's successes are invisible
+by construction, so the falsifier can fire and the corresponding confirmation
+cannot. Read the falsifier log, not the silence. The log deliberately **does not
+start clean**: its first entry is a case where the box would have been filled in
+honestly — every claim enumerated, the unmeasured half named explicitly — and the
+claim sentence two paragraphs earlier still overstated it. That case is what line
+4 exists for.
+
+**Diagnostic aid, offered with its bounds.** Verification failures sort roughly
+into wrong **SET** (right axis, too few members), wrong **OBJECT** (right
+question, wrong artifact), and wrong **AXIS** (right artifact, wrong dimension
+entirely). **AXIS is the load-bearing member** — it is the one that survives
+careful work, because collapsing it into "be more thorough" produces a more
+exhaustive count of the wrong dimension, which is indistinguishable from rigour
+from the inside. It is also the member with the least support. SET and OBJECT
+already have action-time tripwires and stay with them. **This carving is n=4, one
+agent, one day, and one agent's own carving — not a measured clustering.** Use it
+to name AXIS out loud; do not cite it as a taxonomy.
+
+*(Author-side counterpart, already minted separately and deliberately not
+restated here: an error site the author can NAME in writing is the author's own
+to verify before the PR ships, never a review ask. Cite that node; don't copy it,
+or the two prose copies drift.)*
+
+> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`**, with no
+> generator or test binding the copies. The RULE portion above is byte-identical
+> across all three by construction, and was verified so across the three sibling
+> PRs before merge. Change one, change all three in the same pass. Note what is
+> NOT duplicated: the gate itself lives in exactly one place
+> (`engram-pr-reviewer.md`'s output contract), so these three copies are
+> documentation of one mechanism, never three copies of it.
+
 ### The order is a rule, not a diagram — no parallelizing fairy and colleague
 
 Lei's ruling, in-session, 2026-08-24 morning (relayed by Kepler; twin of

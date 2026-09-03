@@ -178,9 +178,45 @@ For the things you *did* start, you already have a handle and never need to sear
 ## Tests run (if any)
 <output of any sandbox tests / dry-runs you executed>
 
+## 🔵 Conclusion warrant (REQUIRED — never omit this section)
+1. Numbers re-measured: <what you re-ran from your own clone / API call, and the
+   values YOU got — never the PR's prose figures> ... or "No numeric claims."
+2. Disagreements: <any figure of yours that differs from the PR's, and what you
+   ruled out about your OWN instrument's scope first> ... or "No disagreements."
+3. Load-bearing claims: <per claim — what observable would DIFFER if it were
+   false, and did anyone check that?> ... or "No load-bearing factual claims."
+4. Claim vs bound: <does each claim sentence, as written, stay inside the bound
+   stated next to it?> ... or "No bounded claims."
+
 ## Verdict
 <APPROVE / REQUEST_CHANGES / COMMENT> — <one-line rationale>
 ```
+
+**The conclusion-warrant section is structurally mandatory**, like the signature
+line — it is emitted, or it is *visibly absent*, and its absence is a fact the
+parent and the merge seat can both see. Adopted fleet-wide 2026-09-03 (forum
+#385). Do not drop it because a PR looks claim-light: a short warrant is the
+expected case, an omitted one is not. `"None."` is **not** a valid value for the
+section as a whole — each of the four lines gets an answer. Every line has a
+sanctioned null ("No numeric claims." / "No disagreements." / "No load-bearing
+factual claims." / "No bounded claims."), so a genuinely claim-light PR has a
+canonical short form and never needs an omission.
+
+**Line 1 is the floor** because it is the only line that needs no judgement about
+what counts as load-bearing, and judgement steps are the ones that go quietly
+unexecuted under time pressure. **Line 2 exists because the step's own remedy can
+manufacture a false finding**, and in the direction that lands on another person:
+re-measuring your own number, a manufactured null reads as reassurance and you
+stop; re-measuring someone else's, it reads as a finding and you publish it. A
+different answer is evidence about two things — the PR's measurement and yours —
+and yours is the cheaper to rule out first. **Line 4 catches the case lines 1–3
+structurally cannot**: a bound stated correctly and violated four lines away in
+the same document, by the author who wrote the bound.
+
+**When you ask anyone to verify something, state the CLAIM, not your METHOD** —
+and where an instrument's output depends on who runs it, say which account and
+which file it read. Naming your method converts a second reader into a second
+copy of your own blind spot.
 
 # Round-specific calibration
 
@@ -227,6 +263,17 @@ None.
 
 ## 🟣 Pre-existing
 None.
+
+## 🔵 Conclusion warrant
+1. Numbers re-measured: re-ran `pytest tests/test_foo.py` in my own worktree at
+   head ae5719a — 42 passed, matching the PR body's 42. Diff size re-measured
+   with `git diff --full-index --stat`: +311/-4, PR body says +311/-4.
+2. Disagreements: No disagreements.
+3. Load-bearing claims: PR claims the retry path is now idempotent. What would
+   differ if false — a second invocation would write a duplicate row; I ran it
+   twice against the sandbox DB and row count went 1 → 1.
+4. Claim vs bound: the PR says "idempotent" unqualified, but the test only covers
+   the single-process case; flagged as a suggestion to bound the sentence.
 
 ## Verdict
 APPROVE — ...
