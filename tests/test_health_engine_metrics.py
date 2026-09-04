@@ -16,10 +16,13 @@ old "clean" reasoning fabricate a number for an unmeasured population). It
 now matches its two epistemic_integrity siblings' empty-population
 treatment exactly.
 
-Aspect B's four metrics (PR3) all return the badness-rate COMPLEMENT of
-their coverage-style names (see health_engine_metrics.py's module docstring
-"SIGN CONVENTION" note) — every test below asserts against that complement,
-not a plain coverage percentage.
+UPDATED (engram-alpha#2518, 2026-09-04): Aspect B's four metrics now return
+their OWN LITERAL coverage/goodness fraction (1.0 = fully covered/best,
+0.0 = none covered/worst) — see health_engine_metrics.py's module docstring
+"SIGN CONVENTION" note. Before this PR they returned the badness-rate
+COMPLEMENT of their coverage-style names instead (polarity lived in the raw
+signal's sign); every test below now asserts against the literal coverage
+value, not the old complement.
 """
 
 from __future__ import annotations
@@ -410,32 +413,35 @@ class TestRecallSummaryCoverage:
         conn = _make_conn()
         assert hem.recall_summary_coverage(conn) is UNAVAILABLE
 
-    def test_mixed_covered_and_missing_returns_missing_rate(self):
-        """Badness-rate convention: return value is the MISSING fraction,
-        not the coverage fraction."""
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
+        """Literal-coverage convention (engram-alpha#2518): return value is
+        the COVERED fraction, not the missing fraction. (Numerically
+        unchanged from the old complement for this specific 1-of-2 split —
+        0.5 is its own complement — but asserted here under the new,
+        correct reading.)"""
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_summary="a short summary")
         _insert(conn, "ob_1", "observation_factual", recall_summary=None)
         assert hem.recall_summary_coverage(conn) == 0.5
 
-    def test_all_covered_is_zero(self):
+    def test_all_covered_is_one(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_summary="s1")
         _insert(conn, "ob_1", "observation_factual", recall_summary="s2")
-        assert hem.recall_summary_coverage(conn) == 0.0
+        assert hem.recall_summary_coverage(conn) == 1.0
 
-    def test_all_missing_is_one(self):
+    def test_all_missing_is_zero(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation")
         _insert(conn, "ob_1", "observation_factual")
-        assert hem.recall_summary_coverage(conn) == 1.0
+        assert hem.recall_summary_coverage(conn) == 0.0
 
     def test_whitespace_only_summary_counts_as_missing(self):
         """Mirrors engram_core._validate_recall_fields's own .strip() check
         — a whitespace-only summary is absent, not a real one."""
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_summary="   ")
-        assert hem.recall_summary_coverage(conn) == 1.0
+        assert hem.recall_summary_coverage(conn) == 0.0
 
     def test_non_claim_bearing_nodes_excluded(self):
         """A definition node (recall_summary-capable at write time, but NOT
@@ -443,13 +449,13 @@ class TestRecallSummaryCoverage:
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_summary=None)
         _insert(conn, "df_1", "definition", recall_summary="covered")
-        assert hem.recall_summary_coverage(conn) == 1.0
+        assert hem.recall_summary_coverage(conn) == 0.0
 
     def test_non_current_excluded(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_summary=None, is_current=0)
         _insert(conn, "ob_1", "observation_factual", recall_summary="s")
-        assert hem.recall_summary_coverage(conn) == 0.0
+        assert hem.recall_summary_coverage(conn) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +468,10 @@ class TestRecallKeywordsCoverage:
         conn = _make_conn()
         assert hem.recall_keywords_coverage(conn) is UNAVAILABLE
 
-    def test_mixed_covered_and_missing_returns_missing_rate(self):
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
+        """Literal-coverage convention (engram-alpha#2518): numerically
+        unchanged from the old complement for this 1-of-2 split (0.5 is its
+        own complement), asserted here under the new, correct reading."""
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_keywords=["kw1", "kw2"])
         _insert(conn, "ob_1", "observation_factual", recall_keywords=None)
@@ -471,7 +480,7 @@ class TestRecallKeywordsCoverage:
     def test_empty_list_counts_as_missing(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_keywords=[])
-        assert hem.recall_keywords_coverage(conn) == 1.0
+        assert hem.recall_keywords_coverage(conn) == 0.0
 
     def test_malformed_json_counts_as_missing(self):
         conn = _make_conn()
@@ -481,19 +490,19 @@ class TestRecallKeywordsCoverage:
             ("{not valid json", "dv_1"),
         )
         conn.commit()
-        assert hem.recall_keywords_coverage(conn) == 1.0
+        assert hem.recall_keywords_coverage(conn) == 0.0
 
     def test_non_claim_bearing_nodes_excluded(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_keywords=None)
         _insert(conn, "df_1", "definition", recall_keywords=["kw"])
-        assert hem.recall_keywords_coverage(conn) == 1.0
+        assert hem.recall_keywords_coverage(conn) == 0.0
 
     def test_non_current_excluded(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", recall_keywords=None, is_current=0)
         _insert(conn, "ob_1", "observation_factual", recall_keywords=["kw"])
-        assert hem.recall_keywords_coverage(conn) == 0.0
+        assert hem.recall_keywords_coverage(conn) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -517,43 +526,46 @@ class TestEmbeddingCoverage:
     def test_default_fixture_state_is_all_missing(self):
         """Mirrors the real ENGRAM_NO_EMBEDDINGS=1 test-suite gotcha flagged
         in the PR3 build spec: without explicitly setting the embedding
-        column, every node reads as uncovered."""
+        column, every node reads as uncovered — literal coverage 0.0
+        (engram-alpha#2518)."""
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             conn = _make_conn()
             _insert(conn, "dv_1", "derivation")
             _insert(conn, "ob_1", "observation_factual")
-            assert hem.embedding_coverage(conn) == 1.0
+            assert hem.embedding_coverage(conn) == 0.0
 
-    def test_mixed_covered_and_missing_returns_missing_rate(self):
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
         """A real populated embedding column (set directly in the fixture,
         not via the real embedding pipeline) proves the 'has coverage'
-        branch actually works, not just the always-missing default."""
+        branch actually works, not just the always-missing default.
+        Literal-coverage convention (engram-alpha#2518): numerically
+        unchanged from the old complement for this 1-of-2 split."""
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             conn = _make_conn()
             _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1, 0.2, 0.3]))
             _insert(conn, "ob_1", "observation_factual", embedding=None)
             assert hem.embedding_coverage(conn) == 0.5
 
-    def test_all_covered_is_zero(self):
+    def test_all_covered_is_one(self):
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             conn = _make_conn()
             _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
             _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.2]))
-            assert hem.embedding_coverage(conn) == 0.0
+            assert hem.embedding_coverage(conn) == 1.0
 
     def test_non_claim_bearing_nodes_excluded(self):
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             conn = _make_conn()
             _insert(conn, "dv_1", "derivation", embedding=None)
             _insert(conn, "df_1", "definition", embedding=json.dumps([0.1]))
-            assert hem.embedding_coverage(conn) == 1.0
+            assert hem.embedding_coverage(conn) == 0.0
 
     def test_non_current_excluded(self):
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             conn = _make_conn()
             _insert(conn, "dv_1", "derivation", embedding=None, is_current=0)
             _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.1]))
-            assert hem.embedding_coverage(conn) == 0.0
+            assert hem.embedding_coverage(conn) == 1.0
 
     # -- embedder structurally unavailable: a CONFIGURATION state, must gate
     #    to UNAVAILABLE regardless of what the embedding column holds
@@ -602,11 +614,14 @@ class TestGiantComponentFraction:
     def test_single_node_is_fully_connected(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation")
-        assert hem.giant_component_fraction(conn) == 0.0
+        assert hem.giant_component_fraction(conn) == 1.0
 
     def test_disconnected_nodes_are_fully_fragmented(self):
         """Two claim-bearing nodes, no edge between them -> each is its own
-        singleton component -> largest=1/total=2 -> fragmentation 0.5."""
+        singleton component -> largest=1/total=2 -> giant-component fraction
+        0.5. Numerically unchanged from the old fragmentation-rate reading
+        (engram-alpha#2518) since 0.5 is the curve's own fixed point
+        (1 - 0.5 == 0.5) — asserted here under the new, literal reading."""
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation")
         _insert(conn, "ob_1", "observation_factual")
@@ -617,7 +632,7 @@ class TestGiantComponentFraction:
         _insert(conn, "dv_1", "derivation")
         _insert(conn, "ob_1", "observation_factual")
         _insert_edge(conn, "dv_1", "ob_1", "derives_from")
-        assert hem.giant_component_fraction(conn) == 0.0
+        assert hem.giant_component_fraction(conn) == 1.0
 
     def test_edge_through_non_claim_bearing_node_does_not_bridge(self):
         """The induced subgraph only counts an edge if BOTH endpoints are
@@ -641,13 +656,13 @@ class TestGiantComponentFraction:
         _insert(conn, "ob_1", "observation_factual")
         _insert_edge(conn, "dv_1", "dv_2", "derives_from")
         _insert_edge(conn, "dv_2", "ob_1", "derives_from")
-        assert hem.giant_component_fraction(conn) == 0.0
+        assert hem.giant_component_fraction(conn) == 1.0
 
     def test_non_current_nodes_excluded_from_population(self):
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation", is_current=0)
         _insert(conn, "ob_1", "observation_factual")
-        assert hem.giant_component_fraction(conn) == 0.0
+        assert hem.giant_component_fraction(conn) == 1.0
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,10 @@ positive tests changed to make the equivalent claim via an explicit
 Covers:
   1. The real production model SPEC (``health_engine_model.MODEL_SPEC``) —
      shape (3 aspects, 9 metrics), points sum to 100, every admitted metric
-     has a registered detector + repair, the one v1 curve is used
-     everywhere, the load-bearing provenance_integrity "zero admitted
+     has a registered detector + repair, [engram-alpha#2518] exactly the
+     two named v1 curves are used (badness_default for badness-rate
+     metrics, goodness_default for the four retrievability coverage-style
+     metrics), the load-bearing provenance_integrity "zero admitted
      metrics" fact (documented, not silently asserted only in a
      docstring), AND [round 3] that it cross-validates cleanly against the
      REAL ``health_engine.CONFIG`` via ``load()``.
@@ -58,7 +60,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import health_engine_model as hem  # noqa: E402
 from health_engine_config import AspectDef, EngineConfig, MetricDef  # noqa: E402
-from health_engine_curves import CurveSpec, piecewise_linear  # noqa: E402
+from health_engine_curves import CurveSpec, GOODNESS_DEFAULT_CURVE, piecewise_linear  # noqa: E402
 from health_engine_model import (  # noqa: E402
     MODEL_SPEC,
     AspectSpec,
@@ -195,11 +197,54 @@ class TestRealModelShape:
             "giant_component_fraction",
         }
 
-    def test_every_metric_uses_the_one_v1_curve(self):
-        """Clarification 3: exactly ONE named curve for v1, shared by every
-        metric (admitted or diagnostic)."""
-        assert {m.curve for m in MODEL_SPEC.metrics} == {"badness_default"}
-        assert set(MODEL_SPEC.curves.keys()) == {"badness_default"}
+    def test_every_metric_uses_one_of_the_two_v1_curves(self):
+        """Clarification 3 (originally: exactly ONE named curve for v1,
+        shared by every metric) — AMENDED by engram-alpha#2518: raw signal
+        = literal meaning of its own name; direction/polarity moved into
+        the curve. The four retrievability metrics (naturally
+        coverage-style) are now bound to the increasing "goodness_default"
+        curve; every other metric (badness-rate) stays on the decreasing
+        "badness_default" curve. Still exactly two named curves for v1, not
+        per-metric differentiation."""
+        assert {m.curve for m in MODEL_SPEC.metrics} == {
+            "badness_default",
+            "goodness_default",
+        }
+        assert set(MODEL_SPEC.curves.keys()) == {
+            "badness_default",
+            "goodness_default",
+        }
+
+    def test_retrievability_metrics_use_goodness_default_curve(self):
+        """engram-alpha#2518: exactly the four retrievability metrics are
+        bound to "goodness_default" — every other metric stays on
+        "badness_default"."""
+        goodness_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "goodness_default"
+        }
+        assert goodness_bound == {
+            "embedding_coverage",
+            "recall_summary_coverage",
+            "recall_keywords_coverage",
+            "giant_component_fraction",
+        }
+        badness_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_default"
+        }
+        assert badness_bound == {
+            "taint_rate",
+            "stale_derivation_rate",
+            "open_contradiction_rate",
+            "uncited_observation_rate",
+            "dangling_evidence_rate",
+        }
+
+    def test_goodness_default_curve_resolves_in_curves_registry(self):
+        """engram-alpha#2518: CURVES["goodness_default"] resolves to the
+        real shipped GOODNESS_DEFAULT_CURVE object, same pattern as the
+        existing badness_default resolution."""
+        assert MODEL_SPEC.curves["goodness_default"] is GOODNESS_DEFAULT_CURVE
+        assert MODEL_SPEC.curves["goodness_default"].monotone_direction == "increasing"
 
     def test_six_admitted_three_diagnostic(self):
         admitted = [m for m in MODEL_SPEC.metrics if m.importance > 0]

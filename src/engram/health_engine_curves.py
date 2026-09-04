@@ -302,3 +302,56 @@ forever — see health_engine_model.py's module docstring and its
 differentiation is future work" statement this constant's shared use is
 scoped by.
 """
+
+
+# ---------------------------------------------------------------------------
+# GOODNESS_DEFAULT_CURVE — engram-alpha#2518 (health-v2 engine: flip
+# Aspect-B (retrievability) signals from badness-complement to literal
+# coverage, with direction moved into the curve). Lei's ruling,
+# 2026-09-03T23:22Z, charge-board record: raw signal = literal meaning of
+# its own name; ALL direction, including polarity, lives in the curve.
+# ---------------------------------------------------------------------------
+
+GOODNESS_DEFAULT_CURVE = CurveSpec(
+    name="goodness_default",
+    curve_fn=functools.partial(
+        piecewise_linear,
+        knots=((0.0, 0.01), (0.01, 0.01), (1.0, 1.0)),
+    ),
+    input_domain=(0.0, 1.0),
+    monotone_direction="increasing",
+    # Same reasoning as BADNESS_DEFAULT_CURVE's own observed_range=None
+    # above: no natural-experiment data has been recorded yet for any of
+    # the four literal-coverage metrics this curve now scores
+    # (embedding_coverage, recall_summary_coverage, recall_keywords_
+    # coverage, giant_component_fraction) — leaving it unset is the honest
+    # default until real per-metric ranges exist.
+    observed_range=None,
+)
+"""The v1 default curve for the four literal-coverage Aspect-B
+(retrievability) metrics in health_engine_model.py's ``MODEL``
+(``embedding_coverage``, ``recall_summary_coverage``,
+``recall_keywords_coverage``, ``giant_component_fraction``) — bound as
+``"goodness_default"`` in that module's ``CURVES`` registry, replacing
+``"badness_default"`` on exactly those four ``MetricBinding``s.
+
+MIRROR DERIVATION (so a future reader can re-verify these knots without
+re-deriving from scratch): this is NOT a new curve shape — it is
+``BADNESS_DEFAULT_CURVE`` reflected through the badness/coverage identity
+``c = 1 - r``, chosen so the SAME underlying badness level always produces
+the SAME score whether read through the old badness-rate signal or the new
+literal-coverage signal (i.e. an unchanged graph's composed score does not
+move because of this PR). Concretely, for every literal-coverage input
+``c`` this curve must satisfy ``g(c) == f(1 - c)``, where ``f`` is
+``BADNESS_DEFAULT_CURVE``'s own ``curve_fn`` (knots
+``((0.0, 1.0), (0.99, 0.01), (1.0, 0.01))`` on badness-rate input ``r``).
+Evaluating that identity at ``f``'s own three knots gives this curve's three
+knots directly: ``g(0.0) = f(1.0) = 0.01``; ``g(0.01) = f(0.99) = 0.01``;
+``g(1.0) = f(0.0) = 1.0`` — already in increasing-``c`` order, no
+re-sorting needed. Verified by direct computation (both curve functions
+evaluated and compared, not just algebraically reasoned) at
+``c in {0.0, 0.005, 0.01, 0.02, 0.3, 0.5, 0.7, 0.9, 0.99, 0.995, 1.0}``,
+matching to floating-point precision at every sample; the same property is
+pinned as a permanent regression test in
+tests/test_health_engine_curves.py.
+"""

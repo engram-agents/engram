@@ -818,13 +818,15 @@ class TestBuildSnapshot:
         assert epistemic_coverage["coverage"] == pytest.approx(2.0 / 3.0)
 
         # Fully covered + connected -> all four aspect-B raw signals
-        # (badness-rate convention) read as perfect (0.0), and the aspect
-        # score is now on the [0,1] range (PR5 change — see build_snapshot's
-        # docstring), not the old [0,100] display scale.
-        assert snap["signals"]["recall_summary_coverage"] == 0.0
-        assert snap["signals"]["recall_keywords_coverage"] == 0.0
-        assert snap["signals"]["embedding_coverage"] == 0.0
-        assert snap["signals"]["giant_component_fraction"] == 0.0
+        # (literal-coverage convention, engram-alpha#2518 — before that PR
+        # these were the badness-rate COMPLEMENT and read 0.0 here instead)
+        # read as perfect (1.0), and the aspect score is now on the [0,1]
+        # range (PR5 change — see build_snapshot's docstring), not the old
+        # [0,100] display scale.
+        assert snap["signals"]["recall_summary_coverage"] == 1.0
+        assert snap["signals"]["recall_keywords_coverage"] == 1.0
+        assert snap["signals"]["embedding_coverage"] == 1.0
+        assert snap["signals"]["giant_component_fraction"] == 1.0
         assert snap["scores"]["aspects"]["retrievability"] == pytest.approx(1.0)
         assert snap["scores"]["aspect_coverage"]["retrievability"]["coverage"] == pytest.approx(1.0)
 
@@ -832,8 +834,12 @@ class TestBuildSnapshot:
         """[PR5, rewritten] build_snapshot's per-metric display score
         (snap["scores"]["metrics"]) must be derived from the SAME curve the
         real scoring model binds to that metric (``badness_default`` for
-        every one of the nine real metrics today) — not an independently
-        re-implemented copy of the transform that could silently diverge.
+        five of the nine real metrics, ``goodness_default`` for the other
+        four as of engram-alpha#2518 — see health_engine_model.py's
+        ``CURVES``) — not an independently re-implemented copy of the
+        transform that could silently diverge. This test exercises
+        ``open_contradiction_rate`` specifically, which stays on
+        ``badness_default``, unaffected by #2518's flip.
         Supersedes the PR2/PR3-era version of this test, which compared
         against ``hem.metric_goodness`` (now dead code from health_engine.
         py's perspective — see that module's docstring)."""

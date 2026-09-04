@@ -47,7 +47,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
 
 from health_engine_curves import (  # noqa: E402
+    BADNESS_DEFAULT_CURVE,
     CurveSpec,
+    GOODNESS_DEFAULT_CURVE,
     LEGACY_GOODNESS_TRANSITION_CURVE,
     piecewise_linear,
 )
@@ -98,9 +100,15 @@ _TRIVIAL_INCREASING_CURVE = CurveSpec(
     observed_range=None,
 )
 
+# GOODNESS_DEFAULT_CURVE (engram-alpha#2518) is the shipped increasing
+# mirror of BADNESS_DEFAULT_CURVE — genuinely NEW as of this PR (unlike
+# BADNESS_DEFAULT_CURVE itself, whose shape is byte-for-byte identical to
+# LEGACY_GOODNESS_TRANSITION_CURVE above and so has no separate entry here),
+# so it gets its own property-contract coverage.
 _ALL_CURVE_SPECS: tuple[CurveSpec, ...] = (
     LEGACY_GOODNESS_TRANSITION_CURVE,
     _TRIVIAL_INCREASING_CURVE,
+    GOODNESS_DEFAULT_CURVE,
 )
 
 
@@ -248,3 +256,44 @@ class TestV1NonSaturationDemonstration:
         lo_penalty = _v1_penalty_shape(lo_count, multiplier=1, cap=10)
         hi_penalty = _v1_penalty_shape(hi_count, multiplier=1, cap=10)
         assert lo_penalty == hi_penalty == 10.0
+
+
+# ---------------------------------------------------------------------------
+# GOODNESS_DEFAULT_CURVE mirror-derivation regression guard (engram-alpha
+# #2518) — pins the property GOODNESS_DEFAULT_CURVE.curve_fn(c) ==
+# BADNESS_DEFAULT_CURVE.curve_fn(1 - c) for every c, which is exactly what
+# makes this PR's flip (Aspect-B signals: badness-complement -> literal
+# coverage, direction moved into the curve) produce byte-identical composed
+# scores for an unchanged graph. Was a throwaway scratch check during
+# development (per the dispatching spec's step 2); committed here as a
+# permanent regression guard instead of a one-off.
+# ---------------------------------------------------------------------------
+
+
+class TestGoodnessDefaultCurveMirrorsBadnessDefault:
+    @pytest.mark.parametrize(
+        "c", [0.0, 0.005, 0.01, 0.02, 0.3, 0.5, 0.7, 0.9, 0.99, 0.995, 1.0]
+    )
+    def test_mirror_identity_holds_at_sample_points(self, c: float):
+        assert GOODNESS_DEFAULT_CURVE.curve_fn(c) == pytest.approx(
+            BADNESS_DEFAULT_CURVE.curve_fn(1 - c), abs=1e-9
+        )
+
+    def test_mirror_identity_holds_densely(self):
+        """Same identity, densely sampled across the whole [0,1] domain —
+        the parametrized spot-check above pins named values for a readable
+        failure message; this catches anything a sparse sample could miss.
+        """
+        for c in _dense_sample((0.0, 1.0)):
+            assert GOODNESS_DEFAULT_CURVE.curve_fn(c) == pytest.approx(
+                BADNESS_DEFAULT_CURVE.curve_fn(1 - c), abs=1e-9
+            ), f"mirror identity failed at c={c}"
+
+    def test_knots_match_hand_derivation(self):
+        """Pins the exact three knots derived in GOODNESS_DEFAULT_CURVE's
+        own docstring (health_engine_curves.py), so a future edit to either
+        curve's knots is caught here even if the dense mirror-identity
+        check above were ever weakened."""
+        assert GOODNESS_DEFAULT_CURVE.curve_fn(0.0) == pytest.approx(0.01)
+        assert GOODNESS_DEFAULT_CURVE.curve_fn(0.01) == pytest.approx(0.01)
+        assert GOODNESS_DEFAULT_CURVE.curve_fn(1.0) == pytest.approx(1.0)

@@ -64,7 +64,7 @@ from typing import Callable
 
 import health_engine_metrics as metrics
 from health_engine_config import EngineConfig, _Unavailable, _check_weights_sum
-from health_engine_curves import BADNESS_DEFAULT_CURVE, CurveSpec
+from health_engine_curves import BADNESS_DEFAULT_CURVE, CurveSpec, GOODNESS_DEFAULT_CURVE
 
 
 def _log(msg: str) -> None:
@@ -144,19 +144,33 @@ SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
 # Layer-3 curve LIBRARY — this module only binds names to library objects,
 # it does not define curve shapes) — see that file's docstring on
 # BADNESS_DEFAULT_CURVE for the full "why a separate constant, why no
-# observed_range" reasoning. All six admitted metrics in MODEL_SPEC below
-# share this ONE curve — a DELIBERATE v1 simplification, not an oversight:
-# per-metric curve differentiation is explicitly future work, and the slot
-# exists in the MetricBinding schema (the ``curve`` field is a per-metric
-# name, not a global constant) so that future differentiation is a data
-# change, not a code change. Lei's curve-carries-sensitivity argument
-# (2026-09-02T14:32Z ruling, cited in health_engine.py's compose_aspect_
-# scores docstring) is EXACTLY why that slot exists on every metric
-# individually rather than once globally — v1 just doesn't populate it
-# differently per metric yet.
+# observed_range" reasoning. Originally all six admitted metrics in
+# MODEL_SPEC below shared this ONE curve — a DELIBERATE v1 simplification,
+# not an oversight: per-metric curve differentiation is explicitly future
+# work, and the slot exists in the MetricBinding schema (the ``curve``
+# field is a per-metric name, not a global constant) so that future
+# differentiation is a data change, not a code change. Lei's
+# curve-carries-sensitivity argument (2026-09-02T14:32Z ruling, cited in
+# health_engine.py's compose_aspect_scores docstring) is EXACTLY why that
+# slot exists on every metric individually rather than once globally.
+#
+# [engram-alpha#2518, 2026-09-04] A second named curve,
+# GOODNESS_DEFAULT_CURVE ("goodness_default"), joined the registry: Lei's
+# ruling that raw signal = literal meaning of its own name, with ALL
+# direction/polarity moved into the curve's own monotone_direction. The
+# retrievability aspect's four metrics (embedding_coverage,
+# recall_summary_coverage, recall_keywords_coverage,
+# giant_component_fraction — all naturally coverage-style, HIGH is good)
+# are now bound to the increasing "goodness_default" curve instead of the
+# decreasing "badness_default" curve; every other metric is unchanged.
+# This is STILL the same "one curve per direction, not per metric" v1
+# simplification the paragraph above describes — per-metric curve
+# differentiation beyond direction remains future work — it is just no
+# longer literally ONE shared curve object for all six admitted metrics.
 
 CURVES: dict[str, CurveSpec] = {
     "badness_default": BADNESS_DEFAULT_CURVE,
+    "goodness_default": GOODNESS_DEFAULT_CURVE,
 }
 
 
@@ -686,7 +700,7 @@ MODEL_SPEC = ScoringModel(
         MetricBinding(
             signal="embedding_coverage",
             aspect="retrievability",
-            curve="badness_default",
+            curve="goodness_default",
             importance=1.0,  # the aspect's reference metric (draft-2 §1)
             detector=DetectorRef(name="scan:null-embeddings", population="claim_bearing_nodes"),
             repair="tool:embedding-backfill",
@@ -694,7 +708,7 @@ MODEL_SPEC = ScoringModel(
         MetricBinding(
             signal="recall_summary_coverage",
             aspect="retrievability",
-            curve="badness_default",
+            curve="goodness_default",
             importance=_DEFAULT_IMPORTANCE,
             detector=DetectorRef(name="scan:summary-absent", population="claim_bearing_nodes"),
             repair="tool:batch-summary-fairy",
@@ -702,7 +716,7 @@ MODEL_SPEC = ScoringModel(
         MetricBinding(
             signal="recall_keywords_coverage",
             aspect="retrievability",
-            curve="badness_default",
+            curve="goodness_default",
             importance=_DEFAULT_IMPORTANCE,
             detector=DetectorRef(name="scan:summary-absent", population="claim_bearing_nodes"),
             repair="tool:batch-summary-fairy",
@@ -710,7 +724,7 @@ MODEL_SPEC = ScoringModel(
         MetricBinding(
             signal="giant_component_fraction",
             aspect="retrievability",
-            curve="badness_default",
+            curve="goodness_default",
             importance=0.0,  # diagnostic until a scanner proposes edges
             detector=None,
             repair=None,

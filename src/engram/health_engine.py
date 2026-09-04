@@ -355,14 +355,16 @@ ASPECT_C_PROVENANCE_INTEGRITY = AspectDef(
 
 
 # ---------------------------------------------------------------------------
-# Aspect B — Retrievability (weight 35, design doc §2) — real as of PR3.
+# Aspect B — Retrievability (weight 35, design doc §2) — real as of PR3;
+# polarity flipped to literal coverage in engram-alpha#2518.
 # Denominator for all four is "claim_bearing_nodes" (same population aspect
 # A's taint_rate already uses) — see health_engine_config.py's
 # DECLARED_POPULATIONS comment and health_engine_metrics.py's aspect-B
-# section docstring for why. Every raw signal below is the badness-rate
-# COMPLEMENT of its coverage-style name — see health_engine_metrics.py's
-# module docstring "SIGN CONVENTION" note before reading `signals` values
-# from a snapshot as plain coverage percentages.
+# section docstring for why. Every raw signal below returns its OWN LITERAL
+# coverage/fraction meaning (1.0 = fully covered/connected, 0.0 = none) —
+# see health_engine_metrics.py's module docstring "SIGN CONVENTION" note;
+# direction is declared on each metric's bound curve
+# (health_engine_model.py's MODEL_SPEC), not encoded in the raw value's sign.
 # ---------------------------------------------------------------------------
 
 _RECALL_SUMMARY_COVERAGE = MetricDef(
@@ -823,10 +825,10 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     },
     "recall_summary_coverage": {
         "meaning": (
-            "Fraction of current claim-bearing nodes MISSING a "
-            "recall_summary (badness rate — 0=all covered, 1=none covered; "
-            "see health_engine_metrics.py's module docstring 'SIGN "
-            "CONVENTION' note). Reads the recall_summary column's actual "
+            "Fraction of current claim-bearing nodes WITH a "
+            "recall_summary (literal coverage — 1=all covered, 0=none "
+            "covered; see health_engine_metrics.py's module docstring "
+            "'SIGN CONVENTION' note). Reads the recall_summary column's actual "
             "content directly rather than nodes.summary_missing: that flag "
             "is set only at node-creation time, and whether any given "
             "backfill route (e.g. the sleep-cycle batch-summary-fairy's "
@@ -850,8 +852,8 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     },
     "recall_keywords_coverage": {
         "meaning": (
-            "Fraction of current claim-bearing nodes with no non-empty "
-            "recall_keywords list (badness rate, same convention as "
+            "Fraction of current claim-bearing nodes with a non-empty "
+            "recall_keywords list (literal coverage, same convention as "
             "recall_summary_coverage)."
         ),
         "denominator": (
@@ -862,8 +864,8 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     },
     "embedding_coverage": {
         "meaning": (
-            "Fraction of current claim-bearing nodes with a NULL embedding "
-            "column (badness rate, same convention). UNAVAILABLE — not a "
+            "Fraction of current claim-bearing nodes with a NON-NULL embedding "
+            "column (literal coverage, same convention). UNAVAILABLE — not a "
             "real coverage number — when the embedder is structurally "
             "unavailable in this install (ENGRAM_NO_EMBEDDINGS=1, "
             "sentence-transformers not installed, or embeddings disabled "
@@ -885,10 +887,10 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     },
     "giant_component_fraction": {
         "meaning": (
-            "Fragmentation rate (1 - giant-component fraction) of the "
+            "Giant-component fraction (literal) of the "
             "induced subgraph on current claim-bearing nodes only (an "
             "edge counts only if BOTH endpoints are claim-bearing) — "
-            "badness rate: 0=fully connected (best), 1=every claim-bearing "
+            "1=fully connected (best), 0=every claim-bearing "
             "node its own singleton component (worst)."
         ),
         "denominator": (

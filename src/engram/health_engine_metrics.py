@@ -21,30 +21,44 @@ independently checked against it at runtime; validate_config only checks
 that the declared policy is a real enum value, not that a signal_fn's
 runtime behaviour matches it — see design doc §5 contract item 5).
 
-SIGN CONVENTION — every raw signal in this catalogue is a "badness rate":
-0.0 = perfect/none-affected, 1.0 = fully collapsed/all-affected. This isn't
-stated as a formal contract anywhere upstream (health_engine_config.py's
-MetricDef has no polarity field), but it is what ``metric_goodness`` below
-actually computes (``100 * (1 - rate)``, floored at 1) and what every aspect
-A/C metric already returns (e.g. "fraction of derivations carrying a stale
-marker" — the BAD condition, not the good one). Aspect B's four metrics
-(PR3) are all natively COVERAGE-style ("fraction WITH a recall_summary" —
-HIGH is good) per the design doc's own §2 wording and the PR3 build spec's
-literal per-metric descriptions. Feeding a coverage fraction directly into
-``metric_goodness`` would invert the metric (100% coverage would score as
-the WORST possible outcome — ``metric_goodness(1.0)`` floors to 1). Rather
-than add a polarity field to the PR1-approved ``MetricDef`` schema or a
-second aspect-scoring function (the PR3 spec explicitly says to reuse
-``aspect_geometric_mean_scoring`` unchanged), each aspect-B signal function
-below returns the coverage metric's COMPLEMENT — the missing/uncovered/
-disconnected rate — so it composes correctly through the exact same shared
-machinery aspects A/C already use. The MetricDef ``name`` in health_engine.py
-still matches the design doc's coverage-style naming (``recall_summary_
-coverage`` etc.) since that's the name the design doc and future PR4
-consumers will look for; only the RAW NUMBER returned is the badness-rate
-complement. Flagged prominently in the PR3 report as a load-bearing judgment
-call — every docstring below restates it locally too, so a reader of just
-one function still gets the warning.
+SIGN CONVENTION — every raw signal in this catalogue returns its OWN LITERAL
+MEANING, full stop: a ``*_rate`` name returns that rate (0.0 = none affected,
+1.0 = fully affected) and a ``*_coverage``/``*_fraction`` name returns that
+literal coverage/fraction (0.0 = none covered, 1.0 = fully covered).
+Direction/polarity is NOT encoded in the sign of the raw value anywhere in
+this module — it is declared exactly once per metric, on that metric's bound
+``CurveSpec.monotone_direction`` (health_engine_curves.py), via
+health_engine_model.py's ``CURVES``/``MetricBinding`` wiring: a "decreasing"
+curve (``BADNESS_DEFAULT_CURVE``, bound as ``"badness_default"``) for the
+five aspect A/C badness-rate metrics (higher raw value = worse), an
+"increasing" curve (``GOODNESS_DEFAULT_CURVE``, bound as
+``"goodness_default"``) for the four aspect B coverage-style metrics (higher
+raw value = better). ``metric_goodness`` below still computes ``max(100 *
+(1 - rate), 1)`` — that formula is unchanged and still describes what IT
+does — but it (and ``aspect_geometric_mean_scoring``) is dead code from
+health_engine.py's real-scoring-path perspective as of the curve-library
+wiring (PR5; see tests/test_health_engine_curve_transition.py's own note);
+the live path always goes through a metric's bound curve, never through
+``metric_goodness`` directly.
+
+Historical note (engram-alpha#1991 PR3 → engram-alpha#2518): aspect B's four
+metrics were always natively coverage-style ("fraction WITH a recall_summary"
+— HIGH is good), but at PR3-time the only scoring machinery available
+(``metric_goodness``/``aspect_geometric_mean_scoring``) had no per-metric
+polarity concept, only a single badness-rate assumption, and adding a
+polarity field to the PR1-approved ``MetricDef`` schema or a second
+aspect-scoring function was out of scope for that PR. So PR3 made each
+aspect-B signal function return the coverage metric's COMPLEMENT (the
+missing/uncovered/disconnected rate) instead, so it would compose correctly
+through the shared badness-rate machinery of the time. Lei's ruling
+(2026-09-03T23:22Z, charge-board record) reversed that stopgap: raw signal =
+literal meaning of its own name; ALL direction, including polarity, lives in
+the curve. By the time this ruling landed, ``CurveSpec.monotone_direction``
+(PR4/PR5) already supported both directions as a tested, first-class
+contract, so this flip needed no schema change at all — only one new
+increasing curve (``GOODNESS_DEFAULT_CURVE``) plus rebinding the four
+aspect-B ``MetricBinding``s from ``"badness_default"`` to
+``"goodness_default"``.
 
 House rule (mirrors engram_core.py / engram_lifecycle.py): access shared
 state ONLY via ``import engram_core as core; core.NAME`` — never via
@@ -245,21 +259,24 @@ def dangling_evidence_rate(conn: sqlite3.Connection) -> float | _Unavailable:
 
 
 # ---------------------------------------------------------------------------
-# Aspect B — Retrievability — signal functions (engram-alpha#1991, PR3 of 4)
+# Aspect B — Retrievability — signal functions (engram-alpha#1991, PR3 of 4;
+# polarity flipped to literal coverage in engram-alpha#2518)
 #
 # All four are scored over CURRENT claim-bearing nodes (engram_core.
 # CLAIM_BEARING_TYPES) — design doc §2's "claim-bearing projection" framing:
 # only claim-bearing content's retrievability matters for recall failures.
-# All four return the badness-rate COMPLEMENT of their literal coverage
-# name — see module docstring's "SIGN CONVENTION" note before reading any
-# of these as a plain coverage percentage.
+# All four now return their OWN LITERAL coverage/goodness fraction (0.0 =
+# none covered/worst, 1.0 = fully covered/best) — see module docstring's
+# "SIGN CONVENTION" note. Each is bound to the increasing "goodness_default"
+# curve (health_engine_model.py), not "badness_default".
 # ---------------------------------------------------------------------------
 
 
 def recall_summary_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fraction of current claim-bearing nodes MISSING a ``recall_summary``
-    (badness rate — see module docstring's sign-convention note; despite the
-    coverage-style name, 0.0 means "all covered", 1.0 means "none covered").
+    """Fraction of current claim-bearing nodes WITH a ``recall_summary``
+    (literal coverage — see module docstring's sign-convention note; the
+    name now agrees with the meaning: 1.0 means "all covered", 0.0 means
+    "none covered").
 
     JUDGMENT CALL (flagged in the PR3 report): reads the ``recall_summary``
     column DIRECTLY (present iff non-NULL and non-whitespace, mirroring
@@ -300,13 +317,13 @@ def recall_summary_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
         1 for r in rows
         if r["recall_summary"] is None or not r["recall_summary"].strip()
     )
-    return missing / total
+    return 1.0 - (missing / total)
 
 
 def recall_keywords_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fraction of current claim-bearing nodes with no non-empty
-    ``recall_keywords`` list (badness rate — see module docstring's
-    sign-convention note).
+    """Fraction of current claim-bearing nodes WITH a non-empty
+    ``recall_keywords`` list (literal coverage — see module docstring's
+    sign-convention note; 1.0 = all covered, 0.0 = none covered).
 
     Reads ``recall_keywords`` the same way engram_core._reflect_keywords
     does: JSON-parse, and treat a missing/non-list/malformed value as absent
@@ -340,14 +357,15 @@ def recall_keywords_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
             continue
         if not isinstance(parsed, list) or len(parsed) == 0:
             missing += 1
-    return missing / total
+    return 1.0 - (missing / total)
 
 
 def embedding_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fraction of current claim-bearing nodes with a NULL ``embedding``
-    column (badness rate — see module docstring's sign-convention note).
-    Direct SQL, no JSON parsing needed (the column itself is either NULL or
-    a populated vector, never inspected for shape here).
+    """Fraction of current claim-bearing nodes with a NON-NULL ``embedding``
+    column (literal coverage — see module docstring's sign-convention note;
+    1.0 = all covered, 0.0 = none covered). Direct SQL, no JSON parsing
+    needed (the column itself is either NULL or a populated vector, never
+    inspected for shape here).
 
     Test-fixture note (flagged in the PR3 report, per the build spec's own
     warning): this repo's test suite runs with ``ENGRAM_NO_EMBEDDINGS=1``
@@ -398,14 +416,15 @@ def embedding_coverage(conn: sqlite3.Connection) -> float | _Unavailable:
         " AND embedding IS NULL",
         claim_bearing_types,
     ).fetchone()["c"]
-    return missing / total
+    return 1.0 - (missing / total)
 
 
 def giant_component_fraction(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fragmentation rate (1 - giant-component fraction) of the INDUCED
-    subgraph on current claim-bearing nodes only — badness rate, see module
-    docstring's sign-convention note: 0.0 = fully connected (best), 1.0 =
-    every claim-bearing node its own singleton component (worst).
+    """Giant-component fraction (literal — see module docstring's
+    sign-convention note) of the INDUCED subgraph on current claim-bearing
+    nodes only: the largest connected component's size divided by the total
+    claim-bearing population. 1.0 = fully connected (best), 0.0 = every
+    claim-bearing node its own singleton component (worst).
 
     "Induced subgraph" (design doc §2's "claim-bearing projection"): an edge
     counts toward connectivity only if BOTH its source and target are
@@ -459,7 +478,7 @@ def giant_component_fraction(conn: sqlite3.Connection) -> float | _Unavailable:
                     queue.append(nb)
         largest = max(largest, size)
 
-    return 1.0 - (largest / total)
+    return largest / total
 
 
 # ---------------------------------------------------------------------------
