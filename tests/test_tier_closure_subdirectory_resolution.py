@@ -96,8 +96,8 @@ class TestResolveImportCandidatesCrossBoundary:
         the manifest source ROOT (correct per Python's own semantics — a
         plain ``import`` is never implicitly relative) AND the importer's
         own directory (this repo's own extensively-used sys.path-insert +
-        sibling-import convention, e.g. tools/baton.py's ``import
-        engram_core`` — see the function's own docstring for the reviewer-
+        sibling-import convention, e.g. tools/baton.py's ``from forum_api
+        import (...)`` — see the function's own docstring for the reviewer-
         fairy-caught regression this preserves). Whichever candidate
         doesn't exist as a real mechanism is silently ignored."""
         node = ast.parse("import curves").body[0]
@@ -278,9 +278,10 @@ class TestCrossBoundaryMistieringFalsifier:
 #    fairy round 1 on PR #2550: treating every absolute import as
 #    resolved-from-source-root-only silently dropped same-directory
 #    resolution for the ~20 real imports in this repo using that
-#    convention (e.g. tools/baton.py's "import engram_core", where
-#    engram_core.py lives at the source root but the convention still
-#    works at runtime because tools/ ALSO puts itself on sys.path).
+#    convention (e.g. tools/baton.py's "from forum_api import (...)",
+#    where forum_api.py lives in the SAME tools/ directory as baton.py,
+#    resolvable only because that convention puts the importer's own
+#    directory on sys.path at runtime).
 # ---------------------------------------------------------------------------
 
 
