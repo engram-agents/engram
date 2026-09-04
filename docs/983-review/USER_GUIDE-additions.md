@@ -132,7 +132,7 @@ PDF/PNG for the fridge. Plain-text version:*
 │    "drowsy but we just started"         → stale reading, ask to check│
 ├─────────────────────────────────────────────────────────────────────┤
 │  UPGRADE:  "Please upgrade ENGRAM."  (non-destructive; ~1–2 min)     │
-│  SEE THE GRAPH:  python3 ~/.engram/viz_server.py → localhost:5001    │
+│  SEE THE GRAPH:  ask your agent to start it → localhost:5001         │
 │  STUCK?  Ask your agent first — it can read its own docs + memory.   │
 └─────────────────────────────────────────────────────────────────────┘
 ```

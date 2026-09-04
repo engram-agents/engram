@@ -1,11 +1,13 @@
-"""Regression tests for viz_server stats-tab plumbing.
+"""Regression tests for viz.data.stats stats-tab plumbing (engram-alpha#2555
+PR A retarget -- was viz_server, now split across viz.agents/viz.data.stats/
+viz.data.config).
 
 Round-1 PR #185 review caught a real bug: `_resolve_logs_index` used the
 wrong AGENTS dict key (`db_path` instead of `db`), so the stats dashboard
 always returned the empty-state and was non-functional. These tests would
 have caught it.
 
-Per the viz_server.py:33 module-level comment, AGENTS structure is:
+Per viz/agents.py's module-level comment, AGENTS structure is:
   {name: {"name": str, "label": str, "db": str (resolved abs path)}}
 """
 
@@ -21,37 +23,39 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz import agents as viz_agents
+from viz.data import config as viz_config_data
+from viz.data import stats as viz_stats_data
 
 
 class TestResolveLogsIndex(unittest.TestCase):
     """Verify the AGENTS lookup uses the correct key name."""
 
     def setUp(self):
-        self._saved_agents = viz_server.AGENTS
+        self._saved_agents = viz_agents.AGENTS
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
+        viz_agents.AGENTS = self._saved_agents
 
     def test_resolves_to_logs_index_db_for_known_agent(self):
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "alice": {"name": "alice", "label": "Alice", "db": "/home/alice/.engram/knowledge.db"}
         }
-        result = viz_server._resolve_logs_index("alice")
+        result = viz_stats_data._resolve_logs_index("alice")
         self.assertEqual(result, "/home/alice/.engram/logs/index.db")
 
     def test_returns_empty_for_unknown_agent(self):
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "alice": {"name": "alice", "label": "Alice", "db": "/home/alice/.engram/knowledge.db"}
         }
-        result = viz_server._resolve_logs_index("bob")
+        result = viz_stats_data._resolve_logs_index("bob")
         self.assertEqual(result, "")
 
     def test_handles_engram_gemini_path_correctly(self):
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "g": {"name": "g", "label": "Gemini", "db": "/home/g/.engram-gemini/knowledge.db"}
         }
-        result = viz_server._resolve_logs_index("g")
+        result = viz_stats_data._resolve_logs_index("g")
         self.assertEqual(result, "/home/g/.engram-gemini/logs/index.db")
 
 
@@ -62,17 +66,17 @@ class TestResolveAgentConfig(unittest.TestCase):
     hardcoded in JS while production config had tier2_max_nodes=4000."""
 
     def setUp(self):
-        self._saved_agents = viz_server.AGENTS
+        self._saved_agents = viz_agents.AGENTS
         self.tmpdir = tempfile.mkdtemp(prefix="engram_viz_cfg_test_")
         self.engram_home = Path(self.tmpdir) / "agent_dir"
         self.engram_home.mkdir()
         (self.engram_home / "knowledge.db").write_bytes(b"")
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "test": {"name": "test", "label": "Test", "db": str(self.engram_home / "knowledge.db")}
         }
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
+        viz_agents.AGENTS = self._saved_agents
         import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
@@ -81,37 +85,37 @@ class TestResolveAgentConfig(unittest.TestCase):
         # tier1_max_nodes is retired (#1220) and no longer returned.
         config_path = self.engram_home / "config.json"
         config_path.write_text('{"memory": {"tier2_max_nodes": 4000, "decay_base": 1.014}}')
-        cfg = viz_server._resolve_agent_config("test")
+        cfg = viz_config_data._resolve_agent_config("test")
         self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 4000)
         self.assertEqual(cfg["decay_base"], 1.014)
 
     def test_returns_defaults_when_config_missing(self):
         # No config.json file in the engram_home dir
-        cfg = viz_server._resolve_agent_config("test")
+        cfg = viz_config_data._resolve_agent_config("test")
         self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 1000)  # default
         self.assertEqual(cfg["decay_base"], 1.014)
 
     def test_returns_defaults_when_config_malformed(self):
         (self.engram_home / "config.json").write_text("not valid json {{")
-        cfg = viz_server._resolve_agent_config("test")
+        cfg = viz_config_data._resolve_agent_config("test")
         self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 1000)  # default
 
     def test_returns_defaults_when_memory_section_absent(self):
         (self.engram_home / "config.json").write_text('{"trust_pool": []}')
-        cfg = viz_server._resolve_agent_config("test")
+        cfg = viz_config_data._resolve_agent_config("test")
         self.assertEqual(cfg["tier2_max_nodes"], 1000)
 
     def test_returns_defaults_for_unknown_agent(self):
-        cfg = viz_server._resolve_agent_config("nonexistent")
+        cfg = viz_config_data._resolve_agent_config("nonexistent")
         self.assertEqual(cfg["tier2_max_nodes"], 1000)
 
     def test_partial_config_falls_back_per_field(self):
         # Only tier2_max_nodes set; decay_base should default
         (self.engram_home / "config.json").write_text('{"memory": {"tier2_max_nodes": 4000}}')
-        cfg = viz_server._resolve_agent_config("test")
+        cfg = viz_config_data._resolve_agent_config("test")
         self.assertNotIn("tier1_max_nodes", cfg)
         self.assertEqual(cfg["tier2_max_nodes"], 4000)  # from config
         self.assertEqual(cfg["decay_base"], 1.014)  # default
@@ -122,12 +126,12 @@ class TestGetStatsDataEmptyStates(unittest.TestCase):
 
     def test_nonexistent_index_db_returns_empty(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = viz_server.get_stats_data(os.path.join(tmpdir, "index.db"))
+            result = viz_stats_data.get_stats_data(os.path.join(tmpdir, "index.db"))
         self.assertTrue(result.get("empty"))
         self.assertIn("reason", result)
 
     def test_empty_string_path_returns_empty(self):
-        result = viz_server.get_stats_data("")
+        result = viz_stats_data.get_stats_data("")
         self.assertTrue(result.get("empty"))
 
     def test_index_db_without_events_table_returns_empty(self):
@@ -139,7 +143,7 @@ class TestGetStatsDataEmptyStates(unittest.TestCase):
             conn = sqlite3.connect(path)
             conn.execute("CREATE TABLE unrelated (x INTEGER)")
             conn.close()
-            result = viz_server.get_stats_data(path)
+            result = viz_stats_data.get_stats_data(path)
             self.assertTrue(result.get("empty"))
             self.assertIn("events table", result.get("reason", ""))
         finally:
@@ -199,7 +203,7 @@ class TestGetStatsDataPopulated(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_returns_populated_payload_with_all_panels(self):
-        result = viz_server.get_stats_data(self.db_path)
+        result = viz_stats_data.get_stats_data(self.db_path)
         self.assertFalse(result.get("empty"), f"Unexpected empty: {result}")
         # All 5 panels present
         self.assertIn("surface", result)
@@ -220,7 +224,7 @@ class TestGetStatsDataPopulated(unittest.TestCase):
         event with a matching event_type could slip through without the test
         catching the level-filter regression.
         """
-        result = viz_server.get_stats_data(self.db_path)
+        result = viz_stats_data.get_stats_data(self.db_path)
         # total_events excludes L2
         self.assertEqual(result["total_events"], 3)
         # Panel 1 (surface): only the 1 L1 surface fire
@@ -271,7 +275,7 @@ class TestGetStatsDataPopulated(unittest.TestCase):
         )
         conn.commit()
         conn.close()
-        result = viz_server.get_stats_data(self.db_path)
+        result = viz_stats_data.get_stats_data(self.db_path)
         # The L2 error event must NOT appear in the errors panel
         for e in result["errors"]:
             self.assertNotEqual(
@@ -296,7 +300,7 @@ class TestGetStatsDataAutoRun(unittest.TestCase):
     def test_auto_run_creates_index_db_when_absent(self):
         """Auto-run creates index.db even when no JSONL events are present."""
         self.assertFalse(os.path.exists(self.index_db_path))
-        result = viz_server.get_stats_data(self.index_db_path)
+        result = viz_stats_data.get_stats_data(self.index_db_path)
         self.assertTrue(os.path.exists(self.index_db_path))
         # 0 events → empty state, but index.db was built (not the missing-db error)
         self.assertTrue(result.get("empty"))
@@ -317,7 +321,7 @@ class TestGetStatsDataAutoRun(unittest.TestCase):
             json.dumps(event) + "\n"
         )
         self.assertFalse(os.path.exists(self.index_db_path))
-        result = viz_server.get_stats_data(self.index_db_path)
+        result = viz_stats_data.get_stats_data(self.index_db_path)
         self.assertTrue(os.path.exists(self.index_db_path))
         self.assertFalse(result.get("empty"), f"Expected stats, got empty: {result}")
         self.assertIn("total_events", result)
@@ -325,15 +329,15 @@ class TestGetStatsDataAutoRun(unittest.TestCase):
 
     def test_error_hint_uses_script_dir_not_tilde_engram(self):
         """Fallback error hint must reference the script dir, not ~/.engram."""
-        saved = viz_server._INDEXER_AVAILABLE
+        saved = viz_stats_data._INDEXER_AVAILABLE
         try:
-            viz_server._INDEXER_AVAILABLE = False
-            result = viz_server.get_stats_data(self.index_db_path)
+            viz_stats_data._INDEXER_AVAILABLE = False
+            result = viz_stats_data.get_stats_data(self.index_db_path)
             reason = result.get("reason", "")
             self.assertIn("engram_log_indexer.py", reason)
             self.assertNotIn("~/.engram/engram_log_indexer.py", reason)
         finally:
-            viz_server._INDEXER_AVAILABLE = saved
+            viz_stats_data._INDEXER_AVAILABLE = saved
 
 
 if __name__ == "__main__":

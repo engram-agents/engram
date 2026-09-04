@@ -44,7 +44,8 @@ import engram_core
 import engram_derive
 import engram_observation
 import engram_revision
-import viz_server  # noqa: E402
+from viz.data import graph as viz_graph_data  # noqa: E402
+from viz.data import health as viz_health_data  # noqa: E402
 
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_viz_cascade_markers_")
@@ -130,7 +131,7 @@ def test_get_graph_attaches_tainted_by_and_stale_by():
     del ob_dep_tainted  # not directly used; dv_id is the tainted node
 
     db_path = str(core.DB_PATH)
-    graph = viz_server.get_graph(db_path)
+    graph = viz_graph_data.get_graph(db_path)
     assert "error" not in graph, graph
     by_id = {n["id"]: n for n in graph["nodes"]}
 
@@ -170,7 +171,7 @@ def test_get_graph_stale_replacement_reads_roots_own_superseded_by():
     assert sup.get("status") == "superseded", sup
 
     db_path = str(core.DB_PATH)
-    graph = viz_server.get_graph(db_path)
+    graph = viz_graph_data.get_graph(db_path)
     by_id = {n["id"]: n for n in graph["nodes"]}
 
     assert by_id[dv_id]["stale_by"] == [ob_old]
@@ -201,7 +202,7 @@ def test_get_health_data_tainted_stale_counts_match_pending_markers():
         assert ret.get("status") == "retracted", ret
 
     db_path = str(core.DB_PATH)
-    health = viz_server.get_health_data(db_path)
+    health = viz_health_data.get_health_data(db_path)
     assert "error" not in health, health
     assert health["tainted"] == 2, f"expected 2 tainted nodes, got {health['tainted']}"
     assert health["stale"] == 0, f"expected 0 stale nodes, got {health['stale']}"

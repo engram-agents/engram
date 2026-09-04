@@ -4,10 +4,16 @@
 <dict>
     <key>Label</key><string>com.engram.viz-server</string>
     <key>ProcessType</key><string>Background</string>
+    <!-- "-m viz.server" (not a direct viz/server.py script path): viz/server.py
+         uses relative imports to reach its sibling modules, which only
+         resolve when run as part of the viz package. WorkingDirectory
+         below puts PLUGIN_ENGRAM_DIR on sys.path so viz resolves
+         (engram-alpha#2555). -->
     <key>ProgramArguments</key>
     <array>
         <string>{{PYTHON}}</string>
-        <string>{{PLUGIN_ENGRAM_DIR}}/viz_server.py</string>
+        <string>-m</string>
+        <string>viz.server</string>
         <string>--bind</string><string>127.0.0.1</string>
         <string>--port</string><string>5001</string>
         <string>--config</string><string>{{VIZ_CONFIG}}</string>

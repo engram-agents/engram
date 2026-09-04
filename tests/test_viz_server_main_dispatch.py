@@ -1,4 +1,11 @@
-"""Tests for viz_server.main() CLI-argument dispatch.
+"""Tests for viz.server.main() CLI-argument dispatch (engram-alpha#2555 PR A
+retarget -- was viz_server; main() lives in viz.server, but the
+AGENTS/DEFAULT_AGENT registry it populates and the discover_agents/
+_load_config/_merge_config_over_discovered/_pick_default helpers it calls
+all live in viz.agents -- main() reaches them via ``viz_agents.X`` attribute
+access (see viz/server.py's own docstring for why), so mocks in this file
+must patch the SAME module main() actually calls through: HTTPServer on
+viz.server, everything else on viz.agents.
 
 PR #1109 unit-tested discover_agents() and _merge_config_over_discovered()
 directly. This file covers the three-path agent-registry build wired inside
@@ -36,11 +43,13 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
-# Insert the src/engram path so `import viz_server` resolves cleanly.
+# Insert the src/engram path so `import viz` resolves cleanly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
 
-import viz_server
-from viz_server import main, DEFAULT_DB
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz.server import main
+from viz.agents import DEFAULT_DB
 
 
 # ---------------------------------------------------------------------------
@@ -55,12 +64,12 @@ class _MainDispatchBase(unittest.TestCase):
     """
 
     def setUp(self):
-        self._saved_agents = dict(viz_server.AGENTS)
-        self._saved_default_agent = viz_server.DEFAULT_AGENT
+        self._saved_agents = dict(viz_agents.AGENTS)
+        self._saved_default_agent = viz_agents.DEFAULT_AGENT
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server.DEFAULT_AGENT = self._saved_default_agent
+        viz_agents.AGENTS = self._saved_agents
+        viz_agents.DEFAULT_AGENT = self._saved_default_agent
 
     # ------------------------------------------------------------------
     # Convenience: run main() with controlled argv + a mocked HTTPServer.
@@ -71,8 +80,14 @@ class _MainDispatchBase(unittest.TestCase):
         """Run main() with sys.argv = ['viz_server'] + argv_tail.
 
         Always patches HTTPServer so no port is bound and serve_forever does
-        not block. Passes extra_patches as additional context-managed mocks
-        into the viz_server module namespace.
+        not block. ``extra_patches`` are additional context-managed mocks --
+        applied to the viz.agents module namespace, since that's where
+        main() actually resolves discover_agents/_load_config/
+        _merge_config_over_discovered/_own_agent_name/_pick_default (via
+        ``viz_agents.X`` attribute access, not a bare name in viz.server's
+        own namespace -- see this file's module docstring). HTTPServer is
+        the one exception: it's imported directly into viz.server's own
+        namespace, so it's patched there, not on viz_agents.
 
         Returns the mock HTTPServer *instance* (the one returned by the
         patched constructor).
@@ -80,18 +95,24 @@ class _MainDispatchBase(unittest.TestCase):
         mock_server_instance = MagicMock()
         mock_server_instance.serve_forever.side_effect = KeyboardInterrupt()
 
-        patches = {
+        server_patches = {
             "HTTPServer": MagicMock(return_value=mock_server_instance),
         }
-        if extra_patches:
-            patches.update(extra_patches)
+        agents_patches = dict(extra_patches) if extra_patches else {}
 
         with patch.object(sys, "argv", ["viz_server"] + argv_tail):
-            with unittest.mock.patch.multiple("viz_server", **patches):
-                try:
-                    main()
-                except KeyboardInterrupt:
-                    pass  # serve_forever raises KeyboardInterrupt → normal exit path
+            with unittest.mock.patch.multiple(viz_server, **server_patches):
+                if agents_patches:
+                    with unittest.mock.patch.multiple(viz_agents, **agents_patches):
+                        try:
+                            main()
+                        except KeyboardInterrupt:
+                            pass  # serve_forever raises KeyboardInterrupt → normal exit path
+                else:
+                    try:
+                        main()
+                    except KeyboardInterrupt:
+                        pass  # serve_forever raises KeyboardInterrupt → normal exit path
 
         return mock_server_instance
 
@@ -104,13 +125,13 @@ class TestMainDbFlag(unittest.TestCase):
     """--db flag forces single-agent mode regardless of autodetect."""
 
     def setUp(self):
-        self._saved_agents = dict(viz_server.AGENTS)
-        self._saved_default_agent = viz_server.DEFAULT_AGENT
+        self._saved_agents = dict(viz_agents.AGENTS)
+        self._saved_default_agent = viz_agents.DEFAULT_AGENT
         self._tmpdir = Path(tempfile.mkdtemp(prefix="engram_main_db_"))
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server.DEFAULT_AGENT = self._saved_default_agent
+        viz_agents.AGENTS = self._saved_agents
+        viz_agents.DEFAULT_AGENT = self._saved_default_agent
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
@@ -119,7 +140,7 @@ class TestMainDbFlag(unittest.TestCase):
         mock_server_instance.serve_forever.side_effect = KeyboardInterrupt()
 
         with patch.object(sys, "argv", ["viz_server"] + argv_tail):
-            with patch("viz_server.HTTPServer", return_value=mock_server_instance):
+            with patch("viz.server.HTTPServer", return_value=mock_server_instance):
                 try:
                     main()
                 except KeyboardInterrupt:
@@ -132,10 +153,10 @@ class TestMainDbFlag(unittest.TestCase):
 
         self._run_main_with_db(["--db", str(db_dir)])
 
-        self.assertIn("default", viz_server.AGENTS)
-        self.assertEqual(viz_server.DEFAULT_AGENT, "default")
+        self.assertIn("default", viz_agents.AGENTS)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "default")
         expected_db = str(db_dir / "knowledge.db")
-        self.assertEqual(viz_server.AGENTS["default"]["db"], expected_db)
+        self.assertEqual(viz_agents.AGENTS["default"]["db"], expected_db)
 
     def test_db_direct_file_used_as_is(self):
         """--db <file.db> (non-directory path) must be used directly."""
@@ -145,9 +166,9 @@ class TestMainDbFlag(unittest.TestCase):
 
         self._run_main_with_db(["--db", str(db_file)])
 
-        self.assertIn("default", viz_server.AGENTS)
-        self.assertEqual(viz_server.DEFAULT_AGENT, "default")
-        self.assertEqual(viz_server.AGENTS["default"]["db"], str(db_file))
+        self.assertIn("default", viz_agents.AGENTS)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "default")
+        self.assertEqual(viz_agents.AGENTS["default"]["db"], str(db_file))
 
     def test_db_single_agent_has_correct_shape(self):
         """AGENTS['default'] must have name, label, and db keys."""
@@ -156,7 +177,7 @@ class TestMainDbFlag(unittest.TestCase):
 
         self._run_main_with_db(["--db", str(db_dir)])
 
-        entry = viz_server.AGENTS["default"]
+        entry = viz_agents.AGENTS["default"]
         self.assertEqual(entry["name"], "default")
         self.assertEqual(entry["label"], "Default")
         self.assertIn("db", entry)
@@ -168,7 +189,7 @@ class TestMainDbFlag(unittest.TestCase):
 
         self._run_main_with_db(["--db", str(db_dir)])
 
-        self.assertEqual(len(viz_server.AGENTS), 1)
+        self.assertEqual(len(viz_agents.AGENTS), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -207,8 +228,8 @@ class TestMainNoAutodetectWithConfig(_MainDispatchBase):
             extra_patches={"_load_config": load_config_mock},
         )
 
-        self.assertEqual(viz_server.AGENTS, fake_agents)
-        self.assertEqual(viz_server.DEFAULT_AGENT, fake_default)
+        self.assertEqual(viz_agents.AGENTS, fake_agents)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, fake_default)
 
     def test_discover_agents_not_called(self):
         """When --no-autodetect is set, discover_agents must not be called."""
@@ -238,20 +259,20 @@ class TestMainNoAutodetectAlone(_MainDispatchBase):
         """AGENTS['default']['db'] must equal DEFAULT_DB."""
         self._run_main(["--no-autodetect"])
 
-        self.assertIn("default", viz_server.AGENTS)
-        self.assertEqual(viz_server.AGENTS["default"]["db"], DEFAULT_DB)
+        self.assertIn("default", viz_agents.AGENTS)
+        self.assertEqual(viz_agents.AGENTS["default"]["db"], DEFAULT_DB)
 
     def test_default_agent_is_default(self):
         """DEFAULT_AGENT must be 'default'."""
         self._run_main(["--no-autodetect"])
 
-        self.assertEqual(viz_server.DEFAULT_AGENT, "default")
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "default")
 
     def test_only_one_agent_registered(self):
         """Exactly one agent ('default') must be registered."""
         self._run_main(["--no-autodetect"])
 
-        self.assertEqual(len(viz_server.AGENTS), 1)
+        self.assertEqual(len(viz_agents.AGENTS), 1)
 
     def test_discover_agents_not_called(self):
         """discover_agents must not be called when --no-autodetect is set."""
@@ -280,39 +301,39 @@ class TestMainPureAutodetect(_MainDispatchBase):
         fake_discovered = self._fake_agents("ariadne", "borges")
         discover_mock = MagicMock(return_value=fake_discovered)
 
-        with patch.object(viz_server, "_own_agent_name", return_value=""):
+        with patch.object(viz_agents, "_own_agent_name", return_value=""):
             self._run_main(
                 [],
                 extra_patches={"discover_agents": discover_mock},
             )
 
-        self.assertEqual(viz_server.AGENTS, fake_discovered)
+        self.assertEqual(viz_agents.AGENTS, fake_discovered)
 
     def test_default_agent_is_sorted_first_when_own_absent(self):
         """When _own_agent_name returns '', DEFAULT_AGENT is sorted-first agent."""
         fake_discovered = self._fake_agents("zara", "alpha", "beta")
         discover_mock = MagicMock(return_value=fake_discovered)
 
-        with patch.object(viz_server, "_own_agent_name", return_value=""):
+        with patch.object(viz_agents, "_own_agent_name", return_value=""):
             self._run_main(
                 [],
                 extra_patches={"discover_agents": discover_mock},
             )
 
-        self.assertEqual(viz_server.DEFAULT_AGENT, "alpha")
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "alpha")
 
     def test_default_agent_is_own_when_present(self):
         """When _own_agent_name returns a name in discovered, it wins as default."""
         fake_discovered = self._fake_agents("ariadne", "borges", "kepler")
         discover_mock = MagicMock(return_value=fake_discovered)
 
-        with patch.object(viz_server, "_own_agent_name", return_value="kepler"):
+        with patch.object(viz_agents, "_own_agent_name", return_value="kepler"):
             self._run_main(
                 [],
                 extra_patches={"discover_agents": discover_mock},
             )
 
-        self.assertEqual(viz_server.DEFAULT_AGENT, "kepler")
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "kepler")
 
     def test_merge_not_called_when_no_config(self):
         """_merge_config_over_discovered must not be called when no --config given."""
@@ -320,7 +341,7 @@ class TestMainPureAutodetect(_MainDispatchBase):
         discover_mock = MagicMock(return_value=fake_discovered)
         merge_mock = MagicMock()
 
-        with patch.object(viz_server, "_own_agent_name", return_value=""):
+        with patch.object(viz_agents, "_own_agent_name", return_value=""):
             self._run_main(
                 [],
                 extra_patches={
@@ -392,8 +413,8 @@ class TestMainAutodetectWithConfig(_MainDispatchBase):
             },
         )
 
-        self.assertEqual(viz_server.AGENTS, merged_agents)
-        self.assertEqual(viz_server.DEFAULT_AGENT, fake_default)
+        self.assertEqual(viz_agents.AGENTS, merged_agents)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, fake_default)
 
     def test_load_config_not_called_in_default_mode(self):
         """_load_config must NOT be called in default (non-no-autodetect) mode."""
@@ -431,8 +452,8 @@ class TestMainAutodetectFallback(_MainDispatchBase):
             extra_patches={"discover_agents": discover_mock},
         )
 
-        self.assertIn("default", viz_server.AGENTS)
-        self.assertEqual(viz_server.AGENTS["default"]["db"], DEFAULT_DB)
+        self.assertIn("default", viz_agents.AGENTS)
+        self.assertEqual(viz_agents.AGENTS["default"]["db"], DEFAULT_DB)
 
     def test_default_agent_is_default(self):
         """DEFAULT_AGENT must be 'default' in the fallback path."""
@@ -443,7 +464,7 @@ class TestMainAutodetectFallback(_MainDispatchBase):
             extra_patches={"discover_agents": discover_mock},
         )
 
-        self.assertEqual(viz_server.DEFAULT_AGENT, "default")
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "default")
 
     def test_only_one_agent_registered(self):
         """Exactly one agent ('default') must be registered in the fallback path."""
@@ -454,7 +475,7 @@ class TestMainAutodetectFallback(_MainDispatchBase):
             extra_patches={"discover_agents": discover_mock},
         )
 
-        self.assertEqual(len(viz_server.AGENTS), 1)
+        self.assertEqual(len(viz_agents.AGENTS), 1)
 
     def test_agent_entry_shape(self):
         """AGENTS['default'] must have the correct name, label, and db keys."""
@@ -465,7 +486,7 @@ class TestMainAutodetectFallback(_MainDispatchBase):
             extra_patches={"discover_agents": discover_mock},
         )
 
-        entry = viz_server.AGENTS["default"]
+        entry = viz_agents.AGENTS["default"]
         self.assertEqual(entry["name"], "default")
         self.assertEqual(entry["label"], "Default")
         self.assertEqual(entry["db"], DEFAULT_DB)
@@ -479,12 +500,12 @@ class TestMainMutualExclusionGuard(unittest.TestCase):
     """--config and --db together must call parser.error (they are mutually exclusive)."""
 
     def setUp(self):
-        self._saved_agents = dict(viz_server.AGENTS)
-        self._saved_default_agent = viz_server.DEFAULT_AGENT
+        self._saved_agents = dict(viz_agents.AGENTS)
+        self._saved_default_agent = viz_agents.DEFAULT_AGENT
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server.DEFAULT_AGENT = self._saved_default_agent
+        viz_agents.AGENTS = self._saved_agents
+        viz_agents.DEFAULT_AGENT = self._saved_default_agent
 
     def test_parser_error_raised_when_both_config_and_db_given(self):
         """Providing both --config and --db must trigger parser.error."""
@@ -500,7 +521,7 @@ class TestMainMutualExclusionGuard(unittest.TestCase):
 
     def test_agents_not_set_when_mutual_exclusion_fires(self):
         """AGENTS must remain at its pre-call value when parser.error fires."""
-        original_agents = dict(viz_server.AGENTS)
+        original_agents = dict(viz_agents.AGENTS)
         with patch.object(sys, "argv",
                           ["viz_server", "--config", "/tmp/a.json", "--db", "/tmp/b.db"]):
             try:
@@ -508,7 +529,7 @@ class TestMainMutualExclusionGuard(unittest.TestCase):
             except SystemExit:
                 pass
 
-        self.assertEqual(viz_server.AGENTS, original_agents)
+        self.assertEqual(viz_agents.AGENTS, original_agents)
 
 
 if __name__ == "__main__":

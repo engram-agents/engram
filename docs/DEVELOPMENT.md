@@ -31,7 +31,7 @@ the layered-sidecar design Lei + Borges agreed on 2026-05-04:
 
 ```
 engram-alpha/
-├── server.py, engram_*.py, viz_server.py    # engine — agent-agnostic
+├── server.py, engram_*.py, viz/             # engine — agent-agnostic
 ├── tools/                                   # shared utilities + build-plugin.sh
 ├── hooks/
 │   └── claude/  ← Claude Code hooks (transcript paths + event JSON)
@@ -184,7 +184,7 @@ Three test surfaces, in order of preference:
 >
 > **Two cases this helper is deliberately WRONG for.** Both exist in this repo, both are correct as they stand, and unifying them would reintroduce a real incident:
 >
-> - **A writer that does not own the file.** `os.replace()` swaps in the temp file's inode, carrying the *writer's* UID and mkstemp's `0600`. `viz_server.py` writes an agent's `config.json` while possibly running as a different UID; renaming there strips the agent's ownership of its own config and locks it out (#372). It copies into the existing inode instead and covers the lost crash-atomicity with backup + read-after-write + rollback.
+> - **A writer that does not own the file.** `os.replace()` swaps in the temp file's inode, carrying the *writer's* UID and mkstemp's `0600`. `viz/data/config.py`'s `write_config_key` writes an agent's `config.json` while possibly running as a different UID; renaming there strips the agent's ownership of its own config and locks it out (#372). It copies into the existing inode instead and covers the lost crash-atomicity with backup + read-after-write + rollback.
 > - **A file that must be readable by others.** `mkstemp` creates `0600`. `forum/coordination/store_file.py` chmods `0644` before the rename because the store is read by other agents.
 >
 > If your write matches either shape, do not use this helper — and say why at the call site, as those two do.

@@ -215,8 +215,8 @@ def atomic_write_json(path, data, *, indent=None, encoding=None):
     NOT for every write in this codebase. Two documented exceptions exist
     and must NOT be converted to this helper (see docs/DEVELOPMENT.md /
     the module docstrings at their call sites for why):
-      - src/engram/viz_server.py's config.json write (os.replace() there
-        would strip the agent's ownership of its own config -- #372).
+      - src/engram/viz/data/config.py's write_config_key() (os.replace()
+        there would strip the agent's ownership of its own config -- #372).
       - forum/coordination/store_file.py (needs 0644, not mkstemp's 0600,
         because the store is read by other agents).
     """

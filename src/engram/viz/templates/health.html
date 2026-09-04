@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ENGRAM Health Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+           background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
+    h2 { color: #7ecfff; font-size: 1.1em; margin: 16px 0 8px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+    .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
+    .card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 10px; }
+    .metric { display: flex; justify-content: space-between; padding: 4px 0;
+              border-bottom: 1px solid #0f3460; font-size: 0.85em; }
+    .metric:last-child { border-bottom: none; }
+    .metric .label { color: #aaa; }
+    .metric .value { color: #fff; font-weight: 600; }
+    .metric .value.warn { color: #ff9800; }
+    .metric .value.danger { color: #f44336; }
+    .metric .value.good { color: #4caf50; }
+    .gauge { width: 120px; height: 120px; margin: 0 auto 12px; position: relative; }
+    .gauge canvas { width: 120px; height: 120px; }
+    .gauge .score { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                    font-size: 1.8em; font-weight: 700; }
+    .bar-chart { display: flex; align-items: flex-end; gap: 4px; height: 80px; margin-top: 8px; }
+    .bar-chart .bar { flex: 1; background: #00d4ff; border-radius: 3px 3px 0 0;
+                      min-width: 20px; position: relative; transition: height 0.3s; }
+    .bar-chart .bar .bar-label { position: absolute; bottom: -18px; left: 50%;
+                                  transform: translateX(-50%); font-size: 0.65em; color: #888; white-space: nowrap; }
+    .bar-chart .bar .bar-value { position: absolute; top: -16px; left: 50%;
+                                  transform: translateX(-50%); font-size: 0.7em; color: #ccc; }
+    .trend { margin-top: 8px; }
+    .trend svg { width: 100%; height: 60px; }
+    .trend path { fill: none; stroke: #00d4ff; stroke-width: 2; }
+    .trend circle { fill: #00d4ff; }
+    .nav { margin-bottom: 16px; }
+    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
+    .nav a:hover { text-decoration: underline; }
+    .timeline { margin-top: 8px; }
+    .timeline .day { display: flex; align-items: center; gap: 8px; padding: 3px 0;
+                     font-size: 0.8em; border-bottom: 1px solid #0f3460; }
+    .timeline .day .date { color: #888; min-width: 80px; }
+    .timeline .day .counts { display: flex; gap: 6px; flex-wrap: wrap; }
+    .timeline .day .counts span { padding: 1px 6px; border-radius: 3px; font-size: 0.75em; }
+    .tag-created { background: #1b5e20; color: #a5d6a7; }
+    .tag-superseded { background: #4a148c; color: #ce93d8; }
+    .tag-retracted { background: #b71c1c; color: #ef9a9a; }
+    .tag-resolved { background: #0d47a1; color: #90caf9; }
+    .tag-other { background: #37474f; color: #b0bec5; }
+    #loading { text-align: center; padding: 40px; color: #888; }
+    /* Calibration card — namespaced to avoid collision with existing .bar-chart */
+    .calibration-bar-chart { display: flex; align-items: flex-end; gap: 3px; height: 60px; margin: 6px 0 20px; }
+    .calibration-bar-chart .cal-bar { flex: 1; border-radius: 3px 3px 0 0; min-width: 16px;
+                                      position: relative; transition: height 0.3s; }
+    .calibration-bar-chart .cal-bar .cal-bar-label { position: absolute; bottom: -18px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.6em;
+                                                      color: #888; white-space: nowrap; }
+    .calibration-bar-chart .cal-bar .cal-bar-value { position: absolute; top: -14px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.65em; color: #ccc; }
+    .cal-type-label { color: #7ecfff; font-size: 0.8em; margin: 10px 0 2px; font-weight: 600; }
+    .cal-caption { font-size: 0.72em; color: #888; font-style: italic; margin: 8px 0 4px; }
+    .cal-col-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .cal-col-header { color: #7ecfff; font-size: 0.78em; font-weight: 600; text-align: center;
+                      border-bottom: 1px solid #0f3460; padding-bottom: 4px; margin-bottom: 4px; }
+    .cal-col-row { font-size: 0.75em; text-align: center; padding: 2px 0; color: #d0d0d0; }
+    .cal-col-type { font-size: 0.72em; color: #aaa; text-align: left; padding: 2px 0; }
+    .nav { display: flex; align-items: center; }
+    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
+    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+    #nav-agent-wrapper { display: none; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <div class="nav">
+  <a href="/">Graph View</a>
+  <a href="/health" style="font-weight:600;">Health Dashboard</a>
+  <a href="/stats">Stats</a>
+  <a href="/config">Config</a>
+  <span id="nav-agent-wrapper"><span class="nav-agent-label">Agent:</span><select id="agent-select-nav" class="nav-agent-select"></select></span>
+</div>
+  <h1>ENGRAM Health Dashboard</h1>
+  <div id="loading">Loading health data...</div>
+  <div id="dashboard" style="display:none;">
+    <div class="grid" id="cards"></div>
+  </div>
+
+  <script>
+  function _currentAgent() {
+    return new URL(window.location.href).searchParams.get('agent');
+  }
+  function _withAgent(path) {
+    const a = _currentAgent();
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+
+  function loadHealth() {
+    document.getElementById('loading').style.display = '';
+    document.getElementById('dashboard').style.display = 'none';
+    document.getElementById('cards').innerHTML = '';
+    Promise.all([
+      fetch(_withAgent('/api/health')).then(r => r.json()),
+      fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
+    ]).then(([data, calData]) => {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+        if (data.error) {
+          document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
+          return;
+        }
+        render(data);
+        if (calData && !calData.error) {
+          renderCalibration(calData);
+        }
+      })
+      .catch(e => {
+        document.getElementById('loading').textContent = 'Error: ' + e.message;
+      });
+  }
+
+  // Agent switching is handled by the shared top-nav selector (see
+  // _NAV_SCRIPT); loadHealth() reads _currentAgent() from the URL on each
+  // page load, so no per-tab wiring is needed here.
+  loadHealth();
+
+  function render(d) {
+    const cards = document.getElementById('cards');
+    let html = '';
+
+    // Health score gauge
+    html += `<div class="card" style="text-align:center">
+      <h3>Health Score</h3>
+      <div class="gauge"><canvas id="gauge" width="120" height="120"></canvas>
+        <div class="score" style="color:${scoreColor(d.health_score)}">${d.health_score}</div>
+      </div>
+      <div style="font-size:0.8em; color:#888">Turn ${d.current_turn}</div>
+    </div>`;
+
+    // Overview
+    html += `<div class="card"><h3>Overview</h3>
+      ${metric('Current nodes', d.total_current)}
+      ${metric('Total (incl. superseded)', d.total_nodes)}
+      ${metric('Edges', d.total_edges)}
+      ${metric('Embedding coverage', d.embedding_pct + '%', d.embedding_pct < 80 ? 'warn' : 'good')}
+      ${metric('Feeling reports', d.feeling_reports)}
+    </div>`;
+
+    // Issues
+    const issues = d.tainted + d.stale + d.retracted + d.orphans;
+    html += `<div class="card"><h3>Issues</h3>
+      ${metric('Tainted nodes', d.tainted, d.tainted > 0 ? 'danger' : 'good')}
+      ${metric('Stale nodes', d.stale, d.stale > 0 ? 'warn' : 'good')}
+      ${metric('Retracted nodes', d.retracted, d.retracted > 10 ? 'warn' : '')}
+      ${metric('Orphan nodes', d.orphans, d.orphans > 5 ? 'warn' : '')}
+      ${metric('Total issues', issues, issues > 10 ? 'warn' : 'good')}
+    </div>`;
+
+    // Resolution
+    html += `<div class="card"><h3>Resolution Rates</h3>
+      ${metric('Questions', d.questions_resolved + '/' + d.questions_total + ' (' + pct(d.questions_resolved, d.questions_total) + ')')}
+      ${metric('Conjectures', d.conjectures_resolved + '/' + d.conjectures_total + ' (' + pct(d.conjectures_resolved, d.conjectures_total) + ')')}
+    </div>`;
+
+    // Confidence distribution
+    const confDist = d.confidence_distribution || {};
+    const confMax = Math.max(...Object.values(confDist), 1);
+    html += `<div class="card"><h3>Confidence Distribution</h3>
+      <div class="bar-chart">
+        ${Object.entries(confDist).map(([k,v]) =>
+          `<div class="bar" style="height:${Math.max(v/confMax*80,2)}px; background:${confBarColor(k)}">
+            <span class="bar-value">${v}</span><span class="bar-label">${k}</span></div>`
+        ).join('')}
+      </div>
+    </div>`;
+
+    // Node types
+    const nc = d.node_counts || {};
+    html += `<div class="card"><h3>Node Types</h3>
+      ${Object.entries(nc).sort((a,b) => b[1].current - a[1].current).map(([t,c]) =>
+        metric(t, c.current + (c.total > c.current ? ' (+' + (c.total - c.current) + ' old)' : ''))
+      ).join('')}
+    </div>`;
+
+    // Edge types
+    const ec = d.edge_counts || {};
+    html += `<div class="card"><h3>Edge Types</h3>
+      ${Object.entries(ec).sort((a,b) => b[1] - a[1]).map(([r,c]) => metric(r, c)).join('')}
+    </div>`;
+
+    // Edit timeline (last 7 days)
+    const ebd = d.edit_by_day || {};
+    const days = Object.keys(ebd).sort();
+    if (days.length > 0) {
+      html += `<div class="card" style="grid-column: span 2"><h3>Edit Activity (Last 7 Days)</h3>
+        <div class="timeline">
+          ${days.map(day => {
+            const acts = ebd[day];
+            return `<div class="day"><span class="date">${day}</span><div class="counts">
+              ${Object.entries(acts).map(([a,c]) =>
+                `<span class="tag-${tagClass(a)}">${a}: ${c}</span>`).join('')}
+            </div></div>`;
+          }).join('')}
+        </div>
+      </div>`;
+    }
+
+    // Health trend
+    const trend = d.health_trend || [];
+    if (trend.length > 1) {
+      html += `<div class="card" style="grid-column: span 2"><h3>Health Score Trend</h3>
+        <div class="trend"><svg id="trend-svg" viewBox="0 0 600 60"></svg></div>
+      </div>`;
+    }
+
+    cards.innerHTML = html;
+
+    // Draw gauge
+    drawGauge(d.health_score);
+
+    // Draw trend line
+    if (trend.length > 1) drawTrend(trend);
+  }
+
+  function metric(label, value, cls) {
+    return `<div class="metric"><span class="label">${label}</span><span class="value ${cls||''}">${value}</span></div>`;
+  }
+  function pct(a, b) { return b > 0 ? Math.round(a/b*100) + '%' : '0%'; }
+  function scoreColor(s) { return s >= 80 ? '#4caf50' : s >= 60 ? '#ff9800' : '#f44336'; }
+  function confBarColor(k) {
+    const m = {'0.0-0.2':'#f44336','0.2-0.4':'#ff9800','0.4-0.6':'#ffeb3b','0.6-0.8':'#8bc34a','0.8-1.0':'#4caf50'};
+    return m[k] || '#00d4ff';
+  }
+  function tagClass(a) {
+    if (a === 'created') return 'created';
+    if (a === 'superseded' || a === 'stale_flagged') return 'superseded';
+    if (a === 'retracted' || a === 'tainted') return 'retracted';
+    if (a === 'resolved' || a === 'reopened') return 'resolved';
+    return 'other';
+  }
+
+  function drawGauge(score) {
+    const c = document.getElementById('gauge');
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    const cx = 60, cy = 60, r = 50;
+    // Background arc
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0.75 * Math.PI, 2.25 * Math.PI);
+    ctx.strokeStyle = '#0f3460';
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    // Score arc
+    const angle = 0.75 * Math.PI + (score / 100) * 1.5 * Math.PI;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0.75 * Math.PI, angle);
+    ctx.strokeStyle = scoreColor(score);
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  function drawTrend(trend) {
+    const svg = document.getElementById('trend-svg');
+    if (!svg || trend.length < 2) return;
+    const w = 600, h = 60, pad = 10;
+    const scores = trend.map(t => t.health_score);
+    const mn = Math.min(...scores) - 5, mx = Math.max(...scores) + 5;
+    const xScale = i => pad + i / (trend.length - 1) * (w - 2 * pad);
+    const yScale = v => h - pad - (v - mn) / (mx - mn) * (h - 2 * pad);
+    const pts = trend.map((t, i) => `${xScale(i)},${yScale(t.health_score)}`);
+    svg.innerHTML = `<path d="M${pts.join(' L')}"/>` +
+      trend.map((t, i) =>
+        `<circle cx="${xScale(i)}" cy="${yScale(t.health_score)}" r="3"><title>Turn ${t.turn}: ${t.health_score}</title></circle>`
+      ).join('');
+  }
+
+  // HTML-escape for DB-sourced strings used in innerHTML.
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Bucket boundaries for per-type histograms (5-6 buckets).
+  // Reserved for future histogram rendering — V1 uses quantile display.
+  const CAL_BUCKETS = [
+    {lo: 0,    hi: 0.30, label: '<0.30', color: '#f44336'},
+    {lo: 0.30, hi: 0.50, label: '0.30–0.50', color: '#ff9800'},
+    {lo: 0.50, hi: 0.70, label: '0.50–0.70', color: '#ffeb3b'},
+    {lo: 0.70, hi: 0.85, label: '0.70–0.85', color: '#8bc34a'},
+    {lo: 0.85, hi: 0.95, label: '0.85–0.95', color: '#4caf50'},
+    {lo: 0.95, hi: 1.01, label: '≥0.95',    color: '#00e676'},
+  ];
+
+  function calDeltaClass(delta) {
+    const abs = Math.abs(delta);
+    if (abs >= 0.15) return 'danger';
+    if (abs >= 0.10) return 'warn';
+    return 'good';
+  }
+
+  function renderCalibration(cal) {
+    const cards = document.getElementById('cards');
+    if (!cards) return;
+
+    const corpus = cal.corpus || {};
+    const byType = corpus.by_type || {};
+    const byQt   = corpus.by_quote_type || {};
+    const byRt   = corpus.by_reasoning_type || {};
+    const drift  = cal.drift_by_type || {};
+
+    const PRIMARY_TYPES = ['observation_factual', 'derivation', 'conjecture', 'lesson'];
+
+    // ── Per-type histograms ───────────────────────────────────────────────
+    let histHtml = '';
+    for (const ntype of PRIMARY_TYPES) {
+      const stats = byType[ntype] || {n: 0};
+      const n = stats.n || 0;
+      // We don't have raw distribution, so approximate from p-quantiles:
+      // use n + p25/p50/p75/p90/p95 to assign fractional counts to buckets.
+      // Simpler approach for V1: render a compact stats row instead of a
+      // histogram (true bucket data requires a separate query not in the
+      // current API shape). Display p25/p50/p75 summary row + N.
+      if (n === 0) {
+        histHtml += `<div class="cal-type-label">${esc(ntype)}</div>
+          <div style="color:#888;font-size:0.78em;font-style:italic;">No data</div>`;
+      } else {
+        const p50 = stats.p50 !== null ? stats.p50.toFixed(2) : '—';
+        const p25 = stats.p25 !== null ? stats.p25.toFixed(2) : '—';
+        const p75 = stats.p75 !== null ? stats.p75.toFixed(2) : '—';
+        const mean = stats.mean !== null ? stats.mean.toFixed(3) : '—';
+        histHtml += `<div class="cal-type-label">${esc(ntype)} <span style="color:#888;font-weight:normal;">(n=${n})</span></div>
+          ${metric('p25 / p50 / p75', p25 + ' / ' + p50 + ' / ' + p75)}
+          ${metric('mean', mean)}`;
+      }
+    }
+
+    // ── Per-quote_type table ──────────────────────────────────────────────
+    const qtEntries = Object.entries(byQt).sort((a, b) => b[1].n - a[1].n);
+    let qtHtml = '';
+    if (qtEntries.length === 0) {
+      qtHtml = '<p class="empty" style="padding:8px 0;">No quote_type data yet.</p>';
+    } else {
+      qtHtml = '<table><thead><tr><th>quote_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [qt, s] of qtEntries) {
+        qtHtml += `<tr><td>${esc(qt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      qtHtml += '</tbody></table>';
+      qtHtml += '<p class="cal-caption">the structural-confidence-determination axiom — structural anchoring — see ob_NNNN for the 2D matrix design.</p>';
+    }
+
+    // ── Per-reasoning_type table ──────────────────────────────────────────
+    const rtEntries = Object.entries(byRt).sort((a, b) => b[1].n - a[1].n);
+    let rtHtml = '';
+    if (rtEntries.length === 0) {
+      rtHtml = '<p class="empty" style="padding:8px 0;">No reasoning_type data yet.</p>';
+    } else {
+      rtHtml = '<table><thead><tr><th>reasoning_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [rt, s] of rtEntries) {
+        rtHtml += `<tr><td>${esc(rt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      rtHtml += '</tbody></table>';
+    }
+
+    // ── Drift indicator ───────────────────────────────────────────────────
+    let driftHtml = '';
+    const driftEntries = Object.entries(drift);
+    if (driftEntries.length === 0) {
+      driftHtml = '<p style="color:#888;font-size:0.8em;font-style:italic;">No this-turn data yet — drift available after first filing.</p>';
+    } else {
+      for (const [ntype, d] of driftEntries) {
+        const cls = calDeltaClass(d.delta);
+        const sign = d.delta >= 0 ? '+' : '';
+        driftHtml += `<div class="metric">
+          <span class="label">${esc(ntype)}</span>
+          <span class="value ${cls}" title="this_turn p50=${d.this_turn_p50} corpus p50=${d.corpus_p50} n_this_turn=${d.n_this_turn}">
+            ${d.this_turn_p50.toFixed(2)} vs ${d.corpus_p50.toFixed(2)} · delta ${sign}${d.delta.toFixed(3)}
+          </span>
+        </div>`;
+      }
+    }
+
+    // ── Assemble card ─────────────────────────────────────────────────────
+    const cardHtml = `<div class="card" style="grid-column: span 2">
+      <h3>Confidence Calibration</h3>
+      <h2 style="margin-top:0;margin-bottom:6px;">Per-Type Summary (corpus)</h2>
+      ${histHtml}
+      <h2>Per-Quote-Type (observation_factual)</h2>
+      ${qtHtml}
+      <h2>Per-Reasoning-Type (derivation)</h2>
+      ${rtHtml}
+      <h2>Drift: This Turn vs Corpus (p50 delta)</h2>
+      ${driftHtml}
+    </div>`;
+
+    cards.innerHTML += cardHtml;
+  }
+  </script>
+<script>
+(function () {
+  var sel = document.getElementById('agent-select-nav');
+  if (!sel) return;
+  var wrapper = document.getElementById('nav-agent-wrapper');
+
+  fetch('/api/agents').then(function(r) { return r.json(); }).then(function(data) {
+    var agents = data.agents || [];
+    var defaultAgent = data.default || (agents[0] && agents[0].name);
+    if (agents.length <= 1) return;  // single-agent mode: keep selector hidden
+
+    var currentAgent = new URL(window.location.href).searchParams.get('agent');
+    if (!currentAgent || !agents.find(function(a) { return a.name === currentAgent; })) {
+      currentAgent = defaultAgent;
+    }
+
+    sel.innerHTML = '';
+    agents.forEach(function(a) {
+      var opt = document.createElement('option');
+      opt.value = a.name;
+      var status = a.available ? '(' + a.current_node_count + ')' : '(unavailable)';
+      opt.textContent = a.label + ' ' + status;
+      if (!a.available && a.error) opt.title = a.error;
+      sel.appendChild(opt);
+    });
+    sel.value = currentAgent;
+    if (wrapper) wrapper.style.display = 'inline-flex';
+
+    // Rewrite all same-origin tab links to preserve the agent param.
+    document.querySelectorAll('.nav a').forEach(function(link) {
+      var href = link.getAttribute('href');
+      if (!href || !href.startsWith('/')) return;
+      var u = new URL(href, window.location.origin);
+      u.searchParams.set('agent', currentAgent);
+      link.setAttribute('href', u.toString());
+    });
+
+    sel.onchange = function() {
+      var u = new URL(window.location.href);
+      u.searchParams.set('agent', sel.value);
+      window.location.href = u.toString();
+    };
+  }).catch(function() {});
+}());
+</script>
+</body>
+</html>

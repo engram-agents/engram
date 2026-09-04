@@ -1,0 +1,4 @@
+    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
+    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+    #nav-agent-wrapper { display: none; margin-left: auto; }

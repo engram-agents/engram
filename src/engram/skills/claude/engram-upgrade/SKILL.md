@@ -185,7 +185,7 @@ If anything looks wrong after reconnecting (missing nodes, a query that used to 
 
 Skip if you don't use the viz dashboard (T2 feature, may not be installed).
 
-The plugin rebuild (Step 3) replaced `viz_server.py` in the plugin tree, but any running viz service still executes the **old code**. Without a restart the health dashboard silently serves stale content — it appears healthy but reports on the pre-upgrade version.
+The plugin rebuild (Step 3) replaced the `viz/` package (`viz/server.py` and its siblings) in the plugin tree, but any running viz service still executes the **old code**. Without a restart the health dashboard silently serves stale content — it appears healthy but reports on the pre-upgrade version.
 
 **macOS note:** systemd is Linux-only. On macOS, skip to the manual-start path below. launchd integration is a known gap (see #402); it is not handled here.
 
@@ -199,7 +199,7 @@ systemctl --user restart engram-viz && echo "viz restarted" || echo "viz restart
 
 **If not a systemd service** (manual-start install, or macOS): the old process is still running. Tell the user:
 > The viz server is serving pre-upgrade code. Kill the old process and restart:
-> `pkill -f viz_server.py; python3 ${CLAUDE_PLUGIN_ROOT:-~/.engram/marketplace/plugins/engram}/viz_server.py &`
+> `pkill -f viz.server; cd ${CLAUDE_PLUGIN_ROOT:-~/.engram/marketplace/plugins/engram} && python3 -m viz.server &`
 
 Verify the server is live with new code after the restart:
 ```bash

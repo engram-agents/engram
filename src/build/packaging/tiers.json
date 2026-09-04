@@ -160,7 +160,89 @@
       "tier": "essential"
     },
     {
-      "path": "viz_server.py",
+      "path": "viz/__init__.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/agents.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/shell.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/routes.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/server.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."
+    },
+    {
+      "path": "viz/data/__init__.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR A folder move: PEP 420 makes this non-load-bearing, kept as an explicit package marker matching the health/__init__.py and tools/__init__.py precedents."
+    },
+    {
+      "path": "viz/data/schema.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/calibration.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/graph.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/health.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/stats.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/config.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/base.css",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/nav.js",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/graph.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/graph.css",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/graph.js",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/graph-agent-select.js",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/health.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/stats.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/config.html",
       "tier": "convenience"
     },
     {

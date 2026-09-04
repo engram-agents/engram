@@ -16,11 +16,18 @@
 # privilege delegation.
 #
 # Run-in-place design (no copying):
-#   viz_server.py, engram_stats.py, engram_core.py, and tools/config_schema.py
-#   all ship TOGETHER in the plugin bundle. The service runs viz_server.py
-#   directly from the plugin dir — no ~/.engram-viz/ copy, no stale-binary risk.
-#   The plugin dir is resolved from this script's own real path (readlink -f
-#   follows the ~/.local/bin/engram-viz-setup symlink back to the real location).
+#   viz/ (the viz package, engram-alpha#2555), engram_stats.py, engram_core.py,
+#   and tools/config_schema.py all ship TOGETHER in the plugin bundle. The
+#   service runs viz.server (`python3 -m viz.server`, WorkingDirectory =
+#   the plugin dir) directly from the plugin dir — no ~/.engram-viz/ copy, no
+#   stale-binary risk. `-m viz.server` (not a direct `python3 viz/server.py`
+#   script path) is required because viz/server.py uses relative imports to
+#   reach its sibling modules (viz/agents.py, viz/shell.py, etc.) — those only
+#   resolve when the file is imported as part of the `viz` package, which
+#   needs the plugin dir on sys.path (what running `-m` from that cwd gives
+#   you), not a bare script execution. The plugin dir is resolved from this
+#   script's own real path (readlink -f follows the
+#   ~/.local/bin/engram-viz-setup symlink back to the real location).
 #
 # Usage:
 #   engram-viz-setup            # via symlink (created by this script)
@@ -73,7 +80,11 @@ _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}"
 #   dirname($_self)        = <plugin>/engram/tools/
 #   dirname(dirname(...))  = <plugin>/engram/
 PLUGIN_ENGRAM_DIR="$(dirname "$(dirname "$_self")")"
-VIZ_PY="$PLUGIN_ENGRAM_DIR/viz_server.py"
+VIZ_PY="$PLUGIN_ENGRAM_DIR/viz/server.py"
+# Module-invocation form for actually launching the server (see the
+# Run-in-place design note above for why this must be `-m viz.server`, run
+# with PLUGIN_ENGRAM_DIR as cwd, rather than a direct `python3 $VIZ_PY`).
+VIZ_MODULE_INVOCATION="-m viz.server"
 
 # ---------------------------------------------------------------------------
 # --dry-run / --check flag
@@ -84,11 +95,11 @@ if [[ "${1:-}" == "--dry-run" || "${1:-}" == "--check" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Verify viz_server.py is present (plugin bundle integrity check)
+# Verify viz/server.py is present (plugin bundle integrity check)
 # ---------------------------------------------------------------------------
 if [[ ! -f "$VIZ_PY" ]]; then
-  echo "ERROR: viz_server.py not found in plugin bundle at: $VIZ_PY" >&2
-  echo "       Expected location: $PLUGIN_ENGRAM_DIR/viz_server.py" >&2
+  echo "ERROR: viz/server.py not found in plugin bundle at: $VIZ_PY" >&2
+  echo "       Expected location: $PLUGIN_ENGRAM_DIR/viz/server.py" >&2
   echo "       The plugin bundle appears malformed — reinstall ENGRAM." >&2
   exit 1
 fi
@@ -160,8 +171,8 @@ if [[ "$OS" == "Linux" ]]; then
 
   if ! command -v systemctl &>/dev/null; then
     echo "ERROR: systemctl not found. This script requires systemd on Linux." >&2
-    echo "       For non-systemd environments, manage viz_server.py manually:" >&2
-    echo "         $PYTHON_BIN $VIZ_PY" >&2
+    echo "       For non-systemd environments, manage viz.server manually:" >&2
+    echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
     exit 1
   fi
 
@@ -239,8 +250,8 @@ elif [[ "$OS" == "Darwin" ]]; then
   if ! command -v launchctl &>/dev/null; then
     echo "ERROR: launchctl not found." >&2
     echo "       This script requires launchctl on macOS." >&2
-    echo "       Manage the viz server manually:" >&2
-    echo "         $PYTHON_BIN $VIZ_PY" >&2
+    echo "       Manage viz.server manually:" >&2
+    echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
     exit 1
   fi
 
@@ -314,7 +325,7 @@ elif [[ "$OS" == "Darwin" ]]; then
 else
   echo "ERROR: Unsupported OS: $OS" >&2
   echo "       This script supports Linux (systemd) and macOS (launchd)." >&2
-  echo "       On other platforms, manage the viz server manually:" >&2
-  echo "         $PYTHON_BIN $VIZ_PY" >&2
+  echo "       On other platforms, manage viz.server manually:" >&2
+  echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
   exit 1
 fi

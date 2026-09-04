@@ -1,4 +1,5 @@
-"""Tests for viz_server config editable UI (PR-3).
+"""Tests for viz.shell/viz.server config editable UI (PR-3) (engram-alpha#2555
+PR A retarget -- was viz_server).
 
 Structural / server-side checks that don't require a browser:
 1.  CONFIG_HTML contains editable input controls (not just disabled ones).
@@ -26,7 +27,9 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz import shell as viz_shell
 from tools.config_schema import SCHEMA, annotate_schema
 
 
@@ -74,7 +77,7 @@ def _make_config() -> dict:
 class TestConfigHtmlStructure(unittest.TestCase):
     """CONFIG_HTML must contain the editable UI elements required by the spec."""
 
-    html = viz_server.CONFIG_HTML
+    html = viz_shell.CONFIG_HTML
 
     def test_restart_banner_element_present(self):
         """The restart-required banner element must exist in the HTML."""
@@ -264,7 +267,7 @@ class TestGetConfigAutoSleep(unittest.TestCase):
     """GET /api/config returns annotated data with auto-sleep keys editable."""
 
     def setUp(self):
-        self._saved_agents = viz_server.AGENTS
+        self._saved_agents = viz_agents.AGENTS
 
         self.tmpdir = tempfile.mkdtemp(prefix="engram_cfg_ui_test_")
         self.engram_home = Path(self.tmpdir) / "agent_dir"
@@ -274,7 +277,7 @@ class TestGetConfigAutoSleep(unittest.TestCase):
         self.config_path = self.engram_home / "config.json"
         self.config_path.write_text(json.dumps(_make_config(), indent=2))
 
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "test": {
                 "name": "test",
                 "label": "Test",
@@ -289,7 +292,7 @@ class TestGetConfigAutoSleep(unittest.TestCase):
 
     def tearDown(self):
         self._server.shutdown()
-        viz_server.AGENTS = self._saved_agents
+        viz_agents.AGENTS = self._saved_agents
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _get_config(self, agent: str = "test") -> dict:

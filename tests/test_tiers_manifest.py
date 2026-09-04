@@ -279,11 +279,17 @@ def _enumerate_candidate_paths() -> set[str]:
                 candidates.add(f"tools/{parts[1]}")
 
     # Top-level named files (relative to source_root, not repo root — Phase 4)
+    # viz_server.py removed here (engram-alpha#2555 PR A): it no longer exists
+    # as a root-level file -- it split into the viz/ package. No replacement
+    # walker was added for viz/ specifically, matching the existing precedent
+    # that health/ (a prior package-ification, #2537) also has no walker here
+    # — package-level directories are covered by the separate, more thorough
+    # whole-tree gate (test_whole_tree_every_tracked_file_has_a_role below),
+    # not by this narrower candidate enumerator.
     for fname in [
         "server.py",
         "bootstrap.py",
         "launch-engram-server.sh",
-        "viz_server.py",
     ]:
         if os.path.exists(os.path.join(src_root, fname)):
             candidates.add(fname)

@@ -42,7 +42,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SETUP_SCRIPT = REPO_ROOT / "src" / "engram" / "tools" / "operator-setup-viz.sh"
 TEMPLATE_DIR = REPO_ROOT / "src" / "engram" / "templates"
-VIZ_SERVER_PY = REPO_ROOT / "src" / "engram" / "viz_server.py"
+# engram-alpha#2555 PR A: viz_server.py relocated into the viz/ package --
+# the bundle-integrity check now looks for viz/server.py (nested), not a
+# root-level viz_server.py.
+VIZ_SERVER_PY = REPO_ROOT / "src" / "engram" / "viz" / "server.py"
 
 
 def _write_stub(directory: Path, name: str, content: str) -> Path:
@@ -62,13 +65,15 @@ def _make_fake_plugin(
     """Create a minimal fake plugin layout under plugin_engram_dir.
 
     Layout mirrors what operator-setup-viz.sh expects:
-      <plugin_engram_dir>/viz_server.py         (bundle integrity check)
+      <plugin_engram_dir>/viz/server.py         (bundle integrity check)
       <plugin_engram_dir>/templates/*.template  (service/plist templates)
     """
     plugin_engram_dir.mkdir(parents=True, exist_ok=True)
     if with_viz_server:
-        vspy = plugin_engram_dir / "viz_server.py"
-        vspy.write_text("# stub viz_server.py\n")
+        viz_dir = plugin_engram_dir / "viz"
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        vspy = viz_dir / "server.py"
+        vspy.write_text("# stub viz/server.py\n")
     if with_templates:
         import shutil
         tmpl_dest = plugin_engram_dir / "templates"

@@ -945,10 +945,28 @@ class TestRootFileManifestDerivation:
     silently omitted because the old implementation used a hardcoded list +
     engram_*.py glob that never included it.  The fix makes section 1 manifest-
     derived, so any root-level entry in tiers.json ships under its declared tier.
+
+    engram-alpha#2555 PR A retarget note: viz_server.py was the ONLY
+    convenience-tier ROOT-level manifest entry (verified: it's the sole
+    "/" not in path + tier=convenience row in tiers.json as of this PR).
+    The #2555 split relocates it to viz/server.py — no longer root-level,
+    so it now ships via the generic subdirectory copy loop
+    (_copy_manifest_entry), not the root-file-specific code path #666
+    fixed. The two tests below are retargeted to viz/server.py to keep
+    exercising "convenience-tier file present/absent by tier" as a
+    story, but this NARROWS #666's original regression coverage: there
+    is currently no other convenience-tier root-level manifest entry, so
+    the root-file-specific code path itself has no live example under
+    test until/unless a future convenience-tier root file is added.
+    test_all_shipped_root_entries_present_in_build below is unaffected
+    (manifest-driven, not hardcoded) and still exercises the root-file
+    copy path generically for whatever root entries currently exist
+    (today: essential + one dev-tier entry, all always-ship-together at
+    dev tier).
     """
 
-    def test_convenience_root_file_present_at_convenience_tier(self, tmp_path):
-        """viz_server.py (convenience) is present in a convenience-tier build."""
+    def test_convenience_file_present_at_convenience_tier(self, tmp_path):
+        """viz/server.py (convenience) is present in a convenience-tier build."""
         from tools.engine.build import build_plugin
         from tools.engine.manifest import load_manifest, resolve_tier
 
@@ -964,13 +982,13 @@ class TestRootFileManifestDerivation:
             manifest=manifest,
         )
 
-        assert os.path.isfile(os.path.join(bundle_dir, "viz_server.py")), (
-            "viz_server.py (convenience tier, root-level) missing from convenience build — "
-            "manifest-derived root copy not including it (see #666)"
+        assert os.path.isfile(os.path.join(bundle_dir, "viz", "server.py")), (
+            "viz/server.py (convenience tier) missing from convenience build — "
+            "manifest-derived copy not including it (see #666, #2555)"
         )
 
-    def test_convenience_root_file_absent_at_essential_tier(self, tmp_path):
-        """viz_server.py (convenience) is absent from an essential-tier build."""
+    def test_convenience_file_absent_at_essential_tier(self, tmp_path):
+        """viz/server.py (convenience) is absent from an essential-tier build."""
         from tools.engine.build import build_plugin
         from tools.engine.manifest import load_manifest, resolve_tier
 
@@ -986,8 +1004,8 @@ class TestRootFileManifestDerivation:
             manifest=manifest,
         )
 
-        assert not os.path.isfile(os.path.join(bundle_dir, "viz_server.py")), (
-            "viz_server.py (convenience tier) should NOT appear in an essential build"
+        assert not os.path.isfile(os.path.join(bundle_dir, "viz", "server.py")), (
+            "viz/server.py (convenience tier) should NOT appear in an essential build"
         )
 
     def test_all_shipped_root_entries_present_in_build(self, tmp_path):

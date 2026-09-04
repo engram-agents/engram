@@ -1,4 +1,5 @@
-"""Tests for viz_server /api/search endpoint and search_nodes helper.
+"""Tests for viz.server /api/search endpoint and viz.data.graph's
+search_nodes helper (engram-alpha#2555 PR A retarget -- was viz_server).
 
 Covers:
 1. search_nodes returns a dict with 'results' and 'query' keys on success.
@@ -27,7 +28,9 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz.data import graph as viz_graph_data
 
 
 # ---------------------------------------------------------------------------
@@ -104,51 +107,51 @@ class TestSearchNodesDirect(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_returns_results_and_query_keys(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         self.assertIn("results", result)
         self.assertIn("query", result)
         self.assertNotIn("error", result)
 
     def test_query_is_echoed_back(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         self.assertEqual(result["query"], "calibration")
 
     def test_fts_hit_returns_matching_nodes(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         ids = [r["id"] for r in result["results"]]
         # ob_001 contains "calibration" — must be in results
         self.assertIn("ob_001", ids, f"Expected ob_001 in results: {ids}")
 
     def test_retracted_nodes_excluded(self):
         """ob_ret is retracted — must not appear even though its claim matches."""
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         ids = [r["id"] for r in result["results"]]
         self.assertNotIn("ob_ret", ids, "Retracted node must not appear in search results")
 
     def test_non_current_nodes_excluded(self):
         """ob_old is not current — must not appear."""
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         ids = [r["id"] for r in result["results"]]
         self.assertNotIn("ob_old", ids, "Non-current node must not appear in search results")
 
     def test_result_shape_has_required_fields(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         self.assertGreater(len(result["results"]), 0)
         for r in result["results"]:
             for field in ("id", "type", "claim"):
                 self.assertIn(field, r, f"Result missing field '{field}': {r}")
 
     def test_no_match_returns_empty_results_not_error(self):
-        result = viz_server.search_nodes(self.db_path, "xyzzy_no_such_term_zyxyz")
+        result = viz_graph_data.search_nodes(self.db_path, "xyzzy_no_such_term_zyxyz")
         self.assertNotIn("error", result)
         self.assertEqual(result["results"], [])
 
     def test_missing_db_returns_error(self):
-        result = viz_server.search_nodes("/nonexistent/path/knowledge.db", "calibration")
+        result = viz_graph_data.search_nodes("/nonexistent/path/knowledge.db", "calibration")
         self.assertIn("error", result)
 
     def test_empty_query_returns_error(self):
-        result = viz_server.search_nodes(self.db_path, "")
+        result = viz_graph_data.search_nodes(self.db_path, "")
         self.assertIn("error", result)
 
     def test_all_special_chars_query_does_not_crash(self):
@@ -159,7 +162,7 @@ class TestSearchNodesDirect(unittest.TestCase):
         cleanly).  Either way the response must be valid JSON with the expected
         shape — no exception, no 'error' key.
         """
-        result = viz_server.search_nodes(self.db_path, "!@#$")
+        result = viz_graph_data.search_nodes(self.db_path, "!@#$")
         self.assertNotIn("error", result, f"Unexpected error: {result.get('error')}")
         self.assertIn("results", result)
         self.assertIn("query", result)
@@ -179,13 +182,13 @@ class TestSearchNodesFallback(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_fallback_returns_results(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         self.assertNotIn("error", result)
         ids = [r["id"] for r in result["results"]]
         self.assertIn("ob_001", ids, f"Fallback must still find ob_001: {ids}")
 
     def test_fallback_excludes_retracted(self):
-        result = viz_server.search_nodes(self.db_path, "calibration")
+        result = viz_graph_data.search_nodes(self.db_path, "calibration")
         ids = [r["id"] for r in result["results"]]
         self.assertNotIn("ob_ret", ids)
 
@@ -199,12 +202,12 @@ class TestSearchEndpointHTTP(unittest.TestCase):
         cls.db_path = os.path.join(cls.tmpdir, "knowledge.db")
         _make_search_db(cls.db_path, with_fts=True)
 
-        cls._saved_agents = viz_server.AGENTS
-        cls._saved_default = viz_server.DEFAULT_AGENT
-        viz_server.AGENTS = {
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
             "test_agent": {"name": "test_agent", "label": "Test", "db": cls.db_path}
         }
-        viz_server.DEFAULT_AGENT = "test_agent"
+        viz_agents.DEFAULT_AGENT = "test_agent"
 
         cls.server = HTTPServer(("127.0.0.1", 0), viz_server.Handler)
         cls.port = cls.server.server_address[1]
@@ -215,8 +218,8 @@ class TestSearchEndpointHTTP(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
-        viz_server.AGENTS = cls._saved_agents
-        viz_server.DEFAULT_AGENT = cls._saved_default
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
         import shutil
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 

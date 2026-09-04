@@ -1281,8 +1281,9 @@ def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
 # Keys that contain long free-text content (user-authored claims, quoted text,
 # reasoning chains) are excluded from the data JSON stored in index.db so the
 # stats dashboard never surfaces L2-equivalent content through an L1 path.
-# Per viz_server.py:2617 privacy note ("L2 events are indexed but never
-# surfaced through this dashboard"). Only non-sensitive metadata is kept:
+# Per viz/templates/stats.html's privacy note ("L2 (content) events are
+# indexed but never surfaced through this dashboard"). Only non-sensitive
+# metadata is kept:
 # node/evidence IDs, shape descriptors, counts, filter parameters, etc.
 # ---------------------------------------------------------------------------
 _PAYLOAD_PRIVATE_KEYS = frozenset({

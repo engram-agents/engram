@@ -1,4 +1,5 @@
-"""Tests for the viz_server 'select' control type (Surface 8, PR #337).
+"""Tests for the viz 'select' control type (Surface 8, PR #337)
+(engram-alpha#2555 PR A retarget -- was viz_server).
 
 Covers:
 1. renderControl-equivalent: annotate_schema marks coder/reviewer_fairy_policy
@@ -32,7 +33,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # every test collected afterward (#2037/#2063).
 sys.path.append(str(Path(__file__).resolve().parent.parent / "tools"))
 
-import viz_server
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz import shell as viz_shell
+from viz.data import config as viz_config_data
 from tools.config_schema import SCHEMA, annotate_schema  # noqa: E402
 
 
@@ -79,9 +83,9 @@ class SelectControlSchemaBase(unittest.TestCase):
     """Base setUp/tearDown for write tests."""
 
     def setUp(self):
-        self._saved_agents = viz_server.AGENTS
-        self._saved_backups = dict(viz_server._CONFIG_WRITE_BACKUPS)
-        viz_server._CONFIG_WRITE_BACKUPS.clear()
+        self._saved_agents = viz_agents.AGENTS
+        self._saved_backups = dict(viz_config_data._CONFIG_WRITE_BACKUPS)
+        viz_config_data._CONFIG_WRITE_BACKUPS.clear()
 
         self.tmpdir = tempfile.mkdtemp(prefix="engram_select_test_")
         self.engram_home = Path(self.tmpdir) / "agent_dir"
@@ -91,7 +95,7 @@ class SelectControlSchemaBase(unittest.TestCase):
         self.config_path = self.engram_home / "config.json"
         self.config_path.write_text(json.dumps(_make_config(), indent=2))
 
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "test": {
                 "name": "test",
                 "label": "Test",
@@ -100,9 +104,9 @@ class SelectControlSchemaBase(unittest.TestCase):
         }
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server._CONFIG_WRITE_BACKUPS.clear()
-        viz_server._CONFIG_WRITE_BACKUPS.update(self._saved_backups)
+        viz_agents.AGENTS = self._saved_agents
+        viz_config_data._CONFIG_WRITE_BACKUPS.clear()
+        viz_config_data._CONFIG_WRITE_BACKUPS.update(self._saved_backups)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _read_config(self) -> dict:
@@ -160,32 +164,32 @@ class TestSelectControlWriteValidation(SelectControlSchemaBase):
     """write_config_key validates allowed_values for coder/reviewer_fairy_policy."""
 
     def test_write_explicit_value_ok(self):
-        result = viz_server.write_config_key("test", "coder_fairy_policy", "explicit")
+        result = viz_config_data.write_config_key("test", "coder_fairy_policy", "explicit")
         self.assertTrue(result["ok"], f"Expected ok=True for 'explicit': {result}")
         self.assertEqual(result["validated_value"], "explicit")
         cfg = self._read_config()
         self.assertEqual(cfg["coder_fairy_policy"], "explicit")
 
     def test_write_auto_value_ok(self):
-        result = viz_server.write_config_key("test", "coder_fairy_policy", "auto")
+        result = viz_config_data.write_config_key("test", "coder_fairy_policy", "auto")
         self.assertTrue(result["ok"], f"Expected ok=True for 'auto': {result}")
         self.assertEqual(result["validated_value"], "auto")
 
     def test_write_always_value_ok(self):
-        result = viz_server.write_config_key("test", "reviewer_fairy_policy", "always")
+        result = viz_config_data.write_config_key("test", "reviewer_fairy_policy", "always")
         self.assertTrue(result["ok"], f"Expected ok=True for 'always': {result}")
         cfg = self._read_config()
         self.assertEqual(cfg["reviewer_fairy_policy"], "always")
 
     def test_write_invalid_value_rejected(self):
-        result = viz_server.write_config_key("test", "coder_fairy_policy", "garbage")
+        result = viz_config_data.write_config_key("test", "coder_fairy_policy", "garbage")
         self.assertFalse(result["ok"], "Expected ok=False for 'garbage'")
         self.assertIn("allowed", result["error"].lower(),
                       f"Error should mention 'allowed': {result['error']!r}")
 
     def test_write_invalid_value_error_names_allowed_values(self):
         """Error message for bad value must name the allowed values."""
-        result = viz_server.write_config_key("test", "coder_fairy_policy", "never")
+        result = viz_config_data.write_config_key("test", "coder_fairy_policy", "never")
         self.assertFalse(result["ok"])
         error = result["error"]
         # The error should mention at least one valid value or "allowed_values"
@@ -195,7 +199,7 @@ class TestSelectControlWriteValidation(SelectControlSchemaBase):
         )
 
     def test_reviewer_write_invalid_value_rejected(self):
-        result = viz_server.write_config_key("test", "reviewer_fairy_policy", "sometimes")
+        result = viz_config_data.write_config_key("test", "reviewer_fairy_policy", "sometimes")
         self.assertFalse(result["ok"], "Expected ok=False for 'sometimes'")
         self.assertIn("allowed", result["error"].lower())
 
@@ -258,16 +262,16 @@ class TestConfigHtmlSelectCss(unittest.TestCase):
     """CONFIG_HTML must include CSS tokens for the select control."""
 
     def test_cfg_select_class_in_html(self):
-        self.assertIn("cfg-select", viz_server.CONFIG_HTML,
+        self.assertIn("cfg-select", viz_shell.CONFIG_HTML,
                       "CONFIG_HTML missing 'cfg-select' CSS class definition")
 
     def test_saveField_function_in_html(self):
-        self.assertIn("saveField", viz_server.CONFIG_HTML,
+        self.assertIn("saveField", viz_shell.CONFIG_HTML,
                       "CONFIG_HTML missing 'saveField' JS function")
 
     def test_select_case_in_renderControl(self):
         """CONFIG_HTML must contain the select branch in renderControl."""
-        self.assertIn("ctrl === 'select'", viz_server.CONFIG_HTML,
+        self.assertIn("ctrl === 'select'", viz_shell.CONFIG_HTML,
                       "CONFIG_HTML missing select case in renderControl")
 
 
@@ -279,26 +283,26 @@ class TestGlobalNavSelectorId(unittest.TestCase):
     """All four tab pages must render the same global agent-selector ID."""
 
     _PAGES = [
-        ("HTML",        viz_server.HTML),
-        ("HEALTH_HTML", viz_server.HEALTH_HTML),
-        ("STATS_HTML",  viz_server.STATS_HTML),
-        ("CONFIG_HTML", viz_server.CONFIG_HTML),
+        ("HTML",        viz_shell.HTML),
+        ("HEALTH_HTML", viz_shell.HEALTH_HTML),
+        ("STATS_HTML",  viz_shell.STATS_HTML),
+        ("CONFIG_HTML", viz_shell.CONFIG_HTML),
     ]
 
     def test_global_selector_id_in_graph_view(self):
-        self.assertIn('id="agent-select-nav"', viz_server.HTML,
+        self.assertIn('id="agent-select-nav"', viz_shell.HTML,
                       "Graph view missing global selector id='agent-select-nav'")
 
     def test_global_selector_id_in_health_dashboard(self):
-        self.assertIn('id="agent-select-nav"', viz_server.HEALTH_HTML,
+        self.assertIn('id="agent-select-nav"', viz_shell.HEALTH_HTML,
                       "Health dashboard missing global selector id='agent-select-nav'")
 
     def test_global_selector_id_in_stats(self):
-        self.assertIn('id="agent-select-nav"', viz_server.STATS_HTML,
+        self.assertIn('id="agent-select-nav"', viz_shell.STATS_HTML,
                       "Stats page missing global selector id='agent-select-nav'")
 
     def test_global_selector_id_in_config(self):
-        self.assertIn('id="agent-select-nav"', viz_server.CONFIG_HTML,
+        self.assertIn('id="agent-select-nav"', viz_shell.CONFIG_HTML,
                       "Config page missing global selector id='agent-select-nav'")
 
     def test_old_sidebar_selector_absent_from_graph_view(self):
@@ -307,16 +311,16 @@ class TestGlobalNavSelectorId(unittest.TestCase):
         # 'agent-select-nav'.  There should be no element with the bare old ID.
         import re
         old_bare = re.compile(r'id=["\']agent-select["\']')
-        self.assertIsNone(old_bare.search(viz_server.HTML),
+        self.assertIsNone(old_bare.search(viz_shell.HTML),
                           "Graph view still contains old bare id='agent-select' "
                           "(sidebar selector not removed)")
 
     def test_old_health_selector_absent(self):
-        self.assertNotIn('id="agent-select-health"', viz_server.HEALTH_HTML,
+        self.assertNotIn('id="agent-select-health"', viz_shell.HEALTH_HTML,
                          "Health dashboard still contains old id='agent-select-health'")
 
     def test_old_config_selector_absent(self):
-        self.assertNotIn('id="agent-select-config"', viz_server.CONFIG_HTML,
+        self.assertNotIn('id="agent-select-config"', viz_shell.CONFIG_HTML,
                          "Config page still contains old id='agent-select-config'")
 
 
@@ -328,10 +332,10 @@ class TestAllTabsSameNavBar(unittest.TestCase):
     """Every tab page must contain the shared nav elements."""
 
     _PAGES = {
-        "graph":  viz_server.HTML,
-        "health": viz_server.HEALTH_HTML,
-        "stats":  viz_server.STATS_HTML,
-        "config": viz_server.CONFIG_HTML,
+        "graph":  viz_shell.HTML,
+        "health": viz_shell.HEALTH_HTML,
+        "stats":  viz_shell.STATS_HTML,
+        "config": viz_shell.CONFIG_HTML,
     }
 
     def test_all_tabs_have_nav_div(self):
@@ -386,10 +390,10 @@ class TestNavScriptTabLinkRewrite(unittest.TestCase):
     be injected into every page."""
 
     _PAGES = {
-        "graph":  viz_server.HTML,
-        "health": viz_server.HEALTH_HTML,
-        "stats":  viz_server.STATS_HTML,
-        "config": viz_server.CONFIG_HTML,
+        "graph":  viz_shell.HTML,
+        "health": viz_shell.HEALTH_HTML,
+        "stats":  viz_shell.STATS_HTML,
+        "config": viz_shell.CONFIG_HTML,
     }
 
     def test_nav_script_rewrite_logic_in_all_pages(self):
@@ -422,16 +426,16 @@ class TestSingleAgentModeSelectorHidden(unittest.TestCase):
     def test_single_agent_guard_in_nav_script(self):
         """The shared nav script must include the single-agent guard."""
         # Check the script constant directly.
-        self.assertIn("agents.length <= 1", viz_server._NAV_SCRIPT,
+        self.assertIn("agents.length <= 1", viz_shell._NAV_SCRIPT,
                       "_NAV_SCRIPT missing single-agent guard (agents.length <= 1)")
 
     def test_nav_agent_wrapper_initially_hidden(self):
         """nav-agent-wrapper must start hidden (display:none) in every page."""
         for tab, html in [
-            ("graph",  viz_server.HTML),
-            ("health", viz_server.HEALTH_HTML),
-            ("stats",  viz_server.STATS_HTML),
-            ("config", viz_server.CONFIG_HTML),
+            ("graph",  viz_shell.HTML),
+            ("health", viz_shell.HEALTH_HTML),
+            ("stats",  viz_shell.STATS_HTML),
+            ("config", viz_shell.CONFIG_HTML),
         ]:
             # The wrapper is hidden via CSS; either inline display:none or a
             # CSS rule.  We check for the CSS rule in the page.
@@ -442,7 +446,7 @@ class TestSingleAgentModeSelectorHidden(unittest.TestCase):
         """The nav script must only show the wrapper when agents.length > 1."""
         # The early-return guard means the wrapper.style.display = 'inline-flex'
         # line is only reached after the agents.length <= 1 check.
-        script = viz_server._NAV_SCRIPT
+        script = viz_shell._NAV_SCRIPT
         guard_pos = script.find("agents.length <= 1")
         show_pos = script.find("wrapper.style.display = 'inline-flex'")
         self.assertGreater(show_pos, guard_pos,
@@ -459,7 +463,7 @@ class TestSingleAgentModeSelectorHidden(unittest.TestCase):
 
         This test catches reintroduction of the silent-hidden bug (PR #425 r3).
         """
-        script = viz_server._NAV_SCRIPT
+        script = viz_shell._NAV_SCRIPT
         # Must NOT contain the empty-string reset pattern.
         self.assertNotIn(
             "wrapper.style.display = ''",

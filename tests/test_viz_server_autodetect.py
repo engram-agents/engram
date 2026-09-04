@@ -1,4 +1,5 @@
-"""Tests for viz_server auto-detect (discover_agents + merge).
+"""Tests for viz.agents auto-detect (discover_agents + merge)
+(engram-alpha#2555 PR A retarget -- was viz_server).
 
 Uses tmp_path to build fake home directories — never touches real homes.
 
@@ -27,8 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
 
-import viz_server
-from viz_server import discover_agents, _merge_config_over_discovered, _pick_default
+from viz import agents as viz_agents
+from viz.agents import discover_agents, _merge_config_over_discovered, _pick_default
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +436,7 @@ class TestMergeConfig(unittest.TestCase):
         discovered = self._make_discovered()
         cfg_path = self._write_config({"agents": []})
 
-        with unittest.mock.patch.object(viz_server, "_own_agent_name", return_value=""):
+        with unittest.mock.patch.object(viz_agents, "_own_agent_name", return_value=""):
             agents, default = _merge_config_over_discovered(discovered, cfg_path)
 
         # own-agent unknown → 'alpha-agent' sorts before 'beta-agent'.
