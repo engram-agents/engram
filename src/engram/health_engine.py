@@ -229,6 +229,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import health_measurements
 import health_engine_metrics as metrics
 import health_engine_model
 from health_engine_config import (
@@ -1201,6 +1202,13 @@ def build_snapshot(
         "engine_version": config.engine_version,
         "config": _config_to_dict(config),
         "definitions": _METRIC_DEFINITIONS,
+        # L0 measurement layer (engram-alpha#2537, PR1 of 3 — purely
+        # additive). Bare graph counts + environment facts, the SSoT slice 2
+        # will make "signals" a formula over instead of independent SQL.
+        # "signals"/"scores"/"aspects"/"composed" below are UNCHANGED by
+        # this block's presence — see health_measurements.py's
+        # module docstring.
+        "measurements": health_measurements.compute_all_measurements(conn),
         "signals": signals,
         "scores": {
             "metrics": scores_per_metric,

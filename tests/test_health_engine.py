@@ -40,6 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engram_core  # noqa: E402
 import health_engine  # noqa: E402
+import health_measurements  # noqa: E402
 import health_engine_metrics as hem  # noqa: E402
 from health_engine_config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
 from health_engine_curves import CurveSpec  # noqa: E402
@@ -674,13 +675,51 @@ class TestBuildSnapshot:
             assert snap["checkpoint_mode"] == mode
 
     def test_top_level_keys(self):
+        """``measurements`` (engram-alpha#2537, PR1 of 3) is the one new key
+        this PR adds — purely additive, see health_measurements.py's
+        module docstring. Every other key is unchanged from PR5."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
         assert set(snap.keys()) == {
             "schema_version", "engine_version", "config", "definitions",
-            "signals", "scores", "red_flags", "diagnostics", "anchor",
-            "turn", "checkpoint_mode",
+            "measurements", "signals", "scores", "red_flags", "diagnostics",
+            "anchor", "turn", "checkpoint_mode",
         }
+
+    def test_measurements_block_delegates_to_compute_all_measurements(self):
+        """build_snapshot's ``measurements`` key must be exactly what
+        health_measurements.compute_all_measurements(conn) returns on
+        the SAME conn — a wiring check, not a re-test of the L0 layer's own
+        correctness (see test_health_measurements.py for that)."""
+        conn = _make_conn()
+        with mock.patch("engram_core._embedder.is_available", return_value=False):
+            snap = health_engine.build_snapshot(conn, "nap")
+            direct = health_measurements.compute_all_measurements(conn)
+        assert snap["measurements"] == direct
+
+    def test_measurements_block_does_not_change_existing_output(self):
+        """PURELY ADDITIVE (#2537 slice 1's whole contract): signals/scores/
+        aspects/composed must be unchanged from what they were before this
+        PR — asserted here against the SAME known-good value the empty-DB
+        fixture already produces elsewhere in this file
+        (``test_empty_graph_every_signal_and_aspect_and_composed_
+        unavailable``'s ``composed == "UNAVAILABLE"``, since ``_make_conn()``
+        starts every population at zero), not just that the ``measurements``
+        key is present."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        assert "measurements" in snap
+        assert isinstance(snap["measurements"], dict)
+        assert snap["measurements"]["raw_schema_version"] == (
+            health_measurements.RAW_SCHEMA_VERSION
+        )
+        # signals/scores untouched — still computed independently of
+        # "measurements", per the module docstring's "no residue" claim.
+        # The actual golden VALUE, not just key-presence: on this empty
+        # fixture every population is zero, so every signal is UNAVAILABLE
+        # and composed is UNAVAILABLE too — the same value this file's own
+        # empty-DB test already establishes.
+        assert snap["scores"]["composed"] == "UNAVAILABLE"
 
     def test_red_flags_still_empty_diagnostics_now_populated(self):
         """red_flags stays [] (DAG-violations-as-a-red-flag is out of scope

@@ -112,6 +112,14 @@
       "tier": "essential"
     },
     {
+      "path": "health_measurements.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health_version.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_query.py",
       "tier": "essential"
     },
