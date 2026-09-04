@@ -423,3 +423,30 @@ class TestRepairRecordMissingMetricNames:
         expected = sorted(m.signal for m in he.MODEL.metrics)
         assert he.repair_record_missing_metric_names(["not", "a", "dict"]) == expected
         assert he.repair_record_missing_metric_names({"metrics": "not-a-dict"}) == expected
+
+
+# ---------------------------------------------------------------------------
+# 6. dream_projection_error_sentinel_is_stale — the repair-pass precondition's
+# freshness check on the `.error` sentinel (engram-alpha#2525): a sentinel
+# whose own `turn` doesn't match tonight's `current_turn` is a leftover from
+# an earlier cycle's failed unlink, not tonight's own failure, and must not
+# be treated as a hard-skip condition.
+# ---------------------------------------------------------------------------
+
+
+class TestDreamProjectionErrorSentinelStaleness:
+    def test_matching_turn_is_not_stale(self):
+        sentinel = {"turn": 42, "written_at": "2026-09-04T00:00:00Z", "error": "boom"}
+        assert he.dream_projection_error_sentinel_is_stale(sentinel, 42) is False
+
+    def test_mismatched_turn_is_stale(self):
+        sentinel = {"turn": 41, "written_at": "2026-09-03T00:00:00Z", "error": "boom"}
+        assert he.dream_projection_error_sentinel_is_stale(sentinel, 42) is True
+
+    def test_missing_turn_key_is_treated_as_stale(self):
+        # Never assume shape: a sentinel missing its own `turn` field entirely
+        # (e.g. a hand-edited or corrupted file) must not be trusted as
+        # "tonight's failure" — `.get("turn")` returns None, and None != 42,
+        # so this falls out of the same comparison without special-casing.
+        sentinel = {"written_at": "2026-09-04T00:00:00Z", "error": "boom"}
+        assert he.dream_projection_error_sentinel_is_stale(sentinel, 42) is True

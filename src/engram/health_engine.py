@@ -1265,6 +1265,20 @@ def _dream_projection_error_path() -> Path:
     return _dream_projection_path().with_suffix(".error")
 
 
+def dream_projection_error_sentinel_is_stale(sentinel: dict, current_turn: int) -> bool:
+    """Whether a read ``.error`` sentinel (the JSON content at
+    ``_dream_projection_error_path()``) is STALE relative to ``current_turn``
+    — i.e. its own ``turn`` field does not match tonight's actual turn,
+    meaning it is a leftover from an earlier cycle's failure (the
+    unlink-after-success step in ``write_snapshot`` failed) rather than
+    tonight's own failure. A stale sentinel must NOT block tonight's repair
+    pass (engram-alpha#2525) — the dream-master's precondition check (see
+    "The repair pass" → "Precondition" in ``engram-dream-master.md``) uses
+    this to distinguish the two cases before deciding whether to skip.
+    """
+    return sentinel.get("turn") != current_turn
+
+
 def _read_previous_dream_projection() -> dict | None:
     """Best-effort read of whatever projection the PREVIOUS checkpoint left
     behind — ``None`` if it doesn't exist yet (first-ever write) or fails to
