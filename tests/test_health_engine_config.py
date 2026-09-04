@@ -1,4 +1,4 @@
-"""Tests for health_engine_config.py — schema, loader, and sanity checks
+"""Tests for health/config.py — schema, loader, and sanity checks
 (engram-alpha#1991 PR1 of 4).
 
 These tests build small FAKE fixture EngineConfigs inline. They never
@@ -30,8 +30,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import health_engine_config as hec  # noqa: E402 — must follow sys.path setup
-from health_engine_config import (  # noqa: E402
+from health import config as hec  # noqa: E402 — must follow sys.path setup
+from health.config import (  # noqa: E402
     UNAVAILABLE,
     AspectDef,
     EngineConfig,
@@ -394,13 +394,13 @@ class TestBorgesRegression:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 assert not any(alias.name == "re" for alias in node.names), (
-                    "health_engine_config.py imports the 're' module — this "
+                    "health/config.py imports the 're' module — this "
                     "reopens exactly the regex/string-proxy failure mode the "
                     "Borges bug (§5.1) came from; use a real 'in' test instead"
                 )
             if isinstance(node, ast.ImportFrom):
                 assert node.module != "re", (
-                    "health_engine_config.py imports from 're' — same "
+                    "health/config.py imports from 're' — same "
                     "concern as a bare 'import re'"
                 )
 

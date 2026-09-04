@@ -1,4 +1,4 @@
-"""health_engine — the real production engine: CONFIG, the dream-side
+"""health.engine — the real production engine: CONFIG, the dream-side
 scoring model, composition, and the snapshot writer for the health-score
 redesign (engram-alpha#1991, PR2+PR3+PR5 of 5).
 
@@ -9,14 +9,14 @@ SUPERSEDED for the scoring/composition layer specifically by issue comment
 5527066386 (Kepler, 2026-09-03, "The dream-side contract for health-v2 —
 DRAFT 2"), §1 (the scoring model's shape) and §2 (the dream-side
 projection), plus Kepler's five follow-up clarifications (recorded in
-health_engine_model.py, inline at the field each one resolves).
+health/model.py, inline at the field each one resolves).
 
 Scope of this module (PR5 additions marked):
   1. The real production ``CONFIG`` (an ``EngineConfig``) — the RAW-SIGNAL-
-     COMPUTATION layer (health_engine_config.py's denominator-population /
+     COMPUTATION layer (health/config.py's denominator-population /
      empty-denominator-policy schema). UNCHANGED by PR5 — still declares all
      nine metrics across three aspects with the SAME ``signal_fn`` callables
-     PR5's own health_engine_model.py's ``SIGNALS`` registry names. See "TWO
+     PR5's own health/model.py's ``SIGNALS`` registry names. See "TWO
      PARALLEL SYSTEMS, ON PURPOSE" below for exactly what CONFIG still does
      and what it no longer does, post-PR5.
   2. [PR5] ``MODEL`` (below) — the SCORING layer (draft-2 §1): which aspect
@@ -24,15 +24,15 @@ Scope of this module (PR5 additions marked):
      binding. Read raw signals via CONFIG (1 above), turns them into scores
      via THIS. [Round 3, engram-alpha#1991/#2520] Built here, right after
      CONFIG, via ``health_engine_model.load(health_engine_model.MODEL_SPEC,
-     CONFIG)`` — not imported ready-made from health_engine_model.py
+     CONFIG)`` — not imported ready-made from health/model.py
      anymore, so ``load()`` can cross-validate every detector's declared
      population against CONFIG's own real ``denominator_population``.
   3. [PR5, replaces PR2/PR3] ``compose_aspect_scores`` and per-aspect
      scoring — the weighted-ARITHMETIC-SUM formula (Kepler's clarification
-     1, below), replacing BOTH ``health_engine_metrics.
+     1, below), replacing BOTH ``health.metrics.
      aspect_geometric_mean_scoring`` (per-aspect) and the OLD
      ``compose_aspect_scores`` (across aspects), which were both geometric-
-     mean. Those two functions are UNCHANGED in health_engine_metrics.py
+     mean. Those two functions are UNCHANGED in health/metrics.py
      (out of this PR's touch scope) but are now DEAD CODE from this
      module's perspective — nothing here calls them anymore; their own
      tests (tests/test_health_engine_metrics.py) still exercise them
@@ -60,7 +60,7 @@ carries low-value sensitivity')."
                    → range [0, 100]
 
 "Admitted" = ``importance > 0`` (today's ``scored=True`` is the same
-predicate under a new name — health_engine_config.py's ``MetricDef.scored``
+predicate under a new name — health/config.py's ``MetricDef.scored``
 field is UNRELATED to this "admitted" predicate now; see "TWO PARALLEL
 SYSTEMS" below). A non-admitted metric's signal/score still appears in the
 snapshot as a diagnostic, never in either sum. "Available" (round 2 of
@@ -129,7 +129,7 @@ a fourth answer, (d) "hold out, renormalize, report":
   3. ``health_engine_model.validate_model`` WARNS (never raises) at
      model-LOAD time (round 3: via ``health_engine_model.load()``, called
      once below, right after CONFIG — no longer at bare ``ScoringModel``
-     construction time, see health_engine_model.py's own docstring for why)
+     construction time, see health/model.py's own docstring for why)
      for any aspect with zero admitted metrics, naming the aspect(s) — see
      that function for the mechanism.
   4. Extensibility, true by construction: the moment a provenance metric
@@ -161,13 +161,13 @@ top-level ``points_in_play``/``composed_coverage`` pair.
 
 TWO PARALLEL SYSTEMS, ON PURPOSE (flagged plainly per the PR5 spec's
 explicit instruction, not silently left as unexplained duplication):
-health_engine_config.py's ``EngineConfig``/``AspectDef``/``MetricDef`` and
-health_engine_model.py's ``ScoringModel``/``AspectSpec``/``MetricBinding``
+health/config.py's ``EngineConfig``/``AspectDef``/``MetricDef`` and
+health/model.py's ``ScoringModel``/``AspectSpec``/``MetricBinding``
 are BOTH still declared, and BOTH still validate independently (each
 requires its own weight/points to sum to 100 — currently the SAME numbers,
 40/25/35, but nothing enforces they stay in sync beyond this docstring and
 code review). ROUND 3 (engram-alpha#1991/#2520, Kepler's ruling, 2026-09-03)
-adds the ONE mechanical exception to "nothing enforces": ``health_engine_
+adds the ONE mechanical exception to "nothing enforces": ``health.
 model.load()`` (called below, right after ``CONFIG``) cross-validates every
 ``MetricBinding``'s declared detector population against ``CONFIG``'s own
 real ``denominator_population`` for that same-named metric — a genuine
@@ -175,7 +175,7 @@ cross-module check, not merely two independent declarations kept in sync by
 review. Everything else about the two systems (weight/points-sum-to-100,
 the rest of each schema) is still unenforced across the boundary. What each
 still DOES, post-PR5:
-  - ``health_engine_config.EngineConfig`` (``CONFIG`` below): declares the
+  - ``health.config.EngineConfig`` (``CONFIG`` below): declares the
     denominator population + empty-denominator policy for each metric
     (UNCHANGED, not superseded by draft-2, which is silent on denominators)
     and provides the ``signal_fn`` callable ``_run_aspect`` calls to compute
@@ -187,10 +187,10 @@ still DOES, post-PR5:
   - ``AspectDef.scoring_fn`` (still set to ``metrics.
     aspect_geometric_mean_scoring`` below, unchanged) and ``MetricDef.
     scored``/``state_valued`` are now VESTIGIAL for real composition — kept
-    ONLY because ``health_engine_config.py``'s own schema still requires
+    ONLY because ``health/config.py``'s own schema still requires
     them (a required dataclass field / a validated invariant) and because
     that module is out of this PR's touch scope (flagged, not deleted, per
-    the PR5 spec's explicit "do NOT delete health_engine_config.py's
+    the PR5 spec's explicit "do NOT delete health/config.py's
     validator/schema wholesale without flagging it first"). Nothing in this
     module calls ``aspect.scoring_fn`` anymore.
 
@@ -229,38 +229,39 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import health_measurements
-import health_engine_metrics as metrics
-import health_engine_model
-from health_engine_config import (
+from . import measurements as health_measurements
+from . import metrics
+from . import model as health_engine_model
+from .config import (
     AspectDef,
     EngineConfig,
     MetricDef,
     UNAVAILABLE,
     _Unavailable,
 )
-from health_engine_model import ScoringModel
+from .model import ScoringModel
 
 # ROUND 3 (engram-alpha#1991/#2520, Kepler's ruling, 2026-09-03): MODEL is no
-# longer imported ready-made from health_engine_model.py — it is built BELOW,
+# longer imported ready-made from health/model.py — it is built BELOW,
 # right after CONFIG, via ``health_engine_model.load(health_engine_model.
 # MODEL_SPEC, CONFIG)``. This is the fix for round 2's row-local population
-# check: health_engine_model.py can now cross-validate a detector's declared
+# check: health/model.py can now cross-validate a detector's declared
 # population against CONFIG's own real ``denominator_population`` for that
 # metric, because construction (this module importing health_engine_model,
 # a plain module import with no import-time side effects) and validation
 # (via ``load()``, called only once CONFIG exists) are no longer forced to
-# happen at the same time. `import health_engine_model` (the module, not a
-# `from ... import MODEL`) is a genuinely ordinary top-of-file import now —
-# there is no more circularity to route around by deferring it.
+# happen at the same time. `from . import model as health_engine_model`
+# (the module, not a `from .model import MODEL`) is a genuinely ordinary
+# top-of-file import now — there is no more circularity to route around
+# by deferring it.
 
 # NOTE on engram_core access: deliberately NOT `import engram_core as core` at
-# module top level here — see health_engine_metrics.py's module docstring for
+# module top level here — see health/metrics.py's module docstring for
 # why (the test-suite's fresh_server() module-clearing convention only sweeps
 # "server"/"engram_"-prefixed modules; a module-top-level binding here would
 # go stale across tests that reload engram_core without knowing to also clear
 # this module). Every function below that needs `core` imports it locally.
-# health_engine_metrics itself follows the same discipline internally, so
+# health.metrics itself follows the same discipline internally, so
 # caching `metrics` (the module object) above is safe regardless of import
 # order — its own functions re-resolve engram_core lazily per call too.
 
@@ -306,7 +307,7 @@ _OPEN_CONTRADICTION_RATE = MetricDef(
     # (UNAVAILABLE) rather than reporting a fabricated "clean" 0.0 on zero
     # current contradiction nodes; this declared policy is updated to keep
     # it honest against the signal function's actual behavior (see
-    # health_engine_metrics.open_contradiction_rate's docstring for the
+    # health.metrics.open_contradiction_rate's docstring for the
     # full reasoning — this module's own docstring notes the declared
     # policy and the signal_fn's runtime behavior are correlated only by
     # construction/code-review, never independently checked, so leaving
@@ -359,13 +360,13 @@ ASPECT_C_PROVENANCE_INTEGRITY = AspectDef(
 # Aspect B — Retrievability (weight 35, design doc §2) — real as of PR3;
 # polarity flipped to literal coverage in engram-alpha#2518.
 # Denominator for all four is "claim_bearing_nodes" (same population aspect
-# A's taint_rate already uses) — see health_engine_config.py's
-# DECLARED_POPULATIONS comment and health_engine_metrics.py's aspect-B
+# A's taint_rate already uses) — see health/config.py's
+# DECLARED_POPULATIONS comment and health/metrics.py's aspect-B
 # section docstring for why. Every raw signal below returns its OWN LITERAL
 # coverage/fraction meaning (1.0 = fully covered/connected, 0.0 = none) —
-# see health_engine_metrics.py's module docstring "SIGN CONVENTION" note;
+# see health/metrics.py's module docstring "SIGN CONVENTION" note;
 # direction is declared on each metric's bound curve
-# (health_engine_model.py's MODEL_SPEC), not encoded in the raw value's sign.
+# (health/model.py's MODEL_SPEC), not encoded in the raw value's sign.
 # ---------------------------------------------------------------------------
 
 _RECALL_SUMMARY_COVERAGE = MetricDef(
@@ -435,10 +436,10 @@ CONFIG = EngineConfig(
 # ---------------------------------------------------------------------------
 # The real production model — round 3 (engram-alpha#1991/#2520, Kepler's
 # ruling, 2026-09-03): built HERE, textually AFTER CONFIG, not imported
-# ready-made from health_engine_model.py. This is the whole point of the
+# ready-made from health/model.py. This is the whole point of the
 # restructure — health_engine_model.load() cross-validates every detector's
 # declared population against CONFIG's own real denominator_population,
-# which requires a real CONFIG to already exist. health_engine_model.py
+# which requires a real CONFIG to already exist. health/model.py
 # itself has no import-time side effects (see that module's own docstring);
 # MODEL_SPEC there is an unvalidated ScoringModel, and load() is what turns
 # it into this module's validated MODEL.
@@ -453,7 +454,7 @@ MODEL = health_engine_model.load(health_engine_model.MODEL_SPEC, CONFIG)
 # 2026-09-02T14:32Z ruling (four-level shape: aspects with point allotments
 # summing to 100, metrics carrying in-aspect importance, arithmetic sums at
 # both levels — 'the curve layer carries low-value sensitivity')"). REPLACES
-# BOTH health_engine_metrics.aspect_geometric_mean_scoring (per-aspect) and
+# BOTH health.metrics.aspect_geometric_mean_scoring (per-aspect) and
 # this function's own former geometric-mean body (across aspects) — see this
 # module's docstring's "COMPOSITION FORMULA" section for the full formula,
 # the UNAVAILABLE-propagation rule, and the LOAD-BEARING DISCOVERED
@@ -747,7 +748,7 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "status": "deprecated, not deleted (engram-alpha#1991 draft-2 §1)",
         "note": (
             "dive_target is emitted per-metric by _metric_def_to_dict "
-            "(health_engine.py, currently line 487) and read by NOTHING "
+            "(health/engine.py, currently line 487) and read by NOTHING "
             "downstream — retiring it is a snapshot-schema change, which is "
             "not this PR's job. Kept on every MetricDef for a future schema "
             "bump (Borges's correction to draft 1's 'dead field': it is "
@@ -768,7 +769,7 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         ),
         "unit": (
             "nodes, not marker rows — a node can carry more than one "
-            "pending marker row (see health_engine_metrics.py's "
+            "pending marker row (see health/metrics.py's "
             "stale_derivation_rate docstring, 'UNIT' note); the OLD formula "
             "shipped for months with the unit unstated, per draft-2 §4."
         ),
@@ -828,7 +829,7 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
         "meaning": (
             "Fraction of current claim-bearing nodes WITH a "
             "recall_summary (literal coverage — 1=all covered, 0=none "
-            "covered; see health_engine_metrics.py's module docstring "
+            "covered; see health/metrics.py's module docstring "
             "'SIGN CONVENTION' note). Reads the recall_summary column's actual "
             "content directly rather than nodes.summary_missing: that flag "
             "is set only at node-creation time, and whether any given "
@@ -1206,7 +1207,7 @@ def build_snapshot(
         # additive). Bare graph counts + environment facts, the SSoT slice 2
         # will make "signals" a formula over instead of independent SQL.
         # "signals"/"scores"/"aspects"/"composed" below are UNCHANGED by
-        # this block's presence — see health_measurements.py's
+        # this block's presence — see health/measurements.py's
         # module docstring.
         "measurements": health_measurements.compute_all_measurements(conn),
         "signals": signals,
@@ -1310,7 +1311,7 @@ def _detector_ref_to_jsonable(detector) -> dict | None:
     Used ONLY for the dream projection's per-metric ``detector`` field
     below (the MAIN snapshot never serializes a ``MetricBinding``/
     ``DetectorRef`` at all — ``_config_to_dict`` walks
-    ``health_engine_config``'s OWN, unrelated ``MetricDef``/``AspectDef``
+    ``health.config``'s OWN, unrelated ``MetricDef``/``AspectDef``
     schema, which has no detector field)."""
     if detector is None:
         return None
@@ -1523,7 +1524,7 @@ def write_snapshot(
 #
 #   1. The repair-pass provenance record's SCHEMA (field names + valid
 #      status values) + ``validate_repair_record`` — the schema-conformance
-#      check, mirroring ``health_engine_config.validate_config`` /
+#      check, mirroring ``health.config.validate_config`` /
 #      ``health_engine_model.validate_model``'s "collect every violation
 #      into one pass, don't just raise on the first" contract (see those
 #      functions' docstrings; read one before changing this one).
@@ -1651,7 +1652,7 @@ REPAIR_RECORD_STATUS_VALUES: frozenset[str] = frozenset({
 def validate_repair_record(record: dict) -> list[str]:
     """Validate a repair-pass provenance record (engram-alpha#2519) against
     the schema declared above. Returns a list of violation strings — an
-    empty list means the record is valid. Mirrors ``health_engine_config.
+    empty list means the record is valid. Mirrors ``health.config.
     validate_config`` / ``health_engine_model.validate_model``'s "collect
     every violation found in one pass, not just the first" contract (see
     those functions' docstrings for the reasoning) — a caller sees the
@@ -1779,7 +1780,7 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
     column — the repair pass's own read-only scanner for ``embedding_
     coverage``'s detector (``scan:null-embeddings``, engram-alpha#2519).
 
-    Mirrors ``health_engine_metrics.embedding_coverage``'s own "missing"
+    Mirrors ``health.metrics.embedding_coverage``'s own "missing"
     query shape exactly (same ``is_current = 1 AND type IN (...) AND
     embedding IS NULL`` predicate) — deliberately kept identical rather than
     a fresh independent query, so this scanner's ``findings_count`` and that
@@ -1795,7 +1796,7 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
     only ever be reached in a state that step 2 has already excluded.
 
     ``population`` is the metric's own declared ``denominator_population``
-    (``health_engine.CONFIG.metric("embedding_coverage").denominator_
+    (``health.engine.CONFIG.metric("embedding_coverage").denominator_
     population``) — today always ``"claim_bearing_nodes"``. Only that one
     population is implemented; a different value raises ``ValueError``
     rather than silently returning a wrong count, per this codebase's own

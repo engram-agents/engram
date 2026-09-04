@@ -1,4 +1,4 @@
-"""health_engine_config — config schema, loader, and sanity checks for the
+"""health.config — config schema, loader, and sanity checks for the
 health-score redesign engine (engram-alpha#1991, PR1 of 4).
 
 Design-of-record: engram-alpha#1991, issue comment 5372283060 (Borges,
@@ -87,8 +87,8 @@ UNAVAILABLE = _Unavailable()
 # be a declared population" check against a live frozenset object.
 #
 # PR2 (aspects A + C, engram-alpha#1991) is the first PR to actually BACK
-# those names with real signal functions (see health_engine_metrics.py /
-# health_engine.py) — claim_bearing_nodes / observations / derivations /
+# those names with real signal functions (see health/metrics.py /
+# health/engine.py) — claim_bearing_nodes / observations / derivations /
 # contradictions are now load-bearing, not placeholders. PR2 also added
 # "evidence_nodes" (dangling-evidence rate's denominator — aspect C has no
 # existing placeholder for it) and a PR2-only "not_yet_implemented" stand-in
@@ -98,7 +98,7 @@ UNAVAILABLE = _Unavailable()
 # PR3 backs aspect B's REAL metrics (recall_summary/keywords/embedding
 # coverage, giant-component fraction) — all four are scored over the SAME
 # "claim_bearing_nodes" population aspects A/C already use (design doc §2's
-# "claim-bearing projection" language; see health_engine_metrics.py's aspect-B
+# "claim-bearing projection" language; see health/metrics.py's aspect-B
 # section for why), so no new population name was needed for them. PR3 also
 # retires "not_yet_implemented" — nothing references it once the aspect-B
 # stub metric it existed for is gone (a stale, unreferenced population name
@@ -212,7 +212,7 @@ class EngineConfig:
         """Look up a declared ``MetricDef`` by name across every aspect.
 
         Added for engram-alpha#1991/#2520 round 3 (Kepler's ruling on PR5's
-        row-local population check): ``health_engine_model.validate_model``
+        row-local population check): ``health.model.validate_model``
         cross-validates a ``MetricBinding``'s ``detector``/``additional_
         detector`` population against THIS config's own real ``denominator_
         population`` for the same-named metric — ``config.metric(row.signal)

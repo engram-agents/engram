@@ -1,15 +1,15 @@
 """Tests for the repair-pass provenance record schema + validator
 (engram-alpha#2519, the health-v2 epic's follow-up to #1991/#2520's PR5).
 
-Scope: ``health_engine.REPAIR_RECORD_TOP_LEVEL_FIELDS`` /
+Scope: ``health.engine.REPAIR_RECORD_TOP_LEVEL_FIELDS`` /
 ``REPAIR_RECORD_METRIC_FIELDS`` / ``REPAIR_RECORD_STATUS_VALUES`` /
 ``REPAIR_RECORD_RUN_STATUS_VALUES`` (the schema, declared once so the
 dream-master's write path and a future #2518 panel's read path check
-against the SAME shape), ``health_engine.validate_repair_record`` (the
-schema-conformance check, mirroring ``health_engine_config.validate_config``
-/ ``health_engine_model.validate_model``'s "collect every violation into one
+against the SAME shape), ``health.engine.validate_repair_record`` (the
+schema-conformance check, mirroring ``health.config.validate_config``
+/ ``health.model.validate_model``'s "collect every violation into one
 pass, don't just raise on the first" contract), and
-``health_engine.repair_record_missing_metric_names`` (round 2's completeness
+``health.engine.repair_record_missing_metric_names`` (round 2's completeness
 helper — the "every metric gets an entry, always" side of the schema).
 
 File-organization note: this is a NEW, narrowly-scoped test file rather than
@@ -51,7 +51,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import health_engine as he  # noqa: E402
+from health import engine as he  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +393,7 @@ class TestMalformedShapes:
 # ---------------------------------------------------------------------------
 # 5. repair_record_missing_metric_names — the completeness helper
 # (JUDGMENT CALL, engram-alpha#2519 round 2: added rather than judged out of
-# scope — see health_engine.py's own docstring on the function).
+# scope — see health/engine.py's own docstring on the function).
 # ---------------------------------------------------------------------------
 
 

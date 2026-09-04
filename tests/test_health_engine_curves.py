@@ -1,4 +1,4 @@
-"""Tests for health_engine_curves.py — the Layer-3 scoring-curve library
+"""Tests for health/curves.py — the Layer-3 scoring-curve library
 (engram-alpha#1991, PR4 of 4, buildable slice).
 
 Two things live in this file, per the dispatching spec:
@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-from health_engine_curves import (  # noqa: E402
+from health.curves import (  # noqa: E402
     BADNESS_DEFAULT_CURVE,
     CurveSpec,
     GOODNESS_DEFAULT_CURVE,
@@ -291,7 +291,7 @@ class TestGoodnessDefaultCurveMirrorsBadnessDefault:
 
     def test_knots_match_hand_derivation(self):
         """Pins the exact three knots derived in GOODNESS_DEFAULT_CURVE's
-        own docstring (health_engine_curves.py), so a future edit to either
+        own docstring (health/curves.py), so a future edit to either
         curve's knots is caught here even if the dense mirror-identity
         check above were ever weakened."""
         assert GOODNESS_DEFAULT_CURVE.curve_fn(0.0) == pytest.approx(0.01)

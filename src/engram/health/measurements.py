@@ -1,4 +1,4 @@
-"""health_measurements — the L0 measurement layer (engram-alpha#2537,
+"""health.measurements — the L0 measurement layer (engram-alpha#2537,
 PR1 of 3 of the health-v2 SSoT refactor; #2537 is itself part of #1991).
 
 Design-of-record: engram-alpha#2537 (Borges, design intent; Lei's charge
@@ -18,7 +18,7 @@ version of the health spec, fully derived from bare data."
 Scope of THIS module: the L0 measurement layer only — PURELY ADDITIVE.
 ``build_snapshot`` gains a new ``measurements`` block; nothing about
 ``signals``/``scores``/``aspects``/``composed`` changes in this slice. Signal
-functions in ``health_engine_metrics.py`` are UNTOUCHED — they keep computing
+functions in ``health/metrics.py`` are UNTOUCHED — they keep computing
 their own SQL exactly as they do today. Slice 2 (#2537, not this PR) makes
 signal functions formulas over these measurements instead of independent SQL;
 slice 3 wires read-time derivation and the two version axes. Do not extend
@@ -36,7 +36,7 @@ Every L0 measurement is a plain, unconditional read off the graph — a COUNT,
 a boolean environment fact, or (for the one case below) a resolved list.
 **Unavailability is L1, decided from L0** — never decided here. A
 zero-population graph simply measures 0; nothing in this module ever returns
-health_engine_config.UNAVAILABLE. (This is the L0/L1 line's whole point: draw
+health.config.UNAVAILABLE. (This is the L0/L1 line's whole point: draw
 it here and a formula change downstream stays a minor, retro-applicable
 bump.)
 
@@ -59,7 +59,7 @@ graph run — not a hypothetical warning.
     that lives outside the health engine's own files.
 
 AST-enumerated (Borges, #2537 comment) as closed for today's code — exactly
-three live cross-module symbols in ``health_engine_metrics.py`` (the
+three live cross-module symbols in ``health/metrics.py`` (the
 PRE-EXISTING signal-function file, not this module): ``engram_core.
 CLAIM_BEARING_TYPES`` (5 call sites there, backing 6 of the 14 L0
 measurements below — the shared ``claim_bearing_current`` denominator plus
@@ -83,7 +83,7 @@ produce:
   "enabled", True)``) is an install fact AND an operator choice; one boolean
   says the gate was shut, not which conjunct shut it (accepted amendment #1,
   #2537 comment thread). Two independently-readable facts, read the exact
-  way ``health_engine_metrics.embedding_coverage``'s own gate already reads
+  way ``health.metrics.embedding_coverage``'s own gate already reads
   them.
 
 So the stored set is 14 ints + 2 embedder booleans + 1 resolved type list +
@@ -104,8 +104,8 @@ smaller copy of the defect being fixed, open for however long elapses before
 slice 3 lands (a plugin rebuild, not a slice boundary, is what actually opens
 that window).
 
-**The value stamped is ``health_version.MAJOR``, not a local constant.**
-Amendment 2 (Lei, via Borges/Ariadne) minted ``health_version.py`` as the
+**The value stamped is ``health.version.MAJOR``, not a local constant.**
+Amendment 2 (Lei, via Borges/Ariadne) minted ``health/version.py`` as the
 ONE canonical home for health-v2's own version identity — retiring the
 confusable ``ENGINE_VERSION``/``SCHEMA_VERSION`` pair into a single
 ``health-v<MAJOR>.<MINOR>`` token. This module imports ``MAJOR`` from
@@ -113,8 +113,8 @@ there rather than defining its own throwaway constant, so the stamp is
 already the right token instead of something slice 3 has to rename later
 ("do not ship the identifier we are retiring, because anything written in
 the window carries it" — Ariadne's build-lead call). See
-``health_version.py``'s own docstring for the full versioning design;
-retiring ``health_engine_config.EngineConfig``'s existing
+``health/version.py``'s own docstring for the full versioning design;
+retiring ``health.config.EngineConfig``'s existing
 ``schema_version``/``engine_version`` fields into that token is NOT this
 PR's job (real, separate blast radius on the top-level snapshot schema —
 stays out of scope for the purely-additive L0 layer).
@@ -126,7 +126,7 @@ canonical L0 set — every ``MeasurementDef``'s ``name`` + ``population``,
 sorted by name — so that adding, removing, or redefining a measurement
 (including a silent redefinition via a remote constant like
 ``CLAIM_BEARING_TYPES`` — the exact 2026-08-26 failure amendment 1 already
-named) fails the test until ``health_version.MAJOR`` is bumped and the
+named) fails the test until ``health.version.MAJOR`` is bumped and the
 hash re-pinned IN THE SAME COMMIT. Makes the MAJOR-bump rule self-enforcing
 rather than a discipline someone has to remember.
 
@@ -148,7 +148,7 @@ for the regression test simulating 2026-08-26 directly.
 
 ## Registry mechanism (this PR's own call, "deliberately yours" per the brief)
 
-Mirrors ``health_engine_model.SIGNALS`` / ``CURVES`` exactly: a plain
+Mirrors ``health.model.SIGNALS`` / ``CURVES`` exactly: a plain
 name -> object mapping, NOT a DSL, NOT an "operator + population" expression
 parser. ``MeasurementDef`` wraps one ``compute_fn``; ``MEASUREMENTS`` collects
 every one; ``compute_all_measurements(conn)`` is the single entry point
@@ -158,7 +158,7 @@ language, and building one here would be exactly the kind of unrequested
 generality the design doc's own restraint (§ "framework serves maintenance,
 never a formality") argues against.
 
-House rule (mirrors health_engine_metrics.py): access shared state ONLY via
+House rule (mirrors health/metrics.py): access shared state ONLY via
 ``import engram_core as core``, lazily inside each function that needs it —
 never a module-level import. See that module's docstring for the full
 cross-test-contamination reasoning; identical here, same test-suite fixture
@@ -171,7 +171,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable, Union
 
-from health_version import MAJOR as RAW_SCHEMA_VERSION
+from .version import MAJOR as RAW_SCHEMA_VERSION
 
 MeasurementValue = Union[int, bool, "tuple[str, ...]"]
 
@@ -261,7 +261,7 @@ _CLAIM_BEARING_TYPES_RESOLVED = _resolve_claim_bearing_types()
 
 # ---------------------------------------------------------------------------
 # Denominators (populations), all `is_current = 1` — mirrors the five
-# populations health_engine_metrics.py's nine signal functions already read;
+# populations health/metrics.py's nine signal functions already read;
 # this module measures the COUNT, not the rate.
 # ---------------------------------------------------------------------------
 
@@ -380,7 +380,7 @@ def m_evidence_uncited(conn: sqlite3.Connection) -> int:
     this correlated ``NOT EXISTS`` query is the single most expensive thing
     in ``build_snapshot`` (measured ~1.1s of a ~2.4s total on a real graph —
     94% of this PR's added wall-clock) and, until slice 2 lands, it runs
-    TWICE per snapshot: once here, and again inside ``health_engine_metrics.
+    TWICE per snapshot: once here, and again inside ``health.metrics.
     dangling_evidence_rate``, which computes the identical query independently.
     This is the price of slice 1 being honestly additive rather than
     rewiring signals early — not a defect, and not something to fix in this
@@ -405,7 +405,7 @@ def m_claim_bearing_without_recall_summary(conn: sqlite3.Connection) -> int:
     Measurement definition (Ariadne's seam #3): presence is decided by
     reading the column directly (non-NULL AND non-whitespace after
     ``.strip()``), never the ``summary_missing`` flag — see
-    ``health_engine_metrics.recall_summary_coverage``'s own docstring for
+    ``health.metrics.recall_summary_coverage``'s own docstring for
     why this is the correct read and not just a convenient one."""
     import engram_core as core  # lazy — see module docstring
 
@@ -428,7 +428,7 @@ def m_claim_bearing_without_recall_keywords(conn: sqlite3.Connection) -> int:
     Measurement definition (Ariadne's seam #3): JSON-parses; missing,
     non-list, or malformed all count as absent — mirrors
     ``engram_core._reflect_keywords``'s own read pattern, per
-    ``health_engine_metrics.recall_keywords_coverage``."""
+    ``health.metrics.recall_keywords_coverage``."""
     import json
 
     import engram_core as core  # lazy — see module docstring
@@ -460,7 +460,7 @@ def m_claim_bearing_null_embedding(conn: sqlite3.Connection) -> int:
     """Count of current claim-bearing nodes with ``embedding IS NULL``.
     Numerator for ``embedding_coverage``.
 
-    Deliberately UNCONDITIONAL — unlike ``health_engine_metrics.
+    Deliberately UNCONDITIONAL — unlike ``health.metrics.
     embedding_coverage``, this measurement does NOT check the embedder
     availability gate; that gate is an environment fact
     (``embedder_installed_available`` / ``embedder_config_enabled`` below),
@@ -486,7 +486,7 @@ def m_claim_bearing_giant_component_size(conn: sqlite3.Connection) -> int:
 
     A MEASUREMENT, not a formula (#2537's own boundary rule): the BFS traversal
     is how this is read off the graph; ``1 - size/total`` is L1 arithmetic on
-    top of it. Adapted from ``health_engine_metrics.giant_component_fraction``
+    top of it. Adapted from ``health.metrics.giant_component_fraction``
     — same plain adjacency-dict + BFS-queue approach, no networkx/numpy.
 
     Unconditional: on zero claim-bearing nodes the loop below never runs and
@@ -711,7 +711,7 @@ def canonical_l0_hash() -> str:
     measurement's declared ``definition_inputs`` (including via an edit to
     a remote code constant one of them resolves — see ``MeasurementDef``'s
     own docstring), or add/remove a measurement, and this hash changes —
-    the gate then fails until ``health_version.MAJOR`` is bumped and the
+    the gate then fails until ``health.version.MAJOR`` is bumped and the
     pinned hash updated IN THE SAME COMMIT, which is what makes the
     MAJOR-bump rule mechanically enforced rather than a discipline someone
     has to remember (the exact gap that let ``CLAIM_BEARING_TYPES`` change

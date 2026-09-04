@@ -1,4 +1,4 @@
-"""Tests for health_engine_model.py — the scoring-model file (engram-alpha
+"""Tests for health/model.py — the scoring-model file (engram-alpha
 #1991, PR5 of 5, "the dream-side contract"; round 2 = engram-alpha#2520;
 round 3 = engram-alpha#1991/#2520, Kepler's ruling, 2026-09-03).
 
@@ -22,7 +22,7 @@ positive tests changed to make the equivalent claim via an explicit
 ``load()`` call instead.
 
 Covers:
-  1. The real production model SPEC (``health_engine_model.MODEL_SPEC``) —
+  1. The real production model SPEC (``health.model.MODEL_SPEC``) —
      shape (3 aspects, 9 metrics), points sum to 100, every admitted metric
      has a registered detector + repair, [engram-alpha#2518] exactly the
      two named v1 curves are used (badness_default for badness-rate
@@ -30,7 +30,7 @@ Covers:
      metrics), the load-bearing provenance_integrity "zero admitted
      metrics" fact (documented, not silently asserted only in a
      docstring), AND [round 3] that it cross-validates cleanly against the
-     REAL ``health_engine.CONFIG`` via ``load()``.
+     REAL ``health.engine.CONFIG`` via ``load()``.
   2. ``validate_model``/``load`` — one test per contract clause, built from
      small FAKE fixture ``ScoringModel``s + a matching fake ``EngineConfig``
      (never referencing the real 9 metrics), mirroring
@@ -58,10 +58,10 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import health_engine_model as hem  # noqa: E402
-from health_engine_config import AspectDef, EngineConfig, MetricDef  # noqa: E402
-from health_engine_curves import CurveSpec, GOODNESS_DEFAULT_CURVE, piecewise_linear  # noqa: E402
-from health_engine_model import (  # noqa: E402
+from health import model as hem  # noqa: E402
+from health.config import AspectDef, EngineConfig, MetricDef  # noqa: E402
+from health.curves import CurveSpec, GOODNESS_DEFAULT_CURVE, piecewise_linear  # noqa: E402
+from health.model import (  # noqa: E402
     MODEL_SPEC,
     AspectSpec,
     DetectorRef,
@@ -106,7 +106,7 @@ def _fake_signals(*names):
 # specifically testing the population-mismatch check below — keeps every
 # OTHER test focused on the ONE violation it names, per this file's own
 # "one test per contract clause" precedent. [round 3] MUST be a genuine
-# member of health_engine_config.DECLARED_POPULATIONS (unlike round 2's
+# member of health.config.DECLARED_POPULATIONS (unlike round 2's
 # arbitrary "pop" string) because it is now used to build a real
 # EngineConfig fixture, and EngineConfig's OWN validate_config rejects an
 # undeclared population at construction time.
@@ -274,14 +274,14 @@ class TestRealModelShape:
     def test_every_detector_population_matches_the_real_config_denominator(self):
         """[round 3, replaces round 2's row-local version of this test]
         Kepler's ruling invariant, re-confirmed directly against the real
-        model spec and the real ``health_engine.CONFIG`` (not just
-        exercised indirectly via ``health_engine.py`` importing cleanly) —
+        model spec and the real ``health.engine.CONFIG`` (not just
+        exercised indirectly via ``health/engine.py`` importing cleanly) —
         every detector / additional_detector's declared population equals
         the metric's REAL ``denominator_population``, read from the real
         ``EngineConfig`` via ``config.metric()`` — not a second,
         independently-declared field on the same ``MetricBinding`` row
         (round 2's version, removed this round)."""
-        from health_engine import CONFIG
+        from health.engine import CONFIG
 
         for m in MODEL_SPEC.metrics:
             config_metric = CONFIG.metric(m.signal)
@@ -325,7 +325,7 @@ class TestRealModelShape:
             assert aspect.reference_metric is None
 
     def test_provenance_integrity_has_zero_admitted_metrics(self):
-        """LOAD-BEARING DISCOVERED CONSEQUENCE (see health_engine.py's
+        """LOAD-BEARING DISCOVERED CONSEQUENCE (see health/engine.py's
         module docstring): under the v1 metric table, provenance_integrity's
         both metrics ship at importance 0 — this aspect has NO admitted
         metric today. This is a documentation-as-test guard, mirroring this
@@ -341,17 +341,17 @@ class TestRealModelShape:
         assert admitted == []
 
     def test_model_load_against_real_config_is_the_validation_gate(self):
-        """[round 3] Mirrors health_engine_config.EngineConfig's own
+        """[round 3] Mirrors health.config.EngineConfig's own
         discipline, adapted to this module's new construct/validate split
         (see ScoringModel's own docstring for why the split exists):
-        ``health_engine.py`` importing cleanly already proves the happy
+        ``health/engine.py`` importing cleanly already proves the happy
         path (MODEL_SPEC loads against the real CONFIG without raising);
         this asserts the mechanism directly, re-running ``load()`` (which
         re-runs ``validate_model``) explicitly against the already-valid
         MODEL_SPEC + the real CONFIG — must not raise (defense-in-depth
-        check, same posture as health_engine_config.load_config's own
+        check, same posture as health.config.load_config's own
         redundant validate_config call)."""
-        from health_engine import CONFIG
+        from health.engine import CONFIG
 
         load(MODEL_SPEC, CONFIG)
 
@@ -364,7 +364,7 @@ class TestRealModelShape:
 
 class TestZeroAdmittedAspectWarning:
     def test_real_model_warns_naming_provenance_integrity(self, capsys):
-        from health_engine import CONFIG
+        from health.engine import CONFIG
 
         load(MODEL_SPEC, CONFIG)  # must not raise
         captured = capsys.readouterr()
@@ -715,7 +715,7 @@ class TestValidateModelNegative:
             load(model, _config_matching(model))
 
     def test_all_violations_collected_in_one_error(self):
-        """Mirrors health_engine_config.py's own "see the whole problem at
+        """Mirrors health/config.py's own "see the whole problem at
         once" contract — a model with TWO simultaneous violations (bad
         points sum + admitted metric missing detector/repair) raises ONE
         ModelError naming both, not two separate failures."""

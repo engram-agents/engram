@@ -92,31 +92,31 @@
       "tier": "essential"
     },
     {
-      "path": "health_engine_config.py",
+      "path": "health/config.py",
       "tier": "essential"
     },
     {
-      "path": "health_engine.py",
+      "path": "health/engine.py",
       "tier": "essential"
     },
     {
-      "path": "health_engine_metrics.py",
+      "path": "health/metrics.py",
       "tier": "essential"
     },
     {
-      "path": "health_engine_curves.py",
+      "path": "health/curves.py",
       "tier": "essential"
     },
     {
-      "path": "health_engine_model.py",
+      "path": "health/model.py",
       "tier": "essential"
     },
     {
-      "path": "health_measurements.py",
+      "path": "health/measurements.py",
       "tier": "essential"
     },
     {
-      "path": "health_version.py",
+      "path": "health/version.py",
       "tier": "essential"
     },
     {
@@ -817,6 +817,11 @@
       "path": "templates/agents.json.example",
       "tier": "convenience",
       "multi_agent": true
+    },
+    {
+      "path": "health/__init__.py",
+      "tier": "essential",
+      "note": "engram-alpha#2537 amendment 3 folder move: PEP 420 makes this non-load-bearing (Luria measured both import styles resolve without it), kept as an explicit package marker matching the tools/ package precedent."
     }
   ],
   "excluded": [

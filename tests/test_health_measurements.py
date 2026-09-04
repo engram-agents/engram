@@ -1,4 +1,4 @@
-"""Tests for health_measurements.py — the L0 measurement layer
+"""Tests for health/measurements.py — the L0 measurement layer
 (engram-alpha#2537, PR1 of 3 of the health-v2 SSoT refactor).
 
 Two jobs, kept deliberately separate:
@@ -16,7 +16,7 @@ Two jobs, kept deliberately separate:
    (arithmetic written here, mirroring each signal function's own formula —
    NOT shipped code; wiring signals as formulas over measurements is slice 2,
    #2537, out of scope for this PR) must equal the value the LIVE signal
-   function in ``health_engine_metrics.py`` returns, on the SAME connection
+   function in ``health/metrics.py`` returns, on the SAME connection
    (Ariadne's amendment #3 — two reads off one ``conn``, never two connections,
    so a concurrent-write artifact can't be mistaken for a decomposition bug).
 
@@ -50,10 +50,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram"))
 
 import engram_core  # noqa: E402
-import health_measurements as hem_l0  # noqa: E402
-import health_engine_metrics as metrics  # noqa: E402
-import health_version  # noqa: E402
-from health_engine_config import UNAVAILABLE  # noqa: E402
+from health import measurements as hem_l0  # noqa: E402
+from health import metrics  # noqa: E402
+from health import version as health_version  # noqa: E402
+from health.config import UNAVAILABLE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -324,14 +324,14 @@ class TestL0HashGate:
     definition_inputs), sorted — so an add/remove/redefine of a
     measurement (including a silent redefinition via a remote constant
     like CLAIM_BEARING_TYPES, resolved into definition_inputs) fails this
-    test until health_version.MAJOR is bumped and the hash below is
-    re-pinned IN THE SAME COMMIT. See health_measurements.canonical_l0_hash's
+    test until health.version.MAJOR is bumped and the hash below is
+    re-pinned IN THE SAME COMMIT. See health.measurements.canonical_l0_hash's
     own docstring for the full design.
 
     HOW TO UPDATE THIS PIN, when a real MAJOR-worthy change lands: bump
-    health_version.MAJOR, run
+    health.version.MAJOR, run
     ``python3 -c "import sys; sys.path.insert(0,'src/engram');
-    import health_measurements as h; print(h.canonical_l0_hash())"``,
+    from health import measurements as h; print(h.canonical_l0_hash())"``,
     paste the new digest below, in the SAME commit as the MAJOR bump."""
 
     _PINNED_L0_HASH = "ed3ac22132ff3377710aeea99501d136e69a04838e94cb7e700f1ab74aeb8fed"
@@ -525,7 +525,7 @@ def _derive_signals_from_measurements(m: dict) -> dict:
     this is what slice 2 will ship as real code; here it exists solely to
     prove the decomposition is complete and correct today, on ANY graph
     (not just a fixture engineered to keep every denominator non-zero). NOT
-    shipped, NOT imported by health_engine.py — see module docstring."""
+    shipped, NOT imported by health/engine.py — see module docstring."""
     derived = {}
 
     derived["stale_derivation_rate"] = _rate(
@@ -624,7 +624,7 @@ class TestAcceptanceCriterion:
         """THE ACCEPTANCE CRITERION. Same connection for both sides
         (Ariadne's amendment #3) — one populated fixture, one conn, read
         twice: once through compute_all_measurements, once through each
-        live signal_fn in health_engine_metrics.py. Equality is exact, not
+        live signal_fn in health/metrics.py. Equality is exact, not
         approximate — same machine, same Python, same stored inputs, so any
         difference is a defect, not float noise."""
         conn = _build_populated_fixture()

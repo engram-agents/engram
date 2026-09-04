@@ -1,4 +1,4 @@
-"""health_engine_curves — Layer 3 scoring-curve library (engram-alpha#1991,
+"""health.curves — Layer 3 scoring-curve library (engram-alpha#1991,
 PR4 of 4, buildable slice: curve library + property contract + transition
 rule).
 
@@ -11,7 +11,7 @@ caught v1" (why non-saturation is the load-bearing one of the four).
 Scope of THIS module: the curve function(s) themselves, plus a small
 dataclass pairing a curve with its declared contract. Nothing here reads a
 live sqlite3.Connection, writes anything, or imports engram_core /
-health_engine_config / health_engine_metrics — Layer 3 sits one level above
+health.config / health.metrics — Layer 3 sits one level above
 the raw signal functions (Layer 1) and metrics (Layer 2), and is pure
 arithmetic over a float, by design (design doc: "a score is a curve applied
 to a metric, with explicit input and output ranges").
@@ -35,8 +35,8 @@ rulings, and the ``observed_range`` "carrier" (auto-populating it from
 historical snapshot data) are all explicitly OUT of scope for this PR — see
 the dispatching spec's "What NOT to do".
 
-Additive-only: this module is new and is not imported by health_engine.py,
-health_engine_metrics.py, health_engine_config.py, or engram_stats.py in
+Additive-only: this module is new and is not imported by health/engine.py,
+health/metrics.py, health/config.py, or engram_stats.py in
 this PR — wiring a curve into the real per-metric scoring path is future
 work, gated on the D1/D2 rulings still pending with Lei.
 """
@@ -183,7 +183,7 @@ LEGACY_GOODNESS_TRANSITION_CURVE = CurveSpec(
     monotone_direction="decreasing",
     observed_range=(0.012, 0.105),
 )
-"""A named, shipped ``CurveSpec`` reproducing ``health_engine_metrics.py``'s
+"""A named, shipped ``CurveSpec`` reproducing ``health/metrics.py``'s
 ``metric_goodness`` function's exact shape — ``max(100.0 * (1.0 - rate),
 1.0)`` — rescaled from its native ``[1, 100]`` output range down to this
 library's ``[0, 1]`` curve contract as ``max(1.0 - rate, 0.01)``. That
@@ -243,7 +243,7 @@ object tests/test_health_engine_curve_transition.py and
 tests/test_health_engine_curves.py already reference by name — it continues
 to serve its original regression-safety role (reproducing
 ``metric_goodness``'s exact shape) and is not itself wired into the real
-scoring path health_engine_model.py builds. A new metric wanting the v1
+scoring path health/model.py builds. A new metric wanting the v1
 default badness curve should reference ``BADNESS_DEFAULT_CURVE``, not this
 one.
 """
@@ -266,7 +266,7 @@ BADNESS_DEFAULT_CURVE = CurveSpec(
     # unlike LEGACY_GOODNESS_TRANSITION_CURVE's (0.012, 0.105) — that range
     # is the stale-derivation-rate natural experiment specifically, and this
     # curve is now shared across the health-v2 model's SIX admitted metrics
-    # (health_engine_model.py), with plausibly very different natural
+    # (health/model.py), with plausibly very different natural
     # ranges (embedding_coverage's typical badness rate is not
     # stale_derivation_rate's). Stamping one metric's observed range onto a
     # now general-purpose curve would misrepresent it as the shared
@@ -276,10 +276,10 @@ BADNESS_DEFAULT_CURVE = CurveSpec(
     # PR4's original deferral).
     observed_range=None,
 )
-"""The v1 default curve for EVERY admitted metric in health_engine_model.py's
+"""The v1 default curve for EVERY admitted metric in health/model.py's
 ``MODEL`` (engram-alpha#1991 PR5) — the SAME decreasing piecewise-linear
 shape as ``LEGACY_GOODNESS_TRANSITION_CURVE`` above (``(0.0,1.0) ->
-(0.99,0.01) -> (1.0,0.01)``), reproducing ``health_engine_metrics.
+(0.99,0.01) -> (1.0,0.01)``), reproducing ``health.metrics.
 metric_goodness``'s exact transform rescaled to this library's ``[0,1]``
 contract — see that constant's own docstring for the full derivation; it is
 not repeated here since the shape is byte-for-byte identical.
@@ -297,7 +297,7 @@ which imports ``LEGACY_GOODNESS_TRANSITION_CURVE`` by name, needs ZERO
 changes — "least churn", per the PR5 spec's explicit preference.
 
 WHAT THIS IS **NOT**: not a claim that one curve shape suits every metric
-forever — see health_engine_model.py's module docstring and its
+forever — see health/model.py's module docstring and its
 ``CURVES``/``MetricBinding`` docstrings for the explicit "per-metric curve
 differentiation is future work" statement this constant's shared use is
 scoped by.
@@ -329,7 +329,7 @@ GOODNESS_DEFAULT_CURVE = CurveSpec(
     observed_range=None,
 )
 """The v1 default curve for the four literal-coverage Aspect-B
-(retrievability) metrics in health_engine_model.py's ``MODEL``
+(retrievability) metrics in health/model.py's ``MODEL``
 (``embedding_coverage``, ``recall_summary_coverage``,
 ``recall_keywords_coverage``, ``giant_component_fraction``) — bound as
 ``"goodness_default"`` in that module's ``CURVES`` registry, replacing

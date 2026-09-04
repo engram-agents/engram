@@ -338,7 +338,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # advance_turn checkpoint tool it's piggybacked onto.
         _health_checkpoint_mode = "nap" if mode == "nap" else "post_dream"
         try:
-            import health_engine
+            from health import engine as health_engine
             _health_snapshot = health_engine.write_snapshot(conn, _health_checkpoint_mode)
             health_snapshot_summary = {
                 "checkpoint_mode": _health_checkpoint_mode,

@@ -1,4 +1,4 @@
-"""health_engine_model — the scoring-model file (engram-alpha#1991, PR5 of 5,
+"""health.model — the scoring-model file (engram-alpha#1991, PR5 of 5,
 the dream-side contract).
 
 Design-of-record: engram-alpha#1991, issue comment 5527066386 (Kepler,
@@ -9,7 +9,7 @@ open (recorded inline below, at the field/section they resolve).
 
 Scope of this module: the DATA — curves, signals, aspects, metric bindings —
 that drives the real per-metric / per-aspect / composed scoring formula
-(clarification 1, wired into ``health_engine.py``'s ``build_snapshot``), plus
+(clarification 1, wired into ``health/engine.py``'s ``build_snapshot``), plus
 the validator, ``validate_model``, and the ``load()`` entry point that runs
 it.
 
@@ -19,36 +19,36 @@ Round 2's check compared a detector's declared population against a
 ``population`` field living on the SAME ``MetricBinding`` row — both written
 by the same author in the same breath, so it could not catch a detector
 pointed at a population that matches its own row's belief but not the
-metric's REAL denominator (declared on ``health_engine_config.MetricDef.
+metric's REAL denominator (declared on ``health.config.MetricDef.
 denominator_population``). Kepler's ruling: "the check is only a check if it
 reads that field." This module therefore now has **no import-time side
 effects** — it defines the model DATA (``MODEL_SPEC``, an unvalidated
 ``ScoringModel``) and the dataclasses, but does NOT construct a validated
 model at import time. The real, validated ``MODEL`` is built by
-``health_engine.py``, via this module's ``load(spec, config)`` function,
-*after* both ``MODEL_SPEC`` (this module) and the real ``CONFIG`` (health_
-engine_config.EngineConfig, populated in health_engine.py) exist — only then
+``health/engine.py``, via this module's ``load(spec, config)`` function,
+*after* both ``MODEL_SPEC`` (this module) and the real ``CONFIG`` (health.
+config.EngineConfig, populated in health/engine.py) exist — only then
 can ``validate_model`` cross-check a detector's population against
 ``config.metric(signal).denominator_population``, the real source of truth.
 This is why ``ScoringModel`` no longer validates itself in ``__post_init__``
-the way ``health_engine_config.EngineConfig`` still does (see that class's
+the way ``health.config.EngineConfig`` still does (see that class's
 own docstring for the "validate on every construction" discipline this
 module deliberately DIVERGES from, and why: this module's validation is not
 expressible without a config that does not exist until after CONFIG is
 built).
 
-This module is DELIBERATELY SEPARATE from ``health_engine_config.py``'s
+This module is DELIBERATELY SEPARATE from ``health/config.py``'s
 ``EngineConfig``/``AspectDef``/``MetricDef`` — the two are NOT redundant,
 they cover different layers (Kepler, draft-2, clarification on
-denominators): ``health_engine_config``'s schema is the RAW-SIGNAL-COMPUTATION
+denominators): ``health.config``'s schema is the RAW-SIGNAL-COMPUTATION
 layer (denominator population, empty-denominator policy, the actual
 ``signal_fn`` callable) and is UNCHANGED by this PR. This module is the
 SCORING layer draft-2 describes: which aspect a signal belongs to, its
 curve, its importance, and its detector/repair binding for the dream side.
-``health_engine.py``'s ``build_snapshot`` now reads raw signals via the OLD
-layer (``health_engine_config.EngineConfig`` / ``health_engine.CONFIG``) and
-turns them into scores via ``health_engine.MODEL`` — a validated
-``ScoringModel`` health_engine.py builds from THIS module's ``MODEL_SPEC``
+``health/engine.py``'s ``build_snapshot`` now reads raw signals via the OLD
+layer (``health.config.EngineConfig`` / ``health.engine.CONFIG``) and
+turns them into scores via ``health.engine.MODEL`` — a validated
+``ScoringModel`` health/engine.py builds from THIS module's ``MODEL_SPEC``
 via ``load()`` (round 3, see below) — see that file's module docstring for
 the fuller "two systems, on purpose, here's why" account, including the
 parts of the old layer that are now vestigial for scoring specifically
@@ -62,9 +62,9 @@ import sys
 from dataclasses import dataclass
 from typing import Callable
 
-import health_engine_metrics as metrics
-from health_engine_config import EngineConfig, _Unavailable, _check_weights_sum
-from health_engine_curves import BADNESS_DEFAULT_CURVE, CurveSpec, GOODNESS_DEFAULT_CURVE
+from . import metrics
+from .config import EngineConfig, _Unavailable, _check_weights_sum
+from .curves import BADNESS_DEFAULT_CURVE, CurveSpec, GOODNESS_DEFAULT_CURVE
 
 
 def _log(msg: str) -> None:
@@ -79,7 +79,7 @@ def _log(msg: str) -> None:
     buried in a return value most callers never inspect) defeats the
     point of surfacing it loudly.
     """
-    print(f"[health_engine_model] {msg}", file=sys.stderr, flush=True)
+    print(f"[health.model] {msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -90,12 +90,12 @@ def _log(msg: str) -> None:
 class ModelError(Exception):
     """Raised by ``validate_model`` / ``ScoringModel.__post_init__`` when the
     scoring model fails a sanity check. Lists EVERY violation found in one
-    pass, not just the first — mirrors ``health_engine_config.
+    pass, not just the first — mirrors ``health.config.
     EngineConfigError``'s "see the whole problem at once" contract exactly
     (see that class's docstring for the Borges-incident reasoning behind it).
 
     JUDGMENT CALL (flagged in the PR5 report): a NEW exception type rather
-    than reusing ``health_engine_config.EngineConfigError`` — this model is a
+    than reusing ``health.config.EngineConfigError`` — this model is a
     genuinely separate object (a ``ScoringModel``, not an ``EngineConfig``),
     and reusing the old error name would read as "something is wrong with
     the EngineConfig" when the actual failure is in the new scoring model.
@@ -140,7 +140,7 @@ SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
 # in the model file that per-metric differentiation is post-v1 and that
 # Lei's curve-carries-sensitivity argument is what the slot exists for."
 #
-# BADNESS_DEFAULT_CURVE itself is DECLARED in health_engine_curves.py (the
+# BADNESS_DEFAULT_CURVE itself is DECLARED in health/curves.py (the
 # Layer-3 curve LIBRARY — this module only binds names to library objects,
 # it does not define curve shapes) — see that file's docstring on
 # BADNESS_DEFAULT_CURVE for the full "why a separate constant, why no
@@ -151,7 +151,7 @@ SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
 # field is a per-metric name, not a global constant) so that future
 # differentiation is a data change, not a code change. Lei's
 # curve-carries-sensitivity argument (2026-09-02T14:32Z ruling, cited in
-# health_engine.py's compose_aspect_scores docstring) is EXACTLY why that
+# health/engine.py's compose_aspect_scores docstring) is EXACTLY why that
 # slot exists on every metric individually rather than once globally.
 #
 # [engram-alpha#2518, 2026-09-04] A second named curve,
@@ -225,7 +225,7 @@ class DetectorRef:
     ``MetricBinding.population`` field") with a real cross-module check:
     ``population`` must equal ``config.metric(the owning MetricBinding's
     signal).denominator_population`` — the metric's REAL declared
-    denominator on ``health_engine_config.MetricDef``, read via
+    denominator on ``health.config.MetricDef``, read via
     ``EngineConfig.metric()``, not a second independently-declared field on
     this module's own side that could drift from it while still agreeing
     with itself. This is THE field the row-local check could not validate
@@ -246,22 +246,22 @@ class MetricBinding:
     ROUND 3 (Kepler's ruling on engram-alpha#1991/#2520, 2026-09-03) REMOVED
     the round-2 ``population: str`` field this class used to carry. That
     field was an INDEPENDENTLY-declared duplicate of the metric's real
-    denominator population (``health_engine_config.MetricDef.
+    denominator population (``health.config.MetricDef.
     denominator_population``), added under round 2's stated reasoning that a
     cross-module reference to the real ``CONFIG`` was blocked by a circular
     import. That reasoning was narrower than it read: an EAGER or LAZY
-    IMPORT of ``health_engine.py``'s real ``CONFIG`` from inside THIS module
-    genuinely is circular (``health_engine.py`` imports
-    ``health_engine_model.py`` first, confirmed by direct import-order
+    IMPORT of ``health/engine.py``'s real ``CONFIG`` from inside THIS module
+    genuinely is circular (``health/engine.py`` imports
+    ``health/model.py`` first, confirmed by direct import-order
     inspection) — but a DEFERRED, parameter-PASSED reference never was
     blocked, since the cycle is created by the ``import`` statement itself,
     not by merely needing the value. Round 3 adopts exactly that
     deferred-injection shape, rather than "resolving" a cycle that a
     parameter-passed check could always have sidestepped: this module builds
     an UNVALIDATED spec at import time (``MODEL_SPEC``, below) and exposes a
-    ``load(spec, config)`` function; ``health_engine.py`` calls ``load()``
+    ``load(spec, config)`` function; ``health/engine.py`` calls ``load()``
     only AFTER its own real ``CONFIG`` exists and passes it in as an
-    ordinary argument (no import of ``health_engine.py`` from this module,
+    ordinary argument (no import of ``health/engine.py`` from this module,
     at any point), so ``validate_model`` can read ``config.metric(m.signal)
     .denominator_population`` directly — the real source of truth, per
     Kepler's ruling ("the check is only a check if it reads that field"). A
@@ -306,8 +306,8 @@ class AspectSpec:
     """One config-declared aspect (draft-2 §1's ``aspects:`` section) —
     ``points`` is this aspect's share of the composed 0-100 score (design
     ruling: aspect ``points`` sum to 100 across all declared aspects, same
-    numeric shape as ``health_engine_config.AspectDef.weight`` before it,
-    see ``health_engine.py``'s module docstring for why both exist).
+    numeric shape as ``health.config.AspectDef.weight`` before it,
+    see ``health/engine.py``'s module docstring for why both exist).
 
     ``reference_metric`` is a PURE ANNOTATION (draft-2 §1: "reference =
     annotation, never a computational input") naming this aspect's most
@@ -325,7 +325,7 @@ class AspectSpec:
     table: BOTH of its metrics ship with importance 0 (diagnostic-only, per
     draft-2 §4 — "diagnostic until a repair exists"), so it has literally
     ZERO admitted metrics to name as a reference. See the validator below,
-    and health_engine.py's module docstring for the significant downstream
+    and health/engine.py's module docstring for the significant downstream
     consequence this has for the composed score.
     """
 
@@ -341,7 +341,7 @@ class ScoringModel:
 
     DELIBERATELY NO ``__post_init__`` validation (round 3, Kepler's ruling on
     engram-alpha#1991/#2520, 2026-09-03) — this is a deliberate DIVERGENCE
-    from ``health_engine_config.EngineConfig``'s own "validate on every
+    from ``health.config.EngineConfig``'s own "validate on every
     construction, not just the loader" discipline, not an oversight; see
     that class's docstring for the discipline this class no longer follows,
     and why: ``validate_model`` (below) now needs a real ``EngineConfig`` to
@@ -350,7 +350,7 @@ class ScoringModel:
     only its own data (this module's own module-level ``MODEL_SPEC`` is
     exactly such a construction, deliberately UNVALIDATED at import time),
     but it cannot be VALIDATED without a config that, for the real
-    production model, does not exist until ``health_engine.py`` builds its
+    production model, does not exist until ``health/engine.py`` builds its
     own ``CONFIG``. Use ``load(spec, config)`` (below) to construct-then-
     validate in one step once both halves exist; constructing a
     ``ScoringModel`` directly is for building an unvalidated spec (or a
@@ -373,7 +373,7 @@ def validate_model(model: ScoringModel, config: EngineConfig) -> None:
     """Validate a ``ScoringModel`` against draft-2 §1's contract, cross-
     checked against the real ``EngineConfig`` (``config``). Raises
     ``ModelError`` listing EVERY violation found (not just the first) if any
-    check fails — mirrors ``health_engine_config.validate_config``'s "see
+    check fails — mirrors ``health.config.validate_config``'s "see
     the whole problem at once" contract; read that function before changing
     this one, per the PR5 spec's explicit instruction.
 
@@ -531,7 +531,7 @@ def validate_model(model: ScoringModel, config: EngineConfig) -> None:
     # "hold out, renormalize, report", item 3): an aspect with zero admitted
     # metrics is a valid, buildable model — this fires UNCONDITIONALLY via
     # _log() at every construction where the condition holds, never
-    # collected into `violations`, never raised. See health_engine.py's
+    # collected into `violations`, never raised. See health/engine.py's
     # compose_aspect_scores / _composition_coverage for what happens to a
     # zero-admitted aspect downstream (its point allotment is held out and
     # `composed` is renormalized over the rest).
@@ -584,12 +584,12 @@ def load(spec: ScoringModel, config: EngineConfig) -> ScoringModel:
     are the real source of truth for every detector's declared population
     (see ``validate_model``'s own docstring).
 
-    Called from ``health_engine.py`` as ``health_engine_model.load(
-    health_engine_model.MODEL_SPEC, CONFIG)``, placed textually AFTER
+    Called from ``health/engine.py`` as ``health.model.load(
+    health.model.MODEL_SPEC, CONFIG)``, placed textually AFTER
     ``CONFIG``'s own definition there — this is the whole point of
     splitting construction (this module, at import time, needs nothing but
     its own data) from validation (needs the real ``CONFIG``, which does
-    not exist until ``health_engine.py`` builds it). Raises ``ModelError``
+    not exist until ``health/engine.py`` builds it). Raises ``ModelError``
     (via ``validate_model``) naming every violation at once if the spec
     fails; returns ``spec`` unchanged (this function performs no copying or
     transformation — the ``ScoringModel`` object identity is the same
@@ -606,10 +606,10 @@ def load(spec: ScoringModel, config: EngineConfig) -> ScoringModel:
 #
 # UNVALIDATED at this point (round 3): constructing this ``ScoringModel``
 # does NOT run ``validate_model`` — see that dataclass's own docstring for
-# why. ``health_engine.py`` validates it for real via ``load(MODEL_SPEC,
+# why. ``health/engine.py`` validates it for real via ``load(MODEL_SPEC,
 # CONFIG)``, once its own ``CONFIG`` exists. Do not treat ``MODEL_SPEC``
 # itself as "the real MODEL" anywhere — the real, validated model is
-# ``health_engine.MODEL``.
+# ``health.engine.MODEL``.
 # ---------------------------------------------------------------------------
 
 _ASPECT_EPISTEMIC_INTEGRITY = AspectSpec(name="epistemic_integrity", points=40.0)
@@ -733,9 +733,9 @@ MODEL_SPEC = ScoringModel(
 )
 
 # Convenience lookup: signal name -> its MetricBinding. Built off MODEL_SPEC
-# (not the validated MODEL, which lives in health_engine.py) — this index is
+# (not the validated MODEL, which lives in health/engine.py) — this index is
 # a pure name->binding derivation, needs no cross-config validation, and is
-# used by tests/health_engine.py alike purely to look up a binding by name.
+# used by tests/ and health/engine.py alike purely to look up a binding by name.
 # Every signal appears in exactly one binding today (validate_model's
 # duplicate-pair check would catch a signal reused with a DIFFERENT aspect;
 # a signal bound twice to the SAME aspect is caught by the same check too,

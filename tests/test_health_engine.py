@@ -1,4 +1,4 @@
-"""Tests for health_engine.py — the real production CONFIG, the [PR5]
+"""Tests for health/engine.py — the real production CONFIG, the [PR5]
 dream-side scoring model wiring, composition, and the snapshot writer
 (engram-alpha#1991, PR2+PR3+PR5 of 5).
 
@@ -9,7 +9,7 @@ Covers:
      weighted-arithmetic-sum formula (Kepler's draft-2 clarification 1),
      UNAVAILABLE propagation (including the zero-admitted-metrics case),
      and the load-bearing discovered consequence for provenance_integrity
-     under the real MODEL (see health_engine.py's module docstring).
+     under the real MODEL (see health/engine.py's module docstring).
   3. build_snapshot's full dict shape (schema_version, engine_version,
      config, definitions, signals, scores, red_flags, diagnostics, anchor,
      turn, checkpoint_mode) against a real (throwaway) SQLite conn.
@@ -39,12 +39,12 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engram_core  # noqa: E402
-import health_engine  # noqa: E402
-import health_measurements  # noqa: E402
-import health_engine_metrics as hem  # noqa: E402
-from health_engine_config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
-from health_engine_curves import CurveSpec  # noqa: E402
-from health_engine_model import (  # noqa: E402
+from health import engine as health_engine  # noqa: E402
+from health import measurements as health_measurements  # noqa: E402
+from health import metrics as hem  # noqa: E402
+from health.config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
+from health.curves import CurveSpec  # noqa: E402
+from health.model import (  # noqa: E402
     AspectSpec,
     DetectorRef,
     MetricBinding,
@@ -84,7 +84,7 @@ CREATE TABLE edit_history (
     details     TEXT DEFAULT '{}'
 );
 
--- health_engine_metrics.stale_derivation_rate/taint_rate query this table
+-- health.metrics.stale_derivation_rate/taint_rate query this table
 -- (cascade machine, #1991 sec1 re-point) -- present here so any test that
 -- exercises build_snapshot() over a real derivation/claim-bearing node
 -- doesn't hit sqlite3.OperationalError: no such table. Mirrors
@@ -439,7 +439,7 @@ class TestScoreAspect:
         assert score == pytest.approx(0.65)
 
     def test_zero_admitted_metrics_is_unavailable(self):
-        """LOAD-BEARING CASE (see health_engine.py's module docstring): an
+        """LOAD-BEARING CASE (see health/engine.py's module docstring): an
         aspect whose every metric is importance=0 (diagnostic-only) has
         nothing to sum over — UNAVAILABLE, not zero, not skipped."""
         model = ScoringModel(
@@ -557,7 +557,7 @@ class TestRealModelCompositionConsequence:
     renormalized over the remaining 75. Supersedes this class's PR5-round-1
     version, which asserted the OPPOSITE (composed IS UNAVAILABLE) — that
     was the discovered consequence THIS round's design ruling resolves;
-    see health_engine.py's module docstring "RESOLVED" section."""
+    see health/engine.py's module docstring "RESOLVED" section."""
 
     def test_composed_is_a_real_number_renormalized_over_scored_aspects(self):
         conn = _make_conn()
@@ -606,19 +606,19 @@ class TestZeroAdmittedAspectExtensibility:
     ask, item 4): the moment provenance_integrity gains an admitted metric
     (importance > 0, valid detector+repair), it automatically re-enters
     composition on the NEXT model construction — no special-casing of
-    "provenance_integrity" by name anywhere in health_engine.py's
-    composition logic or health_engine_model.py's validator. Builds a
+    "provenance_integrity" by name anywhere in health/engine.py's
+    composition logic or health/model.py's validator. Builds a
     MODIFIED model the same way tests/test_health_engine_model.py already
     builds adversarial/fake models — via dataclasses.replace off the REAL
     MODEL (round 3: ``health_engine.MODEL``, the validated model — no
-    longer importable ready-made from health_engine_model.py, see that
+    longer importable ready-made from health/model.py, see that
     module's own docstring), never a hand-rewritten copy of the 9-metric
     table (which would risk silently drifting from the real shape)."""
 
     def _model_with_uncited_observation_rate_admitted(self):
         import dataclasses
 
-        from health_engine import MODEL as real_model
+        from health.engine import MODEL as real_model
 
         new_metrics = tuple(
             dataclasses.replace(
@@ -676,7 +676,7 @@ class TestBuildSnapshot:
 
     def test_top_level_keys(self):
         """``measurements`` (engram-alpha#2537, PR1 of 3) is the one new key
-        this PR adds — purely additive, see health_measurements.py's
+        this PR adds — purely additive, see health/measurements.py's
         module docstring. Every other key is unchanged from PR5."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
@@ -723,7 +723,7 @@ class TestBuildSnapshot:
 
     def test_red_flags_still_empty_diagnostics_now_populated(self):
         """red_flags stays [] (DAG-violations-as-a-red-flag is out of scope
-        for PR3 too — see health_engine.py's module docstring) — but PR3
+        for PR3 too — see health/engine.py's module docstring) — but PR3
         replaces the previously-empty diagnostics block ({}) with a real
         dict (activity metrics + cascade-marker age)."""
         conn = _make_conn()
@@ -768,7 +768,7 @@ class TestBuildSnapshot:
         assert snap["signals"]["embedding_coverage"] == "UNAVAILABLE"
         assert snap["signals"]["giant_component_fraction"] == "UNAVAILABLE"
         # CHANGED (fold #2): zero contradiction NODES -> UNAVAILABLE, not a
-        # fabricated "clean" 0.0 — see health_engine_metrics.
+        # fabricated "clean" 0.0 — see health.metrics.
         # open_contradiction_rate's own docstring.
         assert snap["signals"]["open_contradiction_rate"] == "UNAVAILABLE"
         assert snap["scores"]["aspects"]["epistemic_integrity"] == "UNAVAILABLE"
@@ -807,7 +807,7 @@ class TestBuildSnapshot:
         admitted metrics — unchanged by round 2), but round 2's "hold out,
         renormalize, report" ruling means this NO LONGER propagates to the
         top-level composed score — see TestRealModelCompositionConsequence
-        above for the dedicated test of that fact, and health_engine.py's
+        above for the dedicated test of that fact, and health/engine.py's
         module docstring "RESOLVED" section for the full reasoning. This
         fixture deliberately carries NO contradiction node, so open_
         contradiction_rate (round 2's fold #2: UNAVAILABLE on an EMPTY
@@ -874,15 +874,15 @@ class TestBuildSnapshot:
         (snap["scores"]["metrics"]) must be derived from the SAME curve the
         real scoring model binds to that metric (``badness_default`` for
         five of the nine real metrics, ``goodness_default`` for the other
-        four as of engram-alpha#2518 — see health_engine_model.py's
+        four as of engram-alpha#2518 — see health/model.py's
         ``CURVES``) — not an independently re-implemented copy of the
         transform that could silently diverge. This test exercises
         ``open_contradiction_rate`` specifically, which stays on
         ``badness_default``, unaffected by #2518's flip.
         Supersedes the PR2/PR3-era version of this test, which compared
-        against ``hem.metric_goodness`` (now dead code from health_engine.
+        against ``hem.metric_goodness`` (now dead code from health/engine.
         py's perspective — see that module's docstring)."""
-        import health_engine_model as hem_model
+        from health import model as hem_model
 
         conn = _make_conn()
         _insert(conn, "ct_1", "contradiction", status="active")
@@ -895,7 +895,7 @@ class TestBuildSnapshot:
         assert snap["scores"]["metrics"]["open_contradiction_rate"] == curve.curve_fn(raw)
         # Numerically, badness_default's shape still matches the OLD
         # metric_goodness transform divided by 100 (by construction — see
-        # health_engine_curves.py's BADNESS_DEFAULT_CURVE docstring) — this
+        # health/curves.py's BADNESS_DEFAULT_CURVE docstring) — this
         # is the one place the old and new numbers stay directly comparable.
         assert snap["scores"]["metrics"]["open_contradiction_rate"] == pytest.approx(
             hem.metric_goodness(raw) / 100.0
@@ -904,7 +904,7 @@ class TestBuildSnapshot:
 
 # ---------------------------------------------------------------------------
 # 6. Diagnostics (PR3) — activity metrics + cascade-marker age. Never wired
-#    into scoring — see health_engine.py's module docstring.
+#    into scoring — see health/engine.py's module docstring.
 # ---------------------------------------------------------------------------
 
 
@@ -1316,7 +1316,7 @@ class TestDreamProjection:
 
     def test_admitted_flag_matches_the_scoring_model(self, tmp_path, monkeypatch):
         import engram_core as core
-        import health_engine_model as hem_model
+        from health import model as hem_model
 
         monkeypatch.setattr(core, "DATA_DIR", tmp_path)
         conn = _make_conn()
@@ -1370,7 +1370,7 @@ class TestDreamProjection:
 # ---------------------------------------------------------------------------
 # [engram-alpha#2519] _count_null_embeddings — the repair pass's own ONE
 # genuinely new read-only scanner (embedding_coverage's detector,
-# scan:null-embeddings). Mirrors health_engine_metrics.embedding_coverage's
+# scan:null-embeddings). Mirrors health.metrics.embedding_coverage's
 # own "missing" query shape (same is_current=1 AND type IN (...) AND
 # embedding IS NULL predicate) — these tests exist to prove that mirroring
 # holds, not to re-test embedding_coverage itself.

@@ -11,14 +11,22 @@ pre_sleep wiring; its absence is intentional, not an oversight to catch here.
 
 Fixture note: this file's fresh_server() extends the established
 tests/test_nap_payload.py / test_advance_turn_payload.py pattern by ALSO
-clearing health_engine / health_engine_metrics / health_engine_config from
-sys.modules. Those three modules are the first `health_engine*` family
-members to import engram_core, and the existing fresh_server() convention's
-module-clearing predicate (`key == "server" or key.startswith("engram_")`)
-does not sweep them — see health_engine_metrics.py's module docstring for
-why a stale cross-test engram_core binding would otherwise be a real (not
-hypothetical) contamination risk once this file exists in the same pytest
-process as the pre-existing nap/advance_turn test files.
+clearing the whole `health` package (`health` itself plus every
+`health.*` submodule — engine, metrics, config, measurements, model,
+curves, version) from sys.modules. These are the first modules to import
+engram_core outside the `health_engine*` flat-file family this predicate
+originally targeted (engram-alpha#2537 amendment 3 folded the flat
+`health_engine*.py` files into a `health/` package), and the existing
+fresh_server() convention's module-clearing predicate
+(`key == "server" or key.startswith("engram_")`) does not sweep them —
+see health/metrics.py's module docstring for why a stale cross-test
+engram_core binding would otherwise be a real (not hypothetical)
+contamination risk once this file exists in the same pytest process as
+the pre-existing nap/advance_turn test files. The package-prefix sweep
+(`key == "health" or key.startswith("health.")`) is broader than the old
+`startswith("health_engine")` predicate — it now also covers
+health.measurements/health.model/health.curves/health.version, which the
+original predicate never named.
 """
 
 import atexit
@@ -105,7 +113,8 @@ def fresh_server():
         if (
             key == "server"
             or key.startswith("engram_")
-            or key.startswith("health_engine")
+            or key == "health"
+            or key.startswith("health.")
         ):
             del sys.modules[key]
     import server
@@ -179,7 +188,7 @@ def test_health_engine_failure_does_not_break_nap(monkeypatch):
     still return its normal success result — mirrors core._commit_snapshot's
     own best-effort posture that this wiring is piggybacked onto."""
     server = fresh_server()
-    import health_engine
+    from health import engine as health_engine
 
     def _boom(conn, checkpoint_mode, config=health_engine.CONFIG):
         raise RuntimeError("simulated health-engine failure")

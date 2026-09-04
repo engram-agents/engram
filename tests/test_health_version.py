@@ -1,4 +1,4 @@
-"""Tests for health_version.py — the canonical health-v2 version-identity
+"""Tests for health/version.py — the canonical health-v2 version-identity
 module (engram-alpha#2537, Lei's amendment 2)."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram"))
 
-import health_version  # noqa: E402
+from health import version as health_version  # noqa: E402
 
 
 class TestFormatVersion:

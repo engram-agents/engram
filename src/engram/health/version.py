@@ -1,4 +1,4 @@
-"""health_version — the single canonical home for health-v2's own version
+"""health.version — the single canonical home for health-v2's own version
 identity (engram-alpha#2537, Lei's amendment 2: "please make it very
 differentiate from our Engram versioning, otherwise it's very confusing").
 
@@ -52,12 +52,12 @@ deliberate choice, not an oversight.
 ## Scope (slice 1, #2537) — the token exists; the retirement doesn't, yet
 
 This PR is the L0 measurement layer, purely additive. It mints this module
-and points ``health_measurements.py``'s own L0-identity stamp at
+and points ``health/measurements.py``'s own L0-identity stamp at
 ``MAJOR`` here (replacing what would otherwise have been a throwaway local
 constant — Ariadne's build-lead call: "do not ship the identifier we are
 retiring, because anything written in the window carries it"). It does
-**not** touch ``health_engine_config.EngineConfig``'s existing
-``schema_version``/``engine_version`` fields, or ``health_engine.py``'s
+**not** touch ``health.config.EngineConfig``'s existing
+``schema_version``/``engine_version`` fields, or ``health/engine.py``'s
 ``CONFIG`` construction — retiring those two fields into this one token is
 real, separate blast radius (a change to the top-level snapshot's own
 schema, not to the purely-additive L0 layer) and stays out of scope here.
@@ -67,7 +67,7 @@ from __future__ import annotations
 
 MAJOR = 1
 """Identity of the current L0 (bare-data) measurement set. Bump this
-whenever a measurement in ``health_measurements.MEASUREMENTS`` is added,
+whenever a measurement in ``health.measurements.MEASUREMENTS`` is added,
 removed, or redefined — enforced mechanically by the L0 hash gate
 (``tests/test_health_measurements.py``), not left to memory."""
 
@@ -99,19 +99,19 @@ def parse_version(version: str) -> tuple[int, int]:
     prefix = "health-v"
     if not version.startswith(prefix):
         raise ValueError(
-            f"not a health_version string (missing {prefix!r} prefix): {version!r}"
+            f"not a health.version string (missing {prefix!r} prefix): {version!r}"
         )
     rest = version[len(prefix):]
     parts = rest.split(".")
     if len(parts) != 2:
         raise ValueError(
-            f"not a health_version string (expected exactly one '.' after "
+            f"not a health.version string (expected exactly one '.' after "
             f"{prefix!r}, got {len(parts) - 1}): {version!r}"
         )
     major_str, minor_str = parts
     if not (major_str.isdigit() and minor_str.isdigit()):
         raise ValueError(
-            f"not a health_version string (major/minor must be plain "
+            f"not a health.version string (major/minor must be plain "
             f"non-negative integers): {version!r}"
         )
     return int(major_str), int(minor_str)

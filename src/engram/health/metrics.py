@@ -1,4 +1,4 @@
-"""health_engine_metrics — signal + scoring function catalogue for aspects A
+"""health.metrics — signal + scoring function catalogue for aspects A
 (epistemic integrity), B (retrievability), and C (provenance integrity) of
 the health-score redesign engine (engram-alpha#1991, PR2+PR3 of 4).
 
@@ -7,16 +7,16 @@ Design-of-record: engram-alpha#1991, issue comment 5372283060 (Borges,
 and §5 (engine contract).
 
 Scope of this module: the actual signal functions (``Callable[[sqlite3.
-Connection], float | _Unavailable]`` per health_engine_config.MetricDef's
+Connection], float | _Unavailable]`` per health.config.MetricDef's
 type) for aspect A's three metrics, aspect B's four metrics (PR3), and
 aspect C's two metrics, plus one shared aspect-level scoring function used
-by every real AspectDef in health_engine.py.
+by every real AspectDef in health/engine.py.
 
 Each signal function is SELF-CONTAINED: it takes only ``conn`` (per PR1's
 fixed ``Callable[[sqlite3.Connection], float | _Unavailable]`` signature —
 signal functions do not receive their own MetricDef, so the empty_denominator
 policy each function implements below is *by construction* identical to the
-policy declared on its corresponding MetricDef in health_engine.py, not
+policy declared on its corresponding MetricDef in health/engine.py, not
 independently checked against it at runtime; validate_config only checks
 that the declared policy is a real enum value, not that a signal_fn's
 runtime behaviour matches it — see design doc §5 contract item 5).
@@ -27,8 +27,8 @@ MEANING, full stop: a ``*_rate`` name returns that rate (0.0 = none affected,
 literal coverage/fraction (0.0 = none covered, 1.0 = fully covered).
 Direction/polarity is NOT encoded in the sign of the raw value anywhere in
 this module — it is declared exactly once per metric, on that metric's bound
-``CurveSpec.monotone_direction`` (health_engine_curves.py), via
-health_engine_model.py's ``CURVES``/``MetricBinding`` wiring: a "decreasing"
+``CurveSpec.monotone_direction`` (health/curves.py), via
+health/model.py's ``CURVES``/``MetricBinding`` wiring: a "decreasing"
 curve (``BADNESS_DEFAULT_CURVE``, bound as ``"badness_default"``) for the
 five aspect A/C badness-rate metrics (higher raw value = worse), an
 "increasing" curve (``GOODNESS_DEFAULT_CURVE``, bound as
@@ -36,7 +36,7 @@ five aspect A/C badness-rate metrics (higher raw value = worse), an
 raw value = better). ``metric_goodness`` below still computes ``max(100 *
 (1 - rate), 1)`` — that formula is unchanged and still describes what IT
 does — but it (and ``aspect_geometric_mean_scoring``) is dead code from
-health_engine.py's real-scoring-path perspective as of the curve-library
+health/engine.py's real-scoring-path perspective as of the curve-library
 wiring (PR5; see tests/test_health_engine_curve_transition.py's own note);
 the live path always goes through a metric's bound curve, never through
 ``metric_goodness`` directly.
@@ -68,7 +68,7 @@ module top level — deliberately, not an oversight. The test-suite's
 ``fresh_server()`` fixture pattern (tests/test_nap_payload.py and siblings)
 reloads ``engram_core`` per test via ``del sys.modules['engram_core']`` +
 re-``import``, but its module-clearing predicate only matches ``"server"``
-or a ``"engram_"`` prefix — ``health_engine_metrics`` isn't swept by that
+or a ``"engram_"`` prefix — ``health.metrics`` isn't swept by that
 loop. A module-level ``import engram_core as core`` here would bind ONCE,
 at whichever test happens to import this module first, and silently keep
 referencing that test's stale (possibly since-deleted) ``engram_core``
@@ -85,7 +85,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from health_engine_config import UNAVAILABLE, _Unavailable
+from .config import UNAVAILABLE, _Unavailable
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ def dangling_evidence_rate(conn: sqlite3.Connection) -> float | _Unavailable:
 # All four now return their OWN LITERAL coverage/goodness fraction (0.0 =
 # none covered/worst, 1.0 = fully covered/best) — see module docstring's
 # "SIGN CONVENTION" note. Each is bound to the increasing "goodness_default"
-# curve (health_engine_model.py), not "badness_default".
+# curve (health/model.py), not "badness_default".
 # ---------------------------------------------------------------------------
 
 
@@ -494,7 +494,7 @@ def metric_goodness(rate: float) -> float:
 
     Single source of truth for this transform — reviewer-fairy round 1 on
     PR2 found it independently re-implemented inline in
-    ``health_engine.build_snapshot``'s per-metric display computation
+    ``health.engine.build_snapshot``'s per-metric display computation
     (``scores.metrics``) as well as here; extracted so the two call sites
     can't silently diverge if the transform or floor value ever changes.
     """

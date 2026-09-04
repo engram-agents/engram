@@ -1,4 +1,4 @@
-"""Tests for health_engine_metrics.py — the aspect A/B/C signal + scoring
+"""Tests for health/metrics.py — the aspect A/B/C signal + scoring
 function catalogue (engram-alpha#1991, PR2+PR3 of 4).
 
 Builds a small, real, throwaway SQLite fixture DB (the ``nodes``/``edges``
@@ -10,7 +10,7 @@ is UNAVAILABLE, not 0 or a ZeroDivisionError).
 
 UPDATED (engram-alpha#2520 round 2, fold #2, 2026-09-03): open_contradiction_
 rate's empty-denominator policy CHANGED from "clean" (0.0) to UNAVAILABLE —
-see health_engine_metrics.open_contradiction_rate's own docstring for the
+see health.metrics.open_contradiction_rate's own docstring for the
 full reasoning (the "hold out, renormalize, report" design ruling makes the
 old "clean" reasoning fabricate a number for an unmeasured population). It
 now matches its two epistemic_integrity siblings' empty-population
@@ -18,7 +18,7 @@ treatment exactly.
 
 UPDATED (engram-alpha#2518, 2026-09-04): Aspect B's four metrics now return
 their OWN LITERAL coverage/goodness fraction (1.0 = fully covered/best,
-0.0 = none covered/worst) — see health_engine_metrics.py's module docstring
+0.0 = none covered/worst) — see health/metrics.py's module docstring
 "SIGN CONVENTION" note. Before this PR they returned the badness-rate
 COMPLEMENT of their coverage-style names instead (polarity lived in the raw
 signal's sign); every test below now asserts against the literal coverage
@@ -38,8 +38,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engram_core  # noqa: E402
-import health_engine_metrics as hem  # noqa: E402
-from health_engine_config import UNAVAILABLE  # noqa: E402
+from health import metrics as hem  # noqa: E402
+from health.config import UNAVAILABLE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

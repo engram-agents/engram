@@ -5,19 +5,19 @@ WHY THIS FILE CHANGED: this file used to prove that a hand-built
 ``piecewise_linear`` curve, rescaled from ``metric_goodness``'s exact shape,
 matched PR1-3's per-metric scoring behavior EXACTLY (``LEGACY_GOODNESS_
 TRANSITION_CURVE``'s own regression-safety role, still documented in
-health_engine_curves.py). That guarantee — "the first shipped curve-library
+health/curves.py). That guarantee — "the first shipped curve-library
 model must reproduce today's nine scores" — was the design doc's transition
 rule for PR4's buildable slice, when the curve library was NOT YET wired
 into any real scoring path (PR4's own module docstring: "additive-only,
-this module is new and is not imported by health_engine.py ... in this
-PR"). PR5 wires curves into the REAL scoring path directly (health_engine.
-py's ``build_snapshot``, driven by health_engine.MODEL — round 3 moved
-construction here from ``health_engine_model.MODEL``, see that module's
+this module is new and is not imported by health/engine.py ... in this
+PR"). PR5 wires curves into the REAL scoring path directly (health/engine.
+py's ``build_snapshot``, driven by health.engine.MODEL — round 3 moved
+construction here from ``health.model.MODEL``, see that module's
 docstring) — so asserting
 "the curve reproduces the old formula" is no longer a meaningful regression
 guard for the real path: the real path never computes ``metric_goodness``
-anymore (health_engine_metrics.aspect_geometric_mean_scoring /
-metric_goodness are DEAD CODE from health_engine.py's perspective as of
+anymore (health.metrics.aspect_geometric_mean_scoring /
+metric_goodness are DEAD CODE from health/engine.py's perspective as of
 PR5 — see that module's docstring). Lei's ruling (via Borges, 2026-09-02):
 exact-score reproduction is not required for v2.
 
@@ -25,12 +25,12 @@ REPURPOSED (option (b) of the PR5 spec's "retire vs repurpose" choice,
 preferred over deleting outright because this file's fixture-DB
 infrastructure — a realistic multi-metric, multi-aspect graph exercising
 all nine real signal functions at once — is worth reusing): this file now
-tests that health_engine.MODEL's ONE v1 curve (``badness_default``),
-wired through the REAL composition path (``health_engine.build_snapshot``),
+tests that health.engine.MODEL's ONE v1 curve (``badness_default``),
+wired through the REAL composition path (``health.engine.build_snapshot``),
 produces SANE results against this same realistic fixture — bounded scores,
 no NaN, and the documented (informational, not load-bearing) fact that
 ``badness_default`` happens to numerically match ``metric_goodness``'s old
-shape, since it was built that way on purpose (health_engine_curves.py's
+shape, since it was built that way on purpose (health/curves.py's
 ``BADNESS_DEFAULT_CURVE`` docstring).
 """
 
@@ -47,16 +47,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest  # noqa: E402
 
-import health_engine as he  # noqa: E402
-import health_engine_metrics as hem  # noqa: E402
-import health_engine_model as hem_model  # noqa: E402
-from health_engine_config import UNAVAILABLE  # noqa: E402
+from health import engine as he  # noqa: E402
+from health import metrics as hem  # noqa: E402
+from health import model as hem_model  # noqa: E402
+from health.config import UNAVAILABLE  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Fixture DB — same DDL/helper shape as tests/test_health_engine_metrics.py
 # and tests/test_health_engine.py (this repo's established per-test-file
-# fixture-DDL convention; each health_engine* test file defines its own
+# fixture-DDL convention; each health.engine* test file defines its own
 # copy rather than sharing one via conftest.py). UNCHANGED from the pre-PR5
 # version of this file — this infrastructure is exactly what's worth
 # reusing (see module docstring).
@@ -206,11 +206,11 @@ def _build_fixture_conn() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# The nine real metric bindings — read off health_engine.MODEL (round 3: the
-# validated model, built by health_engine.py via health_engine_model.load()
-# — no longer importable ready-made as health_engine_model.MODEL, see that
+# The nine real metric bindings — read off health.engine.MODEL (round 3: the
+# validated model, built by health/engine.py via health.model.load()
+# — no longer importable ready-made as health.model.MODEL, see that
 # module's own docstring), never hand-copied (same discipline the pre-PR5
-# version of this file applied to health_engine.CONFIG).
+# version of this file applied to health.engine.CONFIG).
 # ---------------------------------------------------------------------------
 
 _ALL_REAL_BINDINGS = he.MODEL.metrics
@@ -238,7 +238,7 @@ def test_model_has_exactly_nine_real_metric_bindings():
 @pytest.mark.parametrize("binding", _ALL_REAL_BINDINGS, ids=lambda m: m.signal)
 def test_badness_default_curve_produces_sane_scores_for_every_real_metric(binding):
     """For each real metric binding: run its REAL signal function (via
-    health_engine_model.SIGNALS — the name registry, clarification 2)
+    health.model.SIGNALS — the name registry, clarification 2)
     against the fixture db to get an actual current rate, then assert its
     bound curve (``badness_default`` for all nine today) produces a SANE
     score: bounded to [0,1] (its declared output_range), never NaN.
@@ -268,7 +268,7 @@ def test_badness_default_curve_produces_sane_scores_for_every_real_metric(bindin
 
     # Informational, NOT the load-bearing guard anymore (see module
     # docstring): badness_default was built to numerically reproduce
-    # metric_goodness's old shape on purpose (health_engine_curves.py's
+    # metric_goodness's old shape on purpose (health/curves.py's
     # BADNESS_DEFAULT_CURVE docstring) — this documents that fact still
     # holds, it does not assert it as a requirement going forward.
     assert score == pytest.approx(hem.metric_goodness(rate) / 100.0, abs=1e-9)
@@ -277,7 +277,7 @@ def test_badness_default_curve_produces_sane_scores_for_every_real_metric(bindin
 def test_full_build_snapshot_wired_through_the_new_model_produces_sane_results():
     """End-to-end integration check (the PR5 spec's step 3 manual-sanity
     ask, promoted to a committed test since the fixture already exists
-    here): run the REAL health_engine.build_snapshot against this
+    here): run the REAL health.engine.build_snapshot against this
     realistic, multi-metric fixture and assert the whole pipeline — signal
     computation -> curve -> per-aspect weighted sum -> composed — produces
     sane, bounded numbers with no NaN / no None-where-a-number-is-expected.
@@ -291,7 +291,7 @@ def test_full_build_snapshot_wired_through_the_new_model_produces_sane_results()
     ``composed`` — its 25 points are held out and ``composed`` is
     renormalized over the remaining 75, landing on a REAL number even on
     this healthy-ish fixture (PR5 round 1 asserted the OPPOSITE here; see
-    health_engine.py's module docstring "RESOLVED" section for why).
+    health/engine.py's module docstring "RESOLVED" section for why).
     """
     with mock.patch("engram_core._embedder.is_available", return_value=True):
         conn = _build_fixture_conn()
