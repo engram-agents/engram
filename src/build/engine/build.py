@@ -1352,6 +1352,34 @@ def build_plugin(
         f"hooks.json ↔ shipped-files: OK ({n_referenced} referenced, all present)"
     )
 
+    # ── 6c. Declared-vs-copied reconciliation gate ───────────────────────────
+    # Historically (#1962), every one of the seven copy sections dispatched by
+    # literal path prefix with no catch-all, so a manifest entry matching none
+    # of them was silently never copied: no error, no warning, no skip line.
+    # engram-alpha#2547 closed most of that gap with a generic manifest-driven
+    # loop (see SPECIAL_COPY_PREFIXES above) that now dies loudly on its own
+    # for any entry it can't find on disk — but the four SPECIAL_COPY_PREFIXES
+    # sections (hooks/, skills/, agents/, output-styles/) still enumerate their
+    # source directory via os.scandir/os.listdir and silently skip a declared
+    # entry whose real file/dir is absent, so this gate remains the only thing
+    # that catches THAT residual shape. copied_paths legitimately contains
+    # MORE than ship_set (plugin.json, hooks/hooks.json, packaging/mcp.json /
+    # .mcp.json / .codex-plugin/plugin.json, platform.json are build-generated
+    # meta files, never manifest-tracked), so this is a one-directional check
+    # — only "declared but never copied" is an error.
+    missing_from_copy = ship_set - set(copied_paths)
+    if missing_from_copy:
+        _die(
+            f"Manifest declares {sorted(missing_from_copy)} but no copy section "
+            f"handled them. The four SPECIAL_COPY_PREFIXES sections (hooks/, "
+            f"skills/, agents/, output-styles/) each enumerate their own source "
+            f"directory and silently skip an entry whose real file/dir is "
+            f"absent — check that the declared path actually exists on disk, "
+            f"or that its prefix is genuinely one of the four special sections "
+            f"(everything else goes through the generic loop, which dies loudly "
+            f"on its own)."
+        )
+
     # ── 7. Build manifest ─────────────────────────────────────────────────────
 
     build_manifest_path = os.path.join(plugin_root, ".engram-build-manifest.json")
