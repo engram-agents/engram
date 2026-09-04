@@ -72,16 +72,45 @@ import json
 import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
+from . import footer
 from . import routes
+from . import shell
+from . import urls as viz_urls
 from .data import calibration as viz_calibration_data
 from .data import config as viz_config_data
 from .data import graph as viz_graph_data
 from .data import health as viz_health_data
 from .data import schema as viz_schema_data
 from .data import stats as viz_stats_data
+
+# ---------------------------------------------------------------------------
+# Static assets (engram-alpha#2555 PR B amendment-1, requirement 5): CSS/JS
+# served from one real /static/<filename> route with cache headers, instead
+# of PR A's baked-into-Python-string-constants shape. static/ is a FLAT
+# directory (base.css, nav.js, graph.css, graph.js,
+# graph-agent-select.js) -- no subdirectories are ever a legitimate request,
+# which is what makes the path-traversal guard below simple to get right:
+# reject any filename containing a path separator or '..' outright, rather
+# than trying to canonicalize-and-compare against arbitrarily nested input.
+# ---------------------------------------------------------------------------
+
+_STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
+
+_STATIC_CONTENT_TYPES = {
+    ".css": "text/css",
+    ".js": "application/javascript",
+}
+
+# These are static assets bundled with the plugin (not per-agent dynamic
+# content) -- a 1-hour cache is a reasonable default; nothing here changes
+# without a plugin upgrade, which is a process restart anyway (see the
+# INVOCATION NOTE above on why a changed source file needs an operator
+# restart to take effect).
+_STATIC_CACHE_CONTROL = "public, max-age=3600"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -92,13 +121,68 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path.startswith("/static/"):
+            self._serve_static(path[len("/static/"):])
+            return
+
         if path == "/api/agents":
             self._json({"agents": viz_agents.get_agents_meta(),
                         "default": viz_agents.DEFAULT_AGENT})
             return
 
         if path in routes.PAGE_ROUTES:
-            self._html(routes.PAGE_ROUTES[path])
+            # Nav rendering happens HERE, at request time, not at import
+            # time in shell.py (engram-alpha#2555 PR B amendment-1,
+            # requirement 2 + 3) -- the active tab is a property of the
+            # matched route, and each nav link must carry the EFFECTIVE
+            # agent through via url_for(), not some import-time default.
+            # See shell.py's module docstring for the full two-phase
+            # (import-time shell + request-time nav splice) architecture.
+            #
+            # RESOLVED agent, not the raw ?agent= param -- deliberate fix
+            # over the coder-fairy's first cut, which carried through only
+            # an EXPLICIT ?agent= and left it absent otherwise, banking on
+            # every page independently re-resolving to the SAME default.
+            # That holds only while DEFAULT_AGENT is stable across the two
+            # requests; agents.py's own _refresh_agents_if_stale() means it
+            # is NOT always stable (a TTL-driven re-discovery can promote a
+            # different agent to "first alphabetically" between two page
+            # loads in the same session) -- exactly the "switching pages
+            # silently changes which graph you're looking at" confusion
+            # this whole feature exists to remove. _resolve_agent() already
+            # does the right fallback (explicit ?agent= else DEFAULT_AGENT,
+            # or the exact requested name unresolved-and-unmodified if it
+            # names an unregistered agent, never silently swapped) -- reuse
+            # its result rather than re-deriving a narrower one here.
+            agent_param, page_db_path = viz_agents._resolve_agent(parsed.query)
+            active_tab = viz_urls.route_name_for_path(path)
+            # route_name_for_path's own docstring says a None here would
+            # mean routes.PAGE_ROUTES and urls._ROUTE_PATHS have drifted
+            # apart, "a bug worth surfacing loudly" -- but nothing DID
+            # surface it loudly until this assert (reviewer-fairy finding,
+            # PR#2564): without it, None flowed silently into _render_nav
+            # and rendered a nav bar with no tab bolded, not the loud
+            # failure the docstring promised. `path in routes.PAGE_ROUTES`
+            # was already checked one line above (the `if` this block is
+            # inside), so a None here can only mean the two tables drifted.
+            assert active_tab is not None, (
+                f"routes.PAGE_ROUTES and urls._ROUTE_PATHS have drifted: "
+                f"{path!r} is a known page route but url_for's registry "
+                f"doesn't know its route name"
+            )
+            nav_html = shell._render_nav(active_tab, agent=agent_param)
+            # Footer's data-provenance half needs the SELECTED agent's own
+            # data directory (the parent of its knowledge.db), not the
+            # process's default -- same resolved-agent value the nav just
+            # used, per the per-selected-agent ruling on forum #389.
+            data_dir = os.path.dirname(page_db_path) if page_db_path else None
+            footer_html = footer.render_footer(data_dir)
+            page = (
+                routes.PAGE_ROUTES[path]
+                .replace(shell._NAV_PLACEHOLDER, nav_html)
+                .replace(shell._FOOTER_PLACEHOLDER, footer_html)
+            )
+            self._html(page)
             return
 
         # Endpoints below are agent-scoped.
@@ -255,6 +339,45 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_static(self, filename: str):
+        """Serve one file from viz/static/ (engram-alpha#2555 PR B
+        amendment-1, requirement 5). *filename* is everything after
+        "/static/" in the request path -- NOT yet validated.
+
+        Path-traversal guard: static/ is a flat directory, so any filename
+        containing a path separator or a '..' component is rejected
+        outright as 404, rather than attempting to canonicalize-and-compare
+        (the flat-directory invariant makes the reject-outright form both
+        simpler and strictly more conservative than that would be).
+        """
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        target = _STATIC_DIR / filename
+        if not target.is_file():
+            self.send_response(404)
+            self.end_headers()
+            return
+        # Belt-and-suspenders: confirm the resolved path is still directly
+        # inside _STATIC_DIR (guards against the target itself being a
+        # symlink that escapes static/, which the string-level checks above
+        # don't see).
+        if target.resolve().parent != _STATIC_DIR:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        content_type = _STATIC_CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", _STATIC_CACHE_CONTROL)
         self.end_headers()
         self.wfile.write(body)
 

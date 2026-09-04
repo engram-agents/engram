@@ -280,30 +280,35 @@ class TestConfigHtmlSelectCss(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestGlobalNavSelectorId(unittest.TestCase):
-    """All four tab pages must render the same global agent-selector ID."""
+    """All four tabs must render the same global agent-selector ID.
 
-    _PAGES = [
-        ("HTML",        viz_shell.HTML),
-        ("HEALTH_HTML", viz_shell.HEALTH_HTML),
-        ("STATS_HTML",  viz_shell.STATS_HTML),
-        ("CONFIG_HTML", viz_shell.CONFIG_HTML),
-    ]
+    PR B (#2555 amendment-1): nav rendering moved from import-time page
+    baking to request-time (`shell._render_nav`) -- see shell.py's module
+    docstring. The nav div (and therefore this id) is no longer present in
+    HTML/HEALTH_HTML/STATS_HTML/CONFIG_HTML at all; those constants now
+    carry only the `<!--NAV_PLACEHOLDER-->` sentinel where it used to be
+    baked in. These assertions test `_render_nav`'s output directly instead
+    -- the actual unit now responsible for this content. See
+    TestAllTabsSameNavBar below for the fuller nav-fragment coverage, and
+    the live-server gate 1b crawl in test_viz_url_for.py for the
+    end-to-end HTTP-level equivalent (nav div byte-identical across all 4
+    routes modulo the active-tab bold marker)."""
 
     def test_global_selector_id_in_graph_view(self):
-        self.assertIn('id="agent-select-nav"', viz_shell.HTML,
-                      "Graph view missing global selector id='agent-select-nav'")
+        self.assertIn('id="agent-select-nav"', viz_shell._render_nav("graph"),
+                      "Graph view nav fragment missing id='agent-select-nav'")
 
     def test_global_selector_id_in_health_dashboard(self):
-        self.assertIn('id="agent-select-nav"', viz_shell.HEALTH_HTML,
-                      "Health dashboard missing global selector id='agent-select-nav'")
+        self.assertIn('id="agent-select-nav"', viz_shell._render_nav("health"),
+                      "Health dashboard nav fragment missing id='agent-select-nav'")
 
     def test_global_selector_id_in_stats(self):
-        self.assertIn('id="agent-select-nav"', viz_shell.STATS_HTML,
-                      "Stats page missing global selector id='agent-select-nav'")
+        self.assertIn('id="agent-select-nav"', viz_shell._render_nav("stats"),
+                      "Stats nav fragment missing id='agent-select-nav'")
 
     def test_global_selector_id_in_config(self):
-        self.assertIn('id="agent-select-nav"', viz_shell.CONFIG_HTML,
-                      "Config page missing global selector id='agent-select-nav'")
+        self.assertIn('id="agent-select-nav"', viz_shell._render_nav("config"),
+                      "Config nav fragment missing id='agent-select-nav'")
 
     def test_old_sidebar_selector_absent_from_graph_view(self):
         """The old sidebar #agent-select must be gone; only the nav selector remains."""
@@ -329,19 +334,69 @@ class TestGlobalNavSelectorId(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestAllTabsSameNavBar(unittest.TestCase):
-    """Every tab page must contain the shared nav elements."""
+    """Every tab's rendered nav fragment must contain the shared nav elements.
+
+    PR B (#2555 amendment-1): nav rendering moved to request time
+    (`shell._render_nav` -- see shell.py's module docstring), so `_PAGES`
+    here holds each tab's rendered nav FRAGMENT rather than the full,
+    pre-baked page HTML constant (which, post-PR-B, contains only the
+    `<!--NAV_PLACEHOLDER-->` sentinel where the nav div used to be baked
+    in). The assertion bodies below are otherwise UNCHANGED from PR A --
+    they still test exactly the same nav-div content, just sourced from
+    the function that now produces it instead of a pre-baked constant.
+    """
 
     _PAGES = {
-        "graph":  viz_shell.HTML,
-        "health": viz_shell.HEALTH_HTML,
-        "stats":  viz_shell.STATS_HTML,
-        "config": viz_shell.CONFIG_HTML,
+        "graph":  viz_shell._render_nav("graph"),
+        "health": viz_shell._render_nav("health"),
+        "stats":  viz_shell._render_nav("stats"),
+        "config": viz_shell._render_nav("config"),
     }
 
     def test_all_tabs_have_nav_div(self):
         for tab, html in self._PAGES.items():
             self.assertIn('<div class="nav">', html,
                           f"{tab} page missing nav div")
+
+    def test_exactly_one_nav_css_rule_opener_in_viz(self):
+        """Gate 1b (forum #389, strong form): the .nav CSS rule opener
+        (the CSS RULE, not the class name in markup -- e.g. NOT
+        'class="nav"') must appear exactly ONCE across src/engram/viz/,
+        in static/base.css. Scoped to viz/ specifically, not repo-wide --
+        a repo-wide grep would false-positive on src/forum/templates/'s own
+        unrelated .nav rule (Kepler's own scope correction, forum #389).
+
+        A leftover page-local .nav rule loses to the cascade (base.css's
+        <link> comes first in every template) and renders invisibly
+        correct while still being dead, wrong CSS -- markup-parity tests
+        like test_all_tabs_have_nav_div above would NOT catch that; only a
+        rule-opener grep does.
+        """
+        import re
+
+        viz_dir = Path(__file__).resolve().parent.parent / "src" / "engram" / "viz"
+        pattern = re.compile(r"\.nav\s*\{")
+        hits = []
+        for path in viz_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix not in (".css", ".html"):
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for m in pattern.finditer(text):
+                hits.append(f"{path.relative_to(viz_dir)}:{m.start()}")
+        self.assertEqual(
+            len(hits), 1,
+            f"expected exactly one '.nav {{' CSS-rule-opener hit, found "
+            f"{len(hits)}: {hits!r}",
+        )
+        self.assertTrue(
+            hits[0].startswith(f"static{os.sep}base.css:"),
+            f"the one '.nav {{' hit must be in static/base.css, found: {hits[0]!r}",
+        )
 
     def test_all_tabs_have_graph_view_link(self):
         for tab, html in self._PAGES.items():
@@ -382,37 +437,76 @@ class TestAllTabsSameNavBar(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 8. Shared nav JS: tab link rewrite logic present in all pages
+# 8. Shared nav JS: now a real static asset, referenced (not inlined); the
+#    old client-side tab-link rewrite is gone (superseded by server-side
+#    url_for()) -- Test class renamed from TestNavScriptTabLinkRewrite,
+#    which tested exactly that now-deleted logic, per the PR's regression-
+#    test discipline: assert the NEW behavior with an explanatory comment,
+#    don't just drop the coverage silently.
+#    Removed-test: tests/test_viz_server_select_control.py::TestNavScriptTabLinkRewrite::test_nav_script_rewrite_logic_in_all_pages — tested the client-side querySelectorAll('.nav a') tab-href rewrite, which PR B deletes from nav.js (superseded by server-side url_for()); replaced by test_tab_link_rewrite_removed_from_nav_script below (a positive check that it's gone).
+#    Removed-test: tests/test_viz_server_select_control.py::TestNavScriptTabLinkRewrite::test_nav_script_agent_param_in_all_pages — asserted 'agent-select-nav' was present INLINE in each page constant (true when nav.js was inlined per-page); PR B moves nav.js to /static/nav.js referenced via <script src>, so the string is no longer inline. Replaced by test_pages_reference_static_nav_script (the <script src> reference) + test_nav_script_agent_param_still_present (asserts it directly against _NAV_SCRIPT, unchanged).
+#    Removed-test: tests/test_viz_server_select_control.py::TestNavScriptTabLinkRewrite::test_nav_script_onchange_full_reload_in_all_pages — same inline-vs-referenced issue as above; replaced by test_nav_script_onchange_full_reload_present (asserts against _NAV_SCRIPT directly).
 # ---------------------------------------------------------------------------
 
-class TestNavScriptTabLinkRewrite(unittest.TestCase):
-    """The shared nav script that rewrites tab links to preserve ?agent= must
-    be injected into every page."""
+class TestNavScriptStaticReference(unittest.TestCase):
+    """PR B (#2555 amendment-1): the shared nav script is now served from
+    /static/nav.js and referenced via <script src>, not inlined per-page.
+    Server-side url_for() (see viz.urls, called from shell._render_nav) now
+    carries ?agent= through nav links, which makes the OLD client-side
+    querySelectorAll('.nav a') tab-href rewrite in nav.js dead code -- so
+    it was deleted from nav.js itself, not merely left unused."""
 
-    _PAGES = {
-        "graph":  viz_shell.HTML,
+    # graph.html deliberately does NOT reference /static/nav.js -- it has
+    # its own near-duplicate agent-selector script (graph-agent-select.js,
+    # asserted separately below), a pre-existing PR-A design choice this PR
+    # doesn't change.
+    _NAV_JS_PAGES = {
         "health": viz_shell.HEALTH_HTML,
         "stats":  viz_shell.STATS_HTML,
         "config": viz_shell.CONFIG_HTML,
     }
 
-    def test_nav_script_rewrite_logic_in_all_pages(self):
-        """querySelectorAll('.nav a') rewrite must appear in every page."""
-        for tab, html in self._PAGES.items():
-            self.assertIn("querySelectorAll('.nav a')", html,
-                          f"{tab} page missing tab-link rewrite JS")
+    def test_pages_reference_static_nav_script(self):
+        for tab, html in self._NAV_JS_PAGES.items():
+            self.assertIn('<script src="/static/nav.js"></script>', html,
+                          f"{tab} page missing /static/nav.js script reference")
 
-    def test_nav_script_agent_param_in_all_pages(self):
-        """The nav script must use 'agent-select-nav' selector in every page."""
-        for tab, html in self._PAGES.items():
-            self.assertIn("agent-select-nav", html,
-                          f"{tab} page missing agent-select-nav reference in script")
+    def test_graph_page_references_static_graph_agent_select_script(self):
+        self.assertIn('<script src="/static/graph-agent-select.js"></script>',
+                      viz_shell.HTML,
+                      "graph page missing /static/graph-agent-select.js "
+                      "script reference")
 
-    def test_nav_script_onchange_full_reload_in_all_pages(self):
-        """Selector onchange must trigger a full URL navigation (not in-place refresh)."""
-        for tab, html in self._PAGES.items():
-            self.assertIn("window.location.href", html,
-                          f"{tab} page nav script missing window.location.href navigation")
+    def test_tab_link_rewrite_removed_from_nav_script(self):
+        """Confirm the client-side rewrite is actually gone, not just unused
+        -- catches reintroduction of now-redundant dead code."""
+        self.assertNotIn(
+            "querySelectorAll('.nav a')", viz_shell._NAV_SCRIPT,
+            "_NAV_SCRIPT still contains the now-redundant client-side "
+            "tab-href rewrite (url_for() carries ?agent= through "
+            "server-side now -- see viz.urls / shell._render_nav)")
+
+    def test_nav_script_agent_param_still_present(self):
+        """The agent-selector population logic itself is UNCHANGED -- only
+        the tab-href-rewrite sub-block was removed."""
+        self.assertIn("agent-select-nav", viz_shell._NAV_SCRIPT,
+                      "_NAV_SCRIPT missing agent-select-nav reference")
+
+    def test_nav_script_onchange_full_reload_present(self):
+        self.assertIn("window.location.href", viz_shell._NAV_SCRIPT,
+                      "_NAV_SCRIPT missing window.location.href navigation")
+
+    def test_tab_link_rewrite_removed_from_graph_agent_select_script(self):
+        """graph-agent-select.js is nav.js's near-duplicate for the graph
+        page (a pre-existing PR-A design choice); it carried the same now-
+        redundant tab-href rewrite and gets the same removal."""
+        content = (viz_shell._STATIC_DIR / "graph-agent-select.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn(
+            "querySelectorAll('.nav a')", content,
+            "graph-agent-select.js still contains the now-redundant "
+            "client-side tab-href rewrite")
 
 
 # ---------------------------------------------------------------------------
@@ -430,16 +524,30 @@ class TestSingleAgentModeSelectorHidden(unittest.TestCase):
                       "_NAV_SCRIPT missing single-agent guard (agents.length <= 1)")
 
     def test_nav_agent_wrapper_initially_hidden(self):
-        """nav-agent-wrapper must start hidden (display:none) in every page."""
-        for tab, html in [
-            ("graph",  viz_shell.HTML),
-            ("health", viz_shell.HEALTH_HTML),
-            ("stats",  viz_shell.STATS_HTML),
-            ("config", viz_shell.CONFIG_HTML),
-        ]:
-            # The wrapper is hidden via CSS; either inline display:none or a
-            # CSS rule.  We check for the CSS rule in the page.
-            self.assertIn("nav-agent-wrapper", html,
+        """nav-agent-wrapper must start hidden (display:none) in every page.
+
+        PR B (#2555 amendment-1): the wrapper ELEMENT is now spliced in at
+        request time (shell._render_nav), and its display:none hiding rule
+        lives in static/base.css (linked via <link rel="stylesheet"
+        href="/static/base.css"> on every page -- for graph.html
+        specifically that's the ONLY place the rule lives now; health/stats/
+        config's own inline <style> blocks still duplicate the same
+        #nav-agent-wrapper rule too, untouched by this PR). Assemble each
+        page the same way server.py does (splice the placeholder) so this
+        test exercises the real end-to-end result rather than the raw,
+        pre-splice shell constant.
+        """
+        pages = {
+            "graph":  viz_shell.HTML,
+            "health": viz_shell.HEALTH_HTML,
+            "stats":  viz_shell.STATS_HTML,
+            "config": viz_shell.CONFIG_HTML,
+        }
+        for tab, shell_html in pages.items():
+            assembled = shell_html.replace(
+                viz_shell._NAV_PLACEHOLDER, viz_shell._render_nav(tab)
+            )
+            self.assertIn("nav-agent-wrapper", assembled,
                           f"{tab} page missing nav-agent-wrapper CSS/element")
 
     def test_wrapper_only_shown_in_multi_agent_mode(self):
@@ -458,8 +566,12 @@ class TestSingleAgentModeSelectorHidden(unittest.TestCase):
 
         Setting wrapper.style.display = '' only removes the inline override and
         lets the CSS cascade apply — which restores display:none from the
-        _NAV_SHARED_CSS rule.  The correct fix is an explicit non-empty value
-        (e.g. 'inline-flex') so the wrapper actually becomes visible.
+        shared nav CSS's #nav-agent-wrapper rule (served from
+        static/base.css and linked via <link rel="stylesheet"
+        href="/static/base.css"> on every page as of #2555 PR B; previously
+        baked in per-page via a shell.py constant named _NAV_SHARED_CSS,
+        which no longer exists). The correct fix is an explicit non-empty
+        value (e.g. 'inline-flex') so the wrapper actually becomes visible.
 
         This test catches reintroduction of the silent-hidden bug (PR #425 r3).
         """

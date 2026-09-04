@@ -485,11 +485,15 @@
     .link.retracts { stroke-dasharray: 3 3; }
 
     /* ── Top nav ────────────────────────────────────────────────────── */
-    .nav { margin-bottom: 0; padding: 8px 16px; background: #0f3460;
-           border-bottom: 1px solid #1a4a8a; flex-shrink: 0;
-           display: flex; align-items: center; }
-    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
-    .nav a:hover { text-decoration: underline; }
+    /* .nav/.nav a/.nav a:hover consolidated into static/base.css
+       (engram-alpha#2555 PR B, forum #389) -- this page intentionally lost
+       its filled #0f3460 bar / padding / border-bottom, per the design
+       ruling on that thread ("I like the old health page's nav style,
+       just the pagelinks, no filled blue bar"), taking the plain-link-row
+       shape of the other three pages.
+       display:flex/align-items:center/flex-shrink:0 are still supplied by
+       base.css's shared .nav rule -- flex-shrink:0 is genuinely load-bearing
+       here (100vh flex column), inert everywhere else. */
     .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
     .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
                         border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }

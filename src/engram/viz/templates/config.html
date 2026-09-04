@@ -4,14 +4,12 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>ENGRAM Config</title>
+  <link rel="stylesheet" href="/static/base.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
            background: #1a1a2e; color: #e0e0e0; padding: 24px; }
     h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
-    .nav { margin-bottom: 16px; display: flex; align-items: center; }
-    .nav a { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
-    .nav a:hover { text-decoration: underline; }
     .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
     .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
                         border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
@@ -138,13 +136,7 @@
   </style>
 </head>
 <body>
-  <div class="nav">
-  <a href="/">Graph View</a>
-  <a href="/health">Health Dashboard</a>
-  <a href="/stats">Stats</a>
-  <a href="/config" style="font-weight:600;">Config</a>
-  <span id="nav-agent-wrapper"><span class="nav-agent-label">Agent:</span><select id="agent-select-nav" class="nav-agent-select"></select></span>
-</div>
+<!--NAV_PLACEHOLDER-->
   <h1>ENGRAM Config</h1>
 
   <div id="cfg-loading">Loading config…</div>
@@ -563,50 +555,7 @@
 
   loadConfig();
   </script>
-<script>
-(function () {
-  var sel = document.getElementById('agent-select-nav');
-  if (!sel) return;
-  var wrapper = document.getElementById('nav-agent-wrapper');
-
-  fetch('/api/agents').then(function(r) { return r.json(); }).then(function(data) {
-    var agents = data.agents || [];
-    var defaultAgent = data.default || (agents[0] && agents[0].name);
-    if (agents.length <= 1) return;  // single-agent mode: keep selector hidden
-
-    var currentAgent = new URL(window.location.href).searchParams.get('agent');
-    if (!currentAgent || !agents.find(function(a) { return a.name === currentAgent; })) {
-      currentAgent = defaultAgent;
-    }
-
-    sel.innerHTML = '';
-    agents.forEach(function(a) {
-      var opt = document.createElement('option');
-      opt.value = a.name;
-      var status = a.available ? '(' + a.current_node_count + ')' : '(unavailable)';
-      opt.textContent = a.label + ' ' + status;
-      if (!a.available && a.error) opt.title = a.error;
-      sel.appendChild(opt);
-    });
-    sel.value = currentAgent;
-    if (wrapper) wrapper.style.display = 'inline-flex';
-
-    // Rewrite all same-origin tab links to preserve the agent param.
-    document.querySelectorAll('.nav a').forEach(function(link) {
-      var href = link.getAttribute('href');
-      if (!href || !href.startsWith('/')) return;
-      var u = new URL(href, window.location.origin);
-      u.searchParams.set('agent', currentAgent);
-      link.setAttribute('href', u.toString());
-    });
-
-    sel.onchange = function() {
-      var u = new URL(window.location.href);
-      u.searchParams.set('agent', sel.value);
-      window.location.href = u.toString();
-    };
-  }).catch(function() {});
-}());
-</script>
+<script src="/static/nav.js"></script>
+<!--FOOTER_PLACEHOLDER-->
 </body>
 </html>

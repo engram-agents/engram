@@ -1,54 +1,62 @@
-"""viz.shell — the nav-rendering + placeholder-substitution machinery, and
-the four assembled page-HTML constants (engram-alpha#2555 PR A, pure
-relocation of viz_server.py's ``_NAV_TABS``/``_render_nav``/nav-placeholder
-constants + the four ``HTML``/``HEALTH_HTML``/``STATS_HTML``/``CONFIG_HTML``
-build chains).
+"""viz.shell — the nav-rendering machinery, and the four assembled
+page-HTML SHELLS (engram-alpha#2555 PR A pure relocation, then PR B
+amendment-1's nav-CSS-consolidation / static-asset / url_for rework).
 
-No HTTP handling here -- this module's whole job is producing the four
-ready-to-serve HTML strings, once, at import time.
+No HTTP handling here -- this module's job is producing the four
+ready-to-serve HTML shells (once, at import time) plus the nav-fragment
+renderer server.py calls per request.
 
-TEMPLATE-BAKING NOTE (load-bearing for understanding why the substitution
-chain below is mostly a no-op on today's templates, and why it stays
-anyway): the original ``viz_server.py`` built each page HTML constant with
-a raw string literal *containing* the sentinel placeholders
-(``<!--NAV_PLACEHOLDER-->`` etc.), immediately followed by
-``.replace(...).replace(...).replace(...)`` in the SAME expression -- so
-the value bound to ``HTML``/``HEALTH_HTML``/``STATS_HTML``/``CONFIG_HTML``
-at runtime was already POST-substitution; the placeholders never survived
-past module-import time in the original file either. The prior commit on
-this branch (``bdba3af2``) extracted ``templates/{health,stats,config}.html``
-from those ACTUAL RUNTIME VALUES (verified byte-for-byte against the
-unmodified original module), so those three template files already have
-their nav baked in for their own active tab and contain none of the three
-NAV_* sentinel strings. ``templates/graph.html`` is the one exception: its
-source giant string ALSO had two artificial ``{{GRAPH_CSS}}``/``{{GRAPH_JS}}``/
-``{{GRAPH_JS_AGENT_SELECT}}`` split-points invented for extraction (not
-present in the original at all), so it genuinely needs a substitution pass
-before it's usable -- see ``_build_graph_html`` below.
+ARCHITECTURE NOTE, PR B (load-bearing for understanding why nav rendering
+is split across two different TIMES): PR A baked all four pages --
+including the nav ``<div class="nav">...</div>`` itself -- once, at module
+import time, from four already-fully-substituted HTML strings. PR B's
+``url_for()`` requirement (#2555 amendment-1, requirement 3) makes the nav
+genuinely request-dependent in two ways a module-import-time bake cannot
+see: (a) the ACTIVE tab is a property of which route was requested, and
+(b) each tab link must carry the EFFECTIVE agent through, not some
+import-time default. "Effective" and not "the raw ``?agent=`` param" is
+deliberate: the agent is resolved the same way every agent-scoped API
+endpoint already resolves it (explicit ``?agent=`` else the live
+``DEFAULT_AGENT``, itself refreshed on a TTL by ``agents._refresh_agents_
+if_stale()``) -- carrying through only a literal query param and leaving
+it absent otherwise would silently reproduce the very bug this feature
+exists to remove, the moment ``DEFAULT_AGENT`` changes between two page
+loads in the same browsing session. So PR B splits nav rendering into
+two phases:
 
-Because of this, calling the SAME nav-substitution chain here
-(``.replace(_NAV_PLACEHOLDER, ...).replace(_NAV_SCRIPT_PLACEHOLDER,
-...).replace(_NAV_CSS_PLACEHOLDER, ...)``) on all four templates is a
-verified no-op for three of them today -- kept anyway, rather than special-
-cased away, because (a) it reproduces the original's own code shape
-exactly, satisfying the pure-relocation contract literally rather than by
-argument, (b) ``_render_nav``/``_NAV_TABS`` remain real, working, IMPORTABLE
-building blocks here -- the natural home #2555's design flags for PR B's
-nav-CSS-consolidation amendment to hook into, and (c) it costs nothing: a
-``str.replace`` call that finds no match returns the original string
-object-identically cheap. Verified byte-for-byte against the ORIGINAL
-module's real runtime ``HTML``/``HEALTH_HTML``/``STATS_HTML``/``CONFIG_HTML``
-values (imported the unmodified viz_server.py, diffed the actual strings --
-not a visual check), including a reassembly of ``templates/graph.html`` +
-``graph.css`` + ``graph.js`` + ``graph-agent-select.js`` via the
-``{{GRAPH_*}}`` placeholders.
+* Import time (this module, unchanged in spirit from PR A): read each page
+  template once into ``HTML``/``HEALTH_HTML``/``STATS_HTML``/``CONFIG_HTML``.
+  Everything on the page EXCEPT the nav div itself is still pre-baked here,
+  preserving PR A's "read once, not per-request" performance property for
+  the bulk of each page. Each of these four strings still contains the
+  literal sentinel ``<!--NAV_PLACEHOLDER-->`` where the nav div used to be
+  baked in -- see ``_NAV_PLACEHOLDER`` below.
+* Request time (``server.py``'s ``Handler.do_GET``): once the matched route
+  and the request's own ``?agent=`` are both known, call ``_render_nav``
+  (below) and splice the result into the page shell via a single
+  ``str.replace(_NAV_PLACEHOLDER, ...)``.
+
+Nav CSS/JS are no longer placeholder-substituted at all (PR A's
+``_NAV_SCRIPT_PLACEHOLDER``/``_NAV_CSS_PLACEHOLDER`` machinery is gone):
+they're real static assets served from ``/static/`` (see ``viz/static/``
+and ``server.py``'s static route) and referenced from each template via a
+plain ``<link rel="stylesheet" href="/static/base.css">`` /
+``<script src="/static/nav.js"></script>`` tag baked directly into the
+template file itself -- static, page-independent, no substitution needed.
+``_NAV_SCRIPT`` is kept as an importable constant purely because several
+regression tests assert against its content directly (the single-agent-mode
+guard, the wrapper-display-value regression guard -- see
+``test_viz_server_select_control.py``); it is NOT used to bake any page.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from . import urls
+
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
 def _read_template(name: str) -> str:
@@ -65,33 +73,74 @@ def _read_template(name: str) -> str:
         return f.read()
 
 
+def _read_static(name: str) -> str:
+    """Read one file from static/, once, at import time (same newline
+    handling as ``_read_template`` -- see its docstring)."""
+    with open(_STATIC_DIR / name, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
 # ---------------------------------------------------------------------------
-# Shared nav bar -- tabs, renderer, shared CSS/JS, and the sentinel strings
-# used inside the (pre-baked) page templates.
+# Shared nav bar -- tabs, request-time renderer, and the sentinel string used
+# inside each (pre-baked-minus-nav) page template.
 # ---------------------------------------------------------------------------
 
+# tab key -> label. Paths are NOT duplicated here -- url_for() (viz.urls) is
+# the single source of truth for tab key -> path, so _render_nav asks it for
+# every href rather than carrying its own copy.
 _NAV_TABS = [
-    ("graph",  "/",        "Graph View"),
-    ("health", "/health",  "Health Dashboard"),
-    ("stats",  "/stats",   "Stats"),
-    ("config", "/config",  "Config"),
+    ("graph",  "Graph View"),
+    ("health", "Health Dashboard"),
+    ("stats",  "Stats"),
+    ("config", "Config"),
 ]
 
-# CSS rules injected into every page's <style> block.
-_NAV_SHARED_CSS = _read_template("base.css")
+# Kept as an importable constant even though it no longer bakes any page
+# (nav.js is served as a real static file, referenced via <script src> --
+# see the module docstring) -- several regression tests assert directly
+# against its content. Read from static/, not templates/, now that nav.js
+# lives there.
+_NAV_SCRIPT = _read_static("nav.js")
+
+# Sentinel string left in each page shell where the nav div goes; replaced
+# by server.py at REQUEST time (see the module docstring's ARCHITECTURE
+# NOTE), never here at import time.
+_NAV_PLACEHOLDER = "<!--NAV_PLACEHOLDER-->"
+
+# Sentinel string left in each page shell (just before </body>) where the
+# shared footer goes -- same two-phase (import-time shell, request-time
+# splice) reasoning as _NAV_PLACEHOLDER above: the footer's data-provenance
+# half depends on which agent's graph is being rendered, a per-request
+# fact PR A's import-time bake can't see. See viz.footer's module
+# docstring for the footer's own content/provenance logic; server.py's
+# do_GET does the splice, exactly like it does for the nav.
+_FOOTER_PLACEHOLDER = "<!--FOOTER_PLACEHOLDER-->"
 
 
-def _render_nav(active_tab: str) -> str:
-    """Return the HTML fragment for the shared top nav bar.
+def _render_nav(active_tab: str, agent: str | None = None) -> str:
+    """Return the HTML fragment for the shared top nav bar, computed at
+    REQUEST TIME (engram-alpha#2555 PR B amendment-1, requirement 2 + 3).
 
-    Includes tab links (active tab bold) and the global agent-selector
-    dropdown.  The dropdown is hidden until the shared nav script populates
-    it (single-agent mode keeps it hidden permanently).
+    Includes tab links (active tab bold, built via ``urls.url_for`` so each
+    one carries *agent* through when given) and the global agent-selector
+    dropdown. The dropdown is hidden until the shared nav script (served
+    from ``/static/nav.js``) populates it (single-agent mode keeps it
+    hidden permanently).
 
-    active_tab: one of {"graph", "health", "stats", "config"}
+    active_tab: one of {"graph", "health", "stats", "config"}.
+    agent: the EFFECTIVE agent for this request -- ``agents._resolve_agent``'s
+        resolved name (explicit ``?agent=`` else the live ``DEFAULT_AGENT``,
+        or the exact unregistered name if one was requested and unknown,
+        never silently swapped), not the raw query param. Callers pass
+        None only when there is genuinely no agent context (there always
+        is one in practice, since ``_resolve_agent`` never returns empty
+        unless no agents are registered at all) -- see ``urls.url_for``'s
+        docstring for why None/empty are treated identically (no stray
+        ``?agent=`` appended to any link) in that edge case.
     """
     links = []
-    for tab_key, href, label in _NAV_TABS:
+    for tab_key, label in _NAV_TABS:
+        href = urls.url_for(tab_key, agent=agent)
         if tab_key == active_tab:
             links.append(f'  <a href="{href}" style="font-weight:600;">{label}</a>')
         else:
@@ -105,58 +154,19 @@ def _render_nav(active_tab: str) -> str:
     return "<div class=\"nav\">\n" + "\n".join(links) + "\n</div>"
 
 
-# Shared JS block injected just before </body> on every tab page.
-# Handles: populating the agent selector from /api/agents, hiding it in
-# single-agent mode, rewriting tab links to preserve ?agent=, and
-# navigating on change.
-# nav.js already carries its own <script>...</script> wrapper tags (it was
-# extracted from the ORIGINAL ``_NAV_SCRIPT`` literal, which included them
-# -- verified byte-for-byte in bdba3af2), so no extra wrapping here.
-_NAV_SCRIPT = _read_template("nav.js")
-
-# Sentinel strings used inside each HTML constant; replaced at module load.
-_NAV_PLACEHOLDER = "<!--NAV_PLACEHOLDER-->"
-_NAV_SCRIPT_PLACEHOLDER = "<!--NAV_SCRIPT_PLACEHOLDER-->"
-_NAV_CSS_PLACEHOLDER = "<!--NAV_CSS_PLACEHOLDER-->"
-
-
-def _substitute_nav(page: str, active_tab: str) -> str:
-    """Apply the original three-step nav substitution chain to *page*.
-
-    A verified no-op on today's pre-baked templates (see module docstring)
-    -- kept so this is the one place the chain lives, matching the
-    original file's own per-page code shape.
-    """
-    return (
-        page.replace(_NAV_PLACEHOLDER, _render_nav(active_tab))
-        .replace(_NAV_SCRIPT_PLACEHOLDER, _NAV_SCRIPT)
-        .replace(_NAV_CSS_PLACEHOLDER, _NAV_SHARED_CSS)
-    )
-
-
 # ---------------------------------------------------------------------------
-# Graph page -- the one template still carrying real split-point
-# placeholders ({{GRAPH_CSS}}, {{GRAPH_JS}}, {{GRAPH_JS_AGENT_SELECT}}),
-# invented at extraction time (bdba3af2) to break the single giant page
-# string into four files.  Substituted here to reconstruct the original.
+# The four page SHELLS -- read once at import time (not per-request),
+# matching PR A's module-load-time behavior for everything except the nav
+# div itself. Each still contains the literal ``_NAV_PLACEHOLDER`` sentinel
+# where the nav div goes -- server.py splices in the real fragment (via
+# ``_render_nav``, above) per request. graph.html no longer needs a separate
+# assembly step (PR A's ``_build_graph_html``): its CSS/JS are now real
+# ``<link>``/``<script src>`` tags baked directly into the template file
+# itself (see ``templates/graph.html``), not split-point placeholders
+# requiring substitution -- so it's read the same way as the other three.
 # ---------------------------------------------------------------------------
 
-def _build_graph_html() -> str:
-    page = _read_template("graph.html")
-    page = page.replace("{{GRAPH_CSS}}", _read_template("graph.css"))
-    page = page.replace("{{GRAPH_JS}}", _read_template("graph.js"))
-    page = page.replace(
-        "{{GRAPH_JS_AGENT_SELECT}}", _read_template("graph-agent-select.js")
-    )
-    return _substitute_nav(page, "graph")
-
-
-# ---------------------------------------------------------------------------
-# The four assembled page-HTML constants -- read once at import time (not
-# per-request), matching the original file's module-load-time behavior.
-# ---------------------------------------------------------------------------
-
-HTML = _build_graph_html()
-HEALTH_HTML = _substitute_nav(_read_template("health.html"), "health")
-STATS_HTML = _substitute_nav(_read_template("stats.html"), "stats")
-CONFIG_HTML = _substitute_nav(_read_template("config.html"), "config")
+HTML = _read_template("graph.html")
+HEALTH_HTML = _read_template("health.html")
+STATS_HTML = _read_template("stats.html")
+CONFIG_HTML = _read_template("config.html")

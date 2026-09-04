@@ -5,19 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KG Memory Visualizer</title>
   <script src="https://d3js.org/d3.v7.min.js"></script>
-  <style>
-{{GRAPH_CSS}}  </style>
+  <link rel="stylesheet" href="/static/base.css">
+  <link rel="stylesheet" href="/static/graph.css">
 </head>
 <body>
 
 <!-- ── Top nav ──────────────────────────────────────────────────────── -->
-<div class="nav">
-  <a href="/" style="font-weight:600;">Graph View</a>
-  <a href="/health">Health Dashboard</a>
-  <a href="/stats">Stats</a>
-  <a href="/config">Config</a>
-  <span id="nav-agent-wrapper"><span class="nav-agent-label">Agent:</span><select id="agent-select-nav" class="nav-agent-select"></select></span>
-</div>
+<!--NAV_PLACEHOLDER-->
 
 <!-- ── Content row ──────────────────────────────────────────────────── -->
 <div id="content-row">
@@ -118,9 +112,8 @@
 <!-- ── Tooltip ───────────────────────────────────────────────────────── -->
 <div id="tooltip"></div>
 
-<script>
-{{GRAPH_JS}}</script>
-<script>
-{{GRAPH_JS_AGENT_SELECT}}</script>
+<script src="/static/graph.js"></script>
+<script src="/static/graph-agent-select.js"></script>
+<!--FOOTER_PLACEHOLDER-->
 </body>
 </html>

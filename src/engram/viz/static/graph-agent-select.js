@@ -1,4 +1,3 @@
-<script>
 (function () {
   var sel = document.getElementById('agent-select-nav');
   if (!sel) return;
@@ -26,15 +25,6 @@
     sel.value = currentAgent;
     if (wrapper) wrapper.style.display = 'inline-flex';
 
-    // Rewrite all same-origin tab links to preserve the agent param.
-    document.querySelectorAll('.nav a').forEach(function(link) {
-      var href = link.getAttribute('href');
-      if (!href || !href.startsWith('/')) return;
-      var u = new URL(href, window.location.origin);
-      u.searchParams.set('agent', currentAgent);
-      link.setAttribute('href', u.toString());
-    });
-
     sel.onchange = function() {
       var u = new URL(window.location.href);
       u.searchParams.set('agent', sel.value);
@@ -42,4 +32,3 @@
     };
   }).catch(function() {});
 }());
-</script>

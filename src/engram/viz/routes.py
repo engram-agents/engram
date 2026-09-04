@@ -18,14 +18,26 @@ deliberately used (not a dataclass / named-route registry) so this stays
 the simplest structure that satisfies PR A's scope -- #2555's design notes
 this table as the natural place PR B's ``url_for()`` / active-tab
 amendment can later hook into, without PR A pre-building any of that.
+
+PR B UPDATE: the values below are no longer FULLY baked pages -- each
+still contains the literal ``<!--NAV_PLACEHOLDER-->`` sentinel where the
+nav div goes (see ``shell.py``'s module docstring for why: the nav is now
+rendered at REQUEST time, not import time, so it can carry the actual
+matched route + the request's own ``?agent=`` value). ``server.py``'s
+``Handler.do_GET`` is responsible for splicing in the real nav fragment
+(via ``shell._render_nav`` + ``urls.route_name_for_path``) before serving
+any of these strings -- this dict alone is not a servable page.
 """
 
 from __future__ import annotations
 
 from . import shell
 
-# path -> fully-assembled page HTML (already nav-baked, see shell.py).
-# One line per page, per #2555's "one line registers a page."
+# path -> page shell (nav div NOT yet spliced in -- still carries the
+# literal shell._NAV_PLACEHOLDER sentinel; see shell.py's module docstring).
+# Active-tab resolution for the nav splice goes through
+# urls.route_name_for_path(path), not a second table here. One line per
+# page, per #2555's "one line registers a page."
 PAGE_ROUTES: dict[str, str] = {
     "/": shell.HTML,
     "/health": shell.HEALTH_HTML,

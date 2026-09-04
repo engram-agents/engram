@@ -176,6 +176,16 @@
       "tier": "convenience"
     },
     {
+      "path": "viz/urls.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: url_for() -- new module, same tier as its viz/ package siblings."
+    },
+    {
+      "path": "viz/footer.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1, requirement 4: the shared page footer -- new module, same tier as its viz/ package siblings."
+    },
+    {
       "path": "viz/server.py",
       "tier": "convenience",
       "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."
@@ -210,28 +220,33 @@
       "tier": "convenience"
     },
     {
-      "path": "viz/templates/base.css",
-      "tier": "convenience"
+      "path": "viz/static/base.css",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <link>, no longer baked into Python string constants."
     },
     {
-      "path": "viz/templates/nav.js",
-      "tier": "convenience"
+      "path": "viz/static/nav.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
     },
     {
       "path": "viz/templates/graph.html",
       "tier": "convenience"
     },
     {
-      "path": "viz/templates/graph.css",
-      "tier": "convenience"
+      "path": "viz/static/graph.css",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <link>."
     },
     {
-      "path": "viz/templates/graph.js",
-      "tier": "convenience"
+      "path": "viz/static/graph.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
     },
     {
-      "path": "viz/templates/graph-agent-select.js",
-      "tier": "convenience"
+      "path": "viz/static/graph-agent-select.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
     },
     {
       "path": "viz/templates/health.html",

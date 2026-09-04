@@ -1,0 +1,23 @@
+    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
+    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
+    #nav-agent-wrapper { display: none; margin-left: auto; }
+
+    /* engram-alpha#2555 PR B amendment-1 nav-CSS consolidation (forum #389):
+       the one .nav/.nav a/.nav a:hover block for all four pages.
+       flex-shrink: 0 is deliberately kept -- it's load-bearing layout for
+       the graph page's 100vh flex column; inert (no-op) everywhere else. */
+    .nav         { margin-bottom: 16px; display: flex; align-items: center; flex-shrink: 0; }
+    .nav a       { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 0.9em; }
+    .nav a:hover { text-decoration: underline; }
+
+    /* engram-alpha#2555 PR B amendment-1 footer (forum #389 ruling):
+       product + provenance (two shas: data anchor, code sha) +
+       license/disclaimer, present on every page. Muted styling -- this is
+       reference/trust information, not a call to action. */
+    .viz-footer { margin-top: 24px; padding: 12px 0 8px; border-top: 1px solid #1a4a8a;
+                  font-size: 0.75em; color: #7a8aa0; display: flex; flex-wrap: wrap;
+                  gap: 4px 16px; align-items: baseline; }
+    .viz-footer-product { color: #7ecfff; font-weight: 600; }
+    .viz-footer-provenance { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .viz-footer-disclaimer { color: #556; }
