@@ -615,6 +615,47 @@ def test_import_dep_tier_consistency():
     as the importing file (the pattern used by the scripts in this repo).
     Stdlib and external packages are automatically excluded (they won't
     resolve to any mechanism entry).
+
+    TWO KNOWN GAPS (engram-alpha#2537, health/ package-layout discussion,
+    2026-09-04 — measured, not theoretical; both verified against this
+    function's own resolution code, both load-bearing for any future
+    package-shaped subdirectory, not specific to health/):
+
+    1. This resolver reads ``ast.ImportFrom.module`` only — it never reads
+       ``.level``, the attribute that actually carries a relative import's
+       leading dot(s). So a single-level explicit relative import
+       (``from .curves import CurveSpec``, ``module='curves'``, ``level=1``)
+       is textually indistinguishable here from a same-directory absolute
+       import, and stays checked — while a dotted absolute import of the
+       identical target (``from health.curves import CurveSpec``,
+       ``module='health.curves'``) fails the ``"." not in module`` gate and
+       is silently skipped. This is why a package under this repo can keep
+       its cross-module imports checked by this function, but ONLY if it
+       uses explicit relative imports for same-directory siblings — a
+       dotted-absolute style loses coverage with no warning. If this
+       function is ever made ``.level``-aware (a reasonable-looking fix, since
+       ignoring ``level`` also means a genuinely cross-package relative
+       import misresolves as same-directory) — that change must re-establish
+       coverage for every subdirectory currently depending on this gap, in
+       the same commit, or their imports go dark silently.
+
+    2. This resolver has NO subdirectory-path notion at all — candidate
+       paths are always ``{importer's own dirname}/{single-segment module
+       name}.py``. So an import that crosses INTO a subpackage from a
+       SIBLING file — e.g. a root file doing ``from health import engine``,
+       ``import health.engine``, or ``from health.engine import X`` — can
+       never resolve to ``health/engine.py`` under ANY spelling: the first
+       two resolve to a nonexistent ``health.py`` (silently unmatched, since
+       ``health`` is a directory, not a file); the third fails the dot gate
+       outright. **This means the tier-closure guarantee this function
+       exists to provide is NOT enforced at a subpackage's entry point,
+       regardless of the importing file's own style** — an essential-tier
+       file importing a dev-tier module from inside a mis-tiered subpackage
+       would break at runtime on a convenience/essential-only install with
+       nothing here catching it. Fixing this needs real subdirectory-aware
+       resolution (walking a dotted module name into a nested candidate
+       path), not a one-line patch; tracked separately rather than folded
+       into this docstring note — see engram-alpha#2549.
     """
     import ast
 
