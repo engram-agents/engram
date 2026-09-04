@@ -79,19 +79,23 @@ template.
    trust-tier MCP tools **and** the `engram-trust-tier` skill are all T1: a safety
    tool used without its discipline is worse than not having it.)
 
-2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
-   be* the single source of truth at `src/build/packaging/tiers.json`; `build-plugin.sh
-   --tier` *will* filter through it at **build time** (the
+2. **Every shippable is tagged exactly once in the manifest.** The tier map **is**
+   the single source of truth at `src/build/packaging/tiers.json`, and
+   `build-plugin.sh --tier` filters through it at **build time** (the
    agent-led install reads the README, prompts the user for tier + multi-agent, and
-   builds accordingly — no post-install pruning). **CI must fail the build if any
+   builds accordingly — no post-install pruning). **CI fails the build if any
    shippable path is untiered or any manifest entry is dangling** — so "added a
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(The `src/build/packaging/tiers.json` manifest + the CI tag-once test land with the tiering
-rollout. Until they do, the tier of any new artifact is still a required design
-decision — record it in the audit so the manifest is a transcription, not a
-re-derivation.)*
+*(All three parts are LIVE, so tiering is enforced rather than aspirational: the
+manifest exists; `src/build/engine/build.py` and `cli.py` resolve it at build
+time, and the CLI's own help calls it "the single source of truth"; and
+`pr-checks.yml` runs the `manifest-gate` step on every PR. Behavioural
+confirmation, not a code-read: on 2026-09-04 that gate blocked a PR for a new
+module its author had not tiered. So the tier of a new artifact is not merely a
+design decision to record for later transcription — **add the entry in the same
+PR that adds the artifact, or CI will stop you.**)*
 
 ## Plugin build restructures code paths — never rely on the `src/` layout
 

@@ -1,7 +1,7 @@
 # 05 — Agent-Facing CLIs (L4)
 
 > **STATUS: DRAFT — fairy archaeology, dispatcher spot-checked 2026-06-05.**
-> **UPDATE 2026-06-09 — the A7 meta-zombie is RESOLVED:** the tag-once CI gate now EXISTS. #968/#991 (merged 2026-06-10) added a whole-tree default-deny gate (`test_whole_tree_every_tracked_file_has_a_role` — every git-tracked file must declare exactly one role across `mechanisms`/`excluded`/`repo_only`/`build_inputs`) plus the narrower plugin-universe gate (`test_every_shippable_path_is_tagged`), both run by manifest-gate.yml on dev PRs. Consequently the two forum utility scripts below are no longer untiered — they are now in tiers.json `excluded[]` (separately-deployed forum service). And the baton auto-archive silent-catch is fixed (see §2). The "documented-but-unbuilt" framing throughout this draft is superseded.
+> **UPDATE 2026-06-09 — the A7 meta-zombie is RESOLVED:** the tag-once CI gate now EXISTS. #968/#991 (merged 2026-06-10) added a whole-tree default-deny gate (`test_whole_tree_every_tracked_file_has_a_role` — every git-tracked file must declare exactly one role across `mechanisms`/`excluded`/`repo_only`/`build_inputs`) plus the narrower plugin-universe gate (`test_every_shippable_path_is_tagged`), both run on dev PRs by the `manifest-gate` step group inside `pr-checks.yml`. *(That header originally said `manifest-gate.yml`; the standalone workflow was consolidated into `pr-checks.yml` on 2026-07-01 (#1597/#1598) and no longer exists — corrected 2026-09-04, since this note is the authority the tiers.json line below now cites.)* Consequently the two forum utility scripts below are no longer untiered — they are now in tiers.json `excluded[]` (separately-deployed forum service). And the baton auto-archive silent-catch is fixed (see §2). The "documented-but-unbuilt" framing throughout this draft is superseded.
 > Mechanical claims verified: the two manifest-gap files exist with zero tiers.json
 > entries — and both landed TODAY with the #810 hybrid-search merge, which led the
 > dispatcher to check the gate itself: **the tag-once CI gate does not exist**
@@ -62,7 +62,7 @@ engram-pkg (convenience — package authoring, isolated namespace) · inspect_ra
 ## Manifest gaps (dispatcher-verified)
 
 - **tools/forum_backfill_embeddings.py** and **tools/forum_regen_derived.py** — RESOLVED 2026-06-09: both now in tiers.json `excluded[]` (reason: "separately-deployed forum community service"), forced-accounted by the whole-tree gate (#991).
-- **Root cause RESOLVED 2026-06-09**: the tag-once gate now exists (#968/#991 whole-tree default-deny gate, run by manifest-gate.yml on dev PRs). The two forum scripts above are now in tiers.json `excluded[]` ("separately-deployed forum community service"). Untiered drift is now caught by construction — any new tracked file with no declared role fails CI.
+- **Root cause RESOLVED 2026-06-09**: the tag-once gate now exists (#968/#991 whole-tree default-deny gate, run on dev PRs by the `manifest-gate` step group inside `pr-checks.yml` — see the header note; the standalone workflow was consolidated away 2026-07-01). The two forum scripts above are now in tiers.json `excluded[]` ("separately-deployed forum community service"). Untiered drift is now caught by construction — any new tracked file with no declared role fails CI.
 
 ## Correctly excluded (operator/persona tier)
 
@@ -215,4 +215,4 @@ Every CLI has a companion skill/module that documents its invariants and usage d
 4. **Is it diagnostic, measurement, or DB-surgery?** → Category D (dev). Mark as T3 dev in tiers.json.
 5. **Is it persona-specific or operator-scope?** → Excluded. Document in the excluded list above and in tiers.json `excluded[]` with a reason comment.
 
-**Tiers.json is mandatory at filing time.** The tiering CI gate (#993 — unbuilt as of 2026-06-05) will enforce this mechanically when it lands. Until then: every new file must have a tiers.json entry before the PR merges — no exceptions. Category D (T3 dev) still requires an entry.
+**Tiers.json is mandatory at filing time, and CI enforces it.** The tag-once gate is BUILT and running — see this file's 2026-06-09 header note: `test_whole_tree_every_tracked_file_has_a_role` plus `test_every_shippable_path_is_tagged`, run by the `manifest-gate` step on dev PRs. Every new file must have a tiers.json entry in the same PR that adds it; Category D (T3 dev) still requires an entry. *(Until 2026-09-04 this sentence read, verbatim: "The tiering CI gate (#993 — unbuilt as of 2026-06-05) will enforce this mechanically when it lands." It contradicted the header four lines above it, whose own claim that "the documented-but-unbuilt framing throughout this draft is superseded" was written to cover this line and did not reach it.)*
