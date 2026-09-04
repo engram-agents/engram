@@ -380,10 +380,6 @@
       "tier": "convenience"
     },
     {
-      "path": ".githooks/pre-push",
-      "tier": "dev"
-    },
-    {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
     },
@@ -446,273 +442,327 @@
       "tier": "dev"
     },
     {
-      "path": "packaging/test-map.json",
-      "tier": "dev"
-    },
-    {
       "path": "tools/release_gates.py",
       "tier": "dev"
     },
     {
-      "path": "packaging/release-gates.json",
-      "tier": "dev"
-    },
-    {
       "path": "hooks/claude/start-engram-daemon.sh",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/start-engram-daemon.sh"
     },
     {
       "path": "hooks/claude/engram-surface-daemon.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-surface-daemon.py"
     },
     {
       "path": "hooks/claude/engram-surface-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-surface-hook.py"
     },
     {
       "path": "hooks/claude/engram-session-start-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-session-start-hook.py"
     },
     {
       "path": "hooks/claude/engram-stale-tree-pull-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stale-tree-pull-hook.py"
     },
     {
       "path": "hooks/claude/engram-stale-tree-warn-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stale-tree-warn-hook.py"
     },
     {
       "path": "hooks/claude/_stale_tree_hooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_stale_tree_hooklib.py"
     },
     {
       "path": "hooks/claude/engram-postcompact-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-postcompact-hook.py"
     },
     {
       "path": "hooks/claude/engram-toolcall-repair.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-toolcall-repair.py"
     },
     {
       "path": "hooks/claude/engram-user-identity-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-user-identity-hook.py"
     },
     {
       "path": "hooks/claude/engram-stop-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stop-hook.py"
     },
     {
       "path": "hooks/claude/_stophooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_stophooklib.py"
     },
     {
       "path": "hooks/claude/context_tracker.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/context_tracker.py"
     },
     {
       "path": "hooks/claude/engram-deference-detector-prompt.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-deference-detector-prompt.py"
     },
     {
       "path": "hooks/claude/engram-deference-detector-stop.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-deference-detector-stop.py"
     },
     {
       "path": "hooks/claude/engram-end-of-day-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-end-of-day-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/_hooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_hooklib.py"
     },
     {
       "path": "hooks/claude/_prompthooklib.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/_prompthooklib.py"
     },
     {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-inter-agent-prompt-hook.py",
       "multi_agent": true,
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-baton-prompt-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-baton-prompt-hook.py",
       "multi_agent": true,
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-forum-prompt-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-forum-prompt-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-time-bar-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-time-bar-hook.py"
     },
     {
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-utility-credit-mention-stop.py"
     },
     {
       "path": "hooks/claude/engram-loop-arm-stop-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-loop-arm-stop-hook.py"
     },
     {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-bash-pipe-exit-warn.py"
     },
     {
       "path": "hooks/claude/engram-lesson-tripwire-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-lesson-tripwire-hook.py"
     },
     {
       "path": "skills/claude/engram-first-session",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-first-session"
     },
     {
       "path": "skills/claude/engram-sleep",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-sleep"
     },
     {
       "path": "skills/claude/engram-nap",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-nap"
     },
     {
       "path": "skills/claude/engram-observe",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-observe"
     },
     {
       "path": "skills/claude/engram-revise",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-revise"
     },
     {
       "path": "skills/claude/engram-resolve-cascade",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-resolve-cascade"
     },
     {
       "path": "skills/claude/engram-support-lost",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-support-lost"
     },
     {
       "path": "skills/claude/engram-contradiction-resolution",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-contradiction-resolution"
     },
     {
       "path": "skills/claude/engram-learn-from-error",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-learn-from-error"
     },
     {
       "path": "skills/claude/engram-trust-tier",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-trust-tier"
     },
     {
       "path": "skills/claude/internal-external-decision",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/internal-external-decision"
     },
     {
       "path": "skills/claude/engram-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-loop"
     },
     {
       "path": "skills/claude/engram-curiosity-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-curiosity-loop"
     },
     {
       "path": "skills/claude/engram-meta-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-meta-loop"
     },
     {
       "path": "skills/claude/engram-deep-research",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-deep-research"
     },
     {
       "path": "skills/claude/engram-school-day",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-school-day"
     },
     {
       "path": "skills/claude/engram-research-report",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-research-report"
     },
     {
       "path": "skills/claude/engram-fairy-orchestration",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-fairy-orchestration"
     },
     {
       "path": "skills/claude/engram-auto-coder-fairy-judgement",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-auto-coder-fairy-judgement"
     },
     {
       "path": "skills/claude/engram-auto-reviewer-fairy-judgement",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-auto-reviewer-fairy-judgement"
     },
     {
       "path": "skills/claude/engram-upgrade",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-upgrade"
     },
     {
       "path": "skills/claude/engram-health-exam",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-health-exam"
     },
     {
       "path": "skills/claude/engram-loop-diagnose",
-      "tier": "dev"
+      "tier": "dev",
+      "dest": "skills/engram-loop-diagnose"
     },
     {
       "path": "skills/claude/engram-letter",
       "tier": "convenience",
+      "dest": "skills/engram-letter",
       "multi_agent": true
     },
     {
       "path": "skills/claude/engram-baton",
       "tier": "convenience",
+      "dest": "skills/engram-baton",
       "multi_agent": true
     },
     {
       "path": "skills/claude/engram-forum",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-forum"
     },
     {
       "path": "skills/claude/engram-standpoint",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-standpoint"
     },
     {
       "path": "skills/claude/engram-collaborating-loop",
       "tier": "convenience",
+      "dest": "skills/engram-collaborating-loop",
       "multi_agent": true
     },
     {
       "path": "skills/claude/engram-self-improve",
-      "tier": "dev"
+      "tier": "dev",
+      "dest": "skills/engram-self-improve"
     },
     {
       "path": "agents/claude/engram-dream-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-dream-fairy.md"
     },
     {
       "path": "agents/claude/engram-dream-master.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-dream-master.md"
     },
     {
       "path": "agents/claude/engram-batch-summary-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-batch-summary-fairy.md"
     },
     {
       "path": "agents/claude/engram-person-node-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-person-node-fairy.md"
     },
     {
       "path": "agents/claude/engram-coder-fairy.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "agents/engram-coder-fairy.md"
     },
     {
       "path": "agents/claude/engram-pr-reviewer.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "agents/engram-pr-reviewer.md"
     },
     {
       "path": "output-styles/claude/proactive-with-carveouts.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "output-styles/proactive-with-carveouts.md"
     },
     {
       "path": "templates/template.CLAUDE.md",
@@ -767,48 +817,6 @@
       "path": "templates/agents.json.example",
       "tier": "convenience",
       "multi_agent": true
-    },
-    {
-      "path": "src/build/instruction_manifestation/__init__.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/__init__.py",
-      "note": "instruction-manifestation engine PR2 (#2140): package init. Lives directly under src/build/ (not source_root=src/engram), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above). Developer (T3): a build-time schema/lint/generator system for authoring instruction templates, not something that runs at agent session time -- removing it doesn't break epistemic identity or continuity."
-    },
-    {
-      "path": "src/build/instruction_manifestation/schema.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/schema.py",
-      "note": "instruction-manifestation engine PR2 (#2140): component-file + harness-contract schema parsing and validator. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/builder.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/builder.py",
-      "note": "instruction-manifestation engine PR2 (#2140): flat-composition render/build logic. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/lints.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/lints.py",
-      "note": "instruction-manifestation engine PR2 (#2140): the three PR2-scope build-time lints (base-never-names-a-tool, unresolved-variable, extension_required coverage). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/generate_tool_policy_component.py",
-      "note": "instruction-manifestation engine PR2 (#2140): generator for the GENERATED tool-policy pilot component, sourced from deploy/tool_policy_facts.py. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/components",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/components",
-      "note": "instruction-manifestation engine PR2 (#2140): the two new-schema pilot components (identity-self-reference-example, tool-policy + its claude extension) in a fresh location, entirely separate from and additive to #2145's untouched src/engram/templates/components/ (different schema, different directory). Directory-level entry, same granularity precedent as the templates/components entry above. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3): build-time authoring content, not shipped/consumed at session time."
-    },
-    {
-      "path": "src/build/instruction_manifestation/harnesses",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/harnesses",
-      "note": "instruction-manifestation engine PR2 (#2140): harness-contract directory (claude.yaml pilot only -- codex/dsh contracts are PR3's job). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
     }
   ],
   "excluded": [
@@ -959,6 +967,34 @@
     {
       "path": "tools/engram-backfill-special-moment-edges.py",
       "reason": "one-shot data-integrity repair: creates the missing 'about' edges every special_moments[].node_id should have had, for nodes written before this backfill existed (issue #1948); idempotent and safe to re-run, but not a recurring shipped mechanism any install needs to run regularly"
+    },
+    {
+      "path": "src/build/instruction_manifestation/__init__.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/schema.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/builder.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/lints.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/components",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/harnesses",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
     }
   ],
   "repo_only": [
@@ -1065,6 +1101,18 @@
     {
       "path": "deploy/tool_policy_facts.py",
       "reason": "canonical TOOL POLICY fact table consumed only by tests/test_tool_policy_sync.py (the three-surface drift guard) — CI-only, never shipped in any install tier"
+    },
+    {
+      "path": ".githooks/pre-push",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, sharpened on inspection): a per-clone git pre-push hook (activated via 'git config core.hooksPath .githooks' in a contributor's own checkout) that checks PR-body close-keywords before push -- issue #1001. Meaningful only inside a real git clone of this repo; an installed plugin bundle has no .git directory and nothing ever activates core.hooksPath for it. Same shape as tests/, docs/, .github/ above -- repo development workflow, never shipped."
+    },
+    {
+      "path": "packaging/test-map.json",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, second pass): the manifest-can-run-from-plugin bar applied consistently means neither packaging json belongs shipped either. tools/release_gates.py load_config() and tools/run_touched_tests.py _load_test_map()/TEST_MAP_PATH both resolve the config path as repo_root-relative src/engram/packaging/<file>.json (release_gates.py:79; run_touched_tests.py:51,61) -- never plugin_root/packaging/<file>.json, which is where the manifest ships them. Verified further: run_touched_tests.py._find_repo_root() requires pytest.ini + tests/ as ancestor markers, both absent from an installed plugin bundle, so it cannot even resolve a repo_root there -- confirmed via source, not assumption. Both tools are themselves dev-tier-shipped but already non-functional from an installed bundle (repo-checkout-only tools) -- a pre-existing, separate issue, out of scope here. Their config companions were never a live recovery: moved to repo_only alongside the source at src/engram/packaging/."
+    },
+    {
+      "path": "packaging/release-gates.json",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, second pass): the manifest-can-run-from-plugin bar applied consistently means neither packaging json belongs shipped either. tools/release_gates.py load_config() and tools/run_touched_tests.py _load_test_map()/TEST_MAP_PATH both resolve the config path as repo_root-relative src/engram/packaging/<file>.json (release_gates.py:79; run_touched_tests.py:51,61) -- never plugin_root/packaging/<file>.json, which is where the manifest ships them. Verified further: run_touched_tests.py._find_repo_root() requires pytest.ini + tests/ as ancestor markers, both absent from an installed plugin bundle, so it cannot even resolve a repo_root there -- confirmed via source, not assumption. Both tools are themselves dev-tier-shipped but already non-functional from an installed bundle (repo-checkout-only tools) -- a pre-existing, separate issue, out of scope here. Their config companions were never a live recovery: moved to repo_only alongside the source at src/engram/packaging/."
     }
   ],
   "build_inputs": [
