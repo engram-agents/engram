@@ -604,69 +604,151 @@ def test_identity_coupled_hooks_are_known():
     )
 
 
-def test_import_dep_tier_consistency():
-    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+def _resolve_import_candidates(node: "ast.Import | ast.ImportFrom", importer_path: str) -> list[str]:
+    """Resolve an import AST node to candidate mechanism paths.
 
-    Prevents the #1087/#1088 class: an importer shipping in contexts where
-    the importee doesn't, causing ImportError at runtime.
+    Subdirectory-aware (engram-alpha#2549): a DOTTED module name is walked
+    into a nested path (``a.b.c`` → ``a/b/c.py``), not just resolved as a
+    same-directory single-segment name — this is what closes the gap where
+    an import crossing INTO a subpackage from a sibling file (``import
+    health.engine``, ``from health.engine import X``) could never resolve
+    to ``health/engine.py`` under the old same-directory-only logic.
 
     Only checks top-level module-scope imports in Python mechanism files.
-    Resolves module names to mechanism paths by checking the same directory
-    as the importing file (the pattern used by the scripts in this repo).
     Stdlib and external packages are automatically excluded (they won't
     resolve to any mechanism entry).
 
-    TWO KNOWN GAPS (engram-alpha#2537, health/ package-layout discussion,
-    2026-09-04 — measured, not theoretical; both verified against this
-    function's own resolution code, both load-bearing for any future
-    package-shaped subdirectory, not specific to health/):
+    Level-aware for ``ast.ImportFrom`` (the old code silently ignored
+    ``node.level`` entirely, which happened to still work for the common
+    single-level relative case by accident): a plain ``ast.Import`` is
+    ALWAYS absolute (Python has no relative form for it), so it resolves
+    from the manifest's source root regardless of the importer's own
+    location. An ``ast.ImportFrom`` with ``level == 0`` is likewise
+    absolute (resolved from source root); with ``level >= 1`` it's
+    explicitly relative, resolved within the importer's own package
+    directory — ``level=1`` is "this package" (the importer's own
+    dirname), each additional level strips one more trailing directory
+    component, mirroring Python's own relative-import semantics.
 
-    1. This resolver reads ``ast.ImportFrom.module`` only — it never reads
-       ``.level``, the attribute that actually carries a relative import's
-       leading dot(s). So a single-level explicit relative import
-       (``from .curves import CurveSpec``, ``module='curves'``, ``level=1``)
-       is textually indistinguishable here from a same-directory absolute
-       import, and stays checked — while a dotted absolute import of the
-       identical target (``from health.curves import CurveSpec``,
-       ``module='health.curves'``) fails the ``"." not in module`` gate and
-       is silently skipped. This is why a package under this repo can keep
-       its cross-module imports checked by this function, but ONLY if it
-       uses explicit relative imports for same-directory siblings — a
-       dotted-absolute style loses coverage with no warning. If this
-       function is ever made ``.level``-aware (a reasonable-looking fix, since
-       ignoring ``level`` also means a genuinely cross-package relative
-       import misresolves as same-directory) — that change must re-establish
-       coverage for every subdirectory currently depending on this gap, in
-       the same commit, or their imports go dark silently.
+    ``from X import Y`` — TWO candidates per imported name, not one, because
+    the AST alone cannot tell whether ``Y`` is a plain attribute defined in
+    ``X`` (module ``X`` is the real target — e.g. ``from health.curves
+    import CurveSpec``) or ``Y`` is itself a SUBMODULE of package ``X``
+    (``X/Y`` is the real target — e.g. ``from health import engine`` when
+    ``engine`` is ``health/engine.py``, not an attribute of
+    ``health/__init__.py``). Caught by this function's own test suite: an
+    earlier version of this fix resolved only the module-level candidate
+    and silently missed the ``from health import engine`` entry-point
+    spelling, one of the three shapes engram-alpha#2549 was filed to fix.
+    Both candidates are always emitted (module-level AND
+    module/name-as-submodule); a wrong guess simply fails to match any real
+    mechanism entry in ``path_to_entry`` and is silently ignored — same
+    mechanism that already excludes stdlib/external imports today, so this
+    costs nothing when the guess is wrong. This also incidentally resolves
+    ``from . import x`` (``node.module is None``, no module-level candidate
+    possible) via the submodule-per-name candidate alone.
 
-    2. This resolver has NO subdirectory-path notion at all — candidate
-       paths are always ``{importer's own dirname}/{single-segment module
-       name}.py``. So an import that crosses INTO a subpackage from a
-       SIBLING file — e.g. a root file doing ``from health import engine``,
-       ``import health.engine``, or ``from health.engine import X`` — can
-       never resolve to ``health/engine.py`` under ANY spelling: the first
-       two resolve to a nonexistent ``health.py`` (silently unmatched, since
-       ``health`` is a directory, not a file); the third fails the dot gate
-       outright. **This means the tier-closure guarantee this function
-       exists to provide is NOT enforced at a subpackage's entry point,
-       regardless of the importing file's own style** — an essential-tier
-       file importing a dev-tier module from inside a mis-tiered subpackage
-       would break at runtime on a convenience/essential-only install with
-       nothing here catching it. Fixing this needs real subdirectory-aware
-       resolution (walking a dotted module name into a nested candidate
-       path), not a one-line patch; tracked separately rather than folded
-       into this docstring note — see engram-alpha#2549.
+    ALSO same-directory, for absolute imports (``level == 0`` ``ImportFrom``,
+    and every plain ``ast.Import``) — caught by reviewer-fairy round 1 on
+    this fix (engram-alpha#2550): this repo extensively uses its OWN
+    `sys.path.insert(0, dirname(__file__))` + bare-sibling-import
+    convention in ``tools/`` and ``hooks/claude/`` (e.g. ``tools/baton.py``
+    doing ``from forum_api import (...)`` — a level-0 ``ImportFrom`` — where
+    ``forum_api.py`` lives in the SAME ``tools/`` directory as
+    ``baton.py``, resolvable only because that convention puts the
+    importer's own directory on `sys.path` at runtime, not because
+    `forum_api` sits at the manifest source root). Treating ``level ==
+    0``/bare `import` as "always resolve from source root, never
+    same-directory" is correct for a genuine absolute import but silently
+    dropped same-directory resolution for every file using this repo's own
+    sibling-import convention — measured on the real tree as 20 real
+    import statements across 16 files that the pre-fix resolver checked
+    and a source-root-only resolver would silently stop checking. So a
+    same-directory candidate is ALWAYS added alongside the source-root
+    candidate for every absolute import, same "wrong guess costs nothing"
+    reasoning as the X/X.Y case above — one of the two will usually be
+    spurious and fail to match `path_to_entry`, but which one is spurious
+    depends on which convention the importing file actually uses, and this
+    function has no way to know that up front.
+
+    Known dormant residual (round-2 reviewer-fairy, engram-alpha#2550): the
+    same-directory candidate above is only generated for the MODULE-level
+    candidate of a ``from X import Y``, never for the submodule-per-name
+    candidate — i.e. for ``level == 0``, ``{importer_dir}/{X}/{Y}.py`` is
+    never emitted, only ``{source_root}/{X}/{Y}.py``. So a hypothetical
+    ``from X import Y`` where ``Y`` is a submodule reachable only via this
+    repo's same-directory sys.path convention (rather than from the source
+    root) would not resolve. Confirmed dormant, not a live false negative:
+    a full scan of the real manifest found zero instances of this shape.
+    Left unfixed deliberately (no real case to regression-test against);
+    revisit if a future import actually needs it.
+
+    History (engram-alpha#2549, 2026-09-04): until this fix, the resolver
+    ignored ``.level`` entirely and had no subdirectory-path notion at all
+    — an import crossing INTO a subpackage from a sibling file
+    (``from health import engine``, ``import health.engine``, ``from
+    health.engine import X``) could never resolve under any spelling, so
+    the tier-closure guarantee wasn't enforced at a subpackage's entry
+    point. Both gaps documented in detail in PR #2548 (now historical —
+    see that PR's diff for the full original write-up) are closed here.
     """
     import ast
 
-    manifest = _load_manifest()
-    mechanisms = manifest["mechanisms"]
-    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    candidates: list[str] = []
+    importer_dir = os.path.dirname(importer_path)
 
-    # Build path→entry lookup for Python files
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        module_as_path = module.replace(".", "/") if module else ""
+
+        if node.level == 0:
+            base_dir = ""
+        else:
+            dir_part = importer_dir
+            for _ in range(node.level - 1):
+                dir_part = os.path.dirname(dir_part)
+            base_dir = dir_part
+
+        if module_as_path:
+            module_path = f"{base_dir}/{module_as_path}" if base_dir else module_as_path
+            candidates.append(f"{module_path}.py")
+            submodule_base = module_path
+            if node.level == 0 and importer_dir:
+                # Also try same-directory resolution for this absolute
+                # import — see the docstring's "ALSO same-directory" note.
+                candidates.append(f"{importer_dir}/{module_as_path}.py")
+        else:
+            # "from . import x" (or "from .. import x", etc.) — no module
+            # name at all; every imported name can only be a submodule of
+            # the resolved relative directory.
+            submodule_base = base_dir
+
+        for alias in node.names:
+            candidates.append(f"{submodule_base}/{alias.name}.py" if submodule_base else f"{alias.name}.py")
+    else:  # ast.Import — always absolute, no "level" attribute exists on this node type
+        for alias in node.names:
+            module_as_path = alias.name.replace(".", "/")
+            candidates.append(f"{module_as_path}.py")
+            if importer_dir:
+                candidates.append(f"{importer_dir}/{module_as_path}.py")
+
+    return candidates
+
+
+def _find_tier_violations(mechanisms: list[dict], src_root: str) -> list[str]:
+    """Scan every Python mechanism's top-level imports and return a list of
+    tier/multi_agent inconsistency violation strings (empty = clean).
+
+    Factored out of ``test_import_dep_tier_consistency`` (engram-alpha#2549)
+    so a synthetic-manifest falsifier test can call the exact same scan
+    logic the real gate uses, over a fake mechanisms list + fake files,
+    rather than re-implementing (and risking silently drifting from) the
+    real detection logic.
+    """
+    import ast
+
     path_to_entry = {e["path"]: e for e in mechanisms}
-
-    violations = []
+    violations: list[str] = []
 
     for entry in mechanisms:
         path = entry["path"]
@@ -688,21 +770,7 @@ def test_import_dep_tier_consistency():
             if not isinstance(node, (ast.Import, ast.ImportFrom)):
                 continue
 
-            # Resolve the module name(s) to potential mechanism paths
-            module_names = []
-            if isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                # Only handle simple names (no dots) — same-dir resolution
-                if "." not in module and module:
-                    dir_part = os.path.dirname(path)
-                    candidate = f"{dir_part}/{module}.py" if dir_part else f"{module}.py"
-                    module_names.append(candidate)
-            else:  # ast.Import
-                for alias in node.names:
-                    name = alias.name.split(".")[0]  # top-level package only
-                    dir_part = os.path.dirname(path)
-                    candidate = f"{dir_part}/{name}.py" if dir_part else f"{name}.py"
-                    module_names.append(candidate)
+            module_names = _resolve_import_candidates(node, path)
 
             for importee_path in module_names:
                 if importee_path not in path_to_entry:
@@ -727,6 +795,29 @@ def test_import_dep_tier_consistency():
                         f"MULTI_AGENT: {path!r} (multi_agent not set → ships single-agent) "
                         f"imports {importee_path!r} (multi_agent=True → single-agent build drops it)"
                     )
+
+    return violations
+
+
+def test_import_dep_tier_consistency():
+    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+
+    Prevents the #1087/#1088 class: an importer shipping in contexts where
+    the importee doesn't, causing ImportError at runtime.
+
+    Only checks top-level module-scope imports in Python mechanism files.
+    Resolution (engram-alpha#2549) is subdirectory- and level-aware — see
+    ``_resolve_import_candidates``'s own docstring for the exact rules and
+    its one known-dormant residual gap (a same-directory ``from X import Y``
+    submodule case, confirmed to have zero live instances on the real
+    manifest). Stdlib and external packages are automatically excluded
+    (they won't resolve to any mechanism entry).
+    """
+    manifest = _load_manifest()
+    mechanisms = manifest["mechanisms"]
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+
+    violations = _find_tier_violations(mechanisms, src_root)
 
     assert not violations, (
         f"Import-dep tier/flag inconsistencies found ({len(violations)}):\n"
