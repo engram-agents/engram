@@ -394,6 +394,8 @@ def _read_importance(server, node_id):
         conn.close()
 
 
+
+
 def test_lesson_importance_base_anchored_at_2_0():
     """Lesson creation ends at importance_base=2.0 with the matching
     decay-anchored importance_score, even though the interim
@@ -421,3 +423,93 @@ def test_lesson_importance_base_anchored_at_2_0():
     )
     # Never left at the interim confidence=0.5/surprise=0.0 value.
     assert row["importance_base"] != 0.5
+
+
+# ---------------------------------------------------------------------------
+# #1944 — prevention_type field
+# ---------------------------------------------------------------------------
+
+def test_prevention_type_defaults_to_advisory():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r["prevention_type"] == "advisory", r
+
+    meta = _lesson_metadata(server, r["lesson_id"])
+    assert meta["prevention_type"] == "advisory", meta
+
+
+def test_prevention_type_shadow_accepted_at_creation():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, prevention_type="shadow")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r["prevention_type"] == "shadow", r
+
+
+def test_prevention_type_blocking_rejected_at_creation():
+    """#1944 — eligibility to block is earned, never declared at mint.
+    A fresh lesson has zero fires and zero measured precision; minting
+    straight to blocking would deadlock the first false positive with no
+    prior warning."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, prevention_type="blocking")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "blocking" in r["error"], r
+    assert "engram_update_lesson" in r["error"], r
+
+
+def test_prevention_type_invalid_value_rejected():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, prevention_type="nonsense")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "Invalid prevention_type" in r["error"], r
+    assert r["valid_types"] == ["advisory", "blocking", "shadow"], r
+
+
+def test_prevention_type_promotable_via_update_lesson():
+    """Unlike creation, engram_update_lesson MAY promote a lesson straight
+    to 'blocking' — that promotion is the whole point of the field, earned
+    elsewhere (a shadow window), not re-litigated by this validation."""
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id, prevention_type="shadow")
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+
+    update_payload = {
+        "node_id": lesson_id,
+        "updates": {"prevention_type": "blocking"},
+        "reason": "measured zero-false-positive shadow window",
+    }
+    u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
+    assert "error" not in u, u
+    assert u["updated_fields"]["prevention_type"] == "blocking", u
+
+    meta = _lesson_metadata(server, lesson_id)
+    assert meta["prevention_type"] == "blocking", meta
+
+
+def test_prevention_type_update_rejects_invalid_value():
+    server = fresh_server()
+    inc_id = _seed_incident(server)
+    payload = _lesson_payload(inc_id)
+    r = json.loads(server.engram_add_lesson(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    lesson_id = r["lesson_id"]
+
+    update_payload = {
+        "node_id": lesson_id,
+        "updates": {"prevention_type": "nonsense"},
+    }
+    u = json.loads(server.engram_update_lesson(payload_json=json.dumps(update_payload)))
+    assert "error" in u, u
+    assert "Invalid prevention_type" in u["error"], u

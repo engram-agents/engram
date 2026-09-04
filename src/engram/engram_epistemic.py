@@ -25,6 +25,18 @@ import engram_core as core
 
 _VALID_EXEMPLAR_TARGET_TYPES = frozenset({"lesson", "cornerstone"})
 
+# alpha#1944 — a lesson's PreToolUse behavior at action-moment. "advisory"
+# (default) injects the nudge and always allows the call, same as today's
+# only behavior. "shadow" is a candidate for blocking: still always allows
+# the call, but the hook logs every would-have-blocked fire so a promotion
+# gate can measure precision before anything actually blocks. "blocking"
+# denies the first matching call and requires a single-use
+# ENGRAM_OVERRIDE token to let an identical retry through (see
+# engram-lesson-tripwire-hook.py). Promotion path is advisory -> shadow ->
+# blocking, earned by a measured zero-false-positive shadow window, never
+# declared at mint.
+PREVENTION_TYPES = frozenset({"advisory", "shadow", "blocking"})
+
 
 def _looks_like_prose(pattern: str) -> bool:
     """Discriminate a command-shape regex from a dead-prose situation_pattern.
@@ -879,6 +891,7 @@ def _add_lesson_impl(
     context_ids: str = "",
     situation_pattern: str = "",
     bypass_prose_check: bool = False,
+    prevention_type: str = "advisory",
     recall_summary: str = "",
     recall_keywords: list = None,
 ) -> str:
@@ -936,6 +949,13 @@ def _add_lesson_impl(
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             situation_pattern — see engram_add_lesson's docstring for the
             discriminator + audit-stamp contract.
+        prevention_type: One of "advisory" (default), "shadow", "blocking"
+            (alpha#1944). Advisory only ever injects the nudge. Shadow and
+            blocking are candidates for the PreToolUse tripwire hook to
+            actually deny the call — see PREVENTION_TYPES's docstring.
+            No lesson may be minted directly as "blocking"; promotion is
+            earned via engram_update_lesson after a measured
+            zero-false-positive shadow window.
         recall_summary: Always provide when you can — ≤140-char recall scent (#1952 PR1).
             Omission clean-accepts as 0 chars; soft-accepted up to 279 chars
             (flagged needs_tightening); rejected at 280+ chars.
@@ -960,6 +980,26 @@ def _add_lesson_impl(
         return json.dumps({
             "error": f"Invalid reasoning_type '{reasoning_type}'.",
             "valid_types": sorted(core.REASONING_TYPES),
+        })
+    if prevention_type not in PREVENTION_TYPES:
+        return json.dumps({
+            "error": f"Invalid prevention_type '{prevention_type}'.",
+            "valid_types": sorted(PREVENTION_TYPES),
+        })
+    # #1944 — eligibility to block is earned, never declared at mint. A
+    # fresh lesson has zero fires and therefore zero measured precision;
+    # minting straight to "blocking" would deadlock the first agent who
+    # hits a false positive with no prior warning it could happen.
+    # Promotion is engram_update_lesson's job, after a real shadow window.
+    if prevention_type == "blocking":
+        return json.dumps({
+            "error": (
+                "A lesson cannot be minted directly as prevention_type="
+                "'blocking'. Mint as 'advisory' (default) or 'shadow', let "
+                "it run a real shadow window, then promote via "
+                "engram_update_lesson once a zero-false-positive window is "
+                "measured."
+            )
         })
 
     _recall_summary, _recall_keywords, _needs_tightening, _summary_missing, _recall_error = (
@@ -1048,6 +1088,7 @@ def _add_lesson_impl(
             "reasoning_type": reasoning_type,
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
+            "prevention_type": prevention_type,
         }
         if situation_pattern:
             meta["situation_pattern"] = situation_pattern
@@ -1156,6 +1197,7 @@ def _add_lesson_impl(
             "reasoning_type": reasoning_type,
             "reasoning_class": rclass,
             "scaffolding_nudge": scaffolding_nudge,
+            "prevention_type": prevention_type,
             "incident_nodes": ids,
             "context_nodes": ctx,
             "importance_anchored": True,
@@ -1189,7 +1231,13 @@ def _add_lesson_impl(
 # now-removed confidence computation; lessons are non-claim-bearing and
 # store no confidence, so that no longer applies — the supersede-only
 # rule stands on the load-bearing-content rationale alone.)
-_LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge"})
+#
+# prevention_type joined the mutable set with alpha#1944: promotion
+# (advisory/shadow -> blocking) and auto-demotion (blocking -> advisory,
+# on a measured override-rate threshold) are both in-place transitions on
+# the SAME lesson, not a new epistemic claim — mechanical/actionability
+# metadata, same class as situation_pattern.
+_LESSON_MUTABLE_FIELDS = frozenset({"situation_pattern", "scaffolding_nudge", "prevention_type"})
 
 # #2000 — the subset of _LESSON_MUTABLE_FIELDS that error_incidents.json
 # actually carries a copy of (see core._rebuild_incidents_cache: it stores
@@ -1218,10 +1266,14 @@ def _update_lesson_impl(
     to an existing node still shows up as a graph-mutation event, distinct
     from node creation, without minting a new node.
 
-    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
-    scaffolding_nudge — both mechanical/actionability metadata tunable from
-    real firing experience, not the lesson's epistemic content (claim,
-    logical_chain, reasoning_type stay supersede-only).
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened again to add
+    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    — all mechanical/actionability metadata tunable from real firing
+    experience, not the lesson's epistemic content (claim, logical_chain,
+    reasoning_type stay supersede-only). prevention_type is the sole field
+    where an update MAY promote a lesson to "blocking" (minting cannot);
+    engram_add_lesson refuses "blocking" at creation for exactly this
+    reason.
 
     situation_pattern, when set to a non-empty value, runs the SAME #1864
     validation _add_lesson_impl runs at creation time — must compile as a
@@ -1234,8 +1286,8 @@ def _update_lesson_impl(
     Args:
         node_id: Lesson node ID (ls_NNNN). Must be type='lesson', is_current=1.
         updates: Dict of field → new_value. Mutable fields: situation_pattern,
-                 scaffolding_nudge. Unknown-field updates are rejected with a
-                 clear error.
+                 scaffolding_nudge, prevention_type. Unknown-field updates are
+                 rejected with a clear error.
         reason: Optional human-readable explanation for the change.
         bypass_prose_check: Default False. Overrides the prose-shape gate on
             a new situation_pattern value — see engram_add_lesson's docstring
@@ -1298,6 +1350,18 @@ def _update_lesson_impl(
             )
             if error is not None:
                 return json.dumps(error)
+
+    # #1944 — a prevention_type update must land on a real state. Unlike
+    # minting (which refuses "blocking" outright), an update MAY promote to
+    # "blocking" — that's the whole point of the promotion path, earned
+    # after a shadow window elsewhere, not re-litigated here.
+    if "prevention_type" in updates:
+        new_prevention_type = updates["prevention_type"]
+        if new_prevention_type not in PREVENTION_TYPES:
+            return json.dumps({
+                "error": f"Invalid prevention_type '{new_prevention_type}'.",
+                "valid_types": sorted(PREVENTION_TYPES),
+            })
 
     conn = core._get_db()
     try:

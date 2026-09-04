@@ -1580,6 +1580,17 @@ def _parse_payload(payload_json):
     non-string payload returns the standard error envelope instead of an uncaught
     exception (issue #1683). Error strings are byte-identical to the prior inline
     blocks — this is behavior-preserving except that TypeError is now caught.
+
+    alpha#1944 — pops "override_lesson" before returning, if present. It is a
+    reserved field: engram-lesson-tripwire-hook.py's PreToolUse deny gate reads
+    it directly off the RAW tool_input (before the server ever sees the call)
+    to let a single overridden call through a "blocking" lesson. By the time
+    _parse_payload runs, the hook has already made its allow/deny decision —
+    the field has done its job and would otherwise fail every tool's own
+    unknown-field check (each tool's allowlist has no reason to know this
+    name). Stripped here, centrally, rather than added to every tool's
+    allowlist: one choke point instead of a per-tool list nobody keeps
+    current. No-op for the vast majority of calls, which never carry it.
     """
     try:
         params = json.loads(payload_json)
@@ -1587,6 +1598,7 @@ def _parse_payload(payload_json):
         return None, json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
     if not isinstance(params, dict):
         return None, json.dumps({"error": "payload_json must be a JSON object"})
+    params.pop("override_lesson", None)
     return params, None
 
 
@@ -5121,7 +5133,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "recall_summary", "recall_keywords",
+    "prevention_type", "recall_summary", "recall_keywords",
 })
 
 
@@ -5210,6 +5222,15 @@ def engram_add_lesson(payload_json: str) -> str:
                 bypass_prose_check: true so the graph can audit how often this
                 override was actually exercised. Has no effect when situation_pattern
                 doesn't look like prose, or is empty.
+            prevention_type (str, optional): One of "advisory" (default) or "shadow"
+                (alpha#1944). "advisory" only ever injects the nudge, same as every
+                lesson before this field existed. "shadow" is a candidate for
+                blocking: still always allows the call, but the PreToolUse tripwire
+                hook logs every would-have-blocked fire so a promotion gate can
+                measure precision. "blocking" is REFUSED at creation — a lesson
+                earns blocking only via engram_update_lesson, after a real shadow
+                window with measured zero false positives; nothing can mint straight
+                to blocking.
             recall_summary (str, optional, always provide when you can): Compress
                 the corrective pattern into a ≤140-char recall-scent string — don't
                 start from a blank line. Not content preservation (the full claim
@@ -5411,10 +5432,11 @@ def engram_update_lesson(payload_json: str) -> str:
     (action="lesson_field_updated") — an in-place update still shows up as
     a graph-mutation event, distinct from creating a new node.
 
-    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
-    scaffolding_nudge — mechanical retrieval/actionability metadata you can
-    refine from real firing experience, never the lesson's epistemic content
-    (claim, logical_chain, confidence, reasoning_type stay supersede-only).
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened again for
+    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    — mechanical retrieval/actionability metadata you can refine from real
+    firing experience, never the lesson's epistemic content (claim,
+    logical_chain, confidence, reasoning_type stay supersede-only).
 
     situation_pattern, set to a non-empty value, runs the SAME #1864
     prose-shape gate engram_add_lesson runs at creation time — must compile
@@ -5426,13 +5448,19 @@ def engram_update_lesson(payload_json: str) -> str:
     failure mode to guard against. No approval gate on either field: neither
     carries trust/security weight (#1826's own scoping call).
 
+    prevention_type must be one of "advisory", "shadow", "blocking"
+    (#1944) — unlike engram_add_lesson, which REFUSES "blocking" outright,
+    this tool MAY promote a lesson to "blocking": that promotion is exactly
+    what an update is for, earned after a real shadow window (measured
+    zero false positives), never re-litigated by this validation.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
-                fields: situation_pattern, scaffolding_nudge. Attempting to
-                update any other field returns an error.
+                fields: situation_pattern, scaffolding_nudge, prevention_type.
+                Attempting to update any other field returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same
                 override semantics as engram_add_lesson's field of the same

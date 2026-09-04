@@ -92,6 +92,310 @@ def check_command(match_target: str, tripwires) -> list:
     return hits
 
 
+# ---------------------------------------------------------------------------
+# alpha#1944 step 2 — shadow-block logging
+# ---------------------------------------------------------------------------
+# A SEPARATE query + check path from load_tripwires/check_command above,
+# deliberately not folded into them: those two feed the advisory-nudge
+# injection every lesson/cornerstone/axiom/goal has always had, and this
+# repo's tests construct bare (pattern, nudge) 2-tuples as fixtures for that
+# path. Widening that tuple shape to carry prevention_type would silently
+# break every such fixture. prevention_type only exists on lesson nodes
+# (engram_epistemic.PREVENTION_TYPES), so this path queries just lessons,
+# runs independently, and — like check_in_turn_recall — must never suppress
+# or be suppressed by the advisory-nudge path.
+
+PREVENTION_LEDGER_PATH = Path(ENGRAM_HOME) / "lesson-prevention-ledger.jsonl"
+
+_PREVENTION_QUERY = """
+SELECT
+    id,
+    json_extract(metadata, '$.situation_pattern')  AS pattern,
+    json_extract(metadata, '$.prevention_type')    AS prevention_type,
+    COALESCE(json_extract(metadata, '$.scaffolding_nudge'), claim) AS nudge
+FROM nodes
+WHERE type = 'lesson'
+  AND is_current = 1
+  AND memory_status = 'active'
+  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
+  AND json_extract(metadata, '$.situation_pattern') != ''
+  AND json_extract(metadata, '$.prevention_type') IN ('shadow', 'blocking')
+"""
+
+
+def load_prevention_lessons(db_path: Path = DB_PATH):
+    """Return list of {id, pattern, prevention_type, nudge} for lessons
+    whose prevention_type is 'shadow' or 'blocking' (advisory/absent
+    lessons are excluded — they have nothing to log or deny here)."""
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        rows = conn.execute(_PREVENTION_QUERY).fetchall()
+        conn.close()
+        return [
+            {"id": row[0], "pattern": row[1], "prevention_type": row[2], "nudge": row[3] or ""}
+            for row in rows if row[1] and row[2]
+        ]
+    except Exception:
+        return []
+
+
+# alpha#1944 step 3 — override token detection. Kepler's verified design
+# (Lei-authorized throwaway test, PreToolUse deny confirmed reachable on
+# this plugin): the override is STATELESS and single-call-scoped — nothing
+# persists, nothing to re-arm. The retry IS the override. Bash embeds it as
+# a harmless leading env-var assignment (ENGRAM_OVERRIDE="ls_NNNN: <reason>"
+# <same command> — the shell sets the var and runs the command unchanged;
+# the hook only reads the literal command STRING, never executes it). MCP
+# tools carry it as an "override_lesson" field in payload_json, which lands
+# inside build_match_target's compact-JSON args string the same way any
+# other field would. One regex covers both shapes since both end up
+# somewhere inside match_target.
+#
+# The hook itself can only ALLOW or DENY — it cannot strip override_lesson
+# before the call reaches the tool. That gap is closed centrally instead:
+# server.py's _parse_payload() pops override_lesson before any tool's own
+# unknown-field check runs, so every MCP tool is covered without touching
+# each one's individual allowlist (see _parse_payload's own docstring).
+_OVERRIDE_TOKEN_RE = r'(?:ENGRAM_OVERRIDE\s*=\s*"|"override_lesson"\s*:\s*")%s\s*:\s*([^"]*)"'
+
+
+def _find_override(match_target: str, lesson_id: str) -> str | None:
+    """Return the override reason for lesson_id if a matching
+    ENGRAM_OVERRIDE / override_lesson token is present in match_target,
+    else None. Never raises."""
+    try:
+        m = re.search(_OVERRIDE_TOKEN_RE % re.escape(lesson_id), match_target)
+    except re.error:
+        return None
+    return m.group(1).strip() if m else None
+
+
+def check_shadow_block(match_target: str, prevention_lessons, hook_input: dict | None = None) -> list:
+    """Return a list of would-have-blocked fire records — one per matching
+    shadow/blocking lesson, including whether an override token for that
+    lesson was present (#1944 step 3 — the override token IS the label
+    step 4's auto-demotion counter reads). Never raises: a malformed
+    pattern is skipped silently, matching check_command's posture."""
+    hits = []
+    for lesson in prevention_lessons:
+        pattern = lesson["pattern"]
+        try:
+            match = re.search(pattern, match_target, re.IGNORECASE)
+        except re.error:
+            continue  # malformed pattern — skip silently, same as check_command
+        if not match:
+            continue
+        override_reason = _find_override(match_target, lesson["id"])
+        hits.append({
+            "lesson_id": lesson["id"],
+            "prevention_type": lesson["prevention_type"],
+            "matched_span": match.group(0),
+            "tool_name": (hook_input or {}).get("tool_name"),
+            "session_id": (hook_input or {}).get("session_id"),
+            "override_present": override_reason is not None,
+            "override_reason": override_reason,
+        })
+    return hits
+
+
+# alpha#1944 step 4 — auto-demotion, Kepler's read-time-lease design
+# (forum #387, 2026-09-04): the hook NEVER writes the graph directly — that
+# is the no-raw-DB-edits rule, and the audit trail (field_traces,
+# edit_history, turn stamp) belongs to engram_update_lesson, the module
+# that owns it. "Mechanically demoted" stays true anyway because the hook
+# computes the EFFECTIVE prevention_type at read time from the ledger, not
+# only from the lesson's stored metadata: once a blocking lesson has N
+# overrides inside the window, THIS call (and every call after it, until
+# the durable write lands) is treated as advisory. A lease, not a latch —
+# it decays to safe immediately from the signal already on disk; the
+# durable write is a follow-up (a person, or a dream-cycle reconcile pass
+# reading the "threshold crossed" ledger entries this emits) tracked
+# separately, not built in this hook.
+_DEMOTION_DEFAULTS = {"overrides": 2, "window_days": 7}
+
+
+def _demotion_config() -> dict:
+    """Read lessons.blocking_demotion from config.json; safe defaults.
+
+    Default (overrides=2, window_days=7) is Kepler's pick made 2026-09-04,
+    not a considered policy from Lei — retune via config.json:
+      {"lessons": {"blocking_demotion": {"overrides": 2, "window_days": 7}}}
+    Reasoning stated on the issue: a lesson only reaches "blocking" after a
+    zero-false-positive shadow window, so one override is plausibly an
+    accepted-risk case; two legitimate overrides in a week is evidence the
+    pattern matches legitimate calls and should stop blocking.
+    """
+    try:
+        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = (config.get("lessons", {}) or {}).get("blocking_demotion", {}) or {}
+        return {
+            "overrides": int(section.get("overrides", _DEMOTION_DEFAULTS["overrides"])),
+            "window_days": float(section.get("window_days", _DEMOTION_DEFAULTS["window_days"])),
+        }
+    except Exception:
+        return dict(_DEMOTION_DEFAULTS)
+
+
+def _count_recent_overrides(lesson_id: str, window_days: float, now: float) -> int:
+    """Count override_present=True ledger entries for lesson_id within the
+    last window_days. Best-effort: any read failure counts as 0, never
+    raises. Only called on an actual blocking-lesson match (rare by
+    design — the whole point of blocking is deterrence), so scanning the
+    full ledger stays cheap in practice."""
+    if not PREVENTION_LEDGER_PATH.exists():
+        return 0
+    cutoff = now - (window_days * 86400)
+    count = 0
+    try:
+        with open(PREVENTION_LEDGER_PATH) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if (
+                    entry.get("lesson_id") == lesson_id
+                    and entry.get("override_present")
+                    and entry.get("ts", 0) >= cutoff
+                ):
+                    count += 1
+    except Exception:
+        return count
+    return count
+
+
+def check_blocking_deny(match_target: str, prevention_lessons, now: float | None = None) -> dict | None:
+    """Return a decision for the FIRST 'blocking' lesson matched without a
+    valid override this call, or None if nothing to report.
+
+    Only prevention_type == 'blocking' is ever consulted — 'shadow' never
+    denies or demotes (that is the entire distinction; shadow only logs,
+    via check_shadow_block above). A lesson-id-matching override token
+    lets THIS call through outright (still recorded as a hit by
+    check_shadow_block); it is checked before the demotion count so an
+    overridden call is never ALSO reported as a demotion.
+
+    Otherwise checks the read-time lease: if this lesson already has
+    demotion_config()["overrides"] overrides inside the window, the
+    returned dict carries demoted=True and override_count/threshold —
+    main() must NOT deny on that, only log + warn. A genuine denial (no
+    override this call, threshold not yet crossed) carries demoted=False.
+    """
+    if now is None:
+        import time as _time
+        now = _time.time()
+    cfg = _demotion_config()
+    for lesson in prevention_lessons:
+        if lesson["prevention_type"] != "blocking":
+            continue
+        pattern = lesson["pattern"]
+        try:
+            match = re.search(pattern, match_target, re.IGNORECASE)
+        except re.error:
+            continue
+        if not match:
+            continue
+        if _find_override(match_target, lesson["id"]) is not None:
+            continue  # overridden this call — do not deny or demote-report
+        override_count = _count_recent_overrides(lesson["id"], cfg["window_days"], now)
+        base = {
+            "lesson_id": lesson["id"],
+            "matched_span": match.group(0),
+            "nudge": lesson.get("nudge", ""),
+        }
+        if override_count >= cfg["overrides"]:
+            base.update({
+                "demoted": True,
+                "override_count": override_count,
+                "threshold": cfg["overrides"],
+                "window_days": cfg["window_days"],
+            })
+        else:
+            base["demoted"] = False
+        return base
+    return None
+
+
+def build_deny_reason(deny: dict) -> str:
+    """Build the permissionDecisionReason text for a blocking denial —
+    lesson id, matched span, the nudge, and the exact override recipe
+    (Kepler's verified design: JSON permissionDecision form, its reason
+    rendering cleanly as the tool error rather than a hook-crash-shaped
+    exit-2 message)."""
+    lesson_id = deny["lesson_id"]
+    return (
+        f"[lesson-tripwire BLOCKING] {lesson_id} matched {deny['matched_span']!r} "
+        f"— this call is blocked, not merely advised.\n"
+        f"{deny['nudge']}\n\n"
+        f"If you've reviewed this and the call is correct, retry with the exact "
+        f"same call plus a single-use override naming this lesson and your reason:\n"
+        f"  Bash:  ENGRAM_OVERRIDE=\"{lesson_id}: <your reason>\" <same command>\n"
+        f"  MCP:   add \"override_lesson\": \"{lesson_id}: <your reason>\" to payload_json\n"
+        f"The override is single-call-scoped — nothing persists, nothing to re-arm."
+    )
+
+
+def _log_threshold_crossed(now: float, deny: dict) -> None:
+    """alpha#1944 step 4 — the read-time-lease signal: a loud stderr line
+    (hook stdout is reserved for the additionalContext/deny JSON contract;
+    stderr is safe to use freely) plus a distinct ledger entry, emitted
+    the FIRST time a call would have denied but the override threshold was
+    already crossed. Best-effort, never raises."""
+    lesson_id = deny["lesson_id"]
+    try:
+        print(
+            f"[lesson-tripwire] AUTO-DEMOTED (lease) {lesson_id}: "
+            f"{deny['override_count']} overrides in the last {deny['window_days']} "
+            f"day(s) (threshold {deny['threshold']}) — treating as advisory on this "
+            f"call; durable prevention_type write still pending (engram_update_lesson).",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+    try:
+        with open(PREVENTION_LEDGER_PATH, "a") as f:
+            f.write(json.dumps({
+                "ts": now,
+                "lesson_id": lesson_id,
+                "mode": "auto_demoted_lease",
+                "override_count": deny["override_count"],
+                "threshold": deny["threshold"],
+                "window_days": deny["window_days"],
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _append_prevention_ledger(now: float, hits: list) -> None:
+    """Best-effort append of one JSONL entry per would-have-blocked fire
+    (alpha#1944 step 2, extended step 3 with override fields — the log a
+    future promotion/demotion gate reads). Mirrors _append_ledger's
+    never-raises contract: a ledger failure must never suppress or delay
+    the tripwire path it rides alongside."""
+    if not hits:
+        return
+    try:
+        with open(PREVENTION_LEDGER_PATH, "a") as f:
+            for hit in hits:
+                f.write(json.dumps({
+                    "ts": now,
+                    "lesson_id": hit["lesson_id"],
+                    "mode": hit["prevention_type"],
+                    "tool_name": hit["tool_name"],
+                    "session_id": hit["session_id"],
+                    "matched_span": hit["matched_span"],
+                    "override_present": hit.get("override_present", False),
+                    "override_reason": hit.get("override_reason"),
+                    # step 4 field (independent-predicate verdict) lands
+                    # when the auto-demotion counter is wired.
+                }) + "\n")
+    except Exception:
+        pass
+
+
 def build_match_target(hook_input: dict) -> str:
     """Build the string to match situation_pattern against, or "" to skip.
 
@@ -561,6 +865,49 @@ def main() -> None:
         if not match_target or not match_target.strip():
             sys.exit(0)
 
+        # alpha#1944 step 3 — the deny gate, checked FIRST and computed
+        # inside its own fail-open try/except. This is the one place this
+        # hook can refuse a tool call at all; every other check in this
+        # function only ever ADDS advisory context. A failure loading
+        # prevention lessons, or any other exception while computing the
+        # deny decision, MUST resolve to "do not deny" — infra failure is
+        # never a reason to block a call (Kepler's design point 5: the only
+        # reachable failure mode is loud-advisory, never silent no-op and
+        # never deadlock). prevention_lessons is computed once and reused
+        # by the shadow-block logging below.
+        prevention_lessons = []
+        deny = None
+        try:
+            prevention_lessons = load_prevention_lessons()
+            if prevention_lessons:
+                deny = check_blocking_deny(match_target, prevention_lessons)
+        except Exception:
+            deny = None
+
+        if deny is not None and deny.get("demoted"):
+            # Read-time lease (step 4): do NOT deny — this lesson's
+            # override count already crossed the auto-demotion threshold,
+            # so the effective state is advisory for this call even though
+            # the durable prevention_type write hasn't landed. Log loudly
+            # and fall through to the normal advisory path below.
+            try:
+                import time as _time
+                _log_threshold_crossed(_time.time(), deny)
+            except Exception:
+                pass
+            deny = None
+
+        if deny is not None:
+            response = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": build_deny_reason(deny),
+                }
+            }
+            print(json.dumps(response))
+            sys.exit(0)
+
         parts = []
 
         tripwires = load_tripwires()
@@ -571,6 +918,23 @@ def main() -> None:
                 "[lesson-tripwire] Action-moment pattern matched — remember:\n"
                 f"{nudge_lines}"
             )
+
+        # alpha#1944 step 2 — shadow-block logging. Independently guarded,
+        # same posture as in-turn recall below: a logging failure must never
+        # suppress a tripwire hit, and a tripwire failure must never suppress
+        # this. Nothing here changes what the agent sees — shadow lessons
+        # (and any blocking lesson that WAS overridden, since deny already
+        # returned above otherwise) still only ever inject the advisory
+        # nudge above; this purely appends to the promotion-gate ledger.
+        try:
+            import time as _time
+            shadow_hits = (
+                check_shadow_block(match_target, prevention_lessons, hook_input)
+                if prevention_lessons else []
+            )
+            _append_prevention_ledger(_time.time(), shadow_hits)
+        except Exception:
+            pass
 
         # In-turn ambient recall (#1690) — independently guarded; a recall
         # failure must never suppress a tripwire hit (and vice versa).
