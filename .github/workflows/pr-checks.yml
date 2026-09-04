@@ -497,6 +497,17 @@ jobs:
         # frontmatter block.
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
 
+      - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
+        # Pins a SHA over the canonical L0 measurement set — every
+        # MeasurementDef's (name, population, definition_inputs). An add,
+        # remove, or silent redefinition through a remote constant (e.g.
+        # CLAIM_BEARING_TYPES) fails this until health.version.MAJOR is
+        # bumped and the pin re-set IN THE SAME COMMIT. Pure stdlib+pytest,
+        # 27 tests in well under a second — same cost class as the gates
+        # above, and it is the only enforcement of the MAJOR-bump
+        # convention on dev PRs.
+        run: python3 -m pytest tests/test_health_measurements.py -q
+
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
       # Cheap tag-once tiering gate — runs on EVERY dev PR (and main PRs).
