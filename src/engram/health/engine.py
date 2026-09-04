@@ -45,6 +45,41 @@ Scope of this module (PR5 additions marked):
      FIXED path, ``DATA_DIR/health-snapshots/health-snapshot-dream.json``,
      overwritten every checkpoint.
 
+SLICE 2 ADDITION (engram-alpha#2537, "signals as formulas over L0") — the
+raw signal path this module drives ``scores``/``aspects``/``composed``
+from changes, and TWO PARALLEL SYSTEMS above becomes THREE:
+
+  - ``health.measurements`` (L0, slice 1) — bare graph counts + environment
+    facts, read once per ``build_snapshot`` call.
+  - ``health.signals`` (L1, THIS slice) — pure arithmetic over that SAME L0
+    read. ``_run_aspect`` now sources every metric's raw value from here,
+    NOT from calling CONFIG's ``metric.signal_fn(conn)`` directly (that was
+    the ENTIRE pre-slice-2 path).
+  - ``health.config.CONFIG``'s ``signal_fn`` bindings (still the same nine
+    ``health.metrics`` functions, still taking ``conn`` directly) are NOT
+    retired and NOT dead code — they are now the SSoT verification oracle:
+    ``_verify_l1_against_live_signal_fns`` calls every one of them, on the
+    SAME connection the L0 read just used, and asserts exact equality
+    against L1's output BEFORE ``build_snapshot`` returns. A mismatch
+    raises ``HealthEngineSSoTError`` — not silently absorbed inside THIS
+    module (see that exception's own docstring for the precise scope of
+    "loud": the sole production caller, ``engram_lifecycle.py``'s
+    checkpoint flow, has a pre-existing broad catch that applies uniformly
+    to every health-snapshot failure, by design). This is the
+    design charge's "recompute L1-L4 from L0 and assert equality against
+    the stored cache ... a test that has never been seen to fail is not a
+    control" requirement, run on every fresh build rather than deferred to
+    a not-yet-built re-score-an-old-snapshot path (storage/migration
+    infrastructure the design charge explicitly does not ask this slice to
+    build).
+  - Version stamps: ``health_version``/``raw_schema_version``/
+    ``model_version`` (health/version.py's MAJOR/MINOR) are written into
+    every snapshot at the top level, making a stored artifact
+    self-describing without needing this module's CURRENT values to
+    interpret it later — the whole point of storing L0 as the SSoT
+    (design charge: "as long as we don't change the bare data items, the
+    whole health score can be reconstructed from previous snapshots").
+
 COMPOSITION FORMULA (Kepler's clarification 1, 2026-09-03, cited verbatim
 per the PR5 spec's instruction to cite it in the docstring): "engram-
 alpha#1991, issue comment thread, Lei's 2026-09-02T14:32Z ruling (four-level
@@ -178,9 +213,14 @@ still DOES, post-PR5:
   - ``health.config.EngineConfig`` (``CONFIG`` below): declares the
     denominator population + empty-denominator policy for each metric
     (UNCHANGED, not superseded by draft-2, which is silent on denominators)
-    and provides the ``signal_fn`` callable ``_run_aspect`` calls to compute
-    a RAW signal. Its own weight-sum-to-100 / scored-implies-state_valued /
-    dive_target checks all still run, unchanged.
+    and provides the ``signal_fn`` callable. Pre-slice-2, ``_run_aspect``
+    called this directly to compute the RAW signal; as of slice 2
+    (engram-alpha#2537, see "SLICE 2 ADDITION" below), ``_run_aspect``
+    sources raw signals from ``health.signals`` (L1) instead, and
+    ``signal_fn`` is called only by the SSoT verification oracle,
+    ``_verify_l1_against_live_signal_fns``. Its own weight-sum-to-100 /
+    scored-implies-state_valued / dive_target checks all still run,
+    unchanged.
   - ``health_engine_model.ScoringModel`` (``MODEL``): declares importance,
     curve, aspect membership, detector/repair for the SAME nine signals, and
     drives the actual ``aspect_score``/``composed`` arithmetic above.
@@ -228,10 +268,13 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from . import measurements as health_measurements
 from . import metrics
 from . import model as health_engine_model
+from . import signals as health_signals
+from . import version as health_version
 from .config import (
     AspectDef,
     EngineConfig,
@@ -647,18 +690,181 @@ def compose_aspect_scores(
 
 
 def _run_aspect(
-    conn: sqlite3.Connection, aspect: AspectDef, model: ScoringModel = MODEL
+    l1_signals: dict[str, float | _Unavailable],
+    aspect: AspectDef,
+    model: ScoringModel = MODEL,
 ) -> tuple[dict[str, float | _Unavailable], float | _Unavailable]:
-    """Run every metric in one aspect (raw signal via CONFIG's ``AspectDef``
-    — the UNCHANGED raw-signal-computation layer, see module docstring);
-    return (raw_by_metric, aspect_score), where aspect_score is now computed
-    via ``_score_aspect`` against the NEW scoring model, NOT via ``aspect.
-    scoring_fn`` (vestigial as of PR5 — see module docstring)."""
+    """Run every metric in one aspect — raw signal via the L1 layer
+    (engram-alpha#2537 slice 2: ``health.signals``, arithmetic over the L0
+    measurements dict — SUPERSEDES this function's pre-slice-2 behavior of
+    calling CONFIG's ``metric.signal_fn(conn)`` directly per metric; see
+    module docstring's "THREE PARALLEL SYSTEMS" section for what CONFIG's
+    ``signal_fn`` still does post-slice-2). Return (raw_by_metric,
+    aspect_score), where aspect_score is computed via ``_score_aspect``
+    against the scoring model, NOT via ``aspect.scoring_fn`` (vestigial as
+    of PR5 — see module docstring)."""
     raw_by_metric: dict[str, float | _Unavailable] = {}
     for metric in aspect.metrics:
-        raw_by_metric[metric.name] = metric.signal_fn(conn)
+        raw_by_metric[metric.name] = l1_signals[metric.name]
     aspect_score = _score_aspect(aspect.name, raw_by_metric, model)
     return raw_by_metric, aspect_score
+
+
+class HealthEngineSSoTError(Exception):
+    """Raised by ``_verify_l1_against_live_signal_fns`` when L1 (formulas
+    over L0) and the live health.metrics SQL path disagree on the same
+    connection, OR at import time if CONFIG's metric names,
+    ``health.signals.SIGNALS``, and ``_LIVE_SIGNAL_FNS_FOR_VERIFICATION``
+    do not all name exactly the same set of signals (see the COMPLETENESS
+    ASSERTION below — a three-way equality check, not just one direction:
+    a CONFIG metric absent from SIGNALS would otherwise be an undiagnosed
+    ``KeyError`` from ``_run_aspect``'s hot path, not only a silently
+    unverified SIGNALS entry). Deliberately loud within THIS module —
+    never caught/swallowed here — see ``_verify_l1_against_live_signal_
+    fns``'s own docstring for why.
+
+    Not loud all the way to a user, and this class does not claim otherwise:
+    the sole production caller, ``engram_lifecycle.py``'s checkpoint flow,
+    wraps ``health.engine.write_snapshot`` in a broad ``except Exception``
+    that predates this slice and applies uniformly to every health-snapshot
+    failure mode, by design ("a health-snapshot failure must never break
+    the underlying nap/advance_turn checkpoint tool it's piggybacked onto").
+    This exception gets that same treatment — downgraded to a soft
+    ``error`` string in ``health_snapshot_summary``, not a crash — which is
+    the correct behavior for THAT caller's contract, not a gap this class
+    needs to route around. "Loud" here means "not silently absorbed inside
+    health.engine itself, at the layer where the divergence is actually
+    detected" — reviewer-fairy finding, PR#2556 round 1, flagging that the
+    PR's own prose had overstated this."""
+
+
+def _verify_l1_against_live_signal_fns(
+    conn: sqlite3.Connection, l1_signals: dict[str, float | _Unavailable]
+) -> None:
+    """THE SSoT equality control (engram-alpha#2537 design charge: "keep the
+    derived block in the snapshot as a cache ... recompute L1-L4 from L0 and
+    assert equality against the stored cache. If they differ, either the
+    spec moved or there is a bug, and both are things you want to be loud").
+
+    A stored-snapshot re-score path (recomputing L1-L4 from an OLD
+    snapshot's own stored L0) needs snapshot-versioning/migration
+    infrastructure this slice does not build (explicitly not this PR's job
+    — design charge, "What I am NOT specifying"). This function is the
+    control that IS available today, run on every fresh build instead of
+    only at some future re-score time: it recomputes every signal via
+    CONFIG's ORIGINAL live-connection path (``health.metrics``'s SQL
+    functions, unchanged since PR1) on the SAME connection the L0 read
+    just used, and asserts exact equality against the L1-derived value.
+    Same connection, no reconnect — Ariadne's amendment #3 discipline from
+    slice 1's own acceptance test (``tests/test_health_measurements.py``),
+    applied here as a live production check rather than only a unit test.
+
+    Raises ``HealthEngineSSoTError`` — see that class's own docstring for
+    the precise scope of "loud" — the moment L1 (arithmetic over L0) and
+    the live SQL path disagree on the SAME graph state. That divergence
+    means one of exactly two things: an L0 measurement's SQL and an L1
+    formula have drifted apart (a real bug), or ``health.metrics``'s own
+    SQL changed without the L0/L1 layers being updated to match (a
+    migration that missed a spot) — both are exactly the class of silent
+    SSoT-identity failure this whole slice exists to make impossible.
+    """
+    mismatches: list[str] = []
+    for name, live_fn in _LIVE_SIGNAL_FNS_FOR_VERIFICATION.items():
+        live_value = live_fn(conn)
+        l1_value = l1_signals[name]
+        if l1_value != live_value:
+            mismatches.append(f"{name}: L1={l1_value!r} live={live_value!r}")
+    if mismatches:
+        raise HealthEngineSSoTError(
+            "L1 (health.signals, arithmetic over L0) disagrees with the "
+            "live health.metrics SQL path on the same connection — the "
+            "SSoT identity this design exists to guarantee has broken:\n"
+            + "\n".join(f"  {m}" for m in mismatches)
+        )
+
+
+# Name -> live signal_fn, for _verify_l1_against_live_signal_fns above.
+# Deliberately a SEPARATE table from CONFIG's own signal_fn bindings
+# (health/config.py's MetricDef.signal_fn, which still points at the same
+# nine health.metrics functions) rather than reading CONFIG's bindings —
+# this table's whole job is being an independent second source, not merely
+# CONFIG's list under a new name; the two happening to name the same
+# functions today is a fact this control's own logic does not depend on.
+_LIVE_SIGNAL_FNS_FOR_VERIFICATION: dict[str, "Callable[[sqlite3.Connection], float | _Unavailable]"] = {
+    "stale_derivation_rate": metrics.stale_derivation_rate,
+    "taint_rate": metrics.taint_rate,
+    "open_contradiction_rate": metrics.open_contradiction_rate,
+    "uncited_observation_rate": metrics.uncited_observation_rate,
+    "dangling_evidence_rate": metrics.dangling_evidence_rate,
+    "recall_summary_coverage": metrics.recall_summary_coverage,
+    "recall_keywords_coverage": metrics.recall_keywords_coverage,
+    "embedding_coverage": metrics.embedding_coverage,
+    "giant_component_fraction": metrics.giant_component_fraction,
+}
+
+# COMPLETENESS ASSERTION (reviewer-fairy finding, PR#2556 round 1, extended
+# per Ariadne's colleague-review suggestion, round 2): three sets need to
+# stay in lockstep, and only one direction was originally guarded.
+#
+#   CONFIG metric names  --  the names _run_aspect looks up in l1_signals
+#   health_signals.SIGNALS.keys()  --  what L1 actually knows how to compute
+#   _LIVE_SIGNAL_FNS_FOR_VERIFICATION.keys()  --  what the SSoT oracle checks
+#
+# The fairy's original check covered SIGNALS -> VERIFICATION (a signal with
+# no verification entry silently narrows SSoT coverage). Ariadne's
+# colleague pass found the direction this PR ITSELF newly introduces is
+# unguarded: _run_aspect changed from metric.signal_fn(conn) (always
+# resolvable — CONFIG defines signal_fn per metric) to
+# l1_signals[metric.name] (a bare dict subscript) — so a CONFIG metric
+# with no matching SIGNALS entry is now a raw KeyError from inside
+# build_snapshot's hot path, not the loud, precise diagnostic this
+# assertion gives everywhere else. The reverse direction (a stray
+# verification-table entry with no SIGNALS match) would raise inside the
+# verifier the same ungraceful way. Checking all three sets for exact
+# equality closes every direction at once.
+#
+# Deliberately NOT "derive these from health_signals.SIGNALS" — that would
+# make the tables share their key SOURCE, undermining the "independent
+# second source" property _LIVE_SIGNAL_FNS_FOR_VERIFICATION's own comment
+# explains — so the fix is an explicit CHECKED assertion (import-time,
+# fail loud immediately, matching this codebase's "the check is only a
+# check if it reads that field" precedent — health/model.py's own
+# cross-validation of MetricBinding populations against CONFIG) rather than
+# either silent drift or a shared source of truth.
+_config_metric_names = {m.name for aspect in CONFIG.aspects for m in aspect.metrics}
+_signals_names = set(health_signals.SIGNALS.keys())
+_verification_names = set(_LIVE_SIGNAL_FNS_FOR_VERIFICATION.keys())
+
+if _config_metric_names != _signals_names or _signals_names != _verification_names:
+    _details = []
+    if _config_metric_names - _signals_names:
+        _details.append(
+            "CONFIG metric(s) with no health.signals.SIGNALS entry "
+            f"(_run_aspect would KeyError on these): {sorted(_config_metric_names - _signals_names)}"
+        )
+    if _signals_names - _config_metric_names:
+        _details.append(
+            "health.signals.SIGNALS entries with no matching CONFIG metric "
+            f"(computed but never used): {sorted(_signals_names - _config_metric_names)}"
+        )
+    if _signals_names - _verification_names:
+        _details.append(
+            "health.signals.SIGNALS declares signal(s) with no matching entry "
+            "in _LIVE_SIGNAL_FNS_FOR_VERIFICATION — the SSoT check would "
+            f"silently skip verifying them: {sorted(_signals_names - _verification_names)}"
+        )
+    if _verification_names - _signals_names:
+        _details.append(
+            "_LIVE_SIGNAL_FNS_FOR_VERIFICATION has entry/entries with no "
+            "matching health.signals.SIGNALS name (the verifier would "
+            f"KeyError on l1_signals[name]): {sorted(_verification_names - _signals_names)}"
+        )
+    raise HealthEngineSSoTError(
+        "CONFIG metric names, health.signals.SIGNALS, and "
+        "_LIVE_SIGNAL_FNS_FOR_VERIFICATION must name EXACTLY the same set "
+        "of signals — they have drifted apart:\n"
+        + "\n".join(f"  {d}" for d in _details)
+    )
 
 
 def _anchor_commit_sha() -> str | None:
@@ -1151,6 +1357,25 @@ def build_snapshot(
 
     current_turn = core._get_current_turn()
 
+    # L0 -> L1 (engram-alpha#2537 slice 2): ONE L0 read, reused for BOTH the
+    # stored "measurements" block below AND as L1's own input — never a
+    # second, separate L0 read for the two. Same discipline slice 1's own
+    # acceptance test established (Ariadne's amendment #3, "one populated
+    # fixture, one conn, read twice: once through compute_all_measurements,
+    # once through each live signal_fn — SAME connection, no reconnect"),
+    # applied here to guarantee snapshot-internal consistency: the stored L0
+    # and the L1 derived from it must come from the exact same instant, not
+    # two reads that could straddle a concurrent write.
+    l0_measurements = health_measurements.compute_all_measurements(conn)
+    l1_signals = health_signals.compute_all_signals(l0_measurements)
+
+    # THE SSoT equality control (design charge, see
+    # _verify_l1_against_live_signal_fns's own docstring for the full
+    # reasoning) — run on every build, on the SAME connection L0 just read,
+    # so L1-vs-live divergence is caught the moment it happens rather than
+    # only at some future re-score time.
+    _verify_l1_against_live_signal_fns(conn, l1_signals)
+
     signals: dict[str, object] = {}
     scores_per_metric: dict[str, object] = {}
     scores_per_aspect: dict[str, object] = {}
@@ -1166,7 +1391,7 @@ def build_snapshot(
     metric_by_signal = {m.signal: m for m in model.metrics}
 
     for aspect in config.aspects:
-        raw_by_metric, aspect_score = _run_aspect(conn, aspect, model)
+        raw_by_metric, aspect_score = _run_aspect(l1_signals, aspect, model)
         for metric_name, raw in raw_by_metric.items():
             signals[metric_name] = _to_jsonable(raw)
             if raw is UNAVAILABLE:
@@ -1201,15 +1426,27 @@ def build_snapshot(
     return {
         "schema_version": config.schema_version,
         "engine_version": config.engine_version,
+        # engram-alpha#2537's two independent version axes (health.version):
+        # raw_schema_version (MAJOR — the L0 set's own identity; a snapshot
+        # from an older MAJOR is not fully reconstructible) and model_version
+        # (MINOR — everything L1-L4; a snapshot is FULLY reconstructible
+        # across any MINOR change, which is the whole point of storing L0 as
+        # the SSoT). Both stamped here so a stored snapshot is
+        # self-describing without needing this module's own current values
+        # to interpret it later.
+        "health_version": health_version.CURRENT,
+        "raw_schema_version": health_version.MAJOR,
+        "model_version": health_version.MINOR,
         "config": _config_to_dict(config),
         "definitions": _METRIC_DEFINITIONS,
-        # L0 measurement layer (engram-alpha#2537, PR1 of 3 — purely
-        # additive). Bare graph counts + environment facts, the SSoT slice 2
-        # will make "signals" a formula over instead of independent SQL.
-        # "signals"/"scores"/"aspects"/"composed" below are UNCHANGED by
-        # this block's presence — see health/measurements.py's
-        # module docstring.
-        "measurements": health_measurements.compute_all_measurements(conn),
+        # L0 measurement layer (engram-alpha#2537, PR1). Bare graph counts +
+        # environment facts — the SSoT. "signals" below is now (slice 2) a
+        # formula over THIS SAME dict (health.signals.compute_all_signals),
+        # verified equal to the live health.metrics SQL path on the same
+        # connection above (_verify_l1_against_live_signal_fns) before this
+        # return is reached — see health/measurements.py's module
+        # docstring for L0's own design, and health/signals.py's for L1's.
+        "measurements": l0_measurements,
         "signals": signals,
         "scores": {
             "metrics": scores_per_metric,

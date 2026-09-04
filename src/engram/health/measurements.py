@@ -376,18 +376,44 @@ def m_evidence_uncited(conn: sqlite3.Connection) -> int:
     """Count of current evidence nodes cited by NO current observation.
     Numerator for ``dangling_evidence_rate``.
 
-    KNOWN, DELIBERATE, TRANSIENT COST (Ariadne's colleague review, PR#2541):
-    this correlated ``NOT EXISTS`` query is the single most expensive thing
-    in ``build_snapshot`` (measured ~1.1s of a ~2.4s total on a real graph —
-    94% of this PR's added wall-clock) and, until slice 2 lands, it runs
-    TWICE per snapshot: once here, and again inside ``health.metrics.
-    dangling_evidence_rate``, which computes the identical query independently.
-    This is the price of slice 1 being honestly additive rather than
-    rewiring signals early — not a defect, and not something to fix in this
-    module (a cache or an index would be the wrong answer to a problem
-    that's scheduled to dissolve). Slice 2 makes ``dangling_evidence_rate``
-    a formula over this measurement instead of its own SQL, and the
-    duplication disappears without anyone touching either query again."""
+    PERMANENT-BY-DESIGN, NOT EXPENSIVE-BY-DESIGN (PR#2541's colleague review
+    predicted this query would run only once after slice 2; corrected by
+    PR#2556's own colleague review, Ariadne, once slice 2 landed and
+    measured it; both the "will disappear" and "so it's an accepted cost"
+    framings that followed were themselves wrong — see below). PR#2541
+    predicted slice 2 would make this query run once instead of twice,
+    because ``dangling_evidence_rate`` would become "a formula over this
+    measurement instead of its own SQL." Slice 2 DID make it a formula
+    (``health.signals.dangling_evidence_rate`` is exactly that) — but the
+    SSoT verification control it also added
+    (``health.engine._verify_l1_against_live_signal_fns``) calls
+    ``health.metrics.dangling_evidence_rate(conn)`` — the ORIGINAL,
+    unformulized SQL — on every single build, as the independent oracle the
+    whole design depends on. So the second query never went away; it moved
+    from "the formula's own implementation" to "the thing verifying the
+    formula is correct," and runs on every build rather than only
+    transiently during slice 1. That part is permanent and correct as
+    designed.
+
+    What is NOT permanent is the ~1.3s/build cost first measured for it
+    (engram-alpha#2556 thread, Ariadne, 4,597-node graph): Kepler traced it
+    to a missing ``ANALYZE`` — no seat in the fleet has ever run
+    ``ANALYZE``/``PRAGMA optimize``, so the query planner has no statistics
+    and falls back to a full ``idx_nodes_current`` scan per evidence node
+    instead of the existing ``idx_nodes_evidence_id``. Ariadne independently
+    confirmed on her own (largest measured, un-``ANALYZE``'d) seat: **758x**
+    on this query alone (1187.8ms → 1.6ms) and **45x** on the whole
+    L0-measure-then-verify path (2749.8ms → 60.8ms), same result counts
+    before/after. Filed as engram-alpha#2559 (Kepler) with a fix + falsifier;
+    not yet landed as of this writing. Kepler ruled the design question
+    itself (keep the SSoT control always-on, unchanged) BEFORE the ANALYZE
+    cause was confirmed, on the grounds that a sometimes-on control is a
+    weaker control and the cost sits at the nap/``advance_turn`` checkpoint,
+    invisible to a user regardless of price — so the ruling does not depend
+    on #2559 landing. What #2559 changes is only how expensive "always-on"
+    turns out to actually be: ~1.3s/build on any seat that has never run
+    ANALYZE (which, as of this writing, is every seat) until it lands, ~30ms
+    after."""
     return conn.execute(
         """SELECT COUNT(*) as c FROM nodes n
            WHERE n.type = 'evidence' AND n.is_current = 1

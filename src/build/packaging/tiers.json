@@ -822,6 +822,10 @@
       "path": "health/__init__.py",
       "tier": "essential",
       "note": "engram-alpha#2537 amendment 3 folder move: PEP 420 makes this non-load-bearing (Luria measured both import styles resolve without it), kept as an explicit package marker matching the tools/ package precedent."
+    },
+    {
+      "path": "health/signals.py",
+      "tier": "essential"
     }
   ],
   "excluded": [

@@ -27,6 +27,7 @@ engram_core.py's real `nodes`/`edges`/`edit_history` table columns).
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sqlite3
@@ -42,6 +43,8 @@ import engram_core  # noqa: E402
 from health import engine as health_engine  # noqa: E402
 from health import measurements as health_measurements  # noqa: E402
 from health import metrics as hem  # noqa: E402
+from health import signals as health_signals  # noqa: E402
+from health import version as health_version  # noqa: E402
 from health.config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
 from health.curves import CurveSpec  # noqa: E402
 from health.model import (  # noqa: E402
@@ -675,13 +678,18 @@ class TestBuildSnapshot:
             assert snap["checkpoint_mode"] == mode
 
     def test_top_level_keys(self):
-        """``measurements`` (engram-alpha#2537, PR1 of 3) is the one new key
-        this PR adds — purely additive, see health/measurements.py's
-        module docstring. Every other key is unchanged from PR5."""
+        """``measurements`` (engram-alpha#2537, PR1 of 3) plus
+        ``health_version``/``raw_schema_version``/``model_version``
+        (engram-alpha#2537, slice 2 — the two independent version axes,
+        health/version.py's own design) are the new keys this epic adds —
+        purely additive, see health/measurements.py's and
+        health/signals.py's module docstrings. Every other key is
+        unchanged from PR5."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
         assert set(snap.keys()) == {
-            "schema_version", "engine_version", "config", "definitions",
+            "schema_version", "engine_version", "health_version",
+            "raw_schema_version", "model_version", "config", "definitions",
             "measurements", "signals", "scores", "red_flags", "diagnostics",
             "anchor", "turn", "checkpoint_mode",
         }
@@ -720,6 +728,157 @@ class TestBuildSnapshot:
         # and composed is UNAVAILABLE too — the same value this file's own
         # empty-DB test already establishes.
         assert snap["scores"]["composed"] == "UNAVAILABLE"
+
+    def test_version_stamps_present_and_match_health_version(self):
+        """engram-alpha#2537 slice 2: the two independent version axes
+        (health/version.py's MAJOR/MINOR) are stamped on every snapshot so
+        a stored artifact is self-describing without needing this module's
+        current values to interpret it later."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        assert snap["health_version"] == health_version.CURRENT
+        assert snap["raw_schema_version"] == health_version.MAJOR
+        assert snap["model_version"] == health_version.MINOR
+
+    def test_signals_delegate_to_l1_health_signals(self):
+        """engram-alpha#2537 slice 2's actual load-bearing claim: the
+        ``signals`` block is now sourced from ``health.signals.
+        compute_all_signals`` over the SAME L0 read stored in
+        ``measurements`` — not from a second, independent computation.
+        Wiring check (not a re-test of L1's own arithmetic correctness —
+        see tests/test_health_signals.py for that)."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        l1 = health_signals.compute_all_signals(snap["measurements"])
+        for name, l1_value in l1.items():
+            assert snap["signals"][name] == health_engine._to_jsonable(l1_value)
+
+    def test_ssot_mismatch_between_l1_and_live_signal_fn_raises_loudly(self):
+        """THE REQUIRED FALSIFIER for _verify_l1_against_live_signal_fns —
+        a control that has only ever been seen to pass has not been shown
+        capable of failing. Monkeypatches ONE entry in the live-verification
+        table to return a value that structurally cannot match L1's real
+        arithmetic (a constant, independent of the graph), and asserts
+        build_snapshot raises HealthEngineSSoTError rather than silently
+        accepting the divergence."""
+        conn = _make_conn()
+        # Populate enough that taint_rate's denominator (claim_bearing_
+        # current) is non-zero, so L1's real computed value is a genuine
+        # float the patched constant is guaranteed to differ from (0.0
+        # could coincidentally match on an all-empty graph — this fixture
+        # avoids that).
+        _insert(conn, "obs_1", "observation_factual")
+        with mock.patch.dict(
+            health_engine._LIVE_SIGNAL_FNS_FOR_VERIFICATION,
+            {"taint_rate": lambda _conn: 0.987654321},
+        ):
+            with pytest.raises(health_engine.HealthEngineSSoTError, match="taint_rate"):
+                health_engine.build_snapshot(conn, "nap")
+
+    def test_verification_table_is_complete_against_l1_signals(self):
+        """Reviewer-fairy finding, PR#2556 round 1: a hand-typed
+        _LIVE_SIGNAL_FNS_FOR_VERIFICATION with no enforced relationship to
+        health.signals.SIGNALS could silently narrow SSoT coverage if a
+        future signal is added to one but not the other — the verification
+        loop only iterates over whatever keys are IN the table, so a
+        missing entry is invisible, not a red test. This asserts the two
+        key-sets are exactly equal today (module import already enforces
+        this via a loud completeness check — this test pins the property
+        under normal test-suite conditions, in case that import-time check
+        is ever weakened)."""
+        assert set(health_signals.SIGNALS.keys()) == set(
+            health_engine._LIVE_SIGNAL_FNS_FOR_VERIFICATION.keys()
+        )
+
+    def test_config_metric_names_match_l1_signals(self):
+        """Ariadne's colleague-review suggestion, PR#2556 round 2: the
+        direction THIS PR itself newly introduces (CONFIG metric names ->
+        health.signals.SIGNALS) was unguarded in round 1's completeness
+        check — _run_aspect changed from metric.signal_fn(conn) (always
+        resolvable) to l1_signals[metric.name] (a bare dict subscript), so
+        a CONFIG metric with no matching SIGNALS entry is now a raw
+        KeyError from build_snapshot's hot path. Pins the property under
+        normal test-suite conditions (module import already enforces it
+        via the same loud three-way completeness check)."""
+        config_metric_names = {
+            m.name for aspect in health_engine.CONFIG.aspects for m in aspect.metrics
+        }
+        assert config_metric_names == set(health_signals.SIGNALS.keys())
+
+    def test_verification_table_completeness_check_actually_fires(self):
+        """THE FALSIFIER for the completeness check above — and, per the
+        delta reviewer-fairy on PR#2556's round-2 commit, a REAL one: the
+        original version of this test recomputed the module's own set-
+        difference arithmetic inline rather than calling into
+        health/engine.py's actual import-time assertion, so it proved the
+        arithmetic was right but nothing about whether engine.py's own code
+        path would ever run it or run it correctly — a dead or inverted
+        check in engine.py would have left this test green.
+
+        Perturbs ``health_signals.SIGNALS`` to drop a name genuinely
+        present in ``_LIVE_SIGNAL_FNS_FOR_VERIFICATION``, then reloads
+        ``health.engine`` so its module-level completeness assertion
+        actually re-runs against the perturbed state, and asserts it
+        raises the real exception naming the real victim. Restores state
+        and reloads again in ``finally`` regardless of outcome — a
+        perturbed ``health_engine`` left in place would corrupt every
+        later test in the same process."""
+        victim = next(iter(health_signals.SIGNALS.keys()))
+        original_entry = health_signals.SIGNALS.pop(victim)
+        try:
+            try:
+                importlib.reload(health_engine)
+            except Exception as exc:  # noqa: BLE001 — asserting on the real raise, not narrowing it away
+                assert type(exc).__name__ == "HealthEngineSSoTError", (
+                    f"expected HealthEngineSSoTError, got {type(exc).__name__}: {exc}"
+                )
+                assert victim in str(exc), (
+                    f"raised, but didn't name the actual missing signal {victim!r}: {exc}"
+                )
+            else:
+                pytest.fail(
+                    "reload with a perturbed SIGNALS table did not raise — "
+                    "the completeness check silently passed drifted state"
+                )
+        finally:
+            health_signals.SIGNALS[victim] = original_entry
+            importlib.reload(health_engine)
+
+    def test_config_to_signals_completeness_check_actually_fires(self):
+        """THE FALSIFIER for the NEW direction (round 2) — real, for the
+        same reason as its sibling above: calls into engine.py's actual
+        import-time check via reload rather than recomputing set
+        arithmetic inline.
+
+        Perturbs ``health_signals.SIGNALS`` to drop a name genuinely
+        present in CONFIG's own metrics — the exact condition that would
+        otherwise surface as a raw, unguarded ``KeyError`` inside
+        ``_run_aspect`` — and confirms the reloaded module raises loudly
+        instead. Restores + reloads in ``finally`` regardless of outcome,
+        same reason as the sibling test."""
+        config_metric_names = {
+            m.name for aspect in health_engine.CONFIG.aspects for m in aspect.metrics
+        }
+        victim = next(iter(config_metric_names))
+        original_entry = health_signals.SIGNALS.pop(victim)
+        try:
+            try:
+                importlib.reload(health_engine)
+            except Exception as exc:  # noqa: BLE001 — asserting on the real raise, not narrowing it away
+                assert type(exc).__name__ == "HealthEngineSSoTError", (
+                    f"expected HealthEngineSSoTError, got {type(exc).__name__}: {exc}"
+                )
+                assert victim in str(exc), (
+                    f"raised, but didn't name the actual missing signal {victim!r}: {exc}"
+                )
+            else:
+                pytest.fail(
+                    "reload with a CONFIG metric missing from SIGNALS did not "
+                    "raise — the completeness check silently passed drifted state"
+                )
+        finally:
+            health_signals.SIGNALS[victim] = original_entry
+            importlib.reload(health_engine)
 
     def test_red_flags_still_empty_diagnostics_now_populated(self):
         """red_flags stays [] (DAG-violations-as-a-red-flag is out of scope
