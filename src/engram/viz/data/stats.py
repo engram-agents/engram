@@ -116,10 +116,47 @@ def get_stats_data(index_db_path: str) -> dict:
                 ),
             }
     try:
-        # mode=ro (no immutable=1): index.db uses WAL journal mode (#879) so
-        # mode=ro needs -shm/-wal access; immutable=1 would skip those files
-        # and produce stale reads.
-        conn = sqlite3.connect(f"file:{index_db_path}?mode=ro", uri=True)
+        # mode=ro&immutable=1 (#2571): index.db uses WAL journal mode (#879).
+        # A plain mode=ro reader still opens the writable -shm sidecar for
+        # WAL locking -- fine for a same-user reader, but this endpoint
+        # reads OTHER agents' index.db files, and this process cannot write
+        # another user's -shm file: the first conn.execute() below raised
+        # "attempt to write a readonly database", and with no except on the
+        # query block (see commit history / #2571) that propagated out of
+        # the handler and dropped the connection with no HTTP response --
+        # the "Failed to fetch" defect. immutable=1 tells sqlite the file
+        # will not change during this connection's lifetime, so it never
+        # opens -shm/-wal at all, sidestepping the write attempt entirely.
+        #
+        # Safe because of TWO preconditions, both load-bearing and neither
+        # obvious from this line alone:
+        #
+        # 1. The indexer drains the WAL after every pass via PRAGMA
+        #    wal_checkpoint(TRUNCATE) (see engram_log_indexer.py's
+        #    _checkpoint_wal), so committed rows normally live in the main db
+        #    file rather than in an un-checkpointed WAL this reader would
+        #    skip. BEST-EFFORT, not a guarantee: under contention that pragma
+        #    returns busy WITHOUT raising and leaves -wal non-empty (two
+        #    independent synthetic rigs agree on the mechanism and differ on
+        #    the figures -- (1, 3, 3)/12,392 bytes and (1, 5, 5)/20,632 bytes
+        #    -- so the reproducible fact is "busy, and -wal survives", not any
+        #    particular count). A reader landing inside that
+        #    window sees a SHORT COUNT, never corruption or an error -- so if
+        #    /api/stats ever reports numbers lower than expected, check the
+        #    indexer's stderr for the busy warning before suspecting the
+        #    query. The state self-heals on the next pass.
+        #
+        # 2. This connection is per-request and short-lived: it is opened
+        #    here, used, and closed in the `finally` below, with exactly one
+        #    caller (viz/server.py's /api/stats handler). immutable=1 promises
+        #    sqlite the file will not change for the connection's lifetime;
+        #    a pooled or cached connection would hold that promise across
+        #    writes it cannot see and would go SILENTLY STALE -- returning
+        #    old numbers with no error. So this is not merely "we happen to
+        #    open per request" -- per-request lifetime is what makes
+        #    immutable=1 correct here, and pooling this connection later
+        #    would break it invisibly.
+        conn = sqlite3.connect(f"file:{index_db_path}?mode=ro&immutable=1", uri=True)
         conn.row_factory = sqlite3.Row
     except sqlite3.Error as exc:
         return {"empty": True, "reason": f"Could not open index.db: {exc}"}
@@ -252,5 +289,7 @@ def get_stats_data(index_db_path: str) -> dict:
         ]
 
         return out
+    except sqlite3.Error as exc:
+        return {"empty": True, "reason": f"Stats query failed: {exc}"}
     finally:
         conn.close()

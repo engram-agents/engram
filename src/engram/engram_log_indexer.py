@@ -228,6 +228,29 @@ def _index_file(conn: sqlite3.Connection, jsonl_path: Path, session_id: str, lev
     return rows_inserted
 
 
+def _checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> Optional[tuple]:
+    """Drain index.db's WAL to zero, reporting a busy result instead of
+    discarding it. Returns the pragma's ``(busy, log_frames,
+    checkpointed_frames)`` row so callers (and tests) can see the outcome.
+
+    Extracted from ``run_once`` for one reason: the busy branch is not
+    reachable on demand from the outside -- it needs a concurrent reader
+    holding a snapshot at exactly the right moment -- so inline it would be
+    a warning nobody had ever seen fire. As a function it can be handed a
+    stub connection and exercised directly.
+    """
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if row and row[0] != 0:
+        print(
+            f"[engram-indexer] WAL checkpoint busy on {db_path} "
+            f"(busy={row[0]}, log_frames={row[1]}, checkpointed={row[2]}); "
+            f"-wal not fully drained -- an immutable=1 reader may see a short "
+            f"count until a later pass drains it",
+            file=sys.stderr,
+        )
+    return row
+
+
 class Indexer:
     """Projects JSONL event files into a derived SQLite index at index.db.
 
@@ -277,6 +300,33 @@ class Indexer:
                     rows = _index_file(conn, jsonl_path, session_id, level)
                     files_processed += 1
                     total_rows_inserted += rows
+
+            # Drain the WAL to zero (#2571). An immutable=1 reader (viz's
+            # /api/stats -- see viz/data/stats.py) ignores -wal entirely, so
+            # any committed-but-not-yet-checkpointed rows would be invisible
+            # to it. TRUNCATE empties the WAL rather than merely folding it
+            # back into the main db file (which FULL permits but does not
+            # guarantee -- see sqlite3 docs on wal_checkpoint).
+            #
+            # BEST-EFFORT, NOT GUARANTEED, and the failure is silent by
+            # default: under contention -- another connection holding an open
+            # transaction on this file -- the pragma returns
+            # (busy=1, log_frames, checkpointed_frames) and does NOT raise,
+            # leaving -wal non-empty. Measured on a MINIMAL SYNTHETIC RIG (a
+            # few-row table, not index.db's own schema): with a concurrent
+            # reader mid-transaction the call returned (1, 3, 3) with -wal at
+            # 12,392 bytes; uncontended, (0, 0, 0) and -wal 0. A second,
+            # independently-built rig reproduced the MECHANISM exactly and got
+            # DIFFERENT figures -- (1, 5, 5), 20,632 bytes. So treat busy != 0
+            # and "-wal stays non-empty" as the reproducible facts; the frame
+            # counts and byte sizes are illustrative of one rig, not constants
+            # to match against a real index.db.
+            # So log the busy status rather than discarding it. No data
+            # is at risk (_index_file commits before this runs) and the state
+            # self-heals on the next pass, but a reader that lands inside the
+            # window sees a short count, and without this log there is nothing
+            # to correlate that against.
+            _checkpoint_wal(conn, db_path)
 
         finally:
             conn.close()
