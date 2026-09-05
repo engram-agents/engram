@@ -712,44 +712,142 @@ def test_rebuild_reproduces_incremental_store(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 13. detect_engine_build order
+# 13. detect_engine_build rule order (round 3, #2600 -- see docstring below
+# for what round-2 tests this folds)
 # ---------------------------------------------------------------------------
 
 
-def test_detect_engine_build_order(tmp_path, monkeypatch):
-    repo_dir = tmp_path / "repo"
-    _init_repo(repo_dir)
-    sha = _commit_knowledge(repo_dir, "k1")
+def test_detect_engine_build_rule_order(tmp_path, monkeypatch, capsys):
+    """End-to-end exercise of ``detect_engine_build``'s ONE rule (round 3,
+    #2600): env > plugin-tree marker > code-checkout git HEAD > 'unknown'.
+    Folds round 2's five ``module_path``-based tests
+    (``test_engine_build_nested_plugin_tree_returns_alpha_sha_not_data_head``,
+    ``test_engine_build_nested_plugin_tree_without_alpha_sha_is_unknown``,
+    ``test_engine_build_code_checkout_returns_its_head_and_dirty_suffix``,
+    ``test_engine_build_data_repo_without_src_is_unknown``,
+    ``test_env_override_wins``) into one, plus the ordering case round 1's
+    ``test_detect_engine_build_order`` never covered (a plugin-tree marker
+    nested inside a git worktree that ALSO qualifies as a code checkout --
+    proving the marker wins even when the git rule would otherwise fire)."""
 
-    data_dir = tmp_path / "data"
-    data_dir.mkdir()
+    # -- A. plugin tree (nested inside a DATA repo -- no src/) resolves to
+    # alpha_sha, never the data repo's own HEAD.
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    h_data = _commit_knowledge(data_repo, "k1")
 
-    # env wins
+    plugin_dir = data_repo / "marketplace" / "plugins" / "engram"
+    health_dir = plugin_dir / "health"
+    health_dir.mkdir(parents=True)
+    (plugin_dir / ".engram-build-manifest.json").write_text("{}", encoding="utf-8")
+    (data_repo / ".deployed-version").write_text(
+        "alpha_sha=abc1234\n", encoding="utf-8"
+    )
+    module_path = health_dir / "series.py"
+
+    result = series.detect_engine_build(module_path=module_path)
+    assert result == "abc1234"
+    assert result != h_data
+
+    # -- B. env wins over that same plugin tree.
     monkeypatch.setenv("ENGRAM_ENGINE_BUILD", "env-build")
-    assert series.detect_engine_build(data_dir=data_dir, repo_dir=repo_dir) == "env-build"
+    assert series.detect_engine_build(module_path=module_path) == "env-build"
     monkeypatch.delenv("ENGRAM_ENGINE_BUILD")
 
-    # then .deployed-version's alpha_sha=
-    (data_dir / ".deployed-version").write_text(
-        "some_other_key=ignored\nalpha_sha=deployed-sha\n", encoding="utf-8"
+    # -- C. plugin tree marker present but no alpha_sha= line -> 'unknown'
+    # plus a stderr line naming the data dir, no fallback to git.
+    data_repo2 = tmp_path / "data-repo-no-alpha"
+    _init_repo(data_repo2)
+    _commit_knowledge(data_repo2, "k1")
+    plugin_dir2 = data_repo2 / "marketplace" / "plugins" / "engram"
+    health_dir2 = plugin_dir2 / "health"
+    health_dir2.mkdir(parents=True)
+    (plugin_dir2 / ".engram-build-manifest.json").write_text("{}", encoding="utf-8")
+    # deliberately no .deployed-version at all
+
+    module_path2 = health_dir2 / "series.py"
+    result2 = series.detect_engine_build(module_path=module_path2)
+    assert result2 == "unknown"
+    captured = capsys.readouterr()
+    assert "alpha_sha" in captured.err
+    assert str(data_repo2) in captured.err
+
+    # -- D. plugin tree marker wins over being inside a git worktree that
+    # ALSO qualifies as a code checkout (carries src/engram/health/
+    # measurements.py). This is the case round 1's order test never
+    # covered: without the marker-first rule, a git-toplevel-first
+    # resolver would find this repo's own HEAD via the (also valid) code
+    # checkout rule instead of the deployed alpha_sha.
+    hybrid_repo = tmp_path / "hybrid-code-and-plugin-tree"
+    _init_repo(hybrid_repo)
+    hybrid_sha = _commit(
+        hybrid_repo,
+        {"src/engram/health/measurements.py": "# stub\n"},
+        "add measurements",
+    )
+    hybrid_plugin_dir = hybrid_repo / "marketplace" / "plugins" / "engram"
+    hybrid_health_dir = hybrid_plugin_dir / "health"
+    hybrid_health_dir.mkdir(parents=True)
+    (hybrid_plugin_dir / ".engram-build-manifest.json").write_text(
+        "{}", encoding="utf-8"
+    )
+    (hybrid_repo / ".deployed-version").write_text(
+        "alpha_sha=hybrid-alpha-sha\n", encoding="utf-8"
+    )
+    hybrid_module_path = hybrid_health_dir / "series.py"
+
+    hybrid_result = series.detect_engine_build(module_path=hybrid_module_path)
+    assert hybrid_result == "hybrid-alpha-sha"
+    assert hybrid_result != hybrid_sha
+
+    # -- E. bare code checkout (no plugin-tree marker) -> its own git HEAD;
+    # a dirty change under src/engram/health adds the '-dirty' suffix.
+    code_repo = tmp_path / "code-repo"
+    _init_repo(code_repo)
+    sha = _commit(
+        code_repo,
+        {"src/engram/health/measurements.py": "# stub\n"},
+        "add measurements",
+    )
+    code_module_path = code_repo / "src" / "engram" / "health" / "series.py"
+    assert series.detect_engine_build(module_path=code_module_path) == sha
+
+    (code_repo / "src" / "engram" / "health" / "measurements.py").write_text(
+        "# stub changed\n", encoding="utf-8"
     )
     assert (
-        series.detect_engine_build(data_dir=data_dir, repo_dir=repo_dir)
-        == "deployed-sha"
+        series.detect_engine_build(module_path=code_module_path) == f"{sha}-dirty"
     )
 
-    # a .deployed-version with no alpha_sha= line falls through
-    (data_dir / ".deployed-version").write_text("foo=bar\n", encoding="utf-8")
-    assert series.detect_engine_build(data_dir=data_dir, repo_dir=repo_dir) == sha
+    # -- F. git repo without src/engram/health/measurements.py (the DATA
+    # repo's own shape) -> 'unknown', never that repo's own HEAD.
+    nested = data_repo / "some" / "nested"
+    nested.mkdir(parents=True)
+    no_src_module_path = nested / "module.py"
 
-    # then git HEAD of repo_dir
-    (data_dir / ".deployed-version").unlink()
-    assert series.detect_engine_build(data_dir=data_dir, repo_dir=repo_dir) == sha
+    result_f = series.detect_engine_build(module_path=no_src_module_path)
+    assert result_f == "unknown"
+    assert result_f != h_data
+    captured_f = capsys.readouterr()
+    assert captured_f.err.strip() != ""
 
-    # else 'unknown'
-    empty_repo = tmp_path / "not-a-repo"
-    empty_repo.mkdir()
-    assert series.detect_engine_build(data_dir=None, repo_dir=empty_repo) == "unknown"
+    # -- G. nothing at all (no env, no plugin marker, not even a git repo)
+    # -> 'unknown'.
+    empty_dir = tmp_path / "not-a-repo"
+    empty_dir.mkdir()
+    assert (
+        series.detect_engine_build(module_path=empty_dir / "module.py") == "unknown"
+    )
+
+    # -- H. env wins even with no plugin tree and no git repo in play.
+    monkeypatch.setenv("ENGRAM_ENGINE_BUILD", "env-build-2")
+    try:
+        assert (
+            series.detect_engine_build(module_path=empty_dir / "module.py")
+            == "env-build-2"
+        )
+    finally:
+        monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1547,3 +1645,147 @@ def test_verify_appends_not_overwrites(tmp_path):
     status_result = series.status(db_path)
     assert status_result["latest_equality_verdicts"] == {"agree": 1, "disagree": 0}
     conn_store.close()
+
+
+# ---------------------------------------------------------------------------
+# 29. engine_build must name the code build, not the data repo HEAD (#2600)
+# ---------------------------------------------------------------------------
+
+
+def test_engine_build_is_not_the_data_repo_head(tmp_path, monkeypatch):
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    h_data = _commit_knowledge(data_repo, "-- k1", _committer_iso(t0))
+
+    code_repo_head = series._default_repo_dir()
+    result_git = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=str(code_repo_head),
+    )
+    module_checkout_head = result_git.stdout.strip()
+
+    # sub-case A: no .deployed-version -- falls through to the module
+    # checkout's own HEAD (code_repo_dir defaults to _default_repo_dir()).
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    snap = _build_v2_snapshot(anchor=None, turn=1)
+    ts = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts, snap)
+
+    db_path = tmp_path / "series-a.db"
+    series.ingest(snapshots_dir, data_repo, db_path)
+    series.backfill(data_repo, db_path)
+
+    conn = series.open_store(db_path)
+    rows = conn.execute("SELECT DISTINCT engine_build FROM l0_points").fetchall()
+    conn.close()
+    assert rows, "expected at least one l0_points row"
+    for row in rows:
+        build = row["engine_build"]
+        assert build != h_data
+        assert build in (module_checkout_head, "unknown")
+
+    # sub-case B: a .deployed-version with alpha_sha= wins over the module
+    # checkout's HEAD. ``ingest``/``backfill`` call ``detect_engine_build()``
+    # bare (no ``module_path``), so to make this genuinely exercise the
+    # plugin-tree branch we monkeypatch the module's own default-seam
+    # (``_MODULE_PATH_DEFAULT``, the seam #2600 round 3 introduced so bare
+    # callers stay testable) to point INTO a plugin-tree marker nested
+    # inside ``data_repo`` -- otherwise this sub-case is vacuous (round 2
+    # reported exactly that: the alpha_sha here was never read by the code
+    # under test, since bare ``detect_engine_build()`` resolves from THIS
+    # module's own real location, not from ``data_repo``).
+    plugin_dir_b = data_repo / "marketplace" / "plugins" / "engram"
+    health_dir_b = plugin_dir_b / "health"
+    health_dir_b.mkdir(parents=True)
+    (plugin_dir_b / ".engram-build-manifest.json").write_text("{}", encoding="utf-8")
+    (data_repo / ".deployed-version").write_text(
+        "alpha_sha=deadbeefcafe\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(series, "_MODULE_PATH_DEFAULT", health_dir_b / "series.py")
+
+    db_path_b = tmp_path / "series-b.db"
+    series.ingest(snapshots_dir, data_repo, db_path_b)
+    series.backfill(data_repo, db_path_b)
+
+    conn_b = series.open_store(db_path_b)
+    rows_b = conn_b.execute("SELECT DISTINCT engine_build FROM l0_points").fetchall()
+    conn_b.close()
+    assert rows_b
+    for row in rows_b:
+        assert row["engine_build"] == "deadbeefcafe"
+
+
+# ---------------------------------------------------------------------------
+# 30. _guard_engine_build rejects a sha that resolves only in the data repo
+# ---------------------------------------------------------------------------
+
+
+def test_guard_rejects_sha_that_resolves_only_in_data_repo(tmp_path, capsys):
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    data_sha = _commit_knowledge(data_repo, "k1")
+
+    code_repo = tmp_path / "code-repo"
+    _init_repo(code_repo)
+    code_sha = _commit_knowledge(code_repo, "c1")
+
+    # a sha that resolves ONLY in the data repo -> 'unknown' + stderr line
+    result = series._guard_engine_build(data_sha, data_repo=data_repo, code_repo=code_repo)
+    assert result == "unknown"
+    captured = capsys.readouterr()
+    assert data_sha in captured.err
+    assert str(data_repo) in captured.err
+    assert str(code_repo) in captured.err
+
+    # a sha that resolves in the code repo -> returned unchanged
+    assert (
+        series._guard_engine_build(code_sha, data_repo=data_repo, code_repo=code_repo)
+        == code_sha
+    )
+
+    # 'unknown' -> returned unchanged (not sha-shaped)
+    assert (
+        series._guard_engine_build("unknown", data_repo=data_repo, code_repo=code_repo)
+        == "unknown"
+    )
+
+    # a sha that resolves in NEITHER repo -> returned unchanged (this guard
+    # is only for the data-repo/code-repo collision, not a general validator)
+    bogus_sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    assert (
+        series._guard_engine_build(bogus_sha, data_repo=data_repo, code_repo=code_repo)
+        == bogus_sha
+    )
+
+
+# ---------------------------------------------------------------------------
+# 31. status reports engine_build resolvability against the code repo
+# ---------------------------------------------------------------------------
+
+
+def test_status_reports_engine_build_resolvability(tmp_path):
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(data_repo, "-- k1", _committer_iso(t0))
+
+    code_repo = tmp_path / "code-repo"
+    _init_repo(code_repo)
+    code_sha = _commit_knowledge(code_repo, "-- c1")
+
+    db_path = tmp_path / "series.db"
+    series.backfill(data_repo, db_path, engine_build=code_sha)
+    series.backfill(data_repo, db_path, engine_build="unknown", health_major=999)
+
+    result = series.status(db_path, code_repo_dir=code_repo)
+    by_build = {
+        d["engine_build"]: d["resolves_in_code_repo"]
+        for d in result["engine_build_resolvability"]
+    }
+    assert by_build[code_sha] is True
+    assert by_build["unknown"] is None

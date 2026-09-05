@@ -398,56 +398,263 @@ def parse_snapshot_name(name: str) -> tuple[int, str, datetime]:
 
 
 def _default_repo_dir() -> Path:
-    """Default ``repo_dir`` for ``detect_engine_build`` -- the engram-alpha
-    checkout containing THIS module (``src/engram/health/series.py`` ->
-    parents[3] == the repo root). Only used when a caller does not pass
-    ``repo_dir`` explicitly."""
+    """The engram-alpha checkout containing THIS module (``src/engram/
+    health/series.py`` -> parents[3] == the repo root). Used as the
+    ``code_repo_dir`` default for ``status()`` and for the ``code_repo``
+    fallback passed to ``_guard_engine_build`` by ``ingest`` / ``backfill``
+    / ``verify`` -- NOT by ``detect_engine_build``, which resolves the code
+    location from ``module_path`` alone (round 3, #2600)."""
     return Path(__file__).resolve().parents[3]
 
 
-def detect_engine_build(
-    data_dir: str | Path | None = None,
-    repo_dir: str | Path | None = None,
-) -> str:
-    """First available of: env ``ENGRAM_ENGINE_BUILD``; ``alpha_sha=`` from
-    ``<data_dir>/.deployed-version`` (a ``key=value`` file, one entry per
-    line); ``git rev-parse HEAD`` of ``repo_dir``; else the literal
-    ``'unknown'``. Never raises."""
-    import os
+def _read_alpha_sha(deployed_version_path: Path) -> str | None:
+    """Read the ``alpha_sha=`` value (a ``key=value`` file, one entry per
+    line) out of ``deployed_version_path``, or ``None`` if the file is
+    missing / unreadable / has no such line."""
+    try:
+        for line in deployed_version_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() == "alpha_sha" and value.strip():
+                return value.strip()
+    except OSError:
+        pass
+    return None
 
-    env_val = os.environ.get("ENGRAM_ENGINE_BUILD")
-    if env_val:
-        return env_val
 
-    if data_dir is not None:
-        deployed = Path(data_dir) / ".deployed-version"
-        try:
-            for line in deployed.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() == "alpha_sha" and value.strip():
-                    return value.strip()
-        except OSError:
-            pass
-
-    effective_repo_dir = Path(repo_dir) if repo_dir is not None else _default_repo_dir()
+def _git_head(repo_dir: Path) -> str | None:
+    """``git rev-parse HEAD`` of ``repo_dir``, or ``None`` on any failure.
+    Never raises."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             check=False,
             capture_output=True,
             text=True,
-            cwd=str(effective_repo_dir),
+            cwd=str(repo_dir),
         )
-        if result.returncode == 0:
-            sha = result.stdout.strip()
-            if sha:
-                return sha
     except OSError:
-        pass
+        return None
+    if result.returncode == 0:
+        sha = result.stdout.strip()
+        if sha:
+            return sha
+    return None
 
+
+def _find_plugin_tree_data_dir(start_dir: Path) -> Path | None:
+    """Walk ``start_dir``'s ancestors (inclusive) for a directory whose path
+    ENDS in ``marketplace/plugins/engram`` -- the deployed-plugin-tree shape
+    -- AND that directly contains ``.engram-build-manifest.json``. Returns
+    the parent of that directory's ``marketplace`` segment (i.e. the DATA
+    dir, e.g. ``~/.engram``), or ``None`` if no such ancestor exists.
+
+    The suffix check comes first deliberately: a bare
+    ``.engram-build-manifest.json`` sitting somewhere unrelated must not be
+    mistaken for the plugin tree (#2600's final rule)."""
+    for ancestor in [start_dir, *start_dir.parents]:
+        parts = ancestor.parts
+        if len(parts) >= 3 and parts[-3:] == ("marketplace", "plugins", "engram"):
+            if (ancestor / ".engram-build-manifest.json").is_file():
+                return ancestor.parents[2]
+    return None
+
+
+def _find_code_repo_toplevel(start_dir: Path) -> Path | None:
+    """``git rev-parse --show-toplevel`` from ``start_dir``, but only
+    returned if that toplevel is a CODE checkout -- i.e. it contains
+    ``src/engram/health/measurements.py``. Returns ``None`` on any git
+    failure, or when the toplevel is some OTHER git work tree (notably the
+    DATA repo, e.g. ``~/.engram``, which has no ``src/`` at all). Never
+    raises."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(start_dir),
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    toplevel_str = result.stdout.strip()
+    if not toplevel_str:
+        return None
+    toplevel = Path(toplevel_str)
+    if (toplevel / "src" / "engram" / "health" / "measurements.py").exists():
+        return toplevel
+    return None
+
+
+def _is_git_dirty(repo_dir: Path, pathspec: str) -> bool:
+    """``True`` iff ``git status --porcelain -- pathspec`` reports anything
+    non-empty. Never raises -- a git failure reads as "not dirty"."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain", "--", pathspec],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(repo_dir),
+        )
+    except OSError:
+        return False
+    return bool(result.stdout.strip())
+
+
+_MODULE_PATH_DEFAULT = Path(__file__)
+"""Default ``module_path`` for ``detect_engine_build`` -- this module's own
+``__file__``. A module-level seam (not a hardcoded literal inside the
+function) so tests can monkeypatch it and exercise callers (``ingest`` /
+``backfill`` / ``verify``) that invoke ``detect_engine_build()`` bare, with
+no way to pass ``module_path`` through."""
+
+
+def detect_engine_build(module_path: str | Path | None = None) -> str:
+    """Resolve the build identifier for the code that is EXECUTING RIGHT
+    NOW, never the knowledge/data repo's HEAD (#2600). ONE rule: resolve
+    from the executing module's own location. ``module_path`` defaults to
+    ``_MODULE_PATH_DEFAULT`` (this module's own ``__file__``) and exists as
+    a parameter only so tests can point it at a scratch tree; production
+    callers (``ingest`` / ``backfill`` / ``verify``) call this bare, with no
+    arguments at all.
+
+    Order, LOAD-BEARING (#2600's final rule -- Ariadne's fix to round 1's
+    fix; round 3 dropped round 1's separate ``data_dir``/``code_repo_dir``
+    override path, which was a SECOND rule bolted onto this one purely to
+    keep an old test passing):
+
+    1. env ``ENGRAM_ENGINE_BUILD`` -- explicit override, wins unconditionally.
+    2. **Plugin-tree marker, checked BEFORE any git question.** Walk
+       ``module_path``'s ancestors for a directory whose path ends in
+       ``marketplace/plugins/engram`` and that contains
+       ``.engram-build-manifest.json``. If found, the answer is
+       ``alpha_sha=`` from ``<data_dir>/.deployed-version`` (``data_dir`` =
+       the parent of that directory's ``marketplace`` segment); a marker
+       present with no ``alpha_sha`` line is ``'unknown'`` plus one stderr
+       line (no further fallback -- we already know we're in a deployed
+       tree, so falling through to git would silently reproduce the
+       original defect, see point 3).
+    3. **Git work tree -- ONLY if it is a CODE checkout.**
+       ``git rev-parse --show-toplevel`` from ``module_path``'s directory,
+       but ONLY accepted if that toplevel contains
+       ``src/engram/health/measurements.py``. If accepted: ``git rev-parse
+       HEAD`` of that toplevel, with a ``-dirty`` suffix when
+       ``git status --porcelain -- src/engram/health`` is non-empty.
+    4. else ``'unknown'`` plus one stderr line.
+
+    WHY step 2 must run before step 3, and why this is not merely an
+    ordering preference: the deployed plugin tree is NESTED INSIDE the data
+    repo's own git work tree (measured on two seats --
+    ``git -C ~/.engram/marketplace/plugins/engram rev-parse --show-toplevel``
+    returns ``~/.engram`` itself, a real directory nesting, not a symlink).
+    So a rule that asks the git question first, for a module executing from
+    the deployed tree, returns the DATA repo's HEAD -- the exact #2600
+    defect, reached through a principled-looking door. Only the
+    plugin-tree-marker check (which looks for the deployed-tree SHAPE, not
+    "some git repo") can tell the two containments apart; hence it goes
+    first, and step 3's own ``src/engram/health/measurements.py`` guard
+    exists to refuse the data repo a SECOND time in case the marker check
+    doesn't fire for some other reason (e.g. the marker file itself is
+    absent from a given install).
+
+    WHY the discriminator in step 3 names ``measurements.py`` specifically,
+    and not e.g. ``server.py`` or ``pyproject.toml`` (round 3, #2600): the
+    module EXECUTING this resolution is ``series.py`` itself, added
+    2026-09-05 -- strictly newer than ``measurements.py``, added
+    2026-09-04. Every tree that can even reach this code already carries
+    ``measurements.py``, so the marker never under-fires against a real
+    engram-alpha checkout capable of running it. More load-bearing than the
+    freshness argument: ``measurements.py`` is the code that COMPUTES the
+    health rows this whole module is building a build-identifier FOR --
+    "is this the tree that produced these numbers" is exactly what
+    ``engine_build`` means. ``server.py`` or ``pyproject.toml`` would
+    answer a neighbouring question -- "is this an ENGRAM checkout at all"
+    -- which is necessary but not sufficient; a checkout could carry
+    ``server.py`` while lacking the health subsystem entirely (e.g. a
+    stale pre-#2537 clone), and ``engine_build`` would then name a build
+    that never ran this code.
+
+    ``_guard_engine_build`` stays as defense in depth on top of this."""
+    import os
+
+    env_val = os.environ.get("ENGRAM_ENGINE_BUILD")
+    if env_val:
+        return env_val
+
+    effective_module_path = (
+        Path(module_path) if module_path is not None else _MODULE_PATH_DEFAULT
+    )
+    module_dir = effective_module_path.resolve().parent
+
+    plugin_data_dir = _find_plugin_tree_data_dir(module_dir)
+    if plugin_data_dir is not None:
+        alpha = _read_alpha_sha(plugin_data_dir / ".deployed-version")
+        if alpha:
+            return alpha
+        print(
+            "health.series: engine_build -- found a deployed plugin-tree "
+            f"marker under {plugin_data_dir} but no alpha_sha= line in "
+            f"{plugin_data_dir / '.deployed-version'}; recording 'unknown' "
+            "(see #2600).",
+            file=sys.stderr,
+        )
+        return "unknown"
+
+    code_toplevel = _find_code_repo_toplevel(module_dir)
+    if code_toplevel is not None:
+        sha = _git_head(code_toplevel)
+        if sha:
+            if _is_git_dirty(code_toplevel, "src/engram/health"):
+                return f"{sha}-dirty"
+            return sha
+
+    print(
+        "health.series: engine_build could not be resolved from the "
+        f"executing module's location ({module_dir}) -- no env override, "
+        "no deployed plugin-tree marker, and no git checkout containing "
+        "src/engram/health/measurements.py; recording 'unknown' (see #2600).",
+        file=sys.stderr,
+    )
+    return "unknown"
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _guard_engine_build(
+    build: str, data_repo: str | Path, code_repo: str | Path
+) -> str:
+    """Loud-not-fatal collision guard (#2600): if ``build`` LOOKS like a git
+    sha (7-to-40-char lowercase hex) and resolves as a commit in
+    ``data_repo`` but NOT in ``code_repo``, it names a commit of the wrong
+    repository -- return the literal ``'unknown'`` and print one stderr
+    line naming both repos and the offending sha. Any other input (a
+    non-sha value such as ``'unknown'`` or a ``.deployed-version``
+    ``alpha_sha``; a sha that resolves in ``code_repo``, whether or not it
+    also resolves in ``data_repo``; or a sha that resolves in neither) is
+    returned UNCHANGED. This is a narrow collision check for the one
+    ambiguous case, NOT a general validator of ``build`` -- it does not
+    confirm ``build`` is otherwise well-formed or meaningful."""
+    if not _SHA_RE.match(build):
+        return build
+
+    if not _commit_exists(data_repo, build):
+        return build
+
+    if _commit_exists(code_repo, build):
+        return build
+
+    print(
+        f"health.series: engine_build {build!r} resolves as a commit in the "
+        f"data repo ({data_repo}) but not in the code repo ({code_repo}) -- "
+        "recording 'unknown' instead of a data-repo sha (see #2600).",
+        file=sys.stderr,
+    )
     return "unknown"
 
 
@@ -627,9 +834,16 @@ def ingest(
     conn = open_store(db_path)
     try:
         started_at = _utc_now_iso(now)
-        build = engine_build if engine_build is not None else detect_engine_build(
-            data_dir=None, repo_dir=repo_dir
-        )
+        if engine_build is not None:
+            build = engine_build
+        else:
+            build = detect_engine_build()
+            build = _guard_engine_build(
+                build,
+                data_repo=repo_dir,
+                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
+                or _default_repo_dir(),
+            )
 
         files = snapshot_files(snapshots_dir)
 
@@ -1275,9 +1489,16 @@ def backfill(
         effective_health_major = (
             health_major if health_major is not None else _current_health_major()
         )
-        build = engine_build if engine_build is not None else detect_engine_build(
-            data_dir=None, repo_dir=repo_dir
-        )
+        if engine_build is not None:
+            build = engine_build
+        else:
+            build = detect_engine_build()
+            build = _guard_engine_build(
+                build,
+                data_repo=repo_dir,
+                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
+                or _default_repo_dir(),
+            )
         current_hash = _replay_decl_hash_for(registry)
 
         total_git_replay_rows = conn.execute(
@@ -1455,7 +1676,13 @@ def verify(
             health_major if health_major is not None else _current_health_major()
         )
         current_hash = _replay_decl_hash_for(registry)
-        build = detect_engine_build(data_dir=None, repo_dir=repo_dir)
+        build = detect_engine_build()
+        build = _guard_engine_build(
+            build,
+            data_repo=repo_dir,
+            code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
+            or _default_repo_dir(),
+        )
 
         stored_rows = conn.execute(
             "SELECT commit_sha, measurements FROM l0_points "
@@ -1533,7 +1760,7 @@ def verify(
 # ---------------------------------------------------------------------------
 
 
-def status(db_path: str | Path) -> dict:
+def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict:
     """Counts per table, the last ``replay_runs`` row, the distinct
     ``health_major`` (from ``l0_points``) / ``health_version`` (from
     ``declarations``) values present in the store, and (PR B1 additions)
@@ -1542,7 +1769,17 @@ def status(db_path: str | Path) -> dict:
     verdict counts (one verdict per ``(commit_sha, health_major,
     replay_decl_hash)``, taking the row with the greatest ``checked_at`` --
     ``equality_checks`` is append-only, per that table's own migration
-    docstring)."""
+    docstring); and (#2600) for each DISTINCT ``engine_build`` present in
+    ``l0_points``, whether it resolves as a commit in the CODE repo
+    (``code_repo_dir``, default ``_default_repo_dir()`` -- the engram-alpha
+    checkout containing this module): ``true``/``false`` for a sha-shaped
+    value, ``null`` for a non-sha value (e.g. ``'unknown'`` or a
+    ``.deployed-version`` ``alpha_sha`` that isn't a git sha) or when no
+    code repo is resolvable at all (``code_repo_dir`` -- or the default --
+    doesn't exist / isn't a git repo)."""
+    effective_code_repo_dir = (
+        Path(code_repo_dir) if code_repo_dir is not None else _default_repo_dir()
+    )
     conn = open_store(db_path)
     try:
         counts = {}
@@ -1602,6 +1839,38 @@ def status(db_path: str | Path) -> dict:
         latest_equality_verdicts = {"agree": 0, "disagree": 0}
         for verdict, _ in latest_by_key.values():
             latest_equality_verdicts[verdict] = latest_equality_verdicts.get(verdict, 0) + 1
+
+        distinct_engine_builds = [
+            r["engine_build"]
+            for r in conn.execute(
+                "SELECT DISTINCT engine_build FROM l0_points ORDER BY engine_build"
+            ).fetchall()
+        ]
+        code_repo_valid = False
+        try:
+            code_repo_check = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(effective_code_repo_dir),
+            )
+            code_repo_valid = (
+                code_repo_check.returncode == 0
+                and code_repo_check.stdout.strip() == "true"
+            )
+        except OSError:
+            code_repo_valid = False
+
+        engine_build_resolvability = []
+        for build in distinct_engine_builds:
+            if not code_repo_valid or not _SHA_RE.match(build):
+                resolves = None
+            else:
+                resolves = _commit_exists(effective_code_repo_dir, build)
+            engine_build_resolvability.append(
+                {"engine_build": build, "resolves_in_code_repo": resolves}
+            )
     finally:
         conn.close()
 
@@ -1613,6 +1882,7 @@ def status(db_path: str | Path) -> dict:
         "current_replay_decl_hash": current_replay_decl_hash,
         "git_replay_counts": git_replay_counts,
         "latest_equality_verdicts": latest_equality_verdicts,
+        "engine_build_resolvability": engine_build_resolvability,
     }
 
 
@@ -1656,6 +1926,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status")
     _add_common(p_status, needs_snapshots_and_repo=False)
+    p_status.add_argument(
+        "--code-repo-dir", default=None,
+        help="engram-alpha checkout to resolve engine_build shas against "
+        "(defaults to this module's own checkout)",
+    )
 
     p_backfill = sub.add_parser("backfill")
     p_backfill.add_argument("--db", required=True, help="path to series.db")
@@ -1690,7 +1965,7 @@ def main(argv: list[str] | None = None) -> int:
             args.snapshots_dir, args.repo_dir, args.db, engine_build=args.engine_build
         )
     elif args.command == "status":
-        result = status(args.db)
+        result = status(args.db, code_repo_dir=args.code_repo_dir)
     elif args.command == "backfill":
         result = backfill(
             args.repo_dir,
