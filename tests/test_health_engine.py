@@ -690,8 +690,8 @@ class TestBuildSnapshot:
         assert set(snap.keys()) == {
             "schema_version", "engine_version", "health_version",
             "raw_schema_version", "model_version", "config", "definitions",
-            "measurements", "signals", "scores", "red_flags", "diagnostics",
-            "anchor", "turn", "checkpoint_mode",
+            "measurements", "signals", "signal_defs", "scores", "red_flags",
+            "diagnostics", "anchor", "turn", "checkpoint_mode",
         }
 
     def test_measurements_block_delegates_to_compute_all_measurements(self):

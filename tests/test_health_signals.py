@@ -17,16 +17,24 @@ re-litigating that cross-check.
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import sqlite3
 import sys
+from unittest import mock
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram"))
 
+from health import engine as health_engine  # noqa: E402
+from health import measurements as health_measurements  # noqa: E402
 from health import signals  # noqa: E402
 from health.config import UNAVAILABLE  # noqa: E402
+from health.signals import SIGNAL_DEFS, _build, compute_all_signals  # noqa: E402
+
+from test_health_measurements import _build_populated_fixture  # noqa: E402
 
 
 class TestRateHelper:
@@ -77,7 +85,7 @@ class TestSimpleRateSignals:
 
 
 class TestCoverageSignalsLiteralPolarity:
-    """The four coverage signals (engram-alpha#2518 polarity flip): 1.0 =
+    """The three coverage signals (engram-alpha#2518 polarity flip): 1.0 =
     fully covered, computed as ``1 - without/total``, not the raw
     "without" rate."""
 
@@ -196,3 +204,287 @@ class TestComputeAllSignals:
             "control failed to detect the perturbation: "
             f"before={before!r} after={after!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SignalDef -- declarative L1 arithmetic (engram-alpha#2518)
+# ---------------------------------------------------------------------------
+
+
+class TestSignalDefsRegisteredAgainstL0:
+    """Every SIGNAL_DEFS numerator/denominator/gate key must be a real,
+    registered L0 measurement name -- so a typo'd key fails HERE, at test
+    time, rather than surfacing later as a plausible-looking wrong number
+    (or a KeyError deep in build_snapshot)."""
+
+    def test_every_key_is_a_registered_measurement(self):
+        registered = set(health_measurements.MEASUREMENTS.keys())
+        for name, d in signals.SIGNAL_DEFS.items():
+            assert d.numerator in registered, (
+                f"{name}: numerator {d.numerator!r} not in MEASUREMENTS"
+            )
+            assert d.denominator in registered, (
+                f"{name}: denominator {d.denominator!r} not in MEASUREMENTS"
+            )
+            for gate in d.gates:
+                assert gate in registered, (
+                    f"{name}: gate {gate!r} not in MEASUREMENTS"
+                )
+
+
+class TestSignalsBuiltFromSignalDefs:
+    def test_signals_keys_match_signal_defs_keys(self):
+        assert set(signals.SIGNALS.keys()) == set(signals.SIGNAL_DEFS.keys())
+
+    def test_each_alias_is_its_signals_entry(self):
+        for name in signals.SIGNAL_DEFS:
+            alias = getattr(signals, name)
+            assert alias is signals.SIGNALS[name], (
+                f"module-level alias {name!r} is not SIGNALS[{name!r}]"
+            )
+
+
+class TestSignalDefsShape:
+    def test_exactly_three_coverage_signals_are_one_minus_rate(self):
+        """NOTE (flagged in the coder-fairy handoff for #2518): the task
+        brief's test list says "exactly the four coverage signals are
+        one_minus_rate", but the actual, verified-against-code arithmetic
+        (matching the brief's own per-signal enumeration in its step 2,
+        which lists giant_component_fraction's form as "rate") has only
+        THREE one_minus_rate signals -- recall_summary_coverage,
+        recall_keywords_coverage, embedding_coverage.
+        giant_component_fraction is the literal connected fraction with NO
+        complement, per its own preserved docstring above. This test
+        asserts the real, code-verified set; see the handoff for the
+        "four" vs "three" discrepancy."""
+        one_minus = {
+            name for name, d in signals.SIGNAL_DEFS.items()
+            if d.form == "one_minus_rate"
+        }
+        assert one_minus == {
+            "recall_summary_coverage",
+            "recall_keywords_coverage",
+            "embedding_coverage",
+        }
+        assert signals.SIGNAL_DEFS["giant_component_fraction"].form == "rate"
+
+    def test_exactly_embedding_coverage_has_gates(self):
+        gated = {
+            name for name, d in signals.SIGNAL_DEFS.items() if d.gates
+        }
+        assert gated == {"embedding_coverage"}
+        assert signals.SIGNAL_DEFS["embedding_coverage"].gates == (
+            "embedder_installed_available",
+            "embedder_config_enabled",
+        )
+
+
+class TestFormulaText:
+    def test_rate_formula_text(self):
+        d = signals.SIGNAL_DEFS["taint_rate"]
+        assert d.formula_text == (
+            "claim_bearing_pending_retract_marker / claim_bearing_current"
+        )
+
+    def test_one_minus_rate_formula_text(self):
+        d = signals.SIGNAL_DEFS["recall_summary_coverage"]
+        assert d.formula_text == (
+            "1 - claim_bearing_without_recall_summary / claim_bearing_current"
+        )
+
+    def test_gated_formula_text_appends_gates_in_words(self):
+        d = signals.SIGNAL_DEFS["embedding_coverage"]
+        assert d.formula_text == (
+            "1 - claim_bearing_null_embedding / claim_bearing_current "
+            "(requires embedder_installed_available and "
+            "embedder_config_enabled)"
+        )
+
+
+class TestSignalDefsJsonable:
+    def test_shape(self):
+        rendered = signals.signal_defs_jsonable()
+        assert set(rendered.keys()) == set(signals.SIGNAL_DEFS.keys())
+        for name, entry in rendered.items():
+            d = signals.SIGNAL_DEFS[name]
+            assert entry["numerator"] == d.numerator
+            assert entry["denominator"] == d.denominator
+            assert entry["form"] == d.form
+            assert entry["gates"] == list(d.gates)
+            assert entry["formula"] == d.formula_text
+
+
+# ---------------------------------------------------------------------------
+# build_snapshot integration -- signal_defs block (minimal throwaway
+# fixture DB, mirroring tests/test_health_engine_metrics.py's own DDL
+# subset; this file stays otherwise DB-free per its own module docstring).
+# ---------------------------------------------------------------------------
+
+_NODES_DDL = """
+CREATE TABLE nodes (
+    id              TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    evidence_id     TEXT,
+    status          TEXT DEFAULT 'active',
+    is_current      INTEGER DEFAULT 1,
+    metadata        TEXT DEFAULT '{}',
+    recall_summary  TEXT,
+    recall_keywords TEXT,
+    embedding       TEXT
+);
+
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   TEXT NOT NULL,
+    target_id   TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE cascade_markers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                 TEXT NOT NULL REFERENCES nodes(id),
+    cascade_event           TEXT NOT NULL,
+    root_node               TEXT NOT NULL,
+    root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+    status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+    resolution_kind         TEXT,
+    resolution_replacement_id TEXT,
+    created_at              TEXT NOT NULL,
+    resolved_at             TEXT,
+    backfill_provenance     TEXT,
+    backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(node_id, cascade_event)
+);
+"""
+
+
+def _make_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_NODES_DDL)
+    return conn
+
+
+class TestBuildSnapshotSignalDefs:
+    def test_signal_defs_present_with_nine_entries_matching_signals(self):
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        assert "signal_defs" in snap
+        assert len(snap["signal_defs"]) == 9
+        assert set(snap["signal_defs"].keys()) == set(snap["signals"].keys())
+
+
+class TestEqualityControlFailsOnPerturbedDefs:
+    """Borges's review ask (engram-alpha#2563): a control that has never
+    been seen to fail is not a control. ``_verify_l1_against_live_signal_fns``
+    (health/engine.py) is the SSoT equality control that compares L1 values
+    (computed from stored L0) against the live ``health.metrics`` SQL
+    functions on the SAME connection and raises ``HealthEngineSSoTError`` on
+    any disagreement. This class shows it actually catches a corrupted
+    ``SignalDef`` — reusing the same richly-populated fixture
+    ``tests/test_health_measurements.py``'s acceptance test already builds
+    (``_build_populated_fixture``), not a synthetic all-nonzero fixture built
+    fresh here.
+
+    Two independent perturbations, each shown to change the value on the
+    fixture (never vacuous), plus one positive control confirming the
+    UNPERTURBED path still passes on the same connection.
+
+    Sibling: `tests/test_health_engine.py::TestBuildSnapshot::test_ssot_mismatch_between_l1_and_live_signal_fn_raises_loudly`
+    perturbs the LIVE-SQL arm (the oracle) of the same control by patching
+    `_LIVE_SIGNAL_FNS_FOR_VERIFICATION`; this class perturbs the DECLARED
+    arm. Together they show the control fails whichever side moves.
+    """
+
+    def _embedder_patches(self):
+        """Same two-patch embedder-available context
+        test_health_measurements.py's own acceptance test uses -- must wrap
+        BOTH the L0 measurement read AND the verifier call, since the
+        verifier's live path (``health.metrics.embedding_coverage``) checks
+        the same environment gate independently; wrapping only the
+        measurement read leaves the verifier reading the real (test-suite
+        default, order-dependent) embedder-availability state and produces a
+        spurious mismatch unrelated to any perturbation."""
+        return (
+            mock.patch("engram_core._embedder.is_available", return_value=True),
+            mock.patch("engram_core._get_embedding_config", return_value={"enabled": True}),
+        )
+
+    def test_positive_control_unperturbed_passes(self):
+        """The unperturbed path must NOT raise on the same connection —
+        the control that shows the verifier isn't just always-failing."""
+        conn = _build_populated_fixture()
+        patch_a, patch_b = self._embedder_patches()
+        with patch_a, patch_b:
+            measurements = health_measurements.compute_all_measurements(conn)
+            l1 = compute_all_signals(measurements)
+            health_engine._verify_l1_against_live_signal_fns(conn, l1)  # must not raise
+
+    def test_recall_summary_coverage_polarity_flip_is_caught(self):
+        """Perturbation (a): flip ``recall_summary_coverage``'s ``form``
+        from ``one_minus_rate`` to ``rate`` -- inverts its polarity.
+        Fixture: claim_bearing_without_recall_summary=1,
+        claim_bearing_current=7 -> one_minus_rate=6/7≈0.857, rate=1/7≈0.143
+        -- genuinely different, not vacuous."""
+        conn = _build_populated_fixture()
+        patch_a, patch_b = self._embedder_patches()
+        with patch_a, patch_b:
+            measurements = health_measurements.compute_all_measurements(conn)
+            l1 = compute_all_signals(measurements)
+
+            orig_def = SIGNAL_DEFS["recall_summary_coverage"]
+            perturbed_def = dataclasses.replace(orig_def, form="rate")
+            perturbed_fn = _build(perturbed_def)
+            perturbed_value = perturbed_fn(measurements)
+
+            assert perturbed_value != l1["recall_summary_coverage"], (
+                "control setup failed: the polarity flip did not change "
+                "the value on this fixture -- the perturbation would be "
+                "vacuous"
+            )
+
+            perturbed_l1 = dict(l1)
+            perturbed_l1["recall_summary_coverage"] = perturbed_value
+
+            with pytest.raises(health_engine.HealthEngineSSoTError):
+                health_engine._verify_l1_against_live_signal_fns(conn, perturbed_l1)
+
+    def test_taint_rate_numerator_swap_is_caught(self):
+        """Perturbation (b): point ``taint_rate``'s numerator at a
+        DIFFERENT registered L0 key.
+
+        DECISION (flagged per the brief's own escape hatch): the brief's own
+        example key, ``derivations_pending_supersede_marker``, is vacuous on
+        this fixture -- its value is 1, identical to the real numerator
+        ``claim_bearing_pending_retract_marker`` (also 1), and both share the
+        same denominator (``claim_bearing_current``=7), so the swap produces
+        the SAME 1/7 value as the live signal and the verifier would not
+        raise. Using ``claim_bearing_without_recall_keywords`` (fixture
+        value 2) instead: 2/7≈0.286 vs the live taint_rate's 1/7≈0.143 --
+        genuinely different, not vacuous."""
+        conn = _build_populated_fixture()
+        patch_a, patch_b = self._embedder_patches()
+        with patch_a, patch_b:
+            measurements = health_measurements.compute_all_measurements(conn)
+            l1 = compute_all_signals(measurements)
+
+            orig_def = SIGNAL_DEFS["taint_rate"]
+            perturbed_def = dataclasses.replace(
+                orig_def, numerator="claim_bearing_without_recall_keywords"
+            )
+            perturbed_fn = _build(perturbed_def)
+            perturbed_value = perturbed_fn(measurements)
+
+            assert perturbed_value != l1["taint_rate"], (
+                "control setup failed: the numerator swap did not change "
+                "the value on this fixture -- the perturbation would be "
+                "vacuous"
+            )
+
+            perturbed_l1 = dict(l1)
+            perturbed_l1["taint_rate"] = perturbed_value
+
+            with pytest.raises(health_engine.HealthEngineSSoTError):
+                health_engine._verify_l1_against_live_signal_fns(conn, perturbed_l1)

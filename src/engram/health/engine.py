@@ -1447,6 +1447,13 @@ def build_snapshot(
         # return is reached — see health/measurements.py's module
         # docstring for L0's own design, and health/signals.py's for L1's.
         "measurements": l0_measurements,
+        # Declarative L1 arithmetic metadata (engram-alpha#2518) -- what
+        # numerator/denominator/gate L0 keys each signal below is made of,
+        # machine-readable so a consumer (e.g. the viz loader) doesn't have
+        # to hand-copy a table out of health/signals.py's source. Purely
+        # additive: no signal value above is affected by this key's
+        # presence.
+        "signal_defs": health_signals.signal_defs_jsonable(),
         "signals": signals,
         "scores": {
             "metrics": scores_per_metric,
