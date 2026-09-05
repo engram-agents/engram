@@ -42,6 +42,11 @@ from health import measurements as health_measurements  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERIES_PATH = REPO_ROOT / "src" / "engram" / "health" / "series.py"
 
+# A sha-shaped (matches series._SHA_RE) but fake engine_build used by the
+# two-diff rebuild tests below that don't need a REAL archivable commit
+# (they inject their own regenerate_under_build).
+FAKE_BUILD = "a" * 40
+
 from health import series  # noqa: E402
 
 
@@ -661,6 +666,15 @@ def test_declarations_row_written_once_per_version(tmp_path):
 
 
 def test_rebuild_reproduces_incremental_store(tmp_path):
+    """The PR A/B1 single-diff form's own reproduces-test (design test 7),
+    exercised via ``single_diff=True`` -- the explicit opt-back into the
+    pre-D4.2 behaviour (see ``rebuild``'s own docstring). This fixture's
+    ``knowledge.sql`` content (``"k1"``/``"k2"``/``"k3"``) is not valid SQL
+    -- fine for the single-diff form, which only ever calls ``ingest``
+    (never replays a commit), but NOT fine for the two-diff default, which
+    also regenerates under HEAD via ``backfill`` (replaying every commit
+    through ``sqlite3.executescript``). The two-diff form's own tests
+    (below) use real, executable ``knowledge.sql`` fixtures throughout."""
     repo_dir = tmp_path / "repo"
     _init_repo(repo_dir)
     t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -682,7 +696,7 @@ def test_rebuild_reproduces_incremental_store(tmp_path):
     _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
     series.ingest(snapshots_dir, repo_dir, db_path)
 
-    result = series.rebuild(snapshots_dir, repo_dir, db_path)
+    result = series.rebuild(snapshots_dir, repo_dir, db_path, single_diff=True)
     assert result["identical"] is True
     assert not Path(result["rebuilt_path"]).exists()  # replaced db_path
     assert db_path.exists()
@@ -700,7 +714,7 @@ def test_rebuild_reproduces_incremental_store(tmp_path):
     conn.commit()
     conn.close()
 
-    result2 = series.rebuild(snapshots_dir, repo_dir, db_path)
+    result2 = series.rebuild(snapshots_dir, repo_dir, db_path, single_diff=True)
     assert result2["identical"] is False
     tables = {d["table"] for d in result2["differences"]}
     fields = {d["field"] for d in result2["differences"]}
@@ -848,6 +862,48 @@ def test_detect_engine_build_rule_order(tmp_path, monkeypatch, capsys):
         )
     finally:
         monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
+
+
+# ---------------------------------------------------------------------------
+# 13b. the '-dirty' suffix is scoped to src/engram/health -- a dirty change
+# OUTSIDE that pathspec must not add it (#2603 fairy suggestion; negative
+# case for the positive one already covered in sub-case E above)
+# ---------------------------------------------------------------------------
+
+
+def test_dirty_suffix_scoped_to_health_pathspec_not_repo_wide(tmp_path):
+    """A code checkout carrying ``src/engram/health/measurements.py``,
+    dirty ONLY outside ``src/engram/health/`` (a modified ``README.md``),
+    must resolve to the bare HEAD sha -- no ``-dirty`` suffix -- because
+    ``detect_engine_build``'s dirty check is scoped to the
+    ``src/engram/health`` pathspec, not the whole repo. Dirty INSIDE that
+    pathspec is the existing positive case (sub-case E of
+    ``test_detect_engine_build_rule_order`` above); this is its negative
+    twin."""
+    code_repo = tmp_path / "code-repo-outside-dirty"
+    _init_repo(code_repo)
+    sha = _commit(
+        code_repo,
+        {
+            "src/engram/health/measurements.py": "# stub\n",
+            "README.md": "original\n",
+        },
+        "add measurements + readme",
+    )
+    code_module_path = code_repo / "src" / "engram" / "health" / "series.py"
+    assert series.detect_engine_build(module_path=code_module_path) == sha
+
+    # Dirty ONLY outside src/engram/health -- no '-dirty' suffix.
+    (code_repo / "README.md").write_text("changed\n", encoding="utf-8")
+    assert series.detect_engine_build(module_path=code_module_path) == sha
+
+    # Now also dirty INSIDE src/engram/health -- '-dirty' suffix appears.
+    (code_repo / "src" / "engram" / "health" / "measurements.py").write_text(
+        "# stub changed\n", encoding="utf-8"
+    )
+    assert (
+        series.detect_engine_build(module_path=code_module_path) == f"{sha}-dirty"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1210,7 +1266,7 @@ def test_equality_control_false_positive_control(tmp_path):
 
     Column + grep, named per the spec's own requirement: this fixture's
     ``nodes`` table (mirroring test_health_engine.py's/test_health_
-    measurements.py's own DDL) has nine columns -- id, type, created_at,
+    measurements.py's own DDL) has ten columns -- id, type, created_at,
     evidence_id, status, is_current, metadata, recall_summary,
     recall_keywords, embedding. ``grep -n "metadata\\|created_at"
     src/engram/health/measurements.py`` (run at test-writing time) matches
@@ -1272,6 +1328,64 @@ def test_equality_control_false_positive_control(tmp_path):
     assert row["verdict"] == "agree"
     assert json.loads(row["diff"]) == {}
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# 20b. equality_check's comparable_names -- two pinning tests (Ariadne,
+# #2599). Each pins ONE of the two clauses in
+# ``comparable_names = sorted(name for name, mdef in registry.items() if
+# mdef.replay == "graph" and name not in replay_unreplayable)`` -- deleting
+# either clause alone must fail its own test (verified by hand: see the
+# spec's own required carry-over report for the two failing outputs).
+# ---------------------------------------------------------------------------
+
+
+def test_comparable_names_excludes_stripped_measurement_absent_from_unreplayable():
+    """Pins the ``mdef.replay == "graph"`` clause: a measurement declared
+    ``"stripped"`` in the registry, even when it is ABSENT from
+    ``replay_unreplayable`` (as if it had somehow been computed anyway),
+    must still be excluded from comparison -- ``replay`` alone decides
+    comparability for a declared-unreplayable measurement, never whether it
+    happens to show up in the per-commit ``unreplayable`` dict."""
+    registry = {
+        "m_stripped": health_measurements.MeasurementDef(
+            name="m_stripped",
+            population="test-only stripped measurement",
+            compute_fn=lambda conn: None,
+            replay="stripped",
+        ),
+    }
+    stored = {"m_stripped": 5}
+    replay = {"m_stripped": 999}  # deliberately different
+    replay_unreplayable = {}  # ABSENT -- the case this test pins
+
+    verdict, diff = series.equality_check(stored, replay, replay_unreplayable, registry)
+    assert verdict == "agree"
+    assert diff == {}
+
+
+def test_comparable_names_excludes_graph_measurement_present_in_unreplayable():
+    """Pins the ``name not in replay_unreplayable`` clause: a measurement
+    declared ``"graph"`` that IS present in ``replay_unreplayable`` (a
+    discovered ``schema:`` null for this particular commit) must still be
+    excluded from comparison despite being ``"graph"`` -- a graph
+    measurement can land in ``replay_unreplayable`` per-commit even though
+    its DECLARATION says it is normally comparable."""
+    registry = {
+        "m_graph": health_measurements.MeasurementDef(
+            name="m_graph",
+            population="test-only graph measurement",
+            compute_fn=lambda conn: None,
+            replay="graph",
+        ),
+    }
+    stored = {"m_graph": 5}
+    replay = {"m_graph": 999}  # deliberately different
+    replay_unreplayable = {"m_graph": {"reason": "schema:no such table", "class": "discovered"}}
+
+    verdict, diff = series.equality_check(stored, replay, replay_unreplayable, registry)
+    assert verdict == "agree"
+    assert diff == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1789,3 +1903,618 @@ def test_status_reports_engine_build_resolvability(tmp_path):
     }
     assert by_build[code_sha] is True
     assert by_build["unknown"] is None
+
+
+# ---------------------------------------------------------------------------
+# 32. two-diff rebuild (D4.2, PR B2) -- the tests named in the spec
+# ---------------------------------------------------------------------------
+
+
+def test_two_diff_rebuild_identical_against_self_archive(tmp_path):
+    """Real integration on THIS checkout: build a store via ingest+backfill
+    over a scratch data repo, then ``rebuild(..., alpha_repo=<this checkout
+    root>)`` -- the stored rows' ``engine_build`` is THIS worktree's own
+    HEAD, so ``git archive HEAD src/engram`` is always available, and
+    ``identical`` must be True (both diffs empty for the one build). If
+    the worktree HEAD carries ``-dirty`` (it will while this PR is being
+    edited), the archive is still taken at the STRIPPED sha (git archive
+    only ever sees committed content) and ``dirty_suffix`` records that the
+    live rows' own stamp carried the suffix."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+    series.backfill(repo_dir, db_path)
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(REPO_ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    expected_dirty = series._is_git_dirty(REPO_ROOT, "src/engram/health")
+
+    result = series.rebuild(snapshots_dir, repo_dir, db_path, alpha_repo=REPO_ROOT)
+
+    assert result["identical"] is True, result
+    assert result["build_confounded"] is False
+    assert len(result["builds"]) == 1
+    assert result["builds"][0]["engine_build"] == head_sha
+    assert result["builds"][0]["dirty_suffix"] == expected_dirty
+    assert result["builds"][0]["status"] == "ok"
+    assert result["content_differences"][head_sha] == []
+    assert result["build_differences"][head_sha] == []
+    assert db_path.exists()
+    assert not Path(result["rebuilt_path"]).exists()  # replaced db_path
+
+    status = series.status(db_path)
+    assert status["last_rebuild_run"] is not None
+    assert status["last_rebuild_run"]["reason"] == "rebuild"
+
+
+def test_two_diff_classifies_content_change(tmp_path):
+    """Mutate one stored row's ``measurements`` in the live store (a data
+    change under an UNCHANGED build) -- ``content_differences`` names it,
+    ``build_differences`` is empty, and the store is not replaced."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=FAKE_BUILD)
+
+    conn = series.open_store(db_path)
+    row = conn.execute("SELECT rowid, measurements FROM l0_points LIMIT 1").fetchone()
+    measurements = json.loads(row["measurements"])
+    a_key = next(iter(measurements))
+    measurements[a_key] = "CORRUPTED"
+    conn.execute(
+        "UPDATE l0_points SET measurements = ? WHERE rowid = ?",
+        (json.dumps(measurements), row["rowid"]),
+    )
+    conn.commit()
+    conn.close()
+
+    def fake_regen(engine_build, snaps_dir, r_dir, out_db):
+        # Recompute fresh from the (unmutated) source data -- same code,
+        # same inputs as the original backfill() call above, so this is
+        # exactly "R_E": what build E would produce today.
+        series.backfill(r_dir, out_db, engine_build=engine_build)
+
+    result = series.rebuild(
+        snapshots_dir, repo_dir, db_path, regenerate_under_build=fake_regen
+    )
+
+    assert result["identical"] is False
+    assert result["build_confounded"] is False
+    content_diffs = result["content_differences"][FAKE_BUILD]
+    assert any(d["field"] == "measurements" for d in content_diffs)
+    assert result["build_differences"][FAKE_BUILD] == []
+    assert result["advice"]
+
+    # not replaced -- the live store still carries the mutated value.
+    conn2 = series.open_store(db_path)
+    still = json.loads(
+        conn2.execute("SELECT measurements FROM l0_points LIMIT 1").fetchone()["measurements"]
+    )
+    assert still[a_key] == "CORRUPTED"
+    conn2.close()
+
+
+def test_two_diff_classifies_build_change(tmp_path, monkeypatch):
+    """Inject a ``regenerate_under_build`` that copies the live store
+    verbatim (content diff is trivially empty), then monkeypatch ONE
+    ``graph`` measurement's ``compute_fn`` in the in-process registry to
+    return ``value + 1`` -- ``build_differences`` must show a difference
+    for the SAME row (via the ``measurements`` column's JSON payload;
+    ``_compare_dumps``'s own established granularity is whole-column, per
+    ``test_rebuild_reproduces_incremental_store``'s precedent), ``content_
+    differences`` stays empty, the store is not replaced, and the returned
+    ``advice`` mentions ``backfill`` (rebuild is not the path a code change
+    re-derives history through)."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation")
+    conn.commit()
+    sql = "\n".join(conn.iterdump())
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, sql, _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=FAKE_BUILD)
+
+    def copy_verbatim_regen(engine_build, snaps_dir, r_dir, out_db):
+        import shutil as _shutil
+
+        Path(out_db).parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copyfile(str(db_path), str(out_db))
+
+    target_name = next(
+        name
+        for name, mdef in health_measurements.MEASUREMENTS.items()
+        if mdef.replay == "graph"
+    )
+    original_mdef = health_measurements.MEASUREMENTS[target_name]
+    original_fn = original_mdef.compute_fn
+
+    def bumped_fn(c):
+        return original_fn(c) + 1
+
+    monkeypatch.setitem(
+        health_measurements.MEASUREMENTS,
+        target_name,
+        dataclasses.replace(original_mdef, compute_fn=bumped_fn),
+    )
+
+    result = series.rebuild(
+        snapshots_dir, repo_dir, db_path, regenerate_under_build=copy_verbatim_regen
+    )
+
+    assert result["identical"] is False
+    assert result["content_differences"][FAKE_BUILD] == []
+    build_diffs = result["build_differences"][FAKE_BUILD]
+    measurements_diff = next(d for d in build_diffs if d["field"] == "measurements")
+    old_measurements = json.loads(measurements_diff["old"])
+    new_measurements = json.loads(measurements_diff["new"])
+    assert new_measurements[target_name] == old_measurements[target_name] + 1
+    assert "backfill" in result["advice"]
+
+
+def test_two_diff_declaration_change_is_a_build_difference(tmp_path, monkeypatch):
+    """Same injection as the build-change test above, but flip one
+    measurement's ``replay`` value in the in-process registry instead of
+    its ``compute_fn`` -- reported as a build difference of ``kind ==
+    "declaration"``, naming both hashes, per ``_compare_build_diff``'s own
+    contract."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation", embedding=None)
+    conn.commit()
+    sql = "\n".join(conn.iterdump())
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, sql, _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=FAKE_BUILD)
+
+    conn_store = series.open_store(db_path)
+    old_hash = conn_store.execute(
+        "SELECT replay_decl_hash FROM l0_points LIMIT 1"
+    ).fetchone()["replay_decl_hash"]
+    conn_store.close()
+
+    def copy_verbatim_regen(engine_build, snaps_dir, r_dir, out_db):
+        import shutil as _shutil
+
+        Path(out_db).parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copyfile(str(db_path), str(out_db))
+
+    original = health_measurements.MEASUREMENTS["claim_bearing_null_embedding"]
+    monkeypatch.setitem(
+        health_measurements.MEASUREMENTS,
+        "claim_bearing_null_embedding",
+        dataclasses.replace(original, replay="graph"),
+    )
+    new_hash = health_measurements.replay_decl_hash()
+    assert new_hash != old_hash
+
+    result = series.rebuild(
+        snapshots_dir, repo_dir, db_path, regenerate_under_build=copy_verbatim_regen
+    )
+
+    assert result["identical"] is False
+    assert result["content_differences"][FAKE_BUILD] == []
+    build_diffs = result["build_differences"][FAKE_BUILD]
+    decl_diffs = [d for d in build_diffs if d.get("kind") == "declaration"]
+    assert len(decl_diffs) == 1
+    assert decl_diffs[0]["old"] == old_hash
+    assert decl_diffs[0]["new"] == new_hash
+
+
+def test_two_diff_unavailable_build_falls_back_confounded(tmp_path):
+    """Stored rows stamped with a sha that is not in ``alpha_repo`` --
+    ``build_differences[E].status == "unavailable"``, ``build_confounded is
+    True``, content diff computed against HEAD instead (D4.2's own
+    reasoning for WHY: an unconfounded verdict was requested and could not
+    be given, so the store is never replaced even if that fallback content
+    diff comes back empty)."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    fake_sha = "deadbeefcafe" + "0" * 28  # sha-shaped, not a commit anywhere
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=fake_sha)
+
+    # alpha_repo IS a real git work tree (this checkout), but fake_sha is
+    # not a commit in it -> git archive fails -> unavailable.
+    result = series.rebuild(snapshots_dir, repo_dir, db_path, alpha_repo=REPO_ROOT)
+
+    assert result["build_confounded"] is True
+    assert result["build_differences"][fake_sha]["status"] == "unavailable"
+    content_entry = result["content_differences"][fake_sha]
+    assert content_entry["confounded"] is True
+    assert result["identical"] is False
+
+    # not replaced -- the original row is still there.
+    conn = series.open_store(db_path)
+    count = conn.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn.close()
+    assert count == 1
+
+
+def test_two_diff_historical_tree_without_backfill_is_unavailable(tmp_path):
+    """A pre-B1 historical tree has no ``backfill`` subcommand -- simulated
+    by injecting a ``regenerate_under_build`` that raises the SAME
+    ``subprocess.CalledProcessError`` shape the real default raises on such
+    a tree. Result: ``unavailable`` with the stderr tail recorded, never an
+    exception out of ``rebuild`` itself."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=FAKE_BUILD)
+
+    def pre_b1_regen(engine_build, snaps_dir, r_dir, out_db):
+        raise subprocess.CalledProcessError(
+            returncode=2,
+            cmd=[sys.executable, "series.py", "backfill"],
+            output="",
+            stderr=(
+                "usage: health.series [-h] {ingest,rebuild,status} ...\n"
+                "health.series: error: argument command: invalid choice: "
+                "'backfill' (choose from 'ingest', 'rebuild', 'status')\n"
+            ),
+        )
+
+    result = series.rebuild(
+        snapshots_dir, repo_dir, db_path, regenerate_under_build=pre_b1_regen
+    )
+
+    assert result["build_confounded"] is True
+    entry = result["build_differences"][FAKE_BUILD]
+    assert entry["status"] == "unavailable"
+    assert "backfill" in entry["reason"]
+    assert result["identical"] is False
+
+
+# ---------------------------------------------------------------------------
+# 32b. two-diff rebuild -- unchecked engine_build buckets never replace
+# (Ariadne's #2605 colleague review -- round 2 of PR B2)
+# ---------------------------------------------------------------------------
+
+
+def test_two_diff_all_unknown_build_never_replaces(tmp_path):
+    """Every stored ``l0_points`` row's ``engine_build`` is ``'unknown'`` --
+    before the fix, such rows land in NO bucket at all (skipped out of
+    ``distinct_builds``, never routed anywhere else), so they can never
+    make ``identical`` False and the live store gets replaced un-checked.
+    Reset the data repo back to its first commit so HEAD's own regenerate
+    can only reproduce it -- the second commit's row must show up as a
+    genuine content difference under the ``"unknown"`` bucket, and the
+    live store must never be replaced.
+
+    Note: this scenario also drops a row (the HEAD reset), so
+    ``any_content_diff`` alone already forces ``identical`` False here --
+    it does not, by itself, pin the separate ``not build_confounded`` term
+    in the ``identical`` formula. See
+    ``test_confounded_alone_blocks_replacement`` for the scenario that
+    isolates that term."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "-- k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build="unknown")
+
+    conn = series.open_store(db_path)
+    row_count_before = conn.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn.close()
+    assert row_count_before == 2
+
+    # Drop the second commit -- HEAD's own regenerate can now only
+    # reproduce the first.
+    _run_git(repo_dir, "reset", "--hard", k1)
+
+    result = series.rebuild(snapshots_dir, repo_dir, db_path)
+
+    assert result["identical"] is False
+    assert result["build_confounded"] is True
+    unknown_content = result["content_differences"]["unknown"]
+    assert unknown_content["confounded"] is True
+    assert any(
+        d["field"] == "<row>" and d["new"] is None for d in unknown_content["differences"]
+    )
+    assert result["build_differences"]["unknown"]["status"] == "unavailable"
+    unknown_meta = next(b for b in result["builds"] if b["engine_build"] == "unknown")
+    assert unknown_meta["rows"] == 2
+    assert unknown_meta["status"] == "unavailable"
+    assert "for every build" not in result["advice"]
+    assert "unknown" in result["advice"]
+
+    # never replaced -- the .rebuild file is still sitting there, and the
+    # live store still carries both original rows.
+    assert Path(result["rebuilt_path"]).exists()
+    conn2 = series.open_store(db_path)
+    row_count_after = conn2.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn2.close()
+    assert row_count_after == row_count_before
+
+
+def test_two_diff_mixed_unknown_and_sha_never_replaces(tmp_path):
+    """One live row stamped with a REAL checkout-able sha (this checkout's
+    own HEAD), one stamped ``'unknown'`` -- the sha'd build must report
+    normally (matches HEAD, since nothing about it changed) AND the
+    ``'unknown'`` bucket must independently report confounded, so the
+    store is refused even though the sha'd bucket alone looks clean.
+
+    Note: like the all-unknown scenario above, this one also drops a row
+    (the HEAD reset), so ``any_content_diff`` alone already forces
+    ``identical`` False -- it does not, by itself, pin the separate
+    ``not build_confounded`` term. See
+    ``test_confounded_alone_blocks_replacement`` for the scenario that
+    isolates that term."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    head_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(REPO_ROOT),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build=head_sha)
+
+    k2 = _commit_knowledge(repo_dir, "-- k2", _committer_iso(t0 + timedelta(minutes=1)))
+    series.backfill(repo_dir, db_path, engine_build="unknown")
+
+    conn = series.open_store(db_path)
+    row_count_before = conn.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn.close()
+    assert row_count_before == 2
+
+    # Drop the second commit -- HEAD's own regenerate (and the sha'd
+    # build's own regenerate, over the SAME repo_dir) can now only
+    # reproduce the first.
+    _run_git(repo_dir, "reset", "--hard", k1)
+
+    result = series.rebuild(snapshots_dir, repo_dir, db_path, alpha_repo=REPO_ROOT)
+
+    assert result["identical"] is False
+    assert result["build_confounded"] is True
+
+    # the sha'd build reports normally -- both diffs empty, not confounded.
+    sha_meta = next(b for b in result["builds"] if b["engine_build"] == head_sha)
+    assert sha_meta["status"] == "ok"
+    assert result["content_differences"][head_sha] == []
+    assert result["build_differences"][head_sha] == []
+
+    # the unknown bucket independently reports confounded, naming k2's row.
+    unknown_content = result["content_differences"]["unknown"]
+    assert unknown_content["confounded"] is True
+    assert any(
+        d["field"] == "<row>" and d["new"] is None for d in unknown_content["differences"]
+    )
+    assert result["build_differences"]["unknown"]["status"] == "unavailable"
+    unknown_meta = next(b for b in result["builds"] if b["engine_build"] == "unknown")
+    assert unknown_meta["rows"] == 1
+
+    assert "for every build" not in result["advice"]
+    assert "unknown" in result["advice"]
+
+    # never replaced.
+    assert Path(result["rebuilt_path"]).exists()
+    conn2 = series.open_store(db_path)
+    row_count_after = conn2.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn2.close()
+    assert row_count_after == row_count_before
+
+
+def test_confounded_alone_blocks_replacement(tmp_path):
+    """Isolates the ``not build_confounded`` term in ``_two_diff_rebuild``'s
+    ``identical`` formula -- the term the round-2 guard tests above
+    (``test_two_diff_all_unknown_build_never_replaces`` and
+    ``test_two_diff_mixed_unknown_and_sha_never_replaces``) could not pin by
+    themselves, because both of those scenarios also drop a row via a HEAD
+    reset, which already forces ``any_content_diff`` True independent of
+    ``build_confounded``. A formula that dropped ``not build_confounded``
+    entirely would still fail both of those tests for the content-diff
+    reason alone, so they cannot tell such a mutation apart from the
+    correct formula.
+
+    This test builds the one scenario that can: an all-``'unknown'`` live
+    store whose HEAD regenerate reproduces EVERY row exactly (no reset, no
+    dropped row). With every row reproduced, ``content_differences
+    ['unknown']['differences']`` is empty and ``build_differences
+    ['unknown']`` carries no ``'differences'`` key at all (it is always an
+    ``{"status": "unavailable", "reason": ...}`` dict for the unknown
+    bucket) -- so both ``any_content_diff`` and ``any_build_diff`` are
+    False, and only ``build_confounded`` can still block ``identical``."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path, engine_build="unknown")
+
+    conn = series.open_store(db_path)
+    row_count_before = conn.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn.close()
+    assert row_count_before == 1
+
+    # No reset here -- HEAD's own regenerate reproduces every row exactly,
+    # so content_differences/build_differences are both empty for the
+    # "unknown" bucket. Only build_confounded can still block replacement.
+    result = series.rebuild(snapshots_dir, repo_dir, db_path)
+
+    assert result["identical"] is False
+    assert result["build_confounded"] is True
+
+    unknown_content = result["content_differences"]["unknown"]
+    assert unknown_content["confounded"] is True
+    assert unknown_content["differences"] == []
+
+    unknown_build = result["build_differences"]["unknown"]
+    assert "differences" not in unknown_build
+    assert unknown_build["status"] == "unavailable"
+
+    unknown_meta = next(b for b in result["builds"] if b["engine_build"] == "unknown")
+    assert unknown_meta["rows"] == 1
+    assert unknown_meta["status"] == "unavailable"
+
+    # advice names the unchecked bucket -- the reader can see WHY the
+    # store was refused even though neither diff bucket found anything.
+    assert "unknown" in result["advice"]
+    assert "could not be checked" in result["advice"]
+
+    # never replaced -- the .rebuild file is still sitting there, and the
+    # live store still carries its original row.
+    assert Path(result["rebuilt_path"]).exists()
+    conn2 = series.open_store(db_path)
+    row_count_after = conn2.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    conn2.close()
+    assert row_count_after == row_count_before
+
+
+def test_two_diff_refuses_on_declarations_difference(tmp_path):
+    """``os.replace`` swaps the whole db file, but the diffs above only ever
+    compare ``l0_points``. Mutate one ``declarations`` row's
+    ``signal_defs`` in the live store, with everything else identical --
+    the mismatch must be caught under ``other_table_differences`` and
+    refuse the replace, even though there is no ``l0_points`` row at all
+    to disagree over (this snapshot's anchor is deliberately out of the
+    by-time resolution window, so it never produces one -- keeps the test
+    from being confounded by the ``l0_points``-bucket checks above)."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    snap = _build_v2_snapshot(anchor=None, turn=1)
+    ts = (t0 - timedelta(minutes=30)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts, snap)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+
+    conn = series.open_store(db_path)
+    l0_count = conn.execute("SELECT COUNT(*) AS c FROM l0_points").fetchone()["c"]
+    row = conn.execute("SELECT health_version, signal_defs FROM declarations LIMIT 1").fetchone()
+    conn.close()
+    assert l0_count == 0
+    assert row is not None
+    hv = row["health_version"]
+    mutated = json.loads(row["signal_defs"])
+    mutated["__mutated__"] = True
+
+    conn = series.open_store(db_path)
+    conn.execute(
+        "UPDATE declarations SET signal_defs = ? WHERE health_version = ?",
+        (json.dumps(mutated), hv),
+    )
+    conn.commit()
+    conn.close()
+
+    result = series.rebuild(snapshots_dir, repo_dir, db_path)
+
+    assert result["identical"] is False
+    assert "declarations" in result["other_table_differences"]
+    diffs = result["other_table_differences"]["declarations"]
+    assert any(d["field"] == "signal_defs" for d in diffs)
+    assert Path(result["rebuilt_path"]).exists()
+
+    conn = series.open_store(db_path)
+    still = conn.execute(
+        "SELECT signal_defs FROM declarations WHERE health_version = ?", (hv,)
+    ).fetchone()["signal_defs"]
+    conn.close()
+    assert "__mutated__" in still
+
+
+def test_single_diff_flag_warns(tmp_path):
+    """CLI ``--single-diff`` prints the confounded warning to stderr and
+    returns TODAY'S (pre-D4.2) shape -- ``{identical, differences,
+    rebuilt_path}`` -- never the two-diff shape."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    db_path = tmp_path / "cli-single-diff.db"
+
+    result = subprocess.run(
+        [
+            sys.executable, str(SERIES_PATH), "rebuild", "--single-diff",
+            "--db", str(db_path),
+            "--snapshots-dir", str(snapshots_dir),
+            "--repo-dir", str(repo_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "single-diff" in result.stderr
+    assert "CONFOUNDED" in result.stderr
+    payload = json.loads(result.stdout)
+    assert set(payload.keys()) == {"identical", "differences", "rebuilt_path"}
+
+
+def test_no_helper_silently_drops_non_sha_builds():
+    """``_distinct_replayable_builds`` was a dead (zero-caller) helper that
+    duplicated the "skip unknown/non-sha ``engine_build``, strip a
+    ``-dirty`` suffix" bucketing logic now inlined directly in the two-diff
+    ``rebuild`` (round 2 of B2, part of #2575). That inline version routes
+    a non-checkout-able ``engine_build`` into the confounded/unavailable
+    branch instead of silently dropping the row -- the very bug the dead
+    helper still carried. If someone later wires the helper back up (e.g.
+    for a status/report path), they would reintroduce the silent-drop
+    behaviour without anyone noticing, since it has no callers today. This
+    test asserts the helper stays gone rather than merely unused."""
+    source = SERIES_PATH.read_text()
+    assert "_distinct_replayable_builds" not in source

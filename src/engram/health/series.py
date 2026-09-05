@@ -3,8 +3,8 @@
 
 Design of record: ``docs/health-series-design.md`` (design v1 sections 0-10,
 amended by deltas D1-D5; the deltas win over the sections they amend). This
-module implements **PR A and PR B1** ("#2575 PR A", "#2575 PR B") of the
-three-PR slicing named in that document's "Slicing after the deltas"
+module implements **PR A, PR B1, and PR B2** ("#2575 PR A", "#2575 PR B") of
+the three-PR slicing named in that document's "Slicing after the deltas"
 section (further split into B1/B2 in that doc's "Scope split" paragraph):
 
   - **PR A** -- the store schema (all tables, including ``replay_decl_
@@ -12,33 +12,37 @@ section (further split into B1/B2 in that doc's "Scope split" paragraph):
     ``declarations``, ``unresolved_snapshots``), ``ingest``, old-format
     refusal, anchor resolution (D1), a single-diff ``rebuild``, and the CLI
     skeleton.
-  - **PR B1 (this module, additionally)** -- the replay driver
-    (``replay_commit``), ``MeasurementDef.replay`` (in ``measurements.py``)
-    and its ``replay_decl_hash`` fingerprint (D2), the equality control
-    (``equality_check``), the regular backfill mechanism (``backfill``),
-    ``verify``, and the CLI's ``backfill``/``verify`` subcommands.
-  - **PR B2 (NOT this module -- follow-up)** -- the two-diff form of
+  - **PR B1** -- the replay driver (``replay_commit``), ``MeasurementDef.
+    replay`` (in ``measurements.py``) and its ``replay_decl_hash``
+    fingerprint (D2), the equality control (``equality_check``), the
+    regular backfill mechanism (``backfill``), ``verify``, and the CLI's
+    ``backfill``/``verify`` subcommands.
+  - **PR B2 (this module, additionally)** -- the two-diff form of
     ``rebuild`` (D4.2: content-changed under the stored ``engine_build`` vs
     build-changed under HEAD), which needs a checkout of a historical
     ``engine_build`` into a scratch tree -- a real blast-radius jump from
     "replay a dump into :memory:" to "checkout a historical commit's
-    ``health/`` package," deliberately kept out of B1.
+    ``health/`` package." The old single-diff form survives as an explicit
+    CLI/API opt-back (``--single-diff`` / ``rebuild(..., single_diff=True)``)
+    since it confounds content and build change and is never the default.
   - **PR C (NOT this module)** -- ``derived_points`` population, ``export``,
     and the lifecycle checkpoint hook.
 
-What PR B1 explicitly does NOT do (left as ``TODO(#2575 PR C)`` / ``TODO(
-#2575 PR B2)`` markers below): no ``derived_points`` population, no
-``export``, no lifecycle wiring (nothing in ``engram_lifecycle.py`` or
-``engram_snapshot_worker.py`` calls into this module), no two-diff
-``rebuild``.
+What PR B2 explicitly does NOT do (left as ``TODO(#2575 PR C)`` markers
+below): no ``derived_points`` population, no ``export``, no lifecycle wiring
+(nothing in ``engram_lifecycle.py`` or ``engram_snapshot_worker.py`` calls
+into this module).
 
 The store (``series.db``) is DERIVED and REBUILDABLE -- never the SSoT. The
 snapshot JSON files under ``<snapshots_dir>/*.json`` (plus git history for
-replay, in PR B) are the SSoT; this store is an index over them. ``rebuild``
-exists precisely because of this: it reconstructs a fresh store from
-scratch and diffs it against the live one, and only replaces the live store
-when they agree byte-for-byte on every non-run-metadata column (design
-doc's "safety property... and a test", section 2).
+replay) are the SSoT; this store is an index over them. ``rebuild`` exists
+precisely because of this: it reconstructs a fresh store from scratch and
+diffs it against the live one, and only replaces the live store when they
+agree byte-for-byte on every non-run-metadata column (design doc's "safety
+property... and a test", section 2) -- extended by D4.2 into TWO diffs
+(content vs build) so that agreement is meaningful even when the code that
+computed the stored rows has since changed (see ``rebuild``'s own
+docstring).
 
 **Never-mutate rule**: rows in ``l0_points``, ``declarations``, and
 ``unresolved_snapshots`` are never UPDATEd once inserted (``unresolved_
@@ -55,22 +59,37 @@ upsert-only-for-``seen_at``/``reason`` discipline as every other
 unresolved reason.
 
 This module is pure stdlib (``sqlite3``, ``json``, ``subprocess``,
-``hashlib``, ``datetime``, ``pathlib``, ``argparse``) and takes every path
-as an explicit argument -- it deliberately does NOT ``import engram_core``
-or read ``DATA_DIR`` at module top level (or anywhere), matching health/
+``hashlib``, ``datetime``, ``pathlib``, ``argparse``, ``tarfile``,
+``tempfile``, ``shutil``, ``io``, ``functools``) and takes every path as an
+explicit argument -- it deliberately does NOT ``import engram_core`` or
+read ``DATA_DIR`` at module top level (or anywhere), matching health/
 engine.py's own lazy-import discipline (see that module's "NOTE on
 engram_core access"). Every git call is a ``subprocess.run([...])`` argument
 list -- never ``shell=True``, never a piped string, never ``git describe``.
+
+**PR B2's scratch-tree mechanism never imports a historical ``health``
+package into this process.** ``rebuild``'s default ``regenerate_under_build``
+archives a historical ``engine_build``'s ``src/engram`` tree and runs its
+``health/series.py`` as a ``subprocess.run([sys.executable, ...])`` child --
+never an in-process ``import`` of anything under the scratch tree. This
+keeps the two-diff form's "checkout a historical commit's ``health/``
+package" blast radius contained to a disposable child process and a
+disposable temp directory, never this module's own ``sys.modules``.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import io
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -523,8 +542,8 @@ def detect_engine_build(module_path: str | Path | None = None) -> str:
     callers (``ingest`` / ``backfill`` / ``verify``) call this bare, with no
     arguments at all.
 
-    Order, LOAD-BEARING (#2600's final rule -- Ariadne's fix to round 1's
-    fix; round 3 dropped round 1's separate ``data_dir``/``code_repo_dir``
+    Order, LOAD-BEARING (#2600's final rule -- a fix to round 1's fix;
+    round 3 dropped round 1's separate ``data_dir``/``code_repo_dir``
     override path, which was a SECOND rule bolted onto this one purely to
     keep an old test passing):
 
@@ -1123,13 +1142,19 @@ def _compare_dumps(
     return diffs
 
 
-def rebuild(
+def _rebuild_single_diff(
     snapshots_dir: str | Path,
     repo_dir: str | Path,
     db_path: str | Path,
     engine_build: str | None = None,
 ) -> dict:
-    """Build a fresh store at ``<db_path>.rebuild`` via ``ingest``, then
+    """The PR A/B1 single-diff form of ``rebuild`` (design doc section 2),
+    kept ONLY as the explicit opt-back behind ``rebuild(..., single_diff=
+    True)`` / the CLI's ``--single-diff`` -- see ``rebuild``'s own
+    docstring for why this confounds content and build change and is never
+    the default from PR B2 onward.
+
+    Build a fresh store at ``<db_path>.rebuild`` via ``ingest``, then
     compare it against the existing ``db_path`` with an ORDERED DUMP
     COMPARE over ``l0_points``/``declarations``/``unresolved_snapshots``
     (ordered by primary key; run-metadata columns -- ``computed_at``,
@@ -1140,13 +1165,6 @@ def rebuild(
     live store at ``db_path`` is atomically replaced (``os.replace``) with
     the freshly rebuilt one; if not, BOTH files are left in place and the
     differences are returned -- a disagreeing store is never replaced.
-
-    TODO(#2575 PR B): this is the single-diff form (design doc section 2's
-    "rebuild"). D4.2's two-diff form (content-changed under the stored
-    ``engine_build`` vs build-changed under HEAD, requiring a checkout of
-    the stored build's ``health/`` into a scratch tree) lands in PR B
-    alongside the replay driver that makes ``engine_build`` a real,
-    checkout-able sha for git_replay rows.
     """
     import os
 
@@ -1189,6 +1207,689 @@ def rebuild(
         "differences": differences,
         "rebuilt_path": str(rebuilt_path),
     }
+
+
+# ---------------------------------------------------------------------------
+# rebuild -- two-diff form (D4.2, PR B2)
+# ---------------------------------------------------------------------------
+
+
+_DIRTY_SUFFIX = "-dirty"
+
+
+def _strip_dirty_suffix(build: str) -> "tuple[str, bool]":
+    """``(sha, True)`` if ``build`` ends in ``-dirty``, else ``(build,
+    False)`` unchanged."""
+    if build.endswith(_DIRTY_SUFFIX):
+        return build[: -len(_DIRTY_SUFFIX)], True
+    return build, False
+
+
+class _RegenerateUnavailable(Exception):
+    """Raised by a ``regenerate_under_build`` implementation (default or
+    injected) when a historical build's side of the two-diff cannot be
+    produced -- not a commit in ``alpha_repo``, a pre-B1 tree missing a
+    subcommand this call uses, an archive/subprocess failure, ... -- and
+    caught by the two-diff ``rebuild`` loop, which turns it into a
+    ``{"status": "unavailable", "reason": ...}`` ``build_differences`` entry
+    and a confounded content diff (D4.2's "Unavailable build side"). Never
+    left to propagate out of ``rebuild`` itself."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _regenerate_failure_reason(exc: "Exception") -> str:
+    """The reason string to record for a ``regenerate_under_build`` failure
+    -- ``exc.reason`` for ``_RegenerateUnavailable`` (the default
+    implementation's own exception), or the child's stderr tail for a bare
+    ``subprocess.CalledProcessError`` (what an INJECTED ``regenerate_under_
+    build`` may raise directly, e.g. in a test standing in for a pre-B1
+    tree that never got the chance to wrap it) -- either way, the two-diff
+    ``rebuild`` loop never lets either exception type propagate; both are
+    turned into an ``{"status": "unavailable", "reason": ...}``
+    ``build_differences`` entry."""
+    if isinstance(exc, _RegenerateUnavailable):
+        return exc.reason
+    stderr = exc.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    stderr_tail = (stderr or "")[-2000:]
+    return f"{exc} (exit {exc.returncode}): {stderr_tail}"
+
+
+def _is_git_worktree(path: "str | Path") -> bool:
+    """``True`` iff ``git rev-parse --is-inside-work-tree`` succeeds and
+    prints ``true`` for ``path``. Never raises -- a git failure (missing
+    ``git``, ``path`` not existing, ``path`` not a repo at all) reads as
+    "not a work tree", per ``rebuild``'s own contract: a non-worktree
+    ``alpha_repo`` makes the build side ``unavailable``, never an
+    exception."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(path),
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "true"
+
+
+def _default_regenerate_under_build(
+    alpha_repo: "str | Path",
+    engine_build: str,
+    snapshots_dir: "str | Path",
+    repo_dir: "str | Path",
+    out_db: "str | Path",
+    keep_scratch: bool = False,
+) -> None:
+    """Default ``regenerate_under_build`` (D4.2): archive ``engine_build``'s
+    ``src/engram`` tree out of ``alpha_repo`` (``git -C <alpha_repo> archive
+    --format=tar <engine_build> src/engram`` -- a ``subprocess.run([...])``
+    ARGUMENT LIST, never a shell pipe; the tar bytes are extracted via
+    ``tarfile`` from an in-memory buffer) into a fresh ``tempfile.
+    mkdtemp()``, then run THAT scratch tree's own ``health/series.py`` as a
+    SUBPROCESS -- ``ingest`` then ``backfill`` -- against the SAME
+    ``snapshots_dir``/``repo_dir`` and a fresh ``out_db``, with
+    ``ENGRAM_ENGINE_BUILD=<engine_build>`` set on the child (so the scratch
+    tree's own rows stamp ``engine_build`` exactly -- ``detect_engine_
+    build``'s rule step 1 always wins, so the guard never fires on a
+    scratch path) and ``ENGRAM_HOME`` pointed at a second, unrelated fresh
+    temp dir as a belt-and-braces measure (``series.py`` never reads it,
+    but nothing here should risk resolving a real ``~/.engram``).
+
+    Never imports the scratch tree's code into THIS process -- the
+    ``sys.executable`` subprocess call is the whole point (module docstring
+    above).
+
+    Raises ``_RegenerateUnavailable`` -- never a bare ``subprocess.
+    CalledProcessError``, never any other exception -- on ANY archive or
+    subprocess failure (``engine_build`` not a commit in ``alpha_repo``, a
+    pre-B1 tree with no ``backfill`` subcommand, a scratch tree whose
+    ``ingest``/``backfill`` otherwise exits non-zero, ...), carrying the
+    failing child's stderr tail. The scratch tree (and its throwaway
+    ``ENGRAM_HOME``) is removed afterwards unless ``keep_scratch``."""
+    scratch_dir = Path(tempfile.mkdtemp(prefix="health-series-rebuild-"))
+    scratch_home = Path(tempfile.mkdtemp(prefix="health-series-rebuild-home-"))
+    try:
+        archive = subprocess.run(
+            ["git", "-C", str(alpha_repo), "archive", "--format=tar", engine_build, "src/engram"],
+            check=False,
+            capture_output=True,
+        )
+        if archive.returncode != 0:
+            stderr_tail = archive.stderr.decode("utf-8", errors="replace")[-2000:]
+            raise _RegenerateUnavailable(
+                f"git archive {engine_build!r} from {alpha_repo!r} failed: {stderr_tail}"
+            )
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tf:
+            try:
+                tf.extractall(str(scratch_dir), filter="data")
+            except TypeError:  # pragma: no cover -- Python < 3.12 has no `filter=`
+                tf.extractall(str(scratch_dir))
+
+        scratch_series = scratch_dir / "src" / "engram" / "health" / "series.py"
+        if not scratch_series.is_file():
+            raise _RegenerateUnavailable(
+                f"archived tree for {engine_build!r} has no "
+                "src/engram/health/series.py (pre-health tree?)"
+            )
+
+        import os
+
+        child_env = dict(os.environ)
+        child_env["ENGRAM_ENGINE_BUILD"] = engine_build
+        child_env["ENGRAM_HOME"] = str(scratch_home)
+
+        for subcommand, extra_args in (
+            ("ingest", ["--snapshots-dir", str(snapshots_dir), "--repo-dir", str(repo_dir)]),
+            ("backfill", ["--repo-dir", str(repo_dir)]),
+        ):
+            result = subprocess.run(
+                [sys.executable, str(scratch_series), subcommand, "--db", str(out_db), *extra_args],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=child_env,
+            )
+            if result.returncode != 0:
+                stderr_tail = result.stderr[-2000:]
+                raise _RegenerateUnavailable(
+                    f"scratch tree for {engine_build!r} failed running "
+                    f"{subcommand!r} (exit {result.returncode}): {stderr_tail}"
+                )
+    finally:
+        if not keep_scratch:
+            shutil.rmtree(str(scratch_dir), ignore_errors=True)
+            shutil.rmtree(str(scratch_home), ignore_errors=True)
+
+
+def _compare_content_diff(old_rows: "list[dict]", new_rows: "list[dict]") -> "list[dict]":
+    """The content-diff half of D4.2: ``_compare_dumps`` over ``l0_points``,
+    then filtered to drop "row exists only in the fresh regenerate" entries.
+    A full ``regenerate_under_build`` necessarily replays EVERY commit
+    ``knowledge_commits(repo_dir)`` finds today, which can be MORE commits
+    than were live under a given build historically (new commits landed
+    since, or the build's own rows were never fully backfilled) -- that is
+    newly-computed COVERAGE, not a data change, so it is not a content
+    difference. A row present in the live store under this build but
+    MISSING from the fresh regenerate (history rewritten out from under it)
+    is still a genuine content difference and is kept."""
+    diffs = _compare_dumps(old_rows, new_rows, "l0_points")
+    return [d for d in diffs if not (d["field"] == "<row>" and d["old"] is None)]
+
+
+_BUILD_DIFF_EXCLUDE_COLUMNS = {"computed_at", "engine_build"}
+
+
+def _compare_build_diff(e_rows: "list[dict]", head_rows: "list[dict]") -> "list[dict]":
+    """The build-diff half of D4.2: compare two ``l0_points`` dumps -- one
+    regenerated under a historical ``engine_build`` E, one regenerated
+    in-process under HEAD -- keyed on ``(commit_sha, health_major,
+    source)``, deliberately NOT the table's real primary key (which also
+    includes ``replay_decl_hash``). A ``MeasurementDef.replay`` flip
+    between E and HEAD changes ``replay_decl_hash`` without changing
+    ``(commit_sha, health_major, source)``, and keying on the real primary
+    key would then see two ROWS THAT NEVER MEET -- one only in ``e_rows``,
+    one only in ``head_rows`` -- reported as an unrelated row-added/
+    row-removed pair instead of what it actually is: the SAME logical
+    point, recomputed, whose declared-replay fingerprint moved. When
+    ``replay_decl_hash`` differs, this function reports EXACTLY ONE diff
+    entry for that key, of ``"kind": "declaration"``, naming both hashes,
+    and does not also diff the two rows' other fields (a hash mismatch
+    already explains why every ``unreplayable``-shaped field could differ)."""
+
+    def key(row: dict) -> tuple:
+        return (row["commit_sha"], row["health_major"], row["source"])
+
+    e_by_key = {key(r): r for r in e_rows}
+    head_by_key = {key(r): r for r in head_rows}
+
+    diffs: "list[dict]" = []
+    all_keys = sorted(set(e_by_key) | set(head_by_key), key=lambda k: [str(x) for x in k])
+    for k in all_keys:
+        e_row = e_by_key.get(k)
+        head_row = head_by_key.get(k)
+        if e_row is None:
+            diffs.append({"table": "l0_points", "key": list(k), "field": "<row>", "old": None, "new": "present"})
+            continue
+        if head_row is None:
+            diffs.append({"table": "l0_points", "key": list(k), "field": "<row>", "old": "present", "new": None})
+            continue
+        if e_row["replay_decl_hash"] != head_row["replay_decl_hash"]:
+            diffs.append(
+                {
+                    "table": "l0_points",
+                    "key": list(k),
+                    "field": "replay_decl_hash",
+                    "kind": "declaration",
+                    "old": e_row["replay_decl_hash"],
+                    "new": head_row["replay_decl_hash"],
+                }
+            )
+            continue
+        fields = sorted(set(e_row) | set(head_row))
+        for field in fields:
+            if field in _BUILD_DIFF_EXCLUDE_COLUMNS:
+                continue
+            if field in ("commit_sha", "health_major", "source", "replay_decl_hash"):
+                continue
+            if e_row.get(field) != head_row.get(field):
+                diffs.append(
+                    {
+                        "table": "l0_points",
+                        "key": list(k),
+                        "field": field,
+                        "old": e_row.get(field),
+                        "new": head_row.get(field),
+                    }
+                )
+    return diffs
+
+
+def _record_rebuild_run(
+    db_path: "str | Path", *, health_major: "int | None", engine_build: "str | None", detail: dict
+) -> None:
+    """Write one ``replay_runs`` row with ``reason='rebuild'`` recording
+    this ``rebuild`` call's verdict, so ``status`` can report "the last
+    rebuild's verdict" (deliverable 1's CLI contract) without re-running
+    anything. Written into ``db_path`` AFTER any ``os.replace`` the rebuild
+    itself performed, so the row lands in whichever file is live afterward."""
+    conn = open_store(db_path)
+    try:
+        now_iso = _utc_now_iso()
+        conn.execute(
+            "INSERT INTO replay_runs (started_at, finished_at, health_major, reason, "
+            "commits_total, commits_done, skipped_old_format, unresolved, engine_build, detail) "
+            "VALUES (?, ?, ?, 'rebuild', ?, ?, ?, ?, ?, ?)",
+            (now_iso, now_iso, health_major, None, None, None, None, engine_build, _canonical_json(detail)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _two_diff_rebuild(
+    snapshots_dir: "str | Path",
+    repo_dir: "str | Path",
+    db_path: "str | Path",
+    *,
+    alpha_repo: "str | Path | None" = None,
+    engine_build: "str | None" = None,
+    regenerate_under_build=None,
+    keep_scratch: bool = False,
+) -> dict:
+    """The D4.2 two-diff form -- see ``rebuild``'s own docstring for the
+    full contract; this function is ``rebuild``'s default (``single_diff=
+    False``) dispatch target."""
+    import os
+
+    db_path = Path(db_path)
+    effective_alpha_repo = Path(alpha_repo) if alpha_repo is not None else _default_repo_dir()
+
+    # -- R_head: regenerate under HEAD, in-process, as today -- ingest THEN
+    # backfill (using whatever registry health_measurements.MEASUREMENTS
+    # currently is -- no override -- so an in-process monkeypatch of a
+    # compute_fn or a `replay` declaration is picked up exactly like a
+    # real code change would be).
+    head_db = Path(str(db_path) + ".rebuild")
+    head_db.unlink(missing_ok=True)
+    for suffix in ("-journal", "-wal", "-shm"):
+        Path(str(head_db) + suffix).unlink(missing_ok=True)
+
+    ingest(snapshots_dir, repo_dir, head_db, engine_build=engine_build)
+    backfill(repo_dir, head_db)
+    head_conn = open_store(head_db)
+    try:
+        head_rows = _dump_table_rows(head_conn, "l0_points")
+        head_health_majors = sorted({r["health_major"] for r in head_rows})
+    finally:
+        head_conn.close()
+    head_build_id = engine_build if engine_build is not None else detect_engine_build()
+
+    alpha_is_worktree = _is_git_worktree(effective_alpha_repo)
+
+    regen = regenerate_under_build
+    if regen is None:
+        regen = functools.partial(
+            _default_regenerate_under_build,
+            effective_alpha_repo,
+            keep_scratch=keep_scratch,
+        )
+
+    builds_meta: "list[dict]" = []
+    content_differences: "dict[str, object]" = {}
+    build_differences: "dict[str, object]" = {}
+    build_confounded = False
+
+    live_exists = db_path.exists()
+    live_rows_all: "list[dict]" = []
+    if live_exists:
+        live_conn = open_store(db_path)
+        try:
+            live_rows_all = _dump_table_rows(live_conn, "l0_points")
+        finally:
+            live_conn.close()
+
+    distinct_builds = []
+    unknown_rows: "list[dict]" = []
+    unknown_raw_values: "set[str]" = set()
+    if live_rows_all:
+        # Group builds directly against an in-memory dump rather than
+        # re-opening db_path a second time (skip unknown/non-sha
+        # engine_build, strip a `-dirty` suffix but record its presence).
+        # Every row whose `engine_build` is NOT checkout-able (`'unknown'`,
+        # or anything failing `_SHA_RE` even after stripping a `-dirty`
+        # suffix) is routed into `unknown_rows` rather than silently
+        # dropped -- such a row can never land in ANY bucket otherwise,
+        # which means it can never make `identical` False and the live
+        # store gets replaced without ever having been checked (the D4.2
+        # gap Ariadne's #2605 colleague review found).
+        grouped: "dict[str, list]" = {}
+        for r in live_rows_all:
+            raw = r["engine_build"]
+            if raw == "unknown":
+                unknown_rows.append(r)
+                unknown_raw_values.add(raw)
+                continue
+            stripped, dirty = _strip_dirty_suffix(raw)
+            if not _SHA_RE.match(stripped):
+                unknown_rows.append(r)
+                unknown_raw_values.add(raw)
+                continue
+            entry = grouped.setdefault(stripped, [False, 0])
+            entry[0] = entry[0] or dirty
+            entry[1] += 1
+        distinct_builds = [(sha, dirty, count) for sha, (dirty, count) in sorted(grouped.items())]
+
+    if unknown_rows:
+        # Route into the SAME unavailable/confounded branch as an
+        # unreachable sha build below (D4.2's own stated rule: a confounded
+        # verdict never replaces) -- `'unknown'` is a checkout-able-build
+        # question, not a data question, so it belongs in `build_
+        # differences`/`content_differences` exactly like any other build
+        # this rebuild cannot resolve, never in neither.
+        builds_meta.append(
+            {
+                "engine_build": "unknown",
+                "rows": len(unknown_rows),
+                "status": "unavailable",
+                "raw_values": sorted(unknown_raw_values),
+            }
+        )
+        build_differences["unknown"] = {
+            "status": "unavailable",
+            "reason": "engine_build is not a checkout-able sha",
+        }
+        content_differences["unknown"] = {
+            "confounded": True,
+            "differences": _compare_content_diff(unknown_rows, head_rows),
+        }
+        build_confounded = True
+
+    for stripped_sha, dirty_seen, row_count in distinct_builds:
+        stored_under_e = [
+            r for r in live_rows_all if _strip_dirty_suffix(r["engine_build"])[0] == stripped_sha
+        ]
+
+        if not alpha_is_worktree:
+            builds_meta.append(
+                {"engine_build": stripped_sha, "dirty_suffix": dirty_seen, "rows": row_count, "status": "unavailable"}
+            )
+            build_differences[stripped_sha] = {
+                "status": "unavailable",
+                "reason": f"alpha_repo {str(effective_alpha_repo)!r} is not a git work tree",
+            }
+            content_differences[stripped_sha] = {
+                "confounded": True,
+                "differences": _compare_content_diff(stored_under_e, head_rows),
+            }
+            build_confounded = True
+            continue
+
+        scratch_root = Path(tempfile.mkdtemp(prefix="health-series-rE-"))
+        e_db = scratch_root / "series.db"
+        try:
+            regen(stripped_sha, snapshots_dir, repo_dir, e_db)
+        except (_RegenerateUnavailable, subprocess.CalledProcessError) as exc:
+            builds_meta.append(
+                {"engine_build": stripped_sha, "dirty_suffix": dirty_seen, "rows": row_count, "status": "unavailable"}
+            )
+            build_differences[stripped_sha] = {
+                "status": "unavailable",
+                "reason": _regenerate_failure_reason(exc),
+            }
+            content_differences[stripped_sha] = {
+                "confounded": True,
+                "differences": _compare_content_diff(stored_under_e, head_rows),
+            }
+            build_confounded = True
+            continue
+        else:
+            builds_meta.append(
+                {"engine_build": stripped_sha, "dirty_suffix": dirty_seen, "rows": row_count, "status": "ok"}
+            )
+            e_conn = open_store(e_db)
+            try:
+                e_rows = _dump_table_rows(e_conn, "l0_points")
+            finally:
+                e_conn.close()
+
+            content_differences[stripped_sha] = _compare_content_diff(stored_under_e, e_rows)
+            build_differences[stripped_sha] = _compare_build_diff(e_rows, head_rows)
+        finally:
+            shutil.rmtree(str(scratch_root), ignore_errors=True)
+
+    def _diff_nonempty(value: object) -> bool:
+        if isinstance(value, dict):
+            return bool(value.get("differences"))
+        return bool(value)
+
+    # `os.replace` below swaps the WHOLE db file, but the diffs above only
+    # ever look at `l0_points`. Before replacing, also compare `declarations`
+    # and `unresolved_snapshots` between the live store and R_head (the same
+    # tables/exclusions `_rebuild_single_diff` already uses via
+    # `_REBUILD_DIFF_TABLES`/`_compare_dumps`) -- any difference there is a
+    # reason to refuse the replace too, reported under its own key rather
+    # than silently overwritten.
+    other_table_differences: "dict[str, list]" = {}
+    if live_exists:
+        live_conn = open_store(db_path)
+        try:
+            head_conn2 = open_store(head_db)
+            try:
+                for table in ("declarations", "unresolved_snapshots"):
+                    old_rows = _dump_table_rows(live_conn, table)
+                    new_rows = _dump_table_rows(head_conn2, table)
+                    table_diffs = _compare_dumps(old_rows, new_rows, table)
+                    if table_diffs:
+                        other_table_differences[table] = table_diffs
+            finally:
+                head_conn2.close()
+        finally:
+            live_conn.close()
+
+    any_content_diff = any(_diff_nonempty(v) for v in content_differences.values())
+    any_build_diff = any(_diff_nonempty(v) for v in build_differences.values())
+    identical = (
+        (not build_confounded)
+        and (not any_content_diff)
+        and (not any_build_diff)
+        and (not other_table_differences)
+    )
+
+    if identical:
+        os.replace(str(head_db), str(db_path))
+
+    if identical:
+        advice = (
+            "content and build diffs are empty for every build; the live store "
+            "was replaced with a fresh regenerate under HEAD."
+        )
+    elif build_confounded:
+        confounded_builds = sorted(
+            key
+            for key, value in build_differences.items()
+            if isinstance(value, dict) and value.get("status") == "unavailable"
+        )
+        advice = (
+            "the following build(s) could not be checked, so content and "
+            "build cannot be separated for their rows (build_confounded="
+            "true): " + ", ".join(confounded_builds) + " -- see build_"
+            "differences[<engine_build>].reason for why. the live store "
+            "was NOT replaced."
+        )
+    elif other_table_differences and (any_content_diff or any_build_diff):
+        advice = (
+            "differences were found in " + ", ".join(sorted(other_table_differences))
+            + " (see other_table_differences), in addition to l0_points "
+            "content/build differences; the live store was NOT replaced."
+        )
+    elif other_table_differences:
+        advice = (
+            "differences were found in "
+            + ", ".join(sorted(other_table_differences))
+            + " between the live store and the fresh regenerate under HEAD "
+            "(see other_table_differences) -- the live store was NOT "
+            "replaced, even though l0_points itself agreed."
+        )
+    elif any_content_diff and any_build_diff:
+        advice = (
+            "both content and build differences were found; the live store was "
+            "NOT replaced. Content differences are a data problem to investigate "
+            "(snapshot files, knowledge.sql history, or anchor resolution moved). "
+            "Build differences mean the code changed -- rebuild never re-derives "
+            "history for a code change; run backfill to gap-fill under the new "
+            "declaration hash / MAJOR."
+        )
+    elif any_content_diff:
+        advice = (
+            "content differences were found under unchanged code; the live "
+            "store was NOT replaced -- a data problem to investigate (snapshot "
+            "files, knowledge.sql history, or anchor resolution moved)."
+        )
+    else:
+        advice = (
+            "build differences were found under unchanged data; the live store "
+            "was NOT replaced -- rebuild is not the path by which a code change "
+            "re-derives history; run backfill to gap-fill the affected rows "
+            "under the new declaration hash / MAJOR."
+        )
+
+    result = {
+        "identical": identical,
+        "content_differences": content_differences,
+        "build_differences": build_differences,
+        "builds": builds_meta,
+        "build_confounded": build_confounded,
+        "other_table_differences": other_table_differences,
+        "advice": advice,
+        "rebuilt_path": str(head_db),
+    }
+
+    _record_rebuild_run(
+        db_path,
+        health_major=(head_health_majors[0] if len(head_health_majors) == 1 else None),
+        engine_build=head_build_id,
+        detail={
+            "identical": identical,
+            "builds": builds_meta,
+            "build_confounded": build_confounded,
+            "advice": advice,
+        },
+    )
+
+    return result
+
+
+def rebuild(
+    snapshots_dir: str | Path,
+    repo_dir: str | Path,
+    db_path: str | Path,
+    *,
+    alpha_repo: "str | Path | None" = None,
+    engine_build: str | None = None,
+    regenerate_under_build=None,
+    single_diff: bool = False,
+    keep_scratch: bool = False,
+) -> dict:
+    """Rebuild the series store from scratch and diff it against the live
+    one (design doc section 2's "rebuild", extended by D4.2). TWO diffs by
+    default, because ``l0_points.engine_build`` records SOME build ``E``
+    that computed the stored rows, and regenerating only under HEAD
+    (today's behaviour before D4.2) cannot tell a code change (``E`` !=
+    HEAD) apart from a data change (the snapshot files or ``knowledge.sql``
+    history moved) -- both would show up as "the regenerate disagrees with
+    the live store."
+
+    **Default (two-diff) behaviour:**
+
+    - Regenerate under HEAD, in-process, exactly as the old single-diff
+      form did (plus a ``backfill`` pass, needed for the build side) ->
+      ``R_head``.
+    - For each distinct ``engine_build`` ``E`` recorded on the live store's
+      ``l0_points`` rows (``'unknown'`` and non-sha values skipped; a
+      ``-dirty`` suffix stripped but its presence recorded per build, via
+      the inline bucketing logic above that groups live rows by stripped
+      sha): regenerate under ``E`` via
+      ``regenerate_under_build(E, snapshots_dir, repo_dir, out_db)`` (the
+      injectable hook; default: ``_default_regenerate_under_build``, which
+      archives ``E``'s ``src/engram`` out of ``alpha_repo`` and runs it as a
+      SUBPROCESS -- see that function's own docstring) -> ``R_E``.
+    - **Content diff** (``content_differences[E]``): ``_compare_dumps``
+      between the LIVE store's own rows under ``E`` and ``R_E`` -- same
+      code (``E``) computed both sides, so any difference is a DATA change.
+    - **Build diff** (``build_differences[E]``): a dedicated comparison
+      (``_compare_build_diff``) between ``R_E`` and ``R_head`` keyed on
+      ``(commit_sha, health_major, source)`` (NOT the real primary key,
+      which also includes ``replay_decl_hash``) -- same inputs (both
+      regenerated against today's ``snapshots_dir``/``repo_dir``), so any
+      difference is a CODE change. A ``replay_decl_hash`` mismatch between
+      the two is reported as its own diff kind, ``"declaration"``, naming
+      both hashes, rather than as two unrelated rows (see that function's
+      docstring for why).
+    - **Replacement policy**: the live store is replaced (``os.replace``)
+      with the fresh ``R_head`` ONLY when every ``content_differences[E]``
+      and every ``build_differences[E]`` is empty for EVERY ``E`` (and no
+      build was ``unavailable``, see below). A content-only difference is a
+      data problem -- returned, never replaced. A build-only difference
+      means the code changed -- also never replaced: ``rebuild`` is not the
+      path by which a code change re-derives history (that is ``backfill``'s
+      regular gap-fill mechanism, under the new declaration hash / MAJOR).
+      See the returned ``advice`` string for which case fired.
+    - **Unavailable build side**: when ``E`` cannot be archived/replayed
+      (``alpha_repo`` is not a git work tree; ``E`` is not a commit there;
+      the scratch tree's subprocess run fails, e.g. a pre-B1 tree with no
+      ``backfill`` subcommand) -- ``build_differences[E]`` is ``{"status":
+      "unavailable", "reason": ...}``, ``content_differences[E]`` is
+      computed against ``R_head`` INSTEAD of the unreachable ``R_E``
+      (``{"confounded": True, "differences": [...]}``), and the top-level
+      ``build_confounded`` is set ``True`` -- content and build cannot be
+      told apart for those rows, and the live store is never replaced on a
+      confounded verdict. This never raises -- an unreachable build is
+      always reported, never an exception.
+    - **Rows whose ``engine_build`` is not checkout-able** (``'unknown'``,
+      or anything failing ``_SHA_RE`` even after stripping a ``-dirty``
+      suffix) are grouped under the key ``"unknown"`` and routed into this
+      SAME unavailable/confounded branch -- ``build_differences["unknown"]``
+      is ``{"status": "unavailable", "reason": "engine_build is not a
+      checkout-able sha"}``, ``content_differences["unknown"]`` is
+      confounded against ``R_head``, ``build_confounded`` is set, and
+      ``builds`` gains a ``{"engine_build": "unknown", "rows": N, "status":
+      "unavailable", "raw_values": [...]}`` entry (``raw_values`` lists the
+      distinct raw strings folded into this bucket). Never dropped, and
+      never left in no bucket at all -- an unchecked build must never be
+      able to make ``identical`` True.
+
+    ``alpha_repo`` defaults to ``_default_repo_dir()`` (this module's own
+    checkout). If ``alpha_repo`` itself is not a git work tree, EVERY
+    build's side is ``unavailable``/confounded (never an exception).
+
+    **Replacement also checks ``declarations``/``unresolved_snapshots``**:
+    ``os.replace`` swaps the whole db file, but the diffs above only ever
+    compare ``l0_points``. Before replacing, the live store's
+    ``declarations`` and ``unresolved_snapshots`` tables are also compared
+    against ``R_head`` (via ``_compare_dumps``, same exclusions as
+    ``_rebuild_single_diff``'s ``_REBUILD_DIFF_TABLES``) -- any difference
+    there is reported under ``other_table_differences`` and refuses the
+    replace, even when every ``l0_points``-derived diff above is empty.
+
+    A ``replay_runs`` row with ``reason='rebuild'`` is written on every
+    call (single-diff or two-diff), so ``status`` can report the last
+    rebuild's verdict without re-running anything.
+
+    Returns ``{identical, content_differences, build_differences, builds:
+    [{engine_build, dirty_suffix, rows, status}], build_confounded,
+    other_table_differences, advice, rebuilt_path}`` in the default
+    (two-diff) mode.
+
+    **``single_diff=True`` (CLI: ``--single-diff``)**: explicit opt-BACK
+    into the PRE-D4.2 behaviour (``_rebuild_single_diff`` -- regenerate
+    once under HEAD, one diff, ``{identical, differences, rebuilt_path}``)
+    for callers that explicitly accept content and build being confounded.
+    Never the default."""
+    if single_diff:
+        result = _rebuild_single_diff(snapshots_dir, repo_dir, db_path, engine_build=engine_build)
+        _record_rebuild_run(
+            db_path,
+            health_major=None,
+            engine_build=engine_build if engine_build is not None else detect_engine_build(),
+            detail={"single_diff": True, "identical": result["identical"]},
+        )
+        return result
+    return _two_diff_rebuild(
+        snapshots_dir,
+        repo_dir,
+        db_path,
+        alpha_repo=alpha_repo,
+        engine_build=engine_build,
+        regenerate_under_build=regenerate_under_build,
+        keep_scratch=keep_scratch,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +2499,14 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
         ).fetchone()
         last_run = dict(last_run_row) if last_run_row is not None else None
 
+        # (PR B2) the last REBUILD's verdict specifically -- last_replay_run
+        # above is the latest run of ANY reason, which may not be a rebuild
+        # at all if an ingest/backfill/verify ran more recently.
+        last_rebuild_row = conn.execute(
+            "SELECT * FROM replay_runs WHERE reason = 'rebuild' ORDER BY run_id DESC LIMIT 1"
+        ).fetchone()
+        last_rebuild_run = dict(last_rebuild_row) if last_rebuild_row is not None else None
+
         health_majors = [
             r["health_major"]
             for r in conn.execute(
@@ -1877,6 +2586,7 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
     return {
         "counts": counts,
         "last_replay_run": last_run,
+        "last_rebuild_run": last_rebuild_run,
         "health_majors": health_majors,
         "health_versions": health_versions,
         "current_replay_decl_hash": current_replay_decl_hash,
@@ -1907,7 +2617,7 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="health.series",
-        description="health-score series store: ingest / rebuild / status / backfill / verify (PR A + PR B1).",
+        description="health-score series store: ingest / rebuild / status / backfill / verify (PR A + PR B1 + PR B2).",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -1923,6 +2633,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p_rebuild = sub.add_parser("rebuild")
     _add_common(p_rebuild, needs_snapshots_and_repo=True)
+    p_rebuild.add_argument(
+        "--alpha-repo", default=None,
+        help="engram-alpha checkout to archive historical engine_builds "
+        "from (two-diff mode only; defaults to this module's own checkout)",
+    )
+    p_rebuild.add_argument(
+        "--single-diff", action="store_true",
+        help="opt back into the pre-D4.2 single-diff form -- content and "
+        "build change are CONFOUNDED in this mode",
+    )
+    p_rebuild.add_argument(
+        "--keep-scratch", action="store_true",
+        help="keep the scratch tree(s) used to regenerate historical "
+        "engine_builds (two-diff mode only) instead of deleting them",
+    )
 
     p_status = sub.add_parser("status")
     _add_common(p_status, needs_snapshots_and_repo=False)
@@ -1961,8 +2686,21 @@ def main(argv: list[str] | None = None) -> int:
             args.snapshots_dir, args.repo_dir, args.db, engine_build=args.engine_build
         )
     elif args.command == "rebuild":
+        if args.single_diff:
+            print(
+                "health.series: --single-diff requested -- content and build "
+                "changes are CONFOUNDED in this mode (a code change and a data "
+                "change are indistinguishable); prefer the two-diff default.",
+                file=sys.stderr,
+            )
         result = rebuild(
-            args.snapshots_dir, args.repo_dir, args.db, engine_build=args.engine_build
+            args.snapshots_dir,
+            args.repo_dir,
+            args.db,
+            alpha_repo=args.alpha_repo,
+            engine_build=args.engine_build,
+            single_diff=args.single_diff,
+            keep_scratch=args.keep_scratch,
         )
     elif args.command == "status":
         result = status(args.db, code_repo_dir=args.code_repo_dir)
