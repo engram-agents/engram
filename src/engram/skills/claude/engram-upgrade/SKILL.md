@@ -62,11 +62,21 @@ UPSTREAM_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # If UPSTREAM_BRANCH is "HEAD" you are in detached state — checkout your branch first (e.g. git checkout main or git checkout dev).
 git pull origin "$UPSTREAM_BRANCH"
 git log --oneline -1        # confirm the commit the user wants
+git tag --points-at HEAD | grep -E '^(v|deploy/)'   # confirm HEAD carries a deployable tag
 ```
+
+The commit you install-local-marketplace.sh from must carry a deployable tag
+(`v*` or `deploy/*` at HEAD) — the installer's #2586 tag guard refuses an
+untagged HEAD by default. `--allow-untagged` exists for a deliberate exception
+(e.g. certifying a merge commit that must itself be untagged) and leaves
+`alpha_tag=none` in `.deployed-version`. This matters because the
+health-snapshot versioning gate (#2563) treats the tag set as the deployable
+baseline — a seat running from untagged code writes snapshots the gate cannot
+see, which can orphan that seat's health history.
 
 If the working tree has uncommitted changes you didn't mean to ship, stash or commit them first — the build packages whatever the tree is at.
 
-**Checkpoint**: source-tree branch + commit confirmed against the user's expectation.
+**Checkpoint**: source-tree branch + **tagged** commit confirmed against the user's expectation (or the untagged exception named).
 
 ---
 
@@ -268,7 +278,7 @@ Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` 
 
 ```python
 engram_add_observation(payload_json=json.dumps({
-    "claim": "ENGRAM plugin upgrade <YYYY-MM-DD HH:MM TZ>: <host target> marketplace source rebuilt at <commit SHA> (<branch>) — hooks/skills/tools live from source (Claude) / cache refreshed (Codex). MCP reconnected: <done|deferred|n/a>. Hooks.json restart: <done|deferred|n/a>. Identity-template gate: <merged paths | 'no template changes' | 'deferred+tracked'>. engram_stats verified: <N> nodes.",
+    "claim": "ENGRAM plugin upgrade <YYYY-MM-DD HH:MM TZ>: <host target> marketplace source rebuilt at <commit SHA> (<branch>, tag <alpha_tag>) — hooks/skills/tools live from source (Claude) / cache refreshed (Codex). MCP reconnected: <done|deferred|n/a>. Hooks.json restart: <done|deferred|n/a>. Identity-template gate: <merged paths | 'no template changes' | 'deferred+tracked'>. engram_stats verified: <N> nodes.",
     "interpretation": "Why the quoted evidence proves the upgrade state.",
     "url": "file:///path/to/committed-or-transcript-evidence",
     "title": "ENGRAM plugin upgrade <YYYY-MM-DD> — <commit SHA>",

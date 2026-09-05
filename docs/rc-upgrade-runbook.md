@@ -39,6 +39,9 @@ cascade_markers table at all); the migration + `/mcp` reconnect handles the thir
 1. **Rebuild the source tree at the target tag (see the Target-tag line above)**
    `tools/install-local-marketplace.sh` from the tagged checkout.
    Hooks / skills / tools are live immediately (directory-source topology; hooks re-read per prompt).
+   The installer now refuses to build from an untagged HEAD (#2586); since this
+   runbook always upgrades from a tagged checkout that guard is a no-op here —
+   `--allow-untagged` is the override, not part of this flow.
 
 2. **Refresh the agent cache** — `/plugin marketplace update engram-local` then `/reload-plugins`.
    AGENTS (dream-master, all fairies) load from the installPath CACHE snapshot, not the source tree.

@@ -80,22 +80,28 @@ trap _venv_fail_trap EXIT
 
 usage() {
   cat <<'EOF'
-Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch]
+Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch] [--allow-untagged]
 
 Assembles a local ENGRAM marketplace at $ENGRAM_HOME/marketplace/ from
 build/plugin/. With --target claude-code it registers via `claude plugin marketplace add`;
 with --target codex it installs via `codex plugin add engram@engram-local`.
 
 Options:
-  --help          Show this help and exit.
-  --skip-add      Assemble but skip the `claude plugin marketplace add` step.
-  --skip-build    Skip the internal build-plugin.sh invocation. Use when the
-                  caller has already built build/plugin/ with the correct flags.
-                  build/plugin/plugin.json must already exist.
-  --target T      Build target to pass through when not using --skip-build:
-                  claude-code (default) or codex.
-  --allow-branch  Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' always allowed).
-                  Use only for deliberate branch builds (e.g. metric-eval checkouts).
+  --help            Show this help and exit.
+  --skip-add        Assemble but skip the `claude plugin marketplace add` step.
+  --skip-build      Skip the internal build-plugin.sh invocation. Use when the
+                    caller has already built build/plugin/ with the correct flags.
+                    build/plugin/plugin.json must already exist.
+  --target T        Build target to pass through when not using --skip-build:
+                    claude-code (default) or codex.
+  --allow-branch    Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' always allowed).
+                    Use only for deliberate branch builds (e.g. metric-eval checkouts).
+  --allow-untagged  Allow building from a commit that carries no deployable tag
+                    (overrides the tag guard, #2586). Deployable tags are v* and
+                    deploy/* at HEAD — the same set the health-snapshot versioning
+                    gate (#2563) treats as the deployable predecessors. Use only for
+                    a deliberate untagged deploy (e.g. certifying an unreleased
+                    merge commit); .deployed-version records alpha_tag=none.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -125,12 +131,14 @@ SKIP_ADD=0
 SKIP_BUILD=0
 TARGET="claude-code"
 ALLOW_BRANCH=0
+ALLOW_UNTAGGED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage ;;
     --skip-add) SKIP_ADD=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --allow-branch) ALLOW_BRANCH=1; shift ;;
+    --allow-untagged) ALLOW_UNTAGGED=1; shift ;;
     --target)
       [[ $# -ge 2 ]] || die "--target requires a value: claude-code or codex"
       TARGET="$2"
@@ -158,6 +166,43 @@ fi
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
 if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $ALLOW_BRANCH -eq 0 ]]; then
   die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
+fi
+
+# #2586 tag guard: refuse builds from an untagged commit unless --allow-untagged
+# is set. "Deployable" is defined identically to test_health_version_gate.py's
+# deployable_tags() — refs/tags/v* UNION refs/tags/deploy/* — enumerated here
+# with `git tag --points-at HEAD` filtered to those two patterns rather than
+# `for-each-ref` (deployable_tags() scans every tag in the repo to find the max
+# version; this guard only needs to know what's AT HEAD). An unrelated tag
+# (e.g. foo/bar) does not count and is ignored below.
+#
+# This sits before the --target dispatch so both Claude and Codex install
+# paths get it — the guard lives in the script, not in the engram-upgrade
+# skill (see #2586's issue body).
+#
+# TODO(#2586 follow-up): a future `--verify` mode (compare the deployed tree
+# to the recorded tag's source) must apply the build's template substitution
+# before diffing, or its first result on every seat is a false positive
+# (start-engram-daemon.sh's {{PYTHON}} token is the concrete example Borges
+# measured) — and it must name its baseline (the seat's own recorded
+# alpha_tag, never the dev tip) in its own output, or a fully-consistent seat
+# reads as drifted against the wrong reference.
+ALPHA_UNTAGGED_OVERRIDE_FIRED=0
+DEPLOY_TAGS="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | grep -E '^(v|deploy/)' || true)"
+if [[ -z "$DEPLOY_TAGS" ]]; then
+  SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  NEAREST_TAG="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null || echo none)"
+  TAG_GUARD_MSG="HEAD ($SHORT_SHA) is not a tagged commit (deployable tags = v* and deploy/*; nearest by ancestry: $NEAREST_TAG). The health-snapshot versioning gate (engram-alpha#2563) treats tags as the deployable set; snapshots written from untagged code are invisible to it and can orphan your health history. Rebuild from a tag (git fetch --tags origin first if your tags are stale), or pass --allow-untagged to proceed anyway — the deploy log repeats this warning and .deployed-version records alpha_tag=none. Guard per #2586."
+  if [[ $ALLOW_UNTAGGED -eq 0 ]]; then
+    die "$TAG_GUARD_MSG"
+  else
+    log "WARNING: $TAG_GUARD_MSG"
+    ALPHA_UNTAGGED_OVERRIDE_FIRED=1
+  fi
+  ALPHA_TAG="none"
+else
+  ALPHA_TAG="$(printf '%s' "$DEPLOY_TAGS" | paste -sd, -)"
+  log "Deployable tag(s) at HEAD: $ALPHA_TAG"
 fi
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
@@ -280,13 +325,17 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/n
 else
   ALPHA_DIRTY="clean"
 fi
-cat > "$ENGRAM_HOME/.deployed-version" <<MARKER
-alpha_sha=$ALPHA_SHA
-alpha_branch=$ALPHA_BRANCH
-alpha_dirty=$ALPHA_DIRTY
-deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-deployed_from=$REPO_ROOT
-MARKER
+{
+  printf 'alpha_sha=%s\n' "$ALPHA_SHA"
+  printf 'alpha_branch=%s\n' "$ALPHA_BRANCH"
+  printf 'alpha_tag=%s\n' "$ALPHA_TAG"
+  if [[ $ALPHA_UNTAGGED_OVERRIDE_FIRED -eq 1 ]]; then
+    printf 'alpha_untagged_override=1\n'
+  fi
+  printf 'alpha_dirty=%s\n' "$ALPHA_DIRTY"
+  printf 'deployed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'deployed_from=%s\n' "$REPO_ROOT"
+} > "$ENGRAM_HOME/.deployed-version"
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
 # ── Persist install choices to config.json (bug 4, #1244) ────────────────────

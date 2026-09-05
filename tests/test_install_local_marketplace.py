@@ -42,7 +42,7 @@ def test_install_local_marketplace_builds_codex_target(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -69,7 +69,7 @@ def test_install_local_marketplace_accepts_equals_target_form(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target=codex", "--skip-add", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target=codex", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -89,7 +89,7 @@ def test_install_local_marketplace_defaults_to_claude_code_target(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--skip-add", "--allow-branch"],
+        ["bash", str(INSTALLER), "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path),
         text=True,
@@ -108,7 +108,7 @@ def test_install_local_marketplace_skip_build_rejects_target_mismatch(tmp_path):
     _write_fake_plugin(build_root, platform="claude-code")
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
         text=True,
@@ -127,7 +127,7 @@ def test_install_local_marketplace_skip_build_rejects_missing_platform_json(tmp_
     _write_fake_plugin(build_root)
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
         text=True,
@@ -175,7 +175,7 @@ def test_install_local_marketplace_installs_codex_agent_toml(tmp_path):
     )
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(
             tmp_path,
@@ -243,7 +243,7 @@ def test_install_local_marketplace_preserves_prior_codex_cache_across_dev_upgrad
         "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
     }
     first = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, **base_env, CLAUDE_PLUGIN_ROOT=old_cache),
         text=True,
@@ -258,7 +258,7 @@ def test_install_local_marketplace_preserves_prior_codex_cache_across_dev_upgrad
     assert "Symlinking prior live cache" in first.stdout
 
     second = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, **base_env, CLAUDE_PLUGIN_ROOT=first_new_cache),
         text=True,
@@ -311,7 +311,7 @@ def test_install_local_marketplace_rejects_non_direct_claude_plugin_roots(tmp_pa
             plugin_root = nested
 
         result = subprocess.run(
-            ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+            ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
             cwd=REPO_ROOT,
             env=_env(
                 tmp_path,
@@ -373,7 +373,7 @@ def test_install_local_marketplace_does_not_preserve_plain_release_without_valid
             env["CLAUDE_PLUGIN_ROOT"] = active_root
 
         result = subprocess.run(
-            ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+            ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
             cwd=REPO_ROOT,
             env=_env(tmp_path, **env),
             text=True,
@@ -418,7 +418,7 @@ def test_install_local_marketplace_replaces_direct_child_symlink_not_external_ta
     codex.chmod(0o755)
 
     result = subprocess.run(
-        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch"],
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-build", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(
             tmp_path,
@@ -464,7 +464,7 @@ def _run_installer_skip_build(tmp_path, *, env_extra):
     _write_fake_plugin(build_root, platform="claude-code")
     return subprocess.run(
         ["bash", str(INSTALLER), "--target", "claude-code",
-         "--skip-build", "--skip-add", "--allow-branch"],
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root, **env_extra),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
@@ -535,7 +535,7 @@ def test_install_local_marketplace_runtime_req_failure_exits_nonzero(tmp_path):
     _write_fake_plugin(build_root, platform="claude-code")
     result = subprocess.run(
         ["bash", str(INSTALLER), "--target", "claude-code",
-         "--skip-build", "--skip-add", "--allow-branch"],
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
         cwd=REPO_ROOT,
         env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
@@ -551,3 +551,162 @@ def test_install_local_marketplace_runtime_req_failure_exits_nonzero(tmp_path):
     assert result.returncode != 0
     # The fake venv was actually invoked for the runtime install.
     assert "requirements/requirements.txt" in log_file.read_text()
+
+
+# ── #2586 tag guard ──────────────────────────────────────────────────────────
+#
+# These tests run against a SCRATCH git repo, never this checkout — the
+# installer resolves REPO_ROOT from its own script location via
+# `git -C "$(dirname "$_self")" rev-parse --show-toplevel`, so copying the
+# installer into a standalone repo (with a stub src/engram/server.py to
+# satisfy the script's own repo-root sanity check) is enough to make the tag
+# guard exercise a repo whose tags we fully control, without ever creating a
+# tag in the real engram-alpha checkout (hard scope bound, #2586).
+
+
+def _make_scratch_repo(tmp_path, *, tags=()):
+    """A minimal standalone git repo carrying its own copy of the installer.
+
+    tags: tag names to apply to the single commit at HEAD.
+    """
+    repo = tmp_path / "scratch-repo"
+    (repo / "tools").mkdir(parents=True)
+    (repo / "src" / "engram").mkdir(parents=True)
+    (repo / "src" / "engram" / "server.py").write_text("# stub\n")
+    scratch_installer = repo / "tools" / "install-local-marketplace.sh"
+    scratch_installer.write_text(INSTALLER.read_text())
+    scratch_installer.chmod(0o755)
+
+    def _git(*args):
+        subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    _git("init", "-q", "-b", "dev")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "init")
+    for tag in tags:
+        _git("tag", tag)
+    return repo
+
+
+def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None):
+    """Run the scratch repo's own installer copy with a temp ENGRAM_HOME.
+
+    build_dir: when given, points ENGRAM_BUILD_DIR at a pre-populated fake
+    plugin tree (via _write_fake_plugin) so a guard-passing run can reach the
+    marketplace-assembly + .deployed-version-write steps. Guard-refusal runs
+    don't need this — the guard dies before the build dir is ever consulted.
+    """
+    env_overrides = {}
+    if build_dir is not None:
+        env_overrides["ENGRAM_BUILD_DIR"] = str(build_dir)
+    return subprocess.run(
+        ["bash", str(repo / "tools" / "install-local-marketplace.sh"),
+         "--skip-add", "--skip-build", *extra_args],
+        cwd=repo,
+        env=_env(engram_home, **env_overrides),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def test_tag_guard_refuses_untagged_head(tmp_path):
+    repo = _make_scratch_repo(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not a tagged commit" in result.stderr
+    assert "#2586" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_tag_guard_accepts_v_tag(tmp_path):
+    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-test"])
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(repo, engram_home, build_dir=build_root)
+
+    assert result.returncode == 0, result.stderr
+    assert "Deployable tag(s) at HEAD" in result.stdout
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=v9.9.9-test" in marker
+
+
+def test_tag_guard_accepts_deploy_tag(tmp_path):
+    repo = _make_scratch_repo(tmp_path, tags=["deploy/2026-09-05-test"])
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(repo, engram_home, build_dir=build_root)
+
+    assert result.returncode == 0, result.stderr
+    assert "Deployable tag(s) at HEAD" in result.stdout
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=deploy/2026-09-05-test" in marker
+
+
+def test_tag_guard_ignores_unrelated_tag(tmp_path):
+    repo = _make_scratch_repo(tmp_path, tags=["foo/bar"])
+    engram_home = tmp_path / "engram-home"
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not a tagged commit" in result.stderr
+    assert "#2586" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_tag_guard_override_records_none_and_warns(tmp_path):
+    repo = _make_scratch_repo(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo, engram_home, extra_args=["--allow-untagged"], build_dir=build_root
+    )
+
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert "WARNING" in combined
+    assert "#2563" in combined
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=none" in marker
+    assert "alpha_untagged_override=1" in marker
+
+
+def test_tag_guard_multiple_tags_joined(tmp_path):
+    repo = _make_scratch_repo(tmp_path, tags=["v1.0.0-a", "deploy/2026-09-05-b"])
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(repo, engram_home, build_dir=build_root)
+
+    assert result.returncode == 0, result.stderr
+    marker = (engram_home / ".deployed-version").read_text()
+    tag_line = next(
+        line for line in marker.splitlines() if line.startswith("alpha_tag=")
+    )
+    joined = tag_line.split("=", 1)[1]
+    assert set(joined.split(",")) == {"v1.0.0-a", "deploy/2026-09-05-b"}
+
+
+def test_tag_guard_runs_before_target_dispatch(tmp_path):
+    repo = _make_scratch_repo(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    result = _run_scratch_installer(repo, engram_home, extra_args=["--target", "codex"])
+
+    assert result.returncode != 0
+    assert "not a tagged commit" in result.stderr
+    assert "#2586" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
