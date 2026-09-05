@@ -7,8 +7,12 @@
   <link rel="stylesheet" href="/static/base.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-           background: #1a1a2e; color: #e0e0e0; padding: 24px; }
+    /* font-family/background/color moved to static/base.css's shared body{}
+       rule (engram-alpha#2555 PR C, forum #389) -- only this page's own
+       padding remains local, since base.css's copy is linked BEFORE this
+       <style> block and a page-local body{} declared here still wins the
+       cascade on any property it sets. */
+    body { padding: 24px; }
     h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; }
     /* Bottom section: tall Tool Decision Context (left) beside a stacked column
@@ -32,10 +36,11 @@
     td { padding: 3px 8px 3px 0; border-bottom: 1px solid #0f3460; color: #d0d0d0; }
     .empty { color: #888; text-align: center; padding: 24px; font-style: italic; }
     .privacy-note { color: #888; font-size: 0.75em; margin-top: 24px; text-align: center; font-style: italic; }
-    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
-    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
-                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
-    #nav-agent-wrapper { display: none; margin-left: auto; }
+    /* .nav-agent-label/.nav-agent-select/#nav-agent-wrapper consolidated
+       into static/base.css's sole copy (engram-alpha#2555 PR C sweep --
+       this page's copy was byte-identical dead weight left behind by PR
+       B's nav-CSS consolidation, which covered .nav/.nav a/.nav a:hover
+       but missed this trio). */
   </style>
 </head>
 <body>

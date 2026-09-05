@@ -233,11 +233,9 @@ _CODE_PROVENANCE_CACHE: str | None = None
 
 _PRODUCT_NAME = "ENGRAM"
 
-# Exact wording flagged for the project maintainer's sign-off per the
-# amendment-1 design post ("exact wording is [the maintainer's] to
-# approve") -- draft, not final. The claim it makes ("computed heuristics,
-# not guarantees") is that post's own phrasing, kept verbatim rather than
-# paraphrased since it's the one piece of wording already agreed on.
+# Wording ruled final (#2555 amendment 2, forum #389): kept as shipped.
+# Originally drafted from the amendment-1 design post's own phrasing
+# ("computed heuristics, not guarantees"), kept verbatim.
 _DISCLAIMER = (
     "© 2026 the ENGRAM authors · Apache-2.0 · "
     "scores and diagnostics are computed heuristics, not guarantees"

@@ -1,13 +1,18 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    /* background/color moved to static/base.css's shared body{} rule
+       (engram-alpha#2555 PR C, forum #389's ruling); this page's
+       distinct font-family/font-size moved to #content-row/#tooltip below,
+       NOT kept here, since the static gate now whitelists ONLY layout
+       properties on a body{}/html{} rule outside base.css (display,
+       flex-direction, flex-wrap, height, min-height, overflow, margin,
+       padding) -- never font-* / line-height / color / background. What's left
+       here is exactly that layout, genuinely graph-page-specific (the
+       other three pages don't need a 100vh flex column). */
     body {
       display: flex;
       flex-direction: column;
       height: 100vh;
-      background: #1a1a2e;
-      color: #e0e0e0;
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      font-size: 13px;
       overflow: hidden;
     }
 
@@ -214,6 +219,12 @@
       border: 1px solid #1a4a8a;
       border-radius: 6px;
       padding: 8px 12px;
+      /* #tooltip is a direct child of body, outside #content-row -- it
+         doesn't inherit #content-row's font-family below, so it needs its
+         own copy (PR C, forum #389) to keep its pre-existing look now that
+         body{} no longer carries the page's font. font-size was already an
+         explicit 12px, unrelated to this fix, left as-is. */
+      font-family: 'Segoe UI', system-ui, sans-serif;
       font-size: 12px;
       color: #dde;
       max-width: 280px;
@@ -493,11 +504,21 @@
        shape of the other three pages.
        display:flex/align-items:center/flex-shrink:0 are still supplied by
        base.css's shared .nav rule -- flex-shrink:0 is genuinely load-bearing
-       here (100vh flex column), inert everywhere else. */
-    .nav-agent-label { color: #7ecfff; font-size: 0.85em; margin-right: 6px; }
-    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
-                        border-radius: 4px; color: #e0e0e0; font-size: 0.85em; outline: none; }
-    #nav-agent-wrapper { display: none; margin-left: auto; }
+       here (100vh flex column), inert everywhere else.
+       .nav-agent-label/.nav-agent-select/#nav-agent-wrapper used to have a
+       byte-identical copy here too -- consolidated into base.css's sole
+       copy (PR C sweep, forum #389): this page's copy was dead weight PR
+       B's consolidation above should have caught but didn't. */
 
     /* ── Content row (sidebar + graph + detail) ─────────────────────── */
-    #content-row { display: flex; flex: 1; overflow: hidden; }
+    /* font-family/font-size added here (PR C, forum #389's ruling): this
+       page's genuinely distinct 13px Segoe UI font used to
+       live on body{} above, inherited by every descendant including
+       #sidebar/#main/#detail-panel. Now that the static gate forbids
+       font-* on body{} outside base.css, it moves onto this row instead --
+       the one ancestor common to all three (sidebar, main, detail-panel),
+       so nothing under it silently falls back to
+       base.css's shared 16px -apple-system default. (#tooltip is the one
+       sibling NOT under #content-row -- see its own comment above.) */
+    #content-row { display: flex; flex: 1; overflow: hidden;
+                   font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; }
