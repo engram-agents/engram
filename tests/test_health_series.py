@@ -23,8 +23,10 @@ sys.path setup), then overridden per-test (``anchor``, ``turn``,
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -35,6 +37,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from health import engine as health_engine  # noqa: E402
+from health import measurements as health_measurements  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERIES_PATH = REPO_ROOT / "src" / "engram" / "health" / "series.py"
@@ -162,12 +165,89 @@ CREATE TABLE cascade_markers (
 
 
 def _make_conn():
-    import sqlite3
-
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.executescript(_NODES_DDL)
     return conn
+
+
+# ``_NODES_DDL`` without the ``cascade_markers`` table -- a stand-in for a
+# ``knowledge.sql`` dump that predates it (design doc's own measured fact:
+# 102 of 136 real commits raise `no such table: cascade_markers`).
+_NODES_DDL_WITHOUT_CASCADE_MARKERS = """
+CREATE TABLE nodes (
+    id              TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    evidence_id     TEXT,
+    status          TEXT DEFAULT 'active',
+    is_current      INTEGER DEFAULT 1,
+    metadata        TEXT DEFAULT '{}',
+    recall_summary  TEXT,
+    recall_keywords TEXT,
+    embedding       TEXT
+);
+
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   TEXT NOT NULL,
+    target_id   TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE edit_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT NOT NULL,
+    turn        INTEGER NOT NULL DEFAULT 0,
+    action      TEXT NOT NULL,
+    node_id     TEXT NOT NULL,
+    node_type   TEXT NOT NULL,
+    details     TEXT DEFAULT '{}'
+);
+"""
+
+
+def _make_conn_without_cascade_markers():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_NODES_DDL_WITHOUT_CASCADE_MARKERS)
+    return conn
+
+
+def _insert(
+    conn,
+    id,
+    type,
+    created_at="t0",
+    evidence_id=None,
+    status="active",
+    is_current=1,
+    metadata=None,
+    recall_summary=None,
+    recall_keywords=None,
+    embedding=None,
+):
+    """Mirrors tests/test_health_engine.py's own ``_insert`` helper exactly
+    (same fixture column shape, same defaults) -- see that file's own
+    ``_NODES_DDL``/``_insert`` for the precedent this copies."""
+    conn.execute(
+        "INSERT INTO nodes (id, type, created_at, evidence_id, status, is_current,"
+        " metadata, recall_summary, recall_keywords, embedding)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            id,
+            type,
+            created_at,
+            evidence_id,
+            status,
+            is_current,
+            json.dumps(metadata) if metadata is not None else "{}",
+            recall_summary,
+            json.dumps(recall_keywords) if recall_keywords is not None else None,
+            embedding,
+        ),
+    )
 
 
 def _build_v2_snapshot(**overrides) -> dict:
@@ -875,3 +955,595 @@ def test_open_store_migrates_old_reason_check(tmp_path):
     ).fetchone()
     assert row2["reason"] == "commit_already_keyed"
     reopened.close()
+
+
+# ===========================================================================
+# #2575 PR B1 -- replay driver, backfill, verify, the equality control
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 19. equality control: agrees, then a named mutation disagrees (D3, test 1)
+# ---------------------------------------------------------------------------
+
+
+def test_equality_control_agrees_then_named_mutation_disagrees(tmp_path):
+    """Design test 1 (D3): the equality control between a ``stored`` row
+    and a ``git_replay`` of the SAME commit must AGREE when the graph is
+    unmutated, and must DISAGREE -- naming EXACTLY the one measurement whose
+    population the mutation touches -- when a single claim-bearing node is
+    retracted in a second commit's dump (with the stored snapshot pinned to
+    the UNMUTATED measurements, per the spec's own construction).
+
+    Mutation choice, DERIVED from measurements.py's own compute_fns (read
+    at test-writing time, not discovered by running this test once) -- not
+    just "any claim-bearing node," but one built to be invisible to every
+    OTHER registered measurement:
+
+    - A NEW node ``t1`` of type ``"theory"`` -- claim-bearing per
+      ``engram_core.CLAIM_BEARING_TYPES`` (so retracting it CAN move
+      ``claim_bearing_current``), but neither ``"derivation"`` nor
+      ``"observation_factual"``/``"observation_predictive"`` (so it cannot
+      move ``derivations_current`` or ``observations_current``).
+    - Given a real, non-null, non-whitespace ``recall_summary`` and a real,
+      non-empty ``recall_keywords`` list -- so it was NEVER counted by
+      ``claim_bearing_without_recall_summary``/``_keywords`` to begin with,
+      and retracting it cannot move either (removing an item that was never
+      in the numerator changes nothing).
+    - Given NO cascade-marker row of any kind -- so
+      ``claim_bearing_pending_retract_marker`` cannot move.
+    - Given NO edges to any other node -- it is its own connected component
+      of size 1. The fixture separately connects a derivation ``d1`` and an
+      observation ``o1`` (also claim-bearing) with one edge, forming a
+      component of size 2 -- the LARGEST claim-bearing component. Since
+      ``t1``'s own component (size 1) was never the largest, removing it
+      cannot move ``claim_bearing_giant_component_size`` either.
+    - ``evidence_current``/``evidence_uncited``/``observations_without_
+      evidence_id``/``contradictions_current``/``contradictions_open``/
+      ``derivations_pending_supersede_marker`` are all untouched by
+      anything to do with ``t1`` -- they range over evidence/contradiction/
+      derivation-marker populations ``t1`` was never part of.
+    - ``claim_bearing_null_embedding`` (``replay="stripped"``) and the two
+      embedder booleans (``replay="environment"``) are excluded from the
+      equality comparison entirely (``equality_check`` compares only
+      ``replay == "graph"`` names) regardless of ``t1``.
+    - ``claim_bearing_types_resolved`` is a resolved CODE CONSTANT, never a
+      function of node data -- unaffected by any node mutation.
+
+    The only measurement whose population changes AT ALL when ``t1``'s
+    ``is_current`` flips ``1 -> 0`` is ``claim_bearing_current`` (its
+    predicate is exactly ``is_current = 1 AND type IN CLAIM_BEARING_
+    TYPES``) -- so it is the ONLY name that can appear in the diff, by
+    construction from the definitions above, not by observing one test
+    run."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation", recall_summary="d1 summary", recall_keywords=["k"])
+    _insert(
+        conn, "o1", "observation_factual", evidence_id="e1",
+        recall_summary="o1 summary", recall_keywords=["k"],
+    )
+    _insert(conn, "e1", "evidence")
+    _insert(conn, "t1", "theory", recall_summary="t1 summary", recall_keywords=["k"])
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
+        ("d1", "o1", "supports", "t0"),
+    )
+    conn.commit()
+    unmutated_sql = "\n".join(conn.iterdump())
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, unmutated_sql, _committer_iso(t0))
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    # _build_v2_snapshot builds its measurements off an EMPTY _make_conn()
+    # -- overwrite with the real, populated fixture graph's own values.
+    snap1["measurements"] = health_measurements.compute_all_measurements(conn)
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    db_path = tmp_path / "series.db"
+    ingest1 = series.ingest(snapshots_dir, repo_dir, db_path)
+    assert ingest1["commits_done"] == 1
+
+    backfill1 = series.backfill(repo_dir, db_path)
+    assert backfill1["commits_done"] == 1
+
+    store = series.open_store(db_path)
+    row = store.execute(
+        "SELECT verdict, diff FROM equality_checks WHERE commit_sha = ? "
+        "ORDER BY checked_at DESC LIMIT 1",
+        (k1,),
+    ).fetchone()
+    assert row is not None
+    assert row["verdict"] == "agree"
+    store.close()
+
+    # -- second commit: retract t1 --
+    conn.execute("UPDATE nodes SET is_current = 0 WHERE id = 't1'")
+    conn.commit()
+    mutated_sql = "\n".join(conn.iterdump())
+    k2 = _commit_knowledge(repo_dir, mutated_sql, _committer_iso(t0 + timedelta(minutes=1)))
+
+    snap2 = dict(snap1)
+    snap2["measurements"] = dict(snap1["measurements"])  # the UNMUTATED values
+    snap2["anchor"] = k1  # resolves (child_of_anchor) to k2
+    snap2["turn"] = 2
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    ingest2 = series.ingest(snapshots_dir, repo_dir, db_path)
+    assert ingest2["commits_done"] == 1
+
+    backfill2 = series.backfill(repo_dir, db_path)
+    assert backfill2["commits_done"] == 1
+
+    store2 = series.open_store(db_path)
+    row2 = store2.execute(
+        "SELECT verdict, diff FROM equality_checks WHERE commit_sha = ? "
+        "ORDER BY checked_at DESC LIMIT 1",
+        (k2,),
+    ).fetchone()
+    assert row2 is not None
+    assert row2["verdict"] == "disagree"
+    diff = json.loads(row2["diff"])
+    assert diff["names"] == ["claim_bearing_current"]
+    stored_val = snap1["measurements"]["claim_bearing_current"]
+    assert diff["stored"] == {"claim_bearing_current": stored_val}
+    assert diff["replay"] == {"claim_bearing_current": stored_val - 1}
+    store2.close()
+
+
+# ---------------------------------------------------------------------------
+# 20. false-positive control (D3)
+# ---------------------------------------------------------------------------
+
+
+def test_equality_control_false_positive_control(tmp_path):
+    """D3's required false-positive control: mutate a column NO registered
+    ``MeasurementDef``'s ``compute_fn`` ranges over, and assert the
+    equality control still reports "agree" -- a control that flags every
+    byte-level change (not just the ones that matter to a measurement's own
+    definition) is not a control at all, it's a checksum.
+
+    Column + grep, named per the spec's own requirement: this fixture's
+    ``nodes`` table (mirroring test_health_engine.py's/test_health_
+    measurements.py's own DDL) has nine columns -- id, type, created_at,
+    evidence_id, status, is_current, metadata, recall_summary,
+    recall_keywords, embedding. ``grep -n "metadata\\|created_at"
+    src/engram/health/measurements.py`` (run at test-writing time) matches
+    NOTHING in that file -- every OTHER column (type/is_current/
+    evidence_id/status/recall_summary/recall_keywords/embedding) IS
+    referenced by at least one compute_fn (see the other tests in this
+    file and in test_health_measurements.py), leaving exactly ``metadata``
+    and ``created_at`` unreferenced. This test mutates ``metadata``. (The
+    spec's own suggested candidate, ``nodes.recall_count``, is NOT a column
+    in this fixture's DDL at all -- there is nothing named ``recall_count``
+    to mutate here, so ``metadata`` is used instead.)"""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation", metadata={"note": "original"})
+    conn.commit()
+    unmutated_sql = "\n".join(conn.iterdump())
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, unmutated_sql, _committer_iso(t0))
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    snap1["measurements"] = health_measurements.compute_all_measurements(conn)
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+    series.backfill(repo_dir, db_path)
+
+    conn.execute(
+        "UPDATE nodes SET metadata = ? WHERE id = 'd1'",
+        (json.dumps({"note": "mutated -- no compute_fn reads this column"}),),
+    )
+    conn.commit()
+    mutated_sql = "\n".join(conn.iterdump())
+    k2 = _commit_knowledge(repo_dir, mutated_sql, _committer_iso(t0 + timedelta(minutes=1)))
+
+    snap2 = dict(snap1)
+    snap2["measurements"] = dict(snap1["measurements"])
+    snap2["anchor"] = k1
+    snap2["turn"] = 2
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    series.ingest(snapshots_dir, repo_dir, db_path)
+    series.backfill(repo_dir, db_path)
+
+    store = series.open_store(db_path)
+    row = store.execute(
+        "SELECT verdict, diff FROM equality_checks WHERE commit_sha = ? "
+        "ORDER BY checked_at DESC LIMIT 1",
+        (k2,),
+    ).fetchone()
+    assert row["verdict"] == "agree"
+    assert json.loads(row["diff"]) == {}
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# 21. schema-missing -> null with discovered reason, never 0 (design test 2)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_missing_yields_null_with_discovered_reason_never_zero(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation")
+    conn.execute(
+        "INSERT INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, created_at) "
+        "VALUES ('d1', 'ev1', 'd1', 'supersede', 'pending', 't0')"
+    )
+    _insert(conn, "o1", "observation_factual", evidence_id="e1")
+    _insert(conn, "e1", "evidence")
+    conn.execute(
+        "INSERT INTO cascade_markers "
+        "(node_id, cascade_event, root_node, root_op, status, created_at) "
+        "VALUES ('o1', 'ev2', 'o1', 'retract', 'pending', 't0')"
+    )
+    conn.commit()
+    full_sql = "\n".join(conn.iterdump())
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k_full = _commit_knowledge(repo_dir, full_sql, _committer_iso(t0))
+
+    conn_no_markers = _make_conn_without_cascade_markers()
+    _insert(conn_no_markers, "d1", "derivation")
+    _insert(conn_no_markers, "o1", "observation_factual", evidence_id="e1")
+    _insert(conn_no_markers, "e1", "evidence")
+    conn_no_markers.commit()
+    no_markers_sql = "\n".join(conn_no_markers.iterdump())
+
+    k_no_markers = _commit_knowledge(
+        repo_dir, no_markers_sql, _committer_iso(t0 + timedelta(minutes=1))
+    )
+
+    full_measurements, full_unreplayable = series.replay_commit(repo_dir, k_full)
+    # The always-declared unreplayables (stripped/environment) are present
+    # on every replay regardless of schema -- only the two schema-dependent
+    # (discovered) ones are absent here, since cascade_markers exists.
+    assert {n for n, info in full_unreplayable.items() if info["class"] == "discovered"} == set()
+    assert full_measurements["derivations_pending_supersede_marker"] == 1
+    assert full_measurements["claim_bearing_pending_retract_marker"] == 1
+
+    dropped_measurements, dropped_unreplayable = series.replay_commit(
+        repo_dir, k_no_markers
+    )
+    discovered_names = {
+        n for n, info in dropped_unreplayable.items() if info["class"] == "discovered"
+    }
+    assert discovered_names == {
+        "derivations_pending_supersede_marker",
+        "claim_bearing_pending_retract_marker",
+    }
+    for name in discovered_names:
+        info = dropped_unreplayable[name]
+        assert info["reason"].startswith("schema:")
+        assert info["class"] == "discovered"
+        assert dropped_measurements[name] is None
+
+    for name, value in dropped_measurements.items():
+        if name in dropped_unreplayable or name == "raw_schema_version":
+            continue
+        assert value == full_measurements[name], (
+            f"{name} differs between the full dump and the schema-missing "
+            "dump even though nothing outside cascade_markers changed"
+        )
+    # never silently 0 where the un-dropped replay had a real non-zero:
+    assert full_measurements["derivations_pending_supersede_marker"] != 0
+    assert full_measurements["claim_bearing_pending_retract_marker"] != 0
+    assert dropped_measurements["derivations_pending_supersede_marker"] is None
+    assert dropped_measurements["claim_bearing_pending_retract_marker"] is None
+
+
+# ---------------------------------------------------------------------------
+# 22. declared-unreplayable never calls compute_fn
+# ---------------------------------------------------------------------------
+
+
+def test_declared_unreplayable_never_calls_compute_fn(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    conn = _make_conn()
+    conn.commit()
+    sql = "\n".join(conn.iterdump())
+    k1 = _commit_knowledge(repo_dir, sql)
+
+    def _boom(_conn):
+        raise AssertionError(
+            "compute_fn was called for a declared-unreplayable measurement"
+        )
+
+    registry = dict(health_measurements.MEASUREMENTS)
+    declared_names = (
+        "embedder_installed_available",
+        "embedder_config_enabled",
+        "claim_bearing_null_embedding",
+    )
+    for name in declared_names:
+        registry[name] = dataclasses.replace(registry[name], compute_fn=_boom)
+
+    measurements, unreplayable = series.replay_commit(repo_dir, k1, registry=registry)
+
+    for name in declared_names:
+        assert measurements[name] is None
+        assert unreplayable[name]["class"] == "declared"
+
+
+# ---------------------------------------------------------------------------
+# 23. backfill idempotence (design test 4)
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_is_idempotent(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- commit 1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "-- commit 2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    db_path = tmp_path / "series.db"
+    result1 = series.backfill(repo_dir, db_path)
+    assert result1["commits_done"] == 2
+
+    conn = series.open_store(db_path)
+    row_count = conn.execute("SELECT COUNT(*) c FROM l0_points").fetchone()["c"]
+    conn.close()
+    assert row_count == 2
+
+    result2 = series.backfill(repo_dir, db_path)
+    assert result2["reason"] == "gap_fill"
+    assert result2["commits_total"] == 0
+    assert result2["commits_done"] == 0
+
+    conn2 = series.open_store(db_path)
+    assert conn2.execute("SELECT COUNT(*) c FROM l0_points").fetchone()["c"] == row_count
+    conn2.close()
+
+
+# ---------------------------------------------------------------------------
+# 24. reason: initial -> gap_fill -> major_bump (design test 5)
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_reason_initial_then_gap_fill_then_major_bump(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- commit 1", _committer_iso(t0))
+
+    db_path = tmp_path / "series.db"
+    result1 = series.backfill(repo_dir, db_path, health_major=1)
+    assert result1["reason"] == "initial"
+    assert result1["commits_done"] == 1
+
+    _commit_knowledge(repo_dir, "-- commit 2", _committer_iso(t0 + timedelta(minutes=1)))
+    result2 = series.backfill(repo_dir, db_path, health_major=1)
+    assert result2["reason"] == "gap_fill"
+    assert result2["commits_done"] == 1
+
+    conn = series.open_store(db_path)
+    m1_rows_before = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT * FROM l0_points WHERE health_major = 1 ORDER BY commit_sha"
+        ).fetchall()
+    ]
+    conn.close()
+
+    result3 = series.backfill(repo_dir, db_path, health_major=2)
+    assert result3["reason"] == "major_bump"
+    assert result3["commits_total"] == 2
+    assert result3["commits_done"] == 2
+
+    conn2 = series.open_store(db_path)
+    m1_rows_after = [
+        dict(r)
+        for r in conn2.execute(
+            "SELECT * FROM l0_points WHERE health_major = 1 ORDER BY commit_sha"
+        ).fetchall()
+    ]
+    conn2.close()
+
+    assert m1_rows_before == m1_rows_after
+
+
+# ---------------------------------------------------------------------------
+# 25. a replay-declaration flip is a gap, never a mutation (D2)
+# ---------------------------------------------------------------------------
+
+
+def test_replay_decl_flip_is_a_gap_not_a_mutation(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation", embedding=None)
+    _insert(conn, "o1", "observation_factual", embedding="[0.1,0.2]")
+    conn.commit()
+    sql = "\n".join(conn.iterdump())
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, sql, _committer_iso(t0))
+
+    db_path = tmp_path / "series.db"
+    result1 = series.backfill(repo_dir, db_path)
+    assert result1["commits_done"] == 1
+
+    conn_store = series.open_store(db_path)
+    old_rows = [
+        dict(r)
+        for r in conn_store.execute(
+            "SELECT * FROM l0_points ORDER BY commit_sha, health_major, source, "
+            "replay_decl_hash"
+        ).fetchall()
+    ]
+    conn_store.close()
+    old_hash = old_rows[0]["replay_decl_hash"]
+
+    flipped_registry = dict(health_measurements.MEASUREMENTS)
+    flipped_registry["claim_bearing_null_embedding"] = dataclasses.replace(
+        flipped_registry["claim_bearing_null_embedding"], replay="graph"
+    )
+
+    result2 = series.backfill(repo_dir, db_path, registry=flipped_registry)
+    assert result2["reason"] == "gap_fill"
+    assert result2["commits_total"] == result2["commits_done"] == 1
+
+    conn_store2 = series.open_store(db_path)
+    all_rows = [
+        dict(r)
+        for r in conn_store2.execute(
+            "SELECT * FROM l0_points ORDER BY commit_sha, health_major, source, "
+            "replay_decl_hash"
+        ).fetchall()
+    ]
+    conn_store2.close()
+
+    old_hash_rows = [r for r in all_rows if r["replay_decl_hash"] == old_hash]
+    assert old_hash_rows == old_rows, "the old-hash rows must stay byte-identical"
+
+    new_hash_rows = [r for r in all_rows if r["replay_decl_hash"] != old_hash]
+    assert len(new_hash_rows) == 1
+    new_measurements = json.loads(new_hash_rows[0]["measurements"])
+    # This fixture puts an embedding on o1 and none on d1 -- so under the
+    # flipped ("graph") declaration, claim_bearing_null_embedding is a REAL
+    # int (1: only d1 is null), not the null/"stripped_from_dump" value the
+    # old-hash row carries.
+    assert isinstance(new_measurements["claim_bearing_null_embedding"], int)
+    assert new_measurements["claim_bearing_null_embedding"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 26. turn is parsed only when the commit message states a transition (§5)
+# ---------------------------------------------------------------------------
+
+
+def test_turn_parsed_only_when_stated():
+    assert (
+        series.parse_turn_from_message("[session] Dream 2026-09-04 (turn 54->55)")
+        == 55
+    )
+    assert series.parse_turn_from_message("[nap] 16:18Z nap (drowsiness 98%)") is None
+
+
+# ---------------------------------------------------------------------------
+# 27. equality_checks migration adds replay_decl_hash
+# ---------------------------------------------------------------------------
+
+_OLD_EQUALITY_CHECKS_DDL = """
+CREATE TABLE equality_checks (
+    commit_sha TEXT NOT NULL,
+    health_major INTEGER NOT NULL,
+    verdict TEXT CHECK(verdict IN ('agree','disagree')),
+    diff TEXT,
+    checked_at TEXT
+);
+"""
+
+
+def test_equality_checks_migration_adds_decl_hash_column(tmp_path):
+    db_path = tmp_path / "old-equality.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_OLD_EQUALITY_CHECKS_DDL)
+    conn.execute(
+        "INSERT INTO equality_checks (commit_sha, health_major, verdict, diff, checked_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("abc123", 1, "agree", "{}", "2026-09-01T00:00:00Z"),
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = series.open_store(db_path)
+    row = reopened.execute(
+        "SELECT * FROM equality_checks WHERE commit_sha = ?", ("abc123",)
+    ).fetchone()
+    assert row is not None
+    assert row["replay_decl_hash"] == ""
+    assert row["verdict"] == "agree"
+
+    reopened.execute(
+        "INSERT INTO equality_checks "
+        "(commit_sha, health_major, verdict, diff, checked_at, replay_decl_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("def456", 1, "disagree", "{}", "2026-09-01T00:01:00Z", "somehash"),
+    )
+    reopened.commit()
+    row2 = reopened.execute(
+        "SELECT replay_decl_hash FROM equality_checks WHERE commit_sha = ?",
+        ("def456",),
+    ).fetchone()
+    assert row2["replay_decl_hash"] == "somehash"
+    reopened.close()
+
+    # idempotent on a second open
+    reopened2 = series.open_store(db_path)
+    count = reopened2.execute("SELECT COUNT(*) c FROM equality_checks").fetchone()["c"]
+    assert count == 2
+    reopened2.close()
+
+
+# ---------------------------------------------------------------------------
+# 28. verify appends, never overwrites
+# ---------------------------------------------------------------------------
+
+
+def test_verify_appends_not_overwrites(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+
+    conn = _make_conn()
+    _insert(conn, "d1", "derivation")
+    conn.commit()
+    sql = "\n".join(conn.iterdump())
+
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, sql, _committer_iso(t0))
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    snap1["measurements"] = health_measurements.compute_all_measurements(conn)
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+
+    health_major = snap1["raw_schema_version"]
+    result1 = series.verify(repo_dir, db_path, health_major=health_major)
+    assert result1["checked"] == 1
+
+    result2 = series.verify(repo_dir, db_path, health_major=health_major)
+    assert result2["checked"] == 1
+
+    conn_store = series.open_store(db_path)
+    rows = conn_store.execute(
+        "SELECT checked_at, verdict FROM equality_checks WHERE commit_sha = ? "
+        "ORDER BY checked_at",
+        (k1,),
+    ).fetchall()
+    assert len(rows) == 2
+
+    status_result = series.status(db_path)
+    assert status_result["latest_equality_verdicts"] == {"agree": 1, "disagree": 0}
+    conn_store.close()

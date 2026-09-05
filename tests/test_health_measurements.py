@@ -719,3 +719,95 @@ class TestMeasurementLabels:
         assert relabeled_hash == TestL0HashGate._PINNED_L0_HASH, (
             "relabeling a measurement changed canonical_l0_hash()'s output"
         )
+
+
+# ---------------------------------------------------------------------------
+# #2575 PR B — MeasurementDef.replay (D2/§3)
+# ---------------------------------------------------------------------------
+
+
+class TestReplayField:
+    """``MeasurementDef.replay`` is L0 metadata OUTSIDE ``canonical_l0_hash``
+    -- exactly like ``label`` (see ``TestReplayIsExcludedFromTheL0Hash``
+    below, mirroring ``test_label_is_excluded_from_the_l0_hash_inputs``
+    above) -- and D2's ``replay_decl_hash`` is the fingerprint that tracks
+    it instead (see ``test_replay_declarations_today``)."""
+
+    def test_replay_is_excluded_from_the_l0_hash_inputs(self):
+        """Mirror of ``test_label_is_excluded_from_the_l0_hash_inputs``
+        above: flip EVERY def's ``replay`` on a copy of the registry (not
+        just one, since ``replay`` — unlike ``label`` — has a closed
+        3-value domain and a single flip could coincidentally leave the
+        canonical tuple's SORT ORDER unchanged; flipping every def's value
+        makes the falsifier exercise the full registry) and assert
+        ``canonical_l0_hash()`` is UNCHANGED."""
+        flipped = {
+            name: dataclasses.replace(
+                mdef, replay="graph" if mdef.replay != "graph" else "stripped"
+            )
+            for name, mdef in hem_l0.MEASUREMENTS.items()
+        }
+        # sanity: the copy actually differs, for every single entry
+        for name in hem_l0.MEASUREMENTS:
+            assert hem_l0.MEASUREMENTS[name].replay != flipped[name].replay
+
+        def hash_input_for(mdef):
+            return (mdef.name, mdef.population, list(mdef.definition_inputs))
+
+        for name in hem_l0.MEASUREMENTS:
+            assert hash_input_for(hem_l0.MEASUREMENTS[name]) == hash_input_for(
+                flipped[name]
+            ), "changing replay altered the L0 hash's own input tuple"
+
+        with mock.patch.dict(hem_l0.MEASUREMENTS, flipped):
+            flipped_hash = hem_l0.canonical_l0_hash()
+        assert flipped_hash == TestL0HashGate._PINNED_L0_HASH, (
+            "flipping every measurement's replay value changed "
+            "canonical_l0_hash()'s output — replay must stay outside the "
+            "L0 hash gate, exactly like label"
+        )
+
+    def test_replay_declarations_today(self):
+        """Exactly three non-``graph`` declarations today (D2/§3's table):
+        ``claim_bearing_null_embedding`` is ``stripped``; the two embedder
+        booleans are ``environment``; every other one of the 17 registered
+        measurements is ``graph`` (14 of them). ``replay_decl_hash()`` is a
+        64-hex-char sha256 digest, and it CHANGES when a single declared
+        value is flipped on a registry copy (never touching the real
+        module-level ``MEASUREMENTS``)."""
+        declarations = hem_l0.replay_declarations()
+        assert declarations == dict(sorted(declarations.items())), (
+            "replay_declarations() must be sorted by name"
+        )
+
+        non_graph = {name: v for name, v in declarations.items() if v != "graph"}
+        assert non_graph == {
+            "claim_bearing_null_embedding": "stripped",
+            "embedder_installed_available": "environment",
+            "embedder_config_enabled": "environment",
+        }
+        graph_names = {name for name, v in declarations.items() if v == "graph"}
+        assert len(graph_names) == 14
+        assert len(declarations) == 17
+
+        current_hash = hem_l0.replay_decl_hash()
+        assert isinstance(current_hash, str)
+        assert len(current_hash) == 64
+        assert all(c in "0123456789abcdef" for c in current_hash)
+
+        # Flip one declared value on a COPY of the registry -- the real
+        # module registry (and thus the pinned L0 hash) is untouched.
+        some_name = next(iter(hem_l0.MEASUREMENTS))
+        original = hem_l0.MEASUREMENTS[some_name]
+        flipped_one = dataclasses.replace(
+            original, replay="graph" if original.replay != "graph" else "stripped"
+        )
+        with mock.patch.dict(hem_l0.MEASUREMENTS, {some_name: flipped_one}):
+            flipped_hash = hem_l0.replay_decl_hash()
+        assert flipped_hash != current_hash, (
+            "flipping one measurement's declared replay value did not "
+            "change replay_decl_hash() — the D2 fingerprint would silently "
+            "fail to detect a declaration flip"
+        )
+        # And after the patch context exits, the real hash is unaffected.
+        assert hem_l0.replay_decl_hash() == current_hash

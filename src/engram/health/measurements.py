@@ -221,6 +221,50 @@ class MeasurementDef:
     it (see that function's own docstring) — relabeling a measurement for
     display never bumps ``health.version.MAJOR``.
 
+    ``replay`` — one of ``"graph"`` / ``"stripped"`` / ``"environment"``
+    (design doc §3, D2), declaring how ``health.series.replay_commit`` (PR B)
+    must treat this measurement when replaying a historical ``knowledge.sql``
+    dump rather than a live graph:
+
+    - ``"graph"`` (the default, 14 of today's 17 measurements) — a plain
+      read off the graph; replay runs ``compute_fn`` against the restored
+      dump exactly as it would against a live connection. On
+      ``sqlite3.OperationalError`` (the dump predates a table/column this
+      measurement needs) replay records ``null`` with a ``schema:<message>``
+      reason and class ``discovered`` — a fact learned only by trying, never
+      predictable from the declaration alone.
+    - ``"stripped"`` (``claim_bearing_null_embedding``) — the dump never
+      carries this data at all (``engram_backup.dump_stripped`` nulls
+      ``embedding`` before every dump), so a graph-mode replay would not
+      fail loudly — it would silently read 100% null and lie. Replay must
+      never call ``compute_fn``; it records ``null`` with reason
+      ``stripped_from_dump``, class ``declared`` (predictable in advance,
+      from the declaration alone, without running anything).
+    - ``"environment"`` (the two embedder booleans) — an install/operator
+      fact about THIS seat's environment right now, not a fact about the
+      graph at any past commit; history of an install fact is not a
+      property of the graph replay is reconstructing. Replay must never
+      call ``compute_fn``; it records ``null`` with reason
+      ``environment_fact``, class ``declared``.
+
+    Load-bearing (D2, restated from the design doc so it is not missed by
+    reading this field in isolation): ``replay`` is L0 *metadata*, exactly
+    like ``label`` above — it is **outside** ``canonical_l0_hash`` (see that
+    function's own docstring: it hashes only ``name``/``population``/
+    ``definition_inputs``) and flipping it (e.g. ``claim_bearing_null_
+    embedding`` moving from ``stripped`` to ``graph`` once dumps start
+    carrying embeddings) never bumps ``health.version.MAJOR``. That is
+    exactly why D2 fingerprints the *declarations themselves* into
+    ``replay_decl_hash`` (part of ``l0_points``'s primary key for
+    ``git_replay`` rows, per ``health.series``) — the axis that tracks a
+    ``replay`` flip is ``replay_decl_hash``, not the MAJOR version. Without
+    that fingerprint a flip would leave every historical replay row saying
+    ``null``/``stripped_from_dump`` with nothing ever re-computing them: no
+    MAJOR bump fires (correctly — ``replay`` isn't hashed), and rows are
+    never mutated (correctly — that's the never-mutate rule), so a
+    permanent hole indistinguishable from a genuinely-measured absence is
+    exactly the failure D2 exists to prevent.
+
     See module docstring for why this is a plain mapping and not a DSL."""
 
     name: str
@@ -228,6 +272,7 @@ class MeasurementDef:
     compute_fn: Callable[[sqlite3.Connection], "MeasurementValue"]
     definition_inputs: "tuple[object, ...]" = ()
     label: str = ""
+    replay: str = "graph"
 
 
 def _resolve_claim_bearing_types() -> "tuple[str, ...]":
@@ -703,6 +748,7 @@ MEASUREMENTS: "dict[str, MeasurementDef]" = {
             m_claim_bearing_null_embedding,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
             label="claim-bearing nodes with no embedding",
+            replay="stripped",
         ),
         MeasurementDef(
             "claim_bearing_giant_component_size",
@@ -716,12 +762,14 @@ MEASUREMENTS: "dict[str, MeasurementDef]" = {
             "engram_core._embedder.is_available()",
             m_embedder_installed_available,
             label="embedder installed and available",
+            replay="environment",
         ),
         MeasurementDef(
             "embedder_config_enabled",
             "engram_core._get_embedding_config().get('enabled', True)",
             m_embedder_config_enabled,
             label="embedder enabled in config",
+            replay="environment",
         ),
         MeasurementDef(
             "claim_bearing_types_resolved",
@@ -796,6 +844,60 @@ def canonical_l0_hash() -> str:
         for d in MEASUREMENTS.values()
     )
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def replay_declarations() -> "dict[str, str]":
+    """``{measurement_name: replay}`` for every registered L0 measurement,
+    sorted by name — the declared-replay-behaviour table ``health.series``
+    (PR B) reads to decide, per measurement, whether a historical replay may
+    call ``compute_fn`` at all (see ``MeasurementDef.replay``'s own
+    docstring for the three values and what each means). PRESENTATION/
+    CONFIGURATION only for THIS module — see ``replay_decl_hash`` below for
+    the fingerprint that makes a change to this table detectable downstream
+    without a MAJOR bump."""
+    return dict(sorted((name, mdef.replay) for name, mdef in MEASUREMENTS.items()))
+
+
+def replay_decl_hash() -> str:
+    """SHA-256 hex digest over the canonical JSON encoding (sorted keys, no
+    whitespace) of the sorted ``(name, replay)`` pairs from
+    ``replay_declarations()`` — the fingerprint D2 folds into ``health.
+    series``'s ``l0_points.replay_decl_hash`` column (part of the primary
+    key for ``git_replay`` rows).
+
+    WHY A CONTENT FINGERPRINT AND NOT A HAND-BUMPED GENERATION INT (D2):
+    ``replay`` is deliberately unhashed by ``canonical_l0_hash`` (see
+    ``MeasurementDef.replay``'s own docstring) — a flip never bumps
+    ``health.version.MAJOR``, and ``l0_points`` rows are never mutated once
+    inserted (the store's own never-mutate rule). Put those two facts
+    together and a ``replay`` flip with no fingerprint at all would leave
+    every historical replay row permanently saying ``null``/``stripped_
+    from_dump`` (or ``environment_fact``) with nothing ever re-computing
+    them — a hole indistinguishable from a genuinely-measured absence, which
+    is the one thing declaring ``replay`` in the first place was supposed to
+    avoid. A HAND-BUMPED int (e.g. a module-level ``REPLAY_GENERATION = 2``
+    someone increments on every flip) would fix that, but only if the
+    person making the flip remembers to bump it — exactly the kind of
+    vigilance-dependent discipline this whole design (the L0 hash gate
+    itself, ``canonical_l0_hash``) exists to replace with something
+    mechanical. A CONTENT fingerprint over the declarations themselves
+    changes automatically, by construction, the moment any declaration
+    changes — there is no separate step to forget. The cost is that it says
+    nothing about ORDER (two totally different sets of declarations could
+    theoretically hash to different values with no meaningful "generation"
+    relationship between them), but ``health.series`` never needs an
+    ordering here — it only needs to detect "the current declarations
+    differ from what a stored ``git_replay`` row was computed under," which
+    a content hash answers directly, and gap-fills the difference through
+    the same regular mechanism as any other missing commit (D2 again — a
+    ``replay`` flip becomes a ``reason='gap_fill'`` backfill, not a special
+    case)."""
+    import hashlib
+    import json as _json
+
+    pairs = sorted(replay_declarations().items())
+    blob = _json.dumps(pairs, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
