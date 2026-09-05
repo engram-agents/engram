@@ -338,10 +338,13 @@ def compute_all_signals(measurements: MeasurementDict) -> dict:
 
 def signal_defs_jsonable() -> dict:
     """JSON-safe rendering of ``SIGNAL_DEFS`` -- ``{name: {"numerator",
-    "denominator", "form", "gates" (list), "formula"}}``. This is the
+    "denominator", "form", "gates" (list), "formula", "doc"}}``. This is the
     machine-readable source a consumer (e.g. the viz loader) reads to know
     which L0 key is the numerator and which is the denominator for each
-    signal, without hand-copying a table out of this module's source."""
+    signal, without hand-copying a table out of this module's source.
+    ``doc`` carries the signal's own hand-written description (see
+    ``SignalDef.doc``'s own docstring) so a detail view can show it
+    directly, without re-deriving it from the formula."""
     return {
         name: {
             "numerator": d.numerator,
@@ -349,6 +352,7 @@ def signal_defs_jsonable() -> dict:
             "form": d.form,
             "gates": list(d.gates),
             "formula": d.formula_text,
+            "doc": d.doc,
         }
         for name, d in SIGNAL_DEFS.items()
     }

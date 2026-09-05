@@ -213,12 +213,21 @@ class MeasurementDef:
     produce the SAME digest — if it doesn't, an environment fact was
     smuggled in.
 
+    ``label`` — a short display noun phrase for this measurement, used by
+    viz/API consumers that need a human-readable name for a raw L0 key
+    (e.g. the #2518 detail view's numerator/denominator rows) without
+    building their own key->name table. PRESENTATION ONLY, not measurement
+    IDENTITY: ``canonical_l0_hash`` below deliberately does not range over
+    it (see that function's own docstring) — relabeling a measurement for
+    display never bumps ``health.version.MAJOR``.
+
     See module docstring for why this is a plain mapping and not a DSL."""
 
     name: str
     population: str
     compute_fn: Callable[[sqlite3.Connection], "MeasurementValue"]
     definition_inputs: "tuple[object, ...]" = ()
+    label: str = ""
 
 
 def _resolve_claim_bearing_types() -> "tuple[str, ...]":
@@ -613,92 +622,113 @@ MEASUREMENTS: "dict[str, MeasurementDef]" = {
     d.name: d
     for d in (
         MeasurementDef(
-            "derivations_current", "current derivations", m_derivations_current
+            "derivations_current",
+            "current derivations",
+            m_derivations_current,
+            label="current derivations",
         ),
         MeasurementDef(
             "claim_bearing_current",
             "current claim-bearing nodes (engram_core.CLAIM_BEARING_TYPES)",
             m_claim_bearing_current,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="current claim-bearing nodes",
         ),
         MeasurementDef(
             "contradictions_current",
             "current contradiction nodes",
             m_contradictions_current,
+            label="current contradictions",
         ),
         MeasurementDef(
             "observations_current",
             "current observation_factual + observation_predictive nodes",
             m_observations_current,
+            label="current observations",
         ),
         MeasurementDef(
-            "evidence_current", "current evidence nodes", m_evidence_current
+            "evidence_current",
+            "current evidence nodes",
+            m_evidence_current,
+            label="current evidence",
         ),
         MeasurementDef(
             "derivations_pending_supersede_marker",
             "current derivations with a pending root_op=supersede cascade marker",
             m_derivations_pending_supersede_marker,
+            label="derivations pending a supersede cascade",
         ),
         MeasurementDef(
             "claim_bearing_pending_retract_marker",
             "current claim-bearing nodes with a pending root_op=retract cascade marker",
             m_claim_bearing_pending_retract_marker,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="claim-bearing nodes pending a retract cascade",
         ),
         MeasurementDef(
             "contradictions_open",
             "current contradictions with status IN (active, partially_resolved)",
             m_contradictions_open,
+            label="open contradictions",
         ),
         MeasurementDef(
             "observations_without_evidence_id",
             "current observations with evidence_id IS NULL",
             m_observations_without_evidence_id,
+            label="observations without an evidence ID",
         ),
         MeasurementDef(
             "evidence_uncited",
             "current evidence cited by no current observation",
             m_evidence_uncited,
+            label="uncited evidence",
         ),
         MeasurementDef(
             "claim_bearing_without_recall_summary",
             "current claim-bearing nodes with recall_summary NULL or whitespace-only",
             m_claim_bearing_without_recall_summary,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="claim-bearing nodes without a recall summary",
         ),
         MeasurementDef(
             "claim_bearing_without_recall_keywords",
             "current claim-bearing nodes with no non-empty recall_keywords list",
             m_claim_bearing_without_recall_keywords,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="claim-bearing nodes without recall keywords",
         ),
         MeasurementDef(
             "claim_bearing_null_embedding",
             "current claim-bearing nodes with embedding IS NULL",
             m_claim_bearing_null_embedding,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="claim-bearing nodes with no embedding",
         ),
         MeasurementDef(
             "claim_bearing_giant_component_size",
             "largest connected component, induced subgraph on current claim-bearing nodes",
             m_claim_bearing_giant_component_size,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="largest claim-bearing component size",
         ),
         MeasurementDef(
             "embedder_installed_available",
             "engram_core._embedder.is_available()",
             m_embedder_installed_available,
+            label="embedder installed and available",
         ),
         MeasurementDef(
             "embedder_config_enabled",
             "engram_core._get_embedding_config().get('enabled', True)",
             m_embedder_config_enabled,
+            label="embedder enabled in config",
         ),
         MeasurementDef(
             "claim_bearing_types_resolved",
             "sorted(engram_core.CLAIM_BEARING_TYPES)",
             m_claim_bearing_types_resolved,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
+            label="resolved claim-bearing types",
         ),
     )
 }
@@ -767,3 +797,14 @@ def canonical_l0_hash() -> str:
     )
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
+
+
+def measurement_labels_jsonable() -> "dict[str, str]":
+    """``{measurement_name: label}`` for every registered L0 measurement —
+    the display-name table ``build_snapshot`` exports alongside the raw
+    ``measurements`` values (as ``measurement_labels``), so a viz/API
+    consumer building the #2518 detail view's numerator/denominator rows
+    reads the label straight off the snapshot instead of maintaining its
+    own key->name table. PRESENTATION ONLY — see ``MeasurementDef.label``'s
+    own docstring for why this never affects ``canonical_l0_hash``."""
+    return {name: mdef.label for name, mdef in MEASUREMENTS.items()}

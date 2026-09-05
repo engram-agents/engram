@@ -696,10 +696,21 @@ class TestBuildSnapshot:
         assert set(snap.keys()) == {
             "schema_version", "engine_version", "health_version",
             "raw_schema_version", "model_version", "config", "definitions",
-            "measurements", "signals", "signal_defs", "curve_defs",
-            "scores", "red_flags",
+            "measurements", "measurement_labels", "signals", "signal_defs",
+            "curve_defs", "scores", "red_flags",
             "diagnostics", "anchor", "turn", "checkpoint_mode",
         }
+
+    def test_measurement_labels_keys_match_measurements(self):
+        """engram-alpha#2580: ``measurement_labels`` must cover exactly the
+        same keys as ``measurements`` on the same snapshot -- a display
+        label for every raw L0 key, no more, no fewer."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        assert set(snap["measurement_labels"].keys()) == set(
+            snap["measurements"].keys()
+        ) - {"raw_schema_version"}
+        assert snap["measurement_labels"] == health_measurements.measurement_labels_jsonable()
 
     def test_measurements_block_delegates_to_compute_all_measurements(self):
         """build_snapshot's ``measurements`` key must be exactly what

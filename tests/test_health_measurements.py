@@ -664,3 +664,58 @@ class TestAcceptanceCriterion:
                 f"{derived['taint_rate']!r} vs live {live_taint_rate!r} — "
                 "the perturbation should have produced a mismatch"
             )
+
+
+class TestMeasurementLabels:
+    """engram-alpha#2580: MeasurementDef.label + measurement_labels_jsonable().
+    Labels are display-only presentation metadata, NOT measurement identity
+    — the L0 hash gate above (TestL0HashGate) is the falsifier for that
+    claim and must stay green, unchanged, alongside these tests."""
+
+    def test_every_measurement_has_a_nonempty_label_distinct_from_its_key(self):
+        """A label that merely repeats the key is not a label — the whole
+        point is a human-readable display name a viz/API consumer can show
+        without a key->name table of its own."""
+        for name, mdef in hem_l0.MEASUREMENTS.items():
+            assert isinstance(mdef.label, str) and mdef.label.strip(), (
+                f"{name} has an empty/missing label"
+            )
+            assert mdef.label != name, (
+                f"{name}'s label merely repeats its key — not a real label"
+            )
+
+    def test_measurement_labels_jsonable_keys_match_measurements(self):
+        labels = hem_l0.measurement_labels_jsonable()
+        assert set(labels) == set(hem_l0.MEASUREMENTS)
+        for name, label in labels.items():
+            assert label == hem_l0.MEASUREMENTS[name].label
+
+    def test_label_is_excluded_from_the_l0_hash_inputs(self):
+        """THE FALSIFIER for "labels don't move identity": build the hash
+        input the same way canonical_l0_hash() does (see that function's
+        own docstring — the (name, population, definition_inputs) triple),
+        for a MeasurementDef copy with its label changed, and assert the
+        hash INPUT is unchanged. This does not merely re-assert the pinned
+        hash (TestL0HashGate already does that) — it demonstrates label is
+        not even in the tuple canonical_l0_hash() builds, so no future
+        change to canonical_l0_hash()'s implementation could accidentally
+        make it hash label without this test catching it."""
+        some_name = next(iter(hem_l0.MEASUREMENTS))
+        original = hem_l0.MEASUREMENTS[some_name]
+
+        def hash_input_for(mdef):
+            return (mdef.name, mdef.population, list(mdef.definition_inputs))
+
+        relabeled = dataclasses.replace(original, label=original.label + " (renamed)")
+        assert original.label != relabeled.label  # sanity: the copy actually differs
+        assert hash_input_for(original) == hash_input_for(relabeled), (
+            "changing label altered the L0 hash's own input tuple — "
+            "label must stay presentation-only"
+        )
+
+        # And the real gate, unaffected by construction:
+        with mock.patch.dict(hem_l0.MEASUREMENTS, {some_name: relabeled}):
+            relabeled_hash = hem_l0.canonical_l0_hash()
+        assert relabeled_hash == TestL0HashGate._PINNED_L0_HASH, (
+            "relabeling a measurement changed canonical_l0_hash()'s output"
+        )

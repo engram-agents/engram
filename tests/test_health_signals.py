@@ -312,6 +312,17 @@ class TestSignalDefsJsonable:
             assert entry["form"] == d.form
             assert entry["gates"] == list(d.gates)
             assert entry["formula"] == d.formula_text
+            assert entry["doc"] == d.doc
+
+    def test_doc_nonempty_for_all_nine_signals(self):
+        """engram-alpha#2580: signal_defs_jsonable() carries each signal's
+        own hand-written doc, non-empty for all nine registered signals."""
+        rendered = signals.signal_defs_jsonable()
+        assert len(rendered) == 9
+        for name, entry in rendered.items():
+            assert isinstance(entry["doc"], str) and entry["doc"].strip(), (
+                f"{name} has an empty/missing doc"
+            )
 
 
 # ---------------------------------------------------------------------------

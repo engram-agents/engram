@@ -1448,6 +1448,13 @@ def build_snapshot(
         # return is reached — see health/measurements.py's module
         # docstring for L0's own design, and health/signals.py's for L1's.
         "measurements": l0_measurements,
+        # engram-alpha#2580 -- display labels for the L0 measurement keys
+        # above ({measurement_name: label}), so a consumer building the
+        # #2518 detail view's numerator/denominator rows doesn't need its
+        # own viz-side key->name table. Presentation only: does not affect
+        # canonical_l0_hash (see health/measurements.py's MeasurementDef.label
+        # docstring).
+        "measurement_labels": health_measurements.measurement_labels_jsonable(),
         # Declarative L1 arithmetic metadata (engram-alpha#2518) -- what
         # numerator/denominator/gate L0 keys each signal below is made of,
         # machine-readable so a consumer (e.g. the viz loader) doesn't have
