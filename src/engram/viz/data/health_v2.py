@@ -356,6 +356,18 @@ def get_health_v2_data(agent_name: str) -> dict:
             "reason": f"Failed to read/parse snapshot {filename!r}: {exc}",
         }
 
+    # DELIBERATE, not an oversight (#2587): this guard refuses even when a
+    # perfectly usable current-format snapshot exists at a LOWER turn number
+    # nearby -- `_latest_snapshot_filename` only ever picks the highest-turn
+    # file, so it never sees that older, usable snapshot to fall back to.
+    # Falling back would show STALE data as CURRENT, which is exactly the
+    # defect this whole health-v2 panel exists to prevent. A higher-turn
+    # old-format file sitting beside a lower-turn current-format one means a
+    # STALE WRITER (a pre-upgrade MCP server process still running) wrote it
+    # after this seat had already upgraded -- which is precisely what the
+    # reason message below already tells the reader to fix (rebuild +
+    # reconnect the MCP server retires the stale writer). Do not turn this
+    # refusal into a fallback to the older snapshot.
     if "measurements" not in snapshot:
         return {
             "has_snapshot": False,

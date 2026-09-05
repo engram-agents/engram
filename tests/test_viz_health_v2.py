@@ -258,6 +258,51 @@ class TestGetHealthV2DataEmptyStates(unittest.TestCase):
         self.assertIn("reason", result)
         self.assertIn("old-format", result["reason"].lower())
 
+    def test_higher_turn_old_format_beside_lower_turn_current_format_still_refuses(self):
+        # engram-alpha#2587: a stale MCP server process (still running
+        # pre-upgrade code) can write an old-format snapshot AFTER a seat
+        # has already upgraded and written a current-format one -- landing
+        # an old-format file at a HIGHER turn number beside a perfectly
+        # usable current-format file at a LOWER turn number. Pin the
+        # DELIBERATE behavior: `_latest_snapshot_filename` picks the
+        # higher-turn (old-format) file, and the guard refuses rather than
+        # falling back to the lower-turn (current-format, usable) one --
+        # falling back would show stale data as current, exactly the defect
+        # this panel exists to prevent. This is distinct from
+        # `test_old_format_snapshot_missing_measurements_returns_empty_state`
+        # above, which only ever has ONE (old-format) file on disk -- that
+        # test can't distinguish "refuses because it's the only file" from
+        # "refuses despite a usable alternative being available"; this test
+        # can, because a usable turn-93 alternative is present and must be
+        # ignored.
+        old_format_snapshot = {
+            "anchor": "deadbeef",
+            "checkpoint_mode": "nap",
+            "config": {"aspects": []},
+            "definitions": {},
+            "diagnostics": {},
+            "engine_version": "0.3.0",
+            "red_flags": [],
+            "schema_version": "1",
+            "scores": {"composed": 80.0},
+            "signals": {},
+            "turn": 94,
+        }
+        current_format_snapshot = _make_fixture_snapshot(turn=93, checkpoint_mode="nap")
+        snap_dir = self.engram_home / "health-snapshots"
+        snap_dir.mkdir()
+        (snap_dir / "94-nap-20260904T120000Z.json").write_text(
+            json.dumps(old_format_snapshot)
+        )
+        (snap_dir / "93-nap-20260904T110000Z.json").write_text(
+            json.dumps(current_format_snapshot)
+        )
+        result = viz_health_v2_data.get_health_v2_data("test")
+        self.assertFalse(result["has_snapshot"], result)
+        self.assertIn("reason", result)
+        self.assertIn("old-format", result["reason"].lower())
+        self.assertIn("94-nap-20260904T120000Z.json", result["reason"])
+
 
 class TestGetHealthV2DataPopulated(unittest.TestCase):
     def setUp(self):
