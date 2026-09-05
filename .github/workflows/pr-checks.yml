@@ -527,7 +527,12 @@ jobs:
         # the required severity can only be MAJOR or NONE in this PR — see
         # the test module's docstring. PASSES with a stated "gate inactive"
         # reason today, since no deployable tag yet carries health/version.py.
-        run: python3 -m pytest tests/test_health_version_gate.py -q
+        # After the pytest line (which passes silently either way), print the
+        # live gate verdict so the CI log names T — an inactive gate and an
+        # active one otherwise leave the same "N passed" log (#2588 review).
+        run: |
+          python3 -m pytest tests/test_health_version_gate.py -q
+          python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','tests/test_health_version_gate.py'); g=u.module_from_spec(s); s.loader.exec_module(g); status, msg = g.run_live_gate(); print(f'health-version gate (live): {status} | {msg}')"
 
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
