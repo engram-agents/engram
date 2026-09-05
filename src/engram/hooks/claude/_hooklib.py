@@ -82,6 +82,81 @@ def resolve_tools_dir(marker_filename: str) -> Optional[Path]:
     return tools_dir
 
 
+def resolve_runtime_dir(engram_home: str, sentinel: str) -> str:
+    """Locate the directory containing `sentinel` for import.
+
+    Canonical resolver for the "where do the runtime modules live" question,
+    hoisted here after gh#2570 found it independently re-implemented three
+    times (engram-utility-credit-mention-stop.py, engram-session-start-hook.py,
+    engram-surface-hook.py) with two of the three copies missing fixes #1712
+    and #1727 that had only ever landed in the surface-hook copy. This is
+    that copy, verbatim, with its one hard-coded filename ("engram_client.py")
+    generalized to the `sentinel` parameter -- each caller passes the name of
+    the module IT actually imports (e.g. "engram_client.py", "engram_ids.py",
+    "engram_log_emitter.py"). One call per module you actually import; do not
+    collapse two different imports onto one sentinel just because they
+    happen to live in the same directory today (gh#2570 -- an import of the
+    emitter must probe for the emitter, not for whatever else is nearby).
+
+    Priority:
+      1. $ENGRAM_RUNTIME_DIR if set explicitly.
+      2. Plugin root: this file lives at <plugin_root>/hooks/_hooklib.py in
+         both topologies (source: hooks/claude/; deployed: hooks/ -- flat
+         layout, tools/build-plugin.sh copies hooks without a platform
+         subdir), so the plugin root is two dirname() levels up from
+         __file__. `sentinel` lives at <plugin_root>/. The plugin bundle is
+         the canonical runtime; when present it MUST win so a stale
+         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
+         can leave ~/.engram/engram_client.py that does `import server`
+         against a removed ~/.engram/server.py, crash-looping the daemon).
+      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only
+         -- reached only when there is no plugin bundle; covers scatter
+         installs that copy `sentinel` into the data dir).
+      4. Walk parents from __file__ for the nearest ancestor whose own
+         src/engram/ actually contains `sentinel`, instead of guessing a
+         fixed absolute path (#1712: the fixed guess resolves to the WRONG
+         checkout when this process is running from a worktree nested
+         under the guessed path, e.g. .claude/worktrees/<id>/ under
+         ~/engram-alpha -- silently shadowing the actually-running copy with
+         a sibling one).
+      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
+         unchanged).
+
+    This file lives in the SAME directory as the hooks that call it, in both
+    topologies (mirrors resolve_tools_dir's own reasoning above) -- so
+    walking from _hooklib.py's own __file__ yields the identical parent
+    chain a hook would get walking from its own location.
+
+    Never raises (reviewer-fairy blocker, PR #1727, originally found in the
+    surface-hook copy): this function is called at bare module-import time
+    by every caller (`_RUNTIME_DIR = resolve_runtime_dir(...)`, unguarded),
+    so the walk itself must never raise. Path.exists() -- unlike
+    os.path.exists() used at every other rung above -- raises
+    PermissionError on an unreadable ancestor instead of returning False; an
+    unhandled exception here would crash the whole hook process at import
+    time. Same precedent as resolve_tools_dir's own docstring ("the
+    caller's own import should be wrapped ... and degrade to a silent
+    no-op on failure") -- wrapped here instead of at the call site so this
+    function keeps a never-raises contract for every caller.
+    """
+    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
+    if explicit:
+        return explicit
+    plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.exists(os.path.join(plugin_root, sentinel)):
+        return plugin_root
+    if os.path.exists(os.path.join(engram_home, sentinel)):
+        return engram_home
+    try:
+        for parent in Path(__file__).resolve().parents:
+            candidate = parent / "src" / "engram"
+            if (candidate / sentinel).exists():
+                return str(candidate)
+    except OSError:
+        pass
+    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
+
+
 def resolve_own_server_py_path(engram_home: str) -> str:
     """Resolve the path to THIS agent's own MCP server.py.
 

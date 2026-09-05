@@ -161,7 +161,15 @@ ENGRAM_HOME = (
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
+
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -645,7 +653,6 @@ def main() -> None:
 
     # Emit engram.hook.fire event. Failure must not break the hook.
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id,

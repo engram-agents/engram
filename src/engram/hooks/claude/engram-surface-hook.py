@@ -32,70 +32,14 @@ def _resolve_engram_home() -> str:
     )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate where engram_client.py lives for import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. Walk parents from __file__ for the nearest ancestor whose own
-         src/engram/ actually contains engram_client.py, instead of guessing a
-         fixed absolute path (#1712: the fixed guess resolves to the WRONG
-         checkout when this process is running from a git worktree nested
-         under the guessed path, e.g. .claude/worktrees/<id>/ under
-         ~/engram-alpha -- silently shadowing the actually-running copy with
-         a sibling one).
-      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
-         unchanged).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    # Reviewer-fairy blocker (PR #1727): this function is called at bare
-    # module-import time below (`PROJECT_DIR = _resolve_runtime_dir(...)`,
-    # unguarded), so the walk itself must never raise. Path.exists() --
-    # unlike os.path.exists() used at every other rung above -- raises
-    # PermissionError on an unreadable ancestor instead of returning False;
-    # an unhandled exception here would crash the whole hook process at
-    # import time. Same precedent as _hooklib.resolve_tools_dir's own
-    # docstring ("the caller's own import should be wrapped... and degrade
-    # to a silent no-op on failure") -- wrapped here instead of at the call
-    # site so this function keeps its existing never-raises contract.
-    try:
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "src" / "engram"
-            if (candidate / "engram_client.py").exists():
-                return str(candidate)
-    except OSError:
-        pass
-    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
-
-
 ENGRAM_HOME = _resolve_engram_home()
-PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
+from _hooklib import resolve_runtime_dir
 try:
     from _hooklib import (
         is_own_server_py_running as _is_own_server_py_running_impl,
@@ -104,6 +48,26 @@ try:
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
+
+# Locate where engram_client.py lives for import (gh#2570: local
+# _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir; this hook's
+# own sentinel, engram_client.py, is preserved unchanged -- used by
+# _should_prepend / query_fts_fallback below).
+PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
+
+# Separate, dedicated resolve+insert for the emitter (gh#2570 §1/§4): the
+# three sys.path.insert(0, ENGRAM_HOME) calls at the emit sites below used
+# to rely entirely on this hook's plugin root having been left on sys.path
+# by two UNRELATED function bodies (_should_prepend's engram_idf import,
+# query_fts_fallback's engram_client import) -- accidental, and only
+# reached at all on the code paths that call those two functions. An import
+# of the emitter must probe for the emitter, not piggyback on a directory
+# some other import incidentally added to sys.path. Module scope,
+# unconditional, so every emit site can rely on it regardless of which
+# branch ran earlier in this request.
+_EMITTER_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _EMITTER_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _EMITTER_RUNTIME_DIR)
 
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
@@ -3033,7 +2997,6 @@ def main():
     # Failure-mode contract: emitter.emit NEVER raises; if init fails or
     # the import itself fails, we degrade silently to a no-op.
     try:
-        sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=hook_input.get("session_id", "unknown"),
@@ -3088,7 +3051,6 @@ def main():
     # hook_input/session_id threading of its own.
     if _principle_rendered:
         try:
-            sys.path.insert(0, ENGRAM_HOME)
             from engram_log_emitter import Emitter
             _emitter3 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),
@@ -3283,7 +3245,6 @@ def main():
     # its out-parameter docstring for why an untouched {} means "skipped".
     if _render_stats:
         try:
-            sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
             from engram_log_emitter import Emitter
             _emitter2 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),

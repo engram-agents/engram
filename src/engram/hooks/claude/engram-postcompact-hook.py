@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import find_active_jsonl
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -38,11 +38,18 @@ ENGRAM_HOME = (
 )
 MARKER_PATH = os.path.join(ENGRAM_HOME, "last-compact-at.json")
 
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
 
 def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int) -> None:
     """Emit engram.hook.fire event. Failure must not break the hook."""
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id or "unknown",

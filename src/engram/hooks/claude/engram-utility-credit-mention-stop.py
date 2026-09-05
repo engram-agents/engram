@@ -65,47 +65,30 @@ ENGRAM_HOME = (
 )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate the directory that contains engram_ids.py and engram_log_emitter.py.
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
-    Probe order mirrors engram-surface-hook.py's resolver; the sentinel file
-    differs (engram_ids.py here vs engram_client.py there) because each hook
-    probes for the module it actually imports.
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_ids.py lives at <plugin_root>/. This
-         resolves clean plugin installs where ENGRAM_HOME is data-only
-         (issue #782 class: stale scatter copy at ENGRAM_HOME must not shadow
-         the plugin's live copy).
-      3. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern). Reached
-         only when no plugin bundle is present — scatter-install fallback.
-      4. ~/engram-alpha (live-source fallback for dev installs that
-         haven't bundled a snapshot into $ENGRAM_HOME).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if os.path.exists(os.path.join(plugin_root, "engram_ids.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_ids.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
-
-
-_RUNTIME_DIR = _resolve_runtime_dir(ENGRAM_HOME)
+# Resolves the directory containing engram_ids.py -- hoisted to
+# _hooklib.resolve_runtime_dir (gh#2570); this hook's own sentinel
+# (engram_ids.py, distinct from engram_client.py/engram_log_emitter.py used
+# by other hooks) is preserved unchanged.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_ids.py")
 
 # Ensure runtime modules are importable. Uses the plugin-aware resolution
 # above instead of the retired scatter-layout sys.path.insert(0, ENGRAM_HOME).
 if _RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _RUNTIME_DIR)
 
-_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
-if _HOOK_DIR not in sys.path:
-    sys.path.insert(0, _HOOK_DIR)
-from _hooklib import atomic_write_json
+# Separate resolve call for the emitter (gh#2570 §1): an import of
+# engram_log_emitter must probe for engram_log_emitter, not piggyback on
+# whatever directory engram_ids.py happened to resolve to above -- one call
+# per module actually imported, even when both currently resolve to the
+# same plugin root in practice.
+_EMITTER_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _EMITTER_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _EMITTER_RUNTIME_DIR)
 
 KNOWLEDGE_DB = os.path.join(ENGRAM_HOME, "knowledge.db")
 LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")

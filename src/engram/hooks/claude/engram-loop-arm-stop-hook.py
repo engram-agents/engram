@@ -321,6 +321,26 @@ _LOOP_ARM_STATE_FILE = os.path.join(ENGRAM_HOME, ".loop-arm-nudge-last-fire.json
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+# Guarded (unlike the sibling hooks' unguarded equivalent): this hook's own
+# design contract, defended by test_emits_via_fallback_when_stophooklib_import_fails
+# and the two _copy_hook_into_baked_bundle regression tests, is that it must
+# NEVER crash even when a sibling lib module is absent from an isolated
+# bundle -- its whole purpose is making a missed ScheduleWakeup arm loud,
+# so an unhandled ImportError here (which would abort the primary nudge
+# below, not just telemetry) is strictly worse than the emitter silently
+# not firing. Same fail-toward-emitting posture as the rest of this file.
+try:
+    from _hooklib import resolve_runtime_dir
+    _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+    if _RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _RUNTIME_DIR)
+except Exception:
+    pass
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -650,7 +670,6 @@ def main() -> None:
     # Emit engram.hook.fire event, matching the sibling Stop hooks'
     # observability convention. Failure must not break the hook.
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id,

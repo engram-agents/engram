@@ -28,6 +28,27 @@ DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
 
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+# This file's own directory IS already sys.path[0] when invoked as a plain
+# script (both source and flattened deployed layout) -- but this repo's own
+# test suite also loads hooks directly via importlib.spec_from_file_location
+# (e.g. tests/test_deference_detector_prompt.py, tests/test_loop_prompt.py),
+# which does NOT implicitly add the hook's own directory to sys.path the way
+# a subprocess invocation does. Insert explicitly so both invocation styles
+# resolve _hooklib the same way (matches every sibling hook's existing
+# precedent, e.g. engram-deference-detector-stop.py's _this_dir insert).
+_this_dir = str(Path(__file__).resolve().parent)
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import resolve_runtime_dir
+
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
 # ---------------------------------------------------------------------------
 # loop_prompt import — SSoT for the loop-wake marker.
 #
@@ -100,7 +121,6 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
 def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, stdout_bytes: int) -> None:
     """Emit engram.hook.fire event. Failure must not break the hook."""
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id or "unknown",

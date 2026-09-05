@@ -72,49 +72,30 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
 
+# Module-scope emitter resolve+insert (gh#2570 §1): probes for
+# engram_log_emitter.py specifically, distinct from the engram_client.py
+# sentinel the resolve_runtime_dir calls below use for the stats-import call sites --
+# one call per module actually imported. Replaces the bare
+# sys.path.insert(0, ENGRAM_HOME) this hook's emit site used to do (same
+# shadowing risk #2570 documents for the sibling hooks: a stale scatter copy
+# of engram_log_emitter.py in ENGRAM_HOME would otherwise be imported ahead
+# of the plugin's live copy).
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
 try:
     from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
-
-
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate directory containing engram_client.py for stats import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
 
 
 def _runtime_platform() -> str | None:
@@ -2221,7 +2202,7 @@ def forum_monitor_block() -> str:
     call site in main()). Silent "" when forum is unconfigured (no forum.url in
     config.json) or the monitor script is absent — hook must never block start.
 
-    Resolves forum-mention-monitor.sh via _resolve_runtime_dir so it works in
+    Resolves forum-mention-monitor.sh via resolve_runtime_dir so it works in
     both plugin install layout (<plugin_root>/tools/) and dev source tree
     layout (~/engram-alpha/tools/). Follows the auto_sleep_cron_block() pattern.
 
@@ -2241,7 +2222,7 @@ def forum_monitor_block() -> str:
     except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         return ""
 
-    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
     script_path = os.path.join(runtime_dir, "tools", "forum-mention-monitor.sh")
     if not os.path.exists(script_path):
         return ""
@@ -2273,7 +2254,7 @@ def forum_updates_monitor_block() -> str:
     call site in main()). Silent "" when forum is unconfigured (no forum.url in
     config.json) or the monitor script is absent — hook must never block start.
 
-    Resolves forum-updates-monitor.sh via _resolve_runtime_dir so it works in
+    Resolves forum-updates-monitor.sh via resolve_runtime_dir so it works in
     both plugin install layout (<plugin_root>/tools/) and dev source tree
     layout (~/engram-alpha/tools/). Follows the forum_monitor_block() pattern.
 
@@ -2293,7 +2274,7 @@ def forum_updates_monitor_block() -> str:
     except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         return ""
 
-    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
     script_path = os.path.join(runtime_dir, "tools", "forum-updates-monitor.sh")
     if not os.path.exists(script_path):
         return ""
@@ -2747,7 +2728,7 @@ def main() -> None:
     # timeout here degrades only calibration, which is an anchor rather than a
     # continuity guarantee, instead of taking the focus list down with it.
     try:
-        _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+        _runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
         os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
         if _runtime_dir not in sys.path:
             sys.path.insert(0, _runtime_dir)
@@ -2838,7 +2819,6 @@ def main() -> None:
     try:
         _session_id = hook_input.get("session_id", "unknown") or "unknown"
         _transcript_path = hook_input.get("transcript_path", "") or ""
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=_session_id,

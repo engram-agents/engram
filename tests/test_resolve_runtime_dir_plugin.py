@@ -1,4 +1,4 @@
-"""Tests for the plugin-root probe added to _resolve_runtime_dir.
+"""Tests for the plugin-root probe in the runtime-dir resolver.
 
 Issue #642: clean plugin install degrades to FTS-only because ENGRAM_HOME
 is data-only (no engram_client.py) and ~/engram-alpha doesn't exist on a
@@ -6,31 +6,90 @@ public user's machine. The fix adds a plugin-root probe (priority 3, before
 the ~/engram-alpha fallback) that walks two dirname() levels up from __file__
 to locate <plugin_root>/engram_client.py.
 
-Two scenarios validated:
+Retargeted for gh#2570 (2026-09-05, maintainer's ruling on the coder-fairy's
+flagged gap): the resolver this file tests used to be an independent
+`_resolve_runtime_dir(engram_home)` copy inside each of
+engram-surface-hook.py / engram-session-start-hook.py /
+engram-surface-daemon.py / engram-utility-credit-mention-stop.py (with
+engram-utility-credit-mention-stop.py taking a different sentinel,
+engram_ids.py). gh#2570 hoisted that logic into ONE shared function,
+`_hooklib.resolve_runtime_dir(engram_home, sentinel)`, and deleted the four
+local copies. Retiring this file instead of retargeting it was considered
+and rejected: TestResolveRuntimeDirWalkParents holds the regression coverage
+for #1712 (worktree-nesting) and #1727 (permission-error-mid-walk) -- i.e.
+the tests for the two properties gh#2570's entire point was to PROPAGATE.
+Deleting the guard on the thing being spread would be exactly the
+coverage-erosion shape gh#2570 exists to fix. So: every scenario class below
+is retargeted at `_hooklib.resolve_runtime_dir`, not dropped.
+
+What changed, precisely:
+  - Four hook-specific loaders (one per file, extracting `_resolve_runtime_dir`
+    by name) collapse to two hooklib-loaders (real location / fake location),
+    parameterized by SENTINEL instead of by hook file -- because the four
+    hooks migrated by gh#2570 now share the identical implementation, so what
+    varies observably between them is the sentinel argument, not the code
+    path. `test_plugin_layout_*` / `test_scatter_no_regression_*` /
+    `test_shadow_regression_*` / `test_scatter_only_*` /
+    `test_explicit_override_*` keep one test method per FORMER subject
+    (surface-hook, session-start-hook, surface-daemon, utility-credit) so the
+    method names and their git-blame history stay traceable, even though
+    three of the four now exercise byte-identical code with the same
+    sentinel.
+  - TestResolveRuntimeDirWalkParents collapses its per-hook-file list to two
+    SUBJECTS: the untouched engram-lesson-tripwire-hook.py (still its own,
+    no-argument `_resolve_runtime_dir` -- named here explicitly, per the
+    maintainer's instruction, as "one copy remains, deliberately, pending a
+    look at whether it is the same thing": its different signature means it
+    may resolve something else entirely, and it was NOT folded on the
+    strength of a matching function name), and the shared
+    `_hooklib.resolve_runtime_dir`, exercised once per sentinel
+    (engram_client.py, covering the three merged-into-one-implementation
+    hooks; engram_ids.py, covering utility-credit-mention-stop.py) rather
+    than three redundant runs of identical code under different hook-name
+    labels.
+  - Where a subject is the shared resolver, the WORKTREE-NESTED file that
+    gets copied and loaded is `_hooklib.py` itself, not any hook file --
+    `_hooklib.py` lives in the exact same directory as the hooks that call
+    it in both topologies (its own docstring establishes this), so copying
+    IT to the fake nested location and loading it there exercises the
+    genuine, unmodified walk-parents/permission-error code at the path
+    depth being simulated, matching this file's own pre-existing principle
+    (stated in TestResolveRuntimeDirWalkParents below) of never
+    reimplementing the resolver under test.
+  - The old `patched_fn` hand-reimplementation inside
+    TestResolveRuntimeDirPluginProbe / TestResolveRuntimeDirShadowRegression
+    (a second, parallel copy of the first 3 resolution rungs, used only to
+    control the `__file__` math without physically copying a file) is
+    removed as part of the retarget: since the subject is now ONE shared
+    file (`_hooklib.py`) instead of eight-hooks-worth of copy-pasted
+    functions, physically writing that one file to the fake location and
+    loading it for real is no more expensive than maintaining a
+    hand-written stand-in, and it means every test in this file now
+    exercises the actual, unmodified resolver -- not a parallel
+    reimplementation of it.
+
+Two scenarios validated (unchanged from the original doc, now against the
+shared resolver):
 
   1. Plugin layout — hook at <tmp>/<plugin>/hooks/hook.py (flat layout,
      no platform subdir — mirrors tools/build-plugin.sh line ~199 which
      copies hooks flat into <plugin_root>/hooks/),
      engram_client.py at <tmp>/<plugin>/, ENGRAM_HOME data-only,
      ENGRAM_RUNTIME_DIR unset, no ~/engram-alpha sentinel.
-     Expected: _resolve_runtime_dir returns <tmp>/<plugin>/.
+     Expected: resolve_runtime_dir returns <tmp>/<plugin>/.
 
   2. Scatter layout (regression) — engram_client.py already present under
      ENGRAM_HOME but no plugin bundle present. ENGRAM_RUNTIME_DIR unset.
-     Expected: _resolve_runtime_dir returns ENGRAM_HOME (priority 3, scatter
+     Expected: resolve_runtime_dir returns ENGRAM_HOME (priority 3, scatter
      fallback when no plugin bundle exists), preserving existing scatter-install
      behaviour.
 
-Each test imports _resolve_runtime_dir directly from the source file after
-overriding the relevant filesystem state with a temporary directory, so no
-live ENGRAM install is touched.
-
-Tests cover the three Claude hook files only; the Gemini lane was removed
-2026-06-06 (upstream discontinued; last state at tag archive/gemini-last-state).
+No live ENGRAM install is touched; every test builds its own temp-dir tree.
 """
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import os
 import shutil
@@ -39,9 +98,12 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+_HOOKLIB_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
+_HOOKLIB_SRC = _HOOKLIB_PATH.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -49,24 +111,61 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 # ---------------------------------------------------------------------------
 
 
-def _load_function_from_hook(hook_path: Path) -> types.FunctionType:
-    """Load _resolve_runtime_dir from the given hook file.
+def _load_resolve_runtime_dir_module(hooklib_file_path: Path) -> types.FunctionType:
+    """Load `resolve_runtime_dir` from an ALREADY-PRESENT _hooklib.py file at
+    hooklib_file_path. The caller is responsible for getting the file onto
+    disk there (shutil.copy2, write_text, ...) -- this function only loads
+    and extracts, so its own behavior doesn't depend on ENGRAM_HOME/
+    ENGRAM_RUNTIME_DIR at import time (_hooklib.py, unlike some hooks, has
+    no module-level env-dependent side effects to guard against)."""
+    mod_name = f"_hooklib_instance_{id(hooklib_file_path)}"
+    spec = importlib.util.spec_from_file_location(mod_name, hooklib_file_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    fn = getattr(mod, "resolve_runtime_dir", None)
+    if fn is None:
+        raise AttributeError(f"resolve_runtime_dir not found in {hooklib_file_path}")
+    return fn
 
-    The hooks have module-level side-effects (importing context_tracker,
-    reading env vars at import time). We extract only the function by
-    compiling the source and extracting it from a throw-away namespace,
-    avoiding the module-level code.
 
-    Approach: exec only the function definition lines by finding the function
-    in a fresh module namespace. We use importlib to load the whole module
-    with guarded env vars, then grab the function attribute.
-    """
-    return _load_function_clean(hook_path)
+def _load_resolve_runtime_dir_real() -> types.FunctionType:
+    """Load resolve_runtime_dir from its REAL repo location, unmodified --
+    for tests that don't need to fake __file__ (scatter, explicit-override:
+    neither rung depends on where the plugin root's dirname() math lands).
+    Mirrors the original test's use of the real hook file's own location for
+    the same purpose. Never writes anything -- read-only load of the real
+    file."""
+    return _load_resolve_runtime_dir_module(_HOOKLIB_PATH)
+
+
+def _load_resolve_runtime_dir_at_fake_path(hooklib_file_path: Path) -> types.FunctionType:
+    """Copy _hooklib.py's real source to hooklib_file_path (creating parent
+    dirs as needed) and load resolve_runtime_dir from THAT location, so its
+    internal os.path.abspath(__file__) plugin-root math resolves relative to
+    the FAKE path being simulated, not this repo's real checkout. Never
+    touches the real _hooklib.py on disk -- writes only to the caller-given
+    (temp-dir) path."""
+    hooklib_file_path.parent.mkdir(parents=True, exist_ok=True)
+    hooklib_file_path.write_text(_HOOKLIB_SRC)
+    return _load_resolve_runtime_dir_module(hooklib_file_path)
 
 
 def _load_function_clean(hook_path: Path) -> types.FunctionType:
-    """Import hook as a module (with env guards) and return _resolve_runtime_dir."""
-    # Stub context_tracker so the session-start hook's top-level import works.
+    """Import a hook module (with env guards) and return its OWN,
+    self-contained `_resolve_runtime_dir` -- the untouched, no-argument
+    contract (engram-lesson-tripwire-hook.py only, post-gh#2570; every other
+    former user of this loader was migrated to
+    `_load_resolve_runtime_dir_real` / `_load_resolve_runtime_dir_at_fake_path`
+    above).
+
+    The hook has module-level side-effects (importing context_tracker,
+    reading env vars at import time). We extract only the function by
+    compiling the source and extracting it from a throw-away namespace,
+    avoiding the module-level code's need for a live ENGRAM install.
+    """
+    # Stub context_tracker so the session-start hook's top-level import
+    # would work too, in case a future subject needs it. Harmless no-op for
+    # engram-lesson-tripwire-hook.py, which doesn't import context_tracker.
     stub_ct = types.ModuleType("context_tracker")
     stub_ct.write_baseline = lambda *a, **kw: None  # type: ignore[attr-defined]
     old_ct = sys.modules.get("context_tracker")
@@ -112,47 +211,50 @@ def _load_function_clean(hook_path: Path) -> types.FunctionType:
 
 
 # ---------------------------------------------------------------------------
-# The actual test: one parameterised base, run against all 5 hook files.
+# The four former subjects, now identified by (label, sentinel) rather than
+# by hook file -- surface-hook / session-start-hook / surface-daemon share
+# ONE implementation post-gh#2570, so what varies between them is only the
+# sentinel a given caller happens to pass, not the code exercised.
 # ---------------------------------------------------------------------------
 
-_HOOK_FILES = [
-    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py",
-    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py",
-    _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py",
+_SUBJECTS = [
+    ("engram-surface-hook.py", "engram_client.py"),
+    ("engram-session-start-hook.py", "engram_client.py"),
+    ("engram-surface-daemon.py", "engram_client.py"),
+    ("engram-utility-credit-mention-stop.py", "engram_ids.py"),
 ]
 
 
 class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
-    """Plugin-root probe fires correctly for all four Claude hook files."""
+    """Plugin-root probe fires correctly for all four former subjects."""
 
-    def _run_plugin_layout_test(
-        self, hook_path: Path, sentinel: str = "engram_client.py"
-    ) -> None:
+    def _run_plugin_layout_test(self, label: str, sentinel: str) -> None:
         """Assert plugin-root probe resolves to plugin root.
 
         Layout mirrors the REAL flat plugin install (tools/build-plugin.sh
         line ~199: hooks copied flat into <plugin_root>/hooks/, no platform
-        subdir):
-          <tmp>/<plugin>/hooks/hook.py    — hook file lives here (FLAT)
-          <tmp>/<plugin>/<sentinel>       — runtime module here
+        subdir), with `_hooklib.py` itself as the file whose __file__ math
+        is exercised (it lives alongside the hooks in this exact layout):
+          <tmp>/<plugin>/hooks/_hooklib.py — the resolver lives here (FLAT)
+          <tmp>/<plugin>/<sentinel>        — runtime module here
           ENGRAM_HOME = <tmp>/data-only-home/  — no <sentinel>
           ENGRAM_RUNTIME_DIR = unset
           ~/engram-alpha = non-existent (patched)
 
-        `sentinel` is the module filename the hook checks for (engram_client.py
-        for the three original hooks; engram_ids.py for utility-credit-mention-stop).
+        `sentinel` is the module filename the ORIGINAL subject checks for
+        (engram_client.py for surface-hook/session-start/surface-daemon;
+        engram_ids.py for utility-credit-mention-stop).
 
         With this flat layout, dirname(dirname(__file__)) correctly resolves
         to <plugin_root> (dirname of hooks/ dir). Three dirname calls would
         resolve to the PARENT of plugin_root — the bug this test catches.
         """
-        fn = _load_function_from_hook(hook_path)
-
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
 
             # Build the FLAT plugin tree (mirrors build-plugin.sh).
-            # Hooks land at <plugin_root>/hooks/<name>.py — no platform subdir.
+            # _hooklib.py lands at <plugin_root>/hooks/_hooklib.py — no
+            # platform subdir, matching the deployed layout.
             plugin_root = tmp_path / "plugin"
             hook_dir = plugin_root / "hooks"
             hook_dir.mkdir(parents=True)
@@ -163,38 +265,13 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             data_home = tmp_path / "data-only-home"
             data_home.mkdir()
 
-            # Simulate the hook's __file__ being inside the flat plugin tree by
-            # patching the resolution logic. We rebuild a wrapper that
-            # overrides __file__ with the flat-layout path.
-            fake_hook_file = str(hook_dir / hook_path.name)
+            hooklib_file = hook_dir / "_hooklib.py"
+            fn = _load_resolve_runtime_dir_at_fake_path(hooklib_file)
 
-            def patched_fn(engram_home: str) -> str:
-                """Wrapper that substitutes __file__ with the flat fake_hook_file."""
-                import os as _os
-
-                explicit = _os.environ.get("ENGRAM_RUNTIME_DIR")
-                if explicit:
-                    return explicit
-                _plugin_root = _os.path.dirname(
-                    _os.path.dirname(_os.path.abspath(fake_hook_file))
-                )
-                if _os.path.exists(_os.path.join(_plugin_root, sentinel)):
-                    return _plugin_root
-                if _os.path.exists(_os.path.join(engram_home, sentinel)):
-                    return engram_home
-                return _os.path.expanduser("~/engram-alpha")
-
-            with (
-                patch.dict(
-                    os.environ,
-                    {"ENGRAM_HOME": str(data_home)},
-                    clear=False,
-                ),
-                patch.dict(
-                    os.environ,
-                    {},
-                    clear=False,
-                ),
+            with patch.dict(
+                os.environ,
+                {"ENGRAM_HOME": str(data_home)},
+                clear=False,
             ):
                 os.environ.pop("ENGRAM_RUNTIME_DIR", None)
                 # Patch expanduser so ~/engram-alpha resolves to a non-existent path.
@@ -206,23 +283,27 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
                     if hasattr(os.path.expanduser, "__wrapped__")
                     else p,
                 ):
-                    result = patched_fn(str(data_home))
+                    result = fn(str(data_home), sentinel)
 
             self.assertEqual(
                 result,
                 str(plugin_root),
-                f"[{hook_path.name}] Expected plugin root {plugin_root!r}, "
+                f"[{label}] Expected plugin root {plugin_root!r}, "
                 f"got {result!r}",
             )
 
-    def _run_scatter_layout_test(
-        self, hook_path: Path, sentinel: str = "engram_client.py"
-    ) -> None:
+    def _run_scatter_layout_test(self, label: str, sentinel: str) -> None:
         """Assert ENGRAM_HOME probe (priority 3) still wins when no plugin bundle present.
 
         Layout:
           ENGRAM_HOME = <tmp>/scatter-home/ with <sentinel> present
-          plugin root has no <sentinel> (no bundle)
+          plugin root has no <sentinel> (no bundle) -- loaded from
+          _hooklib.py's REAL repo location, whose own dirname(dirname())
+          lands one level short of a real plugin root by construction of
+          the source tree (src/engram/hooks/claude/_hooklib.py -> two
+          dirnames -> src/engram/hooks, which never contains engram_client.py
+          / engram_ids.py) -- so rung 2 misses naturally here, same as the
+          original per-hook test relied on.
           ENGRAM_RUNTIME_DIR = unset
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -231,7 +312,7 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
             scatter_home.mkdir()
             (scatter_home / sentinel).write_text("# stub\n")
 
-            fn = _load_function_from_hook(hook_path)
+            fn = _load_resolve_runtime_dir_real()
 
             with patch.dict(
                 os.environ,
@@ -239,66 +320,52 @@ class TestResolveRuntimeDirPluginProbe(unittest.TestCase):
                 clear=False,
             ):
                 os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-                result = fn(str(scatter_home))
+                result = fn(str(scatter_home), sentinel)
 
             self.assertEqual(
                 result,
                 str(scatter_home),
-                f"[{hook_path.name}] Scatter layout: expected ENGRAM_HOME "
+                f"[{label}] Scatter layout: expected ENGRAM_HOME "
                 f"{scatter_home!r} to win, got {result!r}",
             )
 
-    # -- Plugin layout tests (one per hook file) --
+    # -- Plugin layout tests (one per former subject) --
 
     def test_plugin_layout_claude_surface_hook(self):
-        self._run_plugin_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
-        )
+        self._run_plugin_layout_test("engram-surface-hook.py", "engram_client.py")
 
     def test_plugin_layout_claude_session_start_hook(self):
-        self._run_plugin_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-        )
+        self._run_plugin_layout_test("engram-session-start-hook.py", "engram_client.py")
 
     def test_plugin_layout_claude_surface_daemon(self):
-        self._run_plugin_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
-        )
-
-    # -- Scatter no-regression tests (one per hook file) --
-
-    def test_scatter_no_regression_claude_surface_hook(self):
-        self._run_scatter_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
-        )
-
-    def test_scatter_no_regression_claude_session_start_hook(self):
-        self._run_scatter_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-        )
-
-    def test_scatter_no_regression_claude_surface_daemon(self):
-        self._run_scatter_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
-        )
+        self._run_plugin_layout_test("engram-surface-daemon.py", "engram_client.py")
 
     def test_plugin_layout_claude_utility_credit_mention_stop(self):
         self._run_plugin_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
-            sentinel="engram_ids.py",
+            "engram-utility-credit-mention-stop.py", "engram_ids.py"
         )
+
+    # -- Scatter no-regression tests (one per former subject) --
+
+    def test_scatter_no_regression_claude_surface_hook(self):
+        self._run_scatter_layout_test("engram-surface-hook.py", "engram_client.py")
+
+    def test_scatter_no_regression_claude_session_start_hook(self):
+        self._run_scatter_layout_test("engram-session-start-hook.py", "engram_client.py")
+
+    def test_scatter_no_regression_claude_surface_daemon(self):
+        self._run_scatter_layout_test("engram-surface-daemon.py", "engram_client.py")
 
     def test_scatter_no_regression_claude_utility_credit_mention_stop(self):
         self._run_scatter_layout_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
-            sentinel="engram_ids.py",
+            "engram-utility-credit-mention-stop.py", "engram_ids.py"
         )
 
 
 class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
     """Regression tests for #1152: plugin bundle must win over stale data-dir snapshot.
 
-    Three scenarios, each run against all four Claude hook files:
+    Three scenarios, each run against all four former subjects:
 
       (a) Shadow case (#1152): plugin bundle present AND stale engram_home snapshot
           present -> resolver must return plugin_root, NOT engram_home.
@@ -306,34 +373,17 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
           resolver returns engram_home.
       (c) Explicit override: ENGRAM_RUNTIME_DIR set -> wins over both.
 
-    The patched_fn pattern from _run_plugin_layout_test is reused so that the
-    fake_hook_file controls the dirname() math independently of where the test
-    suite is run from.
+    Each scenario physically copies _hooklib.py's real source to the fake
+    plugin-root location and loads it from there (see
+    _load_resolve_runtime_dir_at_fake_path), so the __file__ math is
+    exercised on the actual resolver, not a hand-written stand-in.
 
-    `sentinel` is the module filename the hook checks for: engram_client.py for the
-    three original hooks; engram_ids.py for utility-credit-mention-stop.
+    `sentinel` is the module filename the former subject checks for:
+    engram_client.py for surface-hook/session-start-hook/surface-daemon;
+    engram_ids.py for utility-credit-mention-stop.
     """
 
-    def _make_patched_fn(self, fake_hook_file: str, sentinel: str = "engram_client.py"):
-        """Build a resolver function that uses fake_hook_file for __file__ math."""
-        def patched_fn(engram_home: str) -> str:
-            import os as _os
-            explicit = _os.environ.get("ENGRAM_RUNTIME_DIR")
-            if explicit:
-                return explicit
-            _plugin_root = _os.path.dirname(
-                _os.path.dirname(_os.path.abspath(fake_hook_file))
-            )
-            if _os.path.exists(_os.path.join(_plugin_root, sentinel)):
-                return _plugin_root
-            if _os.path.exists(_os.path.join(engram_home, sentinel)):
-                return engram_home
-            return _os.path.expanduser("~/engram-alpha")
-        return patched_fn
-
-    def _run_shadow_test(
-        self, hook_path: Path, sentinel: str = "engram_client.py"
-    ) -> None:
+    def _run_shadow_test(self, label: str, sentinel: str) -> None:
         """(a) Plugin bundle AND stale engram_home snapshot both present.
 
         Expected: plugin_root wins (bundle canonical; stale snapshot must NOT shadow).
@@ -352,23 +402,21 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
             engram_home.mkdir()
             (engram_home / sentinel).write_text("# stale scatter snapshot\n")
 
-            fake_hook_file = str(hook_dir / hook_path.name)
-            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+            hooklib_file = hook_dir / "_hooklib.py"
+            fn = _load_resolve_runtime_dir_at_fake_path(hooklib_file)
 
             with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}, clear=False):
                 os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-                result = patched_fn(str(engram_home))
+                result = fn(str(engram_home), sentinel)
 
             self.assertEqual(
                 result,
                 str(plugin_root),
-                f"[{hook_path.name}] #1152 shadow: expected plugin_root "
+                f"[{label}] #1152 shadow: expected plugin_root "
                 f"{plugin_root!r} to win over stale engram_home, got {result!r}",
             )
 
-    def _run_scatter_only_test(
-        self, hook_path: Path, sentinel: str = "engram_client.py"
-    ) -> None:
+    def _run_scatter_only_test(self, label: str, sentinel: str) -> None:
         """(b) No plugin bundle; only engram_home snapshot present.
 
         Expected: engram_home wins (scatter-install fallback path).
@@ -386,23 +434,21 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
             engram_home.mkdir()
             (engram_home / sentinel).write_text("# scatter copy\n")
 
-            fake_hook_file = str(hook_dir / hook_path.name)
-            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+            hooklib_file = hook_dir / "_hooklib.py"
+            fn = _load_resolve_runtime_dir_at_fake_path(hooklib_file)
 
             with patch.dict(os.environ, {"ENGRAM_HOME": str(engram_home)}, clear=False):
                 os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-                result = patched_fn(str(engram_home))
+                result = fn(str(engram_home), sentinel)
 
             self.assertEqual(
                 result,
                 str(engram_home),
-                f"[{hook_path.name}] Scatter-only: expected engram_home "
+                f"[{label}] Scatter-only: expected engram_home "
                 f"{engram_home!r}, got {result!r}",
             )
 
-    def _run_explicit_override_test(
-        self, hook_path: Path, sentinel: str = "engram_client.py"
-    ) -> None:
+    def _run_explicit_override_test(self, label: str, sentinel: str) -> None:
         """(c) ENGRAM_RUNTIME_DIR set -> wins over both plugin bundle and engram_home.
 
         Expected: the explicit env-var value is returned unchanged.
@@ -422,8 +468,8 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
 
             explicit_dir = str(tmp_path / "explicit-runtime")
 
-            fake_hook_file = str(hook_dir / hook_path.name)
-            patched_fn = self._make_patched_fn(fake_hook_file, sentinel)
+            hooklib_file = hook_dir / "_hooklib.py"
+            fn = _load_resolve_runtime_dir_at_fake_path(hooklib_file)
 
             with patch.dict(
                 os.environ,
@@ -433,140 +479,209 @@ class TestResolveRuntimeDirShadowRegression(unittest.TestCase):
                 },
                 clear=False,
             ):
-                result = patched_fn(str(engram_home))
+                result = fn(str(engram_home), sentinel)
 
             self.assertEqual(
                 result,
                 explicit_dir,
-                f"[{hook_path.name}] Explicit override: expected {explicit_dir!r}, "
+                f"[{label}] Explicit override: expected {explicit_dir!r}, "
                 f"got {result!r}",
             )
 
     # -- Shadow tests (a): plugin wins over stale engram_home --
 
     def test_shadow_regression_surface_hook(self):
-        self._run_shadow_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
-        )
+        self._run_shadow_test("engram-surface-hook.py", "engram_client.py")
 
     def test_shadow_regression_session_start_hook(self):
-        self._run_shadow_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-        )
+        self._run_shadow_test("engram-session-start-hook.py", "engram_client.py")
 
     def test_shadow_regression_surface_daemon(self):
-        self._run_shadow_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
-        )
+        self._run_shadow_test("engram-surface-daemon.py", "engram_client.py")
 
     def test_shadow_regression_utility_credit_mention_stop(self):
-        self._run_shadow_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
-            sentinel="engram_ids.py",
-        )
+        self._run_shadow_test("engram-utility-credit-mention-stop.py", "engram_ids.py")
 
     # -- Scatter-only tests (b): engram_home wins when no plugin bundle --
 
     def test_scatter_only_surface_hook(self):
-        self._run_scatter_only_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
-        )
+        self._run_scatter_only_test("engram-surface-hook.py", "engram_client.py")
 
     def test_scatter_only_session_start_hook(self):
-        self._run_scatter_only_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-        )
+        self._run_scatter_only_test("engram-session-start-hook.py", "engram_client.py")
 
     def test_scatter_only_surface_daemon(self):
-        self._run_scatter_only_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
-        )
+        self._run_scatter_only_test("engram-surface-daemon.py", "engram_client.py")
 
     def test_scatter_only_utility_credit_mention_stop(self):
-        self._run_scatter_only_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
-            sentinel="engram_ids.py",
-        )
+        self._run_scatter_only_test("engram-utility-credit-mention-stop.py", "engram_ids.py")
 
     # -- Explicit override tests (c): ENGRAM_RUNTIME_DIR wins over both --
 
     def test_explicit_override_surface_hook(self):
-        self._run_explicit_override_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py"
-        )
+        self._run_explicit_override_test("engram-surface-hook.py", "engram_client.py")
 
     def test_explicit_override_session_start_hook(self):
-        self._run_explicit_override_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-session-start-hook.py"
-        )
+        self._run_explicit_override_test("engram-session-start-hook.py", "engram_client.py")
 
     def test_explicit_override_surface_daemon(self):
-        self._run_explicit_override_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-daemon.py"
-        )
+        self._run_explicit_override_test("engram-surface-daemon.py", "engram_client.py")
 
     def test_explicit_override_utility_credit_mention_stop(self):
         self._run_explicit_override_test(
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-utility-credit-mention-stop.py",
-            sentinel="engram_ids.py",
+            "engram-utility-credit-mention-stop.py", "engram_ids.py"
         )
+
+
+class _WalkParentsSubject(NamedTuple):
+    """One subject for the #1712 / #1727 regression coverage below.
+
+    `source_kind` is "hook" for the untouched, self-contained,
+    no-argument engram-lesson-tripwire-hook.py (loaded and called via its
+    own `_resolve_runtime_dir`), or "hooklib" for the shared
+    `_hooklib.resolve_runtime_dir(engram_home, sentinel)` that now serves
+    every migrated hook.
+    """
+
+    label: str
+    source_kind: str  # "hook" | "hooklib"
+    real_source_path: Path
+    sentinel: str
+    takes_engram_home_arg: bool
+    expected_last_ditch: str  # the ORIGINAL hardcoded fallback string, unchanged by #1712
 
 
 class TestResolveRuntimeDirWalkParents(unittest.TestCase):
     """Regression tests for #1712: the absolute-path last-ditch fallback is
-    replaced by a walk-parents search in BOTH `_resolve_runtime_dir`
-    functions (engram-lesson-tripwire-hook.py, no-arg; engram-surface-hook.py,
-    takes engram_home). Recreates the worktree-nesting hazard directly:
+    replaced by a walk-parents search. Two SUBJECTS (retargeted for gh#2570,
+    see module docstring):
+
+      1. engram-lesson-tripwire-hook.py -- UNTOUCHED by gh#2570, deliberately.
+         Its own `_resolve_runtime_dir` takes NO ARGUMENTS -- a different
+         contract from the shared resolver, so it may resolve something
+         else entirely and was not folded on the strength of a matching
+         function name. One copy remains here, deliberately, pending a
+         look at whether it is the same thing.
+      2. `_hooklib.resolve_runtime_dir` -- the shared resolver that now
+         serves engram-surface-hook.py, engram-session-start-hook.py, and
+         engram-surface-daemon.py (sentinel=engram_client.py, tested once
+         since the three now execute byte-identical code) and
+         engram-utility-credit-mention-stop.py (sentinel=engram_ids.py,
+         tested separately since it's a different sentinel value, even
+         though the code path is the same).
+
+    Recreates the worktree-nesting hazard directly:
     `<tmp>/main-repo/.claude/worktrees/fake-agent/` nested under
     `<tmp>/main-repo/`, matching this repo's own dispatch pattern and real
-    relative hook depth (src/engram/hooks/claude/<hook>.py).
+    relative hook depth (src/engram/hooks/claude/<file>.py).
 
-    The real hook file is COPIED to the worktree-nested location (not just
-    referenced) so that `Path(__file__).resolve()` inside the loaded module
-    genuinely resolves under the fake worktree -- exercising the actual,
-    unmodified walk-parents code added by this fix, not a reimplementation.
+    The real subject file is COPIED to the worktree-nested location (not
+    just referenced) so that `Path(__file__).resolve()` inside the loaded
+    module genuinely resolves under the fake worktree -- exercising the
+    actual, unmodified walk-parents code added by this fix, not a
+    reimplementation. For the "hooklib" subjects this means copying
+    `_hooklib.py` itself (not any hook file) to the nested location:
+    `_hooklib.py` lives in the exact same directory as the hooks that call
+    it in both topologies, so this is the genuine deployed-adjacent shape,
+    not a stand-in for it.
     """
 
-    # (hook_path, marker_filename, takes_engram_home_arg, expected last-ditch
-    # fallback string -- the ORIGINAL hardcoded guess, unchanged by this fix)
-    _HOOKS = [
-        (
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-lesson-tripwire-hook.py",
-            "engram_idf.py",
-            False,
-            os.path.expanduser("~/engram-alpha/src/engram"),
+    _SUBJECTS = [
+        _WalkParentsSubject(
+            label="engram-lesson-tripwire-hook.py (untouched by gh#2570 -- "
+            "own no-argument _resolve_runtime_dir, a different contract, "
+            "not folded on the strength of a matching name)",
+            source_kind="hook",
+            real_source_path=(
+                _REPO_ROOT / "src" / "engram" / "hooks" / "claude"
+                / "engram-lesson-tripwire-hook.py"
+            ),
+            sentinel="engram_idf.py",
+            takes_engram_home_arg=False,
+            expected_last_ditch=os.path.expanduser("~/engram-alpha/src/engram"),
         ),
-        (
-            _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "engram-surface-hook.py",
-            "engram_client.py",
-            True,
-            os.path.expanduser("~/engram-alpha"),
+        _WalkParentsSubject(
+            label="_hooklib.resolve_runtime_dir, sentinel=engram_client.py "
+            "(covers the migrated engram-surface-hook.py / "
+            "engram-session-start-hook.py / engram-surface-daemon.py, which "
+            "now share this one implementation -- tested once, not three "
+            "times, since the code path is identical)",
+            source_kind="hooklib",
+            real_source_path=_HOOKLIB_PATH,
+            sentinel="engram_client.py",
+            takes_engram_home_arg=True,
+            expected_last_ditch=os.path.expanduser("~/engram-alpha"),
+        ),
+        _WalkParentsSubject(
+            label="_hooklib.resolve_runtime_dir, sentinel=engram_ids.py "
+            "(covers the migrated engram-utility-credit-mention-stop.py)",
+            source_kind="hooklib",
+            real_source_path=_HOOKLIB_PATH,
+            sentinel="engram_ids.py",
+            takes_engram_home_arg=True,
+            expected_last_ditch=os.path.expanduser("~/engram-alpha"),
         ),
     ]
 
     @staticmethod
-    def _build_worktree_tree(tmp_path: Path, hook_path: Path):
-        """<tmp>/main-repo/.claude/worktrees/fake-agent/src/engram/hooks/claude/<hook>.py
-        -- a copy of the real hook file, nested at this repo's real relative
-        depth under a fake worktree, itself nested under a fake main-repo."""
+    def _build_worktree_tree(tmp_path: Path, subject: _WalkParentsSubject):
+        """<tmp>/main-repo/.claude/worktrees/fake-agent/src/engram/hooks/claude/<file>.py
+        -- a copy of the real subject file (the hook itself for the untouched
+        no-arg case, or _hooklib.py for the shared-resolver case), nested at
+        this repo's real relative depth under a fake worktree, itself nested
+        under a fake main-repo.
+
+        ALSO writes a sibling _hooklib.py into the same nested directory,
+        unconditionally (a genuine bug found while retargeting this file for
+        gh#2570, pre-dating this change and not introduced by it): the
+        lesson-tripwire subject's own `_resolve_runtime_dir` sits behind a
+        module-scope `from _hooklib import atomic_write_json` -- a real
+        dependency at the top of that file, unrelated to gh#2570 -- which
+        this fake worktree tree never satisfied. In a FULL test-suite run
+        this went unnoticed because some earlier test in the same process
+        had already populated sys.modules["_hooklib"] with the REAL module,
+        which Python's import system then reused for the fake worktree copy
+        too, silently -- an order-dependent pass. Verified in isolation
+        (`pytest tests/test_resolve_runtime_dir_plugin.py::TestResolveRuntimeDirWalkParents::test_worktree_own_copy_wins_over_ancestor`
+        alone, fresh process, no prior _hooklib import) that the ORIGINAL,
+        pre-retarget test file failed this exact way for the
+        engram-lesson-tripwire-hook.py subject too -- this is not new
+        breakage from the retarget, it is a pre-existing hermeticity gap the
+        retarget's own isolation testing surfaced. Writing this sibling
+        unconditionally (redundant-but-harmless for "hooklib" subjects,
+        whose own file IS _hooklib.py) makes every subject's worktree tree
+        self-contained regardless of what else ran earlier in the process.
+        """
         main_repo = tmp_path / "main-repo"
         worktree = main_repo / ".claude" / "worktrees" / "fake-agent"
         worktree_hook_dir = worktree / "src" / "engram" / "hooks" / "claude"
         worktree_hook_dir.mkdir(parents=True)
-        worktree_hook_file = worktree_hook_dir / hook_path.name
-        shutil.copy2(hook_path, worktree_hook_file)
-        return main_repo, worktree, worktree_hook_file
+        worktree_file = worktree_hook_dir / subject.real_source_path.name
+        shutil.copy2(subject.real_source_path, worktree_file)
+        hooklib_sibling = worktree_hook_dir / "_hooklib.py"
+        if hooklib_sibling != worktree_file:
+            hooklib_sibling.write_text(_HOOKLIB_SRC)
+        return main_repo, worktree, worktree_file
+
+    @staticmethod
+    def _load_subject_fn(worktree_file: Path, subject: _WalkParentsSubject) -> types.FunctionType:
+        """Load the callable to exercise for `subject`, from the ALREADY
+        worktree-nested copy at worktree_file (see _build_worktree_tree)."""
+        if subject.source_kind == "hook":
+            return _load_function_clean(worktree_file)
+        fn = _load_resolve_runtime_dir_module(worktree_file)
+        return functools.partial(fn, sentinel=subject.sentinel)
 
     @staticmethod
     def _call_resolver(loaded_fn, takes_arg: bool, engram_home: str):
         return loaded_fn(engram_home) if takes_arg else loaded_fn()
 
-    def _resolve_with_clean_env(self, worktree_hook_file: Path, takes_arg: bool,
+    def _resolve_with_clean_env(self, worktree_file: Path, subject: _WalkParentsSubject,
                                  data_home: Path) -> str:
-        fn = _load_function_clean(worktree_hook_file)
+        fn = self._load_subject_fn(worktree_file, subject)
         with patch.dict(os.environ, {"ENGRAM_HOME": str(data_home)}, clear=False):
             os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-            return self._call_resolver(fn, takes_arg, str(data_home))
+            return self._call_resolver(fn, subject.takes_engram_home_arg, str(data_home))
 
     def test_worktree_own_copy_wins_over_ancestor(self):
         """Worktree has its OWN src/engram/<marker> -- the walk-parents
@@ -574,31 +689,31 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         the main-repo's (spec Tests item 2). Main-repo ALSO gets a copy so
         the assertion actually distinguishes "own copy wins" from "walked
         past it and found the ancestor's instead"."""
-        for hook_path, marker, takes_arg, _ in self._HOOKS:
-            with self.subTest(hook=hook_path.name):
+        for subject in self._SUBJECTS:
+            with self.subTest(subject=subject.label):
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
-                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
-                        tmp_path, hook_path
+                    main_repo, worktree, worktree_file = self._build_worktree_tree(
+                        tmp_path, subject
                     )
                     main_repo_engram_dir = main_repo / "src" / "engram"
                     main_repo_engram_dir.mkdir(parents=True)
-                    (main_repo_engram_dir / marker).write_text("# main-repo stub\n")
+                    (main_repo_engram_dir / subject.sentinel).write_text("# main-repo stub\n")
 
                     own_engram_dir = worktree / "src" / "engram"
-                    (own_engram_dir / marker).write_text("# worktree's own stub\n")
+                    (own_engram_dir / subject.sentinel).write_text("# worktree's own stub\n")
 
                     data_home = tmp_path / "data-only-home"
                     data_home.mkdir()
 
                     result = self._resolve_with_clean_env(
-                        worktree_hook_file, takes_arg, data_home
+                        worktree_file, subject, data_home
                     )
 
                     self.assertEqual(
                         result,
                         str(own_engram_dir),
-                        f"[{hook_path.name}] expected worktree's own "
+                        f"[{subject.label}] expected worktree's own "
                         f"{own_engram_dir!r}, got {result!r}",
                     )
 
@@ -607,29 +722,29 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         main-repo (an ancestor beyond the worktree) does -- the walk-parents
         search must find the ancestor's copy (spec Tests item 3, distinct
         from item 2's "worktree has its own copy" case)."""
-        for hook_path, marker, takes_arg, _ in self._HOOKS:
-            with self.subTest(hook=hook_path.name):
+        for subject in self._SUBJECTS:
+            with self.subTest(subject=subject.label):
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
-                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
-                        tmp_path, hook_path
+                    main_repo, worktree, worktree_file = self._build_worktree_tree(
+                        tmp_path, subject
                     )
                     # Worktree's own src/engram/ deliberately has NO marker.
                     main_repo_engram_dir = main_repo / "src" / "engram"
                     main_repo_engram_dir.mkdir(parents=True)
-                    (main_repo_engram_dir / marker).write_text("# main-repo stub\n")
+                    (main_repo_engram_dir / subject.sentinel).write_text("# main-repo stub\n")
 
                     data_home = tmp_path / "data-only-home"
                     data_home.mkdir()
 
                     result = self._resolve_with_clean_env(
-                        worktree_hook_file, takes_arg, data_home
+                        worktree_file, subject, data_home
                     )
 
                     self.assertEqual(
                         result,
                         str(main_repo_engram_dir),
-                        f"[{hook_path.name}] expected ancestor's "
+                        f"[{subject.label}] expected ancestor's "
                         f"{main_repo_engram_dir!r}, got {result!r}",
                     )
 
@@ -637,12 +752,12 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         """Nothing found anywhere in the walked parents -- must still return
         the ORIGINAL hardcoded fallback string, proving the old fallback is
         preserved (additive hardening), not removed (spec Tests item 4)."""
-        for hook_path, marker, takes_arg, expected_last_ditch in self._HOOKS:
-            with self.subTest(hook=hook_path.name):
+        for subject in self._SUBJECTS:
+            with self.subTest(subject=subject.label):
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
-                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
-                        tmp_path, hook_path
+                    main_repo, worktree, worktree_file = self._build_worktree_tree(
+                        tmp_path, subject
                     )
                     # No marker anywhere in the tree -- every walk-parents
                     # candidate misses.
@@ -650,14 +765,14 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
                     data_home.mkdir()
 
                     result = self._resolve_with_clean_env(
-                        worktree_hook_file, takes_arg, data_home
+                        worktree_file, subject, data_home
                     )
 
                     self.assertEqual(
                         result,
-                        expected_last_ditch,
-                        f"[{hook_path.name}] expected last-ditch "
-                        f"{expected_last_ditch!r}, got {result!r}",
+                        subject.expected_last_ditch,
+                        f"[{subject.label}] expected last-ditch "
+                        f"{subject.expected_last_ditch!r}, got {result!r}",
                     )
 
     def test_permission_error_mid_walk_degrades_to_last_ditch(self):
@@ -665,15 +780,15 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         directory mid-walk must degrade to the last-ditch fallback, not
         crash. pathlib.Path.exists() -- unlike os.path.exists() used at the
         rungs above -- raises PermissionError instead of returning False on
-        a permission-denied path component. Since engram-surface-hook.py
-        calls this function at bare MODULE-IMPORT time (unguarded), an
+        a permission-denied path component. Since the resolver is called at
+        bare MODULE-IMPORT time (unguarded) by most of its callers, an
         unhandled exception here would crash the whole hook process."""
-        for hook_path, marker, takes_arg, expected_last_ditch in self._HOOKS:
-            with self.subTest(hook=hook_path.name):
+        for subject in self._SUBJECTS:
+            with self.subTest(subject=subject.label):
                 with tempfile.TemporaryDirectory() as tmp:
                     tmp_path = Path(tmp)
-                    main_repo, worktree, worktree_hook_file = self._build_worktree_tree(
-                        tmp_path, hook_path
+                    main_repo, worktree, worktree_file = self._build_worktree_tree(
+                        tmp_path, subject
                     )
                     # No marker anywhere findable -- same empty tree as the
                     # last-ditch test, but additionally lock down the
@@ -685,17 +800,19 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
                     data_home.mkdir()
 
                     # Load the function BEFORE locking down the directory --
-                    # importing the hook module itself needs to traverse
-                    # worktree/src/engram/hooks/claude/<hook>.py, which lives
+                    # loading the subject module needs to traverse
+                    # worktree/src/engram/hooks/claude/<file>, which lives
                     # UNDER the same directory we're about to chmod. Only the
                     # subsequent CALL (which does the walk-parents .exists()
                     # checks) should hit the permission wall.
-                    fn = _load_function_clean(worktree_hook_file)
+                    fn = self._load_subject_fn(worktree_file, subject)
                     os.chmod(own_engram_dir, 0o000)
                     try:
                         with patch.dict(os.environ, {"ENGRAM_HOME": str(data_home)}, clear=False):
                             os.environ.pop("ENGRAM_RUNTIME_DIR", None)
-                            result = self._call_resolver(fn, takes_arg, str(data_home))
+                            result = self._call_resolver(
+                                fn, subject.takes_engram_home_arg, str(data_home)
+                            )
                     finally:
                         # Restore permissions so TemporaryDirectory cleanup
                         # (which must delete this dir) doesn't itself fail.
@@ -703,9 +820,9 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
 
                     self.assertEqual(
                         result,
-                        expected_last_ditch,
-                        f"[{hook_path.name}] expected degrade-to-last-ditch "
-                        f"{expected_last_ditch!r} on a permission error "
+                        subject.expected_last_ditch,
+                        f"[{subject.label}] expected degrade-to-last-ditch "
+                        f"{subject.expected_last_ditch!r} on a permission error "
                         f"mid-walk, got {result!r}",
                     )
 

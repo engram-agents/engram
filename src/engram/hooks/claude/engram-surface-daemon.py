@@ -127,39 +127,29 @@ def _resolve_engram_home() -> str:
     )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate where engram_client.py lives for import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
-
-
 ENGRAM_HOME = _resolve_engram_home()
-PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
+
+# _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir (gh#2570 --
+# the maintainer's own count correction: this hook's local copy was an
+# accidental omission from the original three-hook enumeration, identical
+# in signature/body to engram-session-start-hook.py's pre-migration copy,
+# not a fourth variant). This hook's own sentinel, engram_client.py, is
+# preserved unchanged. This file's own directory is NOT already on
+# sys.path (unlike hooks that self-insert it for other reasons), and
+# several tests load this module directly via
+# importlib.util.spec_from_file_location (test_surface_daemon_indexer.py,
+# test_surface_daemon_idle_timeout.py, test_surface_daemon_pid_reap.py,
+# test_pgrep_liveness_reap_patterns.py), which does not implicitly add the
+# hook's directory to sys.path the way a subprocess invocation does --
+# insert explicitly so both invocation styles resolve _hooklib the same
+# way (same fix applied to engram-deference-detector-prompt.py in this
+# same change).
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import resolve_runtime_dir
+
+PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
 

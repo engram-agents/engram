@@ -77,7 +77,7 @@ SESSIONS_DIR = os.path.join(ENGRAM_HOME, "sessions")
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
 try:
     from _stophooklib import (
         resolve_transcript_path as _resolve_transcript_path,
@@ -86,6 +86,14 @@ try:
     _STOPHOOKLIB_OK = True
 except Exception:
     _STOPHOOKLIB_OK = False
+
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
 DEFERENCE_MARKER_PATH = os.path.join(ENGRAM_HOME, "deference-detected.json")
 LOOP_MARKER_PATH = os.path.join(ENGRAM_HOME, "loop-mode.json")
 LOG_PATH = os.path.join(ENGRAM_HOME, "deference-detector.log")
@@ -319,7 +327,6 @@ def _payload_from_stdin() -> dict | None:
 def _emit_hook_fire(session_id: str | None, transcript_path: str | None, duration_ms: int) -> None:
     """Emit engram.hook.fire event. Failure must not break the hook."""
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id or "unknown",
