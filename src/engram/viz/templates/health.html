@@ -74,14 +74,48 @@
        this page's copy was byte-identical dead weight left behind by PR
        B's nav-CSS consolidation, which covered .nav/.nav a/.nav a:hover
        but missed this trio). */
+    /* View toggle (Normal/Detail) + Snapshot-now button shell -- #2518 slice 1.
+       Page-scoped (not base.css): this control only exists on health.html. */
+    .health-header { display: flex; align-items: center; justify-content: space-between;
+                      flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .health-header h1 { margin-bottom: 0; }
+    .health-header-controls { display: flex; align-items: center; gap: 12px; }
+    .view-toggle { display: inline-flex; border: 1px solid #1a4a8a; border-radius: 4px;
+                   overflow: hidden; }
+    .view-toggle-btn { background: #0d1b36; color: #888; border: none; padding: 6px 14px;
+                        font-size: 0.85em; font-family: inherit; cursor: pointer; }
+    .view-toggle-btn:hover { background: #16213e; color: #ccc; }
+    .view-toggle-btn.active { background: #00d4ff; color: #0d1b36; font-weight: 600; }
+    .view-toggle-btn + .view-toggle-btn { border-left: 1px solid #1a4a8a; }
+    .snapshot-now-btn { background: #0d1b36; color: #888; border: 1px solid #1a4a8a;
+                         border-radius: 4px; padding: 6px 12px; font-size: 0.85em;
+                         font-family: inherit; cursor: not-allowed; opacity: 0.6; }
+    /* Detail-view empty state -- matches #loading's visual treatment
+       (text-align/padding/color), per the existing dark theme. */
+    .detail-empty-state { text-align: center; padding: 40px; color: #888; }
   </style>
 </head>
 <body>
 <!--NAV_PLACEHOLDER-->
-  <h1>ENGRAM Health Dashboard</h1>
-  <div id="loading">Loading health data...</div>
-  <div id="dashboard" style="display:none;">
-    <div class="grid" id="cards"></div>
+  <div class="health-header">
+    <h1>ENGRAM Health Dashboard</h1>
+    <div class="health-header-controls">
+      <div class="view-toggle" id="view-toggle" role="group" aria-label="View mode">
+        <button type="button" class="view-toggle-btn" id="view-toggle-normal" data-view="normal">Normal</button>
+        <button type="button" class="view-toggle-btn" id="view-toggle-detail" data-view="detail">Detail</button>
+      </div>
+      <button type="button" class="snapshot-now-btn" id="snapshot-now-btn" disabled
+              title="Recompute endpoint not yet available">Snapshot now</button>
+    </div>
+  </div>
+  <div id="normal-view">
+    <div id="loading">Loading health data...</div>
+    <div id="dashboard" style="display:none;">
+      <div class="grid" id="cards"></div>
+    </div>
+  </div>
+  <div id="detail-view" style="display:none;">
+    <div class="detail-empty-state">No detail-view snapshot data yet — this view is under construction.</div>
   </div>
 
   <script>
@@ -117,6 +151,60 @@
         document.getElementById('loading').textContent = 'Error: ' + e.message;
       });
   }
+
+  // ── View toggle (Normal/Detail) -- #2518 slice 1 ─────────────────────────
+  // State-resolution order: URL ?view= param wins if present, else the
+  // localStorage preference, else "normal". Detail view has no real data
+  // source yet (see #detail-view's empty-state placeholder above) -- this
+  // is shell-only, no fetch, no new endpoint.
+  var VIEW_STORAGE_KEY = 'healthViewPreference';
+
+  function getInitialView() {
+    var urlView = new URL(window.location.href).searchParams.get('view');
+    if (urlView === 'detail' || urlView === 'normal') return urlView;
+    // localStorage access throws SecurityError in a browser that denies
+    // site data (e.g. Chrome "Block all cookies", Firefox
+    // dom.storage.enabled=false) -- guarded so that throw can never abort
+    // this top-level inline script before loadHealth() below runs.
+    // Ariadne's colleague-review finding on #2579: unguarded, this took
+    // down the whole dashboard, not just the toggle's persistence.
+    try {
+      var stored = localStorage.getItem(VIEW_STORAGE_KEY);
+      if (stored === 'detail' || stored === 'normal') return stored;
+    } catch (e) { /* storage blocked -- fall through to the default */ }
+    return 'normal';
+  }
+
+  function applyView(view, persist) {
+    var isDetail = view === 'detail';
+    document.getElementById('normal-view').style.display = isDetail ? 'none' : '';
+    document.getElementById('detail-view').style.display = isDetail ? '' : 'none';
+    document.getElementById('view-toggle-normal').classList.toggle('active', !isDetail);
+    document.getElementById('view-toggle-detail').classList.toggle('active', isDetail);
+    document.getElementById('view-toggle-normal').setAttribute('aria-pressed', String(!isDetail));
+    document.getElementById('view-toggle-detail').setAttribute('aria-pressed', String(isDetail));
+    if (persist) {
+      // See getInitialView()'s comment -- same guard, same reason.
+      try {
+        localStorage.setItem(VIEW_STORAGE_KEY, view);
+      } catch (e) { /* storage blocked -- persistence is lost, not fatal */ }
+      var url = new URL(window.location.href);
+      if (isDetail) {
+        url.searchParams.set('view', 'detail');
+      } else {
+        url.searchParams.delete('view');
+      }
+      history.replaceState(null, '', url.toString());
+    }
+  }
+
+  applyView(getInitialView(), false);
+  document.getElementById('view-toggle-normal').addEventListener('click', function () {
+    applyView('normal', true);
+  });
+  document.getElementById('view-toggle-detail').addEventListener('click', function () {
+    applyView('detail', true);
+  });
 
   // Agent switching is handled by the shared top-nav selector (see
   // _NAV_SCRIPT); loadHealth() reads _currentAgent() from the URL on each
