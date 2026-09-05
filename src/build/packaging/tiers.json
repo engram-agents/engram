@@ -1126,6 +1126,10 @@
       "reason": "regression test for gh#2570 (emitter path-resolution propagation) — dev-tier (T3) pytest suite, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_cascade_playbox.py precedent above."
     },
     {
+      "path": "tests/test_health_version_gate.py",
+      "reason": "engram-alpha#2563 Gap 3 — the health-version tag-diff gate's pytest suite (well-formedness + adequacy checks, falsifier suite against scratch git repos). Dev-tier (T3): a CI-only invariant-checks test, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_hook_emitter_path_resolution.py precedent above."
+    },
+    {
       "path": ".github/",
       "reason": "GitHub Actions CI configuration — runs in GitHub's cloud, never part of the plugin install"
     },

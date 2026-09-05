@@ -61,7 +61,15 @@ jobs:
         with:
           # fetch-depth: 0 needed by no-new-shipped-node-ids and name-leak-warn
           # for base-branch diff; harmless for checks that don't use history.
+          # fetch-tags: true (#2563 Gap 3) — the health-version tag-diff gate
+          # below enumerates refs/tags/v* + refs/tags/deploy/* via
+          # `git for-each-ref`, so the runner's checkout must actually carry
+          # tag objects. This job has one shared checkout for all its steps
+          # (pr-checks is a single combined job, see header); adding
+          # fetch-tags here is a one-line change that covers every step,
+          # rather than a second checkout scoped to this one gate.
           fetch-depth: 0
+          fetch-tags: true
 
       # ── 1. anti-dup ────────────────────────────────────────────────────
       # (from anti-dup-check.yml)
@@ -507,6 +515,19 @@ jobs:
         # above, and it is the only enforcement of the MAJOR-bump
         # convention on dev PRs.
         run: python3 -m pytest tests/test_health_measurements.py -q
+
+      - name: invariant-checks — health version tag-diff gate (engram-alpha#2563 Gap 3)
+        # Checks health/version.py's (MAJOR, MINOR) against how HEAD's L0
+        # measurement set differs from the last deployable tag (refs/tags/v*
+        # union refs/tags/deploy/*). Two independent checks: well-formedness
+        # of the staged version delta (pure arithmetic, denies malformed
+        # shapes without ever touching hashes), then adequacy of that delta
+        # against the required severity computed from L0 hashes at HEAD vs
+        # at the tag. Gap 2 (the derived-layer hash) is not built yet, so
+        # the required severity can only be MAJOR or NONE in this PR — see
+        # the test module's docstring. PASSES with a stated "gate inactive"
+        # reason today, since no deployable tag yet carries health/version.py.
+        run: python3 -m pytest tests/test_health_version_gate.py -q
 
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
