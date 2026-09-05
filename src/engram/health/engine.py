@@ -690,25 +690,13 @@ def compose_aspect_scores(
 # ---------------------------------------------------------------------------
 
 
-def _run_aspect(
-    l1_signals: dict[str, float | _Unavailable],
-    aspect: AspectDef,
-    model: ScoringModel = MODEL,
-) -> tuple[dict[str, float | _Unavailable], float | _Unavailable]:
-    """Run every metric in one aspect — raw signal via the L1 layer
-    (engram-alpha#2537 slice 2: ``health.signals``, arithmetic over the L0
-    measurements dict — SUPERSEDES this function's pre-slice-2 behavior of
-    calling CONFIG's ``metric.signal_fn(conn)`` directly per metric; see
-    module docstring's "THREE PARALLEL SYSTEMS" section for what CONFIG's
-    ``signal_fn`` still does post-slice-2). Return (raw_by_metric,
-    aspect_score), where aspect_score is computed via ``_score_aspect``
-    against the scoring model, NOT via ``aspect.scoring_fn`` (vestigial as
-    of PR5 — see module docstring)."""
-    raw_by_metric: dict[str, float | _Unavailable] = {}
-    for metric in aspect.metrics:
-        raw_by_metric[metric.name] = l1_signals[metric.name]
-    aspect_score = _score_aspect(aspect.name, raw_by_metric, model)
-    return raw_by_metric, aspect_score
+# _run_aspect (config-driven: iterated CONFIG's AspectDef.metrics) was
+# deleted here in engram-alpha#2575 PR C0 round 2 — it became unused once
+# score_signals switched to iterating model.aspects/model.metrics directly
+# (see score_signals's own docstring for why). Grepped for other
+# callers/tests first: none found — every reference elsewhere in this
+# module and in tests/test_health_engine.py is prose (docstrings, comments,
+# an error-message string) naming the old code path, not a call.
 
 
 class HealthEngineSSoTError(Exception):
@@ -1292,6 +1280,104 @@ def _compute_diagnostics(conn: sqlite3.Connection, current_turn: int) -> dict:
     }
 
 
+def score_signals(
+    l1_signals: dict[str, float | _Unavailable],
+    model: ScoringModel = MODEL,
+) -> tuple[dict, dict]:
+    """(signals_jsonable, scores) for one L1 signals dict — EXACTLY the
+    block ``build_snapshot`` computes between its L1 read and its return:
+    per-metric curve scores, per-aspect scores, composed, unscored_aspects,
+    points_in_play, composed_coverage, aspect_coverage. ``build_snapshot``
+    calls THIS; the series deriver (PR C1) calls THIS on a stored L0 row
+    with a model reconstructed from the snapshot's own
+    ``model_defs``/``curve_defs`` (``health.model.model_from_defs``) — one
+    function, two callers, so "the same functions the live engine uses"
+    (design doc §2) is true by construction rather than by copy.
+
+    RULING (PR C0 round 2, overriding round 1's ``config.aspects``
+    decision): iterates ``model.aspects``/``model.metrics`` — NEVER
+    ``config.aspects`` — because this function's whole point is to score an
+    L1 dict through a model that may be a HISTORICAL reconstruction
+    (``health.model.model_from_defs``, PR C1's deriver) of a version's OWN
+    declared bindings, not necessarily HEAD's live ``MODEL``. Reading
+    HEAD's ``CONFIG.aspects`` names inside this function would read HEAD's
+    metric set into a historical model — a ``KeyError`` when a version
+    lacks a signal HEAD has, silent omission when it has one HEAD lacks,
+    and HEAD's aspect set imposed on a version that declared a different
+    one. There is no ``config`` parameter for this reason.
+
+    Key ORDER in ``signals``/``scores.metrics`` is model declaration order
+    (``model.aspects``, and within each aspect, ``model.metrics`` filtered
+    to that aspect, in ``model.metrics`` declaration order) — NOT a
+    contract. It changes from before this extraction for two aspects
+    (round 1 measured: ``epistemic_integrity`` config order
+    ``[stale, taint, open_contradiction]`` vs model order
+    ``[taint, stale, open_contradiction]``; ``retrievability`` config order
+    ``[summary, keywords, embedding, giant]`` vs model order
+    ``[embedding, summary, keywords, giant]``) — every stored comparison in
+    this codebase goes through parsed dicts or ``sort_keys=True`` canonical
+    JSON, so key order in a JSON dict is presentation, not a contract.
+
+    A signal present in ``l1_signals`` but bound to no metric in ``model``
+    is simply not in the output. A metric in ``model`` whose signal is
+    absent from ``l1_signals`` raises ``KeyError`` naming the signal (a
+    bare ``l1_signals[m.signal]`` subscript) — never a silent default.
+    """
+    signals: dict[str, object] = {}
+    scores_per_metric: dict[str, object] = {}
+    scores_per_aspect: dict[str, object] = {}
+    aspect_raw_scores: dict[str, float | _Unavailable] = {}
+    aspect_raw_by_metric: dict[str, dict[str, float | _Unavailable]] = {}
+
+    for aspect in model.aspects:
+        aspect_metrics = [m for m in model.metrics if m.aspect == aspect.name]
+        raw_by_metric: dict[str, float | _Unavailable] = {}
+        for m in aspect_metrics:
+            raw_by_metric[m.signal] = l1_signals[m.signal]
+        aspect_score = _score_aspect(aspect.name, raw_by_metric, model)
+        for m in aspect_metrics:
+            raw = raw_by_metric[m.signal]
+            signals[m.signal] = _to_jsonable(raw)
+            if raw is UNAVAILABLE:
+                scores_per_metric[m.signal] = "UNAVAILABLE"
+            else:
+                curve = model.curves[m.curve]
+                scores_per_metric[m.signal] = curve.curve_fn(raw)
+        scores_per_aspect[aspect.name] = _to_jsonable(aspect_score)
+        aspect_raw_scores[aspect.name] = aspect_score
+        aspect_raw_by_metric[aspect.name] = raw_by_metric
+
+    composed = compose_aspect_scores(model, aspect_raw_scores)
+    unscored_aspects, points_in_play = _composition_coverage(model, aspect_raw_scores)
+    composed_coverage = points_in_play / 100.0
+
+    # Per-aspect metrics_in_play/coverage (addendum 2's one-level-down
+    # generalization) — SCORED aspects only, see build_snapshot's own
+    # docstring for why an unscored aspect has no entry here.
+    aspect_coverage: dict[str, dict[str, object]] = {}
+    for aspect in model.aspects:
+        if aspect.name in unscored_aspects:
+            continue
+        metrics_in_play, coverage = _aspect_metric_coverage(
+            aspect.name, aspect_raw_by_metric[aspect.name], model
+        )
+        aspect_coverage[aspect.name] = {
+            "metrics_in_play": metrics_in_play,
+            "coverage": coverage,
+        }
+
+    scores = {
+        "metrics": scores_per_metric,
+        "aspects": scores_per_aspect,
+        "composed": _to_jsonable(composed),
+        "unscored_aspects": unscored_aspects,
+        "points_in_play": points_in_play,
+        "composed_coverage": composed_coverage,
+        "aspect_coverage": aspect_coverage,
+    }
+    return signals, scores
+
+
 def build_snapshot(
     conn: sqlite3.Connection,
     checkpoint_mode: str,
@@ -1377,52 +1463,13 @@ def build_snapshot(
     # only at some future re-score time.
     _verify_l1_against_live_signal_fns(conn, l1_signals)
 
-    signals: dict[str, object] = {}
-    scores_per_metric: dict[str, object] = {}
-    scores_per_aspect: dict[str, object] = {}
-    aspect_raw_scores: dict[str, float | _Unavailable] = {}
-    aspect_raw_by_metric: dict[str, dict[str, float | _Unavailable]] = {}
-
-    # Local (signal -> MetricBinding) lookup for THIS model instance —
-    # deliberately not a cached attribute on ScoringModel (which is frozen
-    # and shared across calls): build_snapshot may be called with a
-    # non-default ``model`` (e.g. from tests), so this is recomputed per
-    # call rather than trusting health_engine_model.METRIC_BY_SIGNAL, which
-    # is only valid for the default MODEL instance.
-    metric_by_signal = {m.signal: m for m in model.metrics}
-
-    for aspect in config.aspects:
-        raw_by_metric, aspect_score = _run_aspect(l1_signals, aspect, model)
-        for metric_name, raw in raw_by_metric.items():
-            signals[metric_name] = _to_jsonable(raw)
-            if raw is UNAVAILABLE:
-                scores_per_metric[metric_name] = "UNAVAILABLE"
-            else:
-                binding = metric_by_signal[metric_name]
-                curve = model.curves[binding.curve]
-                scores_per_metric[metric_name] = curve.curve_fn(raw)
-        scores_per_aspect[aspect.name] = _to_jsonable(aspect_score)
-        aspect_raw_scores[aspect.name] = aspect_score
-        aspect_raw_by_metric[aspect.name] = raw_by_metric
-
-    composed = compose_aspect_scores(model, aspect_raw_scores)
-    unscored_aspects, points_in_play = _composition_coverage(model, aspect_raw_scores)
-    composed_coverage = points_in_play / 100.0
-
-    # Per-aspect metrics_in_play/coverage (addendum 2's one-level-down
-    # generalization) — SCORED aspects only, see build_snapshot's own
-    # docstring for why an unscored aspect has no entry here.
-    aspect_coverage: dict[str, dict[str, object]] = {}
-    for aspect in model.aspects:
-        if aspect.name in unscored_aspects:
-            continue
-        metrics_in_play, coverage = _aspect_metric_coverage(
-            aspect.name, aspect_raw_by_metric[aspect.name], model
-        )
-        aspect_coverage[aspect.name] = {
-            "metrics_in_play": metrics_in_play,
-            "coverage": coverage,
-        }
+    # engram-alpha#2575 PR C0: the per-metric/per-aspect scoring block
+    # (curve scores, composition, coverage) is now ONE shared function —
+    # see score_signals's own docstring for why (design doc §2's "the same
+    # functions the live engine uses" made true by construction). Round 2:
+    # score_signals iterates the MODEL, not config.aspects — see its own
+    # docstring — so no config is passed here.
+    signals, scores = score_signals(l1_signals, model)
 
     return {
         "schema_version": config.schema_version,
@@ -1467,16 +1514,14 @@ def build_snapshot(
         # curve_fn.keywords introspection, so a stored snapshot is
         # self-describing about which curve shape actually scored it.
         "curve_defs": health_curves.curve_defs_jsonable(model.curves),
+        # engram-alpha#2575 PR C0 — the model-layer twin of
+        # signal_defs/curve_defs: which curve/aspect/importance each SIGNAL
+        # is bound to, and each aspect's points — so a stored snapshot can
+        # be RE-SCORED as of its own version (design doc D4.1), never
+        # re-scored through HEAD's model.
+        "model_defs": health_engine_model.model_defs_jsonable(model),
         "signals": signals,
-        "scores": {
-            "metrics": scores_per_metric,
-            "aspects": scores_per_aspect,
-            "composed": _to_jsonable(composed),
-            "unscored_aspects": unscored_aspects,
-            "points_in_play": points_in_play,
-            "composed_coverage": composed_coverage,
-            "aspect_coverage": aspect_coverage,
-        },
+        "scores": scores,
         # DAG violations as a red_flags entry are explicitly OUT of scope for
         # PR3 too (see module docstring) — left exactly as PR2 shipped it.
         "red_flags": [],

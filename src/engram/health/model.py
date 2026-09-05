@@ -741,3 +741,155 @@ MODEL_SPEC = ScoringModel(
 # a signal bound twice to the SAME aspect is caught by the same check too,
 # since the pair is identical).
 METRIC_BY_SIGNAL: dict[str, MetricBinding] = {m.signal: m for m in MODEL_SPEC.metrics}
+
+
+# ---------------------------------------------------------------------------
+# model_defs_jsonable / model_from_defs — engram-alpha#2575 PR C0
+# ---------------------------------------------------------------------------
+
+
+def model_defs_jsonable(model: ScoringModel) -> dict:
+    """JSON-able declaration of a ``ScoringModel``'s aspect/metric BINDINGS
+    (engram-alpha#2575 PR C0, design doc D4.1) — the model-layer twin of
+    ``health.signals.signal_defs_jsonable`` / ``health.curves.
+    curve_defs_jsonable``. Closes the two gaps ``viz/data/health_v2.py``'s
+    own docstrings already name: "no field anywhere in the snapshot
+    declares which curve a given SIGNAL uses", and "per-metric importance
+    serialized into the snapshot, which isn't yet" (#2580). Without this
+    blob a stored snapshot's SIGNALS can be re-derived as of its own
+    ``health_version`` (via ``signal_defs``/``curve_defs``), but its SCORES
+    cannot — D4.1's "versions must be executable, not merely recorded",
+    one layer up.
+
+    Emits LISTS, not dicts, so declaration ORDER is preserved: composition
+    (``health.engine``'s ``build_snapshot``/``score_signals``) iterates
+    ``model.aspects``/``model.metrics`` in declaration order (PR C0 round
+    2: ``score_signals`` iterates the MODEL, not ``config.aspects`` — see
+    that function's own docstring for why), and a consumer reconstructing a
+    historical model from this blob must be able to reproduce the SAME
+    iteration.
+
+    A consumer reconstructs ``AspectSpec``/``MetricBinding`` (with
+    ``DetectorRef`` where present) from THIS dict, and ``CurveSpec`` from a
+    snapshot's own ``curve_defs`` blob, separately — see ``model_from_defs``
+    below — NEVER from any callable: per Borges's closed-operator-set
+    ruling, the scoring model ships as frozen DATA, and ``signal_fn``
+    callables are inadmissible in this blob (there are none here to leak;
+    ``ScoringModel.signals`` is not emitted at all).
+    """
+    return {
+        "aspects": [
+            {
+                "name": aspect.name,
+                "points": aspect.points,
+                "reference_metric": aspect.reference_metric,
+            }
+            for aspect in model.aspects
+        ],
+        "metrics": [
+            {
+                "signal": metric.signal,
+                "aspect": metric.aspect,
+                "curve": metric.curve,
+                "importance": metric.importance,
+                "detector": (
+                    {
+                        "name": metric.detector.name,
+                        "population": metric.detector.population,
+                    }
+                    if metric.detector is not None
+                    else None
+                ),
+                "additional_detector": (
+                    {
+                        "name": metric.additional_detector.name,
+                        "population": metric.additional_detector.population,
+                    }
+                    if metric.additional_detector is not None
+                    else None
+                ),
+                "repair": metric.repair,
+                "dive_target": metric.dive_target,
+            }
+            for metric in model.metrics
+        ],
+    }
+
+
+def _detector_ref_from_dict(raw: dict | None) -> DetectorRef | None:
+    """``{"name", "population"}`` -> ``DetectorRef``, or ``None`` -> ``None``
+    — the one shared sub-shape ``model_from_defs`` reconstructs twice
+    (``detector`` and ``additional_detector``). Raises ``KeyError`` on a
+    malformed dict — see ``model_from_defs``'s own docstring for why this
+    never fills a missing field with a default.
+    """
+    if raw is None:
+        return None
+    return DetectorRef(name=raw["name"], population=raw["population"])
+
+
+def model_from_defs(model_defs: dict, curve_defs: dict) -> ScoringModel:
+    """Reconstruct an UNVALIDATED ``ScoringModel`` from a snapshot's own
+    ``model_defs``/``curve_defs`` blobs (data only) — engram-alpha#2575 PR
+    C0, design doc D4.1's "recomputed ... through the declared ... model
+    AS OF X" requirement: a consumer (PR C1's series deriver) rebuilds the
+    historical model these two blobs describe, never HEAD's ``MODEL``.
+
+    Builds, per ``curve_defs`` entry, ``CurveSpec(name, knots=tuple(tuple(k)
+    for k in knots), monotone_direction, input_domain=tuple(...),
+    output_range=tuple(...), observed_range=tuple(...) or None)``; and, per
+    ``model_defs`` entry, ``AspectSpec`` / ``MetricBinding`` (with
+    ``DetectorRef`` where present, via ``_detector_ref_from_dict`` above).
+    ``signals={}`` on the returned model — the scoring functions
+    (``_score_aspect``, ``compose_aspect_scores``, and this PR's
+    ``health.engine.score_signals``) never read ``ScoringModel.signals``,
+    only ``.curves``/``.aspects``/``.metrics``.
+
+    Deliberately NOT passed through ``load()``/``validate_model`` —
+    validation needs the live ``CONFIG``, and a historical version's own
+    declarations are not HEAD's ``CONFIG`` to validate against (D4.1); a
+    past version was valid against ITS OWN config when it was recorded, and
+    re-validating it against a config that may have since changed would be
+    validating the wrong thing.
+
+    Raises ``KeyError``/``TypeError`` on a malformed blob — never fills a
+    missing field with a HEAD default, so a version whose own declarations
+    are broken fails loud instead of silently borrowing HEAD's shape.
+    """
+    curves = {
+        name: CurveSpec(
+            name=name,
+            knots=tuple(tuple(k) for k in spec["knots"]),
+            monotone_direction=spec["monotone_direction"],
+            input_domain=tuple(spec["input_domain"]),
+            output_range=tuple(spec["output_range"]),
+            observed_range=(
+                tuple(spec["observed_range"])
+                if spec["observed_range"] is not None
+                else None
+            ),
+        )
+        for name, spec in curve_defs.items()
+    }
+    aspects = tuple(
+        AspectSpec(
+            name=a["name"],
+            points=a["points"],
+            reference_metric=a["reference_metric"],
+        )
+        for a in model_defs["aspects"]
+    )
+    metric_bindings = tuple(
+        MetricBinding(
+            signal=m["signal"],
+            aspect=m["aspect"],
+            curve=m["curve"],
+            importance=m["importance"],
+            detector=_detector_ref_from_dict(m["detector"]),
+            additional_detector=_detector_ref_from_dict(m["additional_detector"]),
+            repair=m["repair"],
+            dive_target=m["dive_target"],
+        )
+        for m in model_defs["metrics"]
+    )
+    return ScoringModel(curves=curves, signals={}, aspects=aspects, metrics=metric_bindings)

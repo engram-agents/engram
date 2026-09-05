@@ -215,8 +215,9 @@ def _derive_status(
     structural invariant this function enforces -- a future aspect adding a
     diagnostic metric alongside independently-failable admitted ones would
     silently break it. No fix applied here: doing so would need per-metric
-    importance serialized into the snapshot, which isn't yet (#2580, still
-    open) -- flagging for whoever adds that.
+    importance serialized into the snapshot -- now available as of
+    engram-alpha#2575 PR C0's ``model_defs`` blob (``metrics[].importance``)
+    -- flagging for whoever wires this function to read it.
     """
     if signals.get(name) == "UNAVAILABLE":
         return "unavailable"
@@ -310,16 +311,12 @@ def _signal_row(name: str, snapshot: dict, metric_to_aspect: dict) -> dict:
             # STUBBED. #2578 merged (curve_defs is a real, declared field
             # in the snapshot now: {curve_name: {knots, input_domain,
             # monotone_direction, output_range, observed_range}}) -- but
-            # curve_defs is keyed by CURVE name, not signal name, and no
-            # field anywhere in the snapshot declares which curve a given
-            # SIGNAL uses (health.engine's live code reads that off
-            # MetricBinding.curve, a Python object this module deliberately
-            # does not import). Hand-copying that per-signal mapping into
-            # viz would repeat the exact anti-pattern signal_defs/curve_defs
-            # were both built to avoid -- flagged on #2518 rather than
-            # worked around; a `curve` field belongs beside `numerator`/
-            # `denominator` in signal_defs (or a sibling field), the same
-            # place the num/den mapping landed.
+            # curve_defs is keyed by CURVE name, not signal name. The
+            # per-signal mapping now EXISTS as of engram-alpha#2575 PR C0's
+            # ``model_defs`` blob (``metrics[].curve``, keyed by signal) --
+            # flagged on #2518 rather than worked around here; wiring this
+            # field to read ``model_defs`` is left for whoever picks this
+            # up.
             "curve": None,
         },
     }

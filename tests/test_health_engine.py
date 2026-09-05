@@ -689,15 +689,16 @@ class TestBuildSnapshot:
         (engram-alpha#2537, slice 2 — the two independent version axes,
         health/version.py's own design) are the new keys this epic adds —
         purely additive, see health/measurements.py's and
-        health/signals.py's module docstrings. Every other key is
-        unchanged from PR5."""
+        health/signals.py's module docstrings. ``model_defs``
+        (engram-alpha#2575 PR C0) — the model-layer declaration blob,
+        additive. Every other key is unchanged from PR5."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
         assert set(snap.keys()) == {
             "schema_version", "engine_version", "health_version",
             "raw_schema_version", "model_version", "config", "definitions",
             "measurements", "measurement_labels", "signals", "signal_defs",
-            "curve_defs", "scores", "red_flags",
+            "curve_defs", "model_defs", "scores", "red_flags",
             "diagnostics", "anchor", "turn", "checkpoint_mode",
         }
 
