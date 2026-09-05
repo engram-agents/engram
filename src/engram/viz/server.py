@@ -84,6 +84,7 @@ from .data import calibration as viz_calibration_data
 from .data import config as viz_config_data
 from .data import graph as viz_graph_data
 from .data import health as viz_health_data
+from .data import health_v2 as viz_health_v2_data
 from .data import schema as viz_schema_data
 from .data import stats as viz_stats_data
 
@@ -228,6 +229,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 index_db_path = viz_stats_data._resolve_logs_index(agent_name)
                 resp = viz_stats_data.get_stats_data(index_db_path)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/health/v2":
+            # health-v2 SSoT panel (engram-alpha#2518) -- backend loader
+            # only; the detail-view frontend that consumes this endpoint is
+            # a separate, not-yet-landed PR. Single-agent only (no /fleet
+            # here -- reading OTHER agents' snapshot directories needs a
+            # separate cross-UID permission design, out of scope for this
+            # slice).
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                resp = viz_health_v2_data.get_health_v2_data(agent_name)
                 resp["agent"] = agent_name
                 self._json(resp)
         elif path == "/api/calibration":

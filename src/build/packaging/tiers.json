@@ -212,6 +212,11 @@
       "tier": "convenience"
     },
     {
+      "path": "viz/data/health_v2.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2518: health-v2 SSoT loader for /api/health/v2 -- same tier as its v1 sibling health.py and the rest of the viz dashboard."
+    },
+    {
       "path": "viz/data/stats.py",
       "tier": "convenience"
     },
