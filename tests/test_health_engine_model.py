@@ -87,7 +87,9 @@ def _fake_signal_ok(conn):
 
 _FAKE_CURVE = CurveSpec(
     name="fake_curve",
-    curve_fn=lambda x: 1.0 - x,
+    # curve_fn is now DERIVED from knots (engram-alpha#2576); these two
+    # knots reproduce the old `lambda x: 1.0 - x` EXACTLY over [0.0, 1.0].
+    knots=((0.0, 1.0), (1.0, 0.0)),
     input_domain=(0.0, 1.0),
     monotone_direction="decreasing",
 )

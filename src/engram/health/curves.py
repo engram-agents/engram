@@ -44,7 +44,7 @@ work, gated on the D1/D2 rulings still pending with Lei.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 
@@ -119,27 +119,47 @@ MonotoneDirection = Literal["increasing", "decreasing"]
 
 @dataclass(frozen=True)
 class CurveSpec:
-    """Pairs a fully-specified, single-argument curve function with its
-    declared Layer-3 contract (design doc "Layer 3 — Scoring curves").
+    """Pairs a curve's DECLARED DATA (its knots) with its declared Layer-3
+    contract (design doc "Layer 3 — Scoring curves").
 
-    ``curve_fn`` is ``Callable[[float], float]`` — a curve shape with all
-    of its shape-specific parameters already bound (e.g.
-    ``functools.partial(piecewise_linear, knots=...)``), NOT the raw
-    multi-parameter ``piecewise_linear`` itself. This lets the
-    property-test suite (tests/test_health_engine_curves.py) iterate over
-    a list of ``CurveSpec`` instances and call ``spec.curve_fn(x)``
-    uniformly, regardless of which curve SHAPE backs any given one —
-    piecewise-linear today; sigmoid/step per the design doc's open Q1
-    ("where does the curve library stop?"), later, without changing this
-    contract.
+    ``knots`` — a tuple of ``(x, y)`` pairs, sorted ascending by ``x`` — is
+    the one declared field a curve's SHAPE is built from. Ascending is
+    NON-DECREASING — ties allowed — a zero-width segment is a step, per
+    ``piecewise_linear``'s own degenerate-segment rule; validated in
+    ``__post_init__`` (engram-alpha#2576:
+    before this field existed, the knots lived only inside a
+    ``functools.partial(piecewise_linear, knots=...)`` bound to
+    ``curve_fn``, so every OTHER declared field on this dataclass could
+    stay byte-identical while the knots (and therefore every real curve
+    output) silently changed underneath them — reshaping the knots moved
+    ``curve(0.5)`` from ``0.5`` to ``0.30`` with nothing on the dataclass
+    itself reflecting that change). ``curve_fn`` is now DERIVED from
+    ``knots`` in ``__post_init__`` (never introspect ``curve_fn.keywords``
+    anywhere — read ``knots`` directly instead) and is
+    ``Callable[[float], float]`` — a curve shape with all of its
+    shape-specific parameters already bound, NOT the raw multi-parameter
+    ``piecewise_linear`` itself. This lets the property-test suite
+    (tests/test_health_engine_curves.py) iterate over a list of
+    ``CurveSpec`` instances and call ``spec.curve_fn(x)`` uniformly,
+    regardless of which curve SHAPE backs any given one — piecewise-linear
+    today; sigmoid/step per the design doc's open Q1 ("where does the
+    curve library stop?"), later, without changing this contract.
 
     Fields:
       name               — human-readable label, for test IDs/messages
                             only (not part of the design-doc contract
                             itself; added here as a convenience for the
                             parametrized property-test suite).
-      curve_fn           — see above.
+      knots              — see above; the curve's declared data.
+      curve_fn           — DERIVED (init=False) from ``knots`` — see above.
       input_domain       — ``(lo, hi)`` the curve is declared TOTAL over.
+                            If omitted, DERIVED as
+                            ``(knots[0][0], knots[-1][0])``. If supplied
+                            explicitly, VALIDATED to equal that same pair
+                            — a mismatch raises ``ValueError`` naming both
+                            values, so there is exactly one stored fact
+                            about a curve's domain, never two that can
+                            silently disagree.
       monotone_direction — "increasing" or "decreasing"; which inequality
                             the MONOTONE property tests for.
       output_range       — ``(lo, hi)`` the curve is declared BOUNDED to.
@@ -161,11 +181,40 @@ class CurveSpec:
     """
 
     name: str
-    curve_fn: Callable[[float], float]
-    input_domain: tuple[float, float]
+    knots: tuple[tuple[float, float], ...]
     monotone_direction: MonotoneDirection
+    input_domain: tuple[float, float] | None = None
     output_range: tuple[float, float] = (0.0, 1.0)
     observed_range: tuple[float, float] | None = None
+    curve_fn: Callable[[float], float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if len(self.knots) == 0:
+            raise ValueError(
+                f"CurveSpec {self.name!r}: knots must contain at least "
+                f"one (x, y) pair"
+            )
+        xs = [k[0] for k in self.knots]
+        if any(xs[i] > xs[i + 1] for i in range(len(xs) - 1)):
+            raise ValueError(
+                f"CurveSpec {self.name!r}: knots must be sorted ascending "
+                f"by x; got x = {xs!r}"
+            )
+        derived_domain = (self.knots[0][0], self.knots[-1][0])
+        if self.input_domain is None:
+            object.__setattr__(self, "input_domain", derived_domain)
+        elif self.input_domain != derived_domain:
+            raise ValueError(
+                f"CurveSpec {self.name!r}: declared input_domain "
+                f"{self.input_domain!r} does not match its knots' x-span "
+                f"{derived_domain!r} — one stored fact, no silent "
+                f"disagreement"
+            )
+        object.__setattr__(
+            self,
+            "curve_fn",
+            functools.partial(piecewise_linear, knots=self.knots),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -175,10 +224,7 @@ class CurveSpec:
 
 LEGACY_GOODNESS_TRANSITION_CURVE = CurveSpec(
     name="legacy_goodness_transition_curve",
-    curve_fn=functools.partial(
-        piecewise_linear,
-        knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
-    ),
+    knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
     input_domain=(0.0, 1.0),
     monotone_direction="decreasing",
     observed_range=(0.012, 0.105),
@@ -256,10 +302,7 @@ one.
 
 BADNESS_DEFAULT_CURVE = CurveSpec(
     name="badness_default",
-    curve_fn=functools.partial(
-        piecewise_linear,
-        knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
-    ),
+    knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
     input_domain=(0.0, 1.0),
     monotone_direction="decreasing",
     # JUDGMENT CALL (flagged in the PR5 report): no observed_range set here,
@@ -314,10 +357,7 @@ scoped by.
 
 GOODNESS_DEFAULT_CURVE = CurveSpec(
     name="goodness_default",
-    curve_fn=functools.partial(
-        piecewise_linear,
-        knots=((0.0, 0.01), (0.01, 0.01), (1.0, 1.0)),
-    ),
+    knots=((0.0, 0.01), (0.01, 0.01), (1.0, 1.0)),
     input_domain=(0.0, 1.0),
     monotone_direction="increasing",
     # Same reasoning as BADNESS_DEFAULT_CURVE's own observed_range=None
@@ -355,3 +395,34 @@ matching to floating-point precision at every sample; the same property is
 pinned as a permanent regression test in
 tests/test_health_engine_curves.py.
 """
+
+
+def curve_defs_jsonable(curves: dict[str, CurveSpec]) -> dict:
+    """JSON-able declaration of every ``CurveSpec`` in ``curves`` (a
+    ``name -> CurveSpec`` registry, e.g. ``health/model.py``'s
+    ``ScoringModel.curves``) — engram-alpha#2576, the curve-layer twin of
+    PR #2577's ``signal_defs``.
+
+    Emits, per curve name: ``knots`` (list of ``[x, y]`` pairs — the
+    declared data ``curve_fn`` is derived from), ``input_domain``,
+    ``monotone_direction``, ``output_range`` (all as two-element lists),
+    and ``observed_range`` (a two-element list, or ``null`` if unset).
+    Never introspects ``curve_fn`` itself — every field here reads
+    directly off the ``CurveSpec``'s own declared data, which is exactly
+    the point: a snapshot consumer can now see a curve's actual shape from
+    stored, declared fields instead of a partial's bound keywords.
+    """
+    return {
+        name: {
+            "knots": [[x, y] for x, y in spec.knots],
+            "input_domain": list(spec.input_domain),
+            "monotone_direction": spec.monotone_direction,
+            "output_range": list(spec.output_range),
+            "observed_range": (
+                list(spec.observed_range)
+                if spec.observed_range is not None
+                else None
+            ),
+        }
+        for name, spec in curves.items()
+    }

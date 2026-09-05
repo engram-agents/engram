@@ -37,7 +37,7 @@ instead, per the spec's own fallback instruction.
 
 from __future__ import annotations
 
-import functools
+import dataclasses
 import math
 import os
 import sys
@@ -51,6 +51,7 @@ from health.curves import (  # noqa: E402
     CurveSpec,
     GOODNESS_DEFAULT_CURVE,
     LEGACY_GOODNESS_TRANSITION_CURVE,
+    curve_defs_jsonable,
     piecewise_linear,
 )
 
@@ -91,10 +92,7 @@ def _dense_sample(domain: tuple[float, float], n: int = 201) -> list[float]:
 # properties, not to make a non-saturation claim.
 _TRIVIAL_INCREASING_CURVE = CurveSpec(
     name="trivial_increasing_identity_curve",
-    curve_fn=functools.partial(
-        piecewise_linear,
-        knots=((0.0, 0.0), (1.0, 1.0)),
-    ),
+    knots=((0.0, 0.0), (1.0, 1.0)),
     input_domain=(0.0, 1.0),
     monotone_direction="increasing",
     observed_range=None,
@@ -297,3 +295,148 @@ class TestGoodnessDefaultCurveMirrorsBadnessDefault:
         assert GOODNESS_DEFAULT_CURVE.curve_fn(0.0) == pytest.approx(0.01)
         assert GOODNESS_DEFAULT_CURVE.curve_fn(0.01) == pytest.approx(0.01)
         assert GOODNESS_DEFAULT_CURVE.curve_fn(1.0) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# engram-alpha#2576 — ``CurveSpec.knots`` declared as data, ``curve_fn``
+# derived from it. Borges measured (#2563) that reshaping the knots left
+# every OTHER declared field on ``CurveSpec`` byte-identical while
+# ``curve(0.5)`` moved — this section is the fix's own regression suite.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("spec", _ALL_CURVE_SPECS, ids=lambda s: s.name)
+class TestCurveFnDerivedFromKnots:
+    def test_curve_fn_matches_piecewise_linear_over_knots(
+        self, spec: CurveSpec
+    ):
+        """``spec.curve_fn(x) == piecewise_linear(x, knots=spec.knots)``
+        over a dense grid of the declared input domain PLUS points outside
+        it (clamping) — i.e. ``curve_fn`` is genuinely DERIVED from
+        ``knots``, not an independently-bound partial that could silently
+        drift from the declared data."""
+        lo, hi = spec.input_domain
+        span = hi - lo if hi > lo else 1.0
+        xs = _dense_sample(spec.input_domain) + [
+            lo - span,  # below domain: clamps
+            hi + span,  # above domain: clamps
+        ]
+        for x in xs:
+            assert spec.curve_fn(x) == pytest.approx(
+                piecewise_linear(x, knots=spec.knots)
+            ), f"{spec.name}: curve_fn({x}) diverges from knots-derived value"
+
+    def test_input_domain_matches_knots_x_span(self, spec: CurveSpec):
+        assert spec.input_domain == (spec.knots[0][0], spec.knots[-1][0])
+
+
+class TestInputDomainKnotSpanMismatchRaises:
+    def test_mismatched_explicit_input_domain_raises_value_error(self):
+        with pytest.raises(ValueError):
+            CurveSpec(
+                name="bad_domain_curve",
+                knots=((0.0, 1.0), (1.0, 0.0)),
+                monotone_direction="decreasing",
+                input_domain=(0.0, 2.0),  # does NOT match knots' (0.0, 1.0)
+            )
+
+
+class TestReshapeIsSeenByTheDeclaration:
+    """The artifact Borges specifically asked for (#2563/#2576): before
+    this fix, reshaping a ``CurveSpec``'s knots left every OTHER declared
+    field byte-identical while ``curve(0.5)`` moved 0.5 -> 0.30. Now the
+    declared ``knots`` field itself changes, ``curve_fn`` (derived from it)
+    changes, and ``curve_defs_jsonable``'s output changes — the
+    declaration now SEES the reshape."""
+
+    def test_reshape_changes_declared_knots_curve_fn_and_jsonable(self):
+        reshaped = dataclasses.replace(
+            BADNESS_DEFAULT_CURVE,
+            knots=((0.0, 1.0), (0.5, 0.3), (1.0, 0.01)),
+        )
+
+        # The declared `knots` field itself differs.
+        assert reshaped.knots != BADNESS_DEFAULT_CURVE.knots
+
+        # curve_fn(0.5) moves from 0.5 (old shape's midpoint) to ~0.30.
+        assert BADNESS_DEFAULT_CURVE.curve_fn(0.5) == pytest.approx(0.5)
+        assert reshaped.curve_fn(0.5) == pytest.approx(0.3)
+
+        # curve_defs_jsonable output differs too — the declaration-level
+        # artifact a snapshot consumer actually reads.
+        before = curve_defs_jsonable({"badness_default": BADNESS_DEFAULT_CURVE})
+        after = curve_defs_jsonable({"badness_default": reshaped})
+        assert before != after
+        assert after["badness_default"]["knots"] == [
+            [0.0, 1.0], [0.5, 0.3], [1.0, 0.01],
+        ]
+
+
+class TestCurveSpecKnotsValidation:
+    """PR #2578 colleague review (borges-funes, 13:26Z): before this fix,
+    ``CurveSpec.__post_init__`` derived ``input_domain`` from
+    ``(knots[0][0], knots[-1][0])`` with no validation of the knots
+    themselves — an empty ``knots`` tuple raised a shadowing
+    ``IndexError`` instead of ``piecewise_linear``'s own deliberate
+    ``ValueError``, and unsorted knots were silently accepted, writing a
+    reversed ``input_domain`` into the ``curve_defs`` snapshot."""
+
+    def test_empty_knots_raises_value_error_not_index_error(self):
+        with pytest.raises(ValueError, match="at least one"):
+            CurveSpec(
+                name="empty_knots",
+                knots=(),
+                monotone_direction="increasing",
+            )
+
+    def test_unsorted_knots_raise_value_error(self):
+        with pytest.raises(ValueError, match="sorted ascending"):
+            CurveSpec(
+                name="unsorted",
+                knots=((1.0, 0.0), (0.0, 1.0)),
+                monotone_direction="decreasing",
+            )
+
+    def test_tied_x_knots_accepted_and_step_is_left_continuous(self):
+        """Ties (non-decreasing, not strictly ascending) are legal — a
+        zero-width segment is a step. This asserts the OBSERVABLE at and
+        around the tied x, pinning which side of the step ``curve_fn(0.5)``
+        lands on, rather than asserting anything about which branch of
+        ``piecewise_linear`` produced it.
+
+        The step is LEFT-continuous: in-order segment matching
+        (``for (x0,y0),(x1,y1) in zip(knots, knots[1:])``) finds the
+        PRECEDING segment ``(0.0,0.0)->(0.5,0.3)`` first at ``rate ==
+        0.5`` and returns its ordinary (non-degenerate) interpolation —
+        the jump to the second knot's y (0.8) happens strictly AFTER the
+        tied x, never at it.
+
+        ``piecewise_linear``'s ``x1 == x0`` degenerate-segment guard is
+        defensive insurance against a divide-by-zero, not a branch this
+        test exercises: two reviewers independently checked every knot
+        placement (tie in the middle, tie at the start, tie at the end)
+        and could not reach it — a middle tie always resolves via the
+        preceding segment as above, a tie at the domain start is caught
+        by the ``rate <= xs[0]`` clamp, and a tie at the domain end by
+        the ``rate >= xs[-1]`` clamp. "Could not reach it", not "cannot
+        be reached" — the guard stays in curves.py as insurance regardless.
+        """
+        spec = CurveSpec(
+            name="tied_x",
+            knots=((0.0, 0.0), (0.5, 0.3), (0.5, 0.8), (1.0, 1.0)),
+            monotone_direction="increasing",
+        )
+        assert spec.curve_fn(0.499) == pytest.approx(0.2994)
+        assert spec.curve_fn(0.5) == pytest.approx(0.3)
+        assert spec.curve_fn(0.501) == pytest.approx(0.8004)
+
+    def test_reversed_domain_cannot_be_constructed(self):
+        """The only path to a reversed ``input_domain`` (unsorted knots)
+        is now closed at construction — ``curve_defs_jsonable`` can never
+        be handed a ``CurveSpec`` carrying one."""
+        with pytest.raises(ValueError, match="sorted ascending"):
+            CurveSpec(
+                name="unsorted_for_jsonable",
+                knots=((1.0, 0.0), (0.0, 1.0)),
+                monotone_direction="decreasing",
+            )

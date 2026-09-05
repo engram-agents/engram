@@ -270,6 +270,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from . import curves as health_curves
 from . import measurements as health_measurements
 from . import metrics
 from . import model as health_engine_model
@@ -1454,6 +1455,11 @@ def build_snapshot(
         # additive: no signal value above is affected by this key's
         # presence.
         "signal_defs": health_signals.signal_defs_jsonable(),
+        # engram-alpha#2576, the curve-layer twin of PR #2577's
+        # "signal_defs" — declared curve data (knots + contract), never
+        # curve_fn.keywords introspection, so a stored snapshot is
+        # self-describing about which curve shape actually scored it.
+        "curve_defs": health_curves.curve_defs_jsonable(model.curves),
         "signals": signals,
         "scores": {
             "metrics": scores_per_metric,

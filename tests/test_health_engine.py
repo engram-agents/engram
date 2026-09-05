@@ -46,7 +46,7 @@ from health import metrics as hem  # noqa: E402
 from health import signals as health_signals  # noqa: E402
 from health import version as health_version  # noqa: E402
 from health.config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
-from health.curves import CurveSpec  # noqa: E402
+from health.curves import CurveSpec, curve_defs_jsonable  # noqa: E402
 from health.model import (  # noqa: E402
     AspectSpec,
     DetectorRef,
@@ -227,9 +227,15 @@ class TestConfigShape:
 
 
 def _fake_curve(fn=None):
+    """``fn`` is unused (kept for call-site compatibility — every caller
+    passes ``fn=None``); ``curve_fn`` is now DERIVED from ``knots``
+    (engram-alpha#2576), and ``knots=((0.0, 1.0), (1.0, 0.0))`` reproduces
+    the old ``lambda x: 1.0 - x`` EXACTLY over ``[0.0, 1.0]`` — the two
+    knots ARE that line."""
+    assert fn is None, "fake_curve's fn override is retired; see docstring"
     return CurveSpec(
         name="fake",
-        curve_fn=fn or (lambda x: 1.0 - x),
+        knots=((0.0, 1.0), (1.0, 0.0)),
         input_domain=(0.0, 1.0),
         monotone_direction="decreasing",
     )
@@ -690,7 +696,8 @@ class TestBuildSnapshot:
         assert set(snap.keys()) == {
             "schema_version", "engine_version", "health_version",
             "raw_schema_version", "model_version", "config", "definitions",
-            "measurements", "signals", "signal_defs", "scores", "red_flags",
+            "measurements", "signals", "signal_defs", "curve_defs",
+            "scores", "red_flags",
             "diagnostics", "anchor", "turn", "checkpoint_mode",
         }
 
@@ -728,6 +735,25 @@ class TestBuildSnapshot:
         # and composed is UNAVAILABLE too — the same value this file's own
         # empty-DB test already establishes.
         assert snap["scores"]["composed"] == "UNAVAILABLE"
+
+    def test_curve_defs_block_matches_curve_defs_jsonable_on_model_curves(
+        self,
+    ):
+        """``build_snapshot``'s ``curve_defs`` key (engram-alpha#2576) must
+        be exactly ``health.curves.curve_defs_jsonable(model.curves)`` on
+        the SAME model — a wiring check — and must carry one entry per
+        curve in ``MODEL.curves`` (a ``name -> CurveSpec`` registry), each
+        with its own ``knots``."""
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        model = health_engine.MODEL
+        assert snap["curve_defs"] == curve_defs_jsonable(model.curves)
+        assert set(snap["curve_defs"].keys()) == set(model.curves.keys())
+        for name, entry in snap["curve_defs"].items():
+            assert "knots" in entry
+            assert entry["knots"] == [
+                list(k) for k in model.curves[name].knots
+            ]
 
     def test_version_stamps_present_and_match_health_version(self):
         """engram-alpha#2537 slice 2: the two independent version axes
