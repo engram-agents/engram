@@ -100,6 +100,10 @@
       "tier": "essential"
     },
     {
+      "path": "health/series.py",
+      "tier": "essential"
+    },
+    {
       "path": "health/metrics.py",
       "tier": "essential"
     },
@@ -1128,6 +1132,10 @@
     {
       "path": "tests/test_health_version_gate.py",
       "reason": "engram-alpha#2563 Gap 3 — the health-version tag-diff gate's pytest suite (well-formedness + adequacy checks, falsifier suite against scratch git repos). Dev-tier (T3): a CI-only invariant-checks test, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_hook_emitter_path_resolution.py precedent above."
+    },
+    {
+      "path": "tests/test_health_series.py",
+      "reason": "engram-alpha#2575 PR A — the health-score series store's pytest suite (schema, snapshot_files regex, old-format refusal, anchor resolution per design doc D1, ingest idempotence, the declarations gate per D4.1, rebuild's ordered-dump compare, detect_engine_build ordering, and the CLI-as-script check). Dev-tier (T3): a CI-only test suite for health/series.py, never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_health_version_gate.py precedent above."
     },
     {
       "path": ".github/",
