@@ -356,6 +356,17 @@ def get_health_v2_data(agent_name: str) -> dict:
             "reason": f"Failed to read/parse snapshot {filename!r}: {exc}",
         }
 
+    if "measurements" not in snapshot:
+        return {
+            "has_snapshot": False,
+            "reason": (
+                f"Snapshot {filename!r} is an old-format (pre-health-v2) "
+                "snapshot -- it is missing the 'measurements' key. Rebuild "
+                "the plugin build and reconnect the MCP server to write a "
+                "current-format snapshot."
+            ),
+        }
+
     scores = snapshot.get("scores") or {}
     config = snapshot.get("config") or {}
     signal_defs = snapshot.get("signal_defs") or {}

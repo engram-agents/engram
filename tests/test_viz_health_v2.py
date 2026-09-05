@@ -228,6 +228,36 @@ class TestGetHealthV2DataEmptyStates(unittest.TestCase):
         self.assertFalse(result["has_snapshot"])
         self.assertIn("reason", result)
 
+    def test_old_format_snapshot_missing_measurements_returns_empty_state(self):
+        # A well-formed, parseable JSON snapshot written by an OLDER,
+        # pre-health-v2 build of the health engine -- real top-level keys
+        # observed on a live seat (engram-alpha#2518 follow-up), critically
+        # MISSING `measurements`, `signal_defs`, and `health_version` (all
+        # new-format-only keys). Must NOT fall through to has_snapshot=True
+        # with a silently-empty signal_rows list.
+        old_format_snapshot = {
+            "anchor": "deadbeef",
+            "checkpoint_mode": "nap",
+            "config": {"aspects": []},
+            "definitions": {},
+            "diagnostics": {},
+            "engine_version": "0.3.0",
+            "red_flags": [],
+            "schema_version": "1",
+            "scores": {"composed": 80.0},
+            "signals": {},
+            "turn": 3,
+        }
+        snap_dir = self.engram_home / "health-snapshots"
+        snap_dir.mkdir()
+        (snap_dir / "3-nap-20260904T110000Z.json").write_text(
+            json.dumps(old_format_snapshot)
+        )
+        result = viz_health_v2_data.get_health_v2_data("test")
+        self.assertFalse(result["has_snapshot"], result)
+        self.assertIn("reason", result)
+        self.assertIn("old-format", result["reason"].lower())
+
 
 class TestGetHealthV2DataPopulated(unittest.TestCase):
     def setUp(self):
@@ -324,6 +354,41 @@ class TestGetHealthV2DataPopulated(unittest.TestCase):
         self.assertEqual(composed["points_in_play"], 75)
         self.assertEqual(composed["composed_coverage"], 0.75)
         self.assertEqual(composed["unscored_aspects"], ["provenance_integrity"])
+
+
+class TestGetHealthV2DataEmptySignalDefsRegression(unittest.TestCase):
+    """Regression guard for the old-format-detection fix: a genuinely
+    NEW-format snapshot (has the `measurements` key) with an empty
+    `signal_defs: {}` -- a hypothetical but real-format case of zero
+    signals for some other legitimate reason -- must still be treated as
+    has_snapshot=True with an empty signal_rows list. The fix must key off
+    `measurements`'s absence, not off `signal_defs` being empty."""
+
+    def setUp(self):
+        self._saved_agents = viz_agents.AGENTS
+        self.tmpdir = tempfile.mkdtemp(prefix="engram_health_v2_test_")
+        self.engram_home = Path(self.tmpdir) / "agent_dir"
+        self.engram_home.mkdir()
+        (self.engram_home / "knowledge.db").write_bytes(b"")
+        self.snap_dir = self.engram_home / "health-snapshots"
+        self.snap_dir.mkdir()
+        viz_agents.AGENTS = {
+            "test": {"name": "test", "label": "Test", "db": str(self.engram_home / "knowledge.db")}
+        }
+
+    def tearDown(self):
+        viz_agents.AGENTS = self._saved_agents
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_new_format_with_empty_signal_defs_still_has_snapshot(self):
+        snapshot = _make_fixture_snapshot(turn=6, checkpoint_mode="nap")
+        snapshot["signal_defs"] = {}
+        (self.snap_dir / "6-nap-20260904T130000Z.json").write_text(
+            json.dumps(snapshot)
+        )
+        result = viz_health_v2_data.get_health_v2_data("test")
+        self.assertTrue(result["has_snapshot"], result)
+        self.assertEqual(result["signal_rows"], [])
 
 
 class TestLatestSnapshotIntegerSort(unittest.TestCase):
