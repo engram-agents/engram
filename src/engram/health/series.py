@@ -2727,15 +2727,24 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
     ``equality_checks`` is append-only, per that table's own migration
     docstring); and (#2600) for each DISTINCT ``engine_build`` present in
     ``l0_points``, whether it resolves as a commit in the CODE repo
-    (``code_repo_dir``, default ``_default_repo_dir()`` -- the engram-alpha
-    checkout containing this module): ``true``/``false`` for a sha-shaped
-    value, ``null`` for a non-sha value (e.g. ``'unknown'`` or a
-    ``.deployed-version`` ``alpha_sha`` that isn't a git sha) or when no
-    code repo is resolvable at all (``code_repo_dir`` -- or the default --
-    doesn't exist / isn't a git repo)."""
-    effective_code_repo_dir = (
-        Path(code_repo_dir) if code_repo_dir is not None else _default_repo_dir()
-    )
+    (``code_repo_dir``, default: the DISCRIMINATED resolver
+    ``_find_code_repo_toplevel(Path(__file__).resolve().parent)`` -- this
+    module's own git toplevel, ONLY if that toplevel is itself a code
+    checkout containing ``src/engram/health/measurements.py``): ``true``/
+    ``false`` for a sha-shaped value, ``null`` for a non-sha value (e.g.
+    ``'unknown'`` or a ``.deployed-version`` ``alpha_sha`` that isn't a git
+    sha) or when no code repo is resolvable at all -- either an explicitly
+    passed ``code_repo_dir`` doesn't exist / isn't a git repo, OR, on the
+    default path, this module's own git toplevel is NOT a code checkout
+    (#2615: notably a DEPLOYED plugin tree, whose git toplevel is the DATA
+    repo it's nested inside, not a code checkout -- reported as ``null``,
+    never a false ``false``)."""
+    if code_repo_dir is not None:
+        effective_code_repo_dir = Path(code_repo_dir)
+    else:
+        effective_code_repo_dir = _find_code_repo_toplevel(
+            Path(__file__).resolve().parent
+        )
     conn = open_store(db_path)
     try:
         counts = {}
@@ -2828,20 +2837,21 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
             ).fetchall()
         ]
         code_repo_valid = False
-        try:
-            code_repo_check = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=str(effective_code_repo_dir),
-            )
-            code_repo_valid = (
-                code_repo_check.returncode == 0
-                and code_repo_check.stdout.strip() == "true"
-            )
-        except OSError:
-            code_repo_valid = False
+        if effective_code_repo_dir is not None:
+            try:
+                code_repo_check = subprocess.run(
+                    ["git", "rev-parse", "--is-inside-work-tree"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    cwd=str(effective_code_repo_dir),
+                )
+                code_repo_valid = (
+                    code_repo_check.returncode == 0
+                    and code_repo_check.stdout.strip() == "true"
+                )
+            except OSError:
+                code_repo_valid = False
 
         engine_build_resolvability = []
         for build in distinct_engine_builds:

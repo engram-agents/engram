@@ -1969,6 +1969,53 @@ def test_status_reports_engine_build_resolvability(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 31b. status's DEFAULT code-repo resolution reports null from a nested
+# deployed-plugin-tree shape, never a false ``false`` (#2615)
+# ---------------------------------------------------------------------------
+
+
+def test_status_default_resolution_reports_null_from_nested_repo_shape(
+    tmp_path, monkeypatch
+):
+    """Reproduces the deployed-plugin-tree shape that #2615 found: the
+    module executing ``status()`` sits NESTED inside an OUTER git repo that
+    has no ``src/engram/health`` at its toplevel -- exactly what a real
+    deployed plugin tree's own git toplevel resolves to (the DATA repo it's
+    nested inside; see ``detect_engine_build``'s docstring). ``status()``
+    called with NO ``code_repo_dir`` must report
+    ``resolves_in_code_repo: null`` for every entry, never ``false`` -- the
+    undiscriminated ``_default_repo_dir()`` fallback used to walk straight
+    into this nested outer repo, pass the ``is-inside-work-tree`` probe, and
+    wrongly report ``false``."""
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(data_repo, "-- k1", _committer_iso(t0))
+
+    code_repo = tmp_path / "code-repo"
+    _init_repo(code_repo)
+    code_sha = _commit_knowledge(code_repo, "-- c1")
+
+    db_path = tmp_path / "series.db"
+    series.backfill(data_repo, db_path, engine_build=code_sha)
+
+    # the deployed-tree shape: an OUTER git repo with no src/engram/health
+    # at its toplevel, and the "module" nested somewhere inside it (no
+    # separate .git of its own -- a real nesting, matching the deployed
+    # tree's own single work tree, not a symlink or a second repo).
+    outer_repo = tmp_path / "outer-repo"
+    _init_repo(outer_repo)
+    nested_module_dir = outer_repo / "marketplace" / "plugins" / "engram" / "health"
+    nested_module_dir.mkdir(parents=True)
+    monkeypatch.setattr(series, "__file__", str(nested_module_dir / "series.py"))
+
+    result = series.status(db_path)
+    assert result["engine_build_resolvability"], "expected at least one entry"
+    for entry in result["engine_build_resolvability"]:
+        assert entry["resolves_in_code_repo"] is None, entry
+
+
+# ---------------------------------------------------------------------------
 # 32. two-diff rebuild (D4.2, PR B2) -- the tests named in the spec
 # ---------------------------------------------------------------------------
 
