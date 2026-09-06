@@ -352,6 +352,25 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "error": str(e),
             }
 
+        # Health series store (engram-alpha#2575 PR C, design doc §4 "When it
+        # runs"): ingest -> backfill -> derive, best-effort, POST-DREAM ONLY
+        # (the design's "regular backfill mechanism" -- nightly cost is the
+        # gap only; a nap checkpoint fires far more often and would pay that
+        # cost for no benefit, so it deliberately skips this block). Mirrors
+        # the health_snapshot_summary block just above: a failure here must
+        # never break the underlying nap/advance_turn checkpoint tool.
+        if _health_checkpoint_mode == "post_dream":
+            try:
+                from health import engine as health_engine
+                from health import series as health_series
+                health_series_summary = health_series.checkpoint_hook(
+                    str(health_engine._snapshot_dir()), str(core.DATA_DIR),
+                    str(health_engine._snapshot_dir() / "series.db"), _health_checkpoint_mode)
+            except Exception as e:
+                health_series_summary = {"error": str(e), "checkpoint_mode": _health_checkpoint_mode}
+        else:
+            health_series_summary = {"skipped": "nap checkpoints do not run the series store; post_dream only"}
+
         result = {
             "status": "checkpoint_saved",
             "mode": mode,
@@ -373,6 +392,7 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "decay_base": mem.get("decay_base", 1.014),
             },
             "health_snapshot": health_snapshot_summary,
+            "health_series": health_series_summary,
             "version_control": version_control,
         }
 

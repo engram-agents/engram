@@ -18,6 +18,14 @@ disk). All snapshot-shape knowledge here is a documented CONTRACT with
 ``health/signals.py``'s ``signal_defs_jsonable`` -- re-derived by reading
 those modules' source, never imported.
 
+**One deliberate exception (engram-alpha#2575 PR C1): ``get_health_v2_series``
+imports ``health.series`` lazily.** ``series.db`` is ``health.series``'s OWN
+store and ``export()`` is that module's own query over it -- duplicating
+that SQL here would be exactly the anti-pattern this docstring's "no
+health/ imports" rule exists to avoid (re-deriving another module's
+contract instead of calling it). Every OTHER function in this file keeps
+the plain-JSON-file contract described above unchanged.
+
 No HTTP, no HTML -- unit-testable in isolation, same convention as this
 package's sibling loaders (``stats.py``, ``health.py``, ``calibration.py``).
 
@@ -428,3 +436,45 @@ def get_health_v2_data(agent_name: str) -> dict:
         "aspect_tile": aspect_tile,
         "composed": composed,
     }
+
+
+def get_health_v2_series(agent_name: str, version: "str | None" = None, signal: "str | None" = None) -> dict:
+    """The ``/api/health/v2/series`` payload (engram-alpha#2575 PR C1) --
+    resolves *agent_name*'s ``series.db`` (same directory convention as
+    ``_resolve_health_snapshots_dir`` above -- ``series.db`` lives beside
+    the ``*.json`` snapshot files, under ``$ENGRAM_HOME/health-snapshots``)
+    and calls ``health.series.export(db_path, version, signal)`` -- see
+    this module's own docstring for why THIS ONE function is allowed to
+    import ``health.series`` (unlike every other function here, which
+    treats a snapshot as a plain JSON file).
+
+    Never raises: an unknown agent, a missing ``series.db``, or a failed
+    ``health.series`` import are each their own fail-honest ``{error,
+    reason}`` dict (never an exception) -- same convention ``export``
+    itself already uses (``no_db``/``version_absent``/``signal_unknown``/
+    ``unreadable``); this function adds exactly one more reason,
+    ``series_module_unavailable``, for the import failing."""
+    snapshots_dir = _resolve_health_snapshots_dir(agent_name)
+    if not snapshots_dir:
+        return {"error": f"Unknown agent: {agent_name!r}", "reason": "no_db"}
+
+    db_path = os.path.join(snapshots_dir, "series.db")
+    if not os.path.exists(db_path):
+        return {
+            "error": "no series store for this agent yet",
+            "reason": "no_db",
+            "db_path": db_path,
+        }
+
+    try:
+        # `health` resolves as a top-level package whenever this process's
+        # cwd (production: the plugin root, per viz/server.py's own
+        # INVOCATION NOTE) or `sys.path` (tests: conftest.py inserts
+        # `src/engram`) already makes it importable -- no extra path
+        # surgery needed here, matching every other lazy `from health
+        # import ...` in this codebase.
+        from health import series as health_series
+    except Exception as exc:
+        return {"error": str(exc), "reason": "series_module_unavailable"}
+
+    return health_series.export(db_path, version, signal)

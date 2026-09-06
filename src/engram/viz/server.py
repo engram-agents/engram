@@ -245,6 +245,24 @@ class Handler(BaseHTTPRequestHandler):
                 resp = viz_health_v2_data.get_health_v2_data(agent_name)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/health/v2/series":
+            # health-v2 SERIES panel (engram-alpha#2575 PR C1) -- reads
+            # `series.db`'s own `export()` (health.series). Always 200, even
+            # for a fail-honest `{error, reason}` dict -- same convention as
+            # the sibling `/api/health/v2` endpoint above (the error IS the
+            # payload, not an HTTP-level failure); an unknown agent is the
+            # one case that still gets a real 404, matching every other
+            # per-agent endpoint on this handler.
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                qs = parse_qs(parsed.query or "")
+                version = (qs.get("version", [None])[0]) or None
+                signal = (qs.get("signal", [None])[0]) or None
+                resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
+                resp["agent"] = agent_name
+                self._json(resp)
         elif path == "/api/calibration":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",

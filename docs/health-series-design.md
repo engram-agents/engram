@@ -41,12 +41,16 @@ l0_points        (commit_sha TEXT, health_major INT, commit_time TEXT, turn INT 
                   unreplayable JSON,                    -- {name: reason} — see §3; {} for stored rows
                   PRIMARY KEY (commit_sha, health_major, source))
 derived_points   (commit_sha, health_version TEXT,     -- 'health-v1.0' — MAJOR.MINOR
+                  l0_source TEXT CHECK(l0_source IN ('stored','git_replay')), -- (PR C1) which l0_points row this was derived from
+                  replay_decl_hash TEXT DEFAULT '',     -- (PR C1) '' for stored-derived rows, the l0 row's hash for replay-derived
                   signals JSON, scores JSON, computed_at, engine_build,
-                  PRIMARY KEY (commit_sha, health_version))
+                  PRIMARY KEY (commit_sha, health_version, l0_source, replay_decl_hash))
+derive_checks    (commit_sha, health_version, verdict TEXT CHECK(verdict IN ('agree','disagree')), -- (PR C1)
+                  diff JSON, checked_at)               -- derive's own equality control, mirrors equality_checks
 equality_checks  (commit_sha, health_major, verdict TEXT CHECK(verdict IN ('agree','disagree')),
                   diff JSON, checked_at)
 replay_runs      (run_id, started_at, finished_at, health_major, reason TEXT
-                  CHECK(reason IN ('initial','gap_fill','major_bump','verify','rebuild')),
+                  CHECK(reason IN ('initial','gap_fill','major_bump','verify','rebuild','derive')),
                   commits_total, commits_done, engine_build)
 ```
 
@@ -73,6 +77,7 @@ Consequence, stated so nobody is surprised at the first plot: over git replay, `
 
 - `ingest` — scan `health-snapshots/*.json`; refuse old-format; resolve the commit (§1); upsert `stored` rows. `ingest` does not run the equality check — its second operand, the `git_replay` row, does not exist until `backfill` writes it, so the comparison runs in `backfill`.
 - `backfill` — the regular mechanism. For the current MAJOR: `commits(knowledge.sql) − {commit_sha in l0_points where health_major = current}` → replay each missing commit → upsert. First run on a seat = `initial` (all 136); after a MAJOR bump = `major_bump` (all, again, under the new number — old rows untouched); every other night = `gap_fill` (usually the commits of seats whose plugin was stale, or nothing). Then derive `derived_points` for the current `health_version` where missing.
+- `derive` (PR C1) — for the current `health_version`, compute `derived_points` for every L0 row lacking one, from the STORED declarations (never HEAD's live `SIGNAL_DEFS`/`MODEL` for a non-current version — D4.1); the equality control compares each stored-derived row against its own snapshot's `signals`/`scores`.
 - `verify` — replay the commits that have stored rows and record `equality_checks`. Any `disagree` is surfaced as a finding (it means either the dump, the measurement, or the anchor resolution is wrong — all three are things we want to know the day they break).
 - `rebuild` — delete `series.db`, run `ingest` + `backfill` from scratch, diff against the previous db. The safety net for schema changes to the store itself.
 - `export --version health-v1.0 [--signal X]` — the JSON shape `/api/health/v2/series` serves (`{version, points: [{t, commit, turn, source, num, den, raw, score, unreplayable}]}`), so the API is a thin reader.
@@ -87,7 +92,7 @@ Consequence, stated so nobody is surprised at the first plot: over git replay, `
 
 ### 6. API and page (Sol/Ariadne's side — stating the contract, not building it here)
 
-- `GET /api/health/v2/series?agent=X&version=health-v1.0[&signal=…]` → `export` output. Read-only, fail-honest JSON per the #2571 rule (`{error, reason}` with distinct reasons: no db / version absent / seat unreadable).
+- `GET /api/health/v2/series?agent=X&version=health-v1.0[&signal=…]` → `export` output. Read-only, fail-honest JSON per the #2571 rule (`{error, reason}` with distinct reasons: no db / version absent / seat unreadable). **(PR C1, built)**: the payload also carries a top-level `scores_available: bool` — `false` exactly when that version's `declarations.model_defs` is absent (a version ingested before PR C0), in which case every point's `score` is `null` and `aspects`/`composed` are empty — the page reads this flag rather than inferring "no scores" from empty arrays.
 - `GET /api/health/v2/fleet` reads each seat's `series.db` latest row — same permission class as #2571 (the :5001 process reads other uids' data dirs).
 - The page renders `unreplayable` as a labelled region ("not measurable before 2026-08-30: cascade_markers did not exist"), not as missing points.
 
@@ -170,4 +175,4 @@ The binary capture is synchronous under the WAL read-mark and the residual span 
 
 - **PR A** — store schema (all tables above, including `replay_decl_hash`, `unreplayable` class shape, `anchor_resolution`, `declarations`, `unresolved_snapshots`), `ingest`, old-format refusal, anchor resolution (D1), `rebuild` (single diff — the two-diff form lands with replay in PR B), CLI skeleton, this document. Tests 3, 6, 7 + idempotence of `ingest` + the declarations gate.
 - **PR B** — replay driver, `MeasurementDef.replay` field, `replay_decl_hash`, `backfill` / `verify`, two-diff `rebuild`. Tests 1 (as tightened in D3), 2, 4, 5. **Scope split, decided during PR B's own build**: PR B is further divided into **B1** (replay driver, `MeasurementDef.replay`, `replay_decl_hash`, `backfill` / `verify`, the `equality_check` control, and the CLI's `backfill`/`verify` subcommands — tests 1 as tightened by D3, 2, 4, 5, plus a D2 fingerprint-flip test) and **B2** (the two-diff `rebuild` from D4.2, a follow-up PR — this PR) — B2 needs a checkout of a historical `engine_build` into a scratch tree to compute the build-changed side of the diff, a real jump in blast radius from "replay a dump into `:memory:`" that does not belong in the same PR as the rest of B1's scope.
-- **PR C** — `derived_points` from stored declarations (D4.1), `export`, lifecycle hook, `/series` wiring with Sol.
+- **PR C** — `derived_points` from stored declarations (D4.1), `export`, lifecycle hook, `/series` wiring with Sol. **Split during PR C's own build, same reasoning as PR B's B1/B2 split above**: **PR C0** (BUILT — `health/model.py`'s `model_defs_jsonable`/`model_from_defs`, `health/engine.py`'s shared `score_signals(l1_signals, model)`, and the snapshot's new `model_defs` key — the model-layer declaration D4.1 needed but §2's original table list didn't yet have a home for) and **PR C1** (BUILT — this module's `derive`/`derive_point`/`export`/`checkpoint_hook`, the `derived_points`/`derive_checks` schema additions, and the `/api/health/v2/series` route, built on top of C0's `model_defs`).

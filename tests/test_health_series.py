@@ -261,6 +261,50 @@ def _build_v2_snapshot(**overrides) -> dict:
     return snapshot
 
 
+def _insert_edge(conn, source_id, target_id, relation, created_at="t0"):
+    """Mirrors ``tests/test_health_engine.py``'s own ``_insert_edge`` helper
+    exactly (PR C1 -- used by ``_populated_conn`` below to give
+    ``giant_component_fraction`` a fully-connected graph)."""
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (source_id, target_id, relation, created_at),
+    )
+
+
+def _populated_conn():
+    """A ``knowledge.sql``-shaped connection with real, non-UNAVAILABLE
+    values for every real metric (PR C1 -- mirrors ``tests/
+    test_health_engine.py::TestBuildSnapshot::
+    test_populated_graph_produces_real_aspect_scores``'s own fixture
+    exactly, so its mutation tests below have real curve/model bindings to
+    perturb, not a wall of UNAVAILABLE)."""
+    conn = _make_conn()
+    _insert(
+        conn, "dv_1", "derivation", metadata={},
+        recall_summary="s1", recall_keywords=["k1"], embedding=json.dumps([0.1]),
+    )
+    _insert(
+        conn, "ob_1", "observation_factual", evidence_id="ev_1",
+        recall_summary="s2", recall_keywords=["k2"], embedding=json.dumps([0.2]),
+    )
+    _insert(conn, "ev_1", "evidence")
+    _insert_edge(conn, "dv_1", "ob_1", "derives_from")
+    return conn
+
+
+def _build_populated_v2_snapshot(**overrides) -> dict:
+    """Like ``_build_v2_snapshot`` but over ``_populated_conn()`` -- real
+    aspect scores for ``epistemic_integrity``/``retrievability`` (PR C1's
+    mutation tests need real curve/importance bindings to perturb)."""
+    from unittest import mock
+
+    with mock.patch("engram_core._embedder.is_available", return_value=True):
+        snapshot = health_engine.build_snapshot(_populated_conn(), "nap")
+    snapshot.update(overrides)
+    return snapshot
+
+
 def _write_snapshot_file(
     snapshots_dir: Path, turn: int, mode: str, ts: str, snapshot: dict
 ) -> Path:
@@ -743,6 +787,10 @@ def test_detect_engine_build_rule_order(tmp_path, monkeypatch, capsys):
     ``test_detect_engine_build_order`` never covered (a plugin-tree marker
     nested inside a git worktree that ALSO qualifies as a code checkout --
     proving the marker wins even when the git rule would otherwise fire)."""
+    # (PR C1, 8.13 carry-over from B2's review) an exported override in the
+    # runner's own environment must not change the measured rule -- today 3
+    # tests fail at baseline when it is exported.
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
 
     # -- A. plugin tree (nested inside a DATA repo -- no src/) resolves to
     # alpha_sha, never the data repo's own HEAD.
@@ -879,7 +927,16 @@ def test_dirty_suffix_scoped_to_health_pathspec_not_repo_wide(tmp_path):
     ``src/engram/health`` pathspec, not the whole repo. Dirty INSIDE that
     pathspec is the existing positive case (sub-case E of
     ``test_detect_engine_build_rule_order`` above); this is its negative
-    twin."""
+    twin.
+
+    NOTE (PR C1, 8.13 carry-over from B2's review): this test's own
+    assertions are about a SCRATCH ``code-repo`` fixture, not this file
+    (``series.py``) itself -- but editing ``series.py`` (this PR does)
+    dirties the REAL repo's ``src/engram/health`` pathspec, so a mutation-
+    testing run of THIS file (which imports the real, installed
+    ``detect_engine_build`` and exercises it against the real repo
+    elsewhere in this module) must be committed first, or it produces a
+    false finding exactly like the one the B2 colleague review's harness hit."""
     code_repo = tmp_path / "code-repo-outside-dirty"
     _init_repo(code_repo)
     sha = _commit(
@@ -1767,6 +1824,9 @@ def test_verify_appends_not_overwrites(tmp_path):
 
 
 def test_engine_build_is_not_the_data_repo_head(tmp_path, monkeypatch):
+    # (PR C1, 8.13 carry-over from B2's review) an exported override in the
+    # runner's own environment must not change the measured rule.
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
     data_repo = tmp_path / "data-repo"
     _init_repo(data_repo)
     t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -1839,7 +1899,10 @@ def test_engine_build_is_not_the_data_repo_head(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_guard_rejects_sha_that_resolves_only_in_data_repo(tmp_path, capsys):
+def test_guard_rejects_sha_that_resolves_only_in_data_repo(tmp_path, capsys, monkeypatch):
+    # (PR C1, 8.13 carry-over from B2's review) an exported override in the
+    # runner's own environment must not change the measured rule.
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
     data_repo = tmp_path / "data-repo"
     _init_repo(data_repo)
     data_sha = _commit_knowledge(data_repo, "k1")
@@ -2518,3 +2581,681 @@ def test_no_helper_silently_drops_non_sha_builds():
     test asserts the helper stays gone rather than merely unused."""
     source = SERIES_PATH.read_text()
     assert "_distinct_replayable_builds" not in source
+
+
+# ---------------------------------------------------------------------------
+# PR C1 -- derive/derive_point/export/checkpoint_hook (engram-alpha#2575 PR C1)
+# ---------------------------------------------------------------------------
+
+
+def _setup_populated_store(tmp_path, turn=1):
+    """A scratch repo with ONE knowledge.sql commit, a matching real
+    (non-UNAVAILABLE, populated) v2 snapshot file, and a series.db already
+    ``ingest``ed from it -- shared setup for the PR C1 tests below."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    commit_sha = _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    snap = _build_populated_v2_snapshot(anchor=None, turn=turn)
+    ts = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, turn, "nap", ts, snap)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+    return repo_dir, snapshots_dir, snap, commit_sha, db_path
+
+
+# --- 8.1: derive equality control on a real snapshot -----------------------
+
+
+def test_derive_equality_control_agrees_on_real_snapshot(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["status"] == "ok"
+    assert result["detail"]["control"]["compared"] == 1
+    assert result["detail"]["control"]["agree"] == 1
+    assert result["detail"]["control"]["disagree"] == 0
+    assert result["detail"]["control"]["skipped_reason"] is None
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT signals, scores FROM derived_points WHERE commit_sha = ? AND l0_source = 'stored'",
+        (commit_sha,),
+    ).fetchone()
+    verdicts = [r["verdict"] for r in conn.execute("SELECT verdict FROM derive_checks").fetchall()]
+    conn.close()
+
+    assert json.loads(row["signals"]) == snap["signals"]
+    assert json.loads(row["scores"]) == snap["scores"]
+    assert verdicts == ["agree"]
+
+
+def test_derive_named_mutation_curve_defs_disagrees(tmp_path):
+    """Named mutation 1 (proves as-of-stored, not HEAD): mutate the y of the
+    knot ``taint_rate``'s curve reads at ``raw == 0.0`` (verified by
+    construction -- the populated fixture has no pending-retract markers,
+    so ``taint_rate``'s raw value is exactly the curve's own domain-start
+    knot) -- ``scores["metrics"]["taint_rate"]`` must differ from the
+    snapshot's own, and ``derive_checks`` must record ``disagree`` naming
+    ``taint_rate`` in the diff."""
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    assert snap["signals"]["taint_rate"] == 0.0
+
+    conn = series.open_store(db_path)
+    model_defs = json.loads(conn.execute("SELECT model_defs FROM declarations").fetchone()["model_defs"])
+    curve_name = next(m["curve"] for m in model_defs["metrics"] if m["signal"] == "taint_rate")
+    curve_defs = json.loads(conn.execute("SELECT curve_defs FROM declarations").fetchone()["curve_defs"])
+    original_y = curve_defs[curve_name]["knots"][0][1]
+    mutated_y = 0.5 if original_y != 0.5 else 0.25
+    curve_defs[curve_name]["knots"][0] = [curve_defs[curve_name]["knots"][0][0], mutated_y]
+    conn.execute("UPDATE declarations SET curve_defs = ?", (json.dumps(curve_defs),))
+    conn.commit()
+    conn.close()
+
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["detail"]["control"]["agree"] == 0
+    assert result["detail"]["control"]["disagree"] == 1
+
+    disagreement = result["detail"]["disagreements"][0]
+    assert disagreement["commit_sha"] == commit_sha
+    assert "scores_metrics" in disagreement
+    assert "taint_rate" in disagreement["scores_metrics"]["names"]
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT scores FROM derived_points WHERE commit_sha = ? AND l0_source = 'stored'",
+        (commit_sha,),
+    ).fetchone()
+    verdict = conn.execute("SELECT verdict FROM derive_checks").fetchone()["verdict"]
+    conn.close()
+
+    derived_scores = json.loads(row["scores"])
+    assert derived_scores["metrics"]["taint_rate"] != snap["scores"]["metrics"]["taint_rate"]
+    assert derived_scores["metrics"]["taint_rate"] == pytest.approx(mutated_y)
+    assert verdict == "disagree"
+
+
+def test_derive_named_mutation_model_defs_importance_disagrees(tmp_path):
+    """Named mutation 2: zero out ``taint_rate``'s importance in
+    ``model_defs`` -- ``epistemic_integrity``'s score changes (renormalized
+    over its remaining admitted metrics), ``metrics_in_play`` drops
+    ``taint_rate``, and the verdict is ``disagree`` (this mutation is not
+    required to NAME the dropped signal, per the spec -- only mutation 1
+    is)."""
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    conn = series.open_store(db_path)
+    model_defs = json.loads(conn.execute("SELECT model_defs FROM declarations").fetchone()["model_defs"])
+    for m in model_defs["metrics"]:
+        if m["signal"] == "taint_rate":
+            assert m["importance"] > 0.0, "fixture assumption: taint_rate starts admitted"
+            m["importance"] = 0.0
+    conn.execute("UPDATE declarations SET model_defs = ?", (json.dumps(model_defs),))
+    conn.commit()
+    conn.close()
+
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["detail"]["control"]["disagree"] == 1
+    assert result["detail"]["control"]["agree"] == 0
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT scores FROM derived_points WHERE commit_sha = ? AND l0_source = 'stored'",
+        (commit_sha,),
+    ).fetchone()
+    conn.close()
+    derived_scores = json.loads(row["scores"])
+    assert "taint_rate" not in derived_scores["aspect_coverage"]["epistemic_integrity"]["metrics_in_play"]
+    assert "taint_rate" in snap["scores"]["aspect_coverage"]["epistemic_integrity"]["metrics_in_play"]
+    assert (
+        derived_scores["aspect_coverage"]["epistemic_integrity"]
+        != snap["scores"]["aspect_coverage"]["epistemic_integrity"]
+    )
+
+
+def test_derive_false_positive_control_config_mutation_still_agrees(tmp_path):
+    """False-positive control: mutate ``config`` (the vestigial blob the
+    deriver never reads) only -- the equality control must still ``agree``,
+    proving it doesn't fire on a blob outside its own inputs."""
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    conn = series.open_store(db_path)
+    config = json.loads(conn.execute("SELECT config FROM declarations").fetchone()["config"])
+    config["__mutated__"] = True
+    conn.execute("UPDATE declarations SET config = ?", (json.dumps(config),))
+    conn.commit()
+    conn.close()
+
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["detail"]["control"]["agree"] == 1
+    assert result["detail"]["control"]["disagree"] == 0
+
+
+# --- 8.2: D4.1's own test ----------------------------------------------------
+
+
+def test_derive_versions_independently_recomputed_d41(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    r1 = series.derive(db_path, health_version="health-v1.0", snapshots_dir=snapshots_dir)
+    assert r1["status"] == "ok"
+    conn = series.open_store(db_path)
+    v1_rows_before = {
+        (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
+        for r in conn.execute(
+            "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
+            "WHERE health_version = 'health-v1.0'"
+        ).fetchall()
+    }
+
+    # Insert a synthetic health-v1.1 declaration with different curve knots.
+    signal_defs = conn.execute(
+        "SELECT signal_defs FROM declarations WHERE health_version = 'health-v1.0'"
+    ).fetchone()["signal_defs"]
+    curve_defs = json.loads(
+        conn.execute(
+            "SELECT curve_defs FROM declarations WHERE health_version = 'health-v1.0'"
+        ).fetchone()["curve_defs"]
+    )
+    model_defs = conn.execute(
+        "SELECT model_defs FROM declarations WHERE health_version = 'health-v1.0'"
+    ).fetchone()["model_defs"]
+    for spec in curve_defs.values():
+        spec["knots"][0] = [spec["knots"][0][0], 1.0 - spec["knots"][0][1]]
+    conn.execute(
+        "INSERT INTO declarations (health_version, signal_defs, curve_defs, config, "
+        "model_defs, first_seen_commit, first_seen_file, engine_build) "
+        "VALUES ('health-v1.1', ?, ?, '{}', ?, NULL, 'synthetic', 'test')",
+        (signal_defs, json.dumps(curve_defs), model_defs),
+    )
+    conn.commit()
+    conn.close()
+
+    r2 = series.derive(db_path, health_version="health-v1.1", snapshots_dir=snapshots_dir)
+    assert r2["status"] == "ok"
+
+    conn = series.open_store(db_path)
+    v1_rows_after = {
+        (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
+        for r in conn.execute(
+            "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
+            "WHERE health_version = 'health-v1.0'"
+        ).fetchall()
+    }
+    v11_rows = {
+        (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
+        for r in conn.execute(
+            "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
+            "WHERE health_version = 'health-v1.1'"
+        ).fetchall()
+    }
+    conn.close()
+
+    assert v1_rows_before == v1_rows_after
+    assert v11_rows
+    for key, (sig11, sc11) in v11_rows.items():
+        sig10, sc10 = v1_rows_after[key]
+        assert sc11 != sc10
+
+
+# --- 8.3: null L0 -> UNAVAILABLE, never 0 -----------------------------------
+
+
+def test_derive_null_l0_to_unavailable_not_zero(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1 (no cascade_markers table)", _committer_iso(t0))
+
+    db_path = tmp_path / "series.db"
+    monkey_registry = dict(health_measurements.MEASUREMENTS)
+    bf = series.backfill(repo_dir, db_path, registry=monkey_registry)
+    assert bf["commits_done"] == 1
+
+    dv = series.derive(db_path)
+    assert dv["status"] == "ok"
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT signals FROM derived_points WHERE l0_source = 'git_replay'"
+    ).fetchone()
+    conn.close()
+    signals = json.loads(row["signals"])
+
+    assert signals["taint_rate"] == "UNAVAILABLE"
+    assert signals["stale_derivation_rate"] == "UNAVAILABLE"
+    assert isinstance(signals["open_contradiction_rate"], (int, float)) or (
+        signals["open_contradiction_rate"] == "UNAVAILABLE"
+    )
+    # Explicitly never a numeric 0/0.0 standing in for "unmeasurable".
+    assert signals["taint_rate"] != 0
+    assert signals["taint_rate"] != 0.0
+    assert signals["stale_derivation_rate"] != 0
+    assert signals["stale_derivation_rate"] != 0.0
+
+
+# --- 8.4: model_defs absent --------------------------------------------------
+
+
+def test_derive_model_defs_absent_scores_unavailable_reason(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    conn = series.open_store(db_path)
+    conn.execute("UPDATE declarations SET model_defs = NULL")
+    conn.commit()
+    conn.close()
+
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["detail"]["control"]["compared"] == 1
+    assert result["detail"]["control"]["agree"] == 1
+    assert result["detail"]["control"]["disagree"] == 0
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT signals, scores FROM derived_points WHERE commit_sha = ? AND l0_source = 'stored'",
+        (commit_sha,),
+    ).fetchone()
+    conn.close()
+    assert json.loads(row["signals"]) == snap["signals"]
+    assert json.loads(row["scores"]) == {"unavailable_reason": "model_defs_absent"}
+
+    ex = series.export(db_path)
+    assert ex["scores_available"] is False
+
+
+# --- 8.5: declarations gate (fills / silent-accept / raise) -----------------
+
+
+def test_declarations_gate_null_then_value_fills(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    k1 = _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    k2 = _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    snap1["model_defs"] = None  # simulate a pre-PR-C0 seat
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)  # carries real model_defs
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    result = series.ingest(snapshots_dir, repo_dir, db_path)
+
+    assert len(result["detail"]["declaration_fills"]) == 1
+    fill = result["detail"]["declaration_fills"][0]
+    assert fill["blob"] == "model_defs"
+    assert fill["file"] == f"2-nap-{ts2}.json"
+
+    conn = series.open_store(db_path)
+    stored_model_defs = conn.execute(
+        "SELECT model_defs FROM declarations WHERE health_version = ?", (snap1["health_version"],)
+    ).fetchone()["model_defs"]
+    conn.close()
+    assert json.loads(stored_model_defs) == snap2["model_defs"]
+
+
+def test_declarations_gate_value_then_null_accepted_silently(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)  # carries real model_defs
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)
+    snap2["model_defs"] = None  # an older-build seat's snapshot, declares less
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    result = series.ingest(snapshots_dir, repo_dir, db_path)
+    assert result["detail"]["declaration_fills"] == []
+
+    conn = series.open_store(db_path)
+    stored_model_defs = conn.execute(
+        "SELECT model_defs FROM declarations WHERE health_version = ?", (snap1["health_version"],)
+    ).fetchone()["model_defs"]
+    conn.close()
+    assert json.loads(stored_model_defs) == snap1["model_defs"]
+
+
+def test_declarations_gate_differing_model_defs_raises(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "k1", _committer_iso(t0))
+    _commit_knowledge(repo_dir, "k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+
+    snap1 = _build_v2_snapshot(anchor=None, turn=1)
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_v2_snapshot(anchor=None, turn=2)
+    mutated_model_defs = json.loads(json.dumps(snap2["model_defs"]))
+    mutated_model_defs["aspects"][0]["points"] += 1
+    snap2["model_defs"] = mutated_model_defs
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    with pytest.raises(series.SeriesIntegrityError) as excinfo:
+        series.ingest(snapshots_dir, repo_dir, db_path)
+    assert "model_defs" in str(excinfo.value)
+
+
+# --- 8.6: never-mutate + export preference -----------------------------------
+
+
+def test_derive_never_mutate_and_export_prefers_stored(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    # backfill FIRST -> a git_replay row is derived before the stored one.
+    series.backfill(repo_dir, db_path)
+    r1 = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert r1["detail"]["rows_by_source"]["git_replay"] == 1
+    assert r1["detail"]["rows_by_source"]["stored"] == 1
+
+    conn = series.open_store(db_path)
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM derived_points WHERE commit_sha = ?", (commit_sha,)
+    ).fetchone()["c"]
+    conn.close()
+    assert n == 2
+
+    ex = series.export(db_path)
+    all_points = ex["signals"]["taint_rate"]
+    matching = [p for p in all_points if p["commit"] == commit_sha]
+    assert len(matching) == 1
+    assert matching[0]["source"] == "stored"
+
+
+# --- 8.7: seeding -------------------------------------------------------------
+
+
+def test_derive_seeds_from_live_and_refuses_noncurrent_without_declarations(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path)
+
+    result = series.derive(db_path)
+    assert result["status"] == "ok"
+    assert result["detail"]["declarations_seeded_from_live"] is True
+
+    conn = series.open_store(db_path)
+    row = conn.execute(
+        "SELECT first_seen_file, first_seen_commit FROM declarations WHERE health_version = ?",
+        (series.health_version_module.CURRENT,),
+    ).fetchone()
+    conn.close()
+    assert row["first_seen_file"] == "live-engine"
+    assert row["first_seen_commit"] is None
+
+    result2 = series.derive(db_path, health_version="health-v0.9")
+    assert result2["status"] == "no_declarations"
+    assert result2["commits_done"] == 0
+
+    db_path2 = tmp_path / "series2.db"
+    series.backfill(repo_dir, db_path2)
+    result3 = series.derive(db_path2, seed_from_live=False)
+    assert result3["status"] == "no_declarations"
+    assert result3["commits_done"] == 0
+
+
+# --- 8.8: idempotence ---------------------------------------------------------
+
+
+def test_derive_and_export_idempotent(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    r1 = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert r1["commits_done"] == 1
+
+    r2 = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert r2["commits_done"] == 0
+
+    ex1 = series.export(db_path)
+    ex2 = series.export(db_path)
+    assert json.dumps(ex1, sort_keys=True) == json.dumps(ex2, sort_keys=True)
+
+
+# --- 8.9: export ---------------------------------------------------------------
+
+
+def test_export_shape_ordering_num_den_unreplayable_and_signal_filter(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    series.derive(db_path, snapshots_dir=snapshots_dir)
+
+    ex = series.export(db_path)
+    assert ex["version"] == "health-v1.0"
+    assert set(ex.keys()) == {"version", "replay_decl_hash", "signals", "aspects", "composed", "scores_available"}
+    assert set(ex["signals"].keys()) == set(snap["signal_defs"].keys())
+
+    point = ex["signals"]["taint_rate"][0]
+    assert point["commit"] == commit_sha
+    assert point["num"] == snap["measurements"]["claim_bearing_pending_retract_marker"]
+    assert point["den"] == snap["measurements"]["claim_bearing_current"]
+    assert point["unreplayable"] is None
+
+    ex_filtered = series.export(db_path, signal="taint_rate")
+    assert set(ex_filtered["signals"].keys()) == {"taint_rate"}
+
+
+def test_export_unreplayable_populated_for_replay_row(tmp_path):
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    _commit_knowledge(repo_dir, "-- k1 (no cascade_markers table)", _committer_iso(t0))
+
+    db_path = tmp_path / "series.db"
+    series.backfill(repo_dir, db_path)
+    series.derive(db_path)
+
+    ex = series.export(db_path, signal="taint_rate")
+    point = ex["signals"]["taint_rate"][0]
+    assert point["source"] == "git_replay"
+    assert point["unreplayable"] is not None
+    assert "claim_bearing_pending_retract_marker" in point["unreplayable"]
+
+
+def test_export_fail_honest_reasons(tmp_path):
+    missing_db = tmp_path / "does-not-exist.db"
+    r = series.export(missing_db)
+    assert r["reason"] == "no_db"
+    assert not missing_db.exists()
+
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    series.derive(db_path, snapshots_dir=snapshots_dir)
+
+    r2 = series.export(db_path, health_version="health-v9.9")
+    assert r2["reason"] == "version_absent"
+
+    r3 = series.export(db_path, signal="not_a_real_signal")
+    assert r3["reason"] == "signal_unknown"
+
+    # corrupt file -> unreadable
+    corrupt_db = tmp_path / "corrupt.db"
+    corrupt_db.write_text("not a sqlite file", encoding="utf-8")
+    r4 = series.export(corrupt_db)
+    assert r4["reason"] == "unreadable"
+
+
+# --- 8.10: migrations ---------------------------------------------------------
+
+_PRE_C1_DERIVED_POINTS_DDL = """
+CREATE TABLE derived_points (
+    commit_sha TEXT NOT NULL,
+    health_version TEXT NOT NULL,
+    signals TEXT NOT NULL,
+    scores TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    engine_build TEXT NOT NULL,
+    PRIMARY KEY (commit_sha, health_version)
+);
+"""
+
+_PRE_C1_DECLARATIONS_DDL = """
+CREATE TABLE declarations (
+    health_version TEXT PRIMARY KEY,
+    signal_defs TEXT,
+    curve_defs TEXT,
+    config TEXT,
+    first_seen_commit TEXT,
+    first_seen_file TEXT,
+    engine_build TEXT
+);
+"""
+
+_PRE_C1_REPLAY_RUNS_DDL = """
+CREATE TABLE replay_runs (
+    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at TEXT,
+    finished_at TEXT,
+    health_major INTEGER,
+    reason TEXT CHECK(reason IN ('ingest','initial','gap_fill','major_bump','verify','rebuild')),
+    commits_total INTEGER,
+    commits_done INTEGER,
+    skipped_old_format INTEGER,
+    unresolved INTEGER,
+    engine_build TEXT,
+    detail TEXT
+);
+"""
+
+
+def test_migration_pre_c1_derived_points_empty_gets_new_columns(tmp_path):
+    db_path = tmp_path / "series.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_PRE_C1_DERIVED_POINTS_DDL)
+    conn.commit()
+    conn.close()
+
+    conn = series.open_store(db_path)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(derived_points)").fetchall()}
+    conn.close()
+    assert "l0_source" in cols
+    assert "replay_decl_hash" in cols
+
+
+def test_migration_pre_c1_derived_points_nonempty_raises(tmp_path):
+    db_path = tmp_path / "series.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_PRE_C1_DERIVED_POINTS_DDL)
+    conn.execute(
+        "INSERT INTO derived_points VALUES (?, ?, ?, ?, ?, ?)",
+        ("deadbeef", "health-v1.0", "{}", "{}", "2026-01-01T00:00:00Z", "unknown"),
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(series.SeriesIntegrityError):
+        series.open_store(db_path)
+
+
+def test_migration_replay_runs_check_widened_preserving_rows(tmp_path):
+    db_path = tmp_path / "series.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_PRE_C1_REPLAY_RUNS_DDL)
+    conn.execute(
+        "INSERT INTO replay_runs (started_at, finished_at, health_major, reason, "
+        "commits_total, commits_done, skipped_old_format, unresolved, engine_build, detail) "
+        "VALUES ('t0', 't1', 1, 'ingest', 1, 1, 0, 0, 'unknown', '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = series.open_store(db_path)
+    rows = conn.execute("SELECT reason FROM replay_runs").fetchall()
+    conn.execute(
+        "INSERT INTO replay_runs (started_at, finished_at, health_major, reason, "
+        "commits_total, commits_done, skipped_old_format, unresolved, engine_build, detail) "
+        "VALUES ('t2', 't3', 1, 'derive', 1, 1, NULL, NULL, 'unknown', '{}')"
+    )
+    conn.commit()
+    conn.close()
+    assert [r["reason"] for r in rows] == ["ingest"]
+
+
+def test_migration_declarations_model_defs_added(tmp_path):
+    db_path = tmp_path / "series.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(_PRE_C1_DECLARATIONS_DDL)
+    conn.execute(
+        "INSERT INTO declarations (health_version, signal_defs, curve_defs, config, "
+        "first_seen_commit, first_seen_file, engine_build) "
+        "VALUES ('health-v1.0', '{}', '{}', '{}', NULL, 'f.json', 'unknown')"
+    )
+    conn.commit()
+    conn.close()
+
+    conn = series.open_store(db_path)
+    row = conn.execute("SELECT model_defs FROM declarations WHERE health_version = 'health-v1.0'").fetchone()
+    conn.close()
+    assert row["model_defs"] is None
+
+
+# --- 8.11: CLI as script -------------------------------------------------------
+
+
+def test_cli_derive_and_export_run_as_script(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable, str(SERIES_PATH), "derive",
+            "--db", str(db_path),
+            "--snapshots-dir", str(snapshots_dir),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "ok"
+    assert payload["commits_done"] == 1
+
+    result2 = subprocess.run(
+        [sys.executable, str(SERIES_PATH), "export", "--db", str(db_path), "--signal", "taint_rate"],
+        capture_output=True,
+        text=True,
+    )
+    assert result2.returncode == 0, result2.stderr
+    payload2 = json.loads(result2.stdout)
+    assert set(payload2["signals"].keys()) == {"taint_rate"}
+
+
+def test_cli_status_reports_derive_checks_and_verdicts(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    series.derive(db_path, snapshots_dir=snapshots_dir)
+
+    result = subprocess.run(
+        [sys.executable, str(SERIES_PATH), "status", "--db", str(db_path)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["counts"]["derive_checks"] == 1
+    assert payload["latest_derive_verdicts"]["agree"] == 1

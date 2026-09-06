@@ -25,13 +25,22 @@ section (further split into B1/B2 in that doc's "Scope split" paragraph):
     ``health/`` package." The old single-diff form survives as an explicit
     CLI/API opt-back (``--single-diff`` / ``rebuild(..., single_diff=True)``)
     since it confounds content and build change and is never the default.
-  - **PR C (NOT this module)** -- ``derived_points`` population, ``export``,
-    and the lifecycle checkpoint hook.
+  - **PR C1 (this module, additionally)** -- ``derived_points`` population
+    from STORED declarations (D4.1), never HEAD's live ``SIGNAL_DEFS``/
+    ``MODEL`` for a non-current version (``derive``/``derive_point``), the
+    equality control against each stored row's own snapshot file
+    (``derive_checks``), ``export`` (the JSON ``/api/health/v2/series``
+    serves), and ``checkpoint_hook`` (wired into ``engram_lifecycle.py``'s
+    post-dream checkpoint, ``ingest`` -> ``backfill`` -> ``derive`` in one
+    best-effort call).
 
-What PR B2 explicitly does NOT do (left as ``TODO(#2575 PR C)`` markers
-below): no ``derived_points`` population, no ``export``, no lifecycle wiring
-(nothing in ``engram_lifecycle.py`` or ``engram_snapshot_worker.py`` calls
-into this module).
+PR C1 does not touch ``rebuild``'s two-diff machinery, or
+``health/engine.py``/``health/model.py``/``health/signals.py``/``health/
+curves.py``/``health/measurements.py``/``health/version.py`` -- it only
+calls into ``health.model.model_from_defs``/``health.engine.score_signals``
+(both lazily, from inside ``derive_point``/``derive``), and reads
+``health.signals.signal_defs_jsonable``/``health.curves.curve_defs_jsonable``
+only for the CURRENT-version seeding path.
 
 The store (``series.db``) is DERIVED and REBUILDABLE -- never the SSoT. The
 snapshot JSON files under ``<snapshots_dir>/*.json`` (plus git history for
@@ -131,6 +140,15 @@ except ImportError:
     from health import measurements as health_measurements  # type: ignore[no-redef]
     from health import version as health_version  # type: ignore[no-redef]
 
+# Second alias to the SAME `health.version` module object as `health_version`
+# above -- used ONLY inside PR C1's `derive`/`export`, whose own PARAMETER is
+# named `health_version` (a string, per the spec'd signature) and would
+# otherwise shadow the module-level import of the same name inside those two
+# function bodies. Every other function in this file keeps using the plain
+# `health_version` name (no shadowing risk there -- none of them takes a
+# same-named parameter).
+health_version_module = health_version
+
 __all__ = [
     "SeriesIntegrityError",
     "open_store",
@@ -147,6 +165,10 @@ __all__ = [
     "equality_check",
     "backfill",
     "verify",
+    "derive_point",
+    "derive",
+    "export",
+    "checkpoint_hook",
 ]
 
 
@@ -189,11 +211,21 @@ CREATE TABLE IF NOT EXISTS l0_points (
 CREATE TABLE IF NOT EXISTS derived_points (
     commit_sha TEXT NOT NULL,
     health_version TEXT NOT NULL,
+    l0_source TEXT NOT NULL CHECK(l0_source IN ('stored','git_replay')),
+    replay_decl_hash TEXT NOT NULL DEFAULT '',
     signals TEXT NOT NULL,
     scores TEXT NOT NULL,
     computed_at TEXT NOT NULL,
     engine_build TEXT NOT NULL,
-    PRIMARY KEY (commit_sha, health_version)
+    PRIMARY KEY (commit_sha, health_version, l0_source, replay_decl_hash)
+);
+
+CREATE TABLE IF NOT EXISTS derive_checks (
+    commit_sha TEXT NOT NULL,
+    health_version TEXT NOT NULL,
+    verdict TEXT CHECK(verdict IN ('agree','disagree')),
+    diff TEXT,
+    checked_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS equality_checks (
@@ -210,7 +242,7 @@ CREATE TABLE IF NOT EXISTS replay_runs (
     started_at TEXT,
     finished_at TEXT,
     health_major INTEGER,
-    reason TEXT CHECK(reason IN ('ingest','initial','gap_fill','major_bump','verify','rebuild')),
+    reason TEXT CHECK(reason IN ('ingest','initial','gap_fill','major_bump','verify','rebuild','derive')),
     commits_total INTEGER,
     commits_done INTEGER,
     skipped_old_format INTEGER,
@@ -224,6 +256,7 @@ CREATE TABLE IF NOT EXISTS declarations (
     signal_defs TEXT,
     curve_defs TEXT,
     config TEXT,
+    model_defs TEXT,
     first_seen_commit TEXT,
     first_seen_file TEXT,
     engine_build TEXT
@@ -240,6 +273,11 @@ CREATE TABLE IF NOT EXISTS unresolved_snapshots (
 # The literal that must appear in unresolved_snapshots' CHECK constraint for
 # the store to be on the current schema -- see open_store()'s migration.
 _UNRESOLVED_REASON_MIGRATION_MARKER = "commit_already_keyed"
+
+# The literal that must appear in replay_runs' CHECK constraint for the
+# store to be on the current (PR C1) schema -- see open_store()'s
+# migration (5).
+_REPLAY_RUNS_REASON_MIGRATION_MARKER = "'derive'"
 
 # Tables compared by rebuild()'s ordered-dump diff (run metadata --
 # computed_at/engine_build/seen_at, and every replay_runs row -- is
@@ -332,6 +370,130 @@ def _migrate_equality_checks(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _derived_points_needs_migration(conn: sqlite3.Connection) -> bool:
+    """``True`` iff ``derived_points`` exists but predates the ``l0_source``
+    column (this store's THIRD schema migration, PR C1) -- a plain column,
+    so ``PRAGMA table_info`` suffices."""
+    cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(derived_points)").fetchall()
+    }
+    return "l0_source" not in cols
+
+
+def _migrate_derived_points(conn: sqlite3.Connection) -> None:
+    """Migrate a PR-A/B-era ``derived_points`` table (``commit_sha,
+    health_version, signals, scores, computed_at, engine_build``, PK
+    ``(commit_sha, health_version)``) to PR C1's shape (adds ``l0_source``/
+    ``replay_decl_hash``, PK widened to ``(commit_sha, health_version,
+    l0_source, replay_decl_hash)``). NO shipped writer ever populated this
+    table before PR C1 (``derive`` is the first), so the safe migration is:
+    if the table is EMPTY, drop and recreate under the new DDL; if it is
+    NON-empty (meaning something, somehow, wrote to it under the old
+    schema -- should never happen), raise ``SeriesIntegrityError`` naming
+    the table rather than silently dropping rows."""
+    count = conn.execute("SELECT COUNT(*) AS c FROM derived_points").fetchone()["c"]
+    if count != 0:
+        raise SeriesIntegrityError(
+            "derived_points migration (PR C1): the table is on the pre-C1 "
+            f"schema (no l0_source column) but holds {count} row(s) -- "
+            "refusing to silently drop them. No shipped writer populated "
+            "this table before PR C1 (`derive` is the first), so a "
+            "non-empty pre-C1 table is unexpected; investigate before "
+            "proceeding."
+        )
+    conn.execute("DROP TABLE derived_points")
+    conn.executescript(
+        """
+        CREATE TABLE derived_points (
+            commit_sha TEXT NOT NULL,
+            health_version TEXT NOT NULL,
+            l0_source TEXT NOT NULL CHECK(l0_source IN ('stored','git_replay')),
+            replay_decl_hash TEXT NOT NULL DEFAULT '',
+            signals TEXT NOT NULL,
+            scores TEXT NOT NULL,
+            computed_at TEXT NOT NULL,
+            engine_build TEXT NOT NULL,
+            PRIMARY KEY (commit_sha, health_version, l0_source, replay_decl_hash)
+        );
+        """
+    )
+    conn.commit()
+
+
+def _declarations_needs_model_defs_migration(conn: sqlite3.Connection) -> bool:
+    """``True`` iff ``declarations`` exists but predates the ``model_defs``
+    column (this store's FOURTH schema migration, PR C1 / D4.1) -- a plain
+    column, so ``PRAGMA table_info`` suffices."""
+    cols = {
+        r["name"] for r in conn.execute("PRAGMA table_info(declarations)").fetchall()
+    }
+    return "model_defs" not in cols
+
+
+def _migrate_declarations_model_defs(conn: sqlite3.Connection) -> None:
+    """Add the nullable ``model_defs`` column to a pre-PR-C1
+    ``declarations`` table. A plain ``ALTER TABLE ... ADD COLUMN`` --
+    existing rows get SQL ``NULL`` (read back as Python ``None``, distinct
+    from the JSON string ``"null"`` a post-migration ``ingest`` writes for
+    a snapshot that declares no ``model_defs`` -- both mean "absent"; see
+    ``derive``'s own declarations-loading code for where that
+    distinction is handled)."""
+    conn.execute("ALTER TABLE declarations ADD COLUMN model_defs TEXT")
+    conn.commit()
+
+
+def _replay_runs_needs_migration(conn: sqlite3.Connection) -> bool:
+    """``True`` iff ``replay_runs`` exists but its ``reason`` CHECK
+    constraint predates ``'derive'`` (this store's FIFTH schema migration,
+    PR C1) -- same ``sqlite_master.sql`` literal-text check as
+    ``_unresolved_snapshots_needs_migration`` above, since ``PRAGMA
+    table_info`` cannot see CHECK constraints."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'replay_runs'"
+    ).fetchone()
+    if row is None or row["sql"] is None:
+        return False
+    return _REPLAY_RUNS_REASON_MIGRATION_MARKER not in row["sql"]
+
+
+def _migrate_replay_runs(conn: sqlite3.Connection) -> None:
+    """Recreate ``replay_runs`` with the widened ``reason`` CHECK
+    (``'derive'`` added), preserving every row -- same rename-recreate-
+    reinsert shape as ``_migrate_unresolved_snapshots`` (SQLite cannot
+    alter a CHECK constraint in place). ``replay_runs`` is run METADATA
+    (never the SSoT for anything derivable), so recreating it in place --
+    including re-inserting each row's own ``run_id`` explicitly, so
+    AUTOINCREMENT identity is preserved -- carries no data-loss risk."""
+    conn.execute("ALTER TABLE replay_runs RENAME TO replay_runs__old")
+    conn.executescript(
+        """
+        CREATE TABLE replay_runs (
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT,
+            finished_at TEXT,
+            health_major INTEGER,
+            reason TEXT CHECK(reason IN ('ingest','initial','gap_fill','major_bump','verify','rebuild','derive')),
+            commits_total INTEGER,
+            commits_done INTEGER,
+            skipped_old_format INTEGER,
+            unresolved INTEGER,
+            engine_build TEXT,
+            detail TEXT
+        );
+        """
+    )
+    conn.execute(
+        "INSERT INTO replay_runs (run_id, started_at, finished_at, health_major, "
+        "reason, commits_total, commits_done, skipped_old_format, unresolved, "
+        "engine_build, detail) "
+        "SELECT run_id, started_at, finished_at, health_major, reason, "
+        "commits_total, commits_done, skipped_old_format, unresolved, "
+        "engine_build, detail FROM replay_runs__old"
+    )
+    conn.execute("DROP TABLE replay_runs__old")
+    conn.commit()
+
+
 def open_store(db_path: str | Path) -> sqlite3.Connection:
     """Open (creating if needed) the series store at ``db_path``, with all
     tables created idempotently. Plain rollback journal -- WAL is NOT
@@ -342,18 +504,28 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
     it was created with -- a schema-level change (widening ``unresolved_
     snapshots.reason`` to add ``commit_already_keyed``; adding ``equality_
     checks.replay_decl_hash``) does not reach an existing store on its own.
-    These are the store's first two schema migrations, run in order after
+    These are the store's five schema migrations, run in order after
     creating tables: (1) detect the old ``unresolved_snapshots`` CHECK
     (``PRAGMA table_info`` doesn't expose CHECKs, so the literal is read off
     ``sqlite_master.sql``) and, if found, recreate the table preserving its
     rows; (2) detect a missing ``equality_checks.replay_decl_hash`` column
     (a plain column, so ``PRAGMA table_info`` sees it directly) and, if
-    missing, ``ALTER TABLE ADD COLUMN`` it in place. Both are safe
-    specifically because both tables are DERIVED state -- ``rebuild``
-    reconstructs ``unresolved_snapshots`` from the snapshot files and the
-    repo, and ``equality_checks`` is itself a re-runnable control
-    (``verify`` re-populates it) -- so migrating either in place never
-    risks a source of truth."""
+    missing, ``ALTER TABLE ADD COLUMN`` it in place; (3) (PR C1) detect a
+    pre-C1 ``derived_points`` table (no ``l0_source`` column) and, if EMPTY,
+    drop and recreate it under the new DDL (``l0_source``/
+    ``replay_decl_hash`` added, PK widened) -- if NON-empty, raise
+    ``SeriesIntegrityError`` naming the table rather than silently drop rows
+    (no shipped writer populated this table before PR C1's ``derive``, so a
+    non-empty pre-C1 table is unexpected); (4) (PR C1) detect a missing
+    ``declarations.model_defs`` column and, if missing, ``ALTER TABLE ADD
+    COLUMN`` it in place (nullable, D4.1); (5) (PR C1) detect the old
+    ``replay_runs`` CHECK (missing the ``'derive'`` reason) and, if found,
+    recreate the table preserving its rows (same rename-recreate-reinsert
+    shape as migration (1), since SQLite cannot alter a CHECK in place).
+    All five are safe specifically because every migrated table is DERIVED
+    state -- ``rebuild``/``derive``/``verify`` reconstruct or re-populate
+    each of them -- so migrating any of them in place never risks a source
+    of truth."""
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=DELETE")
@@ -363,6 +535,12 @@ def open_store(db_path: str | Path) -> sqlite3.Connection:
         _migrate_unresolved_snapshots(conn)
     if _equality_checks_needs_migration(conn):
         _migrate_equality_checks(conn)
+    if _derived_points_needs_migration(conn):
+        _migrate_derived_points(conn)
+    if _declarations_needs_model_defs_migration(conn):
+        _migrate_declarations_model_defs(conn)
+    if _replay_runs_needs_migration(conn):
+        _migrate_replay_runs(conn)
     return conn
 
 
@@ -849,6 +1027,25 @@ def ingest(
     Returns the run record as a dict; the same dict (as JSON, with
     ``detail`` itself JSON-encoded) is inserted into ``replay_runs`` with
     ``reason='ingest'``.
+
+    **The declarations gate now compares FOUR blobs (PR C1, D4.1's own
+    delta): ``signal_defs``/``curve_defs``/``config``/``model_defs``.**
+    "Absence is not disagreement" -- comparison happens only when BOTH
+    sides declare a value (``_canonical_json(None) == "null"``, or a
+    genuine SQL ``NULL`` on a pre-migration-(4) row, both read as
+    "absent"). A stored absence filled by a later non-null value is a
+    FILL: the row is ``UPDATE``d and ``detail.declaration_fills`` lists
+    ``{health_version, blob, file}`` for each one. A stored non-null
+    against a later absence is accepted SILENTLY (an older build wrote
+    that snapshot -- it declared LESS, not DIFFERENTLY). Two non-null
+    values that differ is still the loud ``SeriesIntegrityError``. Why this
+    matters concretely: seats on the ``deploy/2026-09-05-health-v1.0`` tag
+    write ``health-v1.0`` snapshots WITHOUT ``model_defs`` (added by PR C0,
+    after that tag was cut -- no version bump, since the tag-diff gate
+    reads L0 only), while a dev seat writes ``health-v1.0`` WITH it. Same
+    version, same declared content wherever both sides declare -- that is
+    not a version-discipline violation. Two ``signal_defs`` blobs that
+    differ still is.
     """
     conn = open_store(db_path)
     try:
@@ -890,7 +1087,12 @@ def ingest(
         skipped_old_format = 0
         skipped_unreadable = 0
         collided = 0
-        detail: dict[str, list] = {"old_format": [], "unreadable": [], "collisions": []}
+        detail: dict[str, list] = {
+            "old_format": [],
+            "unreadable": [],
+            "collisions": [],
+            "declaration_fills": [],
+        }
 
         # Track which files were actually parsed, so unreadable ones are
         # identified by filename even though they never made it into
@@ -917,22 +1119,29 @@ def ingest(
             signal_defs_json = _canonical_json(snapshot.get("signal_defs"))
             curve_defs_json = _canonical_json(snapshot.get("curve_defs"))
             config_json = _canonical_json(snapshot.get("config"))
+            # (PR C1, D4.1) model_defs -- the fourth declared blob, added by
+            # engram-alpha#2575 PR C0. Older seats (e.g. one still on the
+            # deploy/2026-09-05-health-v1.0 tag) write health-v1.0 snapshots
+            # WITHOUT this key -- `_canonical_json(None) == "null"`.
+            model_defs_json = _canonical_json(snapshot.get("model_defs"))
 
             existing_decl = conn.execute(
-                "SELECT signal_defs, curve_defs, config FROM declarations WHERE health_version = ?",
+                "SELECT signal_defs, curve_defs, config, model_defs FROM declarations "
+                "WHERE health_version = ?",
                 (hv,),
             ).fetchone()
             if existing_decl is None:
                 conn.execute(
                     "INSERT INTO declarations "
-                    "(health_version, signal_defs, curve_defs, config, "
+                    "(health_version, signal_defs, curve_defs, config, model_defs, "
                     "first_seen_commit, first_seen_file, engine_build) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         hv,
                         signal_defs_json,
                         curve_defs_json,
                         config_json,
+                        model_defs_json,
                         None,
                         f.name,
                         build,
@@ -940,21 +1149,60 @@ def ingest(
                 )
                 conn.commit()
             else:
-                if existing_decl["signal_defs"] != signal_defs_json:
-                    first_diff = "signal_defs"
-                elif existing_decl["curve_defs"] != curve_defs_json:
-                    first_diff = "curve_defs"
-                elif existing_decl["config"] != config_json:
-                    first_diff = "config"
-                else:
-                    first_diff = None
+                # (PR C1, D4.1's own delta) "Absence is not disagreement":
+                # comparison happens only when BOTH sides are non-null
+                # (`_canonical_json(None) == "null"` is the absent sentinel
+                # for a canonical-JSON-encoded blob; `existing_decl[
+                # "model_defs"]` can ALSO be a genuine SQL NULL -- i.e.
+                # Python `None` -- for a row created before migration (4)
+                # added the column, which this loop treats the same as the
+                # string "null"). A stored `null`/`None` filled by a later
+                # non-null value is a FILL (UPDATE + record it); a stored
+                # non-null against a later `null` is accepted SILENTLY (an
+                # older build wrote that snapshot -- it declared less, not
+                # differently); two non-null values that differ is still
+                # the loud D4.1 violation.
+                update_fields: dict[str, str] = {}
+                first_diff: str | None = None
+                for blob_name, new_val in (
+                    ("signal_defs", signal_defs_json),
+                    ("curve_defs", curve_defs_json),
+                    ("config", config_json),
+                    ("model_defs", model_defs_json),
+                ):
+                    old_val = existing_decl[blob_name]
+                    old_absent = old_val is None or old_val == "null"
+                    new_absent = new_val == "null"
+                    if old_absent and new_absent:
+                        continue
+                    if old_absent and not new_absent:
+                        update_fields[blob_name] = new_val
+                        detail["declaration_fills"].append(
+                            {"health_version": hv, "blob": blob_name, "file": f.name}
+                        )
+                        continue
+                    if (not old_absent) and new_absent:
+                        continue
+                    if old_val != new_val:
+                        first_diff = blob_name
+                        break
                 if first_diff is not None:
                     raise SeriesIntegrityError(
                         f"declarations gate: health_version {hv!r} already has a "
                         f"stored declaration that disagrees with {f.name!r} in "
                         f"{first_diff!r} (D4.1: a version's declared signal_defs/"
-                        "curve_defs/config must never differ across snapshots)."
+                        "curve_defs/config/model_defs must never differ across "
+                        "snapshots where BOTH sides declare a value -- absence "
+                        "on one side is a fill or a silently-accepted lesser "
+                        "declaration, never a disagreement)."
                     )
+                if update_fields:
+                    set_clause = ", ".join(f"{k} = ?" for k in update_fields)
+                    conn.execute(
+                        f"UPDATE declarations SET {set_clause} WHERE health_version = ?",
+                        (*update_fields.values(), hv),
+                    )
+                    conn.commit()
 
             _, mode, ts = parse_snapshot_name(f.name)
             anchor = snapshot.get("anchor")
@@ -1862,6 +2110,13 @@ def rebuild(
     call (single-diff or two-diff), so ``status`` can report the last
     rebuild's verdict without re-running anything.
 
+    **``derived_points`` (PR C1) is deliberately NOT part of either rebuild
+    diff** -- it is a pure function of ``l0_points`` + ``declarations``
+    (both already diffed above), never a second source of truth, so after a
+    rebuild that replaces the store the next ``derive`` call simply
+    re-fills it from whatever ``l0_points``/``declarations`` rebuild left
+    behind.
+
     Returns ``{identical, content_differences, build_differences, builds:
     [{engine_build, dirty_suffix, rows, status}], build_confounded,
     other_table_differences, advice, rebuilt_path}`` in the default
@@ -2488,6 +2743,7 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
             "l0_points",
             "derived_points",
             "equality_checks",
+            "derive_checks",
             "replay_runs",
             "declarations",
             "unresolved_snapshots",
@@ -2549,6 +2805,22 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
         for verdict, _ in latest_by_key.values():
             latest_equality_verdicts[verdict] = latest_equality_verdicts.get(verdict, 0) + 1
 
+        # (PR C1) latest_derive_verdicts -- same "append-only, take the
+        # latest per key by checked_at" shape as latest_equality_verdicts
+        # above, but derive_checks' key has no replay_decl_hash column
+        # (it's keyed on (commit_sha, health_version) only).
+        latest_derive_by_key: "dict[tuple, tuple[str, str]]" = {}
+        for r in conn.execute(
+            "SELECT commit_sha, health_version, verdict, checked_at FROM derive_checks"
+        ).fetchall():
+            key = (r["commit_sha"], r["health_version"])
+            checked_at = r["checked_at"]
+            if key not in latest_derive_by_key or checked_at > latest_derive_by_key[key][1]:
+                latest_derive_by_key[key] = (r["verdict"], checked_at)
+        latest_derive_verdicts = {"agree": 0, "disagree": 0}
+        for verdict, _ in latest_derive_by_key.values():
+            latest_derive_verdicts[verdict] = latest_derive_verdicts.get(verdict, 0) + 1
+
         distinct_engine_builds = [
             r["engine_build"]
             for r in conn.execute(
@@ -2592,8 +2864,763 @@ def status(db_path: str | Path, code_repo_dir: str | Path | None = None) -> dict
         "current_replay_decl_hash": current_replay_decl_hash,
         "git_replay_counts": git_replay_counts,
         "latest_equality_verdicts": latest_equality_verdicts,
+        "latest_derive_verdicts": latest_derive_verdicts,
         "engine_build_resolvability": engine_build_resolvability,
     }
+
+
+# ---------------------------------------------------------------------------
+# PR C1 -- derived_points, export, the post-dream lifecycle hook
+# ---------------------------------------------------------------------------
+#
+# "derived_points is derivation, not truth" (design doc §2 + D4.1, restated
+# in this module's own PR C1 docstring addition above): for a version X,
+# signals and scores are recomputed from l0_points.measurements through the
+# declarations STORED for X (declarations.signal_defs/curve_defs/model_defs),
+# NEVER through HEAD's live SIGNAL_DEFS/MODEL. The ONE exception is seeding
+# (derive()'s own seed-from-live branch), allowed only when health_version
+# == health.version.CURRENT, where HEAD *is* the declaration by definition.
+
+
+def _import_health_module(name: str):
+    """Lazy import of ``health.<name>`` (e.g. ``"engine"``, ``"model"``,
+    ``"config"``, ``"signals"``, ``"curves"``), honoring this module's own
+    dual execution mode -- see the top-of-file ``try``/``except
+    ImportError`` block for ``measurements``/``version``, which this
+    mirrors exactly. Tries the relative import first (the normal,
+    package-imported path); on failure (bare script execution, no package
+    context) falls back to the same ``sys.path.insert`` + absolute-import
+    pattern used there. Deliberately a FUNCTION, not a module-level import,
+    so callers (``derive_point``/``derive``) can import these submodules
+    LAZILY -- never at series.py's own import time (this module's
+    ``test_module_imports_nothing_from_engram_core_at_import`` guard stays
+    green because none of these imports happen until one of PR C1's
+    functions is actually CALLED)."""
+    import importlib
+
+    try:
+        return importlib.import_module(f".{name}", package=__package__)
+    except (ImportError, TypeError):
+        # ImportError: the relative import resolved a package but the
+        # submodule genuinely failed to import. TypeError: `__package__` is
+        # falsy (bare script execution, no package context -- the same
+        # condition the top-of-file try/except for measurements/version
+        # handles via ImportError; `importlib.import_module` raises
+        # TypeError instead of ImportError for this specific case).
+        _src_engram = str(Path(__file__).resolve().parent.parent)
+        if _src_engram not in sys.path:
+            sys.path.insert(0, _src_engram)
+        return importlib.import_module(f"health.{name}")
+
+
+def derive_point(measurements: dict, declarations: dict) -> "tuple[dict, dict]":
+    """Pure, module-level, unit-testable deriver (design doc §2 + D4.1):
+    ``(signals, scores)`` for ONE L0 ``measurements`` dict, computed
+    through the STORED ``declarations`` dict for a version -- never HEAD's
+    live ``SIGNAL_DEFS``/``MODEL`` (see this module's "the rule this PR
+    implements" note above ``derive``).
+
+    ``declarations`` is the shape read off one ``declarations`` row, already
+    JSON-decoded: ``{"signal_defs": {...} | None, "curve_defs": {...} |
+    None, "model_defs": {...} | None}`` (``"config"`` is read by nothing
+    here -- it is the vestigial blob the deriver never touches, per the
+    design's false-positive control).
+
+    **Signal order**: iterates ``declarations["signal_defs"]`` in ITS OWN
+    dict order. On a real stored row this is alphabetical-by-name (the
+    stored canonical JSON was written with ``sort_keys=True``, so Python's
+    ``json.loads`` reconstructs a dict in that same sorted order) -- but
+    that is NOT asserted as a contract by this function, and ``export``
+    below does not rely on it either; a caller wanting a stable order
+    should sort ``signals.keys()`` itself.
+
+    **Signals**: reproduces ``health.signals._build``'s semantics exactly
+    (gate check first, then the shared empty-denominator/null policy, then
+    ``1 - rate`` for ``one_minus_rate``) -- but does NOT call ``health.
+    signals.SIGNALS`` (HEAD's live declaration); every numerator/
+    denominator/gate/form name comes from the passed-in ``declarations
+    ["signal_defs"]`` dict instead (the same shape ``health.signals.
+    signal_defs_jsonable()`` emits: ``{name: {numerator, denominator, form,
+    gates, ...}}``). Any gate key whose ``measurements`` value is ``None``
+    or falsy -> ``"UNAVAILABLE"``. A ``None`` numerator or denominator (an
+    unreplayable L0 measurement, e.g. a ``git_replay`` row missing
+    ``cascade_markers`` -- design §2: "a null L0 derives to UNAVAILABLE,
+    never 0, never a crash") -> ``"UNAVAILABLE"``. A zero denominator ->
+    ``"UNAVAILABLE"``. Otherwise ``n/d`` or ``1 - n/d`` per ``form``.
+
+    **Scores**: ``{"unavailable_reason": "model_defs_absent"}`` when
+    ``declarations["model_defs"]`` is ``None`` (a version whose
+    declarations were ingested/seeded before PR C0 added the ``model_defs``
+    blob). Otherwise reconstructs the historical model (``health.model.
+    model_from_defs``) from ``declarations["model_defs"]``/``["curve_defs"]``
+    and scores through the SAME function the live engine uses (``health.
+    engine.score_signals``) -- design doc §2's "the same functions the live
+    engine uses", true by construction, not by copy. This function's own
+    ``"UNAVAILABLE"`` STRING sentinel (used in its ``signals`` return value)
+    is mapped back to ``health.config.UNAVAILABLE`` (the real sentinel
+    OBJECT) before calling ``score_signals``, which expects the object, not
+    the string; ``score_signals``'s own ``_to_jsonable`` turns it back into
+    the string ``"UNAVAILABLE"`` inside the returned ``scores``.
+
+    Both ``health.model``/``health.engine``/``health.config`` are imported
+    LAZILY, inside this function, via ``_import_health_module`` above --
+    never at series.py's own module top level."""
+    signal_defs = declarations.get("signal_defs") or {}
+    signals: "dict[str, object]" = {}
+    for name, d in signal_defs.items():
+        gates = d.get("gates") or []
+        if gates and not all(measurements.get(g) for g in gates):
+            signals[name] = "UNAVAILABLE"
+            continue
+        num = measurements.get(d["numerator"])
+        den = measurements.get(d["denominator"])
+        if num is None or den is None or den == 0:
+            signals[name] = "UNAVAILABLE"
+            continue
+        rate = num / den
+        signals[name] = (1.0 - rate) if d["form"] == "one_minus_rate" else rate
+
+    model_defs = declarations.get("model_defs")
+    if model_defs is None:
+        return signals, {"unavailable_reason": "model_defs_absent"}
+
+    health_config = _import_health_module("config")
+    health_model = _import_health_module("model")
+    health_engine = _import_health_module("engine")
+
+    curve_defs = declarations.get("curve_defs") or {}
+    model = health_model.model_from_defs(model_defs, curve_defs)
+    l1_signals = {
+        name: (health_config.UNAVAILABLE if value == "UNAVAILABLE" else value)
+        for name, value in signals.items()
+    }
+    _, scores = health_engine.score_signals(l1_signals, model)
+    return signals, scores
+
+
+def derive(
+    db_path: "str | Path",
+    health_version: "str | None" = None,
+    engine_build: "str | None" = None,
+    now: "datetime | None" = None,
+    seed_from_live: bool = True,
+    snapshots_dir: "str | Path | None" = None,
+) -> dict:
+    """Populate ``derived_points`` for ``health_version`` (default
+    ``health.version.CURRENT``, imported via the module-level
+    ``health_version_module`` alias -- see that alias's own comment for why
+    a second name is needed here, distinct from ``health_version`` the
+    module import, given this function's own ``health_version`` STRING
+    parameter) from ``l0_points``, through the declarations STORED for
+    that version -- never HEAD's live declarations, except when seeding a
+    genuinely-absent CURRENT version's row (below).
+
+    **Declarations**: loads the ``declarations`` row for ``health_version``.
+    If absent:
+
+    - ``seed_from_live and health_version == health_version_module.CURRENT``
+      -- seed it from the live engine (``health.signals.
+      signal_defs_jsonable()``, ``health.curves.curve_defs_jsonable(MODEL.
+      curves)``, ``health.engine._config_to_dict(CONFIG)``, ``health.model.
+      model_defs_jsonable(MODEL)`` -- all four lazily imported), with
+      ``first_seen_file = 'live-engine'``, ``first_seen_commit = NULL``, and
+      ``detail.declarations_seeded_from_live = True`` in the returned run
+      record. This is the ONE place this function reads HEAD's live
+      declaration -- justified because, for the CURRENT version, HEAD *is*
+      the declaration by definition (nothing else could have declared it
+      yet).
+    - Otherwise: returns a run record with ``status: "no_declarations"`` and
+      zero rows touched -- a non-current version with no stored declaration
+      is NEVER derived from HEAD.
+
+    **Candidates**: every ``l0_points`` row with ``health_major ==
+    health_version_module.parse_version(health_version)[0]`` that is either
+    a ``stored`` row, or a ``git_replay`` row under the CURRENT
+    ``health.measurements.replay_decl_hash()`` (a stale-fingerprint
+    ``git_replay`` row is never derived against -- ``backfill``'s own
+    gap-fill mechanism is what re-replays it under a new fingerprint).
+
+    **Never-mutate**: for each candidate lacking a ``derived_points`` row
+    under its own ``(commit_sha, health_version, l0_source,
+    replay_decl_hash)`` key, ``derive_point`` computes and an INSERT (never
+    an UPDATE) adds it. A ``stored`` row arriving after a ``git_replay``
+    row already derived for the same commit simply adds a SECOND derived
+    row (distinct ``l0_source``) -- ``export`` picks between them (prefers
+    ``stored``).
+
+    **Equality control** (the derivation's own correctness test, run on
+    real data every night via the lifecycle hook, not only in CI): for
+    every ``stored`` L0 row derived THIS run, if ``snapshots_dir`` is given,
+    the snapshot file that produced it (``l0_points.snapshot_file``, read
+    from under ``snapshots_dir``) carries its own ``signals``/``scores``.
+    ``derive_point``'s output is compared against the file's own JSON
+    (parsed, exact equality -- same inputs, same functions, must be
+    identical, no float tolerance): ``signals`` always; ``scores`` too when
+    ``declarations["model_defs"]`` is non-null. A verdict (``"agree"``/
+    ``"disagree"``) is appended to ``derive_checks`` (append-only, like
+    ``equality_checks``) for every ``stored`` row checked this run; a
+    ``disagree`` verdict's diff names the specific signal(s) (under
+    ``diff["signals"]``) and/or scored metric(s) (``diff["scores_metrics"]``)
+    that differ, or a generic ``diff["scores_other"]`` when the scores
+    dicts differ in some other shape (e.g. ``metrics_in_play``/aspect
+    composition) with no differing per-metric score to name -- never a bare
+    "something disagreed" signal. When ``snapshots_dir`` is ``None`` the
+    control is skipped entirely and the run record's
+    ``detail.control.skipped_reason`` says so.
+
+    **Run record**, appended to ``replay_runs`` with ``reason='derive'``:
+    ``{reason, status, started_at, finished_at, health_version,
+    commits_total (candidates), commits_done (rows inserted), engine_build,
+    detail: {health_version, rows_by_source: {stored, git_replay},
+    declarations_seeded_from_live, control: {compared, agree, disagree,
+    skipped_reason}, disagreements: [...]}}``.
+    """
+    conn = open_store(db_path)
+    try:
+        started_at = _utc_now_iso(now)
+        effective_health_version = (
+            health_version if health_version is not None else health_version_module.CURRENT
+        )
+        build = engine_build if engine_build is not None else detect_engine_build()
+        major, _minor = health_version_module.parse_version(effective_health_version)
+
+        decl_row = conn.execute(
+            "SELECT signal_defs, curve_defs, config, model_defs FROM declarations "
+            "WHERE health_version = ?",
+            (effective_health_version,),
+        ).fetchone()
+
+        declarations_seeded_from_live = False
+        if decl_row is None:
+            if seed_from_live and effective_health_version == health_version_module.CURRENT:
+                health_signals = _import_health_module("signals")
+                health_curves = _import_health_module("curves")
+                health_engine = _import_health_module("engine")
+                health_model = _import_health_module("model")
+
+                signal_defs_json = _canonical_json(health_signals.signal_defs_jsonable())
+                curve_defs_json = _canonical_json(
+                    health_curves.curve_defs_jsonable(health_engine.MODEL.curves)
+                )
+                config_json = _canonical_json(health_engine._config_to_dict(health_engine.CONFIG))
+                model_defs_json = _canonical_json(
+                    health_model.model_defs_jsonable(health_engine.MODEL)
+                )
+                conn.execute(
+                    "INSERT INTO declarations "
+                    "(health_version, signal_defs, curve_defs, config, model_defs, "
+                    "first_seen_commit, first_seen_file, engine_build) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        effective_health_version,
+                        signal_defs_json,
+                        curve_defs_json,
+                        config_json,
+                        model_defs_json,
+                        None,
+                        "live-engine",
+                        build,
+                    ),
+                )
+                conn.commit()
+                decl_row = conn.execute(
+                    "SELECT signal_defs, curve_defs, config, model_defs FROM declarations "
+                    "WHERE health_version = ?",
+                    (effective_health_version,),
+                ).fetchone()
+                declarations_seeded_from_live = True
+            else:
+                finished_at = _utc_now_iso(now)
+                run_record = {
+                    "reason": "derive",
+                    "status": "no_declarations",
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "health_version": effective_health_version,
+                    "commits_total": 0,
+                    "commits_done": 0,
+                    "engine_build": build,
+                    "detail": {
+                        "health_version": effective_health_version,
+                        "declarations_seeded_from_live": False,
+                    },
+                }
+                conn.execute(
+                    "INSERT INTO replay_runs "
+                    "(started_at, finished_at, health_major, reason, commits_total, "
+                    "commits_done, skipped_old_format, unresolved, engine_build, detail) "
+                    "VALUES (?, ?, ?, 'derive', ?, ?, ?, ?, ?, ?)",
+                    (
+                        started_at,
+                        finished_at,
+                        major,
+                        0,
+                        0,
+                        None,
+                        None,
+                        build,
+                        _canonical_json(run_record["detail"]),
+                    ),
+                )
+                conn.commit()
+                return run_record
+
+        declarations_dict = {
+            "signal_defs": json.loads(decl_row["signal_defs"]),
+            "curve_defs": json.loads(decl_row["curve_defs"]),
+            "config": json.loads(decl_row["config"]),
+            "model_defs": (
+                json.loads(decl_row["model_defs"]) if decl_row["model_defs"] is not None else None
+            ),
+        }
+
+        current_hash = health_measurements.replay_decl_hash()
+        candidates = conn.execute(
+            "SELECT * FROM l0_points WHERE health_major = ? "
+            "AND (source = 'stored' OR (source = 'git_replay' AND replay_decl_hash = ?))",
+            (major, current_hash),
+        ).fetchall()
+
+        rows_by_source = {"stored": 0, "git_replay": 0}
+        compared = 0
+        agree = 0
+        disagree = 0
+        disagreements: "list[dict]" = []
+        skipped_reason = None if snapshots_dir is not None else (
+            "snapshots_dir not provided -- equality control skipped"
+        )
+
+        for row in candidates:
+            commit_sha = row["commit_sha"]
+            source = row["source"]
+            r_hash = row["replay_decl_hash"]
+            existing = conn.execute(
+                "SELECT 1 FROM derived_points WHERE commit_sha = ? AND health_version = ? "
+                "AND l0_source = ? AND replay_decl_hash = ?",
+                (commit_sha, effective_health_version, source, r_hash),
+            ).fetchone()
+            if existing is not None:
+                continue
+
+            measurements = json.loads(row["measurements"])
+            signals, scores = derive_point(measurements, declarations_dict)
+            computed_at = _utc_now_iso(now)
+            conn.execute(
+                "INSERT INTO derived_points "
+                "(commit_sha, health_version, l0_source, replay_decl_hash, signals, "
+                "scores, computed_at, engine_build) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    commit_sha,
+                    effective_health_version,
+                    source,
+                    r_hash,
+                    _canonical_json(signals),
+                    _canonical_json(scores),
+                    computed_at,
+                    build,
+                ),
+            )
+            conn.commit()
+            rows_by_source[source] = rows_by_source.get(source, 0) + 1
+
+            if source == "stored" and snapshots_dir is not None:
+                snap_file = row["snapshot_file"]
+                snap = None
+                if snap_file:
+                    snap_path = Path(snapshots_dir) / snap_file
+                    try:
+                        snap = json.loads(snap_path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        snap = None
+                if snap is not None:
+                    compared += 1
+                    file_signals = snap.get("signals") or {}
+                    diff: "dict[str, object]" = {}
+
+                    mismatched_signal_names = sorted(
+                        n
+                        for n in set(signals) | set(file_signals)
+                        if signals.get(n) != file_signals.get(n)
+                    )
+                    if mismatched_signal_names:
+                        diff["signals"] = {
+                            "names": mismatched_signal_names,
+                            "derived": {n: signals.get(n) for n in mismatched_signal_names},
+                            "snapshot": {n: file_signals.get(n) for n in mismatched_signal_names},
+                        }
+
+                    if declarations_dict["model_defs"] is not None:
+                        file_scores = snap.get("scores") or {}
+                        file_metrics = file_scores.get("metrics") or {}
+                        derived_metrics = (scores or {}).get("metrics") or {}
+                        mismatched_metric_names = sorted(
+                            n
+                            for n in set(derived_metrics) | set(file_metrics)
+                            if derived_metrics.get(n) != file_metrics.get(n)
+                        )
+                        if mismatched_metric_names:
+                            diff["scores_metrics"] = {
+                                "names": mismatched_metric_names,
+                                "derived": {n: derived_metrics.get(n) for n in mismatched_metric_names},
+                                "snapshot": {n: file_metrics.get(n) for n in mismatched_metric_names},
+                            }
+                        if scores != file_scores and "scores_metrics" not in diff:
+                            diff["scores_other"] = {"derived": scores, "snapshot": file_scores}
+
+                    verdict = "disagree" if diff else "agree"
+                    conn.execute(
+                        "INSERT INTO derive_checks "
+                        "(commit_sha, health_version, verdict, diff, checked_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            commit_sha,
+                            effective_health_version,
+                            verdict,
+                            _canonical_json(diff),
+                            _utc_now_iso(now),
+                        ),
+                    )
+                    conn.commit()
+                    if verdict == "agree":
+                        agree += 1
+                    else:
+                        disagree += 1
+                        disagreements.append({"commit_sha": commit_sha, **diff})
+
+        finished_at = _utc_now_iso(now)
+        commits_done = sum(rows_by_source.values())
+        detail = {
+            "health_version": effective_health_version,
+            "rows_by_source": rows_by_source,
+            "declarations_seeded_from_live": declarations_seeded_from_live,
+            "control": {
+                "compared": compared,
+                "agree": agree,
+                "disagree": disagree,
+                "skipped_reason": skipped_reason,
+            },
+            "disagreements": disagreements,
+        }
+        run_record = {
+            "reason": "derive",
+            "status": "ok",
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "health_version": effective_health_version,
+            "commits_total": len(candidates),
+            "commits_done": commits_done,
+            "engine_build": build,
+            "detail": detail,
+        }
+        conn.execute(
+            "INSERT INTO replay_runs "
+            "(started_at, finished_at, health_major, reason, commits_total, "
+            "commits_done, skipped_old_format, unresolved, engine_build, detail) "
+            "VALUES (?, ?, ?, 'derive', ?, ?, ?, ?, ?, ?)",
+            (
+                started_at,
+                finished_at,
+                major,
+                len(candidates),
+                commits_done,
+                None,
+                None,
+                build,
+                _canonical_json(detail),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return run_record
+
+
+def export(
+    db_path: "str | Path", health_version: "str | None" = None, signal: "str | None" = None
+) -> dict:
+    """The JSON shape ``/api/health/v2/series`` serves (design doc §4, §6).
+    READ-ONLY: opens ``db_path`` via ``sqlite3.connect(f"file:{db_path}?
+    mode=ro", uri=True)`` -- NEVER ``open_store`` (which creates tables and
+    runs migrations; a read path must never write). If ``db_path`` does not
+    exist, this function never even attempts to open it -- the caller can
+    assert the file still doesn't exist afterward.
+
+    Distinct fail-honest returns (a dict with ``error``/``reason``, NEVER an
+    exception):
+
+    - ``no_db`` -- ``db_path`` does not exist.
+    - ``version_absent`` -- no ``derived_points`` rows for ``health_version``
+      (default ``health_version_module.CURRENT``); ``has_declarations``
+      says whether a ``declarations`` row exists for it regardless.
+    - ``signal_unknown`` -- ``signal`` is not a key of that version's
+      ``signal_defs``.
+    - ``unreadable`` -- a ``sqlite3.Error`` occurred (corrupt file, etc.);
+      the error text is the ``error`` value.
+
+    Shape (design doc §6, one point per commit -- prefers the ``stored``-
+    derived row when both exist for a commit; a ``git_replay`` row is
+    included only under the CURRENT ``replay_decl_hash``; ordered by
+    ``t`` ascending, then ``commit``)::
+
+        {"version": ..., "replay_decl_hash": <current hash>,
+         "signals": {name: [point, ...]},   # every signal_defs name, or
+                                             # just `signal` when given
+         "aspects": {aspect: [{t, commit, source, score}, ...]},
+         "composed": [{t, commit, source, value, points_in_play,
+                        composed_coverage}, ...],
+         "scores_available": bool}          # False when model_defs_absent
+
+    where ``point = {t, commit, turn, source, num, den, raw, score,
+    unreplayable}`` -- ``num``/``den`` read off the L0 row's own
+    ``measurements`` via the version's ``signal_defs[name].numerator/
+    denominator``; ``unreplayable`` is the L0 row's own ``unreplayable``
+    entries restricted to those two keys (``None`` if neither is present).
+    This function does NOT compute distribution statistics (#2518 §4: the
+    page does that client-side over ``history``)."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {
+            "error": f"series store not found at {db_path}",
+            "reason": "no_db",
+            "db_path": str(db_path),
+        }
+
+    effective_health_version = (
+        health_version if health_version is not None else health_version_module.CURRENT
+    )
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error as e:
+        return {"error": str(e), "reason": "unreadable"}
+
+    try:
+        try:
+            derived_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM derived_points WHERE health_version = ?",
+                (effective_health_version,),
+            ).fetchone()["c"]
+            decl_row = conn.execute(
+                "SELECT * FROM declarations WHERE health_version = ?",
+                (effective_health_version,),
+            ).fetchone()
+        except sqlite3.Error as e:
+            return {"error": str(e), "reason": "unreadable"}
+
+        if derived_count == 0:
+            return {
+                "error": f"no derived_points rows for {effective_health_version!r}",
+                "reason": "version_absent",
+                "has_declarations": decl_row is not None,
+            }
+
+        signal_defs = json.loads(decl_row["signal_defs"]) if decl_row is not None else {}
+        if signal is not None and signal not in (signal_defs or {}):
+            return {
+                "error": f"unknown signal {signal!r} for {effective_health_version!r}",
+                "reason": "signal_unknown",
+            }
+
+        try:
+            major, _minor = health_version_module.parse_version(effective_health_version)
+        except ValueError as e:
+            return {"error": str(e), "reason": "unreadable"}
+
+        current_hash = health_measurements.replay_decl_hash()
+
+        try:
+            l0_rows = conn.execute(
+                "SELECT * FROM l0_points WHERE health_major = ? "
+                "AND (source = 'stored' OR (source = 'git_replay' AND replay_decl_hash = ?))",
+                (major, current_hash),
+            ).fetchall()
+            derived_rows = conn.execute(
+                "SELECT * FROM derived_points WHERE health_version = ?",
+                (effective_health_version,),
+            ).fetchall()
+        except sqlite3.Error as e:
+            return {"error": str(e), "reason": "unreadable"}
+
+        l0_by_commit: "dict[str, sqlite3.Row]" = {}
+        for r in l0_rows:
+            c = r["commit_sha"]
+            existing_l0 = l0_by_commit.get(c)
+            if existing_l0 is None or (existing_l0["source"] != "stored" and r["source"] == "stored"):
+                l0_by_commit[c] = r
+
+        derived_by_key = {
+            (r["commit_sha"], r["l0_source"], r["replay_decl_hash"]): r for r in derived_rows
+        }
+
+        triples: "list[tuple[str, sqlite3.Row, sqlite3.Row]]" = []
+        for commit_sha, l0_row in l0_by_commit.items():
+            key = (commit_sha, l0_row["source"], l0_row["replay_decl_hash"])
+            derived_row = derived_by_key.get(key)
+            if derived_row is None:
+                continue
+            triples.append((commit_sha, l0_row, derived_row))
+        triples.sort(key=lambda t: (t[1]["commit_time"], t[0]))
+
+        names = [signal] if signal is not None else list(signal_defs.keys())
+        signals_out: "dict[str, list]" = {name: [] for name in names}
+        aspects_out: "dict[str, list]" = {}
+        composed_out: "list[dict]" = []
+        scores_available = decl_row is not None and decl_row["model_defs"] is not None
+
+        for commit_sha, l0_row, derived_row in triples:
+            measurements = json.loads(l0_row["measurements"])
+            unreplayable_all = json.loads(l0_row["unreplayable"])
+            signals_json = json.loads(derived_row["signals"])
+            scores_json = json.loads(derived_row["scores"])
+            source = l0_row["source"]
+            t = l0_row["commit_time"]
+            turn = l0_row["turn"]
+
+            for name in names:
+                d = signal_defs.get(name)
+                if d is None:
+                    continue
+                num_key = d["numerator"]
+                den_key = d["denominator"]
+                unrep = {
+                    k: unreplayable_all[k] for k in (num_key, den_key) if k in unreplayable_all
+                }
+                point = {
+                    "t": t,
+                    "commit": commit_sha,
+                    "turn": turn,
+                    "source": source,
+                    "num": measurements.get(num_key),
+                    "den": measurements.get(den_key),
+                    "raw": signals_json.get(name),
+                    "score": (
+                        (scores_json.get("metrics") or {}).get(name)
+                        if scores_available and isinstance(scores_json, dict)
+                        else None
+                    ),
+                    "unreplayable": unrep or None,
+                }
+                signals_out[name].append(point)
+
+            if scores_available and isinstance(scores_json, dict):
+                for aspect_name, aspect_score in (scores_json.get("aspects") or {}).items():
+                    aspects_out.setdefault(aspect_name, []).append(
+                        {"t": t, "commit": commit_sha, "source": source, "score": aspect_score}
+                    )
+                composed_out.append(
+                    {
+                        "t": t,
+                        "commit": commit_sha,
+                        "source": source,
+                        "value": scores_json.get("composed"),
+                        "points_in_play": scores_json.get("points_in_play"),
+                        "composed_coverage": scores_json.get("composed_coverage"),
+                    }
+                )
+
+        return {
+            "version": effective_health_version,
+            "replay_decl_hash": current_hash,
+            "signals": signals_out,
+            "aspects": aspects_out,
+            "composed": composed_out,
+            "scores_available": scores_available,
+        }
+    finally:
+        conn.close()
+
+
+def _trim_run_record(record: dict) -> dict:
+    """Trim a run-record's ``detail`` to counts only (no long lists) --
+    ``checkpoint_hook``'s own contract: its summary lands in an MCP tool
+    result and must stay small. Any list-valued ``detail`` entry becomes
+    ``{"count": len(...)}``; one level of nested dict is walked the same
+    way (so e.g. ``detail.control`` -- a small dict of counts -- passes
+    through unchanged, while a nested list inside it would be trimmed
+    too). Every other field is passed through unchanged."""
+    trimmed = dict(record)
+    detail = trimmed.get("detail")
+    if isinstance(detail, dict):
+        new_detail: dict = {}
+        for k, v in detail.items():
+            if isinstance(v, list):
+                new_detail[k] = {"count": len(v)}
+            elif isinstance(v, dict):
+                new_detail[k] = {
+                    kk: ({"count": len(vv)} if isinstance(vv, list) else vv)
+                    for kk, vv in v.items()
+                }
+            else:
+                new_detail[k] = v
+        trimmed["detail"] = new_detail
+    return trimmed
+
+
+def checkpoint_hook(
+    snapshots_dir: "str | Path", repo_dir: "str | Path", db_path: "str | Path", mode: str
+) -> dict:
+    """The post-dream lifecycle hook (engram-alpha#2575 PR C, design doc §4
+    "When it runs"): runs ``ingest`` -> ``backfill`` -> ``derive(...,
+    snapshots_dir=snapshots_dir)`` IN ORDER, each in its OWN ``try``/
+    ``except`` -- one step's failure never blocks the next, and NONE of
+    them ever propagates out of this function (mirrors ``write_snapshot``'s
+    own best-effort posture in ``engram_lifecycle.py``: a health-series
+    failure must never break the checkpoint it's piggybacked onto).
+
+    ``mode`` is accepted but not branched on inside this function -- the
+    caller (``engram_lifecycle._checkpoint_internal``) is what decides
+    WHETHER to call this at all (post_dream only, never nap -- see that
+    call site's own comment) and passes ``mode`` through only so a caller
+    reading this function's return value can see which mode it ran under.
+
+    Returns ``{ingest: <summary or {"error": ...}>, backfill: <...>,
+    derive: <...>, elapsed_seconds: float}`` where each summary is the
+    corresponding function's run record with ``detail`` TRIMMED to counts
+    (``_trim_run_record`` -- no long lists in a tool result).
+
+    Two things a caller should expect and NOT treat as a defect (design
+    doc §4):
+
+    (a) The snapshot JUST WRITTEN by ``write_snapshot`` in THIS SAME
+        checkpoint has NO ``knowledge.sql`` child commit yet -- the async
+        snapshot worker commits it later, out of band (design D1). THIS
+        run's ``ingest`` records that file under ``unresolved_snapshots``
+        with reason ``no_child_commit``; the NEXT post-dream run's
+        ``ingest`` resolves it once the worker has caught up. Expected,
+        not a defect.
+    (b) The FIRST run on a seat is ``"initial"`` (``backfill``'s own
+        reason) and replays EVERY ``knowledge.sql`` commit (~20 seconds for
+        ~140 commits, measured 2026-09-05 on the design doc's own seat). A
+        MAJOR version bump replays them all again, under the new
+        ``health_major`` -- the design's own "backfills itself the first
+        night" property (§4)."""
+    import time
+
+    start = time.monotonic()
+    result: dict = {}
+
+    try:
+        ingest_result = ingest(snapshots_dir, repo_dir, db_path)
+        result["ingest"] = _trim_run_record(ingest_result)
+    except Exception as e:
+        result["ingest"] = {"error": str(e)}
+
+    try:
+        backfill_result = backfill(repo_dir, db_path)
+        result["backfill"] = _trim_run_record(backfill_result)
+    except Exception as e:
+        result["backfill"] = {"error": str(e)}
+
+    try:
+        derive_result = derive(db_path, snapshots_dir=snapshots_dir)
+        result["derive"] = _trim_run_record(derive_result)
+    except Exception as e:
+        result["derive"] = {"error": str(e)}
+
+    result["elapsed_seconds"] = time.monotonic() - start
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2674,6 +3701,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="defaults to health.version.MAJOR",
     )
 
+    p_derive = sub.add_parser("derive")
+    p_derive.add_argument("--db", required=True, help="path to series.db")
+    p_derive.add_argument(
+        "--health-version", default=None,
+        help="defaults to health.version.CURRENT (health_version_module.CURRENT)",
+    )
+    p_derive.add_argument(
+        "--snapshots-dir", default=None,
+        help="if given, runs the equality control against each stored row's own snapshot file",
+    )
+    p_derive.add_argument("--engine-build", default=None)
+    p_derive.add_argument(
+        "--no-seed", action="store_true",
+        help="never seed declarations from the live engine, even for the CURRENT version",
+    )
+
+    p_export = sub.add_parser("export")
+    p_export.add_argument("--db", required=True, help="path to series.db")
+    p_export.add_argument(
+        "--health-version", default=None,
+        help="defaults to health.version.CURRENT (health_version_module.CURRENT)",
+    )
+    p_export.add_argument("--signal", default=None)
+
     return parser
 
 
@@ -2713,6 +3764,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "verify":
         result = verify(args.repo_dir, args.db, health_major=args.health_major)
+    elif args.command == "derive":
+        result = derive(
+            args.db,
+            health_version=args.health_version,
+            engine_build=args.engine_build,
+            seed_from_live=not args.no_seed,
+            snapshots_dir=args.snapshots_dir,
+        )
+    elif args.command == "export":
+        result = export(args.db, health_version=args.health_version, signal=args.signal)
     else:  # pragma: no cover -- argparse `required=True` prevents this
         parser.error(f"unknown command: {args.command!r}")
         return 2
