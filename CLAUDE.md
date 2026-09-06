@@ -528,6 +528,56 @@ Cheap to check, and the check is the whole point: it
 replaces inferring readiness from the *shape* of the review record with
 actually reading it.
 
+**The hazard is BIDIRECTIONAL, and the paragraph above names only one half.** A
+round transcribed by a colleague into a **review body** is invisible to a scan of
+`issues/<N>/comments`, exactly as a round posted as a comment is invisible to
+`pulls/<N>/reviews`. Whichever single endpoint a hand-rolled fallback hits, it is
+blind in the other direction — so hit both, or use the one command that merges
+them.
+
+**And read them IN FULL — a CAPPED read of the RIGHT surface fails exactly like
+querying the wrong one.** This is the harder half, because it survives doing
+everything above correctly. Measured 2026-09-06 on engram-alpha#2656: the merge
+seat queried both surfaces and printed each review body **cut at 700
+characters**; the transcribed round sat at char 2152 of a 6414-char review, and
+the PR was twice reported as having no fairy round. Nothing was missing and no
+pattern was too narrow — the slice did not reach it.
+
+```
+wrong surface            -> hit BOTH endpoints (you cannot know which holds it)
+pattern too narrow       -> widen the pattern
+TRUNCATED right surface  -> NEITHER helps; only a full read does
+```
+
+**THE RULE.** Before you cap a read, ask: **could an item past my cut change this
+answer?** If yes, do not cap — no `head`, no `tail`, no character limit, no
+`--json` projection that drops the body.
+
+That question is the whole of it, and the property behind it is **monotonicity**:
+a capped read settles a question only when the slice is known — independently of
+the read — to hold everything the answer depends on. Finding your evidence
+*inside* the slice is the usual way to know that: a positive existential,
+answered YES. *Plainly: finding something proves it exists; not finding it, or
+needing to know what is LATEST, does not.* **If you cannot name how you know
+the slice suffices, you do not know it.**
+
+Two traps inside "conclusive", both of which have bitten:
+
+- **A bare keyword hit is not conclusive.** A cap landing mid-sentence, right
+  after `Blocker: X is broken` and before `— false alarm, retracting`, is a true
+  positive of the *literal string* and a false answer about the *claim*. A match
+  counts only once you have read to the end of its own clause.
+- **Absence is not the only fatal shape.** **Recency** ("is the current verdict
+  APPROVE?" — the resolving comment sits past the cap, so a stale blocker reads
+  as the live state), **counts and thresholds**, and **latest-state** questions
+  all fail the same way, because the truncated output and the true-negative
+  output are identical.
+
+*Two earlier drafts of this rule were false and both were caught before merge: it
+first claimed the safe case was "any question other than is-it-absent", then that
+a positive existential was the only safe case. Recorded because each wrong
+version was the kind a reader would have acted on.*
+
 ### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
 
 GitHub Stacked PRs (public preview 2026-07-30; official extension
