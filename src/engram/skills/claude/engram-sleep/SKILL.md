@@ -246,6 +246,32 @@ Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees wit
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
+### Step 3.8 — Reconcile lesson auto-demotion leases (engram-alpha#2544)
+
+alpha#1944's blocking-lesson auto-demotion is a **read-time lease, not a durable write**: `engram-lesson-tripwire-hook.py` computes a blocking lesson's *effective* `prevention_type` from the prevention ledger at match time (advisory once it has crossed `overrides` overrides within `window_days`), but never rewrites the lesson's own stored `prevention_type` — deliberately, since the hook has no `engram_core`/`engram_epistemic` import and the no-raw-DB-edits rule keeps audit-trail logging (field_traces, edit_history, turn stamp) inside `engram_update_lesson`, the module that owns it. Left alone, a demoted lesson stays stored as `"blocking"` indefinitely.
+
+Run the read-only detector once per sleep, from the repo root:
+
+```bash
+python3 tools/reconcile_lesson_demotions.py
+```
+
+Output is JSON: `{"candidates": [{"lesson_id", "override_count", "threshold", "window_days", "reason"}, ...]}` on success (exit 0). The script performs no writes — it reads the prevention ledger and each candidate's *current* stored `prevention_type` read-only, and only reports a lesson whose lease is **still hot right now** (a fresh override recount, not the ledger entry's stale timestamp). A lesson whose overrides have aged out of the window is correctly NOT reported — the read-time hook would resume blocking on it today, so a durable demotion now would be stricter than the lease itself currently demands.
+
+**Check the exit code before trusting an empty list.** `{"candidates": []}` (exit 0) is the healthy common case — no lesson has ever crossed the lease threshold. A genuine failure to check (missing `knowledge.db`, or a prevention ledger that exists but couldn't be read) is a *different* shape: `{"error": "...", "candidates": null}` with a non-zero exit code. Never read a non-zero exit's `candidates: null` as "nothing to do" — log the error line in today's history file instead, so a silently-broken reconcile pass doesn't read identically to a quiet night.
+
+For each candidate, call `engram_update_lesson` to make the demotion durable — `node_id` top-level, the changed field nested under `updates` (NOT `lesson_id` / a top-level `prevention_type` — verified against the tool's own real schema, not assumed):
+
+```
+engram_update_lesson(payload_json=json.dumps({
+    "node_id": candidate["lesson_id"],
+    "updates": {"prevention_type": "advisory"},
+    "reason": candidate["reason"],
+}))
+```
+
+Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec grants `tools: *` and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
+
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
 `~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md`, which captures consolidation output.

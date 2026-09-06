@@ -388,6 +388,13 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/reconcile_lesson_demotions.py",
+      "test_globs": [
+        "tests/test_reconcile_lesson_demotions.py"
+      ],
+      "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
+    },
+    {
       "path_prefix_or_glob": "tools/worktree-gc.py",
       "test_globs": [
         "tests/test_worktree_gc.py"

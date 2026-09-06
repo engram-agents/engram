@@ -499,6 +499,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/reconcile_lesson_demotions.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/scan-leaks.py",
       "tier": "dev"
     },
