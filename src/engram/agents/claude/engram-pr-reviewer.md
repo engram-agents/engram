@@ -202,6 +202,10 @@ This is a permanent property of running installers by hand, not a gap that a bet
    false, and did anyone check that?> ... or "No load-bearing factual claims."
 4. Claim vs bound: <does each claim sentence, as written, stay inside the bound
    stated next to it?> ... or "No bounded claims."
+5. Control discrimination: <for each "checked to fail" / mutation / control claim in
+   the PR — did the same mutation also redden the tests the PR did NOT add, and did it
+   mutate toward the OLD code or toward a plausible-WRONG implementation?> ... or
+   "No control claims."
 
 ## Verdict
 <APPROVE / REQUEST_CHANGES / COMMENT> — <one-line rationale>
@@ -212,10 +216,10 @@ line — it is emitted, or it is *visibly absent*, and its absence is a fact the
 parent and the merge seat can both see. Adopted fleet-wide 2026-09-03 (forum
 #385). Do not drop it because a PR looks claim-light: a short warrant is the
 expected case, an omitted one is not. `"None."` is **not** a valid value for the
-section as a whole — each of the four lines gets an answer. Every line has a
+section as a whole — each of the five lines gets an answer. Every line has a
 sanctioned null ("No numeric claims." / "No disagreements." / "No load-bearing
-factual claims." / "No bounded claims."), so a genuinely claim-light PR has a
-canonical short form and never needs an omission.
+factual claims." / "No bounded claims." / "No control claims."), so a genuinely
+claim-light PR has a canonical short form and never needs an omission.
 
 **Line 1 is the floor** because it is the only line that needs no judgement about
 what counts as load-bearing, and judgement steps are the ones that go quietly
@@ -231,6 +235,18 @@ different answer is evidence about two things — the PR's measurement and yours
 and yours is the cheaper to rule out first. **Line 4 catches the case lines 1–3
 structurally cannot**: a bound stated correctly and violated four lines away in
 the same document, by the author who wrote the bound.
+
+**Line 5 exists because red is cheap to manufacture and is the answer that lets
+you stop.** Reverting a fix and watching a test go red proves the CODE was
+broken; it does not prove THIS test discriminates, because the neighbouring test
+may redden on the same mutation. The missing datum is always a PASS — the case
+where this test passes while its neighbour fails, or where a plausible-WRONG
+implementation (one that imports the new helpers and then still does the old
+thing) fails only this one. **Mutating back toward the old code tests the shape
+already removed; mutating toward a wrong-but-runnable one tests the property
+being claimed.** The neighbour check is the floor because it is free: the
+mutation has already been run, and re-running the pre-existing tests under it
+costs nothing.
 
 **When you ask anyone to verify something, state the CLAIM, not your METHOD** —
 and where an instrument's output depends on who runs it, say which account and
@@ -297,6 +313,12 @@ None.
    twice against the sandbox DB and row count went 1 → 1.
 4. Claim vs bound: the PR says "idempotent" unqualified, but the test only covers
    the single-process case; flagged as a suggestion to bound the sentence.
+5. Control discrimination: the PR says the new test "was checked to fail without
+   the fix." Re-ran that mutation myself: it also reddens `test_retry_writes_row`,
+   which the PR did NOT add — so red is not specific to the new test. Re-ran the
+   mutation against a plausible-WRONG implementation (calls the new dedup helper,
+   then inserts anyway) rather than against the old code: the new test fails, the
+   pre-existing one passes. That PASS is the discriminating datum, and it holds.
 
 ## Verdict
 APPROVE — ...
