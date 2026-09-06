@@ -1024,19 +1024,45 @@ def _fresh_core_with_data_dir(tmp_path, monkeypatch):
     the import makes resolution deterministic regardless of what any other
     test file has done to `sys.path` -- matches this file's own
     `_load_surface_hook` pattern of never trusting ambient `sys.path` order
-    for locating repo-local modules under test."""
+    for locating repo-local modules under test.
+
+    #2664: this function's own need for `src_engram` at `sys.path[0]` is
+    real (unlike test_surgical_relation_sets.py's sibling site, where the
+    equivalent insert was found to be entirely redundant) -- but leaving
+    it there afterward is not, and this is called fresh per-test (3 call
+    sites) with no restore, permanently reordering `src_engram` ahead of
+    REPO_ROOT for every test file collected after it in the same session.
+    That IS the #2565 collision shape, just usually masked in this file's
+    own full run: an earlier, unrelated test happens to `import server`
+    first (which needs `tools.recall_summary_validator`), caching the
+    CORRECT `tools` package while `sys.path` is still clean, before any
+    of these 3 tests get a chance to pollute it -- so the #2565 guard's
+    own "already cached, trust that" branch protects every later file by
+    accident. Reproduced live with that accidental protection removed
+    (selecting just these 3 tests, `-k`-style, alongside
+    tests/test_engine_phase3.py): 3 passed, 53 errors, before this fix.
+    Restored (not appended, unlike the sibling site): this function's own
+    documented need is for `src_engram` at position 0 specifically during
+    THIS import, so `sys.path` is snapshotted before the mutation and
+    restored verbatim in a `finally` -- once `import engram_core`
+    completes, the module is already cached in `sys.modules` regardless
+    of `sys.path`'s later state, so restoring costs nothing here."""
     for key in list(sys.modules):
         if key == "server" or key.startswith("engram_"):
             del sys.modules[key]
     src_engram = str(PROJECT_ROOT / "src" / "engram")
+    _prior_sys_path = list(sys.path)
     if src_engram in sys.path:
         sys.path.remove(src_engram)
     sys.path.insert(0, src_engram)
-    import engram_core as core
-    assert Path(core.__file__).resolve() == (PROJECT_ROOT / "src" / "engram" / "engram_core.py").resolve(), (
-        f"engram_core resolved to {core.__file__!r}, not this worktree's copy -- "
-        "sys.path pollution from another test file (see docstring)"
-    )
+    try:
+        import engram_core as core
+        assert Path(core.__file__).resolve() == (PROJECT_ROOT / "src" / "engram" / "engram_core.py").resolve(), (
+            f"engram_core resolved to {core.__file__!r}, not this worktree's copy -- "
+            "sys.path pollution from another test file (see docstring)"
+        )
+    finally:
+        sys.path[:] = _prior_sys_path
     monkeypatch.setattr(core, "DATA_DIR", str(tmp_path))
     return core
 

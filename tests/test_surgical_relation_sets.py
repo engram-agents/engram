@@ -49,8 +49,25 @@ SRC_ENGRAM = REPO_ROOT / "src" / "engram"
 
 
 def _load_surgical():
-    """Import tools/surgical.py fresh, isolated from any cached module."""
-    sys.path.insert(0, str(SRC_ENGRAM))
+    """Import tools/surgical.py fresh, isolated from any cached module.
+
+    #2664: does NOT touch sys.path -- an earlier version did
+    `sys.path.insert(0, str(SRC_ENGRAM))` here, called fresh per-test via
+    the `surgical` fixture below, with no restore. That insert(0) was
+    never actually needed: tests/conftest.py already puts SRC_ENGRAM on
+    sys.path unconditionally for the whole session (position 1, behind
+    REPO_ROOT) before any test file runs -- surgical.py's own top-level
+    `from engram_confidence import ...` / `from engram_core import ...`
+    resolve fine from that position, since nothing else on sys.path
+    shadows those names. The insert(0)'s ONLY actual effect was
+    reordering SRC_ENGRAM AHEAD of REPO_ROOT, permanently, for every test
+    file collected after this one in the same session -- exactly the
+    #2565 collision shape (verified live: reproduced 5 passed/53 errors
+    running this file with tests/test_engine_phase3.py before this fix;
+    58 passed/0 errors after). Confirmed this file's own 5 tests still
+    pass with the line removed entirely, rather than swapping it for
+    .append(...) or a restore-after-use pattern -- both would have
+    worked, but neither is needed once the insert itself is redundant."""
     sys.modules.pop("surgical", None)
     spec = importlib.util.spec_from_file_location(
         "surgical", str(SRC_ENGRAM / "tools" / "surgical.py")

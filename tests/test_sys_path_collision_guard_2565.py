@@ -316,6 +316,94 @@ def test_run_phase_collision_is_caught_by_the_fixture_not_collectstart(tmp_path:
 
 
 # ---------------------------------------------------------------------------
+# #2664 -- two fixture/function-scoped sites the completeness sweep above
+# CANNOT see by construction (it only runs each candidate file STANDALONE,
+# which proves nothing about a fixture-scoped insert whose hazard is
+# specifically cross-file). Checked in as real regression tests against
+# THIS REPO's own files, not a synthetic scratch repo, since the whole
+# point is to guard the two actual sites that were found broken.
+# ---------------------------------------------------------------------------
+
+
+def test_surgical_relation_sets_no_longer_collides_with_test_engine_phase3():
+    """#2664 site 1. Before the fix, tests/test_surgical_relation_sets.py's
+    `_load_surgical()` did `sys.path.insert(0, str(SRC_ENGRAM))` (removed
+    entirely -- redundant, since tests/conftest.py already puts SRC_ENGRAM
+    on sys.path unconditionally) AND src/engram/tools/surgical.py's own
+    module top level did the identical `sys.path.insert(0, str(PROJECT_DIR))`
+    (changed to .append() -- this one is the actual root cause: fixing
+    only the test file's line does NOT close this reproduction, since
+    `_load_surgical()`'s exec_module() call re-runs surgical.py's own
+    top-level code fresh every time it's invoked). Measured before this
+    fix: 5 passed, 53 errors. After: 58 passed, 0 errors -- this test
+    checks in that measurement so a regression at either site fails loud."""
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+            "tests/test_surgical_relation_sets.py", "tests/test_engine_phase3.py",
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "sys.path collision (#2565)" not in combined, (
+        f"the #2664 fix regressed -- test_engine_phase3.py collided again "
+        f"when run alongside test_surgical_relation_sets.py:\n{combined}"
+    )
+    assert "58 passed" in combined, (
+        f"expected all 58 tests (5 + 53) to pass cleanly, got:\n{combined}"
+    )
+
+
+def test_principle_triggers_registry_no_longer_collides_with_test_engine_phase3():
+    """#2664 site 2. Before the fix,
+    tests/test_principle_triggers_registry.py's `_fresh_core_with_data_dir`
+    (called fresh per-test at 3 call sites) did `sys.path.insert(0,
+    src_engram)` with no restore, permanently reordering src_engram ahead
+    of the repo root for the rest of the session. Fixed via snapshot/
+    restore (this site's own position-0 need, documented in its docstring,
+    is real -- unlike site 1's -- so the fix restores sys.path afterward
+    rather than removing the insert or switching to append).
+
+    Selects ONLY the 3 tests that call the helper, not the whole file:
+    running the full file masks this collision by accident (an earlier,
+    unrelated test in the same file happens to `import server`, caching
+    the CORRECT `tools` package before these 3 tests get a chance to
+    pollute sys.path -- the #2565 guard's own 'already cached, trust
+    that' branch then protects every later file regardless). That
+    masking is why the full-file combination stays green before AND
+    after this fix (checked, not assumed) and is not itself evidence of
+    anything -- the narrower selection below is. Measured before this
+    fix: 3 passed, 53 errors. After: 56 passed, 0 errors."""
+    repo_root = Path(__file__).resolve().parent.parent
+    proc = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+            "tests/test_principle_triggers_registry.py::test_concurrent_hook_and_reset_writes_lose_no_update",
+            "tests/test_principle_triggers_registry.py::test_with_state_lock_degrades_when_lockfile_open_fails",
+            "tests/test_principle_triggers_registry.py::test_with_state_lock_releases_lock_when_closure_raises",
+            "tests/test_engine_phase3.py",
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "sys.path collision (#2565)" not in combined, (
+        f"the #2664 fix regressed -- test_engine_phase3.py collided again "
+        f"when run alongside these 3 test_principle_triggers_registry.py "
+        f"tests:\n{combined}"
+    )
+    assert "56 passed" in combined, (
+        f"expected all 56 tests (3 + 53) to pass cleanly, got:\n{combined}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Completeness sweep -- reviewer-fairy round-1 catch on PR #2661: a clean
 # FULL-suite collection (`pytest tests/ --co`) only proves the DEFAULT,
 # complete, alphabetically-ordered run is safe (some earlier file's own
@@ -370,24 +458,22 @@ def _files_with_insert0_src_engram_pattern() -> list[Path]:
     docstring states about its own, more thorough bound.
 
     A SECOND, independent bound (found by PR #2661's own round-2 reviewer-
-    fairy, via its own fresh sibling search rather than this sweep):
-    this sweep's test runs each candidate file STANDALONE, which can only
+    fairy, via its own fresh sibling search rather than this sweep, still
+    live even after both known instances were fixed under #2664): this
+    sweep's test runs each candidate file STANDALONE, which can only
     prove a module-top-level insert is safe in isolation. It cannot see a
     FIXTURE- or FUNCTION-SCOPED insert whose hazard is specifically
     CROSS-FILE -- the file passes fine alone and only pollutes a
-    DIFFERENT, later-run file in the same process. Live instance found and
-    left unfixed by this PR (pre-existing, untouched by either commit
-    here): tests/test_surgical_relation_sets.py's `_load_surgical()`
-    helper does an unconditional, never-restored
-    `sys.path.insert(0, str(SRC_ENGRAM))` inside a function called per-test
-    via a fixture -- reproduced live as 53 ERRORS when
-    `tests/test_surgical_relation_sets.py` and `tests/test_engine_phase3.py`
-    run together vs. 53/53 passed when the latter runs alone.
-    `tests/test_principle_triggers_registry.py`'s `_fresh_core_with_data_dir`
-    has the identical shape (unconfirmed as a live failure). Tracked as
-    engram-alpha#2664 rather than fixed here -- the runtime guard this PR
-    ships still catches the collision loudly and attributably when it
-    fires; only this sweep's own COVERAGE CLAIM has the gap."""
+    DIFFERENT, later-run file in the same process. See
+    test_surgical_relation_sets_no_longer_collides_with_test_engine_phase3
+    and test_principle_triggers_registry_no_longer_collides_with_test_engine_phase3
+    below for the two instances #2664 found and fixed this way -- both
+    checked in as their own dedicated regression tests rather than folded
+    into this sweep, because that is the whole point of this bound: this
+    sweep's standalone-execution model cannot express them. The runtime
+    guard's own safety property held throughout regardless -- it caught
+    both collisions loudly and attributably the moment they fired; the
+    gap was only ever in what THIS SWEEP's coverage claim could see."""
     tests_dir = Path(__file__).resolve().parent
     matches = []
     for path in sorted(tests_dir.glob("*.py")):

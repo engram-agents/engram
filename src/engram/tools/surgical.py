@@ -37,7 +37,17 @@ from pathlib import Path
 # Import confidence constants from the shared module (single source of truth).
 # Derive the repo root from this script's location (tools/ is one level down).
 PROJECT_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_DIR))
+# #2664: append, not insert(0) -- this only needs PROJECT_DIR to be
+# SOMEWHERE on sys.path so the two bare imports below resolve (true both
+# for standalone CLI use, where sys.path starts empty of it, and for
+# tests/test_surgical_relation_sets.py's exec_module-based fresh reload,
+# where tests/conftest.py has ALREADY put PROJECT_DIR/src/engram on
+# sys.path -- just behind the repo root). insert(0) reordered PROJECT_DIR
+# ahead of the repo root on every exec_module() call, permanently, for
+# the rest of that pytest session -- the #2565 tools/-package collision
+# shape, and the actual root cause the test file's own sibling fix
+# (removing its now-redundant insert(0)) could not close on its own.
+sys.path.append(str(PROJECT_DIR))
 from engram_confidence import (
     CONFIDENCE_MAP, SOURCE_CLASS_CONFIDENCE_DISCOUNT,
     PREDICTIVE_CONFIDENCE_CAP, REASONING_CLASS, REASONING_DISCOUNT,
