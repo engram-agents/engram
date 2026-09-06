@@ -132,11 +132,15 @@ The practical consequence for a reviewer: a FALLING unaccounted count across a
 rebase is not evidence of accounting. Read the stale-marker warnings, and diff
 the two runs' id sets, rather than taking the smaller number as progress.
 
-Escape hatch — a PR body line:
+Escape hatch — a line, in EITHER the PR body OR the base..head diff itself
+(#2568):
 
     Removed-test: <id> — <reason>
 
-accounts for a disappeared test, where <id> is either the full id
+optionally prefixed by a markdown list marker (`- `, `* `, `+ `, #2421) or a
+source-code comment marker (`# `, `// `, `<!-- `, #2568 — this is what lets
+the SAME line, written as a comment beside the actual removal, account for
+it), accounts for a disappeared test, where <id> is either the full id
 (`path::name`) or a bare function/method name (accepted only when exactly one
 disappeared id ends with `::<name>` — an ambiguous bare name is NOT accounted,
 and the failure message says the full id is needed). The separator is an
@@ -144,6 +148,14 @@ em-dash or a hyphen; the reason must be non-empty after stripping. A marker
 naming an id that did NOT disappear is a warning, not a failure: deliberate,
 because a PR author who correctly restored a test after writing the marker
 line should not be blocked by their own now-stale housekeeping.
+
+The two surfaces are read independently (never concatenated into one text
+before parsing — a stray backtick in one must never be able to swallow a
+marker in the other) and unioned before the accounting check. Placing the
+marker in the diff, next to the removal, is the more durable choice: it
+survives the PR closing, it's versioned in the repo, and a future reader of
+the file finds it where the removal actually happened, none of which is
+true of a PR body. The gate does not care which surface an author picks.
 
 Usage:
     python3 tools/test_id_set_check.py \
@@ -297,8 +309,19 @@ def collect_ids(sources: Mapping[str, str]) -> set[str]:
 # merely stopping the fail-loud warning from firing on it -- the warning
 # path is untouched and still catches variants 1 and 2, which a bulleted
 # marker was never the shape of anyway.
+#
+# #2568 -- a leading source-code comment marker (`# `, `// `, `<!-- `) is
+# ALSO permitted, same slot as the list markers above. This is what makes
+# a marker written as a comment beside the actual removal in a diff (not
+# just in the PR body) parse at all -- see parse_removed_test_markers_
+# from_diff() below, the second surface that reuses this SAME regex so the
+# two call sites (body vs diff) can't drift apart the way #2421 fixed for
+# body-only list markers. Widening this ONE shared anchor means a
+# `# Removed-test: ...` line in the PR body ALSO now parses, which is
+# correct and intentional (same reasoning as the list-marker widening: a
+# marker is a marker regardless of which surface's decoration wraps it).
 _MARKER_RE = re.compile(
-    r"^[ \t]*(?:[-*+][ \t]+)?removed-test:[ \t]+(?P<id>\S+)[ \t]+[—-][ \t]*(?P<reason>.*?)[ \t]*$",
+    r"^[ \t]*(?:[-*+][ \t]+|#[ \t]+|//[ \t]+|<!--[ \t]+)?removed-test:[ \t]+(?P<id>\S+)[ \t]+[—-][ \t]*(?P<reason>.*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -588,8 +611,9 @@ def format_report_text(report: Report) -> str:
     for tid in report.unaccounted:
         lines.append(
             f"::error::disappeared test id not accounted for: {tid} "
-            f"(add 'Removed-test: {tid} — <reason>' to the PR body if this "
-            f"deletion is legitimate)"
+            f"(add 'Removed-test: {tid} — <reason>' to the PR body, or as a "
+            f"comment beside the removal in the diff, if this deletion is "
+            f"legitimate)"
         )
     if report.passed:
         lines.append("PASS — no unaccounted test-id disappearances.")
@@ -642,6 +666,128 @@ def read_sources_at_rev(repo_root: Path, rev: str) -> dict[str, str]:
     for path in list_test_files(repo_root, rev):
         sources[path] = _run_git(repo_root, ["show", f"{rev}:{path}"])
     return sources
+
+
+def read_diff_added_text_by_file(repo_root: Path, base: str, head: str) -> list[str]:
+    """#2568 — the added (`+`) lines of the base..head unified diff, `+`
+    prefix stripped, grouped ONE BLOB PER FILE (files with no added lines
+    are omitted).
+
+    A `Removed-test:` marker written as a comment beside the actual
+    removal (in the diff, not the PR body) is real accounting -- it sits
+    next to the code a future reader will look at, it's versioned in the
+    repo, and it survives the PR closing (see the issue's own case: three
+    well-formed markers at a specific file:line, invisible to a
+    body-only parser, failing a PR whose accounting was actually
+    complete). No path restriction to tests/ -- an author may document a
+    removal anywhere in the diff, same as the PR-body path has no
+    restriction on where in the body a marker may appear.
+
+    Per-file grouping (not one flat blob for the whole diff) matters for
+    the same reason #2539/#2540 fixed cross-blob leakage at the
+    body-vs-diff boundary: `_strip_inline_code_preserving_fences`'s
+    unmatched-backtick-swallow LIMIT pairs an unclosed backtick with the
+    NEXT backtick it finds, however far away. A flat whole-diff blob lets
+    a stray backtick added in one file swallow a marker added in an
+    unrelated file elsewhere in the same PR -- caught live on #2632's own
+    review, by running this exact function against #2632's own diff.
+    Callers strip each file's blob independently (see
+    parse_removed_test_markers_from_diff) so backtick-pairing stays
+    scoped to the file that introduced it.
+
+    Diff header lines (`diff --git`, `index`, `--- a/path`, `+++ b/path`,
+    mode/similarity/rename lines) are excluded by POSITION relative to the
+    file's first hunk, not by content shape. Every one of those header
+    lines appears ONLY before a file's first `@@ ... @@` hunk marker --
+    that placement is fixed by the diff format itself, never by content --
+    so everything before the first `@@` for a file is unconditionally
+    skipped, and everything from the first `@@` onward is unconditionally
+    real hunk content (a `+`-prefixed line is always a genuine addition
+    there, never a header).
+
+    A shape-based check (`line.startswith("+++")`) instead matches a
+    genuine ADDED line whose own content starts with `++` -- git's own `+`
+    prefix turns "++x; ..." into "+++x; ...", indistinguishable from a
+    header by shape alone (caught on #2632's own review, round 1). A
+    NARROWER positional check (skip a `+++` line only when it immediately
+    follows a `--- ` line) still collides: a REMOVED line whose own
+    content starts with `-- ` becomes, after git's single-`-` prefix, a
+    line that also starts with `--- `, so an adjacent removed-`-- `/
+    added-`++` pair in the same one-line hunk is still misread as a
+    genuine header pair (caught on #2632's review, round 2). Anchoring on
+    "has this file's first hunk marker been seen yet" has no shape
+    collision to inherit, because it never inspects the CONTENT of the
+    line being classified -- only whether a `@@` has been seen since the
+    last `diff --git`.
+    """
+    diff_text = _run_git(repo_root, ["diff", "--unified=0", f"{base}..{head}"])
+    files: list[str] = []
+    current: list[str] = []
+    in_hunk = False  # this file's first "@@ ... @@" hunk marker seen yet?
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if current:
+                files.append("\n".join(current))
+                current = []
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            # Still in this file's extended header block (index/---/+++/
+            # mode/similarity/rename lines, or a "Binary files ... differ"
+            # line for a binary diff) -- none of it is hunk content,
+            # regardless of what any individual line's text looks like.
+            continue
+        if line.startswith("+"):
+            current.append(line[1:])
+    if current:
+        files.append("\n".join(current))
+    return files
+
+
+def parse_removed_test_markers_from_diff(repo_root: Path, base: str, head: str) -> list[Marker]:
+    """#2568 — the diff-sourced sibling of parse_removed_test_markers.
+
+    Deliberately parsed as its OWN text blob PER FILE, never concatenated
+    across files or with the PR body before parsing:
+    `_strip_inline_code_preserving_fences`'s unmatched-backtick-swallow
+    LIMIT is a real (accepted) hazard, and concatenating semantically
+    unrelated blobs would let a stray backtick in one swallow a marker in
+    another -- exactly the cross-file leakage class #2539/#2540 fixed for
+    markdown fences, just at a different boundary (see
+    read_diff_added_text_by_file's docstring). Parsing each file's added
+    text independently and UNIONING the resulting marker lists (across
+    files here, and across the body/diff surfaces at this function's
+    caller) keeps every blob's backtick-pairing failure domain separate.
+    """
+    markers: list[Marker] = []
+    for file_added_text in read_diff_added_text_by_file(repo_root, base, head):
+        stripped = _strip_inline_code_preserving_fences(file_added_text)
+        markers.extend(
+            Marker(id=m.group("id"), reason=m.group("reason").strip(), raw_line=m.group(0))
+            for m in _MARKER_RE.finditer(stripped)
+        )
+    return markers
+
+
+def find_unparsed_removed_test_lines_from_diff(repo_root: Path, base: str, head: str) -> list[str]:
+    """#2568 — the diff-sourced sibling of find_unparsed_removed_test_lines,
+    same reasoning: a `Removed-test:`-shaped line added in the diff that
+    fails to parse deserves the identical #2393 fail-loud treatment a
+    malformed body line gets. Same per-file scoping as
+    parse_removed_test_markers_from_diff, for the same reason."""
+    unparsed = []
+    for file_added_text in read_diff_added_text_by_file(repo_root, base, head):
+        stripped = _strip_inline_code_preserving_fences(file_added_text)
+        for line in stripped.splitlines():
+            if "removed-test:" not in line.lower():
+                continue
+            if _MARKER_RE.match(line):
+                continue
+            unparsed.append(line.strip())
+    return unparsed
 
 
 def _is_ancestor(repo_root: Path, base: str, head: str) -> bool | None:
@@ -807,8 +953,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"test_id_set_check: error — could not read --pr-body-file: {exc}", file=sys.stderr)
             return 2
 
-    markers = parse_removed_test_markers(pr_body)
-    unparsed_removed_test_lines = find_unparsed_removed_test_lines(pr_body)
+    # #2568: accounting comes from EITHER surface -- the PR body (unchanged)
+    # OR a Removed-test marker written as a comment beside the removal in
+    # the diff itself. Each is parsed independently (never concatenated —
+    # see parse_removed_test_markers_from_diff's docstring for why) and the
+    # resulting marker/warning lists are unioned before evaluate() sees them.
+    try:
+        diff_markers = parse_removed_test_markers_from_diff(repo_root, args.base, args.head)
+        diff_unparsed = find_unparsed_removed_test_lines_from_diff(repo_root, args.base, args.head)
+    except GitReadError as exc:
+        print(f"test_id_set_check: error — {exc}", file=sys.stderr)
+        return 2
+
+    markers = parse_removed_test_markers(pr_body) + diff_markers
+    unparsed_removed_test_lines = find_unparsed_removed_test_lines(pr_body) + diff_unparsed
     report = evaluate(base_ids, head_ids, markers, tuple(unparsed_removed_test_lines))
 
     if args.format == "json":
