@@ -300,7 +300,7 @@ class TestJsonlSnapshotOutput:
         required_keys = {
             "file_url", "content_hash", "captured_at",
             "git_sha", "archive_status", "original_url",
-            "source_type", "block_reason",
+            "source_type", "block_reason", "evidence_type",
         }
         assert required_keys == set(result.keys()), (
             f"Missing keys: {required_keys - set(result.keys())}, "
@@ -315,6 +315,7 @@ class TestJsonlSnapshotOutput:
         assert result["source_type"] == "jsonl"
         assert result["block_reason"] is None
         assert result["original_url"].startswith("file://")
+        assert result["evidence_type"] == "session_transcript"
 
     def test_captured_at_is_utc_iso(self, tmp_path):
         engram_home = tmp_path / "engram"
@@ -427,13 +428,14 @@ class TestForumSnapshot:
         required_keys = {
             "file_url", "content_hash", "captured_at",
             "git_sha", "archive_status", "original_url",
-            "source_type", "block_reason",
+            "source_type", "block_reason", "evidence_type",
         }
         assert required_keys == set(result.keys())
         assert result["source_type"] == "forum"
         assert result["git_sha"] is None
         assert result["archive_status"] == "archived"
         assert result["block_reason"] is None
+        assert result["evidence_type"] == "forum_thread"
 
     def test_forum_snapshot_original_url(self, tmp_path):
         engram_home = tmp_path / "engram"
@@ -582,9 +584,11 @@ class TestSourceParsing:
         assert exc_info.value.code == snap.EXIT_VALIDATION
 
     def test_parse_unknown_source_exits(self, tmp_path):
+        """web: is now implemented (#2606 facet 1) -- use a genuinely
+        unrecognised prefix instead."""
         snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
         with pytest.raises(SystemExit) as exc_info:
-            snap._parse_source("web:https://example.com")
+            snap._parse_source("ftp:example.com/file")
         assert exc_info.value.code == snap.EXIT_VALIDATION
 
     def test_parse_file_remote_authority_exits(self, tmp_path):
@@ -592,6 +596,53 @@ class TestSourceParsing:
         snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
         with pytest.raises(SystemExit) as exc_info:
             snap._parse_source("file://host/etc/passwd")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
+    def test_parse_web_source(self, tmp_path):
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        source_type, url = snap._parse_source("web:https://example.com/page")
+        assert source_type == "web"
+        assert url == "https://example.com/page"
+
+    def test_parse_pdf_source(self, tmp_path):
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        source_type, url = snap._parse_source("pdf:https://example.com/paper.pdf")
+        assert source_type == "pdf"
+        assert url == "https://example.com/paper.pdf"
+
+    def test_parse_web_https_source(self, tmp_path):
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        source_type, url = snap._parse_source("web:http://example.com/page")
+        assert source_type == "web"
+        assert url == "http://example.com/page"
+
+    def test_parse_web_non_http_scheme_rejected(self, tmp_path):
+        """web:/pdf: only accept http(s) URLs -- rejecting e.g. file:// stops
+        urllib's own file:// support from becoming reachable (and therefore a
+        local-file-read surface) through this fetch-only prefix."""
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("web:file:///etc/passwd")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
+    def test_parse_pdf_non_http_scheme_rejected(self, tmp_path):
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("pdf:ftp://example.com/paper.pdf")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
+    def test_parse_bare_web_colon_exits(self, tmp_path):
+        """Bare 'web:' (no URL) exits with EXIT_VALIDATION."""
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("web:")
+        assert exc_info.value.code == snap.EXIT_VALIDATION
+
+    def test_parse_bare_pdf_colon_exits(self, tmp_path):
+        """Bare 'pdf:' (no URL) exits with EXIT_VALIDATION."""
+        snap = _load_snapshot(tmp_path / "engram", tmp_path / "archive")
+        with pytest.raises(SystemExit) as exc_info:
+            snap._parse_source("pdf:")
         assert exc_info.value.code == snap.EXIT_VALIDATION
 
 
@@ -772,7 +823,7 @@ class TestSnapshotFile:
         assert archive_file.exists(), f"archive file missing: {archive_file}"
 
     def test_output_json_has_all_required_keys(self, tmp_path):
-        """The output dict has exactly the required 8 keys."""
+        """The output dict has exactly the required 9 keys."""
         snap = self._load_snap(tmp_path)
 
         src = tmp_path / "schema_check.json"
@@ -783,11 +834,253 @@ class TestSnapshotFile:
         required_keys = {
             "file_url", "content_hash", "captured_at",
             "git_sha", "archive_status", "original_url",
-            "source_type", "block_reason",
+            "source_type", "block_reason", "evidence_type",
         }
         assert required_keys == set(result.keys()), (
             f"Missing: {required_keys - set(result.keys())}, "
             f"Extra: {set(result.keys()) - required_keys}"
+        )
+        assert result["evidence_type"] == "local_file"
+
+
+# ============================================================================
+# Tests: web:/pdf: snapshot (#2606 facet 1 unit 1) -- happy path
+# ============================================================================
+
+class _FakeHTTPResponse:
+    """Minimal file-like context manager mimicking urllib's response object,
+    enough to exercise _fetch_url_bytes's chunked-read loop."""
+
+    def __init__(self, data: bytes, status: int = 200):
+        self._data = data
+        self.status = status
+        self._pos = 0
+
+    def getcode(self):
+        return self.status
+
+    def read(self, n=-1):
+        if n is None or n < 0:
+            chunk = self._data[self._pos:]
+            self._pos = len(self._data)
+            return chunk
+        chunk = self._data[self._pos:self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+class TestSnapshotWebPdfHappyPath:
+    """_snapshot_web / _snapshot_pdf archive raw fetched bytes and return the
+    correct JSON shape, urllib.request.urlopen mocked so no real network
+    call occurs."""
+
+    def test_archives_web_page_raw_bytes(self, tmp_path, monkeypatch):
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        body = b"<html><body>hello world</body></html>"
+
+        def _fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(body, status=200)
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _fake_urlopen)
+
+        result = snap._snapshot_web("https://example.com/page", {})
+
+        required_keys = {
+            "file_url", "content_hash", "captured_at",
+            "git_sha", "archive_status", "original_url",
+            "source_type", "block_reason", "evidence_type",
+        }
+        assert required_keys == set(result.keys())
+        assert result["source_type"] == "web"
+        assert result["evidence_type"] == "web_page"
+        assert result["original_url"] == "https://example.com/page"
+        assert result["git_sha"] is None
+        assert result["archive_status"] == "archived"
+        assert result["block_reason"] is None
+
+        archive_path = Path(result["file_url"][len("file://"):])
+        assert archive_path.exists()
+        assert archive_path.suffix == ".html"
+        assert archive_path.read_bytes() == body
+        assert result["content_hash"] == _sha256(body)
+
+    def test_archives_pdf_raw_bytes(self, tmp_path, monkeypatch):
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        body = b"%PDF-1.4 fake pdf bytes for testing\n%%EOF"
+
+        def _fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(body, status=200)
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _fake_urlopen)
+
+        result = snap._snapshot_pdf("https://example.com/paper.pdf", {})
+
+        assert result["source_type"] == "pdf"
+        assert result["evidence_type"] == "pdf"
+        assert result["original_url"] == "https://example.com/paper.pdf"
+
+        archive_path = Path(result["file_url"][len("file://"):])
+        assert archive_path.exists()
+        assert archive_path.suffix == ".pdf"
+        assert archive_path.read_bytes() == body
+        assert result["content_hash"] == _sha256(body)
+
+    def test_web_snapshot_idempotent(self, tmp_path, monkeypatch):
+        """Snapshotting the same URL twice (same bytes) -> one archive file."""
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        body = b"<html>stable content</html>"
+
+        def _fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(body, status=200)
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _fake_urlopen)
+
+        result1 = snap._snapshot_web("https://example.com/stable", {})
+        result2 = snap._snapshot_web("https://example.com/stable", {})
+
+        assert result1["content_hash"] == result2["content_hash"]
+        assert result1["file_url"] == result2["file_url"]
+
+        sha = result1["content_hash"]
+        bucket = evidence_archive / sha[:2]
+        files = list(bucket.glob(f"{sha}.*"))
+        assert len(files) == 1
+
+
+# ============================================================================
+# Tests: web:/pdf: fetch FAILURES (#2606 facet 1 unit 1) -- fail loudly,
+# write NOTHING to the archive.
+#
+# Each test asserts BOTH the non-zero exit code AND the absence of any
+# archived file. The second assertion is the one that matters -- the first
+# passes for the wrong reasons if the write happened before the failure was
+# detected (a half-written archive file whose hash names truncated content
+# is worse than no archive at all, per the spec's own live example: a
+# transcript archived at 26,582,953 bytes against a live 27,282,639, where
+# sha256(archived) == sha256(live[:26582953]) -- content-identity scored a
+# truncated ancestor as a DIFFERENT file rather than as a partial one).
+# ============================================================================
+
+def _archive_is_empty(evidence_archive: Path) -> bool:
+    if not evidence_archive.exists():
+        return True
+    return not any(evidence_archive.rglob("*"))
+
+
+class TestSnapshotWebPdfFetchFailures:
+    def test_non_2xx_status_exits_and_writes_nothing(self, tmp_path, monkeypatch):
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        def _raise_http_error(req, timeout=None):
+            raise snap.urllib.error.HTTPError(
+                "https://example.com/gone", 404, "Not Found", {}, None
+            )
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _raise_http_error)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_web("https://example.com/gone", {})
+        assert exc_info.value.code == snap.EXIT_IO
+        assert _archive_is_empty(evidence_archive), (
+            "a failed fetch must not leave any file under the archive root"
+        )
+
+    def test_timeout_exits_and_writes_nothing(self, tmp_path, monkeypatch):
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        def _raise_timeout(req, timeout=None):
+            raise TimeoutError("timed out")
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _raise_timeout)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_web("https://example.com/slow", {})
+        assert exc_info.value.code == snap.EXIT_IO
+        assert _archive_is_empty(evidence_archive), (
+            "a failed fetch must not leave any file under the archive root"
+        )
+
+    def test_dns_failure_exits_and_writes_nothing(self, tmp_path, monkeypatch):
+        """URLError (DNS/connection failure) -- distinct code path from
+        HTTPError and from a raw socket timeout."""
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        def _raise_url_error(req, timeout=None):
+            raise snap.urllib.error.URLError("Name or service not known")
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _raise_url_error)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_web("https://does-not-exist.invalid/page", {})
+        assert exc_info.value.code == snap.EXIT_IO
+        assert _archive_is_empty(evidence_archive), (
+            "a failed fetch must not leave any file under the archive root"
+        )
+
+    def test_oversize_exits_and_writes_nothing(self, tmp_path, monkeypatch):
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        # Shrink the size cap so a small fake body still trips it, rather
+        # than fabricating a multi-MB fixture.
+        monkeypatch.setattr(snap, "WEB_FETCH_MAX_BYTES", 10)
+        oversized_body = b"x" * 1000
+
+        def _fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(oversized_body, status=200)
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _fake_urlopen)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_web("https://example.com/huge", {})
+        assert exc_info.value.code == snap.EXIT_IO
+        assert _archive_is_empty(evidence_archive), (
+            "an oversize fetch must not leave any (truncated) file under "
+            "the archive root -- a truncated file's hash would otherwise "
+            "certify the truncation as if it were the whole document"
+        )
+
+    def test_pdf_non_2xx_exits_and_writes_nothing(self, tmp_path, monkeypatch):
+        """pdf: shares _fetch_url_bytes/the archive-after-fetch ordering
+        with web: -- spot-check rather than repeating every failure mode."""
+        engram_home = tmp_path / "engram"
+        evidence_archive = tmp_path / "archive"
+        snap = _load_snapshot(engram_home, evidence_archive)
+
+        def _raise_http_error(req, timeout=None):
+            raise snap.urllib.error.HTTPError(
+                "https://example.com/paper.pdf", 403, "Forbidden", {}, None
+            )
+
+        monkeypatch.setattr(snap.urllib.request, "urlopen", _raise_http_error)
+
+        with pytest.raises(SystemExit) as exc_info:
+            snap._snapshot_pdf("https://example.com/paper.pdf", {})
+        assert exc_info.value.code == snap.EXIT_IO
+        assert _archive_is_empty(evidence_archive), (
+            "a failed fetch must not leave any file under the archive root"
         )
 
 

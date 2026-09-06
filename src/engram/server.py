@@ -1681,6 +1681,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "session_id",
     "recall_summary",
     "recall_keywords",
+    "evidence_type",
+    "original_url",
 })
 
 
@@ -1861,6 +1863,8 @@ def engram_add_observation(payload_json: str) -> str:
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
             recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
+            evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time — the capturer knows what it just archived; a later reader has to guess. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit. See #2606 facet 1.
+            original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata, for traceability only: it is NOT a re-fetch pointer, and nothing reads it back to refetch. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes. See #2606 facet 1.
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.

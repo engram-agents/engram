@@ -1181,6 +1181,8 @@ def _add_observation_impl(
     session_id: str = "",
     recall_summary: str = "",
     recall_keywords: Optional[list] = None,
+    evidence_type: str = "",
+    original_url: str = "",
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1391,6 +1393,21 @@ def _add_observation_impl(
             )
         })
 
+    # evidence_type validation (#2606 facet 1 unit 2): closed vocabulary,
+    # matching engram-snapshot's EVIDENCE_TYPE_BY_SOURCE. Not inferred from
+    # content or fs_class -- the capturer (engram-snapshot, or a caller citing
+    # a known source kind) names it; a later reader only ever reads it back.
+    _EVIDENCE_TYPE_ENUM = {
+        "forum_thread", "session_transcript", "local_file", "web_page", "pdf",
+    }
+    if evidence_type and evidence_type not in _EVIDENCE_TYPE_ENUM:
+        return json.dumps({
+            "error": (
+                f"Invalid evidence_type '{evidence_type}'. Must be one of: "
+                f"{', '.join(sorted(_EVIDENCE_TYPE_ENUM))}"
+            )
+        })
+
     # Resolve evidence node: either from evidence_id or auto-create from url+title
     if not evidence_id and not url:
         return json.dumps(
@@ -1418,13 +1435,49 @@ def _add_observation_impl(
     try:
         # Validate evidence exists
         ev = conn.execute(
-            "SELECT id, source_url FROM nodes WHERE id = ? AND type = 'evidence'",
+            "SELECT id, source_url, metadata FROM nodes WHERE id = ? AND type = 'evidence'",
             (evidence_id,),
         ).fetchone()
         if not ev:
             return json.dumps(
                 {"error": f"Evidence node '{evidence_id}' not found."}
             )
+
+        # evidence_type / original_url passthrough onto the evidence node's
+        # metadata (#2606 facet 1 units 2+3), whether that node was just
+        # created above or is being reused (evidence_id-cite path or
+        # url-match reuse inside _add_evidence_impl). First-capture-wins: a
+        # value already present is never overwritten; a caller naming a
+        # DIFFERING value surfaces as a *_conflict key in the response rather
+        # than silently resolving one way or the other. Absent/empty
+        # arguments never touch the evidence node -- an evidence node created
+        # without a snapshot must not grow a spurious key.
+        _ev_metadata = json.loads(ev["metadata"] or "{}")
+        _ev_metadata_changed = False
+        _evidence_type_conflict = None
+        _original_url_conflict = None
+
+        if evidence_type:
+            _existing_evidence_type = _ev_metadata.get("evidence_type")
+            if _existing_evidence_type is None:
+                _ev_metadata["evidence_type"] = evidence_type
+                _ev_metadata_changed = True
+            elif _existing_evidence_type != evidence_type:
+                _evidence_type_conflict = {
+                    "existing": _existing_evidence_type,
+                    "attempted": evidence_type,
+                }
+
+        if original_url:
+            _existing_original_url = _ev_metadata.get("original_url")
+            if _existing_original_url is None:
+                _ev_metadata["original_url"] = original_url
+                _ev_metadata_changed = True
+            elif _existing_original_url != original_url:
+                _original_url_conflict = {
+                    "existing": _existing_original_url,
+                    "attempted": original_url,
+                }
 
         # Verify quoted_text exists in the evidence source (file:// only)
         ev_url = ev["source_url"] or ""
@@ -1714,6 +1767,21 @@ def _add_observation_impl(
         _pred_hint = _predictive_hint(is_predictive, predicted_event, resolution_timeframe)
         if _pred_hint:
             result["predictive_hint"] = _pred_hint
+
+        # Persist the evidence_type / original_url metadata update (if any)
+        # in the SAME transaction as the observation insert above -- an
+        # early return before this point (a validation failure) leaves both
+        # un-committed together, so the evidence node's metadata never
+        # changes for an observation that itself was never created.
+        if _ev_metadata_changed:
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(_ev_metadata), evidence_id),
+            )
+        if _evidence_type_conflict:
+            result["evidence_type_conflict"] = _evidence_type_conflict
+        if _original_url_conflict:
+            result["original_url_conflict"] = _original_url_conflict
 
         conn.commit()
 
