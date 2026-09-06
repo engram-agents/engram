@@ -109,9 +109,12 @@ class TestProbeAgainstFixedScript(unittest.TestCase):
         self.addCleanup(self._tmp_obj.cleanup)
         self.tmp = Path(self._tmp_obj.name)
 
-    def test_healthy_listening_socket_exits_zero(self):
+    def test_bound_and_listening_socket_exits_zero(self):
         """A real, bound, listening socket with a successful connect must
-        report exit code 0 -- the case the bare `except:` broke."""
+        report exit code 0 -- the case the bare `except:` broke. This
+        fixture never calls accept(); the probe cannot distinguish it from
+        a serving daemon, which is a known limit of connect()-based
+        liveness, not a gap in this test."""
         socket_path = self.tmp / "recall-daemon.sock"
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:

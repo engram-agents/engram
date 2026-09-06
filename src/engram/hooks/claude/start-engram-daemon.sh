@@ -8,6 +8,17 @@ PID_PATH="$ENGRAM_HOME/recall-daemon.pid"
 DAEMON_SCRIPT="$(dirname "$0")/engram-surface-daemon.py"
 LOG_PATH="$ENGRAM_HOME/surface-daemon.log"
 
+# #2652 phase-0 unit 1: log which liveness-probe branch this invocation
+# took, so a restart can later be traced to "silent death" vs. "pidfile-
+# not-yet-written race" vs. "live but unresponsive" vs. "healthy, no
+# action" without guessing (Borges's §4 unresolved question, issue #2652).
+# Additive only -- does not change the reap/relaunch or healthy-exit
+# behavior below.
+_log_probe() {
+    printf '[%s] [start-engram-daemon] probe: %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LOG_PATH" 2>/dev/null || true
+}
+
 # Check if daemon is already running
 if [ -f "$PID_PATH" ]; then
     pid=$(cat "$PID_PATH")
@@ -24,10 +35,17 @@ try:
 except Exception:
     sys.exit(1)
 " 2>/dev/null; then
-            # Daemon is alive and socket works
+            # Daemon is alive and socket works.
+            _log_probe "healthy (pid=${pid}), no action"
             exit 0
+        else
+            _log_probe "pidfile present (pid=${pid}), process alive, socket probe failed/timed out"
         fi
+    else
+        _log_probe "pidfile present (pid=${pid}) but process not running"
     fi
+else
+    _log_probe "no pidfile at ${PID_PATH}"
 fi
 
 # #1874: reap EVERY process matching this daemon's script name AND this
@@ -75,7 +93,27 @@ fi
 # make that realistically implausible, not structurally impossible. See
 # tests/test_pgrep_liveness_reap_patterns.py for the synthetic-table proof.
 _reap_pattern="engram-surface-daemon\.py.*${ENGRAM_HOME}\$"
-for stale_pid in $(pgrep -f "$_reap_pattern" 2>/dev/null); do
+
+# Fold onto #2652 phase-0 unit 1 (colleague-review finding, Ariadne): branch
+# 1's "no pidfile" line above collapses three distinct cases -- a genuine
+# cold start, the pidfile-not-yet-written warmup race, and a start that
+# lands after THIS OR A PRIOR invocation already reaped a daemon and removed
+# the pidfile. Recording whether this invocation's reap loop actually
+# matched/killed anything doesn't fully disambiguate all three (the race and
+# a genuine cold start both reap zero), but it separates "something was
+# killed just now" from "nothing was killed" -- the discriminating datum
+# this unit exists to produce. Capture the pgrep output ONCE into a variable
+# (rather than calling pgrep twice) so the log line and the kill loop can
+# never disagree about what was matched, and so a live race between two
+# separate pgrep calls can't produce a different process set for each.
+_stale_pids="$(pgrep -f "$_reap_pattern" 2>/dev/null)"
+if [ -n "$_stale_pids" ]; then
+    _stale_count="$(printf '%s\n' "$_stale_pids" | grep -c .)"
+    _log_probe "reap matched ${_stale_count} stale process(es): $(printf '%s' "$_stale_pids" | tr '\n' ' ')"
+else
+    _log_probe "reap matched none"
+fi
+for stale_pid in $_stale_pids; do
     kill "$stale_pid" 2>/dev/null || true
 done
 rm -f "$PID_PATH" "$SOCKET_PATH"
