@@ -5084,9 +5084,25 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
             elif ntype in ("derivation", "theory"):
                 lines.append(f"### {n['id']} [{conf_str}] [{status_tag}]")
                 lines.append(f"Claim: {n['claim']}")
+                # #2657 (fourth sibling of #2624): the old literal
+                # ('derives_from', 'cites') predates acknowledged_derives_from
+                # and silently dropped a premise reached only via that
+                # relation from a label ("Derives from:") that asserts
+                # completeness. CITATION_SUPPORT_RELATIONS (derives_from,
+                # supported_by, acknowledged_derives_from) is the one-hop
+                # premise set #2618/#2624 established -- but this site's
+                # OLD query also included 'cites', which is NOT a premise
+                # relation and is not in that constant. Keeping 'cites'
+                # unioned in preserves today's rendered shape (nothing
+                # already shown disappears) while adding the missing
+                # premise relation -- the smallest change consistent with
+                # the "Derives from:" label as written, per the issue's own
+                # stated preference among its three options.
+                _snapshot_support_rels = sorted(CITATION_SUPPORT_RELATIONS | {"cites"})
                 edges = conn.execute(
-                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'cites')",
-                    (n["id"],),
+                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN "
+                    f"({','.join('?' for _ in _snapshot_support_rels)})",
+                    (n["id"], *_snapshot_support_rels),
                 ).fetchall()
                 support_ids = [e["target_id"] for e in edges]
                 if support_ids:
