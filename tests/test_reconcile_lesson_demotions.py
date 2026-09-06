@@ -204,6 +204,35 @@ def test_inactive_lesson_with_non_faded_status_is_also_not_a_candidate(reconcile
     assert candidates == []
 
 
+def test_null_memory_status_lesson_is_not_a_candidate(reconcile, db_path, tmp_path):
+    """engram-alpha#2647: a lesson row with memory_status IS NULL (e.g. an
+    old/malformed node predating the field's introduction) must not be
+    reported. Re-run of the reviewer-fairy's own mutant, independently
+    re-verified rather than trusted from its unverified report: patching
+    the live query to `memory_status = 'active' OR memory_status IS NULL`
+    escapes ALL 16 tests in this suite as of this commit (re-measured
+    directly, via a temporary mutation + full-suite run, not assumed from
+    the fairy's original count) -- this is the fixture that closes that
+    gap. SQL three-valued logic means `memory_status = 'active'` on a NULL
+    column evaluates to NULL/false under the real code, so this row is
+    correctly excluded there; it is only the OR-IS-NULL mutant that admits
+    it, which is what makes this fixture targeted rather than redundant
+    with test_inactive_lesson_with_non_faded_status_is_also_not_a_candidate
+    (that one's 'stale' mutant is a non-NULL string and doesn't touch this
+    code path at all)."""
+    now = time.time()
+    _insert_lesson(db_path, "ls_0107", "blocking", memory_status=None)
+    ledger_path = tmp_path / "ledger.jsonl"
+    _write_ledger(ledger_path, [
+        _override_entry(now - 3600, "ls_0107"),
+        _override_entry(now - 1800, "ls_0107"),
+        _lease_entry(now - 1800, "ls_0107"),
+    ])
+
+    candidates = reconcile.find_candidates(db_path=db_path, ledger_path=ledger_path, now=now)
+    assert candidates == []
+
+
 def test_reuses_hook_demotion_config_not_reimplemented(reconcile, db_path, tmp_path, monkeypatch):
     """Sourcing proof, checked to be able to FAIL: patch the hook module's
     _demotion_config to require 5 overrides instead of the default 2. A
@@ -287,6 +316,36 @@ def test_resolve_hook_path_returns_none_when_nothing_matches(reconcile, monkeypa
         reconcile, "_HOOK_RELATIVE_PATHS", ("no/such/hook-file-anywhere.py",)
     )
     assert reconcile._resolve_hook_path() is None
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+    reason="root bypasses file permission bits -- chmod 0o000 would not "
+           "actually block traversal, making this test vacuously true in a "
+           "root-run CI container rather than a real check",
+)
+def test_resolve_hook_path_skips_unreadable_candidate_root(reconcile, tmp_path, monkeypatch):
+    """engram-alpha#2646: Path.exists() stats every path component from the
+    root, so a candidate whose PARENT directory is unreadable (permission
+    denied, not merely absent) raises OSError instead of returning False.
+    Before the fix that escaped _resolve_hook_path() uncaught, crashing
+    resolution at import time rather than treating that one candidate as
+    'not found' and continuing to the next. Point CLAUDE_PLUGIN_ROOT at a
+    directory chmod'd 0o000 (no execute/search permission) so stat'ing
+    anything underneath it raises PermissionError, and confirm the walk
+    survives it and still finds the real hook via the parents fallback."""
+    blocked_root = tmp_path / "blocked"
+    blocked_root.mkdir()
+    blocked_root.chmod(0o000)
+    monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", str(blocked_root))
+    try:
+        resolved = reconcile._resolve_hook_path()
+    finally:
+        blocked_root.chmod(0o755)  # restore so tmp_path cleanup can remove it
+
+    assert resolved is not None
+    assert resolved.name == "engram-lesson-tripwire-hook.py"
+    assert resolved.exists()
 
 
 def test_load_hook_module_raises_loud_when_unresolvable(reconcile, monkeypatch):

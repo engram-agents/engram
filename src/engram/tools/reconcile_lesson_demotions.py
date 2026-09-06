@@ -102,7 +102,18 @@ def _resolve_hook_path() -> Path | None:
     for root in roots:
         for rel in _HOOK_RELATIVE_PATHS:
             candidate = root / rel
-            if candidate.exists():
+            # candidate.exists() stats every path component from root, so a
+            # parent directory that is unreadable (permission denied on a
+            # sibling seat's home dir, a stale/unmounted path, etc.) raises
+            # OSError instead of returning False -- letting that escape here
+            # would crash resolution outright rather than simply treating
+            # this one candidate as "not found" and continuing the walk
+            # (engram-alpha#2646).
+            try:
+                found = candidate.exists()
+            except OSError:
+                continue
+            if found:
                 return candidate
     return None
 
