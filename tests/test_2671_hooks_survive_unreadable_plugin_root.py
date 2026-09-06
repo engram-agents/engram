@@ -240,3 +240,66 @@ def test_find_indexer_dir_survives_unreadable_ancestor(tmp_path):
     finally:
         blocked.chmod(0o755)
     assert result is None
+
+
+# engram-alpha#2677: the two tests above only cover the wholly-unreadable
+# case, which the old whole-walk-wrapped try/except and the current
+# per-candidate one satisfy identically (both correctly return None when
+# EVERY candidate raises). Neither test can fail against the round-1 shape
+# fixed in #2671/#2673 -- the same class of gap the hooks' own
+# test_hook_resolves_via_fallback_when_plugin_root_unreadable exists to
+# close. These two are the discriminating case for the viz resolvers:
+# a NEARER ancestor is unreadable, a FARTHER one is readable and carries
+# the target file. A whole-walk guard aborts on the first raise (the
+# nearer, unreadable candidates) and never reaches the farther, resolvable
+# one; the per-candidate guard skips past them and finds it.
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+    reason="root bypasses file permission bits",
+)
+def test_find_tools_parent_resolves_past_nearer_unreadable_ancestor(tmp_path):
+    outer = tmp_path / "outer"
+    (outer / "tools").mkdir(parents=True)
+    (outer / "tools" / "config_schema.py").write_text("# stub\n")
+
+    blocked = outer / "blocked"
+    blocked.mkdir()
+    start = blocked / "nested" / "start"
+    blocked.chmod(0o000)
+    try:
+        result = _viz_config._find_tools_parent(start)
+    finally:
+        blocked.chmod(0o755)  # restore so tmp_path cleanup can remove it
+
+    assert result == outer, (
+        f"expected fallback resolution to {outer}, got {result!r} -- the "
+        "unreadable nearer candidate aborted the whole walk instead of "
+        "being skipped"
+    )
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0 if hasattr(os, "geteuid") else False,
+    reason="root bypasses file permission bits",
+)
+def test_find_indexer_dir_resolves_past_nearer_unreadable_ancestor(tmp_path):
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    (outer / "engram_log_indexer.py").write_text("# stub\n")
+
+    blocked = outer / "blocked"
+    blocked.mkdir()
+    start = blocked / "nested" / "start"
+    blocked.chmod(0o000)
+    try:
+        result = _viz_stats._find_indexer_dir(start)
+    finally:
+        blocked.chmod(0o755)  # restore so tmp_path cleanup can remove it
+
+    assert result == outer, (
+        f"expected fallback resolution to {outer}, got {result!r} -- the "
+        "unreadable nearer candidate aborted the whole walk instead of "
+        "being skipped"
+    )
