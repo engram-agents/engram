@@ -979,6 +979,23 @@ below is a plain regex that **does** match inside backticks, so it conservativel
 over-flags backticked refs — a backticked match is safe-from-the-real-parser, so
 confirm it rather than treating it as an auto-close risk.
 
+**Fenced code blocks are the SAME exception, measured separately (#2630,
+2026-09-06):** a closing keyword inside a triple-backtick fence or a tilde
+(`~~~`) fence also does **not** populate `closingIssuesReferences` — a
+throwaway PR with `Closes #N.` inside each fence type read empty on 9
+consecutive `closingIssuesReferences` queries spanning ~140s (well past the
+documented propagation lag in either direction). This settles the question
+#2539/#2540's fence-swallow fix left open for the three CI gates that still
+run the naive `` sed 's/`[^`]*`//g' `` strip on PR bodies
+(`pr-checks.yml:104`, `anti-dup-retro-check.yml:55`/`181`): the strip's
+blind spot is **correct**, not a hole — GitHub's own parser is blind to the
+same fenced content those gates strip, so there is no accidental-auto-close
+case they're failing to catch. No fence-aware port needed there. **The same
+two-sided consequence as the backtick case above applies**: an *intentional*
+`Closes #N` inside a fence will silently fail to auto-close on merge, exactly
+like a backticked one — plain text near the issue number is still the only
+form that fires the parser.
+
 **Empirical traps caught (2026-05-30):**
 - PR #516 body said `"this PR does NOT close #510"` → auto-closed #510 on merge
   (the NOT is invisible to the regex; caught manually + reopened).
