@@ -1,0 +1,336 @@
+"""#2565 -- can-it-fail control for the sys.path-collision guard added to
+tests/conftest.py (`_sys_path_collision_guard` / `_assert_tools_package_is_repo_root`).
+
+The guard itself cannot be exercised as a normal in-process unit test: it
+runs as an autouse, module-scoped fixture inside THIS repo's own
+conftest.py, checking the real `tools` package that this very test session
+has already imported correctly. Testing "does it fire on a genuine
+collision" requires a SEPARATE pytest invocation, in a scratch directory
+shaped like this repo (a `tests/` subdirectory holding the test files and
+conftest.py, separate from the scratch repo root holding `tools/`) --
+reproducing the actual bug shape end-to-end (#2063 / PR#2564: one test
+file's own sys.path.insert(0, ...) silently breaks a LATER, unrelated file
+in the same pytest invocation), not just unit-testing the check function.
+
+The scratch/repo-root split matters mechanically, not just cosmetically:
+pytest's own "prepend" import mode auto-manages each test file's own
+rootpath (here, the scratch `tests/` dir, since it has no __init__.py) by
+re-inserting it at sys.path[0] before importing every module. If the
+scratch repo root and the test files lived in the SAME directory (an
+earlier draft of this fixture did this), pytest's own per-file
+reinsertion would keep re-prepending that shared directory ahead of
+whatever a "poisoning" module inserted, silently defeating the repro --
+caught by this exact scratch layout returning "2 passed" on the first
+draft, which meant the fixture was not actually reproducing anything.
+Splitting `tests/` (pytest-managed) from the scratch repo root (managed
+only by the scratch conftest.py's own explicit reinsertion, mirroring
+THIS repo's own tests/conftest.py) makes decoy-vs-repo-root ordering
+entirely independent of pytest's own per-file rootpath dance, matching
+the real repo's actual mechanics.
+
+Coverage:
+  1. Two well-behaved scratch modules (neither touches sys.path) both pass
+     -- the guard's normal, quiet path.
+  2. A first scratch module that inserts a decoy directory ahead of the
+     scratch repo root, poisoning `sys.modules['tools']`, causes the
+     SECOND module's guard fixture to fail loudly with a message naming
+     the actual collision -- the can-it-fail control, reproducing the
+     real bug shape and confirming the guard actually catches it rather
+     than passing trivially regardless of input.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+_GUARD_CONFTEST = textwrap.dedent(
+    """
+    import os
+    import sys
+
+    import pytest
+
+    # Mirrors this repo's own tests/conftest.py: REPO_ROOT is the scratch
+    # repo root (one level up from this conftest.py, which lives in the
+    # scratch tests/ dir), explicitly reinserted at sys.path[0] once at
+    # session start -- independent of pytest's own per-file rootpath
+    # management, which only ever concerns the scratch tests/ dir itself.
+    REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if REPO_ROOT in sys.path:
+        sys.path.remove(REPO_ROOT)
+    sys.path.insert(0, REPO_ROOT)
+
+    _EXPECTED_TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+
+
+    def _assert_tools_package_is_repo_root():
+        # Proactive, filesystem-based check -- does NOT require `tools` to
+        # already be imported. If `tools` is already cached, trust that
+        # (an import already committed to a resolution; re-deriving from
+        # sys.path here could disagree with what Python actually did).
+        # Otherwise, scan sys.path in order for the first entry that
+        # contains a same-named tools/__init__.py -- that is what the NEXT
+        # `import tools` would resolve to, whether or not it has happened
+        # yet, which is what lets this fire BEFORE a later file's own
+        # `import tools...` line raises a raw, less-attributable error.
+        mod = sys.modules.get("tools")
+        if mod is not None and getattr(mod, "__file__", None) is not None:
+            actual_dir = os.path.dirname(os.path.abspath(mod.__file__))
+        else:
+            actual_dir = None
+            for entry in sys.path:
+                candidate = os.path.join(entry, "tools", "__init__.py")
+                if os.path.isfile(candidate):
+                    actual_dir = os.path.dirname(os.path.abspath(candidate))
+                    break
+            if actual_dir is None:
+                return  # no `tools` package resolvable at all -- not this guard's concern
+        if actual_dir != _EXPECTED_TOOLS_DIR:
+            raise RuntimeError(
+                "sys.path collision (#2565): `import tools` would resolve "
+                f"to {actual_dir!r}, not the repo-root package at "
+                f"{_EXPECTED_TOOLS_DIR!r}."
+            )
+
+
+    @pytest.fixture(autouse=True, scope="module")
+    def _sys_path_collision_guard():
+        _assert_tools_package_is_repo_root()
+        yield
+
+
+    def pytest_collectstart(collector):
+        # Runs BEFORE a module is imported/collected -- catches a collision
+        # left over from an earlier file's own top-level sys.path mistake
+        # before THIS file's own `import tools...` line gets a chance to
+        # raise a raw, less-attributable ModuleNotFoundError instead.
+        #
+        # pytest.exit(), never a bare raise: pytest_collectstart is called
+        # with no surrounding try/except in _pytest.runner.collect_one_node,
+        # so any other exception here becomes an INTERNALERROR crash trace
+        # instead of the intended attributable message (confirmed live,
+        # not assumed -- see tests/conftest.py's own copy of this hook for
+        # the incident that caught it).
+        try:
+            _assert_tools_package_is_repo_root()
+        except RuntimeError as exc:
+            pytest.exit(str(exc), returncode=1)
+    """
+)
+
+
+def _build_scratch_repo(root: Path, *, poison_first_module: bool) -> None:
+    """Layout, mirroring this repo's own shape:
+
+        root/tools/__init__.py, root/tools/marker.py   -- the "real" package
+        root/decoy/tools/__init__.py                    -- same-named decoy,
+                                                             no marker.py
+        root/tests/conftest.py                          -- carries the guard
+        root/tests/test_a.py, root/tests/test_b.py      -- the two modules
+
+    test_a.py optionally pollutes sys.path with `root/decoy` ahead of
+    everything (mimicking a test file that inserts the wrong directory,
+    per #2063/#2564's actual shape); test_b.py always needs the real
+    `tools.marker` to pass, mirroring test_engine_phase3.py's role as the
+    LATER, unrelated victim of an earlier file's mistake."""
+    (root / "tools").mkdir(parents=True)
+    (root / "tools" / "__init__.py").write_text("")
+    (root / "tools" / "marker.py").write_text("VALUE = 'real'\n")
+
+    (root / "decoy" / "tools").mkdir(parents=True)
+    (root / "decoy" / "tools" / "__init__.py").write_text("")
+    # deliberately no marker.py here -- importing tools.marker via the
+    # decoy fails, exactly like src/engram/tools/ lacking tools/engine.
+
+    tests_dir = root / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "conftest.py").write_text(_GUARD_CONFTEST)
+
+    poison_line = (
+        "sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname("
+        "os.path.abspath(__file__))), 'decoy'))\n"
+        if poison_first_module
+        else ""
+    )
+    (tests_dir / "test_a.py").write_text(
+        "import os\nimport sys\n" + poison_line + "\n\ndef test_a():\n    assert True\n"
+    )
+    (tests_dir / "test_b.py").write_text(
+        "import tools.marker\n\n\ndef test_b():\n    assert tools.marker.VALUE == 'real'\n"
+    )
+
+
+def _run_pytest(root: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-v", str(root / "tests")],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_guard_is_quiet_when_no_collision_occurs(tmp_path: Path):
+    """Baseline: two well-behaved modules, no sys.path pollution -- both
+    tests pass, and the guard fires (harmlessly) on both."""
+    _build_scratch_repo(tmp_path, poison_first_module=False)
+    proc = _run_pytest(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "2 passed" in proc.stdout, proc.stdout
+
+
+def test_guard_fires_loudly_on_a_genuine_collision(tmp_path: Path):
+    """The can-it-fail control: test_a.py pollutes sys.path (mimicking a
+    real test file's own mistaken sys.path.insert), which does NOT itself
+    break test_a but leaves the decoy directory ahead of the scratch repo
+    root for the rest of the process. test_b.py's guard fixture (running
+    right after test_b's own module finishes collecting, per module-scope
+    timing) then detects `sys.modules['tools']` resolved to the decoy and
+    fails loudly, naming the actual collision -- BEFORE test_b's own test
+    function ever runs. Must NOT read as '2 passed'; if it does, this
+    fixture is not actually reproducing the collision shape."""
+    _build_scratch_repo(tmp_path, poison_first_module=True)
+    proc = _run_pytest(tmp_path)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, (
+        f"expected the collision to produce a failure, got returncode 0:\n{combined}"
+    )
+    assert "2 passed" not in combined, (
+        f"the poisoned sys.path did not break anything -- the scratch "
+        f"fixture may not actually reproduce the collision shape:\n{combined}"
+    )
+    # Checked explicitly, not just "the message text appears somewhere":
+    # an earlier draft of this hook raised a bare RuntimeError from
+    # pytest_collectstart, which pytest has NO try/except around --
+    # crashing the whole run with an INTERNALERROR trace that ALSO
+    # contains the exception's message text. A naive
+    # `"sys.path collision (#2565)" in combined` assertion passes on
+    # either outcome, so it would have shipped that crash as "the guard
+    # works." This assertion rules that class of false-positive out.
+    assert "INTERNALERROR" not in combined, (
+        f"the guard crashed pytest's own collection machinery instead of "
+        f"producing a clean, attributable failure:\n{combined}"
+    )
+    assert "sys.path collision (#2565)" in combined, (
+        f"expected the guard's own attributable message naming the "
+        f"collision, got:\n{combined}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Completeness sweep -- reviewer-fairy round-1 catch on PR #2661: a clean
+# FULL-suite collection (`pytest tests/ --co`) only proves the DEFAULT,
+# complete, alphabetically-ordered run is safe (some earlier file's own
+# correct `import tools`-family usage caches the right package first for
+# everyone). It says nothing about running a single file or small subset
+# STANDALONE -- exactly this repo's own documented dev-PR workflow ("run
+# affected-tests locally") and exactly what several `pr-checks.yml` steps
+# already do. Three sibling files with the identical `insert(0, SRC_ENGRAM)`
+# bug shape (test_cornerstone_anchor.py, test_in_turn_recall.py,
+# test_lesson_tripwire.py) passed the full-suite --co check cleanly while
+# regressing to errors (or, for the unittest.TestCase-based
+# test_lesson_tripwire.py, a full session abort via pytest.exit -- a class
+# collector re-triggers pytest_collectstart, unlike a flat function-only
+# module) when run standalone or in a small subset. This sweep runs EVERY
+# test file matching the same `sys.path.insert(0, ...src...engram...)`
+# shape in ISOLATION, so a future sibling instance is caught here rather
+# than slipping past a full-suite-only check the way these three did.
+# ---------------------------------------------------------------------------
+
+_INSERT0_SRC_ENGRAM_RE = re.compile(
+    r"sys\.path\.insert\(\s*0\s*,[^)]*"
+    r"(?:\bSRC_ENGRAM\b|\bsrc_engram\b|\bsrc\b[^)]*\bengram\b)"
+    r"[^)]*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _files_with_insert0_src_engram_pattern() -> list[Path]:
+    """Every tests/*.py file whose source text contains an `insert(0, ...)`
+    call mentioning `SRC_ENGRAM` (this repo's established variable-name
+    convention for the computed .../src/engram path -- most sites hold
+    it, then pass just the variable at the call site) OR the literal `src`
+    and `engram` string components directly -- the same shape as all 15
+    sites this issue's PRs have fixed to date (12 in the original PR, 3
+    more from this fairy round).
+
+    Bound, stated because it is a real limit and this sweep must not be
+    read as more than it is: a regex over raw source text with two known
+    shapes, not an AST walk with alias resolution like
+    tests/test_syspath_shadow_guard.py's own (much more thorough) scanner.
+    A first draft of this sweep checked only the literal-string shape and
+    passed even after DELIBERATELY REVERTING one of the 3 fairy-found
+    fixes back to its buggy form -- caught by that exact mutation test,
+    not by inspection: the reverted line reads
+    `sys.path.insert(0, str(SRC_ENGRAM))`, and `\bsrc\b` does not match
+    inside `SRC_ENGRAM` (`_` is a word character in regex `\b` semantics,
+    so there is no boundary between `SRC` and `_ENGRAM`). A THIRD naming
+    convention this sweep still cannot see (e.g. a locally-renamed
+    `_MY_OWN_SRC_ENGRAM_DIR` variable) would recur the same way -- this
+    sweep narrows the blind spot to two known shapes, it does not close
+    it, mirroring the same caveat test_syspath_shadow_guard.py's own
+    docstring states about its own, more thorough bound.
+
+    A SECOND, independent bound (found by PR #2661's own round-2 reviewer-
+    fairy, via its own fresh sibling search rather than this sweep):
+    this sweep's test runs each candidate file STANDALONE, which can only
+    prove a module-top-level insert is safe in isolation. It cannot see a
+    FIXTURE- or FUNCTION-SCOPED insert whose hazard is specifically
+    CROSS-FILE -- the file passes fine alone and only pollutes a
+    DIFFERENT, later-run file in the same process. Live instance found and
+    left unfixed by this PR (pre-existing, untouched by either commit
+    here): tests/test_surgical_relation_sets.py's `_load_surgical()`
+    helper does an unconditional, never-restored
+    `sys.path.insert(0, str(SRC_ENGRAM))` inside a function called per-test
+    via a fixture -- reproduced live as 53 ERRORS when
+    `tests/test_surgical_relation_sets.py` and `tests/test_engine_phase3.py`
+    run together vs. 53/53 passed when the latter runs alone.
+    `tests/test_principle_triggers_registry.py`'s `_fresh_core_with_data_dir`
+    has the identical shape (unconfirmed as a live failure). Tracked as
+    engram-alpha#2664 rather than fixed here -- the runtime guard this PR
+    ships still catches the collision loudly and attributably when it
+    fires; only this sweep's own COVERAGE CLAIM has the gap."""
+    tests_dir = Path(__file__).resolve().parent
+    matches = []
+    for path in sorted(tests_dir.glob("*.py")):
+        if path.name in (Path(__file__).name, "conftest.py"):
+            continue  # this file's own docstring/patterns, and the guard itself
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if _INSERT0_SRC_ENGRAM_RE.search(text):
+            matches.append(path)
+    return matches
+
+
+def test_no_sibling_file_trips_the_guard_when_run_standalone():
+    """Run every candidate file (see _files_with_insert0_src_engram_pattern)
+    standalone and confirm none of them produce the guard's own "sys.path
+    collision (#2565)" message or an INTERNALERROR -- the completeness
+    check a full-suite-only --co run cannot provide (see module docstring
+    above this test for why)."""
+    candidates = _files_with_insert0_src_engram_pattern()
+    assert candidates, (
+        "expected at least one file matching the insert(0, src, engram) "
+        "pattern (this test file's own scratch conftest templates are "
+        "excluded, but real tests/*.py sources should still match) -- if "
+        "this is genuinely zero, the regex itself may have drifted from "
+        "the actual pattern in use"
+    )
+    failures = []
+    for path in candidates:
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(path)],
+            cwd=str(path.parent.parent),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        combined = proc.stdout + proc.stderr
+        if "sys.path collision (#2565)" in combined or "INTERNALERROR" in combined:
+            failures.append((path.name, combined[-2000:]))
+    assert not failures, "sibling files still trip the #2565 guard when run standalone:\n\n" + "\n\n".join(
+        f"=== {name} ===\n{tail}" for name, tail in failures
+    )

@@ -22,7 +22,7 @@ from urllib.request import urlopen
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "src" / "engram"))
+sys.path.append(str(REPO_ROOT / "src" / "engram"))  # #2565: append, not insert(0)
 
 from viz import agents as viz_agents  # noqa: E402
 from viz import server as viz_server  # noqa: E402

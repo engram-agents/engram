@@ -44,7 +44,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 # Insert the src/engram path so `import viz` resolves cleanly.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src" / "engram"))  # #2565: append, not insert(0)
 
 from viz import agents as viz_agents
 from viz import server as viz_server

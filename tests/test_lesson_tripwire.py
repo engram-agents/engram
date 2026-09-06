@@ -34,7 +34,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(SRC_ENGRAM))
+sys.path.append(str(SRC_ENGRAM))  # #2565: append, not insert(0)
 
 # ---------------------------------------------------------------------------
 # Load the hook module (hyphenated filename, not importable via normal import)

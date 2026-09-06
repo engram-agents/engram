@@ -25,7 +25,7 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src" / "engram"))  # #2565: append, not insert(0)
 
 from viz import agents as viz_agents
 from viz.agents import _refresh_agents_if_stale

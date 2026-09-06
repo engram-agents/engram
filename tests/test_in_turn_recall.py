@@ -45,7 +45,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(SRC_ENGRAM))
+sys.path.append(str(SRC_ENGRAM))  # #2565: append, not insert(0)
 
 # Capture the REAL canonical junk list at collection time (before any test
 # installs a fake engram_idf), so the stubs below can expose the same list the

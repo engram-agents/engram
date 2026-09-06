@@ -102,7 +102,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "src" / "engram"))
+sys.path.append(str(REPO_ROOT / "src" / "engram"))  # #2565: append, not insert(0)
 
 VERSION_PATH = "src/engram/health/version.py"
 PIN_TEST_PATH = "tests/test_health_measurements.py"
