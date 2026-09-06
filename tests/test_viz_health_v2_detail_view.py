@@ -146,6 +146,121 @@ class TestDetailViewFunctionNamesPresent(_LiveServerBase):
         self.assertIn("loadDetailView()", fn_body)
 
 
+def _extract_function(script: str, name: str) -> str:
+    """Extract a top-level `function <name>(...) { ... }` block via brace
+    counting -- more robust than a `\n  }`-anchored regex, needed here
+    because `renderHistoryStrip` itself contains inner `.map(m => {...})`
+    callback bodies that a naive "first line starting with two spaces and a
+    closing brace" regex would stop at prematurely."""
+    m = re.search(r"function\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", script)
+    assert m is not None, f"{name} not found in inline script"
+    start = m.end() - 1  # position of the opening brace itself
+    depth = 0
+    for i in range(start, len(script)):
+        if script[i] == "{":
+            depth += 1
+        elif script[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return script[m.start():i + 1]
+    raise AssertionError(f"unbalanced braces extracting {name}")
+
+
+@unittest.skipUnless(_NODE_AVAILABLE, "node not available on this seat")
+class TestTodayMarkerUnreplayableFold(_LiveServerBase):
+    """#2625 (fold on #2622/a36dbc72): the history strip's "(today)" marker
+    must be computed from the chronologically-latest point (max `t`) across
+    ALL points, not from `plotted[plotted.length - 1]` -- `plotted` has
+    unreplayable points filtered OUT, so the old computation silently
+    promoted an older point to "today" whenever the true latest point was
+    itself unreplayable.
+
+    `renderHistoryStrip` isn't in the standalone `health-detail-math.js`
+    file that `TestDistributionMathViaNode` above runs directly under
+    `node` -- it lives in `health.html`'s inline `<script>`, alongside DOM
+    calls it doesn't itself make (it only ever touches its `containerEl`
+    parameter). So it's extracted (with its two callees, `esc` and
+    `_unreplayableLabel`) straight out of the served inline script by brace
+    counting and executed for real under `node`, same genuine
+    executed-JS-coverage principle as the math tests above -- not a DOM
+    harness, since none of these three functions need one.
+    """
+
+    def _render(self, points_js: str) -> str:
+        body = self._get_text("/health")
+        script = _extract_inline_script(body)
+        src = "\n".join(
+            _extract_function(script, name)
+            for name in ("esc", "_unreplayableLabel", "renderHistoryStrip")
+        )
+        harness = f"""
+        {src}
+        var container = {{
+          _html: '',
+          set innerHTML(v) {{ this._html = v; }},
+          get innerHTML() {{ return this._html; }}
+        }};
+        var points = {points_js};
+        renderHistoryStrip(container, points);
+        console.log(JSON.stringify({{html: container._html}}));
+        """
+        result = subprocess.run(
+            ["node", "-e", harness],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"node script failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+        )
+        return json.loads(result.stdout)["html"]
+
+    def test_today_marker_lands_on_unreplayable_true_latest_point(self):
+        """Series: t=1,2 plottable; t=3 (the true latest, max `t`) is
+        unreplayable. The stale bug renders "(today)" on the t=2 circle
+        (`plotted[plotted.length - 1]`); the fix must NOT label any plotted
+        circle "(today)", and must instead render the unreplayable marker
+        for t=3 with a "(today — unreplayable: ...)" tooltip at that
+        point's own x-position."""
+        points_js = (
+            "[{t:1,value:10,unreplayable:null},"
+            "{t:2,value:20,unreplayable:null},"
+            "{t:3,value:null,unreplayable:{num:{reason:'stripped_from_dump',class:'declared'}}}]"
+        )
+        html = self._render(points_js)
+        # No plotted (older) point promoted to "today".
+        self.assertNotIn("(today)", html)
+        # The true-latest (index 2 of 3, 0-based) unreplayable point carries
+        # the today-labeled tooltip and the underlying reason text.
+        self.assertIn("today — unreplayable: stripped_from_dump", html)
+        # Positioned at that point's own x (todayIdx=2, n=3, w=300, pad=10:
+        # xScale(2) = 10 + (2/2)*(300-20) = 290) -- confirms the marker
+        # isn't merely present anywhere, but at the true-latest point's
+        # x-coordinate specifically.
+        self.assertIn('cx="290"', html)
+        self.assertIn('class="detail-unreplayable-today-marker"', html)
+
+    def test_today_marker_lands_on_true_latest_when_plottable(self):
+        """No-regression control: when the true latest point IS plottable
+        (the common case), "(today)" renders exactly as before -- on that
+        point's own circle, not on some other index."""
+        points_js = (
+            "[{t:1,value:10,unreplayable:null},"
+            "{t:2,value:20,unreplayable:null},"
+            "{t:3,value:30,unreplayable:null}]"
+        )
+        html = self._render(points_js)
+        self.assertIn("(today)", html)
+        self.assertNotIn("unreplayable: ", html)
+        # Exactly one circle carries "(today)", and it's the t=3 value.
+        self.assertEqual(html.count("(today)"), 1)
+        today_pos = html.index("(today)")
+        # The title text immediately preceding "(today)" must be the t=3
+        # value (30), not an older point's value.
+        self.assertIn("30 (today)", html[max(0, today_pos - 10):today_pos + len("(today)")])
+
+
 class TestMathFileServedAndReferenced(_LiveServerBase):
     def test_health_page_references_math_static_file(self):
         body = self._get_text("/health")

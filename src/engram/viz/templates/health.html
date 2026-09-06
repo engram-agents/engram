@@ -118,6 +118,13 @@
     /* Adapts the existing .trend/SVG pattern; a bare "unreplayable" tick
        mark needs its own stroke since .trend only styles path/circle. */
     .detail-unreplayable-tick { stroke: #ff9800; stroke-width: 2; stroke-dasharray: 3,3; }
+    /* #2625: when the chronologically-latest point is itself unreplayable,
+       the "today" marker becomes a hollow circle (not a solid/plotted
+       circle, since there's no value) at that point's x -- stroked in the
+       same orange as .detail-unreplayable-tick so it reads as part of the
+       same "unreplayable" visual family, distinguished from an ordinary
+       tick only by shape + its "(today — unreplayable: ...)" tooltip. */
+    .detail-unreplayable-today-marker { fill: none; stroke: #ff9800; stroke-width: 2; }
     .detail-strip-empty, .detail-dist-empty, .detail-series-note {
       color: #888; font-size: 0.78em; font-style: italic; padding: 6px 0; }
     .detail-histogram { margin-top: 4px; }
@@ -775,6 +782,14 @@
       containerEl.innerHTML = '<div class="detail-strip-empty">no history yet</div>';
       return;
     }
+    // "Today" is the chronologically-latest point (max `t`) across ALL
+    // points -- computed here, BEFORE the unreplayable filter below, so an
+    // unreplayable true-latest point is never silently promoted-away in
+    // favor of an older plotted point (#2625: the old `idx === plotted.length
+    // - 1` computed "today" from the FILTERED array, which excludes
+    // unreplayable points and so picked a stale point whenever the true
+    // latest was itself unreplayable).
+    var todayIdx = n - 1;
     var plotted = [];
     var markers = [];
     pts.forEach((p, i) => {
@@ -794,16 +809,25 @@
     var xScale = i => pad + (n > 1 ? i / (n - 1) : 0.5) * (w - 2 * pad);
     var yScale = v => h - pad - (v - mn) / (mx - mn) * (h - 2 * pad);
     var pathPts = plotted.map(p => xScale(p.i) + ',' + yScale(p.value));
-    var circles = plotted.map((p, idx) => {
-      var isLast = idx === plotted.length - 1; // the "today" marker
-      var r = isLast ? 5 : 3;
-      var styleAttr = isLast ? ' style="fill:#fff"' : '';
-      var titleText = esc(String(p.value)) + (isLast ? ' (today)' : '');
+    var circles = plotted.map(p => {
+      var isToday = p.i === todayIdx; // true latest point, and it's plottable
+      var r = isToday ? 5 : 3;
+      var styleAttr = isToday ? ' style="fill:#fff"' : '';
+      var titleText = esc(String(p.value)) + (isToday ? ' (today)' : '');
       return '<circle cx="' + xScale(p.i) + '" cy="' + yScale(p.value) + '" r="' + r + '"' + styleAttr + '><title>' + titleText + '</title></circle>';
     }).join('');
     var ticks = markers.map(m => {
       var x = xScale(m.i);
       var label = _unreplayableLabel(m.unreplayable);
+      if (m.i === todayIdx) {
+        // True latest point, but unreplayable: do NOT promote an older
+        // plotted point to "today" (#2625). Render a hollow-circle marker
+        // -- stroked like the ordinary unreplayable tick, distinguished
+        // from it only by shape + tooltip -- instead of the dashed tick
+        // line, at this same x. No plotted circle above gets "(today)".
+        var todayTitle = '(today — unreplayable: ' + label + ')';
+        return '<circle class="detail-unreplayable-today-marker" cx="' + x + '" cy="' + (h / 2) + '" r="5"><title>' + esc(todayTitle) + '</title></circle>';
+      }
       return '<line class="detail-unreplayable-tick" x1="' + x + '" y1="' + pad + '" x2="' + x + '" y2="' + (h - pad) + '"><title>' + esc(label) + '</title></line>';
     }).join('');
     containerEl.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '">' +
