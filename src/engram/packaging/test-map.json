@@ -541,6 +541,27 @@
         "tests/test_verify_quote_exit_codes.py"
       ],
       "note": "exit-code contract (#1990); subprocess-tested against the real entrypoint"
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_engine.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: the ordering regression only manifests across a pytest session shared with a fresh_server()-clearing sibling file (test_health_engine_checkpoint_wiring.py, test_health_series_hook.py) -- layer-1's static import graph can't see that cross-file interaction since the regression test itself only subprocess-invokes pytest, it doesn't statically import health.engine. A change to this file (e.g. narrowing _resync_health_modules_before_reload) needs the ordering regression re-run, not just this file's own direct tests."
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_engine_checkpoint_wiring.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: same reasoning as the test_health_engine.py entry above -- this file's fresh_server() is the OTHER half of the cross-file ordering interaction the regression test pins."
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_series_hook.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
     }
   ],
   "unmapped": [

@@ -40,9 +40,13 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import engram_core  # noqa: E402
+import health as health_pkg  # noqa: E402
+from health import config as health_config  # noqa: E402
+from health import curves as health_curves_module  # noqa: E402
 from health import engine as health_engine  # noqa: E402
 from health import measurements as health_measurements  # noqa: E402
 from health import metrics as hem  # noqa: E402
+from health import model as health_model_module  # noqa: E402
 from health import signals as health_signals  # noqa: E402
 from health import version as health_version  # noqa: E402
 from health.config import UNAVAILABLE, AspectDef, EngineConfig, MetricDef  # noqa: E402
@@ -53,6 +57,52 @@ from health.model import (  # noqa: E402
     MetricBinding,
     ScoringModel,
 )
+
+
+def _resync_health_modules_before_reload():
+    """Guard against cross-file test-order contamination (engram-alpha#2609).
+
+    ``tests/test_health_engine_checkpoint_wiring.py``'s ``fresh_server()``
+    deletes ``health`` + every ``health.*`` submodule from ``sys.modules``
+    and then ``import server``s fresh — which re-imports the whole
+    ``health`` package family as BRAND NEW module objects, distinct from
+    the ones this file bound at collection time (``health_engine``,
+    ``health_signals``, etc., above). ``importlib.reload()`` requires the
+    module argument to BE the object currently registered under its name
+    in ``sys.modules`` (see ``importlib/__init__.py``'s own precondition
+    check) — so when this file's tests run AFTER the checkpoint-wiring
+    file in the same pytest session, ``importlib.reload(health_engine)``
+    fails outright with ``ImportError: module health.engine not in
+    sys.modules``, even before doing anything with the perturbed
+    ``SIGNALS`` state.
+
+    Re-registering every ``health.*`` submodule THIS FILE already holds a
+    reference to (never a fresh ``import health.x``, which would just
+    return whatever object currently happens to be cached — the wrong
+    one) restores a self-consistent object family: ``health.engine``'s
+    own top-level ``from . import signals as health_signals`` (etc.)
+    re-executes during reload and re-binds against these SAME objects, so
+    the perturbation this test makes to ``health_signals.SIGNALS`` is
+    what the reloaded ``engine.py`` actually reads back. Restoring the
+    WHOLE family (not just engine + signals) also keeps a successful
+    reload's rebuilt ``CONFIG``/``MODEL`` from mixing this file's
+    ``AspectDef``/``MetricDef``/etc. classes with a different cached
+    copy's — which would silently desync later isinstance-shaped checks
+    in this same file rather than fail loud here.
+
+    Idempotent and harmless when nothing drifted (the normal collection
+    order, or a solo run of this file) — it just re-registers the objects
+    already in ``sys.modules`` under their own names.
+    """
+    sys.modules["health"] = health_pkg
+    sys.modules["health.config"] = health_config
+    sys.modules["health.curves"] = health_curves_module
+    sys.modules["health.engine"] = health_engine
+    sys.modules["health.measurements"] = health_measurements
+    sys.modules["health.metrics"] = hem
+    sys.modules["health.model"] = health_model_module
+    sys.modules["health.signals"] = health_signals
+    sys.modules["health.version"] = health_version
 
 
 _NODES_DDL = """
@@ -861,6 +911,7 @@ class TestBuildSnapshot:
         and reloads again in ``finally`` regardless of outcome — a
         perturbed ``health_engine`` left in place would corrupt every
         later test in the same process."""
+        _resync_health_modules_before_reload()
         victim = next(iter(health_signals.SIGNALS.keys()))
         original_entry = health_signals.SIGNALS.pop(victim)
         try:
@@ -894,6 +945,7 @@ class TestBuildSnapshot:
         ``_run_aspect`` — and confirms the reloaded module raises loudly
         instead. Restores + reloads in ``finally`` regardless of outcome,
         same reason as the sibling test."""
+        _resync_health_modules_before_reload()
         config_metric_names = {
             m.name for aspect in health_engine.CONFIG.aspects for m in aspect.metrics
         }
