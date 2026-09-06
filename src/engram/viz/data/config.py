@@ -52,11 +52,25 @@ def _find_tools_parent(start: Path) -> Path | None:
     SAME relative depth from this file (three ``..`` up), but computing
     that depth by counting is exactly the "fixed parents[N]" mistake
     this function exists to avoid if the tree is ever restructured
-    again. Returns None if not found (caller degrades gracefully, same
-    as the original file's own try/except ImportError contract).
+    again. Returns None if not found, OR if every candidate directory is
+    unreadable -- Path.is_file() raises OSError (not False) in that
+    case, and this function runs at bare module-import time, so the
+    walk must never raise (same never-raises shape as
+    _hooklib.resolve_runtime_dir, engram-alpha#2671). Guards PER
+    CANDIDATE, not the whole walk in one try/except: if the nearest
+    candidate happens to be the unreadable one, a whole-walk guard
+    would abort before ever checking a further, normally-readable
+    ancestor -- discarding a candidate that would have resolved
+    (engram-alpha#2671 review round). Caller degrades gracefully
+    either way, same as the original file's own try/except ImportError
+    contract.
     """
     for candidate in [start, *start.parents]:
-        if (candidate / "tools" / "config_schema.py").is_file():
+        try:
+            found = (candidate / "tools" / "config_schema.py").is_file()
+        except OSError:
+            continue
+        if found:
             return candidate
     return None
 

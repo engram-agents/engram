@@ -61,13 +61,26 @@ def _find_indexer_dir(start: Path) -> Path | None:
     built/deployed plugin tree (``plugin_root/viz/data/stats.py``, target
     ``plugin_root/``) -- see data/config.py's ``_find_tools_parent`` for the
     identical pattern applied to a different sibling file. Returns ``None``
-    if not found; the caller falls back to ``Path(__file__).resolve().parent``
-    (this file's own directory) in that case -- the same
-    not-quite-right-but-harmless hint the original would give if run from an
-    unexpected location, never raises.
+    if not found, OR if every candidate directory is unreadable --
+    ``Path.is_file()`` raises ``OSError`` (not ``False``) in that case, and
+    this function runs at bare module-import time, so the walk must never
+    raise (same never-raises shape as _hooklib.resolve_runtime_dir,
+    engram-alpha#2671). Guards PER CANDIDATE, not the whole walk in one
+    try/except: if the nearest candidate happens to be the unreadable one,
+    a whole-walk guard would abort before ever checking a further,
+    normally-readable ancestor -- discarding a candidate that would have
+    resolved (engram-alpha#2671 review round). The caller falls back to
+    ``Path(__file__).resolve().parent`` (this file's own directory) in
+    either not-found case -- the same not-quite-right-but-harmless hint
+    the original would give if run from an unexpected location, never
+    raises.
     """
     for candidate in [start, *start.parents]:
-        if (candidate / "engram_log_indexer.py").is_file():
+        try:
+            found = (candidate / "engram_log_indexer.py").is_file()
+        except OSError:
+            continue
+        if found:
             return candidate
     return None
 
