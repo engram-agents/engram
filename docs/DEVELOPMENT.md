@@ -390,23 +390,46 @@ from merging — it is live, not merely intended. The 2026-05-30 scrub wave
 before the gate shipped; new PRs should not introduce new concrete IDs in
 shipped files.
 
-To check your own PR locally before pushing:
+To check your own PR locally before pushing — this snippet must match the
+workflow's own `EXCLUDES` array exactly (checked 2026-09-06, engram-alpha
+#2626: it had drifted, missing 5 entries and one path was wrong in a way
+that made the local check *stricter* than CI, i.e. false alarms rather
+than missed leaks):
 
 ```bash
 git diff --no-color "origin/dev...HEAD" -- \
-  ':(exclude)tests/' ':(exclude)paper_draft/' ':(exclude)active-work/' \
-  ':(exclude)README.md' ':(exclude)CHANGELOG.md' \
+  ':(exclude)tests/' ':(exclude)src/forum/tests/' ':(exclude)paper_draft/' \
+  ':(exclude)active-work/' ':(exclude)docs/cycle/' ':(exclude)docs/handbook/' \
+  ':(exclude)README.md' ':(exclude)docs/CHANGELOG.md' \
+  ':(exclude).github/workflows/pr-checks.yml' ':(exclude)src/engram/engram_ids.py' \
   | grep -E '^\+[^+].*\b[a-z]{2}_[0-9]{4,}\b' && echo "FAIL: new node-ID references introduced" || echo "PASS: no new node-IDs"
 ```
 
-**Allowlisted paths** (intentional exceptions):
+**Allowlisted paths** (intentional exceptions — kept in sync with the
+workflow's own `EXCLUDES` comment block; if you change one, change both):
 
-- `tests/` — fixture IDs are part of test scenarios, not citations.
-- `paper_draft/`, `active-work/` — non-shipped surfaces.
+- `tests/`, `src/forum/tests/` — fixture IDs are part of test scenarios,
+  not citations.
+- `paper_draft/`, `active-work/` — non-shipped surfaces. (`paper_draft/`
+  has no git history and no `.gitignore` entry as of 2026-09-06 — possibly
+  a named-but-unused convention; harmless to the gate either way, since an
+  exclude pathspec for a nonexistent directory is a no-op.)
+- `docs/cycle/` — self-improvement-cycle process docs (charter, chronicle,
+  review packages, dream-pass protocol); node IDs are load-bearing
+  provenance there by design, and `build-plugin.sh` does not bundle it.
+- `docs/handbook/` — dev-internal developer handbook (accuracy-pass
+  reference docs); same rationale as `docs/cycle/` — node IDs are
+  load-bearing provenance and the build engine doesn't bundle `docs/`.
 - `README.md` — documents the seed-graph IDs (the ones present in
   **every** install, listed there as the install-state mapping); these
   are install state, not developer citations.
-- `CHANGELOG.md` — historical record; scrub deferred (low-priority).
+- `docs/CHANGELOG.md` — historical record; scrub deferred (low-priority).
+  (There is no top-level `CHANGELOG.md` — the real file lives at
+  `docs/CHANGELOG.md`; a bare `CHANGELOG.md` exclude entry excludes
+  nothing.)
+- `.github/workflows/pr-checks.yml` — the workflow file itself contains
+  the pattern literally.
+- `src/engram/engram_ids.py` — see "Schema-illustration exception" below.
 
 **Schema-illustration exception** (the small carve-out the scrub wave
 surfaced):
