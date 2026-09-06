@@ -1730,30 +1730,66 @@ def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
     """First-init check: clear a stale degraded marker if the DB is now healthy.
 
     Called once per server lifetime (guarded by _walguard_startup_done flag).
-    If a degraded marker exists AND detect_shm_displacement() returns None AND
+    If a degraded marker exists AND detect_shm_displacement() returns None
+    (GENUINELY confirmed healthy, not merely unavailable -- #2651) AND
     PRAGMA integrity_check returns 'ok', the marker is removed and a log line
     is emitted.  If integrity_check fails, the marker is left in place and a
     loud error is logged.
+
+    #2651: detection unavailable (e.g. no /proc on this platform, or no shm
+    fd held by this process yet) must NOT read as healthy here -- this is
+    the conjunct doing the safety work, since integrity_check alone does
+    not test write durability (the failure mode this guard exists to
+    catch, per #1947/#786). A loud one-time startup line fires whenever
+    detection is unavailable, whether or not a stale marker exists, so a
+    seat knows which guard it's running without, even on a clean start
+    with nothing to clear.
 
     Never raises — any internal failure is logged and swallowed.
     """
     import sys
     try:
         import engram_walguard as _wg
-        marker = _wg.read_degraded_marker(DATA_DIR)
-        if marker is None:
-            return  # no stale marker; nothing to do
         detection = _wg.detect_shm_displacement(str(DB_PATH))
-        if detection is not None:
-            # Still displaced — leave the marker and log loudly
+        if detection is not None and detection.get("reason") == "detection_unavailable":
+            # Deliberately no "on this platform" here: the "why" field's
+            # cause may be platform-permanent (no /proc) or merely
+            # connection-timing (no shm fd held yet) -- see
+            # detect_shm_displacement's own docstring for the distinction.
+            # Naming the platform unconditionally would misdescribe the
+            # latter case.
             print(
-                f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
-                f"(reason={detection.get('reason')}); leaving marker in place. "
-                f"Do not run a hard checkpoint. {_wg.recovery_banner_text()}",
+                f"[walguard] displacement detection unavailable "
+                f"({detection.get('why')}); this guard cannot confirm WAL/shm "
+                f"displacement is absent right now. (#2651)",
                 file=sys.stderr,
             )
+        marker = _wg.read_degraded_marker(DATA_DIR)
+        if marker is None:
+            return  # no stale marker; nothing further to do
+        if detection is not None:
+            if detection.get("reason") == "detection_unavailable":
+                # #2651: cannot confirm displacement is absent -- treat the
+                # same as "still displaced" for the purpose of NOT clearing,
+                # but say so honestly rather than claiming confirmed displacement.
+                print(
+                    f"[walguard] CRITICAL: stale degraded marker present AND "
+                    f"displacement detection is unavailable ({detection.get('why')}); "
+                    f"cannot confirm displacement is absent -- leaving marker in "
+                    f"place as a precaution. Do not run a hard checkpoint. "
+                    f"{_wg.recovery_banner_text()}",
+                    file=sys.stderr,
+                )
+            else:
+                # Still displaced — leave the marker and log loudly
+                print(
+                    f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
+                    f"(reason={detection.get('reason')}); leaving marker in place. "
+                    f"Do not run a hard checkpoint. {_wg.recovery_banner_text()}",
+                    file=sys.stderr,
+                )
             return
-        # Displacement gone — verify integrity before clearing
+        # detection is genuinely None (confirmed healthy) — verify integrity before clearing
         try:
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             ic_ok = len(rows) == 1 and rows[0][0] == "ok"
@@ -1804,10 +1840,17 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
 
     No-ops unless ≥30 s have elapsed since the last check (keeps per-call cost
     near zero — two stat() calls plus a listdir that is amortised over the
-    interval).  On detection: logs loudly, writes the degraded marker, attempts
-    an emergency dump (checkpoint skipped — checkpointing under a split-brain
-    WAL-index is the corruption vector, #786), and updates the marker's dump
-    fields.
+    interval).  On a GENUINE displacement reason: logs loudly, writes the
+    degraded marker, attempts an emergency dump (checkpoint skipped —
+    checkpointing under a split-brain WAL-index is the corruption vector,
+    #786), and updates the marker's dump fields.
+
+    #2651: "detection_unavailable" (can't judge, e.g. no /proc or no shm fd
+    held yet) is NOT a genuine displacement reason and is a quiet no-op here,
+    same as bare None (confirmed healthy) -- without this carve-out, an
+    unresolvable "unavailable" state would falsely re-fire the logging/
+    marker-write/dump path above every throttle window, permanently, on
+    every affected seat.
 
     Storm-gate (#786): displacement is a persistent condition.  To avoid firing
     a full SQL dump + git commit on every 30-second throttle window for the
@@ -1831,6 +1874,14 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
         detection = _wg.detect_shm_displacement(str(DB_PATH))
         if detection is None:
             return  # healthy
+        if detection.get("reason") == "detection_unavailable":
+            # #2651: can't judge (platform, or fd not held yet) -- not a
+            # displacement. Quiet no-op, unlike a genuine reason below: an
+            # unresolvable "unavailable" state on a non-Linux seat would
+            # otherwise re-fire this CRITICAL branch, write a degraded
+            # marker, and attempt an emergency dump every throttle window
+            # for the life of the process, on every affected seat.
+            return
 
         import sys
 

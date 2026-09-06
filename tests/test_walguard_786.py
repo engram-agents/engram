@@ -69,7 +69,9 @@ def _open_wal_db(path: str) -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 class TestDetectHealthy:
-    """detect_shm_displacement returns None when shm inode matches."""
+    """detect_shm_displacement returns None ONLY for a genuinely confirmed
+    healthy inode match (#2651) -- every other "can't tell" case below
+    returns a distinguishable {"reason": "detection_unavailable", ...}."""
 
     @_LINUX_PROC
     def test_healthy_returns_none(self, tmp_path):
@@ -85,23 +87,39 @@ class TestDetectHealthy:
         finally:
             conn.close()
 
-    def test_no_proc_returns_none(self, tmp_path, monkeypatch):
-        """When /proc/self/fd is absent, detect_shm_displacement returns None."""
+    def test_no_proc_returns_detection_unavailable(self, tmp_path, monkeypatch):
+        """#2651: when /proc/self/fd is absent, detect_shm_displacement
+        returns a distinguishable "detection_unavailable" reason, NOT the
+        same bare None a genuine healthy match returns. Before #2651 this
+        returned None -- indistinguishable from healthy, and the ONLY path
+        that ever executes on every Darwin seat (no /proc at all)."""
         db_path = str(tmp_path / "knowledge.db")
         conn = _open_wal_db(db_path)
         try:
             monkeypatch.setattr(os.path, "isdir", lambda p: False)
             result = engram_walguard.detect_shm_displacement(db_path)
-            assert result is None
+            assert result is not None, (
+                "must NOT collapse to bare None -- that is indistinguishable "
+                "from a genuinely confirmed-healthy result"
+            )
+            assert result.get("reason") == "detection_unavailable"
+            assert "why" in result and result["why"]
         finally:
             conn.close()
 
-    def test_no_shm_fd_held_returns_none(self, tmp_path):
-        """When this process holds no shm fd, returns None (cannot judge)."""
+    def test_no_shm_fd_held_returns_detection_unavailable(self, tmp_path):
+        """#2651: when this process holds no shm fd yet (cannot judge),
+        returns a distinguishable "detection_unavailable" reason rather
+        than the bare None a genuine healthy match returns."""
         db_path = str(tmp_path / "other.db")
         # Use a db path we know no fd is open for
         result = engram_walguard.detect_shm_displacement(db_path)
-        assert result is None
+        assert result is not None, (
+            "must NOT collapse to bare None -- that is indistinguishable "
+            "from a genuinely confirmed-healthy result"
+        )
+        assert result.get("reason") == "detection_unavailable"
+        assert "why" in result and result["why"]
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +616,71 @@ class TestStartupClearing:
         finally:
             conn.close()
 
+    def test_marker_not_cleared_when_detection_unavailable(self, monkeypatch):
+        """#2651: end-to-end reproduction, NOT mocking detect_shm_displacement
+        itself -- forces the REAL unavailable path (monkeypatching
+        os.path.isdir to simulate no /proc, exactly as a Darwin seat would
+        hit it) through the real detector into the real startup-clear
+        caller, with an otherwise-clean integrity_check, and asserts the
+        marker is NOT cleared.
+
+        This is the genuine end-to-end regression this issue exists to
+        fix, and it is deliberately NOT a mocked-detector test: mocking
+        detect_shm_displacement to already return a distinguishable
+        "detection_unavailable" dict would pass under BOTH the old and
+        the new caller code, because the pre-#2651 caller's crude "any
+        non-None value means still displaced, don't clear" check happens
+        to also refuse to clear on an unrecognized truthy dict shape --
+        it just prints a MISLEADING message while doing so. The actual
+        bug was entirely in the DETECTOR returning bare None for
+        "unavailable" (indistinguishable from healthy); only exercising
+        the real detector reproduces that. Checked to fail against the
+        pre-#2651 collapse: reverting detect_shm_displacement's /proc-absent
+        branch to `return None` makes this test fail (marker gets cleared)."""
+        conn = self._make_healthy_db()
+        try:
+            engram_walguard.write_degraded_marker(
+                str(self.tmp), {"reason": "shm_deleted", "fd": 3}
+            )
+            monkeypatch.setattr(os.path, "isdir", lambda p: False)
+
+            self.server._walguard_startup_clear(conn)
+
+            assert engram_walguard.read_degraded_marker(str(self.tmp)) is not None, (
+                "Degraded marker must NOT be cleared when detection is "
+                "unavailable, even with a clean integrity_check -- "
+                "'could not confirm' must not read as 'confirmed absent'"
+            )
+        finally:
+            conn.close()
+
+    def test_loud_startup_line_fires_on_unavailable_even_with_no_marker(self, capsys):
+        """#2651 item 3: one loud startup line fires when detection is
+        unavailable on this platform, regardless of whether a stale marker
+        exists to clear -- a seat on a clean start still needs to know
+        which guard it is running without."""
+        conn = self._make_healthy_db()
+        try:
+            # Deliberately NO marker written -- the loud line must fire anyway.
+            assert engram_walguard.read_degraded_marker(str(self.tmp)) is None
+
+            with mock.patch(
+                "engram_walguard.detect_shm_displacement",
+                return_value={
+                    "reason": "detection_unavailable",
+                    "why": "no /proc/self/fd (non-Linux or /proc not mounted)",
+                },
+            ):
+                self.server._walguard_startup_clear(conn)
+
+            captured = capsys.readouterr()
+            assert "displacement detection unavailable" in captured.err, (
+                f"expected a loud startup line naming detection unavailability "
+                f"even with no marker to clear; got stderr:\n{captured.err}"
+            )
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # 7. Guard never raises
@@ -665,6 +748,44 @@ class TestGuardNeverRaises:
         # Should NOT have called detect (throttled)
         assert call_count["n"] == 0, (
             f"detect was called {call_count['n']} time(s) despite throttle"
+        )
+        conn.close()
+
+    def test_periodic_check_quiet_no_op_when_detection_unavailable(self, capsys):
+        """#2651 item 2: the periodic check treats "detection_unavailable"
+        as a quiet no-op, same as genuine None -- it must NOT write a
+        degraded marker or attempt an emergency dump. Checked to fail
+        against the pre-#2651 collapse: before the fix, this reason value
+        did not exist (unavailable collapsed into bare None, which this
+        function already handled quietly) -- but if a future change made
+        detect_shm_displacement return a truthy "unavailable" dict WITHOUT
+        also teaching this caller to recognize it, this exact test would
+        catch the resulting false-CRITICAL-alarm-on-every-check regression
+        on every non-Linux seat."""
+        db_path = self.tmp / "knowledge.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+        self.server.core._walguard_last_check = 0.0
+
+        with mock.patch(
+            "engram_walguard.detect_shm_displacement",
+            return_value={
+                "reason": "detection_unavailable",
+                "why": "no /proc/self/fd (non-Linux or /proc not mounted)",
+            },
+        ):
+            self.server._run_walguard_check(conn)
+
+        captured = capsys.readouterr()
+        assert "CRITICAL" not in captured.err, (
+            f"periodic check must not raise a false displacement alarm on "
+            f"an unavailable-detection platform; got stderr:\n{captured.err}"
+        )
+        assert engram_walguard.read_degraded_marker(str(self.tmp)) is None, (
+            "periodic check must not write a degraded marker when "
+            "detection is merely unavailable, not a genuine displacement"
         )
         conn.close()
 

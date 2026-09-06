@@ -7,7 +7,11 @@ coordinating degraded-mode across all DB-touching processes.
 Detection is Linux-only in v1: it relies on /proc/self/fd/ symlinks to compare
 the inode the live server process holds open against the on-disk file.  On
 non-Linux hosts or when /proc is absent, detect_shm_displacement() returns
-None (graceful no-op).
+{"reason": "detection_unavailable", ...} (#2651) -- distinct from the bare
+None it returns for a GENUINELY confirmed-healthy inode match. Before #2651
+this case collapsed into bare None too, indistinguishable from health; on
+every seat without /proc (every Darwin seat) that made the guard silently
+report clean on every call, for the life of the process.
 
 Motivating incident (2026-06-03): knowledge.db-shm was deleted under the live
 MCP server.  The server stayed coherent for ~6 hours while fresh external
@@ -119,9 +123,21 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
     (via /proc/self/fd/) against the inode of the on-disk <db_path>-shm.
 
     Returns:
-        None  — healthy (inodes match) OR no shm fd held by this process
-                (connection may not have opened WAL yet) OR /proc not available
-                (non-Linux; detection is Linux-only in v1).
+        None  — GENUINELY healthy: an shm fd is held and its inode matches
+                the on-disk file. The ONLY value a caller may read as
+                "confirmed not displaced".
+        {"reason": "detection_unavailable", "why": <str>}
+            — #2651: detection could not be performed, for any of several
+              reasons (no /proc on this platform; no shm fd held by this
+              process yet, e.g. the connection hasn't opened WAL; the held
+              fd or the on-disk file couldn't be stat()'d; an unexpected
+              internal error). Mirrors capture_forensics()'s own
+              "unavailable" vocabulary below. Callers MUST NOT treat this
+              the same as None -- "could not check" is not "checked and
+              clean". Before #2651 every one of these cases returned bare
+              None, indistinguishable from genuine health; on a seat with
+              no /proc (every Darwin seat, v1), that made this function
+              return the None shape on EVERY call, permanently.
         {"reason": "shm_deleted", "fd": <int>}
             — the fd symlink ends with " (deleted)", meaning the on-disk shm
               was removed while the process held it open.
@@ -139,7 +155,11 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
         shm_path = db_path + "-shm"
         proc_fd = "/proc/self/fd"
         if not os.path.isdir(proc_fd):
-            return None  # non-Linux or /proc not mounted; detection unavailable
+            return {
+                "reason": "detection_unavailable",
+                "why": "no /proc/self/fd (non-Linux or /proc not mounted; "
+                "detection is Linux-only in v1)",
+            }
 
         shm_fd: Optional[int] = None
         shm_target: Optional[str] = None
@@ -171,8 +191,16 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
         if shm_fd is None:
             # No fd held for this shm — cannot judge; connection may not have
             # opened WAL yet (e.g. the DB was opened in WAL mode but no
-            # read/write has forced shm creation yet).
-            return None
+            # read/write has forced shm creation yet). #2651: this is a
+            # "can't tell" state, not a health verdict -- distinct from
+            # None, even though (unlike the /proc-absent case) it is
+            # typically transient and resolves on the next check once the
+            # connection has opened WAL.
+            return {
+                "reason": "detection_unavailable",
+                "why": "no shm fd held by this process yet "
+                "(connection may not have opened WAL yet)",
+            }
 
         # fd target ends with " (deleted)" → on-disk shm is gone
         if shm_target is not None and shm_target.endswith(" (deleted)"):
@@ -183,14 +211,22 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
         try:
             fd_stat = os.stat(fd_link)
         except OSError:
-            return None  # can't stat the fd link; give up gracefully
+            # can't stat the fd link -- #2651: unavailable, not healthy
+            return {
+                "reason": "detection_unavailable",
+                "why": f"could not stat the held fd link {fd_link!r}",
+            }
 
         try:
             disk_stat = os.stat(shm_path)
         except FileNotFoundError:
             return {"reason": "shm_deleted", "fd": shm_fd}
         except OSError:
-            return None  # unexpected; fail open (don't raise)
+            # unexpected; #2651: unavailable, not healthy -- don't raise
+            return {
+                "reason": "detection_unavailable",
+                "why": f"could not stat the on-disk shm path {shm_path!r}",
+            }
 
         if fd_stat.st_ino != disk_stat.st_ino:
             return {
@@ -202,10 +238,14 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
 
         return None  # healthy
 
-    except Exception:
-        # Any unexpected error → graceful no-op (the guard must never crash the
-        # caller)
-        return None
+    except Exception as e:
+        # Any unexpected error → the guard must never crash the caller, but
+        # #2651: this is "could not check", not "checked and healthy" --
+        # a bare None here was the same collapse this whole issue is about.
+        return {
+            "reason": "detection_unavailable",
+            "why": f"unexpected error during detection: {e!r}",
+        }
 
 
 # ---------------------------------------------------------------------------
