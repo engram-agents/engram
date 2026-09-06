@@ -923,3 +923,173 @@ def test_2381_is_ancestor_returns_none_on_an_invalid_revision(tmp_path: Path) ->
     mode for an advisory-only check than silently returning None."""
     fx = _make_ancestry_fixture(tmp_path)
     assert _is_ancestor(Path(fx["repo"]), "deadbeef" * 5, fx["feature_tip"]) is None
+
+
+# ---------------------------------------------------------------------------
+# #2539 / #2540 -- a legitimate triple-backtick fence around Removed-test
+# markers was silently swallowed by the single-backtick-span strip (the
+# fence's three backticks read as one-and-a-half spans: the first two pair
+# off empty, the third dangles and pairs with the *closing* fence's first
+# backtick, taking everything between the two fences with it). Fixed by
+# `_split_out_fenced_code_blocks` / `_strip_inline_code_preserving_fences`,
+# which leave fenced content untouched before the inline-code strip runs.
+#
+# The fixture below is a reconstruction, not the literal PR #2538 body the
+# issues cite: PR #2538's body was edited (unfenced) by its author shortly
+# after the incident, and the GitHub REST API does not expose prior PR-body
+# revisions, so the exact original text is not recoverable. It reproduces
+# the same SHAPE both issues describe -- a fenced block wrapping several
+# `Removed-test:` lines -- with the same 7-marker COUNT as the real
+# incident (PR #2538's live body still carries exactly 7 unfenced
+# `Removed-test:` lines today, independently re-confirmed), not just a
+# same-shape-smaller-count stand-in. Independently verified against the
+# unpatched (pre-fix) code to reproduce a 7-parsed-as-0 failure with this
+# exact fixture before checking it here on the fix.
+# ---------------------------------------------------------------------------
+
+
+_FENCED_MARKERS_BODY = (
+    "## What\n\n"
+    "Removed 7 stale tests during the cleanup.\n\n"
+    "```\n"
+    "Removed-test: tests/test_mod.py::test_a — superseded by test_b\n"
+    "Removed-test: tests/test_mod.py::test_c — duplicate of test_d\n"
+    "Removed-test: tests/test_mod.py::TestX::test_e — merged into test_f\n"
+    "Removed-test: tests/test_mod.py::TestX::test_g — obsolete fixture\n"
+    "Removed-test: tests/test_other.py::test_h — flaky, replaced\n"
+    "Removed-test: tests/test_other.py::test_i — flaky, replaced\n"
+    "Removed-test: tests/test_other.py::test_j — no longer applicable\n"
+    "```\n\n"
+    "See the PR diff for details.\n"
+)
+
+
+def test_2539_fenced_markers_all_parse():
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    assert [m.id for m in markers] == [
+        "tests/test_mod.py::test_a",
+        "tests/test_mod.py::test_c",
+        "tests/test_mod.py::TestX::test_e",
+        "tests/test_mod.py::TestX::test_g",
+        "tests/test_other.py::test_h",
+        "tests/test_other.py::test_i",
+        "tests/test_other.py::test_j",
+    ]
+
+
+def test_2539_fenced_markers_account_for_real_disappearances():
+    base_ids = {
+        "tests/test_mod.py::test_a",
+        "tests/test_mod.py::test_c",
+        "tests/test_mod.py::TestX::test_e",
+        "tests/test_mod.py::TestX::test_g",
+        "tests/test_other.py::test_h",
+        "tests/test_other.py::test_i",
+        "tests/test_other.py::test_j",
+        "tests/test_mod.py::test_kept",
+    }
+    head_ids = {"tests/test_mod.py::test_kept"}
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.passed, report.unaccounted
+
+
+def test_2539_fenced_markers_leave_no_unparsed_warning():
+    # The #2393 fail-loud warning path must not fire for markers that
+    # parse cleanly from inside a proper fence. Asserting markers are
+    # non-empty in THIS test (not just in the sibling
+    # test_2539_fenced_markers_all_parse) matters: without it, a
+    # regression that re-introduces the fence-swallow bug would ALSO
+    # pass this assertion vacuously -- a fully-swallowed fenced region
+    # removes the "removed-test:" substring along with everything else,
+    # so the per-line scan finds nothing to flag either, for the wrong
+    # reason (reviewer-fairy catch on PR #2628 round 1, confirmed by
+    # mutation-testing against the pre-fix regex).
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    assert len(markers) == 7
+    assert find_unparsed_removed_test_lines(_FENCED_MARKERS_BODY) == []
+
+
+def test_2539_tilde_fence_also_preserved():
+    # A body with NO backtick anywhere (the original shape of this test)
+    # passes under every configuration -- the pre-fix code, the fix, and
+    # the fix with tilde support removed entirely -- because the naive
+    # strip has nothing to swallow regardless of whether the fence is
+    # even recognized (Ariadne's colleague-review catch on PR #2628,
+    # same class as the unterminated-fence fixture's own fix above: a
+    # test needs an UNPAIRED backtick straddling the fence to actually
+    # discriminate). An even count of backticks outside the fence would
+    # also fail to discriminate -- they pair off normally either way --
+    # so this needs an ODD one specifically: `x` (one backtick, unclosed)
+    # supplies it, and the closing `y` afterward is deliberately a
+    # SEPARATE, already-closed span, not part of counting toward that
+    # oddness.
+    body = (
+        "Note `x\n"
+        "~~~\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "~~~\n"
+        "and `y` after.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_language_tagged_fence_also_preserved():
+    body = (
+        "```text\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "```\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_unterminated_fence_extends_to_end_of_body():
+    # CommonMark's own rule: an unclosed fence implicitly closes at the end
+    # of the document. The marker inside must still parse, not be treated
+    # as "outside any fence" (which would re-expose it to the single-
+    # backtick swallow LIMIT below via whatever comes after it, in a real
+    # body that continues past this point).
+    #
+    # The trailing paragraph with a real inline-code span is load-bearing
+    # for this test, not decoration (reviewer-fairy catch on PR #2628
+    # round 1): with nothing after the marker, the dangling opening
+    # backtick has no OTHER backtick anywhere in the document to pair
+    # with, so even the PRE-FIX naive regex leaves the marker alone by
+    # accident -- this test would pass unchanged under the very bug it
+    # claims to guard against. Confirmed by mutation-testing: reverting to
+    # the pre-fix regex, a body ending right after the marker still
+    # parses correctly (false negative), while THIS body (marker,
+    # unterminated fence, then a real single-backtick span afterward)
+    # correctly fails under the pre-fix regex and passes only with the
+    # fix -- proving the EOF-closing rule is what's actually being tested.
+    body = (
+        "```\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "\n"
+        "See `option_foo` for details.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_stray_backtick_typo_outside_a_fence_still_swallows_by_design():
+    """The fix narrows the LIMIT to non-fenced text; it does not remove it.
+    Identical shape to test_stray_unterminated_backtick_swallows_a_later_
+    marker_by_design above, confirming the fence carve-out did not
+    accidentally make every single backtick fence-like."""
+    base_ids = {"tests/test_mod.py::test_a", "tests/test_mod.py::test_b"}
+    head_ids = {"tests/test_mod.py::test_a"}
+    body = (
+        "See the config option `enable_foo (typo, unclosed)\n"
+        "\n"
+        "Removed-test: tests/test_mod.py::test_b — obsolete after refactor"
+        "\n"
+        "Also see `this real inline code`.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert markers == []
+    report = evaluate(base_ids, head_ids, markers)
+    assert not report.passed
+    assert report.unaccounted == ("tests/test_mod.py::test_b",)

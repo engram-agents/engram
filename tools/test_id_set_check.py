@@ -302,6 +302,94 @@ _MARKER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# A GFM fenced code block's opening delimiter: 3+ backticks OR 3+ tildes,
+# optionally indented, optionally followed by a language tag on the same
+# line. Captured so the closing-fence check below can require the SAME
+# character repeated AT LEAST as many times (CommonMark's own rule) --
+# without that, a stray "```" inside a ```` ```python ```` ... ```` ``` ````
+# block (or a tilde fence closed by a shorter run of tildes) could close
+# early or never.
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+
+
+def _split_out_fenced_code_blocks(text: str) -> list[tuple[bool, str]]:
+    """Split `text` into (is_fenced, segment) pairs, line-aligned, so a
+    caller can leave fenced-block content untouched while still processing
+    everything else (#2539/#2540).
+
+    Root cause this exists to fix: `parse_removed_test_markers`'s inline-
+    code strip (`re.sub(r"`[^`]*`", "", pr_body)`) treats a fence's THREE
+    backticks as one-and-a-half single-backtick spans -- the first two pair
+    off as an empty span, the third dangles and pairs with the *closing*
+    fence's first backtick, silently swallowing every line in between
+    (measured: a real 7-marker fenced block parsed as 0 markers). A fence
+    is not inline code and not a typo; it is the standard, correct markdown
+    for presenting a literal multi-line list -- exactly what a
+    `Removed-test:` block is. Segmenting fenced regions OUT before the
+    inline-code strip runs (and leaving their content byte-for-byte
+    untouched) means a marker written inside a proper fence parses like any
+    other marker, while an unmatched/typo'd single backtick OUTSIDE a fence
+    still gets the existing (documented, fail-safe) swallow-to-next-
+    backtick treatment -- this only widens what counts as "not inline
+    code," it does not change how inline code itself is handled.
+
+    LIMIT (by design, same posture as the module's other LIMIT entries):
+    this recognizes GFM fences by their DELIMITER LINES only (indentation
+    allowed, an optional language tag on the open line, and a closing line
+    of the same fence character repeated at least as many times) -- it is
+    not a CommonMark parser and does not handle nested fences of the same
+    character (CommonMark itself does not define nesting for identical
+    fence characters; a real block needing that should use the OTHER fence
+    character, same as any markdown renderer). An unterminated fence (no
+    matching close before the body ends) is treated as extending to the end
+    of the text, matching CommonMark's own end-of-document closing rule.
+
+    Pure. Returns [(False, text)] unchanged when no fence is found.
+    """
+    lines = text.split("\n")
+    segments: list[tuple[bool, str]] = []
+    current: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for line in lines:
+        if not in_fence:
+            m = _FENCE_OPEN_RE.match(line)
+            if m:
+                if current:
+                    segments.append((False, "\n".join(current)))
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                current = [line]
+                in_fence = True
+            else:
+                current.append(line)
+            continue
+
+        current.append(line)
+        stripped = line.strip()
+        if stripped and set(stripped) == {fence_char} and len(stripped) >= fence_len:
+            segments.append((True, "\n".join(current)))
+            current = []
+            in_fence = False
+
+    if current:
+        segments.append((in_fence, "\n".join(current)))
+
+    return segments
+
+
+def _strip_inline_code_preserving_fences(pr_body: str) -> str:
+    """The `parse_removed_test_markers`/`find_unparsed_removed_test_lines`
+    strip step, fence-aware (#2539/#2540): identical single-backtick-span
+    stripping outside a fenced code block, and a byte-for-byte pass-through
+    for everything inside one."""
+    parts = []
+    for is_fenced, segment in _split_out_fenced_code_blocks(pr_body):
+        parts.append(segment if is_fenced else re.sub(r"`[^`]*`", "", segment))
+    return "\n".join(parts)
+
 
 def parse_removed_test_markers(pr_body: str) -> list[Marker]:
     """Parse every `Removed-test: <id> — <reason>` line in a PR body.
@@ -314,22 +402,35 @@ def parse_removed_test_markers(pr_body: str) -> list[Marker]:
     `Removed-test:` syntax inside backticks must not be parsed as a real
     marker — an intentional marker must be written as plain text.
 
-    LIMIT (by design, not oversight): the strip is a regex over the whole
+    A fenced code block (```` ``` ```` ... ```` ``` ````) is NOT treated as
+    inline code for this strip (#2539/#2540) — its content passes through
+    untouched, via `_strip_inline_code_preserving_fences`. Without this, a
+    fence's three backticks are read as one-and-a-half single-backtick
+    spans by the naive strip (the first two pair off empty, the third
+    dangles and pairs with the *closing* fence), swallowing every marker
+    inside — measured: a real 7-marker fenced block parsed as 0. A fence is
+    the standard, correct markdown for presenting a literal multi-line
+    list, which is exactly what a `Removed-test:` block is; unlike an
+    unmatched single-backtick typo (still handled by the LIMIT below), it
+    is not a mistake to guard against.
+
+    LIMIT (by design, not oversight — narrower after #2539/#2540, not
+    removed): OUTSIDE a fence, the strip is still a regex over the whole
     body, not a markdown parser, so it has no notion of "this backtick was
-    never closed." An unmatched backtick anywhere earlier in the body pairs
-    with the next backtick that appears later in the document — even across
-    unrelated paragraphs — and everything between the two, including a
-    well-formed `Removed-test:` marker sitting in that gap, is swallowed
-    along with it. This fails SAFE: the swallowed marker never reaches the
-    marker regex, so the disappearance it would have accounted for reads as
-    unaccounted and the gate FAILS LOUDLY, rather than a real deletion
-    slipping through silently. A markdown-correct parser (one that actually
-    tracks whether a given backtick opens or closes a span) is out of scope
-    for the same reason the module docstring's other LIMIT entries are: real
-    parsing machinery this tool deliberately avoids. Practical guidance:
-    write `Removed-test:` marker lines as isolated lines, away from any
-    inline code, so an unrelated backtick typo elsewhere in the body can
-    never reach across and swallow one.
+    never closed." An unmatched backtick anywhere earlier in the
+    non-fenced text pairs with the next one that appears later — even
+    across unrelated paragraphs — and everything between the two,
+    including a well-formed `Removed-test:` marker sitting in that gap, is
+    swallowed along with it. This fails SAFE: the swallowed marker never
+    reaches the marker regex, so the disappearance it would have accounted
+    for reads as unaccounted and the gate FAILS LOUDLY, rather than a real
+    deletion slipping through silently. A markdown-correct parser (one
+    that actually tracks whether a given single backtick opens or closes a
+    span) is out of scope for the same reason the module docstring's other
+    LIMIT entries are: real parsing machinery this tool deliberately
+    avoids. Practical guidance, narrowed to what still applies: write
+    `Removed-test:` marker lines as isolated lines, away from any
+    single-backtick inline code (a fenced block is now safe).
 
     Pure. Returns a Marker even when the reason is empty after stripping —
     evaluate() is the layer that decides an empty-reason marker accounts for
@@ -338,7 +439,7 @@ def parse_removed_test_markers(pr_body: str) -> list[Marker]:
     """
     if not pr_body:
         return []
-    stripped_body = re.sub(r"`[^`]*`", "", pr_body)
+    stripped_body = _strip_inline_code_preserving_fences(pr_body)
     markers = []
     for m in _MARKER_RE.finditer(stripped_body):
         markers.append(Marker(id=m.group("id"), reason=m.group("reason").strip(), raw_line=m.group(0)))
@@ -366,13 +467,17 @@ def find_unparsed_removed_test_lines(pr_body: str) -> list[str]:
     start, parses as a marker — the same question `_MARKER_RE` answers, just
     without assuming the interesting text starts the line.
 
+    Uses the same fence-aware strip as `parse_removed_test_markers`
+    (#2539/#2540) — a marker inside a fence parses cleanly there, so it
+    correctly never reaches this warning path at all.
+
     Pure. Returns the raw (stripped) line text for each candidate that
     mentions the key but does not parse — empty list when every mention
     parses or none exists.
     """
     if not pr_body:
         return []
-    stripped_body = re.sub(r"`[^`]*`", "", pr_body)
+    stripped_body = _strip_inline_code_preserving_fences(pr_body)
     unparsed = []
     for line in stripped_body.splitlines():
         if "removed-test:" not in line.lower():
