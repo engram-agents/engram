@@ -43,6 +43,7 @@ from engram_confidence import (
     PREDICTIVE_CONFIDENCE_CAP, REASONING_CLASS, REASONING_DISCOUNT,
     ABDUCTIVE_CONFIDENCE_CAP,
 )
+from engram_core import CASCADE_RELATIONS, CITATION_SUPPORT_RELATIONS
 
 DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -198,10 +199,16 @@ def _compute_confidence_for_node(conn: sqlite3.Connection, node: dict) -> float 
 
     # Derivations and theories: confidence from premises + reasoning_type
     if ntype in ("derivation", "theory"):
-        # Get premises via derives_from edges
+        # Formula-input premises: CASCADE_RELATIONS (derives_from +
+        # acknowledged_derives_from), matching engram_core.py's own canonical
+        # recompute (#2349 blocker 2) — deliberately NOT CITATION_SUPPORT_RELATIONS,
+        # which also carries supported_by and answers a different question
+        # ("which premises were affected"), not "what does the formula read".
+        _rels = sorted(CASCADE_RELATIONS)
         premises = conn.execute(
-            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'derives_from'",
-            (node["id"],),
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation IN "
+            f"({','.join('?' for _ in _rels)})",
+            (node["id"], *_rels),
         ).fetchall()
         if not premises:
             return 0.5  # no premises found
@@ -253,11 +260,21 @@ def _compute_confidence_for_node(conn: sqlite3.Connection, node: dict) -> float 
 
 
 def _get_downstream_nodes(conn: sqlite3.Connection, node_id: str) -> list[str]:
-    """Get all nodes that depend on this node (follow edges in reverse: target→source)."""
+    """Get all nodes that depend on this node (follow edges in reverse: target→source).
+
+    Ranges over CITATION_SUPPORT_RELATIONS (derives_from, supported_by,
+    acknowledged_derives_from) — the same one-hop premise relation set
+    engram_core.py's own `_direct_premise_ids` uses, mirrored in the reverse
+    edge direction. `cites` is deliberately excluded: it is not a premise
+    relation (see CITATION_SUPPORT_RELATIONS' own comment in engram_core.py),
+    and including it walked into nodes whose confidence formula never reads
+    the changed node at all.
+    """
+    _rels = sorted(CITATION_SUPPORT_RELATIONS)
     rows = conn.execute(
         "SELECT source_id FROM edges WHERE target_id = ? AND relation IN "
-        "('derives_from', 'cites', 'supported_by')",
-        (node_id,),
+        f"({','.join('?' for _ in _rels)})",
+        (node_id, *_rels),
     ).fetchall()
     return [r["source_id"] for r in rows]
 
