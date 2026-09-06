@@ -177,16 +177,53 @@ jobs:
           # (random text rarely matches `xx_NNNN+` boundaries).
           PATTERN='\b[a-z]{2}_[0-9]{4,}\b'
 
-          # Allowlist scope rationale:
-          #   tests/, paper_draft/, active-work/, cycle/ — non-shipped surfaces
-          #     (cycle/ = self-improvement-cycle process docs — charter, chronicle,
-          #      review packages, dream-pass protocol; node IDs are load-bearing
-          #      provenance there by design, and build-plugin.sh does not bundle it)
+          # Allowlist scope rationale — the criterion is SHARED-SOURCE HYGIENE,
+          # not build-bundling: a concrete node ID is install-private (every
+          # install renumbers its own graph from scratch, per DEVELOPMENT.md
+          # "Shipped files" / issue #51), so it resolves to nothing — or to an
+          # unrelated node — for ANY reader of a shared or public repo,
+          # regardless of whether the file in question ships inside a plugin
+          # install. "Not bundled" is therefore not a reason on its own; each
+          # exclusion below needs its own positive reason — most on the
+          # hygiene axis; CHANGELOG.md and this file are excluded for the
+          # unrelated reasons noted inline below.
+          #   tests/, src/forum/tests/ — excluded for two DIFFERENT reasons,
+          #     not one, and no claim here about the split between them:
+          #     (a) some matches are synthetic fixture-payload data — an
+          #     id-shaped string passed as example input, test-scenario
+          #     data and never a citation, so nothing is offered to a
+          #     reader as resolvable provenance; (b) some matches are
+          #     genuine developer-graph citations in module docstrings
+          #     naming the migration wave or design decision that produced
+          #     the test — excluded on the SAME audience argument as the
+          #     process docs above: the reader is an agent working this
+          #     repo, not a general shared-repo reader.
+          #   paper_draft/, active-work/ — ephemeral drafting/scratch
+          #     surfaces; any node-ID text there is a working note for the
+          #     author's own session, not a citation offered to a reader.
+          #   docs/cycle/ — self-improvement-cycle process docs (charter,
+          #     chronicle, review packages, dream-pass protocol). These are
+          #     process artifacts whose whole value IS author-graph
+          #     provenance — the record of which claim drove which decision —
+          #     read by agents working the cycle who hold (or can resolve
+          #     against) the graph the docs were written from. A dangling ID
+          #     here is expected background for that audience, not a hollow
+          #     citation offered to an uninformed reader.
           #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
-          #     reference docs; concrete node IDs are load-bearing provenance
-          #     by design, and the build engine does not bundle docs/ into the
-          #     plugin — same rationale as cycle/ and the other non-shipped surfaces)
-          #   README.md — documents seed-graph IDs that ARE in every install
+          #     reference docs assembled by agents auditing the substrate
+          #     against their own graph, with observation- and derivation-
+          #     level provenance citations throughout, e.g. 03-hooks.md).
+          #     Same reasoning as cycle/: the IDs are load-bearing provenance
+          #     for a reader who holds the graph, not a citation offered to a
+          #     general shared-repo reader.
+          #   README.md — currently carries no node-ID citations (the
+          #     seed-graph example block went with the scatter installer's
+          #     retirement in a1ddd75a); excluded pre-emptively in case a
+          #     future rewrite reintroduces install-identical seed IDs,
+          #     which would be install-state reference — an ID identical
+          #     across every install — rather than developer provenance,
+          #     a different and valid non-hygiene-problem argument from the
+          #     insider-provenance one the bullets above use.
           #   CHANGELOG.md — historical record; scrub planned separately
           #   this workflow file — contains the pattern literally
           # IN scope (intentionally NOT excluded; flag if added to):

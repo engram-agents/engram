@@ -372,16 +372,23 @@ Substitution shape:
 | `ob_NNNN captured this` (provenance breadcrumb) | drop, OR "an earlier capture of this" if context demands |
 | Cross-references inside narrative docs | replace with the concept, not a graph pointer |
 
-### Enforcement (reviewer-discipline; CI temporarily disabled)
+### Enforcement (CI-backed)
 
-This rule is currently enforced by **reviewer discipline + local testing**,
-not CI. (The repo's GitHub Actions billing is paused 2026-05-30; full tests
-run locally before each PR push instead.) When CI is re-enabled, a
-diff-grep workflow on PRs to `dev`/`main` is the intended structural
-backstop; until then, the reviewer-fairy and counterpart-colleague layers
-catch new additions. The 2026-05-30 scrub wave (issue #51, ten incremental
-PRs) cleared the alpha-released-scope corpus; new PRs should not introduce
-new concrete IDs in shipped files.
+This rule is enforced by CI: the **`no-new-shipped-node-ids`** step (step 2)
+of `.github/workflows/pr-checks.yml`, which runs on every `pull_request`
+event (opened/reopened/synchronize/edited, with no base-branch filter — it
+fires on PRs targeting `dev`, `main`, or any stacked intermediate branch).
+The step diffs the PR against its base branch, excludes the allowlisted
+non-citation surfaces (test fixtures, scratch/drafting dirs, and the process
+docs where node IDs are load-bearing author-graph provenance — see the
+allowlist-rationale comment in the workflow for the per-path reasoning), and
+hard-fails the job if any added line introduces a new concrete node ID
+outside that allowlist. Reviewer discipline and local testing remain useful
+as a pre-push check, but the mechanical gate is what actually blocks a PR
+from merging — it is live, not merely intended. The 2026-05-30 scrub wave
+(issue #51, ten incremental PRs) cleared the alpha-released-scope corpus
+before the gate shipped; new PRs should not introduce new concrete IDs in
+shipped files.
 
 To check your own PR locally before pushing:
 
