@@ -1941,6 +1941,147 @@ def test_guard_rejects_sha_that_resolves_only_in_data_repo(tmp_path, capsys, mon
 
 
 # ---------------------------------------------------------------------------
+# 30b. #2620 -- _guard_engine_build(code_repo=None) and the three call sites
+# that must pass it through rather than falling back to _default_repo_dir()
+# ---------------------------------------------------------------------------
+
+
+def test_guard_engine_build_accepts_none_code_repo_and_skips_check(tmp_path, capsys):
+    """Unit-level: with code_repo=None the collision check is skipped
+    entirely (nothing to compare against) and build is returned UNCHANGED
+    -- but with a stderr line naming the sha and the data repo, so
+    "skipped, unverified" is distinguishable from "verified", the
+    loud-not-silent contract #2620 asks for. Also a can-it-fail control on
+    the guard's own signature: against the pre-#2620 signature (code_repo
+    typed as str | Path, with no None branch), this call would fall
+    through to `_commit_exists(None, build)`, whose `subprocess.run(...,
+    cwd=str(None))` -- the literal string "None" -- is not a directory and
+    raises. This test fails loudly under that code, not just semantically."""
+    data_repo = tmp_path / "data-repo"
+    _init_repo(data_repo)
+    data_sha = _commit_knowledge(data_repo, "k1")
+
+    result = series._guard_engine_build(data_sha, data_repo=data_repo, code_repo=None)
+    assert result == data_sha  # unchanged -- unverified, not silently dropped either
+    captured = capsys.readouterr()
+    assert data_sha in captured.err
+    assert str(data_repo) in captured.err
+    assert "skipping the collision check" in captured.err
+
+
+def test_ingest_call_site_no_longer_falls_back_to_default_repo_dir_for_code_repo(
+    tmp_path, monkeypatch
+):
+    """Call-site wiring, not the guard's own logic (that's the test above):
+    when _find_code_repo_toplevel can't resolve a code checkout (returns
+    None, e.g. a deployed plugin tree), ingest() must pass code_repo=None
+    straight through to _guard_engine_build -- NOT fall back to
+    _default_repo_dir(), which would hand the guard the data repo itself
+    (or a directory inside its own work tree) and silently disarm the
+    #2600 collision check on the exact input it exists to catch. Spies on
+    _guard_engine_build to capture what code_repo it actually receives,
+    rather than inferring it from ingest()'s return value -- the guard's
+    own return value is 'build unchanged' whether code_repo is None
+    (skip-and-warn) or wrongly falls back to a same-repo path
+    (silently-passes), so the wiring bug is invisible from the return
+    value alone; this is the CALL SITE'S bug, not the guard's."""
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    db_path = tmp_path / "series.db"
+
+    monkeypatch.setattr(series, "_find_code_repo_toplevel", lambda start_dir: None)
+
+    captured_kwargs = {}
+    real_guard = series._guard_engine_build
+
+    def _spy_guard(build, *, data_repo, code_repo):
+        captured_kwargs["code_repo"] = code_repo
+        return real_guard(build, data_repo=data_repo, code_repo=code_repo)
+
+    monkeypatch.setattr(series, "_guard_engine_build", _spy_guard)
+
+    series.ingest(snapshots_dir, repo_dir, db_path)
+
+    assert "code_repo" in captured_kwargs, "the guard was never called"
+    assert captured_kwargs["code_repo"] is None, (
+        "ingest() fell back to a non-None code_repo (e.g. _default_repo_dir()) "
+        "when the discriminated resolver returned None -- this silently "
+        "disarms the #2600 collision guard on a deployed tree (#2620)"
+    )
+
+
+def test_backfill_call_site_no_longer_falls_back_to_default_repo_dir_for_code_repo(
+    tmp_path, monkeypatch
+):
+    """Sibling of the ingest test above, same wiring bug at backfill()'s
+    own _guard_engine_build call site."""
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    # backfill() calls knowledge_commits(repo_dir) internally, which shells
+    # out to `git log` -- a repo with literally zero commits exits non-zero
+    # ("does not have any commits yet"), unrelated to this test's concern.
+    # Content must be executable SQL (backfill replays it via
+    # conn.executescript) -- empty is the simplest valid script.
+    _commit_knowledge(repo_dir, "")
+    db_path = tmp_path / "series.db"
+
+    monkeypatch.setattr(series, "_find_code_repo_toplevel", lambda start_dir: None)
+
+    captured_kwargs = {}
+    real_guard = series._guard_engine_build
+
+    def _spy_guard(build, *, data_repo, code_repo):
+        captured_kwargs["code_repo"] = code_repo
+        return real_guard(build, data_repo=data_repo, code_repo=code_repo)
+
+    monkeypatch.setattr(series, "_guard_engine_build", _spy_guard)
+
+    series.backfill(repo_dir, db_path)
+
+    assert "code_repo" in captured_kwargs, "the guard was never called"
+    assert captured_kwargs["code_repo"] is None, (
+        "backfill() fell back to a non-None code_repo when the discriminated "
+        "resolver returned None -- this silently disarms the #2600 collision "
+        "guard on a deployed tree (#2620)"
+    )
+
+
+def test_verify_call_site_no_longer_falls_back_to_default_repo_dir_for_code_repo(
+    tmp_path, monkeypatch
+):
+    """Sibling of the ingest test above, same wiring bug at verify()'s own
+    _guard_engine_build call site."""
+    monkeypatch.delenv("ENGRAM_ENGINE_BUILD", raising=False)
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    db_path = tmp_path / "series.db"
+
+    monkeypatch.setattr(series, "_find_code_repo_toplevel", lambda start_dir: None)
+
+    captured_kwargs = {}
+    real_guard = series._guard_engine_build
+
+    def _spy_guard(build, *, data_repo, code_repo):
+        captured_kwargs["code_repo"] = code_repo
+        return real_guard(build, data_repo=data_repo, code_repo=code_repo)
+
+    monkeypatch.setattr(series, "_guard_engine_build", _spy_guard)
+
+    series.verify(repo_dir, db_path)
+
+    assert "code_repo" in captured_kwargs, "the guard was never called"
+    assert captured_kwargs["code_repo"] is None, (
+        "verify() fell back to a non-None code_repo when the discriminated "
+        "resolver returned None -- this silently disarms the #2600 collision "
+        "guard on a deployed tree (#2620)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 31. status reports engine_build resolvability against the code repo
 # ---------------------------------------------------------------------------
 

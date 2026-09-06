@@ -824,7 +824,7 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 def _guard_engine_build(
-    build: str, data_repo: str | Path, code_repo: str | Path
+    build: str, data_repo: str | Path, code_repo: str | Path | None
 ) -> str:
     """Loud-not-fatal collision guard (#2600): if ``build`` LOOKS like a git
     sha (7-to-40-char lowercase hex) and resolves as a commit in
@@ -836,11 +836,40 @@ def _guard_engine_build(
     also resolves in ``data_repo``; or a sha that resolves in neither) is
     returned UNCHANGED. This is a narrow collision check for the one
     ambiguous case, NOT a general validator of ``build`` -- it does not
-    confirm ``build`` is otherwise well-formed or meaningful."""
+    confirm ``build`` is otherwise well-formed or meaningful.
+
+    ``code_repo=None`` (#2620): callers pass this when
+    ``_find_code_repo_toplevel`` could not resolve a code checkout --
+    notably a deployed plugin tree, where that resolver correctly returns
+    ``None`` because the tree it walked up from is the DATA repo, not a
+    code checkout. Callers MUST NOT fall back to an undiscriminated
+    resolver (e.g. ``_default_repo_dir()``) in this case: doing so hands
+    this function the data repo itself as ``code_repo``, so
+    ``_commit_exists(data_repo, build)`` and ``_commit_exists(code_repo,
+    build)`` become the same query against the same repository -- the
+    second is ``True`` whenever the first is, and the guard can never
+    fire on the exact input it exists to catch (a real #2600 collision,
+    caught silently reintroduced in the guard meant to catch it). With
+    ``code_repo=None`` the collision check is skipped outright (there is
+    nothing to compare against) and ``build`` is returned UNCHANGED, with
+    one stderr line noting the check was skipped -- loud about the
+    degraded state, rather than silently comparing a repo against
+    itself."""
     if not _SHA_RE.match(build):
         return build
 
     if not _commit_exists(data_repo, build):
+        return build
+
+    if code_repo is None:
+        print(
+            f"health.series: engine_build {build!r} looks like a sha and "
+            f"resolves as a commit in the data repo ({data_repo}), but no "
+            "code repo could be resolved to check it against -- skipping "
+            f"the collision check and recording {build!r} unverified "
+            "(see #2600, #2620).",
+            file=sys.stderr,
+        )
         return build
 
     if _commit_exists(code_repo, build):
@@ -1057,8 +1086,12 @@ def ingest(
             build = _guard_engine_build(
                 build,
                 data_repo=repo_dir,
-                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
-                or _default_repo_dir(),
+                # #2620: no fallback to _default_repo_dir() -- a None here
+                # means we're in a deployed (data-repo) tree, and falling
+                # back to the undiscriminated resolver would hand the
+                # guard the data repo as code_repo, disarming it on the
+                # exact input it exists to catch. None propagates.
+                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent),
             )
 
         files = snapshot_files(snapshots_dir)
@@ -2452,8 +2485,12 @@ def backfill(
             build = _guard_engine_build(
                 build,
                 data_repo=repo_dir,
-                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
-                or _default_repo_dir(),
+                # #2620: no fallback to _default_repo_dir() -- a None here
+                # means we're in a deployed (data-repo) tree, and falling
+                # back to the undiscriminated resolver would hand the
+                # guard the data repo as code_repo, disarming it on the
+                # exact input it exists to catch. None propagates.
+                code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent),
             )
         current_hash = _replay_decl_hash_for(registry)
 
@@ -2636,8 +2673,12 @@ def verify(
         build = _guard_engine_build(
             build,
             data_repo=repo_dir,
-            code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent)
-            or _default_repo_dir(),
+            # #2620: no fallback to _default_repo_dir() -- a None here
+            # means we're in a deployed (data-repo) tree, and falling back
+            # to the undiscriminated resolver would hand the guard the
+            # data repo as code_repo, disarming it on the exact input it
+            # exists to catch. None propagates.
+            code_repo=_find_code_repo_toplevel(Path(__file__).resolve().parent),
         )
 
         stored_rows = conn.execute(
