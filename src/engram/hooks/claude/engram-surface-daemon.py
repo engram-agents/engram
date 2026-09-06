@@ -120,8 +120,26 @@ def _indexer_loop(interval_s: int, shutdown_event: threading.Event) -> None:
 
 
 def _resolve_engram_home() -> str:
-    """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    return (
+    """Per-install data dir: knowledge.db, sockets, briefing, history.
+
+    Always returns an ABSOLUTE path (gh#2695): a relative ENGRAM_HOME would
+    make this process bind its AF_UNIX socket with a relative path string,
+    so /proc/net/unix records the bind exactly as passed to bind() --
+    relative text. start-engram-daemon.sh's unit-2 ownership guard
+    (#2652 phase-0) always compares against its own absolute $SOCKET_PATH
+    (built from whatever ENGRAM_HOME the HOOK resolved, which may differ in
+    absolute-vs-relative form and cwd from this process), so a relative
+    bind means the guard's path-text match finds zero rows, the guard
+    concludes "no live holder", and fails OPEN -- allowing exactly the
+    delete it exists to prevent. abspath() (not realpath()) is used
+    deliberately: it makes the path absolute relative to cwd without
+    resolving symlinks, which matches the existing expanduser-only
+    behavior for the already-absolute common case (an intermediate
+    symlinked ENGRAM_HOME component would keep resolving the same way it
+    always has -- realpath would be a second, unrelated behavior change
+    bundled into this fix).
+    """
+    return os.path.abspath(
         os.environ.get("ENGRAM_HOME")
         or os.path.expanduser("~/.engram")
     )
