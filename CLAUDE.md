@@ -964,6 +964,24 @@ body. Don't rely on a "wrap-up PR I'll file later" — that PR rarely materializ
 (empirical: 7 of 11 stale-but-addressed candidates in the 2026-05-28 backlog
 scan followed this pattern, leaving their parent issues open indefinitely).
 
+**A `[part of #N]` PR deliberately never auto-closes #N — which means the
+epic body is the one artifact in this whole pipeline that nothing points at**:
+not the auto-close parser, not CI, not a review gate (#2617, 2026-09-06).
+Two epics were found reading as open to-do lists in one sweep, after every
+one of their workstreams had already shipped — work units got assigned off
+the stale body before anyone checked the actual PR history. The convention,
+adopted from that incident: **a `[part of #N]` PR ticks its own workstream
+line in the epic body (checkbox, or a `— landed as #M (sha)` suffix) as part
+of merging** — the same shape as "a fairy round that isn't transcribed to the
+PR didn't happen": a workstream that isn't ticked stays an imperative, no
+matter how done the work actually is. **The knowledge of which workstream
+line a given PR corresponds to sits with the PR's own author, not with
+whoever merges it** — so the author names that line in the PR's own body
+(e.g. "ticks #N's `WS3` line"), and the merge seat ticks the line the PR
+itself named rather than reverse-engineering it from the epic. This is
+discipline, not a mechanical gate (tracked as a follow-up only if the
+convention gets walked past).
+
 **For partial work that addresses but doesn't fully close:** omit the closing
 tag from both title AND body. Comment on the issue describing what landed and
 what remains, so the scope is durable.
