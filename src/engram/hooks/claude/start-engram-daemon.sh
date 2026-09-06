@@ -21,7 +21,7 @@ try:
     s.connect('$SOCKET_PATH')
     s.close()
     sys.exit(0)
-except:
+except Exception:
     sys.exit(1)
 " 2>/dev/null; then
             # Daemon is alive and socket works
