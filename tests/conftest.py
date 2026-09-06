@@ -116,7 +116,26 @@ def _sys_path_collision_guard():
     ModuleNotFoundError surfacing three files later -- but for the
     import-time case that credit belongs to `pytest_collectstart`, per
     the attribution above; this fixture's own share of that credit is
-    the run-phase case only."""
+    the run-phase case only.
+
+    Checked in, not just asserted: the run-phase claim above is a
+    falsifiable property, and
+    tests/test_sys_path_collision_guard_2565.py::test_run_phase_collision_is_caught_by_the_fixture_not_collectstart
+    is the regression test that verifies it (Borges's colleague-review
+    finding on PR #2665: he confirmed it live before approving, but the
+    docstring stated it as fact with nothing in the suite checking it --
+    a hedge that did not survive compression into code).
+
+    Unlike `pytest_collectstart` below, this fixture lets
+    `_assert_tools_package_is_repo_root`'s RuntimeError propagate raw
+    rather than converting it to `pytest.exit()` -- deliberately, not an
+    oversight: a fixture failure is scoped and attributable per-module
+    (pytest reports it as a clean "ERROR at setup of <test>", not a
+    crash), unlike `pytest_collectstart`, which pytest calls with no
+    surrounding try/except and would turn a bare raise into an
+    INTERNALERROR (see that hook's own docstring for the confirmed
+    incident). Same underlying error, two different call-sites, two
+    different safe handling strategies -- not an inconsistency."""
     _assert_tools_package_is_repo_root()
     yield
 

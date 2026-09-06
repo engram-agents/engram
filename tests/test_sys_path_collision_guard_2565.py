@@ -123,20 +123,22 @@ _GUARD_CONFTEST = textwrap.dedent(
 )
 
 
-def _build_scratch_repo(root: Path, *, poison_first_module: bool) -> None:
-    """Layout, mirroring this repo's own shape:
+def _build_base_layout(root: Path) -> Path:
+    """Shared scaffolding both scratch-repo builders below need, mirroring
+    this repo's own shape:
 
         root/tools/__init__.py, root/tools/marker.py   -- the "real" package
         root/decoy/tools/__init__.py                    -- same-named decoy,
                                                              no marker.py
         root/tests/conftest.py                          -- carries the guard
-        root/tests/test_a.py, root/tests/test_b.py      -- the two modules
 
-    test_a.py optionally pollutes sys.path with `root/decoy` ahead of
-    everything (mimicking a test file that inserts the wrong directory,
-    per #2063/#2564's actual shape); test_b.py always needs the real
-    `tools.marker` to pass, mirroring test_engine_phase3.py's role as the
-    LATER, unrelated victim of an earlier file's mistake."""
+    Returns the created `tests/` dir; each caller writes its own
+    test_a.py/test_b.py content into it (deliberately not built here --
+    that content is what differs between the import-time and run-phase
+    repros, and is each builder's own reason to exist). Factored out per
+    reviewer-fairy round 1 on PR #2668: this scaffolding was duplicated
+    verbatim between the two builders, a maintenance hazard for any future
+    third scratch-repo shape."""
     (root / "tools").mkdir(parents=True)
     (root / "tools" / "__init__.py").write_text("")
     (root / "tools" / "marker.py").write_text("VALUE = 'real'\n")
@@ -149,6 +151,16 @@ def _build_scratch_repo(root: Path, *, poison_first_module: bool) -> None:
     tests_dir = root / "tests"
     tests_dir.mkdir()
     (tests_dir / "conftest.py").write_text(_GUARD_CONFTEST)
+    return tests_dir
+
+
+def _build_scratch_repo(root: Path, *, poison_first_module: bool) -> None:
+    """test_a.py optionally pollutes sys.path with `root/decoy` ahead of
+    everything AT MODULE TOP LEVEL (mimicking a test file that inserts the
+    wrong directory, per #2063/#2564's actual shape); test_b.py always
+    needs the real `tools.marker` to pass, mirroring test_engine_phase3.py's
+    role as the LATER, unrelated victim of an earlier file's mistake."""
+    tests_dir = _build_base_layout(root)
 
     poison_line = (
         "sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname("
@@ -162,6 +174,34 @@ def _build_scratch_repo(root: Path, *, poison_first_module: bool) -> None:
     (tests_dir / "test_b.py").write_text(
         "import tools.marker\n\n\ndef test_b():\n    assert tools.marker.VALUE == 'real'\n"
     )
+
+
+def _build_scratch_repo_run_phase_poison(root: Path) -> None:
+    """Same base layout as _build_scratch_repo, but the poison happens
+    INSIDE test_a's own test FUNCTION body -- during test EXECUTION, after
+    collection (and every module's own pytest_collectstart call) has
+    already finished clean -- rather than at test_a's module top level.
+    test_b.py is deliberately bare (`assert True`, no `import tools...` of
+    its own) so the guard's PROACTIVE sys.path-scan branch is what fires
+    (see _assert_tools_package_is_repo_root's docstring: it does not
+    require `tools` to already be imported), matching Borges's own
+    colleague-review repro on PR #2665 exactly -- his victim was a bare
+    `assert True`, not a tools.marker importer. A victim that itself
+    imports tools.marker at module level would import it correctly during
+    COLLECTION (before the run-phase poison fires) and get cached, which
+    would defeat this repro by construction: the fixture's `already
+    cached, trust that` branch would short-circuit before ever reaching
+    the sys.path scan the poison is meant to trip."""
+    tests_dir = _build_base_layout(root)
+
+    (tests_dir / "test_a.py").write_text(
+        "import os\nimport sys\n\n\n"
+        "def test_a_poisons_at_run_time():\n"
+        "    sys.path.insert(0, os.path.join(os.path.dirname(os.path."
+        "dirname(os.path.abspath(__file__))), 'decoy'))\n"
+        "    assert True\n"
+    )
+    (tests_dir / "test_b.py").write_text("def test_b():\n    assert True\n")
 
 
 def _run_pytest(root: Path) -> subprocess.CompletedProcess:
@@ -218,6 +258,60 @@ def test_guard_fires_loudly_on_a_genuine_collision(tmp_path: Path):
     assert "sys.path collision (#2565)" in combined, (
         f"expected the guard's own attributable message naming the "
         f"collision, got:\n{combined}"
+    )
+
+
+def test_run_phase_collision_is_caught_by_the_fixture_not_collectstart(tmp_path: Path):
+    """Colleague-review finding on PR #2665 (Borges): the fixture's own
+    docstring asserts a falsifiable property -- that IT, not
+    pytest_collectstart, is what catches a run-phase collision (one a
+    test body introduces during its own execution, after collection has
+    already finished clean). Borges confirmed this live with an ad-hoc,
+    not-checked-in poison before approving, and flagged the gap himself:
+    the docstring states the property as fact with nothing in the suite
+    that verifies it. This test is that check, checked in.
+
+    Discriminator vs. the import-time control above
+    (test_guard_fires_loudly_on_a_genuine_collision): an import-time
+    collision is caught by pytest_collectstart's pytest.exit(), which
+    aborts the ENTIRE SESSION during collection, before any test body
+    ever runs -- that control asserts '2 passed' NOT in the output for
+    exactly this reason. A run-phase collision cannot be caught that
+    early (collection already finished clean before the poison fires),
+    so test_a's own test function genuinely PASSES, and only test_b's
+    autouse fixture -- a per-module setup ERROR, not a session-wide
+    exit -- catches it. '1 passed, 1 error' (empirically confirmed, not
+    assumed) is the positive signature that this exercised the
+    fixture's path, not collectstart's."""
+    _build_scratch_repo_run_phase_poison(tmp_path)
+    proc = _run_pytest(tmp_path)
+    combined = proc.stdout + proc.stderr
+    assert "INTERNALERROR" not in combined, (
+        f"the guard crashed pytest's own machinery instead of producing "
+        f"a clean, attributable failure:\n{combined}"
+    )
+    assert "sys.path collision (#2565)" in combined, (
+        f"expected the guard's own attributable message naming the "
+        f"collision, got:\n{combined}"
+    )
+    # Positive control: test_a's own test function must have genuinely
+    # run and passed BEFORE its run-phase poison could take effect. If
+    # this is missing, the session likely aborted during collection (the
+    # import-time / collectstart path, already covered above) instead of
+    # reaching the run-phase / fixture path this test targets.
+    assert "1 passed" in combined, (
+        f"expected test_a's own test function to have genuinely run and "
+        f"passed before its run-phase poison took effect -- got:\n{combined}"
+    )
+    # Negative control matching the discriminator above: pytest.exit()
+    # produces a distinct "Interrupted"/session-abort shape, never
+    # "1 passed, 1 error". Seeing it here would mean this scratch repo
+    # accidentally reproduced the OTHER, already-covered code path
+    # instead of the run-phase one this test exists to check.
+    assert "Interrupted" not in combined, (
+        f"expected a per-module fixture ERROR, not pytest.exit()'s "
+        f"whole-session abort -- got what looks like a session-wide "
+        f"interrupt instead:\n{combined}"
     )
 
 
