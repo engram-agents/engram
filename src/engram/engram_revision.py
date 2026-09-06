@@ -18,12 +18,13 @@ and its callee chain live in core and are consumed by ``_resolve_impl`` here via
 ``core._create_derivation``.  ``_count_live_exemplars`` is in core (wave 3) and
 consumed by ``_detect_zero_support`` here via ``core._count_live_exemplars``.
 
-Caller dependency for ``_retract_impl`` replacement path:
-  ``_retract_impl`` accepts an optional ``_obs_creator`` callable (default None).
-  server.py passes ``_add_observation_impl`` when constructing the retraction
-  call, keeping the acyclic family → core dependency intact (family modules must
-  not import server.py).  When ``_obs_creator`` is None the replacement step is
-  skipped — same behaviour as if ``replacement_json`` were absent.
+``_retract_impl`` replacement path is purely relational, like
+``_supersede_impl``: it accepts ``replacement_id``, naming a node the caller
+already created via that node's own canonical creation tool
+(``engram_add_observation`` for observations). ``_retract_impl`` never mints a
+node itself — no callable injection across the module boundary is needed for
+this (#2612 retired the earlier mint-inside-retraction path, which took this
+role via an injected creator callable).
 
 House rules (wave pattern):
   - Shared state ONLY via ``import engram_core as core`` + call-time ``core.X``.
@@ -2294,7 +2295,10 @@ def _supersede_impl(
                     "Either compose a replacement that does not cite anything "
                     "downstream of the superseded node, or — if the downstream "
                     "claim really is the successor — retract the old node "
-                    "instead and let the newer claim stand on its own."
+                    "WITHOUT naming this node as replacement_id (a retract "
+                    "naming the same downstream node is refused by the "
+                    "equivalent guard on that path) and let the newer claim "
+                    "stand on its own / be cited organically."
                 ),
             })
         if new["supersedes"] is not None:
@@ -2581,12 +2585,11 @@ def _retract_impl(
     node_id: str = "",
     error_type: str = "",
     reason: str = "",
-    replacement_json: str = "",
+    replacement_id: str = "",
     initiation: str = "",
     initiation_gate: str = "",
     initiation_ref: str = "",
     cascade_triggering: bool = True,
-    _obs_creator=None,
 ) -> str:
     """Internal implementation — see engram_retract MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -2622,7 +2625,7 @@ def _retract_impl(
         the retracted side was never valid, so the contradiction itself
         may need to be closed (since one of its claims is now invalid)
         or rewired to a corrected replacement observation if one was
-        created via the replacement_json path.
+        named via replacement_id.
       - Resolution reopening: if the retracted node was a resolution
         (had outgoing resolves edges), each target without another
         valid resolution is set back to status='open'.
@@ -2660,9 +2663,15 @@ def _retract_impl(
         error_type: One of: fabricated_quote, wrong_citation, wrong_evidence,
             hallucinated_claim, duplicate, other.
         reason: Human-readable explanation of the error.
-        replacement_json: Optional JSON object with fields for creating a correct
-            replacement observation: {"quoted_text", "interpretation", "claim",
-            "quote_type", "source_class"}. The replacement cites the same evidence.
+        replacement_id: The replacement node's id, already created via its
+            type's canonical creation tool (engram_add_observation, for
+            observations) BEFORE calling engram_retract — a purely relational
+            operation, it does NOT create a new node (matches
+            _supersede_impl's new_node_id convention). Must name a node that
+            exists, is_current=1, differs from node_id, and is not older than
+            node_id (the retracts edge it lands on is temporal_causal=True).
+            Does not check that the replacement is claim-bearing — deferred,
+            see #2613.
         initiation (str, optional): Who initiated this retraction. One of:
             user_prompted — triggered by explicit user request;
             gate_prompted — triggered by an internal gate (see initiation_gate);
@@ -2674,11 +2683,6 @@ def _retract_impl(
             captured by the server wrapper; not a user-supplied field).
             Allows contingent-verification of the initiation tier while the
             session transcript lives.
-        _obs_creator: Optional callable matching the _add_observation_impl
-            signature — injected by the server.py wrapper so this module
-            does not need to import server.py (acyclic dependency rule).
-            When None, the replacement step is skipped even if replacement_json
-            is provided.
 
     Returns:
         JSON with retraction details, tainted downstream nodes, and optional replacement.
@@ -2814,6 +2818,70 @@ def _retract_impl(
                     "then": f"engram_cascade_resolve(node_id={node_id!r}, "
                             f"resolution_kind='retracted', "
                             f"error_type={error_type!r})",
+                })
+
+        # #2612: validate replacement_id up front, before any mutation — a
+        # purely relational reference to a node the caller already created,
+        # mirroring _supersede_impl's equivalent checks on new_node_id.
+        if replacement_id:
+            _repl_node = conn.execute(
+                "SELECT id, is_current, created_at FROM nodes WHERE id = ?",
+                (replacement_id,),
+            ).fetchone()
+            if not _repl_node:
+                return json.dumps({
+                    "error": f"replacement_id '{replacement_id}' not found. "
+                             f"Create the replacement node via its type's canonical "
+                             f"creation tool (engram_add_observation, engram_derive, "
+                             f"engram_add_axiom, engram_add_definition, engram_add_goal, "
+                             f"engram_add_conjecture, engram_add_cornerstone, …) BEFORE "
+                             f"calling engram_retract.",
+                })
+            if _repl_node["is_current"] != 1:
+                return json.dumps({
+                    "error": f"replacement_id '{replacement_id}' is not current "
+                             f"(already superseded or retracted). Cannot use it as a "
+                             f"replacement.",
+                })
+            if replacement_id == node_id:
+                return json.dumps({"error": "node_id and replacement_id must differ."})
+            # core._now() is datetime.now(timezone.utc).isoformat(), uniformly
+            # offset-aware, so plain string comparison here is sound — the
+            # hazard is a future format change, not the comparison itself.
+            if _repl_node["created_at"] < node["created_at"]:
+                return json.dumps({
+                    "error": f"replacement_id '{replacement_id}' was created at "
+                             f"{_repl_node['created_at']}, before node_id '{node_id}' "
+                             f"created at {node['created_at']}. The 'retracts' relation "
+                             f"is temporal_causal — the replacement must be at least as "
+                             f"new as the node it replaces.",
+                })
+            # §12.3 GUARDRAIL, ported from _supersede_impl (see that guard's
+            # comment for the full cycle-closing argument) — the replacement
+            # must not be DOWNSTREAM of the node being retracted. Naming a
+            # pre-existing node as replacement_id (post-#2612) makes this
+            # reachable in a way inline-minting never was: an inline-minted
+            # node had no derives_from edges yet, so it could never be
+            # downstream of anything. A pre-existing node can be.
+            if _cascade_reaches(conn, node_id, replacement_id):
+                return json.dumps({
+                    "error": f"Cycle guard: '{replacement_id}' transitively derives "
+                             f"from '{node_id}', so it cannot replace it. Retracting "
+                             f"a node with one of its own descendants named as "
+                             f"replacement would make the replacement stale by the "
+                             f"act that installs it, and it is the one shape that "
+                             f"lets an acknowledgement close a cascade cycle.",
+                    "guard": "retract_replacement_is_downstream",
+                    "node_id": node_id,
+                    "replacement_id": replacement_id,
+                    "guidance": (
+                        "The replacement must not rest on the node it retracts. "
+                        "Either name a replacement_id that does not cite anything "
+                        "downstream of the retracted node, or — if the downstream "
+                        "claim really is the correction — retract this node "
+                        "WITHOUT a replacement_id and let the newer claim stand "
+                        "on its own / be cited organically."
+                    ),
                 })
 
         now = core._now()
@@ -3148,56 +3216,22 @@ def _retract_impl(
             core._log_edit(conn, "reopened", rt["id"], rt["type"],
                       {"reason": f"resolution {node_id} retracted"})
 
-        # Commit retraction and taint before creating replacement
-        # (engram_add_observation opens its own connection, so we must release ours)
-        conn.commit()
-        conn.close()
-        conn = None
-
-        # 3. Optionally create replacement node
-        replacement_id = None
-        ev_id = node["evidence_id"]
-        if replacement_json and ev_id and _obs_creator is None:
-            # Loud skip: a direct caller (not via server.py's compat forwarder,
-            # which always wires _obs_creator) asked for a replacement that
-            # cannot be created. Surfacing the skip prevents a silent
-            # replacement-drop on the cascade path — the retract itself
-            # succeeded, but the caller must know the replacement did not.
-            result_replacement_skipped = True
-        else:
-            result_replacement_skipped = False
-        if replacement_json and ev_id and _obs_creator is not None:
+        # 3. Optionally record the replacement edge — purely relational
+        # (#2612: the replacement node itself was already created by the
+        # caller via its own canonical creation tool, and validated above).
+        # Written on the same connection, in the retraction's own
+        # transaction, so "retraction done, replacement edge missing" is not
+        # a reachable partial state.
+        if replacement_id:
             try:
-                repl = json.loads(replacement_json)
-            except json.JSONDecodeError as e:
-                return json.dumps({
-                    "error": f"Invalid replacement_json: {e}",
-                    "retraction": "completed",
-                    "node_id": node_id,
-                })
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'retracts', ?)",
+                    (replacement_id, node_id, now),
+                )
+            except sqlite3.IntegrityError:
+                pass
 
-            repl_result = json.loads(_obs_creator(
-                evidence_id=ev_id,
-                quoted_text=repl.get("quoted_text", ""),
-                interpretation=repl.get("interpretation", ""),
-                claim=repl.get("claim", ""),
-                quote_type=repl.get("quote_type", node["quote_type"] or "hard_data"),
-                source_class=repl.get("source_class", "introspective"),
-            ))
-            if repl_result.get("status") == "created":
-                replacement_id = repl_result["observation_id"]
-                # Add retracts edge in a new connection
-                conn2 = core._get_db()
-                try:
-                    conn2.execute(
-                        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'retracts', ?)",
-                        (replacement_id, node_id, now),
-                    )
-                    conn2.commit()
-                except sqlite3.IntegrityError:
-                    pass
-                finally:
-                    conn2.close()
+        conn.commit()
 
         result = {
             "status": "retracted",
@@ -3234,8 +3268,6 @@ def _retract_impl(
             result["retracted_predictions_count"] = len(retracted_predictions)
         if replacement_id:
             result["replacement_id"] = replacement_id
-        if result_replacement_skipped:
-            result["replacement_skipped"] = True
         if _self_anchor_retracted:
             result["warning"] = (
                 "Retracted node was the agent's self-anchor (is_self=True). "
@@ -3254,11 +3286,10 @@ def _retract_impl(
                 "target_id": node_id,
                 "action_type": "retract",
                 "result_status": "retracted",
-                "result_node_id": replacement_id,
+                "result_node_id": replacement_id or None,
             },
         )
 
         return json.dumps(result)
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()

@@ -756,9 +756,11 @@ EDGE_CLASSIFICATIONS = {
                                 # wrong node, not a dependency on it — its source exists BECAUSE
                                 # the target was found wrong. The retract-with-replacement path in
                                 # `_retract_impl` (engram_revision.py) inserts
-                                # `replacement —retracts→ retracted_node`; walking this relation
-                                # would make a retract cascade's first taint target the
-                                # replacement that same retract just created.
+                                # `replacement —retracts→ retracted_node` (#2612: the replacement
+                                # node itself is created by the caller beforehand, via its own
+                                # canonical creation tool — _retract_impl only inserts the edge);
+                                # walking this relation would make a retract cascade's first
+                                # taint target the very node that is correcting it.
         "temporal_causal": True,
         "dag": True,
         "removable": False,

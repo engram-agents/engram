@@ -61,13 +61,6 @@ Importing this module as a bare name would shadow them at delegation time.
 Caller (server.py) uses the alias form::
 
     import engram_observation as _observation_mod
-
-_obs_creator wiring (#918 predicted, wave 9 delivers):
-  server.py's wave-6 compat forwarder for _retract_impl injects
-  ``_obs_creator=_add_observation_impl``.  Before wave 9 that referenced the
-  server-resident name (now a compat forwarder itself).  After wave 9 the
-  wiring is updated to point at the module source of truth:
-  ``_obs_creator=_observation_mod._add_observation_impl``.
 """
 
 from __future__ import annotations

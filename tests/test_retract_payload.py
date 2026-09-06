@@ -9,11 +9,14 @@ Coverage:
   6. Retract deletes resolves edges (issue #211, Option A).
   7. Self-anchor retract warning (issue #1200).
   8. Initiation provenance fields (issue #1099 C1).
-
-Note on terminology: the OUTER param is `payload_json` (wave 2 wrapper);
-there is also an INNER `replacement_json` field inside the payload (the
-optional replacement-observation JSON for retract semantics). They are
-two distinct JSON-string fields.
+  9. replacement_id — purely relational (#2612): the replacement node is
+     created by the caller via its own canonical creation tool BEFORE
+     calling engram_retract, then named by id. Covers the four up-front
+     validations (missing / non-current / self-reference / older-than-target
+     — the last because the retracts edge is temporal_causal=True), the
+     retracts edge landing in the retraction's own transaction, and the
+     targeted migration error for a payload still carrying the retired
+     replacement_json field.
 """
 
 import atexit
@@ -71,24 +74,60 @@ def test_payload_json_retracts_node():
     assert r.get("retracted_id") == ob_id or r.get("node_id") == ob_id, r
 
 
-def test_payload_json_with_inner_replacement_json():
-    """Outer payload_json contains an inner replacement_json string field."""
+def test_payload_json_with_replacement_id():
+    """replacement_id names a node the caller already created (purely relational)."""
     server = fresh_server()
     ob_id = _seed_observation(server)
-    inner_replacement = json.dumps({
-        "quoted_text": "Corrected quote.",
-        "interpretation": "Corrected interp.",
-        "claim": "Corrected claim.",
-        "quote_type": "attributed_analysis",
-    })
+    repl_id = _seed_observation(server)
     payload = {
         "node_id": ob_id,
         "error_type": "wrong_citation",
         "reason": "Original cited the wrong passage.",
-        "replacement_json": inner_replacement,
+        "replacement_id": repl_id,
     }
     r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
     assert "error" not in r, r
+    assert r.get("replacement_id") == repl_id, r
+
+
+def test_payload_json_replacement_json_migration_error():
+    """A payload still carrying the retired replacement_json gets a targeted
+    migration error, not the generic unknown-field rejection."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_json": json.dumps({"claim": "irrelevant"}),
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "replacement_json" in r["error"], r
+    assert "replacement_id" in r["error"], r
+    assert "Unknown fields" not in r["error"], r
+
+
+def test_payload_json_replacement_json_migration_error_with_unknown_field():
+    """Compound payload: retired replacement_json PLUS an unrelated bogus
+    field. The targeted migration error must still win — it holds today
+    because the migration check runs before the unknown-field check, but
+    nothing pins that order; a reorder would silently start returning the
+    generic unknown-field error instead."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_json": json.dumps({"claim": "irrelevant"}),
+        "bogus_field": "should not matter here",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "replacement_json" in r["error"], r
+    assert "replacement_id" in r["error"], r
+    assert "Unknown fields" not in r["error"], r
 
 
 # ── 2. Schema enforcement ──────────────────────────────────────────────────
@@ -684,3 +723,270 @@ def test_initiation_ref_anthropic_session_id_fallback():
         assert meta.get("initiation_ref") == "anthropic-fallback-xyz", meta
     finally:
         os.environ.pop("ANTHROPIC_SESSION_ID", None)
+
+
+# ── 9. replacement_id validation (#2612) ────────────────────────────────────
+
+
+def test_replacement_id_missing_node_rejected():
+    """replacement_id naming a nonexistent node is refused, no mutation performed."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_id": "ob_9999999",
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "replacement_id" in r["error"] and "not found" in r["error"], r
+    # No mutation performed — node still current.
+    conn = server._get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (ob_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["is_current"] == 1, "retract must not have mutated the node"
+    assert row["status"] != "retracted"
+
+
+def test_replacement_id_non_current_node_rejected():
+    """replacement_id naming an already-superseded/retracted node is refused."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    stale_repl_id = _seed_observation(server)
+    # Retract the would-be replacement first, so it's no longer current.
+    stale_retract = json.loads(server._retract_impl(
+        node_id=stale_repl_id,
+        error_type="other",
+        reason="Make this node non-current for the test.",
+    ))
+    assert "error" not in stale_retract, stale_retract
+
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_id": stale_repl_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "replacement_id" in r["error"] and "not current" in r["error"], r
+    conn = server._get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (ob_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["is_current"] == 1, "retract must not have mutated the target node"
+
+
+def test_replacement_id_self_reference_rejected():
+    """replacement_id equal to node_id is refused."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_id": ob_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "must differ" in r["error"], r
+    conn = server._get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (ob_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["is_current"] == 1, "retract must not have mutated the node"
+
+
+def test_replacement_id_older_than_target_rejected():
+    """replacement_id naming a node OLDER than node_id is refused — the
+    retracts edge (replacement -> retracted) is temporal_causal=True, so a
+    replacement that predates the node it corrects would violate that
+    relation's own declared invariant."""
+    server = fresh_server()
+    # Create the would-be replacement FIRST, so it is strictly older than
+    # the node created next.
+    repl_id = _seed_observation(server)
+    ob_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "x",
+        "replacement_id": repl_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert "temporal_causal" in r["error"], r
+    assert "retracts" in r["error"], r
+    conn = server._get_db()
+    try:
+        row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (ob_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row["is_current"] == 1, "retract must not have mutated the node"
+
+
+def test_replacement_id_edge_written_in_same_transaction():
+    """The retracts edge lands alongside the retraction itself — both visible
+    immediately after the call, on one connection's worth of writes."""
+    server = fresh_server()
+    ob_id = _seed_observation(server)
+    repl_id = _seed_observation(server)
+    payload = {
+        "node_id": ob_id,
+        "error_type": "wrong_citation",
+        "reason": "Original cited the wrong passage.",
+        "replacement_id": repl_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r.get("replacement_id") == repl_id, r
+
+    conn = server._get_db()
+    try:
+        node_row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (ob_id,)
+        ).fetchone()
+        edge_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'retracts'",
+            (repl_id, ob_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert node_row["status"] == "retracted"
+    assert node_row["is_current"] == 0
+    assert edge_row["c"] == 1, "retracts edge must exist alongside the retraction"
+
+
+def _seed_dv(server, claim, supporting_ids):
+    """Create a derivation via the engram_derive facade — supporting_ids may
+    be a single node id or a list of them."""
+    if isinstance(supporting_ids, list):
+        supporting_ids = ",".join(supporting_ids)
+    payload = {
+        "claim": claim,
+        "supporting_ids": supporting_ids,
+        "logical_chain": f"Derivation: {claim}",
+        "reasoning_type": "deductive_modus_ponens",
+    }
+    r = json.loads(server.engram_derive(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    return r["derivation_id"]
+
+
+# ── 10. retract_replacement_is_downstream guard (round-3 review of #2612) ───
+#
+# Seeded graph, per the reviewing colleague's reproduction:
+#   O (observation) <- P (derivation) <- X (derivation)
+#   edges: P --derives_from--> O ,  X --derives_from--> P
+#
+# CONTROL: engram_supersede(old=P, new=X) must be REFUSED by the pre-existing
+# §12.3 guard ("supersede_replacement_is_downstream") — this is the positive
+# control proving the fixture itself is capable of tripping the guard.
+# SUBJECT: engram_retract(node_id=P, replacement_id=X) must ALSO be refused,
+# by the new guard ("retract_replacement_is_downstream") ported in this PR.
+
+
+def _seed_downstream_chain(server):
+    o_id = _seed_observation(server)
+    p_id = _seed_dv(server, "P derives from O.", o_id)
+    x_id = _seed_dv(server, "X derives from P.", p_id)
+    return o_id, p_id, x_id
+
+
+def test_supersede_replacement_is_downstream_control():
+    """Positive control: the pre-existing supersede guard refuses replacing
+    P with its own descendant X. Without this passing, a refusal on the
+    retract path below cannot be distinguished from a broken fixture."""
+    server = fresh_server()
+    _o_id, p_id, x_id = _seed_downstream_chain(server)
+
+    payload = {"old_node_id": p_id, "new_node_id": x_id}
+    r = json.loads(server.engram_supersede(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert r.get("guard") == "supersede_replacement_is_downstream", r
+
+
+def test_retract_replacement_is_downstream_rejected():
+    """Subject: retract(node_id=P, replacement_id=X) must be refused by the
+    new guard — naming a pre-existing downstream node as replacement_id is
+    the shape that makes the replacement stale by the act that installs it,
+    and installs a cascade marker on the very node the response also reports
+    as the replacement."""
+    server = fresh_server()
+    _o_id, p_id, x_id = _seed_downstream_chain(server)
+
+    payload = {
+        "node_id": p_id,
+        "error_type": "hallucinated_claim",
+        "reason": "x",
+        "replacement_id": x_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" in r, r
+    assert r.get("guard") == "retract_replacement_is_downstream", r
+
+    # No mutation performed — P must still be current, no retracts edge, no
+    # pending cascade marker installed on X.
+    conn = server._get_db()
+    try:
+        p_row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (p_id,)
+        ).fetchone()
+        edge_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM edges WHERE source_id = ? AND target_id = ? "
+            "AND relation = 'retracts'",
+            (x_id, p_id),
+        ).fetchone()
+        marker_row = conn.execute(
+            "SELECT COUNT(*) AS c FROM cascade_markers WHERE node_id = ?",
+            (x_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert p_row["is_current"] == 1, "retract must not have mutated the node"
+    assert p_row["status"] != "retracted"
+    assert edge_row["c"] == 0, "no retracts edge should have been written"
+    assert marker_row["c"] == 0, "no cascade marker should have landed on X"
+
+
+def test_retract_replacement_id_non_downstream_still_succeeds():
+    """A legitimate, NON-downstream replacement_id still succeeds — proves
+    the new guard isn't vacuously refusing every replacement_id retract."""
+    server = fresh_server()
+    _o_id, p_id, _x_id = _seed_downstream_chain(server)
+    # An unrelated, freshly-created observation — not on P's cascade at all.
+    repl_id = _seed_observation(server)
+
+    payload = {
+        "node_id": p_id,
+        "error_type": "hallucinated_claim",
+        "reason": "Corrected by an unrelated, non-downstream replacement.",
+        "replacement_id": repl_id,
+    }
+    r = json.loads(server.engram_retract(payload_json=json.dumps(payload)))
+    assert "error" not in r, r
+    assert r.get("replacement_id") == repl_id, r
+
+    conn = server._get_db()
+    try:
+        p_row = conn.execute(
+            "SELECT status, is_current FROM nodes WHERE id = ?", (p_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert p_row["status"] == "retracted"
+    assert p_row["is_current"] == 0

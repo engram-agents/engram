@@ -135,7 +135,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: test_cascade_semantics.py, test_cascade_derived_sets.py
 
 **9. engram_retract** — Mark claim as erroneous.
-- **contract**: `{node_id, error_type, reason, [replacement_json]}`
+- **contract**: `{node_id, error_type, reason, [replacement_id]}`
 - **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo)
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED

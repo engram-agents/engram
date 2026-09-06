@@ -612,8 +612,6 @@ def _graph_lineage_count(*args, **kwargs):
 # Impls + cascade helpers moved to engram_revision.py (family E).
 # Constants VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT also moved;
 # aliased here so server-level references and tests continue to resolve.
-# _retract_impl injects _add_observation_impl to preserve the optional
-# replacement path (acyclic: family modules may not import server.py).
 VALID_ERROR_TYPES = _revision_mod.VALID_ERROR_TYPES
 _THRESHOLD_GATE_DISCIPLINE_HINT = _revision_mod._THRESHOLD_GATE_DISCIPLINE_HINT
 
@@ -630,14 +628,11 @@ def _supersede_impl(*args, **kwargs):
     return _revision_mod._supersede_impl(*args, **kwargs)
 
 def _retract_impl(*args, **kwargs):
-    # NOTE: do not pass _obs_creator through this forwarder — it is wired here
-    # (composition root); a caller-supplied value would raise TypeError
-    # ("multiple values for keyword argument").
-    # Wave 9: updated wiring from the server-resident compat forwarder name to
-    # the module source of truth (_observation_mod._add_observation_impl).
-    # This is the one-line change PR #918 predicted — composition root now
-    # references the canonical implementation, not the forwarder chain.
-    return _revision_mod._retract_impl(*args, _obs_creator=_observation_mod._add_observation_impl, **kwargs)
+    # #2612 retired the mint-inside-retraction path — no more callable
+    # injection across the module boundary here. The replacement node (if
+    # any) is created by the caller via its own canonical creation tool,
+    # before calling engram_retract, and named by replacement_id.
+    return _revision_mod._retract_impl(*args, **kwargs)
 # ---- end #872 wave-6 compat forwarders --------------------------------
 
 # ---- engram_cascade_frontier (engram-alpha#2013 slice 3) --------------
@@ -1902,10 +1897,10 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # source_class confidence determination. Same substrate guards as singleton
 # add_observation — the bulk is purely a transaction-shape optimization.
 #
-# Nested-encoding pattern (matches engram_retract's replacement_json): inner
-# field `observations_json` is itself a stringified JSON array. The outer
-# wrapper is the payload_json contract; the inner is the per-observation list.
-# Don't confuse the two levels.
+# Nested-encoding pattern (same shape as engram_set_recall_summaries'
+# `summaries` field): inner field `observations_json` is itself a
+# stringified JSON array. The outer wrapper is the payload_json contract;
+# the inner is the per-observation list. Don't confuse the two levels.
 #
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99) — antml-prefix swallow
 # protection same as singleton add_observation.
@@ -6363,7 +6358,7 @@ def engram_supersede(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 # Set of legitimate field names for the engram_retract payload.
 _RETRACT_FIELDS = frozenset({
-    "node_id", "error_type", "reason", "replacement_json",
+    "node_id", "error_type", "reason", "replacement_id",
     "initiation", "initiation_gate",
 })
 
@@ -6384,13 +6379,13 @@ _RETRACT_FIELDS = frozenset({
 # hallucinated_claim, duplicate, other. These name the failure modes — agents
 # can later scan-by-error-type to learn which kinds of errors they make.
 #
-# Optional replacement (replacement_json field): the retract can be paired with
-# a corrected observation that cites the same evidence. This is the typical
-# pattern — retract WITH a fix, not just retract-and-leave-empty.
-#
-# Naming caution: the outer param is payload_json; the INNER field is
-# replacement_json. They're distinct — outer is wrapper-protocol JSON; inner
-# is the replacement-observation JSON.
+# Optional replacement (replacement_id field): the retract can be paired with
+# a corrected node, named by id. #2612 retired the earlier mint-inside-
+# retraction path (a nested replacement_json field that minted the
+# replacement inline) — this is a purely relational operation, like
+# engram_supersede's new_node_id: the caller creates the replacement first,
+# via its own canonical creation tool (engram_add_observation for
+# observations), then names it here.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -6424,9 +6419,7 @@ def engram_retract(payload_json: str) -> str:
     resolution_kind='retracted'). A retract resolved that way is a partial
     resolution of the existing cascade event, not a new one.
 
-    Pass all fields as one JSON object string in payload_json. Note: the
-    outer wrapper parameter is `payload_json` and there is also an INNER
-    field named `replacement_json` — distinct things.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -6434,10 +6427,14 @@ def engram_retract(payload_json: str) -> str:
             error_type (str, required): One of: fabricated_quote, wrong_citation,
                 wrong_evidence, hallucinated_claim, duplicate, other.
             reason (str, required): Human-readable explanation of the error.
-            replacement_json (str, optional): JSON object string with replacement
-                observation fields {quoted_text, interpretation, claim,
-                quote_type, source_class}. The replacement cites the same
-                evidence.
+            replacement_id (str, optional): The replacement node's id, already
+                created via its type's canonical creation tool
+                (engram_add_observation, for observations) BEFORE calling
+                engram_retract — a purely relational operation, it does NOT
+                create a new node (matches engram_supersede's new_node_id
+                convention). Must name a node that exists, is_current=1,
+                differs from node_id, and is not older than node_id (the
+                retracts edge it lands on is temporal_causal=True).
             initiation (str, optional): Who initiated the retraction. One of:
                 user_prompted, gate_prompted, unprompted.
             initiation_gate (str, optional): Which gate triggered the
@@ -6453,6 +6450,17 @@ def engram_retract(payload_json: str) -> str:
     params, err = _parse_payload(payload_json)
     if err:
         return err
+
+    # #2612 migration error: replacement_json was retired — targeted message,
+    # not the generic unknown-field rejection below.
+    if "replacement_json" in params:
+        return json.dumps({
+            "error": "replacement_json was retired (#2612) — engram_retract no "
+                     "longer mints a replacement inline. Create the replacement "
+                     "first via its own canonical creation tool "
+                     "(engram_add_observation for observations), then pass its "
+                     "id as replacement_id."
+        })
 
     unknown = set(params.keys()) - _RETRACT_FIELDS
     if unknown:
@@ -6470,7 +6478,7 @@ def engram_retract(payload_json: str) -> str:
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
-# Compat forwarder above in wave-6 compat block (injects _obs_creator=_add_observation_impl).
+# Compat forwarder above in wave-6 compat block.
 # ---------------------------------------------------------------------------
 # Focus mode — family G (engram_focus.py)
 # ---------------------------------------------------------------------------
