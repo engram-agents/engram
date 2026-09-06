@@ -2358,9 +2358,17 @@ class TestForensicCapture:
 
     # -- Size guard: cap the fd scan, record truncated:true -------------------
 
+    @_LINUX_PROC
     def test_fd_scan_truncates_with_flag_rather_than_unbounded(self, tmp_path):
         """The fd scan is capped; a tiny max_scan produces truncated=True
-        rather than an unbounded scan of every open fd."""
+        rather than an unbounded scan of every open fd.
+
+        #2683: missing this guard (present on every sibling test in this
+        class) made this test fail on every Darwin seat by construction --
+        _capture_fds itself gates on /proc/self/fd (the same shape as
+        detect_shm_displacement, #2651) and correctly returns
+        status=="unavailable" there, which this test's unconditional
+        status=="ok" assertion had no way to accommodate."""
         db_path = str(tmp_path / "knowledge.db")
         paths = {"db": db_path, "wal": db_path + "-wal", "shm": db_path + "-shm"}
         result = engram_walguard._capture_fds(paths, max_scan=1)
