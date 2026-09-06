@@ -262,6 +262,11 @@
       "tier": "convenience"
     },
     {
+      "path": "viz/static/health-detail-math.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2518 detail-view slice: pure distribution/histogram math for the history strip, served via <script src>, same tier as its sibling health.html and the rest of the viz dashboard."
+    },
+    {
       "path": "viz/templates/stats.html",
       "tier": "convenience"
     },
