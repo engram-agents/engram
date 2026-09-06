@@ -784,10 +784,22 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         # Filter to thin-support (support_count <= 1), preserving importance order.
         thin_support_candidates = []
+        # #2624: "how many premises does this derivation rest on" is the
+        # SAME one-hop-premise question core._direct_premise_ids answers
+        # (core.CITATION_SUPPORT_RELATIONS -- derives_from, supported_by,
+        # acknowledged_derives_from) -- NOT the confidence-formula's own
+        # narrower core.CASCADE_RELATIONS, which deliberately excludes
+        # supported_by because that relation is a real premise for
+        # cascade/health purposes but not a formula input (see #2618's
+        # comment at engram_core.py's confidence-recompute site). This is
+        # a "how well is this claim grounded" health metric, not a
+        # confidence recompute, so it uses the general premise notion.
+        _rels = sorted(core.CITATION_SUPPORT_RELATIONS)
         for d in derivations:
             support_count = conn.execute(
-                "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation = 'derives_from'",
-                (d["id"],),
+                "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation IN "
+                f"({','.join('?' for _ in _rels)})",
+                (d["id"], *_rels),
             ).fetchone()["c"]
             if support_count <= 1:
                 thin_support_candidates.append((d, support_count))
