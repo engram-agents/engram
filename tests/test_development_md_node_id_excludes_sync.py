@@ -57,6 +57,44 @@ def _development_md_excludes() -> set[str]:
     return set(_EXCLUDE_RE.findall(match.group(1)))
 
 
+def _development_md_allowlist_prose_paths() -> set[str]:
+    text = DEV_MD_PATH.read_text(encoding="utf-8")
+    # Isolate the "Allowlisted paths" bullet section specifically -- it runs
+    # from its own heading up to (not including) the next bold heading
+    # ("Schema-illustration exception"). Scoping this way means a backticked
+    # path mentioned somewhere ELSE in the file (e.g. the Schema-illustration
+    # section's own engram_ids.py/engram_idf.py bullets) doesn't count as
+    # documentation for THIS list.
+    match = re.search(r"\*\*Allowlisted paths\*\*.*?(?=\n\*\*|\Z)", text, re.DOTALL)
+    assert match, "'Allowlisted paths' prose section not found in DEVELOPMENT.md"
+    return set(re.findall(r"`([^`]+)`", match.group(0)))
+
+
+def test_development_md_allowlist_prose_documents_every_exclude():
+    """Kepler's follow-up on PR #2649 (#2626): the bash snippet above is
+    guarded by test_development_md_excludes_match_live_workflow, but the
+    "Allowlisted paths" PROSE list underneath it is a separate hand-copy and
+    was not guarded -- it could drift on its own even with the snippet kept
+    in sync. This checks every live EXCLUDES path is documented (backtick-
+    quoted) somewhere in that prose section.
+
+    Deliberately a SUBSET check (every exclude path must appear), not exact
+    set equality: the prose section legitimately backticks other terms
+    (EXCLUDES itself, build-plugin.sh) that aren't paths and shouldn't be
+    flagged as unexpected extras -- unlike the bash snippet, which contains
+    nothing BUT exclude pathspecs, so exact equality was the right check
+    there but would be too strict here."""
+    workflow_excludes = _workflow_excludes()
+    prose_mentions = _development_md_allowlist_prose_paths()
+
+    undocumented = {p for p in workflow_excludes if p not in prose_mentions}
+    assert not undocumented, (
+        "The following live EXCLUDES paths aren't documented (backtick-quoted) "
+        "in DEVELOPMENT.md's 'Allowlisted paths' prose section: "
+        f"{sorted(undocumented)}"
+    )
+
+
 def test_development_md_excludes_match_live_workflow():
     workflow_excludes = _workflow_excludes()
     dev_md_excludes = _development_md_excludes()
