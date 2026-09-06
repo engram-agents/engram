@@ -80,6 +80,8 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import engram_core as core
+from engram_anchoring import anchor as _anchor_claim
+from engram_anchoring import quote_claim_similarity as _quote_claim_similarity
 from engram_log_emitter import emit_if_initialized
 
 # VALID_QUOTE_TYPES and VALID_SOURCE_CLASSES come from engram_confidence via
@@ -1083,6 +1085,75 @@ def _predictive_hint(is_predictive: bool,
     )
 
 
+def _log_anchoring_advisory(entry: dict) -> None:
+    """Append one JSONL line per observation write — the calibration input
+    for #2602 facets 3/4. Not read by anything in this PR. Best-effort:
+    logging failures must never block a write (same discipline as
+    engram_query.py's _pattern_telemetry_log)."""
+    try:
+        path = Path(core.DATA_DIR) / "anchoring_advisory.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _build_anchoring_advisory(
+    node_id: str, claim: str, quoted_text: str, interpretation: str,
+    quote_type: str, source_class: str, confidence: Optional[float],
+) -> dict:
+    """Facet 2 (#2602): advisory-only hard-token anchoring measurement
+    attached to every observation write's response.
+
+    Loud, never fatal — any exception here becomes an
+    {"status": "unavailable", "reason": ...} advisory rather than failing
+    the write (a broken advisory must never block an observation).
+    """
+    try:
+        result = _anchor_claim(claim, quoted_text)
+        similarity, similarity_reason = _quote_claim_similarity(quoted_text, claim)
+        body_to_quote_ratio = (len(claim or "") + len(interpretation or "")) / max(len(quoted_text or ""), 1)
+
+        advisory: dict = {
+            "hard_tokens": result.hard_tokens,
+            "anchored": result.anchored,
+            "ratio": result.ratio,
+            "unanchored": result.unanchored[:20],
+            "body_to_quote_ratio": body_to_quote_ratio,
+            "quote_claim_similarity": similarity,
+        }
+        if similarity is None and similarity_reason:
+            advisory["similarity_status"] = f"unavailable: {similarity_reason}"
+        if quote_type == "hard_data" and result.unanchored:
+            advisory["hint"] = (
+                f"hard_data: {len(result.unanchored)} claim token(s) absent from the "
+                "quote — widen the quote, move the fact to `interpretation`, or "
+                "downgrade quote_type. Advisory only (#2602 facet 2)."
+            )
+
+        _log_anchoring_advisory({
+            "ts": core._now(),
+            "node_id": node_id,
+            "quote_type": quote_type,
+            "source_class": source_class,
+            "confidence": confidence,
+            "hard_tokens": result.hard_tokens,
+            "anchored": result.anchored,
+            "ratio": result.ratio,
+            "unanchored": result.unanchored[:20],
+            "quote_len": len(quoted_text or ""),
+            "claim_len": len(claim or ""),
+            "interp_len": len(interpretation or ""),
+            "body_to_quote_ratio": body_to_quote_ratio,
+            "quote_claim_similarity": similarity,
+        })
+        return advisory
+    except Exception as exc:  # noqa: BLE001 — advisory must never fail a write
+        logging.warning("anchoring advisory failed for %s: %s", node_id, exc)
+        return {"status": "unavailable", "reason": str(exc)[:200]}
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1464,6 +1535,13 @@ def _add_observation_impl(
                 "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
                 "citations, verify manually. See #1204."
             )
+
+        # Advisory hard-token anchoring (#2602 facet 2) — attaches to every
+        # write, all quote types; never refuses, never changes confidence.
+        result["anchoring_advisory"] = _build_anchoring_advisory(
+            node_id, claim, quoted_text, interpretation, quote_type,
+            source_class, confidence,
+        )
 
         # Handle prediction decomposition
         prediction_id = None

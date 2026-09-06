@@ -132,6 +132,10 @@
       "tier": "essential"
     },
     {
+      "path": "engram_anchoring.py",
+      "tier": "essential"
+    },
+    {
       "path": "engram_walguard.py",
       "tier": "essential"
     },
@@ -313,6 +317,10 @@
     {
       "path": "tools/write_sleep_marker.py",
       "tier": "essential"
+    },
+    {
+      "path": "tools/anchoring_report.py",
+      "tier": "convenience"
     },
     {
       "path": "tools/backup_knowledge_db.py",

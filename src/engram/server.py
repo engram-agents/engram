@@ -1746,6 +1746,15 @@ def engram_add_observation(payload_json: str) -> str:
     and removed pre-merge on measured zero precision; redesign tracked in
     #2264.)
 
+    Advisory anchoring_advisory (#2602 facet 2): every response also carries
+    an "anchoring_advisory" object measuring how many of the claim's "hard"
+    facts (node ids, issue/PR refs, hex shas, 3+-digit numbers, dates/times)
+    are literal substrings of quoted_text. For quote_type=hard_data, "the
+    quoted text IS the data" — unanchored hard tokens in the claim are the
+    signal to widen the quote, move the fact to interpretation, or downgrade
+    the quote type. Advisory only until #2602 facet 3 — nothing here refuses
+    a write or changes a confidence.
+
     Simplest — citing the CURRENT chat (pass your injected session_id; the
     server resolves the transcript, defaults quote_type=personal_communication
     + source_class=user_stated; a wrong or stale session_id fails loud via the
