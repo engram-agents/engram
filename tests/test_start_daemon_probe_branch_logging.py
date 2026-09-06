@@ -458,7 +458,10 @@ class _ProbeBranchFixture(unittest.TestCase):
         return False
 
 
-def _branch_regex(branch: int, *, pid: int | None = None, pid_path: Path | None = None) -> re.Pattern:
+def _branch_regex(
+    branch: int, *, pid: int | None = None, pid_path: Path | None = None,
+    exc_name: str | None = None,
+) -> re.Pattern:
     if branch == 1:
         assert pid_path is not None
         pattern = (
@@ -472,11 +475,17 @@ def _branch_regex(branch: int, *, pid: int | None = None, pid_path: Path | None 
             rf"pidfile present \(pid={pid}\) but process not running"
         )
     elif branch == 3:
+        # #2676: branch 3's log line now names WHICH exception the socket
+        # probe caught (FileNotFoundError / ConnectionRefusedError /
+        # BlockingIOError) -- exc_name is required so every caller states
+        # explicitly which population it is asserting, rather than matching
+        # any exception name generically.
         assert pid is not None
+        assert exc_name is not None, "branch 3 assertions must name the expected exception class"
         pattern = (
             rf"\[{_TIMESTAMP_RE}\] \[start-engram-daemon\] probe: "
             rf"pidfile present \(pid={pid}\), process alive, "
-            rf"socket probe failed/timed out"
+            rf"socket probe failed: {re.escape(exc_name)}"
         )
     elif branch == 4:
         assert pid is not None
@@ -611,10 +620,16 @@ class TestBranch2AgainstPreUnit1Script(_ProbeBranchFixture):
 
 
 class TestBranch3LiveProcessDeadSocket(_ProbeBranchFixture):
+    """#2676 case 1: no socket file present at all -> FileNotFoundError --
+    the healthy-daemon-in-warmup-window population (pidfile written before
+    bind()/listen() -- engram-surface-daemon.py's main(): pidfile write,
+    then server.bind(), then server.listen())."""
+
     def setUp(self):
         super().setUp()
         # A real, alive process -- kill -0 must succeed. No socket is bound
-        # at self.socket_path, so the python connect-probe must fail.
+        # at self.socket_path, so the python connect-probe must fail with
+        # FileNotFoundError specifically.
         self.live_proc = _spawn_sleeper(seconds=8.0)
         self.pid_path.write_text(str(self.live_proc.pid))
         self.addCleanup(self._kill_live_proc)
@@ -630,7 +645,7 @@ class TestBranch3LiveProcessDeadSocket(_ProbeBranchFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
 
-        self.assertRegex(content, _branch_regex(3, pid=self.live_proc.pid))
+        self.assertRegex(content, _branch_regex(3, pid=self.live_proc.pid, exc_name="FileNotFoundError"))
         self.assertNotIn("probe: no pidfile", content)
         self.assertNotIn("but process not running", content)
         self.assertNotIn("probe: healthy", content)
@@ -663,9 +678,146 @@ class TestBranch3AgainstPreUnit1Script(_ProbeBranchFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         content = "\n".join(self._log_lines())
 
-        self.assertNotRegex(content, _branch_regex(3, pid=self.live_proc.pid))
+        self.assertNotRegex(content, _branch_regex(3, pid=self.live_proc.pid, exc_name="FileNotFoundError"))
         self.assertNotIn("[start-engram-daemon] probe:", content)
         self.assertTrue(self._wait_for_relaunch_marker())
+
+
+class TestBranch3ConnectionRefused(_ProbeBranchFixture):
+    """#2676 case 2: the socket file exists but nothing is listening on it
+    (bind + listen + close, leaving the inode behind) -> ConnectionRefusedError
+    -- the actual orphan pathology the #2652 epic exists to fix. Measured:
+    bind()+listen()+close() reliably produces ECONNREFUSED on a subsequent
+    connect() (30/30 in manual verification during this unit's development)."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_proc = _spawn_sleeper(seconds=8.0)
+        self.pid_path.write_text(str(self.live_proc.pid))
+        self.addCleanup(self._kill_live_proc)
+
+        srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        srv.bind(str(self.socket_path))
+        srv.listen(1)
+        srv.close()
+
+    def _kill_live_proc(self):
+        if self.live_proc.poll() is None:
+            self.live_proc.terminate()
+            self.live_proc.wait(timeout=2)
+
+    def test_logs_branch3_line_with_connection_refused(self):
+        self.assertTrue(self.socket_path.exists(), "test setup: stale socket file must exist")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+
+        self.assertRegex(content, _branch_regex(3, pid=self.live_proc.pid, exc_name="ConnectionRefusedError"))
+        self.assertNotIn("probe: no pidfile", content)
+        self.assertNotIn("but process not running", content)
+        self.assertNotIn("probe: healthy", content)
+
+    def test_reap_relaunch_unchanged(self):
+        self._run()
+        self.assertTrue(
+            self._wait_for_relaunch_marker(),
+            "branch 3 (live process, refused connection) must still fall "
+            "through to reap+relaunch, unchanged",
+        )
+
+
+class TestBranch3ConnectionRefusedAgainstPreUnit1Script(_ProbeBranchFixture):
+    """Falsification control for the ConnectionRefusedError case: identical
+    scenario against the frozen pre-#2652-unit-1 baseline, which writes no
+    probe line at all."""
+
+    SCRIPT_TEXT = _PRE_UNIT1_SCRIPT_TEXT
+
+    def setUp(self):
+        super().setUp()
+        self.live_proc = _spawn_sleeper(seconds=8.0)
+        self.pid_path.write_text(str(self.live_proc.pid))
+        self.addCleanup(self._kill_live_proc)
+
+        srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        srv.bind(str(self.socket_path))
+        srv.listen(1)
+        srv.close()
+
+    def _kill_live_proc(self):
+        if self.live_proc.poll() is None:
+            self.live_proc.terminate()
+            self.live_proc.wait(timeout=2)
+
+    def test_reverted_script_writes_no_probe_line_at_all(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+
+        self.assertNotRegex(content, _branch_regex(3, pid=self.live_proc.pid, exc_name="ConnectionRefusedError"))
+        self.assertNotIn("[start-engram-daemon] probe:", content)
+        self.assertTrue(self._wait_for_relaunch_marker())
+
+
+class TestBranch3BlockingIO(_ProbeBranchFixture):
+    """#2676 case 3: a real bound+listening socket with a zero backlog
+    (`listen(0)`), its accept backlog deliberately exhausted by opening
+    several simultaneous non-blocking connections before the probe connects
+    -> BlockingIOError. A live, listening, busy daemon -- distinct from the
+    orphan case above. Measured deterministic 30/30 in manual verification
+    during this unit's development (see PR description for the full run)."""
+
+    def setUp(self):
+        super().setUp()
+        self.live_proc = _spawn_sleeper(seconds=8.0)
+        self.pid_path.write_text(str(self.live_proc.pid))
+        self.addCleanup(self._kill_live_proc)
+
+        self.srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+        self.srv.bind(str(self.socket_path))
+        self.srv.listen(0)
+        self.addCleanup(self.srv.close)
+
+        # Exhaust the zero backlog with several simultaneous non-blocking
+        # connect() attempts before the script's own probe ever connects --
+        # none of these are ever accept()ed.
+        self._backlog_clients = []
+        for _ in range(20):
+            c = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+            c.setblocking(False)
+            try:
+                c.connect(str(self.socket_path))
+            except BlockingIOError:
+                pass
+            self._backlog_clients.append(c)
+        self.addCleanup(self._close_backlog_clients)
+
+    def _close_backlog_clients(self):
+        for c in self._backlog_clients:
+            c.close()
+
+    def _kill_live_proc(self):
+        if self.live_proc.poll() is None:
+            self.live_proc.terminate()
+            self.live_proc.wait(timeout=2)
+
+    def test_logs_branch3_line_with_blocking_io_error(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        content = "\n".join(self._log_lines())
+
+        self.assertRegex(content, _branch_regex(3, pid=self.live_proc.pid, exc_name="BlockingIOError"))
+        self.assertNotIn("probe: no pidfile", content)
+        self.assertNotIn("but process not running", content)
+        self.assertNotIn("probe: healthy", content)
+
+    def test_reap_relaunch_unchanged(self):
+        self._run()
+        self.assertTrue(
+            self._wait_for_relaunch_marker(),
+            "branch 3 (live process, full accept backlog) must still fall "
+            "through to reap+relaunch, unchanged",
+        )
 
 
 # ===========================================================================

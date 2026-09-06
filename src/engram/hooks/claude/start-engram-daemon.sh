@@ -23,8 +23,23 @@ _log_probe() {
 if [ -f "$PID_PATH" ]; then
     pid=$(cat "$PID_PATH")
     if kill -0 "$pid" 2>/dev/null; then
-        # Daemon is running, verify socket is responsive
-        if {{PYTHON}} -c "
+        # Daemon is running, verify socket is responsive. #2676: capture the
+        # heredoc's stderr (the caught exception's class name) via command
+        # substitution instead of discarding it to /dev/null, so branch 3's
+        # log line can name WHICH of three distinct populations fired --
+        # FileNotFoundError (healthy daemon still in its warmup window,
+        # before bind()/listen() -- see engram-surface-daemon.py's main():
+        # pidfile write, then server.bind(), then server.listen()),
+        # ConnectionRefusedError (the orphan: a dead/unlinked socket -- the
+        # actual pathology #2652 exists to fix), or BlockingIOError (a live,
+        # listening daemon whose accept backlog is full). socket.timeout is
+        # measured unreachable on an AF_UNIX connect() -- every failure
+        # returns immediately -- so no refused-vs-timed-out split is built;
+        # the settimeout(2) call stays as defensive code regardless.
+        # Restructured from a direct `if <cmd>; then` into a
+        # capture-then-check-$? form so the same exit-code semantics still
+        # gate the branch.
+        _probe_output="$({{PYTHON}} -c "
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.settimeout(2)
@@ -32,14 +47,17 @@ try:
     s.connect('$SOCKET_PATH')
     s.close()
     sys.exit(0)
-except Exception:
+except Exception as e:
+    print(type(e).__name__, file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null; then
+" 2>&1)"
+        _probe_rc=$?
+        if [ "$_probe_rc" -eq 0 ]; then
             # Daemon is alive and socket works.
             _log_probe "healthy (pid=${pid}), no action"
             exit 0
         else
-            _log_probe "pidfile present (pid=${pid}), process alive, socket probe failed/timed out"
+            _log_probe "pidfile present (pid=${pid}), process alive, socket probe failed: ${_probe_output:-unknown}"
         fi
     else
         _log_probe "pidfile present (pid=${pid}) but process not running"

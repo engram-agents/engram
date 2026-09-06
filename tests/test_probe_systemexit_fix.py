@@ -58,10 +58,17 @@ _ORIGINAL_BUGGY_SNIPPET = (
 )
 
 # The heredoc-body extraction pattern: everything between the opening
-# `-c "` line and the closing `"` line that precedes ` 2>/dev/null`.
-# Equivalent in effect to sed-extracting the same span from the file; done
-# in Python here for portability.
-_HEREDOC_BODY_RE = re.compile(r'-c "\n(.*?)\n" 2>/dev/null', re.DOTALL)
+# `-c "` line and the closing `"` line that precedes the invocation's stderr
+# redirection. Equivalent in effect to sed-extracting the same span from the
+# file; done in Python here for portability.
+#
+# #2676 widened this from a literal `2>/dev/null` to `2>\S+` (matches
+# `2>/dev/null` AND the `2>&1` this unit introduced when it started
+# capturing the probe's stderr -- the exception class name -- via command
+# substitution instead of discarding it). The heredoc BODY this test cares
+# about (the Python source between the quotes) is unaffected either way;
+# only how the surrounding bash line disposes of stderr changed.
+_HEREDOC_BODY_RE = re.compile(r'-c "\n(.*?)\n" 2>\S+', re.DOTALL)
 
 
 def _extract_probe_snippet(script_text: str) -> str:
@@ -97,10 +104,14 @@ class TestProbeAgainstFixedScript(unittest.TestCase):
 
     def setUp(self):
         self.snippet = _extract_probe_snippet(SCRIPT_PATH.read_text())
+        # #2676 changed the clause from `except Exception:` to
+        # `except Exception as e:` (binding the caught exception so its
+        # class name can be printed to stderr) -- still not a bare
+        # `except:`, so the #2666 fix this class exists to pin is intact.
         self.assertIn(
-            "except Exception:",
+            "except Exception as e:",
             self.snippet,
-            "the live script no longer reads 'except Exception:' -- "
+            "the live script no longer reads 'except Exception as e:' -- "
             "extraction may have grabbed stale/wrong text, or the fix "
             "was reverted",
         )
