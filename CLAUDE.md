@@ -396,6 +396,13 @@ exactly the ones that go quietly unexecuted under time pressure:
    it?** Read claim and bound *adjacently*, not in sequence. A caveat can be
    stated correctly and violated four lines away, in the same document, by the
    author who wrote it.
+5. **For each "checked to fail" / mutation / control claim in the PR: did the
+   same mutation also redden tests the PR did NOT add, and did it mutate
+   toward the OLD code or toward a plausible-WRONG implementation?** A control
+   that has only ever been observed to fail is not yet a control — the
+   discriminating case is the one where a neighbouring test stays green while
+   the new one goes red, or where the failure comes from a plausible-wrong
+   implementation rather than from the pre-fix code itself.
 
 **And a wording rule for review requests, which is not part of the box.** State
 the claim, **not the method** — and where an instrument's output depends on who
