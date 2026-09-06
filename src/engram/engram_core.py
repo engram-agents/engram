@@ -1879,12 +1879,35 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
                 file=sys.stderr,
             )
 
+        # Forensic capture (#2635): AT DETECTION TIME, BEFORE the dump, while
+        # the state that produced the detection is still live.  Never allowed
+        # to raise (capture_forensics() has its own top-level guard), but
+        # defense-in-depth here too — a broken capture must never block the
+        # marker write or the dump.
+        #
+        # On an hourly-refresh of an ONGOING incident (original_detected_at
+        # is not None), reuse the marker's EXISTING forensics rather than
+        # re-capturing fresh ones — a fresh capture at refresh time reflects
+        # state hours after detection, not the state that produced it, and
+        # would silently overwrite the one snapshot answering "who held it
+        # at the moment of detection" (reviewer-fairy finding, PR #2653).
+        # Same preservation the original_detected_at timestamp already gets.
+        forensics = None
+        if original_detected_at is not None and existing_marker is not None:
+            forensics = (existing_marker.get("details") or {}).get("forensics")
+        if forensics is None:
+            try:
+                forensics = _wg.capture_forensics(str(DB_PATH))
+            except Exception as fe:
+                forensics = {"status": "unavailable", "why": f"capture_forensics call raised: {fe!r}"}
+
         # Write initial/refreshed marker (dump_committed=False until dump completes).
         # Pass detected_at to preserve the original timestamp on re-dumps.
         try:
             _wg.write_degraded_marker(
                 DATA_DIR, detection, dump_info=None,
                 detected_at=original_detected_at,
+                forensics=forensics,
             )
         except Exception as me:
             print(f"[walguard] marker write failed: {me!r} (#786)", file=sys.stderr)
@@ -1902,11 +1925,14 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
             print(f"[walguard] emergency dump raised: {de!r} (#786)", file=sys.stderr)
             dump_info = {"git_committed": False, "error": str(de)}
 
-        # Update marker with dump result; preserve original detected_at.
+        # Update marker with dump result; preserve original detected_at and
+        # the same forensics snapshot captured before the dump (#2635) — the
+        # dump itself doesn't change what was live at detection time.
         try:
             _wg.write_degraded_marker(
                 DATA_DIR, detection, dump_info=dump_info,
                 detected_at=original_detected_at,
+                forensics=forensics,
             )
         except Exception as me2:
             print(f"[walguard] marker update after dump failed: {me2!r} (#786)", file=sys.stderr)

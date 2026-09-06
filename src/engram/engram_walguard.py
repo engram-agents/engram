@@ -209,6 +209,241 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Forensic capture (#2635) — extra reads at the exact moment of detection.
+# ---------------------------------------------------------------------------
+#
+# Motivating incident: on 2026-09-06 four candidate mechanisms were proposed
+# to explain a displacement and all four were falsified, because by the time
+# anyone looked, the live state that would have discriminated between them
+# was already gone.  These two extra reads — the lock table and the
+# fd→inode mapping — are cheap, taken at the exact instant detect_shm_
+# displacement() fires, and answer the two questions a bare /proc listing
+# cannot: who else holds a read mark on these three inodes, and does this
+# process's own fd still point at a live disk inode or a dead one.
+#
+# THE CONSTRAINT THAT IS THE WHOLE POINT (see #2651): "instrument
+# unavailable" must never collapse into "instrument ran, found nothing".
+# #2651 documents detect_shm_displacement() itself returning None for three
+# different conditions (healthy / no shm fd / no /proc) with both callers
+# reading None as healthy — silent false-healthy.  Every sub-capture below
+# therefore returns an explicit "status" of "ok" or "unavailable", never a
+# bare empty list/dict standing in for "couldn't check".
+
+_FD_SCAN_LIMIT = 4096      # cap on /proc/self/fd entries scanned per capture
+_LOCK_ROWS_LIMIT = 500     # cap on matching /proc/locks rows kept per capture
+
+
+def _capture_locks(
+    target_dev_inodes: set[tuple[int, int]], max_rows: int = _LOCK_ROWS_LIMIT
+) -> dict:
+    """Read /proc/locks, keep rows whose (device, inode) matches one of
+    target_dev_inodes.
+
+    Returns one of:
+        {"status": "unavailable", "why": <str>}
+        {"status": "ok", "rows": [<verbatim line>, ...], "pids": [<int>, ...],
+         "truncated": bool}
+
+    "unavailable" is returned distinctly from an "ok" result with an empty
+    "rows" list — the former means the instrument could not be read at all,
+    the latter means it was read and genuinely found no matching lock.  Per
+    the spec: os.access() first (a bare `grep -q` inside an `if` cannot make
+    this distinction — grep exits 2 on file-error and 1 on no-match, and -q
+    destroys the difference).
+
+    Matches on (device, inode), NOT inode alone (reviewer-fairy finding, PR
+    #2653): inode numbers are only unique per-filesystem, so an inode-only
+    match can mis-attribute a lock on a completely unrelated file sharing
+    the same inode number on a different device to the target file, exactly
+    the kind of false positive this capture exists to avoid producing in
+    the "who else holds a read mark" field.
+    """
+    path = "/proc/locks"
+    if not os.access(path, os.R_OK):
+        return {"status": "unavailable", "why": f"{path} not readable (os.access failed)"}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError as e:
+        return {"status": "unavailable", "why": f"open({path}) raised: {e!r}"}
+
+    rows: list[str] = []
+    pids: set[int] = set()
+    truncated = False
+    for line in lines:
+        if len(rows) >= max_rows:
+            truncated = True
+            break
+        # /proc/locks row shape: "<id>: <type> <mode> <kind> <pid> <maj>:<min>:<inode> <start> <end>"
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        try:
+            maj_str, min_str, inode_str = parts[5].split(":")
+            dev = os.makedev(int(maj_str, 16), int(min_str, 16))
+            inode = int(inode_str)
+        except (ValueError, IndexError):
+            continue
+        if (dev, inode) not in target_dev_inodes:
+            continue
+        rows.append(line.rstrip("\n"))
+        try:
+            pids.add(int(parts[4]))
+        except (ValueError, IndexError):
+            pass
+
+    return {
+        "status": "ok",
+        "rows": rows,
+        "pids": sorted(pids),
+        "truncated": truncated,
+    }
+
+
+def _capture_fds(paths: dict[str, str], max_scan: int = _FD_SCAN_LIMIT) -> dict:
+    """Resolve /proc/self/fd for every fd targeting one of `paths` (name→path).
+
+    Returns one of:
+        {"status": "unavailable", "why": <str>}
+        {"status": "ok", "matches": [{"fd", "which", "target", "deleted",
+                                       "fd_inode", "disk_inode"}, ...],
+         "truncated": bool}
+
+    This is the fd→inode mapping, not a bare fd list: a bare fd list is what
+    left #2635's incident ambiguous, because the same fd number means
+    opposite things depending on whether its inode still matches disk.
+    "deleted" comes from the literal " (deleted)" suffix os/proc appends to
+    the readlink target; fd_inode from fstat(fd); disk_inode from stat(path)
+    on the live (non-deleted-suffixed) target path, or None when that path
+    no longer resolves (covers both the deleted case and any other stat
+    failure — e.g. the shm_replaced case where a live file exists at the
+    path but under a different inode still resolves normally here).
+    """
+    proc_fd = "/proc/self/fd"
+    if not os.path.isdir(proc_fd):
+        return {
+            "status": "unavailable",
+            "why": f"{proc_fd} not available (non-Linux or /proc unmounted)",
+        }
+    try:
+        # os.listdir intentional (see detect_shm_displacement): closes the
+        # dir fd before return, avoiding a transient self-referencing entry.
+        entries = os.listdir(proc_fd)
+    except OSError as e:
+        return {"status": "unavailable", "why": f"listdir({proc_fd}) raised: {e!r}"}
+
+    target_by_path = {p: name for name, p in paths.items()}
+    matches: list[dict] = []
+    truncated = False
+    scanned = 0
+
+    for entry in entries:
+        if scanned >= max_scan:
+            truncated = True
+            break
+        try:
+            fd_num = int(entry)
+        except ValueError:
+            continue
+        scanned += 1
+        try:
+            target = os.readlink(os.path.join(proc_fd, entry))
+        except OSError:
+            continue
+
+        base_target = target.rstrip()
+        deleted = base_target.endswith(" (deleted)")
+        clean_target = base_target[: -len(" (deleted)")] if deleted else base_target
+        if clean_target not in target_by_path:
+            continue
+
+        try:
+            fd_inode = os.fstat(fd_num).st_ino
+        except OSError:
+            fd_inode = None
+
+        try:
+            disk_inode = os.stat(clean_target).st_ino
+        except OSError:
+            disk_inode = None
+
+        matches.append({
+            "fd": fd_num,
+            "which": target_by_path[clean_target],
+            "target": target,
+            "deleted": deleted,
+            "fd_inode": fd_inode,
+            "disk_inode": disk_inode,
+        })
+
+    return {"status": "ok", "matches": matches, "truncated": truncated}
+
+
+def capture_forensics(db_path: str) -> dict:
+    """Assemble the forensics dict for a live shm-displacement detection.
+
+    Must be called AT DETECTION TIME (before the dump) so the reads land
+    while the state that produced the detection is still live — the whole
+    point of this capture (#2635) is that a `/proc` listing taken later, once
+    the process that produced the displacement is gone, cannot answer
+    whether a live connection stood behind the fd or whether it already
+    pointed at the dead inode.
+
+    Contract: MUST NEVER RAISE (same contract as the rest of this module —
+    a guard that exists to diagnose an outage must not become one itself).
+    Any unexpected failure degrades to a top-level {"status": "unavailable",
+    "why": ...} rather than propagating.
+
+    Shape:
+        {
+          "pid": int,
+          "files": {"db": {...}, "wal": {...}, "shm": {...}},
+          "locks": {...},   # see _capture_locks
+          "fds": {...},     # see _capture_fds
+        }
+
+    Linux-only capture is expected: on a non-Linux seat, "fds" reads
+    {"status": "unavailable", ...} (mirrors detect_shm_displacement's own
+    /proc gate) rather than an empty match list that would read as "no fds
+    held" — the same false-healthy shape #2651 documents for detection
+    itself. "locks" degrades the same way if /proc/locks is absent.
+    """
+    try:
+        wal_path = db_path + "-wal"
+        shm_path = db_path + "-shm"
+        paths = {"db": db_path, "wal": wal_path, "shm": shm_path}
+
+        files: dict[str, dict] = {}
+        target_dev_inodes: set[tuple[int, int]] = set()
+        for name, p in paths.items():
+            try:
+                st = os.stat(p)
+                entry = {"exists": True, "st_ino": st.st_ino}
+                if name == "wal":
+                    entry["size_bytes"] = st.st_size
+                files[name] = entry
+                # (device, inode), not inode alone: inode numbers are only
+                # unique per-filesystem, so matching by inode alone can
+                # mis-attribute a lock on an unrelated file that happens to
+                # share the same inode number on a different device
+                # (reviewer-fairy finding, PR #2653).
+                target_dev_inodes.add((st.st_dev, st.st_ino))
+            except OSError:
+                files[name] = {"exists": False, "st_ino": None}
+
+        return {
+            "pid": os.getpid(),
+            "files": files,
+            "locks": _capture_locks(target_dev_inodes),
+            "fds": _capture_fds(paths),
+        }
+    except Exception as e:
+        # Must never raise into the caller — degrade to an explicit
+        # unavailable status rather than propagate or silently return {}.
+        return {"status": "unavailable", "why": f"capture_forensics raised: {e!r}"}
+
+
+# ---------------------------------------------------------------------------
 # Degraded-state marker
 # ---------------------------------------------------------------------------
 
@@ -225,6 +460,7 @@ def write_degraded_marker(
     dump_info: Optional[dict] = None,
     *,
     detected_at: Optional[str] = None,
+    forensics: Optional[dict] = None,
 ) -> str:
     """Write (or overwrite) the degraded marker atomically.
 
@@ -236,7 +472,9 @@ def write_degraded_marker(
           "dump_committed":      bool,         # True when emergency dump succeeded
           "dump_sha":            str | null,   # git SHA of the emergency dump commit
           "last_emergency_dump": str | null,   # UTC ISO-8601 of most recent dump attempt
-          "details":             dict,         # full detection dict + any dump_info
+          "details":             dict,         # full detection dict + any dump_info +
+                                                # forensics (#2635) under details["forensics"]
+                                                # when `forensics` is provided
           "recovery":            dict,         # recovery_block() (#1947) — condition,
                                                 # steps, verify, issue; same source as
                                                 # the CRITICAL log line / degraded banner
@@ -252,6 +490,11 @@ def write_degraded_marker(
         detected_at: When provided, used verbatim as the "detected_at" field
             (preserves the original timestamp on hourly re-dumps).  When None,
             set to the current UTC time.
+        forensics: Optional dict from capture_forensics() (#2635), taken at
+            detection time before the dump.  Stored verbatim under
+            details["forensics"] when provided; omitted entirely (not even
+            an empty-dict key) when None — additive only, existing callers
+            that don't pass it see no change to the marker's shape.
 
     Returns the marker path as a string.
     """
@@ -259,6 +502,10 @@ def write_degraded_marker(
     dump_committed = bool(dump_info and dump_info.get("git_committed"))
     dump_sha = (dump_info or {}).get("commit_sha", None)
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    details = {**detection, **(dump_info or {})}
+    if forensics is not None:
+        details["forensics"] = forensics
 
     payload = {
         "reason": detection.get("reason", "unknown"),
@@ -270,7 +517,7 @@ def write_degraded_marker(
         # hourly-refresh gate in _run_walguard_check can age-check without
         # touching detected_at (which must remain the original detection time).
         "last_emergency_dump": now_iso if dump_info is not None else None,
-        "details": {**detection, **(dump_info or {})},
+        "details": details,
         "recovery": recovery_block(),
     }
 

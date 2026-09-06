@@ -1070,6 +1070,89 @@ class TestStormGate:
         finally:
             conn.close()
 
+    def test_hourly_refresh_preserves_original_forensics(self):
+        """An hourly-refresh dump must NOT overwrite the marker's original
+        detection-instant forensics with a fresh capture of current state
+        (reviewer-fairy finding, PR #2653) — same preservation
+        detected_at already gets, extended to the forensics snapshot.
+
+        Scenario: a stale committed marker already carries a distinctive
+        planted 'forensics' payload (standing in for the original
+        detection-instant lock/fd snapshot). A refresh fires
+        (last_emergency_dump >1h old). If the refresh re-captures fresh
+        forensics, the marker's forensics field changes to whatever
+        capture_forensics() returns for CURRENT state; if it correctly
+        preserves the original, the planted payload survives unchanged.
+        """
+        from datetime import datetime, timezone, timedelta
+
+        conn = self._make_conn()
+        try:
+            original_detected_at = "2026-06-03T08:00:00+00:00"
+            two_hours_ago = (
+                datetime.now(timezone.utc) - timedelta(hours=2)
+            ).isoformat()
+
+            # A forensics payload that a fresh capture_forensics() call could
+            # never coincidentally reproduce (a sentinel PID and rows) --
+            # standing in for "the original detection-instant snapshot".
+            planted_forensics = {
+                "pid": -999999,
+                "files": {"db": {"exists": True, "st_ino": -1}},
+                "locks": {"status": "ok", "rows": ["SENTINEL-ROW"], "pids": [-999999], "truncated": False},
+                "fds": {"status": "ok", "matches": [], "truncated": False},
+            }
+
+            import json as _json
+            import tempfile as _tempfile
+            stale_payload = {
+                "reason": "shm_deleted",
+                "detected_at": original_detected_at,
+                "pid": os.getpid(),
+                "dump_committed": True,
+                "dump_sha": "stalesha",
+                "last_emergency_dump": two_hours_ago,
+                "details": {"reason": "shm_deleted", "fd": 7, "forensics": planted_forensics},
+            }
+            marker_path = self.tmp / ".substrate-degraded.json"
+            fd, tmp_path = _tempfile.mkstemp(
+                suffix=".tmp", dir=str(self.tmp), prefix=".substrate-degraded-"
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                _json.dump(stale_payload, f, indent=2)
+                f.write("\n")
+            os.replace(tmp_path, str(marker_path))
+
+            # Discrimination check: confirm a REAL fresh capture on this seat
+            # would NOT coincidentally equal the planted sentinel -- otherwise
+            # this test could pass for the wrong reason.
+            real_fresh = engram_walguard.capture_forensics(str(self.tmp / "knowledge.db"))
+            assert real_fresh != planted_forensics, (
+                "fixture assumption broken: a real fresh capture happens to "
+                "equal the planted sentinel, so this test can't discriminate"
+            )
+
+            with mock.patch(
+                "engram_walguard.detect_shm_displacement",
+                return_value={"reason": "shm_deleted", "fd": 7},
+            ), mock.patch.object(
+                self.server.core, "_commit_snapshot",
+                return_value={"git_committed": True, "commit_sha": "refreshsha"},
+            ):
+                self._force_throttle_expired()
+                self.server._run_walguard_check(conn)
+
+            marker = engram_walguard.read_degraded_marker(str(self.tmp))
+            assert marker is not None
+            actual_forensics = (marker.get("details") or {}).get("forensics")
+            assert actual_forensics == planted_forensics, (
+                f"hourly refresh overwrote the original detection-instant "
+                f"forensics with a fresh capture; expected the planted "
+                f"sentinel to survive unchanged, got {actual_forensics!r}"
+            )
+        finally:
+            conn.close()
+
 
 # ---------------------------------------------------------------------------
 # 10. Disabled-guard observability — once-per-process stderr line
@@ -1921,3 +2004,357 @@ class TestWriteToolCarriesWalguardWarning:
         malformed = "{not valid json"
         result2 = self.server._attach_walguard_banner(malformed)
         assert result2 == malformed
+
+
+# ---------------------------------------------------------------------------
+# 12. Forensic capture (#2635) — locks + fd→inode mapping at detection time
+# ---------------------------------------------------------------------------
+
+class TestForensicCapture:
+    """capture_forensics() (#2635): locks table + fd->inode mapping, taken at
+    the exact instant detect_shm_displacement() fires.
+
+    THE CONSTRAINT THAT IS THE WHOLE POINT (#2651): instrument-unavailable
+    must never collapse into an empty/negative result.  Every arm below is
+    shown to actually discriminate — either against a naive always-empty
+    stub, or by asserting the real implementation reports a shape the naive
+    stub could never produce (status=='unavailable' vs. status=='ok' with
+    an empty payload).  "A control that has only ever been observed to fail
+    is not yet a control."
+    """
+
+    _LINUX_PROC = pytest.mark.skipif(
+        not os.path.isdir("/proc/self/fd") or not os.path.exists("/proc/locks"),
+        reason="forensic capture requires /proc/self/fd and /proc/locks (Linux only)",
+    )
+
+    @staticmethod
+    def _naive_stub(db_path):
+        """A no-op capture that always reports 'ok, nothing found' regardless
+        of real state.  Exists purely to prove the assertions below aren't
+        vacuous — this is the exact shape a no-op implementation would
+        produce, and it is what the discriminating assertions must reject.
+        """
+        return {
+            "pid": os.getpid(),
+            "files": {
+                "db": {"exists": False, "st_ino": None},
+                "wal": {"exists": False, "st_ino": None, "size_bytes": 0},
+                "shm": {"exists": False, "st_ino": None},
+            },
+            "locks": {"status": "ok", "rows": [], "pids": [], "truncated": False},
+            "fds": {"status": "ok", "matches": [], "truncated": False},
+        }
+
+    # -- Arm 1: planted positive ---------------------------------------------
+
+    @_LINUX_PROC
+    def test_planted_positive_deleted_fd_is_detected(self, tmp_path):
+        """Open a file, unlink it while holding the fd: the capture must see
+        the entry with deleted=True and disk_inode=None.  A capture that
+        cannot see a planted (deleted) fd is blind — this is the failure to
+        design against."""
+        db_path = str(tmp_path / "knowledge.db")
+        shm_path = db_path + "-shm"
+        f = open(shm_path, "wb")
+        try:
+            f.write(b"x")
+            f.flush()
+            os.unlink(shm_path)
+
+            # Discrimination check: a naive no-op stub sees nothing here —
+            # proving the positive assertion below is not vacuously true.
+            naive = self._naive_stub(db_path)
+            assert naive["fds"]["matches"] == [], (
+                "fixture assumption broken: naive stub unexpectedly found a "
+                "match; the discriminating check below no longer holds"
+            )
+
+            forensics = engram_walguard.capture_forensics(db_path)
+            assert forensics["fds"]["status"] == "ok"
+            shm_matches = [m for m in forensics["fds"]["matches"] if m["which"] == "shm"]
+            assert shm_matches, (
+                f"expected a captured fd entry for the deleted shm; "
+                f"got {forensics['fds']}"
+            )
+            entry = shm_matches[0]
+            assert entry["deleted"] is True
+            assert entry["disk_inode"] is None
+            assert entry["fd_inode"] is not None
+        finally:
+            f.close()
+
+    # -- Arm 2: planted negative ---------------------------------------------
+
+    @_LINUX_PROC
+    def test_planted_negative_live_fd_not_flagged_deleted(self, tmp_path):
+        """Same fixture shape as Arm 1, but the file is NOT unlinked: the
+        capture must report deleted=False and fd_inode == disk_inode.  This
+        is the case that discriminates a real inode-comparison implementation
+        from one that hardcodes deleted=True (or otherwise can't tell live
+        from dead)."""
+        db_path = str(tmp_path / "knowledge.db")
+        shm_path = db_path + "-shm"
+        f = open(shm_path, "wb")
+        try:
+            f.write(b"x")
+            f.flush()
+
+            forensics = engram_walguard.capture_forensics(db_path)
+            assert forensics["fds"]["status"] == "ok"
+            shm_matches = [m for m in forensics["fds"]["matches"] if m["which"] == "shm"]
+            assert shm_matches, (
+                f"expected a captured fd entry for the live shm; got {forensics['fds']}"
+            )
+            entry = shm_matches[0]
+            assert entry["deleted"] is False
+            assert entry["disk_inode"] is not None
+            assert entry["fd_inode"] == entry["disk_inode"]
+        finally:
+            f.close()
+
+    @_LINUX_PROC
+    def test_positive_and_negative_arms_disagree(self, tmp_path):
+        """Arms 1 and 2 must disagree on `deleted` for the identical fixture
+        shape (open fd targeting the shm path) modulo the one difference
+        (unlinked or not) — otherwise the capture can't tell a live fd from
+        a dead one, which is exactly the ambiguity #2635 exists to resolve.
+        """
+        db_path_a = str(tmp_path / "a" / "knowledge.db")
+        db_path_b = str(tmp_path / "b" / "knowledge.db")
+        os.makedirs(os.path.dirname(db_path_a))
+        os.makedirs(os.path.dirname(db_path_b))
+
+        fa = open(db_path_a + "-shm", "wb")
+        fb = open(db_path_b + "-shm", "wb")
+        try:
+            fa.write(b"x")
+            fa.flush()
+            fb.write(b"x")
+            fb.flush()
+            os.unlink(db_path_a + "-shm")  # only A is deleted
+
+            forensics_a = engram_walguard.capture_forensics(db_path_a)
+            forensics_b = engram_walguard.capture_forensics(db_path_b)
+
+            deleted_a = [m["deleted"] for m in forensics_a["fds"]["matches"] if m["which"] == "shm"]
+            deleted_b = [m["deleted"] for m in forensics_b["fds"]["matches"] if m["which"] == "shm"]
+
+            assert deleted_a == [True], f"expected [True] for the unlinked fixture; got {deleted_a}"
+            assert deleted_b == [False], f"expected [False] for the live fixture; got {deleted_b}"
+        finally:
+            fa.close()
+            fb.close()
+
+    # -- Arm 3: instrument-unavailable, never a collapsed negative -----------
+
+    def test_unavailable_locks_reads_as_unavailable_not_empty(self, tmp_path, monkeypatch):
+        """Forcing /proc/locks unreadable (monkeypatching the access check,
+        per the spec) must produce status=='unavailable' — never an 'ok'
+        result with an empty rows list.  This is the arm that would have
+        caught #2651: an instrument that can't be read must never read the
+        same as an instrument that ran and found nothing."""
+        db_path = str(tmp_path / "knowledge.db")
+
+        # Discrimination check: the naive stub produces exactly the collapsed
+        # "ok, empty" shape that the real implementation must NOT produce
+        # once the instrument is forced unavailable.
+        naive = self._naive_stub(db_path)
+        assert naive["locks"] == {"status": "ok", "rows": [], "pids": [], "truncated": False}, (
+            "fixture assumption broken: naive stub no longer represents the "
+            "collapsed shape this arm exists to reject"
+        )
+
+        real_access = os.access
+
+        def fake_access(path, mode):
+            if path == "/proc/locks":
+                return False
+            return real_access(path, mode)
+
+        monkeypatch.setattr(os, "access", fake_access)
+        forensics = engram_walguard.capture_forensics(db_path)
+
+        assert forensics["locks"]["status"] == "unavailable", (
+            f"expected locks capture to report unavailable when /proc/locks "
+            f"is forced unreadable; got {forensics['locks']}"
+        )
+        assert "why" in forensics["locks"]
+        assert forensics["locks"] != naive["locks"], (
+            "unavailable result must not equal the collapsed 'ok, empty' shape"
+        )
+
+    def test_unavailable_fds_reads_as_unavailable_not_empty(self, tmp_path, monkeypatch):
+        """Forcing /proc/self/fd unavailable (simulating non-Linux, per
+        detect_shm_displacement's own /proc gate) must produce
+        status=='unavailable' — never an empty match list."""
+        db_path = str(tmp_path / "knowledge.db")
+
+        naive = self._naive_stub(db_path)
+        assert naive["fds"] == {"status": "ok", "matches": [], "truncated": False}, (
+            "fixture assumption broken: naive stub no longer represents the "
+            "collapsed shape this arm exists to reject"
+        )
+
+        real_isdir = os.path.isdir
+
+        def fake_isdir(path):
+            if path == "/proc/self/fd":
+                return False
+            return real_isdir(path)
+
+        monkeypatch.setattr(os.path, "isdir", fake_isdir)
+        forensics = engram_walguard.capture_forensics(db_path)
+
+        assert forensics["fds"]["status"] == "unavailable", (
+            f"expected fds capture to report unavailable when /proc/self/fd "
+            f"is absent; got {forensics['fds']}"
+        )
+        assert "why" in forensics["fds"]
+        assert forensics["fds"] != naive["fds"], (
+            "unavailable result must not equal the collapsed 'ok, empty' shape"
+        )
+
+    # -- Cheap context (#3) ---------------------------------------------------
+
+    def test_cheap_context_pid_and_file_facts(self, tmp_path):
+        """pid, per-file existence/st_ino, and -wal size in bytes are present
+        and correct."""
+        db_path = str(tmp_path / "knowledge.db")
+        wal_path = db_path + "-wal"
+        with open(wal_path, "wb") as f:
+            f.write(b"\x00" * 37)
+        expected_wal_ino = os.stat(wal_path).st_ino
+
+        forensics = engram_walguard.capture_forensics(db_path)
+        assert forensics["pid"] == os.getpid()
+        assert forensics["files"]["db"]["exists"] is False
+        assert forensics["files"]["db"]["st_ino"] is None
+        assert forensics["files"]["wal"]["exists"] is True
+        assert forensics["files"]["wal"]["st_ino"] == expected_wal_ino
+        assert forensics["files"]["wal"]["size_bytes"] == 37
+        assert forensics["files"]["shm"]["exists"] is False
+
+    # -- Size guard: cap the fd scan, record truncated:true -------------------
+
+    def test_fd_scan_truncates_with_flag_rather_than_unbounded(self, tmp_path):
+        """The fd scan is capped; a tiny max_scan produces truncated=True
+        rather than an unbounded scan of every open fd."""
+        db_path = str(tmp_path / "knowledge.db")
+        paths = {"db": db_path, "wal": db_path + "-wal", "shm": db_path + "-shm"}
+        result = engram_walguard._capture_fds(paths, max_scan=1)
+        assert result["status"] == "ok"
+        assert result["truncated"] is True
+
+    # -- Lock matching is (device, inode), not inode alone (PR #2653 fold) ---
+
+    def test_lock_capture_ignores_inode_collision_on_a_different_device(
+        self, tmp_path, monkeypatch
+    ):
+        """A /proc/locks row whose inode number matches the target file but
+        whose device does NOT must be excluded — inode numbers are only
+        unique per-filesystem, so matching on inode alone can attribute an
+        unrelated lock on a different device to the target file. This is the
+        reviewer-fairy finding on PR #2653: the pre-fix code parsed only the
+        inode field and discarded the device field entirely."""
+        db_path = str(tmp_path / "knowledge.db")
+        shm_path = db_path + "-shm"
+        with open(shm_path, "wb") as f:
+            f.write(b"x")
+        real_ino = os.stat(shm_path).st_ino
+        real_dev = os.stat(shm_path).st_dev
+        real_maj, real_min = os.major(real_dev), os.minor(real_dev)
+
+        # A device deliberately different from the real one, same inode
+        # number. If dev:min collide too (vanishingly unlikely on any real
+        # host), bump major by 1 until they differ.
+        fake_maj, fake_min = real_maj + 1, real_min
+        assert (fake_maj, fake_min) != (real_maj, real_min)
+
+        fake_line = (
+            f"9: POSIX  ADVISORY  READ 424242 {fake_maj:02x}:{fake_min:02x}:{real_ino} "
+            f"0 EOF\n"
+        )
+        real_line = (
+            f"10: POSIX  ADVISORY  READ 999 {real_maj:02x}:{real_min:02x}:{real_ino} "
+            f"128 128\n"
+        )
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/locks":
+                import io
+
+                return io.StringIO(fake_line + real_line)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        # os.access must still pass so the code reaches the fake open() above.
+        monkeypatch.setattr(
+            os, "access", lambda p, m: True if p == "/proc/locks" else os.path.exists(p)
+        )
+
+        forensics = engram_walguard.capture_forensics(db_path)
+        assert forensics["locks"]["status"] == "ok"
+        assert 424242 not in forensics["locks"]["pids"], (
+            f"a lock on a DIFFERENT device with a colliding inode number was "
+            f"wrongly attributed to the target file; pids={forensics['locks']['pids']!r}"
+        )
+        assert 999 in forensics["locks"]["pids"], (
+            f"the genuinely matching (device, inode) row was dropped; "
+            f"pids={forensics['locks']['pids']!r}"
+        )
+
+    # -- capture_forensics() must never raise ---------------------------------
+
+    def test_capture_forensics_never_raises_on_internal_error(self):
+        """An unexpected internal error degrades to a top-level
+        status=='unavailable' rather than propagating — same contract as the
+        rest of this module.  Deliberately does NOT monkeypatch a global
+        stdlib function (e.g. os.stat) here: doing so would also break
+        pytest's own teardown, which uses os.stat internally.  Passing a
+        non-str db_path triggers the same internal-error path (TypeError on
+        `db_path + "-wal"`) with no blast radius outside this call."""
+        forensics = engram_walguard.capture_forensics(12345)  # type: ignore[arg-type]
+        assert forensics.get("status") == "unavailable"
+        assert "why" in forensics
+
+
+# ---------------------------------------------------------------------------
+# 13. Forensics threaded into the degraded marker (#2635)
+# ---------------------------------------------------------------------------
+
+class TestForensicsInMarker:
+    """write_degraded_marker(..., forensics=...) threads the forensics dict
+    into details["forensics"] — additive only, no change to the marker's
+    existing keys when forensics is omitted."""
+
+    def test_forensics_threaded_into_marker_details(self, tmp_path):
+        data_dir = str(tmp_path)
+        detection = {"reason": "shm_deleted", "fd": 3}
+        forensics = {
+            "pid": 123,
+            "files": {},
+            "locks": {"status": "ok", "rows": [], "pids": [], "truncated": False},
+            "fds": {"status": "ok", "matches": [], "truncated": False},
+        }
+        engram_walguard.write_degraded_marker(
+            data_dir, detection, forensics=forensics
+        )
+        marker = engram_walguard.read_degraded_marker(data_dir)
+        assert marker is not None
+        assert marker["details"]["forensics"] == forensics
+        # Existing keys untouched.
+        assert marker["details"]["reason"] == "shm_deleted"
+        assert marker["details"]["fd"] == 3
+
+    def test_no_forensics_key_when_not_passed(self, tmp_path):
+        """Additive-only: omitting forensics leaves details unchanged — no
+        forensics key at all, not even an empty dict."""
+        data_dir = str(tmp_path)
+        detection = {"reason": "shm_deleted", "fd": 3}
+        engram_walguard.write_degraded_marker(data_dir, detection)
+        marker = engram_walguard.read_degraded_marker(data_dir)
+        assert marker is not None
+        assert "forensics" not in marker["details"]
