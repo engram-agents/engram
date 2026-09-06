@@ -91,12 +91,32 @@ def _assert_tools_package_is_repo_root() -> None:
 def _sys_path_collision_guard():
     """Runs once per test MODULE, after that module's own top-level code
     (including any sys.path manipulation it does at import time) has
-    already executed -- catching the collision at the first module that
-    introduces it, and every module collected after, rather than only at
-    session start before anything could have gone wrong yet. Turns "a new
-    test file quietly breaks a later, unrelated test file" into an
-    immediate, attributable failure naming the actual cause, instead of a
-    confusing ModuleNotFoundError surfacing three files later."""
+    already executed.
+
+    Attribution correction (Borges's colleague-review finding on PR #2661):
+    under pytest's default collect-then-run order (no xdist / pytest-randomly
+    / pytest-order / --forked on this repo), EVERY module is collected --
+    and therefore imported -- before ANY module-scoped fixture runs. So for
+    an IMPORT-TIME collision (a module's own top-level
+    `sys.path.insert(0, ...)`, the actual shape of the #2564/#2565
+    incident), `pytest_collectstart` below has ALREADY caught it before
+    this fixture ever gets a turn on that same module -- this fixture is
+    NOT the first line of defense there, whatever an earlier version of
+    this docstring implied. What this fixture actually, uniquely catches
+    is a RUN-PHASE collision: one a test body introduces during test
+    EXECUTION rather than at import time, which `pytest_collectstart`
+    structurally cannot see (it only fires before collection, never during
+    a test's own run). Keep both -- they cover genuinely different
+    phases -- but don't read this fixture as redundant belt-and-braces on
+    the import-time case; collectstart alone already covers that one.
+
+    Together with `pytest_collectstart`, turns "a new test file quietly
+    breaks a later, unrelated test file" into an immediate, attributable
+    failure naming the actual cause, instead of a confusing
+    ModuleNotFoundError surfacing three files later -- but for the
+    import-time case that credit belongs to `pytest_collectstart`, per
+    the attribution above; this fixture's own share of that credit is
+    the run-phase case only."""
     _assert_tools_package_is_repo_root()
     yield
 
