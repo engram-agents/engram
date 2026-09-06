@@ -56,6 +56,74 @@ The distinguishing principle: **does the decision live in the merged PR?** If no
 
 **Never escape the worktree to work around a failure.** Two equivalent escape patterns to avoid: `cd /home/<user>/<repo> && git ...` (changing cwd to the primary repo) AND `git -C /home/<user>/<repo> ...` (using `-C` flag to operate git on the primary repo from within the worktree). Both silently corrupt the source state you're reviewing — you may end up reviewing the wrong branch's content, or stale content from another worktree, producing a review grounded in code that isn't actually in the PR. If something blocks your worktree-local progress and isn't transient, stop and report — that's the discipline.
 
+## FIRST ACT — assert that you are still standing in your worktree
+
+Everything above assumes you are where the harness put you. **That is a claim
+about the present, and it can be false through no act of yours** — so assert it
+before you read a file, run a test, or run any git command:
+
+```
+pwd                              # where am I actually standing?
+git rev-parse --show-toplevel    # which tree does that path belong to?
+git rev-parse --git-common-dir   # ABSOLUTE path outside this tree = worktree; ANY relative path (.git, ../../../.git) = primary clone
+```
+
+**Two things must hold, and you assert them rather than assume them:** the
+toplevel is the `.claude/worktrees/agent-<id>/` path you were provisioned (or
+another tree you created yourself), and it is **not** the parent's primary
+clone. If either fails, **do not proceed in that tree** — before any checkout,
+any fetch, any file read you would ground a finding in — and go to the
+**recovery below**, which builds you a fresh private worktree; STOP and report
+only if that recovery turns out to be impossible. Either way, say what `pwd`
+returned. Report the clean case too: one line in your review preamble, so the
+parent knows the check actually ran.
+
+The repo-identity assertion in the next section is the second half of this same
+first act, and this half runs first: if you are not where you think you are,
+`git remote get-url origin` answers about the wrong tree — and answers
+*reassuringly*, because the parent's primary clone is a clone of the very repo
+you were expecting.
+
+**Why an assertion and not one more prohibition.** Every other rule on this page
+governs where you may *go*, and **a prohibition cannot fire when nobody
+disobeyed it.** This failure needs no disobedience. Measured 2026-09-06 on a
+sibling coder-fairy, running the same `isolation: worktree` contract you run
+under: it stopped and returned its final report, was resumed by its parent, and
+found its provisioned worktree **gone** — reclaimed when it completed. Your cwd resets between Bash calls, and a cwd whose path no
+longer exists falls back to **the parent's primary clone**; the `git checkout`
+that followed ran in that clone with no error and no warning. That fairy broke
+no rule. It never left its worktree — the worktree left it.
+
+**Do not read that incident's small damage as a small hazard**, and for a
+reviewer the damage has a second face. It cost only a moved branch pointer, and
+only because the parent's clone happened to be clean and sitting on the same
+commit — so HEAD moved between two names for one commit; the identical sequence
+on a dirty primary, or one on a different commit, is destructive. The second
+face is your own output: a checkout you did not know you were making, in a tree
+you did not know you were in, produces a review grounded in whatever that tree
+holds — which is not the PR, and you would have no signal that it wasn't.
+
+**If the assertion fails, build yourself a fresh private worktree.** This is
+the primary response, not a fallback — `git -C <the repo path> worktree add
+<fresh path> --detach origin/<the PR's base>`, then `cd` there and fetch the PR
+head as the next section shows, and work there, for the same reason it gives:
+that CREATES correct isolation rather than borrowing someone else's tree.
+**Never resolve it by simply continuing in the primary clone.** Note what you
+did in your review preamble.
+
+`<the repo path>` is your provisioned worktree path with its
+`/.claude/worktrees/agent-<id>` suffix removed — the parent's primary clone
+(also what `--show-toplevel` returns when the fallback landed you there).
+`<fresh path>` is `<the repo path>/.claude/worktrees/agent-<id>-recovered`:
+that directory is gitignored (`.gitignore:24`), so the recovery never surfaces
+as untracked state in the parent's status.
+
+**If you cannot create the worktree** — path in use, repo path gone — **STOP and
+report.** That is the one place "STOP and report" belongs for this failure: the
+fallback when recovery is impossible, never the first response to the assertion
+failing. A stopped dispatch costs one re-dispatch; a review grounded in a tree
+nobody sanctioned costs the parent a verdict they cannot trust.
+
 ## When your worktree is the WRONG REPO — the one sanctioned exception
 
 Everything above assumes your worktree was cut from the repo your spec targets.
