@@ -59,7 +59,10 @@ def test_reported_broken_order_passes():
     # reasons unrelated to this ordering regression (an added/removed/
     # skipped test in either file) -- that's the fix, not a sign the
     # ordering regression itself came back.
-    assert "90 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2720 added 4 new tests to test_health_engine.py's
+    # TestWriteSnapshot (explicit umask-independent file/dir permissions):
+    # 90 -> 94.
+    assert "94 passed" in proc.stdout, proc.stdout
 
 
 def test_normal_order_still_passes():
@@ -75,7 +78,8 @@ def test_normal_order_still_passes():
     # reasons unrelated to this ordering regression (an added/removed/
     # skipped test in either file) -- that's the fix, not a sign the
     # ordering regression itself came back.
-    assert "90 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2720: 90 -> 94 (see identical note above).
+    assert "94 passed" in proc.stdout, proc.stdout
 
 
 def test_sibling_fresh_server_file_ordering_also_passes():
@@ -93,4 +97,5 @@ def test_sibling_fresh_server_file_ordering_also_passes():
     # test_health_series_hook.py's own test count changes for reasons
     # unrelated to this ordering regression -- see the identical note on
     # test_reported_broken_order_passes above.
-    assert "83 passed" in proc.stdout, proc.stdout
+    # engram-alpha#2720: 83 -> 87 (see identical note above).
+    assert "87 passed" in proc.stdout, proc.stdout

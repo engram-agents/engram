@@ -16,12 +16,18 @@ Tests cover the six cases specified in the PR:
   f. Invalid viz_operator (e.g. 'a; rm -rf') → marker removed, no setfacl.
 """
 
+import getpass
 import importlib.util
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
+
+import pytest
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -529,3 +535,132 @@ class TestNeverRaises:
 
         # Must not raise
         mod._apply_pending_viz_acl(str(engram_home))
+
+
+# ---------------------------------------------------------------------------
+# engram-alpha#2720 — real end-to-end can-it-fail control.
+#
+# Every test above mocks subprocess.run: it proves the CALL SHAPE the
+# consumer builds is right (right flags, right argument order, list-not-
+# shell), but never proves the real setfacl/getfacl binaries actually
+# accept that shape and that the grant genuinely lands on disk. This class
+# runs the REAL tools against a real throwaway directory tree with NO
+# subprocess mocking, and reads the ACL back with an INDEPENDENT `getfacl`
+# call (not the consumer's own internal idempotency check) to confirm the
+# grant took effect. This is the "does the consumer genuinely fire" proof
+# the issue asked for -- if the consumer's argument shape were ever wrong
+# in a way that's invisible to a mocked subprocess.run (a typo in a flag,
+# a missing recursive flag, wrong entry syntax), this is the test that
+# would catch it and the mocked tests above would not.
+# ---------------------------------------------------------------------------
+
+class TestRealSetfaclEndToEnd:
+    def _require_acl_tools(self):
+        if not (shutil.which("setfacl") and shutil.which("getfacl")):
+            pytest.skip("setfacl/getfacl not available in this environment")
+
+    def test_real_grant_makes_operator_an_effective_reader(self, tmp_path, monkeypatch):
+        """Real setfacl/getfacl, real filesystem, no mocking: the deferred
+        marker's grant is applied and independently verifiable via a
+        SEPARATE getfacl invocation than the one the consumer itself uses
+        for its idempotency check."""
+        self._require_acl_tools()
+
+        operator = getpass.getuser()
+        if not operator or not re.match(r"^[a-z_][a-z0-9_-]*$", operator):
+            pytest.skip(
+                f"current user {operator!r} doesn't satisfy the consumer's "
+                "own POSIX-username charset validation -- can't be used as "
+                "viz_operator in this environment"
+            )
+
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        engram_home = home / ".engram"
+        engram_home.mkdir()
+        snapshots_dir = engram_home / "health-snapshots"
+        snapshots_dir.mkdir()
+
+        # A pre-existing snapshot file -- simulating a checkpoint that ran
+        # BEFORE the SessionStart hook ever got a chance to consume the
+        # deferred marker (the exact race #1525/#2720 describe: ENGRAM
+        # installs and starts writing snapshots before finalize-name's
+        # grant has been picked up). Mode set the way engine.py's
+        # write_snapshot now sets it (engram-alpha#2720 item 4).
+        pre_existing = snapshots_dir / "1-nap-20260101T000000Z.json"
+        pre_existing.write_text("{}")
+        os.chmod(pre_existing, 0o640)
+
+        marker = _write_marker(home, viz_operator=operator, chosen_name="testagent")
+
+        mod = _load_hook_module(monkeypatch, engram_home)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setattr(mod.os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+        # Deliberately NOT monkeypatching subprocess.run or shutil.which --
+        # this is the whole point of this test class.
+
+        mod._apply_pending_viz_acl(str(engram_home))
+
+        assert not marker.exists(), (
+            "consumer must have applied the real grant and removed the marker "
+            "-- if this fails, the real setfacl invocation the consumer built "
+            "did not succeed against the real binary (a case the mocked tests "
+            "above cannot catch)"
+        )
+
+        # Independent verification: a SEPARATE getfacl call than the one the
+        # consumer used internally for its own idempotency check.
+        dir_acl = subprocess.run(
+            ["getfacl", "--absolute-names", str(snapshots_dir)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert dir_acl.returncode == 0
+        assert f"user:{operator}:r-x" in dir_acl.stdout, (
+            f"expected an effective r-x grant for {operator!r} on the "
+            f"snapshots dir; getfacl output:\n{dir_acl.stdout}"
+        )
+        assert f"default:user:{operator}:r-x" in dir_acl.stdout, (
+            "expected the DEFAULT ACL (inheritance for future files) to "
+            f"also carry the grant; getfacl output:\n{dir_acl.stdout}"
+        )
+
+        # The pre-existing file is covered too (setfacl -R is recursive).
+        file_acl = subprocess.run(
+            ["getfacl", "--absolute-names", str(pre_existing)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert file_acl.returncode == 0
+        assert f"user:{operator}:" in file_acl.stdout, (
+            f"expected the pre-existing snapshot file to carry a named ACL "
+            f"entry for {operator!r} too; getfacl output:\n{file_acl.stdout}"
+        )
+
+    def test_falsification_wrong_flag_shape_is_caught_by_this_class_not_the_mocked_ones(
+        self, tmp_path, monkeypatch
+    ):
+        """Control demonstrating this class's own value: stub the consumer's
+        setfacl argument list to a subtly WRONG shape (comma inside the
+        entry where a colon belongs -- a plausible typo) and confirm setfacl
+        itself rejects it (non-zero exit), which is exactly the failure mode
+        a mocked subprocess.run can never surface."""
+        self._require_acl_tools()
+
+        operator = getpass.getuser()
+        if not operator or not re.match(r"^[a-z_][a-z0-9_-]*$", operator):
+            pytest.skip(f"current user {operator!r} unusable as viz_operator here")
+
+        home = tmp_path / "agent-home"
+        home.mkdir()
+        engram_home = home / ".engram"
+        engram_home.mkdir()
+
+        result = subprocess.run(
+            ["setfacl", "-R", "-m", f"u,{operator},rX", str(engram_home)],  # broken shape
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode != 0, (
+            "expected the deliberately-malformed setfacl entry to be "
+            "rejected by the real binary -- if it succeeded, this control "
+            "itself is broken and proves nothing about the real form used "
+            "by _apply_pending_viz_acl"
+        )

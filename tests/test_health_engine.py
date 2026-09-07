@@ -1472,6 +1472,118 @@ class TestWriteSnapshot:
         assert "_dream_projection_write_error" not in snap
         assert not error_path.exists()
 
+    # -----------------------------------------------------------------
+    # engram-alpha#2720 — explicit, umask-independent file/dir permissions
+    # so the cross-user operator viz can read snapshots without depending
+    # on an inherited ACL.
+    # -----------------------------------------------------------------
+
+    def test_snapshot_and_dream_projection_file_modes_are_explicit_and_umask_independent(
+        self, tmp_path, monkeypatch
+    ):
+        """Every file write_snapshot writes into health-snapshots/ (the
+        main snapshot + the dream projection) gets an explicit 0o640 mode
+        (owner rw, group r, other none) via os.chmod right after
+        write_text — not left to whatever the process umask happens to
+        produce. Exercised under TWO very different umasks (0o077 —
+        restrictive, would otherwise yield 0o600; 0o000 — permissive,
+        would otherwise yield 0o666) to prove the mode is fixed regardless
+        of which direction the umask would have pushed it."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        for forced_umask in (0o077, 0o000):
+            old_umask = os.umask(forced_umask)
+            try:
+                conn = _make_conn()
+                snap = health_engine.write_snapshot(conn, "nap")
+            finally:
+                os.umask(old_umask)
+
+            assert "_snapshot_write_error" not in snap
+            assert "_dream_projection_write_error" not in snap
+
+            main_mode = os.stat(snap["_snapshot_path"]).st_mode & 0o777
+            dream_mode = os.stat(snap["_dream_projection_path"]).st_mode & 0o777
+            assert main_mode == 0o640, (
+                f"main snapshot mode {oct(main_mode)} under umask "
+                f"{oct(forced_umask)}, expected 0o640"
+            )
+            assert dream_mode == 0o640, (
+                f"dream projection mode {oct(dream_mode)} under umask "
+                f"{oct(forced_umask)}, expected 0o640"
+            )
+
+    def test_falsification_without_the_chmod_fix_umask_would_leak_through(
+        self, tmp_path, monkeypatch
+    ):
+        """Red-first control for the test above: with os.chmod stubbed to
+        a no-op (simulating the pre-#2720 code, which relied on the
+        process umask alone via plain Path.write_text), a restrictive
+        umask produces a mode DIFFERENT from 0o640 — proving the assertion
+        above is not vacuously true and would actually have failed against
+        the old code."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(health_engine.os, "chmod", lambda *a, **k: None)
+
+        old_umask = os.umask(0o077)
+        try:
+            conn = _make_conn()
+            snap = health_engine.write_snapshot(conn, "nap")
+        finally:
+            os.umask(old_umask)
+
+        assert "_snapshot_write_error" not in snap
+        main_mode = os.stat(snap["_snapshot_path"]).st_mode & 0o777
+        assert main_mode != 0o640, (
+            "expected the no-chmod stub to leave the umask-derived mode "
+            f"({oct(main_mode)}) different from the fixed 0o640 — if this "
+            "assertion fails, the control itself is broken, not the fix."
+        )
+
+    def test_snapshot_dir_mode_is_forced_on_first_creation_regardless_of_umask(
+        self, tmp_path, monkeypatch
+    ):
+        """health-snapshots/ itself gets 0o750 at first-creation time,
+        independent of the process umask."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        old_umask = os.umask(0o077)
+        try:
+            conn = _make_conn()
+            health_engine.write_snapshot(conn, "nap")
+        finally:
+            os.umask(old_umask)
+
+        dir_mode = os.stat(tmp_path / "health-snapshots").st_mode & 0o777
+        assert dir_mode == 0o750, f"dir mode {oct(dir_mode)}, expected 0o750"
+
+    def test_snapshot_dir_mode_is_not_reasserted_on_an_existing_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """_snapshot_dir() only chmods a FRESHLY created directory — an
+        already-existing health-snapshots/ (e.g. one an operator has
+        already granted wider ACLs/mode on) is left alone, so
+        write_snapshot never fights a one-shot ACL-repair tool by
+        silently reclipping its mask on every checkpoint."""
+        import engram_core as core
+        monkeypatch.setattr(core, "DATA_DIR", tmp_path)
+
+        snapshots_dir = tmp_path / "health-snapshots"
+        snapshots_dir.mkdir(parents=True)
+        os.chmod(snapshots_dir, 0o770)  # simulate an operator's wider grant
+
+        conn = _make_conn()
+        health_engine.write_snapshot(conn, "nap")
+
+        dir_mode = os.stat(snapshots_dir).st_mode & 0o777
+        assert dir_mode == 0o770, (
+            f"dir mode {oct(dir_mode)} — write_snapshot must not have "
+            "re-chmod'd an already-existing directory"
+        )
+
 
 # ---------------------------------------------------------------------------
 # [PR5] The dream-side projection — draft-2 §2. Fixed filename, aspect-blind

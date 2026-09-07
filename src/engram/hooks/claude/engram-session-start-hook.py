@@ -2384,10 +2384,30 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
         except Exception:
             return  # leave marker on getfacl failure; retry next session
 
-        # Apply ACL — the agent owns ~/.engram, so no sudo required
+        # Apply ACL — the agent owns ~/.engram, so no sudo required.
+        #
+        # engram-alpha#2720: each -m entry list also carries an explicit
+        # `m::rX` mask alongside the named grant, not just `u:{op}:rX` on
+        # its own. GNU setfacl already auto-recomputes the mask on every
+        # -m invocation by default (measured: a bare `u:...:rX` grant here
+        # already produces an unclipped `mask::r-x` on the directory and
+        # on any files that already existed at grant time) — so this is
+        # belt-and-suspenders explicitness, not a fix for an observed
+        # clipped-DIRECTORY-mask bug in the existing bare form. It does
+        # NOT, by itself, fix the effective-permission clipping #2720
+        # actually reports: a NEW file created under this directory's
+        # default ACL *after* the grant gets its OWN freshly-computed mask
+        # from the writing process's umask at creation time, regardless of
+        # what mask value the directory's default ACL carries (measured:
+        # bumping the directory's own default mask to `rwx` did not change
+        # a subsequently-created file's clipped `#effective:r--`). That
+        # per-file clipping is fixed at the WRITER (health/engine.py's
+        # explicit os.chmod after write_text — see write_snapshot), not
+        # here; see this issue's report to the parent for the full
+        # measurement.
         try:
             _r1 = subprocess.run(
-                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX", engram_home],
+                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX,m::rX", engram_home],
                 capture_output=True,
                 timeout=30,
             )
@@ -2395,7 +2415,7 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
                 return  # leave marker; retry next session
 
             _r2 = subprocess.run(
-                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX", engram_home],
+                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX,m::rX", engram_home],
                 capture_output=True,
                 timeout=30,
             )

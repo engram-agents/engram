@@ -264,6 +264,7 @@ this PR replaced the stub with real metrics.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -1532,11 +1533,41 @@ def build_snapshot(
     }
 
 
+# engram-alpha#2720: explicit, umask-independent permissions for
+# health-snapshots/ and everything written into it, so the operator viz
+# (spt, cross-user) can read snapshots without depending on a seat's
+# ~/.engram ACL having been set up (or set up with `-d`, or set up at all
+# before this directory first existed) -- see the module docstring's
+# "The multi-tenant viz" framing in the issue for the failure this fixes.
+# Group-read, NOT group-write or world-anything: spt is a member of every
+# seat's private group (`id spt` lists every `agent-*` group), so plain
+# POSIX group permissions already suffice without relying on ACLs at all;
+# ACLs (agentctl Step 7 / tools/*viz-operator-acl* one-shot repair) are a
+# belt-and-suspenders grant on TOP of these bits, not a replacement.
+_SNAPSHOT_DIR_MODE = 0o750
+_SNAPSHOT_FILE_MODE = 0o640
+
+
 def _snapshot_dir() -> Path:
     import engram_core as core  # lazy — see module-top NOTE
 
     d = core.DATA_DIR / "health-snapshots"
+    existed_before = d.exists()
     d.mkdir(parents=True, exist_ok=True)
+    if not existed_before:
+        # Set the mode explicitly ONLY at first-creation time -- never
+        # re-chmod an already-existing directory. A directory that already
+        # carries POSIX ACLs (from agentctl's rename-time grant or the
+        # one-shot repair tool) has its ACL MASK entry silently rewritten
+        # to match chmod's "group" class bits whenever chmod runs on it
+        # (that's how extended-ACL semantics work) -- reapplying 0750 on
+        # every checkpoint would repeatedly reclip whatever mask the ACL
+        # tooling set, fighting item 2's mask fix instead of complementing
+        # it. Only a brand-new directory has no such grant yet to clobber.
+        try:
+            os.chmod(d, _SNAPSHOT_DIR_MODE)
+        except OSError:
+            pass  # best-effort -- see write_snapshot's docstring
     return d
 
 
@@ -1705,6 +1736,23 @@ def write_snapshot(
     and [PR5] the aspect-blind dream-side projection at the FIXED path
     ``DATA_DIR/health-snapshots/health-snapshot-dream.json`` (draft-2 §2).
 
+    [engram-alpha#2720] Every file this function writes into
+    ``health-snapshots/`` (the main snapshot, the dream projection, and its
+    ``.error`` sentinel) gets its mode set explicitly to
+    ``_SNAPSHOT_FILE_MODE`` (0o640: owner rw, group r, other none) via
+    ``os.chmod`` right after each ``write_text`` call, rather than relying
+    on the process umask -- a restrictive umask (or none at all) previously
+    left snapshots unreadable by the cross-user, multi-tenant operator viz
+    on seats whose ``~/.engram`` never got a `default:user:spt:r-x` ACL (or
+    got one before ``health-snapshots/`` existed). Group-read is
+    sufficient because the operator viz account is a member of every
+    seat's private group; this is belt-and-suspenders with, not a
+    replacement for, the ACL grant agentctl/the one-shot repair tool set
+    separately. The containing directory gets the same treatment (0o750)
+    but ONLY at first-creation time -- see ``_snapshot_dir()``'s comment
+    for why re-chmod'ing an already-existing directory is deliberately
+    avoided.
+
     JUDGMENT CALL (flagged in the PR2 report): the design doc calls these
     "versioned snapshots as SSoT" and says several consumers will render
     them (later PRs), which implies real persistence, not a computed-then-
@@ -1761,6 +1809,11 @@ def write_snapshot(
     path = _snapshot_dir() / filename
     try:
         path.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+        # engram-alpha#2720: explicit, umask-independent mode -- see
+        # _SNAPSHOT_FILE_MODE's comment above _snapshot_dir(). A chmod
+        # failure here is folded into the same best-effort
+        # _snapshot_write_error path as the write itself (both OSError).
+        os.chmod(path, _SNAPSHOT_FILE_MODE)
         snapshot["_snapshot_path"] = str(path)
     except OSError as e:
         snapshot["_snapshot_write_error"] = str(e)
@@ -1771,6 +1824,7 @@ def write_snapshot(
         dream_path.write_text(
             json.dumps(projection, indent=2, sort_keys=True), encoding="utf-8"
         )
+        os.chmod(dream_path, _SNAPSHOT_FILE_MODE)  # engram-alpha#2720
         snapshot["_dream_projection_path"] = str(dream_path)
         try:
             _dream_projection_error_path().unlink(missing_ok=True)
@@ -1793,6 +1847,7 @@ def write_snapshot(
                 ),
                 encoding="utf-8",
             )
+            os.chmod(_dream_projection_error_path(), _SNAPSHOT_FILE_MODE)  # #2720
         except OSError:
             pass  # sentinel write is itself best-effort — see docstring
 

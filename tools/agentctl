@@ -87,12 +87,228 @@
 set -euo pipefail
 
 SHARED_ROOT="/home/agents-shared"
+
 # Viz/operator account that needs read access to agent ~/.engram dirs for the
 # viz dashboard (knowledge.db dropdown) and write access to config.json for
-# the viz config tab. Override via env var; empty string disables the ACL step.
-VIZ_OPERATOR="${VIZ_OPERATOR:-spt}"
+# the viz config tab.
+#
+# NO DEFAULT (engram-alpha#2720, Lei's ruling): a hardcoded local account name
+# ("spt") in shipped code was a functional leak of one host's personal setting
+# into every other install. Every install must set this explicitly:
+#   - persistently: put `VIZ_OPERATOR=<name>` in $AGENTCTL_CONFIG (parsed
+#     below if present — plain KEY=VALUE lines, one per line; see the
+#     security note on _read_viz_operator_from_config below for why this
+#     file is PARSED, never sourced);
+#   - one-off: VIZ_OPERATOR=<name> sudo agentctl <subcommand> ...
+# cmd_finalize_name is the command that actually consumes VIZ_OPERATOR (its
+# Step 7 grants the operator an ACL on the newborn's ~/.engram*). cmd_spawn
+# does NOT read VIZ_OPERATOR itself -- its own operator-facing step is an
+# unrelated `chgrp agents` for shared-group traversal -- but it preflights
+# anyway (per Lei's ruling) so a newborn is never created without a viable
+# path to being finalized later. Both (and the fleet-repair tool,
+# tools/grant_viz_operator_acl.py) refuse loudly via _require_viz_operator
+# when this is empty, before any useradd/usermod/setfacl mutation. Every
+# other subcommand (health, session, attach, bash, share, ...) does not
+# consume VIZ_OPERATOR and keeps working regardless of whether it's set.
+AGENTCTL_CONFIG="$SHARED_ROOT/agentctl.conf"
+
+# _read_viz_operator_from_config: restricted, NON-EXECUTING read of a
+# `VIZ_OPERATOR=<value>` line from $AGENTCTL_CONFIG.
+#
+# $SHARED_ROOT ("/home/agents-shared") is mode 3775, group "agents" --
+# writable by every agent account on the fleet, NOT root-only. This file
+# must therefore never be `source`d (full shell evaluation of arbitrary
+# syntax): any unprivileged agent account could plant
+# `/home/agents-shared/agentctl.conf` with a command in it, which would then
+# execute with the privilege of whoever next runs agentctl with
+# VIZ_OPERATOR unset -- including root, since agentctl is frequently run via
+# sudo. This is an unauthenticated root-code-execution vector, live-
+# demonstrated by a reviewer-fairy against the prior `source`-based
+# implementation on engram-alpha#2734/PR #2734.
+#
+# Only plain KEY=VALUE line parsing is performed here -- no `source`, no
+# `eval`, no variable expansion, no command substitution: whatever text
+# follows `VIZ_OPERATOR=` on the first matching line is taken as a literal
+# string, nothing more. Mirrors
+# src/engram/tools/grant_viz_operator_acl.py's
+# `_read_viz_operator_from_config` (same file, same contract) so both
+# consumers of $AGENTCTL_CONFIG agree on what's a legal line: blank lines
+# and `#`-prefixed comments are skipped, and a single layer of matching
+# single/double quotes around the value is stripped. Prints the value of
+# the FIRST matching VIZ_OPERATOR= line (nothing printed if the file has no
+# such line, or if the matched value is empty after stripping); always
+# returns 0 -- callers decide what an empty result means (here: fall
+# through to _require_viz_operator's "unset" refusal).
+#
+# Usage: _read_viz_operator_from_config <config_path>
+_read_viz_operator_from_config() {
+    local config_path="$1"
+    local line key value first last
+    [[ -f "$config_path" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" == \#* ]] && continue
+        [[ "$line" != *"="* ]] && continue
+        key="${line%%=*}"
+        key="${key%"${key##*[![:space:]]}"}"
+        [[ "$key" != "VIZ_OPERATOR" ]] && continue
+        value="${line#*=}"
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        if [[ ${#value} -ge 2 ]]; then
+            first="${value:0:1}"
+            last="${value: -1}"
+            if [[ "$first" == "$last" && ( "$first" == '"' || "$first" == "'" ) ]]; then
+                value="${value:1:-1}"
+            fi
+        fi
+        [[ -n "$value" ]] && printf '%s\n' "$value"
+        return 0
+    done < "$config_path"
+    return 0
+}
+
+# _viz_operator_conf_provenance_ok: PURE ownership/permission check over an
+# EXPLICIT (uid, mode) pair -- not over any real file. Returns 0 (ok) iff
+# uid == 0 (root-owned) AND mode grants no group or other write bit
+# (mode & 0022 == 0).
+#
+# engram-alpha#2720/PR #2734, colleague-review residual gap: parsing
+# $AGENTCTL_CONFIG as plain KEY=VALUE (not `source`) closed the
+# code-execution vector above, but VIZ_OPERATOR's VALUE was still trusted
+# as AUTHORIZATION (it becomes the setfacl ACL grantee) with no check on
+# who controls the file it came from. $SHARED_ROOT is group-writable by
+# every agent account, so any agent could still plant this file and choose
+# who gets ACL read access to every seat's health snapshots.
+#
+# Deliberately does NOT use a bash file-test operator like `[ -O "$file" ]`
+# (or, in the Python fleet-repair tool, `os.stat().st_uid == os.getuid()`):
+# agentctl itself typically runs as root (via sudo), so either check would
+# be trivially satisfied by the CALLER's identity, not the file's actual
+# owner -- an attacker-planted file passes right through. Comparing against
+# uid 0 explicitly, rather than the caller's own uid, is the fix. This
+# mirrors the OpenSSH StrictModes pattern (refuse a config/key file that
+# isn't owned by the expected principal and isn't group/other-writable).
+#
+# Usage: _viz_operator_conf_provenance_ok <uid> <octal_mode>
+_viz_operator_conf_provenance_ok() {
+    local uid="$1" mode="$2"
+    [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( uid == 0 )) || return 1
+    (( (8#$mode) & 8#022 )) && return 1
+    return 0
+}
+
+# _viz_operator_config_value_if_provenance_ok: the provenance DECISION + read,
+# taking the file's uid/mode as EXPLICIT arguments rather than stat-ing the
+# file itself. Separating this from the real stat call is what lets the test
+# suite exercise "a root-owned, non-writable-shaped config's value is
+# correctly read through" and "a root-owned-but-group-writable config is
+# rejected" without needing to literally chown a test fixture to root
+# (impossible in an unprivileged test sandbox) -- mirrors this repo's
+# established pure/side-effecting split (e.g.
+# grant_viz_operator_acl.py's plan_for_seat/apply_seat_plan).
+#
+# On provenance failure: emits a specific WARNING to stderr naming exactly
+# why the file was rejected (distinct from "file doesn't exist", which is
+# silent -- see _resolve_viz_operator_from_config below) and prints nothing
+# on stdout. On provenance success: delegates to _read_viz_operator_from_config
+# for the actual value extraction. Always returns 0 -- callers decide what an
+# empty result means (fall through to _require_viz_operator's "unset"
+# refusal).
+#
+# Usage: _viz_operator_config_value_if_provenance_ok <config_path> <uid> <mode>
+_viz_operator_config_value_if_provenance_ok() {
+    local config_path="$1" uid="$2" mode="$3"
+    if _viz_operator_conf_provenance_ok "$uid" "$mode"; then
+        _read_viz_operator_from_config "$config_path"
+    else
+        echo "WARNING: $config_path exists but failed its ownership/permission check." >&2
+        echo "         It must be owned by root (uid 0) and not writable by group or" >&2
+        echo "         other -- otherwise any agent account on this shared-writable" >&2
+        echo "         host could plant it and choose who gets ACL read access to" >&2
+        echo "         every seat's ENGRAM data (VIZ_OPERATOR's value is trusted as" >&2
+        echo "         AUTHORIZATION, not just as text)." >&2
+        echo "         Refusing to trust its contents for this invocation; treating" >&2
+        echo "         VIZ_OPERATOR as if the file were absent." >&2
+        echo "         Fix: sudo chown root:root $config_path && sudo chmod go-w $config_path" >&2
+    fi
+    return 0
+}
+
+# _resolve_viz_operator_from_config: the real top-level entry point -- stats
+# the actual file and delegates the accept/reject decision to the function
+# above. Prints the resolved value (or nothing) on stdout. Prints NOTHING
+# (not even a warning) when the file doesn't exist at all, or when its
+# metadata can't be read -- that is the plain "unset" case, deliberately
+# distinct from "exists but rejected" (which warns, via the function above).
+# Always returns 0.
+#
+# Usage: _resolve_viz_operator_from_config <config_path>
+_resolve_viz_operator_from_config() {
+    local config_path="$1"
+    [[ -f "$config_path" ]] || return 0
+    local stat_out uid mode
+    stat_out="$(stat -c '%u %a' "$config_path" 2>/dev/null)" || return 0
+    read -r uid mode <<< "$stat_out"
+    _viz_operator_config_value_if_provenance_ok "$config_path" "$uid" "$mode"
+}
+
+if [[ -z "${VIZ_OPERATOR:-}" && -f "$AGENTCTL_CONFIG" ]]; then
+    VIZ_OPERATOR="$(_resolve_viz_operator_from_config "$AGENTCTL_CONFIG")"
+fi
+VIZ_OPERATOR="${VIZ_OPERATOR:-}"
 SUBCMD="${1:-help}"
 [[ $# -gt 0 ]] && shift
+
+# _require_viz_operator: preflight gate for VIZ_OPERATOR-consuming commands.
+# Refuses loudly, before any useradd/usermod/setfacl mutation, when
+# VIZ_OPERATOR is unset or empty — no default (engram-alpha#2720: "remove
+# that spt default, fail loud if that parameter is missing, and guide user
+# set it"). Names the variable, explains its purpose, and shows both the
+# persistent (config file) and one-off (env var) fix. Does NOT gate
+# unrelated subcommands — only cmd_finalize_name (which actually consumes
+# VIZ_OPERATOR) and cmd_spawn (which preflights it early so a newborn is
+# never created without a viable finalize-name path) invoke this.
+#
+# Usage: _require_viz_operator <calling-subcommand-name>
+_require_viz_operator() {
+    local caller="$1"
+    [[ -n "${VIZ_OPERATOR:-}" ]] && return 0
+    echo "ERROR: VIZ_OPERATOR is not set." >&2
+    echo "       VIZ_OPERATOR names the human operator account that runs the" >&2
+    echo "       viz dashboard and needs read-only access to every seat's" >&2
+    echo "       ENGRAM data (health snapshots, knowledge.db) plus read-write" >&2
+    echo "       on each seat's config.json. '$caller' will not proceed" >&2
+    echo "       without it — there is no default." >&2
+    echo "" >&2
+    echo "       Set it persistently for this host:" >&2
+    echo "         echo 'VIZ_OPERATOR=<operator-username>' | sudo tee -a $AGENTCTL_CONFIG" >&2
+    echo "" >&2
+    echo "       Or set it for a single invocation:" >&2
+    echo "         VIZ_OPERATOR=<operator-username> sudo $0 $caller ..." >&2
+    exit 3
+}
+
+# _viz_operator_charset_ok: charset gate for VIZ_OPERATOR immediately before
+# it is embedded in a setfacl ACL-entry string (e.g. "u:${VIZ_OPERATOR}:rX").
+# setfacl parses its entry-list argument as COMMA-separated ACL entries, so
+# an unvalidated value containing a comma could inject an additional,
+# unintended ACL entry -- e.g. VIZ_OPERATOR="spt,u:evil:rwx" would grant
+# "evil" rwx too, not merely fail to match "spt" (engram-alpha#2734
+# suggestion 2). Mirrors the POSIX-username charset check already enforced
+# in hooks/claude/engram-session-start-hook.py's _apply_pending_viz_acl
+# (identical regex, same purpose, a different consumer of the same
+# VIZ_OPERATOR value) so all three consumers agree on what's a legal
+# operator name.
+#
+# Usage: _viz_operator_charset_ok <value>   (returns 0 = ok, 1 = invalid)
+_viz_operator_charset_ok() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]]
+}
 
 # ---------- helpers ----------
 list_agents() {
@@ -950,6 +1166,7 @@ cmd_attach() {
 
 cmd_spawn() {
     require_root "spawn"
+    _require_viz_operator "spawn"
 
     local runtime="claude"
     local alpha_source=""
@@ -1064,6 +1281,7 @@ NEXT
 
 cmd_finalize_name() {
     require_root "finalize-name"
+    _require_viz_operator "finalize-name"
 
     local newborn_tag="${1:-}"; shift || true
     local chosen="${1:-}"; shift || true
@@ -1621,11 +1839,28 @@ JSON
     # can read knowledge.db; rw on config.json so the viz config tab can edit
     # it. Uses the per-config-ACL model: config-write via POSIX ACL.
     # Handles ~/.engram-<lineage> variants (e.g. .engram-gemini).
-    # Non-fatal: skipped gracefully when VIZ_OPERATOR is empty, setfacl is
-    # absent, or no engram dir exists yet (agent installs ENGRAM post-finalize).
+    # Non-fatal: skipped gracefully when VIZ_OPERATOR has an invalid
+    # charset, setfacl is absent, or no engram dir exists yet (agent
+    # installs ENGRAM post-finalize). VIZ_OPERATOR itself being empty is
+    # NOT handled here -- this function's own preflight
+    # (_require_viz_operator "finalize-name", at the top of
+    # cmd_finalize_name) already refuses loudly and exits before any
+    # mutation, including reaching this point, whenever VIZ_OPERATOR is
+    # unset or empty. A prior "skipped (VIZ_OPERATOR not set)" branch here
+    # was therefore unreachable dead code (confirmed: nothing between that
+    # preflight and here reassigns VIZ_OPERATOR) and has been removed
+    # (engram-alpha#2734 suggestion 3) -- it also silently documented a
+    # capability (deliberately setting VIZ_OPERATOR="" to skip only the ACL
+    # grant while still running finalize-name) that the preflight had
+    # already foreclosed, and nothing else in the repo relies on that
+    # opt-out.
     local _viz_acl_result
-    if [[ -z "${VIZ_OPERATOR:-}" ]]; then
-        _viz_acl_result="skipped (VIZ_OPERATOR not set)"
+    if ! _viz_operator_charset_ok "$VIZ_OPERATOR"; then
+        # Refuse to embed an unvalidated value in a setfacl ACL-entry string
+        # (see _viz_operator_charset_ok above for why: setfacl parses
+        # comma-separated entries, so a malformed value could inject an
+        # additional, unintended ACL grant).
+        _viz_acl_result="skipped (VIZ_OPERATOR '${VIZ_OPERATOR}' has an invalid charset -- must be lowercase letters, digits, underscore, or hyphen, starting with a letter or underscore -- refusing to embed in a setfacl ACL-entry string)"
     elif ! command -v setfacl >/dev/null 2>&1; then
         _viz_acl_result="skipped (setfacl not available)"
     else
@@ -1944,6 +2179,90 @@ cmd__expand_session_args() {
 }
 
 # Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __require-viz-operator <caller-name>
+# Exercises _require_viz_operator directly — no sudo, no real users, no
+# mutation. Exit 0 + "OK" on stdout when VIZ_OPERATOR is set; exit 3 + the
+# naming-the-variable/setting-path guidance on stderr when it is not. Used
+# by the test suite to verify the preflight gate that cmd_spawn and
+# cmd_finalize_name run before any useradd/usermod (engram-alpha#2720).
+cmd__require_viz_operator() {
+    local caller="${1:-}"
+    [[ -z "$caller" ]] && { echo "Usage: agentctl __require-viz-operator <caller-name>" >&2; exit 2; }
+    _require_viz_operator "$caller"
+    echo "OK"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __read-viz-operator-config <config-path>
+# Exercises _read_viz_operator_from_config directly against an arbitrary
+# path (never the real $AGENTCTL_CONFIG) — no sudo, no real users, no
+# mutation, no shell evaluation of the target file's contents. Prints the
+# extracted VIZ_OPERATOR value (or nothing) on stdout; always exits 0. Used
+# by the test suite to verify the restricted, non-executing config-parsing
+# fix (engram-alpha#2734: the prior `source`-based implementation was an
+# unauthenticated root-code-execution vector).
+cmd__read_viz_operator_config() {
+    local config_path="${1:-}"
+    [[ -z "$config_path" ]] && { echo "Usage: agentctl __read-viz-operator-config <config-path>" >&2; exit 2; }
+    _read_viz_operator_from_config "$config_path"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __viz-operator-conf-provenance-ok <uid> <octal_mode>
+# Exercises _viz_operator_conf_provenance_ok directly with EXPLICIT integer
+# args -- no real file, no stat call, no root needed. Exit 0 = provenance
+# would be accepted; exit 1 = rejected. Used by the test suite to cover the
+# provenance-check logic exhaustively (root-owned+non-writable accepted;
+# root-owned+group/other-writable rejected; non-root-owned rejected
+# regardless of mode) without needing a root-owned test fixture
+# (engram-alpha#2720 colleague-review residual gap).
+cmd__viz_operator_conf_provenance_ok() {
+    local uid="${1:-}" mode="${2:-}"
+    _viz_operator_conf_provenance_ok "$uid" "$mode"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __viz-operator-config-value-if-provenance-ok <config_path> <uid> <mode>
+# Exercises _viz_operator_config_value_if_provenance_ok directly -- a real
+# config file's path, but a CALLER-SUPPLIED (uid, mode) pair rather than a
+# real stat(1) result. This is the seam the test suite uses to prove that a
+# config whose provenance WOULD be accepted (uid=0, non-writable mode) has
+# its VIZ_OPERATOR value read through correctly, and that a config whose
+# provenance WOULD be rejected produces no value plus the distinguishing
+# stderr warning -- all without needing to chown a fixture to root.
+cmd__viz_operator_config_value_if_provenance_ok() {
+    local config_path="${1:-}" uid="${2:-}" mode="${3:-}"
+    [[ -z "$config_path" ]] && { echo "Usage: agentctl __viz-operator-config-value-if-provenance-ok <config_path> <uid> <mode>" >&2; exit 2; }
+    _viz_operator_config_value_if_provenance_ok "$config_path" "$uid" "$mode"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __resolve-viz-operator-from-config <config_path>
+# Exercises _resolve_viz_operator_from_config directly against a REAL path
+# (including this process's own real stat(1) call) -- never the real
+# $AGENTCTL_CONFIG. Used by the test suite to cover the two cases that don't
+# require faking uid: a missing file (silent, no warning) and a real,
+# test-owned file (never root-owned in an unprivileged test sandbox, so
+# this always exercises the rejection + warning path end-to-end).
+cmd__resolve_viz_operator_from_config() {
+    local config_path="${1:-}"
+    [[ -z "$config_path" ]] && { echo "Usage: agentctl __resolve-viz-operator-from-config <config_path>" >&2; exit 2; }
+    _resolve_viz_operator_from_config "$config_path"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
+# Usage: agentctl __viz-operator-charset-ok <value>
+# Exercises _viz_operator_charset_ok directly — no sudo, no real users, no
+# setfacl invocation. Exit 0 if the charset is a legal shape; exit 1
+# otherwise. Used by the test suite to verify the charset gate that Step 7
+# of cmd_finalize_name checks before embedding VIZ_OPERATOR in a setfacl
+# ACL-entry string (engram-alpha#2734 suggestion 2).
+cmd__viz_operator_charset_ok() {
+    local value="${1:-}"
+    _viz_operator_charset_ok "$value"
+}
+
+# Not listed in user-facing help (internal verb, invoked programmatically).
 # Usage: agentctl __validate-chosen-name <chosen>
 # Applies the same lowercase-normalization + regex validation that finalize-name
 # uses, without requiring root or a real newborn user. Used by the test suite.
@@ -2018,6 +2337,12 @@ case "$SUBCMD" in
     help|--help|-h) cmd_help ;;
     __codex-managed-session) cmd__codex_managed_session "$@" ;;
     __expand-session-args) cmd__expand_session_args "$@" ;;
+    __require-viz-operator) cmd__require_viz_operator "$@" ;;
+    __read-viz-operator-config) cmd__read_viz_operator_config "$@" ;;
+    __viz-operator-conf-provenance-ok) cmd__viz_operator_conf_provenance_ok "$@" ;;
+    __viz-operator-config-value-if-provenance-ok) cmd__viz_operator_config_value_if_provenance_ok "$@" ;;
+    __resolve-viz-operator-from-config) cmd__resolve_viz_operator_from_config "$@" ;;
+    __viz-operator-charset-ok) cmd__viz_operator_charset_ok "$@" ;;
     __validate-chosen-name) cmd__validate_chosen_name "$@" ;;
     __as-self-check) cmd__as_self_check "$@" ;;
     __parse-session-flags) cmd__parse_session_flags "$@" ;;
