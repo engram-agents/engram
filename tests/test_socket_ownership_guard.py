@@ -714,6 +714,24 @@ class _ForceUnsupervisedMixin:
         return super()._run(timeout=timeout, extra_env=merged_env)
 
 
+def _shell_stat_identity(path) -> str:
+    """Python-side mirror of the guard's own `_stat_identity()` shell
+    function (`stat -c '%d:%i:%W' <path>`) -- shells out to the real `stat`
+    binary for byte-for-byte parity with what the shipped script actually
+    runs, since Python's os.stat() does not expose the Linux statx
+    birth-time field. Returns "" if the path does not exist (mirrors the
+    shell function's empty-string-on-nonzero-exit behavior). Used by
+    TestRaceHookIdentityChangeIsGuaranteed (#2703) to test the
+    scenario-5 race-hook mechanism directly, independent of the full
+    script-under-test."""
+    try:
+        return subprocess.check_output(
+            ["stat", "-c", "%d:%i:%W", str(path)], stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
 class _SocketGuardFixture(unittest.TestCase):
     """Shared setup: a real, executable copy of start-engram-daemon.sh (or
     the frozen pre-unit-2 variant) with {{PYTHON}} substituted, next to a
@@ -1113,7 +1131,41 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
     immediately-pre-delete stat, via the test-only race hook (see
     _patch_in_race_hook). Deliberately does NOT bind a new listener at the
     replacement path -- proving the mismatch alone (pure stat() identity)
-    is sufficient to refuse, with no live holder found at all."""
+    is sufficient to refuse, with no live holder found at all.
+
+    #2703: the race-hook mechanism itself must GUARANTEE the on-disk
+    identity actually changes -- an unlink() immediately followed by a
+    bind() at the SAME path does not reliably guarantee this. Diagnosed via
+    `bash -x` tracing (repro script, not committed): on this host's ext4
+    filesystem, a just-freed inode is frequently the very NEXT inode number
+    handed out for a new file created in the same directory -- measured
+    16/20 unlink-then-rebind trials producing a byte-identical
+    `dev:inode:%W` triplet pre/post (`%W`, the GNU-coreutils statx-backed
+    birth time, has only 1-second resolution, and the whole hook completes
+    in well under 100ms, so even a genuinely fresh allocation can't be
+    relied on to bump it). When that collision happens, the guard's own
+    stat-identity race check (A) finds no disagreement and falls through to
+    live-holder identification (B), which finds no holder (the hook's
+    socket is closed immediately) and ALLOWS the delete -- reproducing
+    exactly the observed symptom (no "socket-guard" line in the log). This
+    explains the order-dependence reported in #2703: this test failed
+    ~90% of standalone runs (low inode churn nearby) but passed reliably
+    as part of the full file (busy nearby inode traffic from sibling
+    tests' own socket/subprocess churn perturbs which inode the allocator
+    hands back) -- host-filesystem behavior, not Python-side state leakage
+    and not a bug in the shipped script.
+
+    Fix: bind the REPLACEMENT socket at a SCRATCH path FIRST, while the
+    original path's inode is still allocated (not yet unlinked), then
+    `os.rename()` the scratch socket over the original path. Since the
+    scratch bind()'s inode allocation happens strictly before the
+    original's inode is freed, the allocator structurally cannot hand back
+    the same number -- this guarantees a byte-different identity
+    deterministically, with no dependence on timing, sleep, or host speed.
+    Measured 20/20 with this approach (vs. 16/20 FAILURES for the old
+    unlink-then-rebind approach, same host, same loop) -- see
+    TestRaceHookIdentityChangeIsGuaranteed below, the permanent regression
+    control for this specific mechanism."""
 
     RACE_HOOK = True
 
@@ -1128,18 +1180,26 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
         srv.close()
         self.assertTrue(self.socket_path.exists())
 
-        # The race-hook script: unlink the original file and bind a FRESH
-        # socket at the same path (new inode, new birth time), then close
-        # it immediately -- deliberately leaving no live holder, so a
-        # pass here can only be explained by the identity-mismatch check
-        # itself, not by any live-holder signal.
+        # The race-hook script (#2703 fix): bind the FRESH replacement
+        # socket at a SCRATCH path first -- the original file at
+        # self.socket_path is still on disk/allocated at this point, so the
+        # scratch bind() cannot possibly be handed the original's inode --
+        # then atomically os.rename() it over the original path, and close
+        # it immediately, deliberately leaving no live holder. This
+        # guarantees the post-hook on-disk identity (dev:inode:%W) differs
+        # from the pre-hook one, so a pass here can only be explained by
+        # the identity-mismatch check itself, not by any live-holder
+        # signal, AND not by luck of which inode the allocator happened to
+        # reuse (see class docstring).
         hook_path = self.tmp / "race_hook.sh"
+        scratch_path = f"{self.socket_path}.new"
         hook_src = (
             "#!/bin/bash\n"
             f"{sys.executable} -c \"import socket, os; "
-            f"os.unlink('{self.socket_path}'); "
             "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); "
-            f"s.bind('{self.socket_path}'); s.listen(1); s.close()\"\n"
+            f"s.bind('{scratch_path}'); s.listen(1); "
+            f"os.rename('{scratch_path}', '{self.socket_path}'); "
+            "s.close()\"\n"
         )
         hook_path.write_text(hook_src)
         hook_path.chmod(hook_path.stat().st_mode | stat.S_IXUSR)
@@ -1170,6 +1230,104 @@ class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _So
 
         self.assertNotIn("socket-guard", content)
         self.assertFalse(self.socket_path.exists())
+
+
+# ===========================================================================
+# #2703 regression control: the scenario-5 race-hook mechanism must ALWAYS
+# produce a changed on-disk stat() identity -- isolates the root cause of the
+# test-order-dependent failure diagnosed on issue #2703, independent of the
+# full script-under-test.
+# ===========================================================================
+
+
+class TestRaceHookIdentityChangeIsGuaranteed(unittest.TestCase):
+    """Permanent regression control for issue #2703's diagnosed root cause.
+
+    TestRaceDetectionBlocksEvenWithoutALiveHolder's own race hook (see that
+    class's docstring) simulates a mid-run socket replacement by making the
+    on-disk special file's stat() identity (dev:inode:%W) differ between the
+    guard's pre-kill-loop snapshot and its immediately-pre-delete snapshot.
+    The guard's own race-detection branch (A) depends ENTIRELY on that
+    difference actually materializing -- if it doesn't, the guard silently
+    falls through to live-holder identification (B), finds no holder (the
+    hook's own socket is closed immediately), and allows the delete, which
+    is exactly the symptom #2703 reports (no "socket-guard" line in the log,
+    order-dependent pass/fail).
+
+    Diagnosis: the ORIGINAL hook did `os.unlink(path)` immediately followed
+    by a fresh `bind()` at the SAME path. On this host's ext4 filesystem, a
+    just-freed inode is frequently the very NEXT inode number the allocator
+    hands out for a new file created in the same directory -- measured
+    16/20 unlink-then-rebind trials producing a byte-identical
+    `dev:inode:%W` triplet pre/post (`%W` has only 1-second resolution, and
+    the whole hook completes in well under 100ms, so even a genuinely fresh
+    allocation event can't be relied on to bump it within the same wall-clock
+    second). This is a HOST-FILESYSTEM-BEHAVIOR race in the test's own
+    simulation mechanism, not Python-side state leakage between tests and
+    not a bug in the shipped script -- it explains #2703's order-dependence
+    directly: low nearby inode-churn (running this single test standalone)
+    makes the collision highly likely; busy nearby inode churn (sibling
+    tests' own socket/subprocess activity, as when running the full file)
+    makes it unlikely.
+
+    Fix (applied to TestRaceDetectionBlocksEvenWithoutALiveHolder's hook):
+    bind the REPLACEMENT socket at a SCRATCH path FIRST, while the original
+    path's inode is still allocated (not yet unlinked), then `os.rename()`
+    the scratch socket over the original path. Since the scratch bind()'s
+    inode allocation happens strictly before the original's inode is freed,
+    the allocator structurally cannot hand back the same number -- this
+    guarantees a byte-different identity deterministically, independent of
+    timing, sleep, or host speed.
+
+    This control exercises that exact mechanism directly (not through the
+    full script-under-test, so it stays fast and isolates the one property
+    that matters) N_TRIALS times and asserts every trial changes identity.
+    Verified during diagnosis (not re-asserted here, to avoid a permanently
+    flaky CI assertion tied to host filesystem behavior) that the OLD
+    unlink-then-rebind mechanism, run through this identical loop on this
+    same host, failed 16/20 trials -- confirming this control discriminates
+    the diagnosed defect from the fix rather than passing regardless of
+    which mechanism is under test."""
+
+    N_TRIALS = 20
+
+    def test_bind_then_rename_hook_always_changes_stat_identity(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "probe.sock"
+            scratch = Path(d) / "probe.sock.new"
+            failures = []
+            for i in range(self.N_TRIALS):
+                srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+                srv.bind(str(path))
+                srv.listen(1)
+                pre = _shell_stat_identity(path)
+                srv.close()
+
+                # The fixed hook mechanism: bind the replacement at a
+                # scratch path FIRST (the original's inode is still
+                # allocated -- not yet unlinked), then atomically rename it
+                # into place. See class docstring for why this guarantees a
+                # distinct identity where unlink-then-rebind did not.
+                new_srv = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
+                new_srv.bind(str(scratch))
+                new_srv.listen(1)
+                os.rename(str(scratch), str(path))
+                post = _shell_stat_identity(path)
+                new_srv.close()
+                os.unlink(str(path))
+
+                if not pre or not post or pre == post:
+                    failures.append((i, pre, post))
+
+            self.assertEqual(
+                failures, [],
+                f"{len(failures)}/{self.N_TRIALS} trials failed to produce a "
+                "changed (and non-empty) stat() identity via the bind-then-"
+                "rename mechanism -- the fix's core guarantee (scratch bind "
+                "precedes the original's unlink, so the allocator cannot "
+                "reuse the freed inode) has regressed: "
+                f"{failures!r}",
+            )
 
 
 # ===========================================================================
