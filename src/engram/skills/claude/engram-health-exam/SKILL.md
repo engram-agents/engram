@@ -170,6 +170,75 @@ migrations touch the graph and require deliberate action.
 
 ---
 
+## Step 5.5 — FTS ranking-path integrity
+
+`nodes_fts` is an external-content FTS5 table: the index stores tokens/positions only, and *ranking* a
+match (`ORDER BY rank`, which `engram_query` and `_similar_existing_matches`'s dedup check both use)
+reads auxiliary data to score it. If that data has desynced for one term's postings, ranking raises
+SQLite's generic `database disk image is malformed` *for that term* — while `PRAGMA quick_check` still
+says "ok", plain `MATCH` (no ranking) still works, and every other term ranks fine. So this is invisible
+to every check this exam already runs, and stays silent until a real query happens to rank the one bad
+term (engram-alpha#2678, forum #398).
+
+```bash
+python3 -c "
+import sys, sqlite3, os
+sys.path.insert(0, os.path.expanduser('~/.engram/marketplace/plugins/engram'))
+import engram_backup
+p = os.path.expanduser('~/.engram/knowledge.db')
+conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
+print(engram_backup.check_fts_integrity(conn))
+"
+```
+
+**PASS:** `{'status': 'ok', 'probed_terms': N}` — every vocabulary term both plain-matched and ranked
+clean, with nothing left unclassified.
+
+**FAIL:** `{'status': 'mismatch', ...}` with one or both of:
+- `'problems': [{'term': ..., 'error': ..., 'stage': 'ranked_match'}, ...]` — confirmed ranking-path
+  corruption: the term's plain match succeeded but ranking it raised.
+- `'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...]` — a term whose PLAIN
+  (unranked) query itself raised. This is not classified as syntax-vs-corruption (the error text is the
+  same generic message either way) and is worth investigating in its own right: on the default
+  tokenizer no legitimate vocab term produces this, so an entry here means damage bad enough to break
+  even the simple path — worse than a `problems` entry alone. `status` is `mismatch` whenever either
+  list is non-empty, never `ok` while anything is unprobed.
+
+Either way: a real, actionable finding. Consider `engram_backup.rebuild_fts_index` (own-substrate
+authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm) — though note
+the repair's effectiveness against either failure class is not yet verified; confirm rather than assume.
+This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the corruption
+happened) is worth a forum post regardless.
+
+**ADVISORY (not a FAIL on a real install):** `{'status': 'unavailable', 'reason': '...'}` — the probe
+itself couldn't run (no `nodes_fts` or `nodes_fts_vocab` table, e.g. a fresh/minimal DB). Shouldn't
+happen against a normal live `knowledge.db`; if it does, note the reason and move on rather than treating
+it as a schema failure.
+
+**Design note, so a future edit doesn't quietly reintroduce noise or blindness:** three designs were
+tried, in order, each falsified by the next real measurement against the one graph in the fleet that
+actually had this bug — see `check_fts_integrity`'s own docstring for the full history. Neither of FTS5's
+`'integrity-check'` special-command variants works: the *plain* form tolerates ENGRAM's by-design
+retracted-row exclusion (#781) but reported CLEAN against a byte-copy of the affected graph — a false
+negative on the exact case this step exists to catch. The `rank=1` ("more thorough") form correctly
+caught that same real corruption, but false-positives on *any* graph with even one retracted node, and
+that false positive survives healing the retracted rows out of a scratch copy after the fact — not just
+a tuning problem, a structural one. This probes real `MATCH` vs `MATCH ... ORDER BY rank` for terms from
+`nodes_fts_vocab` instead — retraction-immune by construction (retracted rows never enter a `MATCH`
+result set), and it targets the layer that's actually damaged. **A first version of this probe sampled
+only the top-k highest-document-frequency terms (k=30) and was validated against the affected graph — it
+caught the one poisoned term then known.** A *full-vocabulary* sweep of that same graph then found 24
+poisoned terms, not 1 — the one caught by the k=30 sample was the ONLY one in the top-30 by frequency; the
+other 23 spanned mid/low frequency and bare numerals, uncorrelated with rank. No k a person would pick
+would have caught more than one of twenty-four. So this sweeps the full vocabulary by default (`probe_k`
+is `None`) rather than sampling — confirmed cheap on both the largest known affected seat (1.5s over
+26,745 terms) and a second, healthy seat (0.53s over 13,805 terms, 33 retracted nodes, zero false
+positives). `probe_k` survives only as an explicit opt-in sampling escape hatch for a future graph where
+full-vocab cost turns out not to be negligible — never lower the default without a fresh cost measurement
+on a graph at least as large as the ones above.
+
+---
+
 ## Step 6 — Viz server health (if configured)
 
 Skip this step if you do not use the viz dashboard (T2 feature, may not be installed).
