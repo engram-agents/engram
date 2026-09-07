@@ -284,44 +284,62 @@ def check_fts_integrity(conn: sqlite3.Connection, probe_k: int | None = None) ->
     ``_similar_existing_matches``'s exception handling -- both are separate,
     write-path-adjacent work (#2678 items 2/3), out of scope here.
 
-    Returns one of:
+    Returns one of FOUR statuses -- kept distinct rather than collapsed,
+    because a caller must be able to tell "I found damage" from "I could
+    not look" from "I never checked at all" (Ariadne's #2731 colleague-
+    review refinement, forum #398, raised on top of her own earlier
+    "never a silent pass" finding, before the same status value quietly
+    swallowed the distinction one layer up from where her original
+    finding fixed it):
+
       {"status": "unavailable", "reason": <str>} -- no ``nodes_fts`` or
           ``nodes_fts_vocab`` table to probe, or the probe itself could not
-          run (any unexpected ``sqlite3.Error``).
-      {"status": "mismatch", "problems": [...], "unprobed": [...]} -- EITHER
-          key may be present, never both empty when this status is returned
-          (a missing key means that category found nothing):
-            "problems": every term whose plain MATCH succeeded but whose
-                ranked query raised ({"term", "error", "stage":
-                "ranked_match"}) -- confirmed ranking-path corruption.
-            "unprobed": every term whose PLAIN (unranked) query itself
-                raised ({"term", "error", "stage": "plain_match"}) -- NOT
-                classified as syntax-error-vs-corruption (the error text is
-                the same generic SQLITE_CORRUPT_VTAB message either way;
-                text-matching it would reintroduce the brittleness this
-                design escaped), just never silently dropped. On the default
-                tokenizer no legitimate vocab term produces this (verified:
-                embedded quotes, boolean operators, wildcards, punctuation,
-                bare numerals all plain-match cleanly), so any entry here is
-                itself worth investigating -- damage bad enough to break
-                even the unranked path is worse than what "problems" alone
-                reports, and status reflects that: "ok" is never returned
-                while any term is unprobed, however clean the probed ones
-                are (Ariadne's #2731 colleague-review finding -- an earlier
-                version silently `continue`d past this case, making
-                unprobed-due-to-corruption byte-identical to a clean sweep).
-          The full lists in both keys, not a boolean or a truncated sample
-          (per Kepler's ruling: "report the count and the list, never a
-          boolean" -- design 3's top-k sample under-reported real damage by
-          24x, and a truncated list would repeat that mistake one level
-          down). A real, actionable finding: consider ``rebuild_fts_index``
-          (own-substrate authority; snapshot first) -- though note its
-          repair effectiveness against either failure class is unverified;
-          re-run this check after to confirm.
-      {"status": "ok", "probed_terms": <int>} -- every vocabulary term
-          both plain-matched AND ranked clean, with nothing left unprobed
-          (full sweep by default -- see ``probe_k`` above for when this is
-          instead a sample).
+          run at all (any unexpected ``sqlite3.Error`` before any term was
+          examined).
+      {"status": "mismatch", "problems": [...], "unprobed": [...]}
+          -- CONFIRMED ranking-path corruption: at least one term's plain
+          MATCH succeeded but its ranked query raised
+          ({"term", "error", "stage": "ranked_match"}). ``unprobed`` may
+          also be present alongside (not classified further; see below) but
+          never changes this status once ``problems`` is non-empty. The
+          full list, not a boolean or a truncated sample (per Kepler's
+          ruling: "report the count and the list, never a boolean" --
+          design 3's top-k sample under-reported real damage by 24x, and a
+          truncated list would repeat that mistake one level down). A real,
+          actionable finding: consider ``rebuild_fts_index`` (own-substrate
+          authority; snapshot first) -- though note its repair effectiveness
+          against either failure class is unverified; re-run this check
+          after to confirm.
+      {"status": "partial", "unprobed": [...], "probed_terms": <int>}
+          -- an UNKNOWN, not confirmed damage: every term that WAS fully
+          probed (plain-matched AND ranked) came back clean, but at least
+          one term's PLAIN (unranked) query itself raised ({"term", "error",
+          "stage": "plain_match"}), so it was never reached by the ranked
+          check at all. NOTE: ``probed_terms`` here is ``len(terms)`` -- the
+          size of the full sweep, INCLUDING the unprobed term(s) -- not a
+          count of how many were successfully checked; a caller wanting the
+          latter must compute ``probed_terms - len(unprobed)``. Deliberately NOT
+          classified as syntax-error-vs-corruption -- the error text is the
+          same generic SQLITE_CORRUPT_VTAB message either way, and text-
+          matching it would reintroduce the brittleness this design escaped
+          -- just never silently dropped. On the default tokenizer no
+          legitimate vocab term produces this (verified: embedded quotes,
+          boolean operators, wildcards, punctuation, bare numerals all
+          plain-match cleanly), so any entry here is itself worth
+          investigating; damage bad enough to break even the unranked path
+          would be worse than a "mismatch" entry, IF it turns out to be
+          corruption rather than an untested tokenizer's real syntax
+          restriction (bound: default tokenizer only -- see the exception
+          handler's own comment). This status exists so that possibility
+          is never silently reported as either "ok" (would hide a real
+          unknown) or "mismatch" (would falsely confirm damage that was
+          never actually observed, on a graph whose only sin might be a
+          custom tokenizer this design hasn't been tested against).
+      {"status": "ok", "probed_terms": <int>} -- every vocabulary term both
+          plain-matched AND ranked clean, with nothing left unprobed at all;
+          here (and only here) ``probed_terms`` equals the count that came
+          back fully clean, since none were skipped (full sweep by default
+          -- see ``probe_k`` above for when this is instead a sample).
 
     Never raises: every SQL call is guarded, and unlike the special-command
     designs this replaced, none of these are write-shaped -- no implicit
@@ -396,12 +414,31 @@ def check_fts_integrity(conn: sqlite3.Connection, probe_k: int | None = None) ->
             except sqlite3.Error as e:
                 problems.append({"term": term, "error": str(e), "stage": "ranked_match"})
 
-        result = {"status": "mismatch" if (problems or unprobed) else "ok"}
+        # Ariadne's #2731 forum #398 refinement, raised before her colleague
+        # read on 4e4436d converged: an unprobed term is an UNKNOWN, not a
+        # confirmed problem -- collapsing both into "mismatch" would (on an
+        # untested custom/trigram tokenizer, where a legitimate plain-match
+        # syntax error might exist) reintroduce the false-positive shape
+        # that killed design 2, one layer up in the reporting rather than
+        # the probe. "mismatch" means confirmed damage found (problems is
+        # non-empty); "partial" means everything probed came back clean but
+        # something could not be checked at all (unprobed non-empty,
+        # problems empty) -- a caller must be able to tell "I found damage"
+        # from "I could not look", and only a distinct status value keeps
+        # that true even for a caller who checks status alone rather than
+        # reading the whole dict.
+        if problems:
+            status = "mismatch"
+        elif unprobed:
+            status = "partial"
+        else:
+            status = "ok"
+        result = {"status": status}
         if problems:
             result["problems"] = problems
         if unprobed:
             result["unprobed"] = unprobed
-        if result["status"] == "ok":
+        if status in ("ok", "partial"):
             result["probed_terms"] = len(terms)
         return result
     except sqlite3.Error as e:

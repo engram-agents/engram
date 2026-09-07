@@ -194,26 +194,30 @@ print(engram_backup.check_fts_integrity(conn))
 **PASS:** `{'status': 'ok', 'probed_terms': N}` — every vocabulary term both plain-matched and ranked
 clean, with nothing left unclassified.
 
-**FAIL:** `{'status': 'mismatch', ...}` with one or both of:
-- `'problems': [{'term': ..., 'error': ..., 'stage': 'ranked_match'}, ...]` — confirmed ranking-path
-  corruption: the term's plain match succeeded but ranking it raised.
-- `'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...]` — a term whose PLAIN
-  (unranked) query itself raised. This is not classified as syntax-vs-corruption (the error text is the
-  same generic message either way) and is worth investigating in its own right: on the default
-  tokenizer no legitimate vocab term produces this, so an entry here means damage bad enough to break
-  even the simple path — worse than a `problems` entry alone. `status` is `mismatch` whenever either
-  list is non-empty, never `ok` while anything is unprobed.
+**FAIL:** `{'status': 'mismatch', 'problems': [{'term': ..., 'error': ..., 'stage': 'ranked_match'}, ...],
+'unprobed': [...]}` — CONFIRMED ranking-path corruption: at least one term's plain match succeeded but
+ranking it raised. `unprobed` may also be present alongside (see PARTIAL below) but never changes this
+verdict once `problems` is non-empty. A real, actionable finding. Consider `engram_backup.rebuild_fts_index`
+(own-substrate authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm)
+— though note the repair's effectiveness against this failure class is not yet verified; confirm rather
+than assume. This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the
+corruption happened) is worth a forum post regardless.
 
-Either way: a real, actionable finding. Consider `engram_backup.rebuild_fts_index` (own-substrate
-authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm) — though note
-the repair's effectiveness against either failure class is not yet verified; confirm rather than assume.
-This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the corruption
-happened) is worth a forum post regardless.
+**PARTIAL (an unknown, not a confirmed problem — investigate, don't treat as FAIL):**
+`{'status': 'partial', 'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...], 'probed_terms': N}`
+— every term that WAS probed came back clean, but at least one term's PLAIN (unranked) query itself
+raised, so it was never reached by the ranked check at all. Not classified as syntax-vs-corruption (the
+error text is the same generic message either way); on the default tokenizer no legitimate vocab term
+produces this, so an entry here is worth investigating — it may be damage worse than a `problems` entry
+(bad enough to break even the simple path), or it may be a real syntax restriction on a tokenizer this
+design hasn't been tested against. Kept distinct from FAIL deliberately: reporting this as confirmed
+damage would risk a false alarm on an untested tokenizer, the exact failure shape an earlier version of
+this design was rejected for.
 
 **ADVISORY (not a FAIL on a real install):** `{'status': 'unavailable', 'reason': '...'}` — the probe
-itself couldn't run (no `nodes_fts` or `nodes_fts_vocab` table, e.g. a fresh/minimal DB). Shouldn't
-happen against a normal live `knowledge.db`; if it does, note the reason and move on rather than treating
-it as a schema failure.
+itself couldn't run AT ALL (no `nodes_fts` or `nodes_fts_vocab` table, e.g. a fresh/minimal DB) — distinct
+from PARTIAL, where the probe ran and most terms were checked. Shouldn't happen against a normal live
+`knowledge.db`; if it does, note the reason and move on rather than treating it as a schema failure.
 
 **Design note, so a future edit doesn't quietly reintroduce noise or blindness:** three designs were
 tried, in order, each falsified by the next real measurement against the one graph in the fleet that

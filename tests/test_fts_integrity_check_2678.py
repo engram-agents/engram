@@ -337,20 +337,30 @@ def test_mutation_control_a_probe_that_never_runs_the_ranked_query_would_miss_th
 # "problems" alone reports, and the old code made it byte-identical to a
 # clean sweep. This section pins the fix: such a term is recorded in
 # "unprobed", never dropped, and "ok" is never returned while any term is
-# unprobed.
+# unprobed. Follow-up refinement, same thread, raised before her colleague
+# read converged: an unprobed term reads as "partial" (an unknown), NOT
+# "mismatch" (confirmed damage) -- collapsing the two would risk a false
+# confirmation on an untested tokenizer, the same false-positive shape
+# that killed an earlier design. See test_mismatch_vs_partial_stay_
+# distinguishable below.
 
 
 def test_plain_match_corruption_is_recorded_not_dropped(engram_db):
     """THE headline regression guard for this fix. A term whose plain MATCH
-    itself raises must appear in 'unprobed', with status 'mismatch' -- NOT
-    silently skipped with status 'ok'."""
+    itself raises must appear in 'unprobed', with status 'partial' -- NOT
+    silently skipped with status 'ok'. 'partial', not 'mismatch': an
+    unprobed term is an unknown, not confirmed damage (Ariadne's
+    same-thread refinement) -- see test_mismatch_vs_partial_stay_
+    distinguishable below for why collapsing them back is itself a
+    regression risk."""
     conn = _connect_raising_on_plain_query(
         engram_db, "apple", sqlite3.DatabaseError("database disk image is malformed")
     )
     result = engram_backup.check_fts_integrity(conn)
-    assert result["status"] == "mismatch", (
+    assert result["status"] == "partial", (
         f"a term whose plain match itself raises must never read as 'ok' "
-        f"-- got {result!r}"
+        f"(silent) or 'mismatch' (a false confirmation of damage never "
+        f"actually observed) -- got {result!r}"
     )
     assert result["unprobed"] == [
         {"term": "apple", "error": "database disk image is malformed", "stage": "plain_match"}
@@ -391,12 +401,17 @@ def test_ariadnes_discriminating_control_plain_vs_ranked_poisoning_are_distingui
         "control failed: plain-arm poisoning must NOT be byte-identical to "
         "a clean sweep -- this is the exact defect Ariadne's review caught"
     )
-    assert plain_poisoned["status"] == "mismatch"
+    # 'partial' (unknown), not 'mismatch' (confirmed damage) -- an unprobed
+    # term is an unknown, and only the ranked arm produces a confirmed
+    # finding. This is Ariadne's follow-up refinement on top of her own
+    # original blocker, raised before her colleague read converged.
+    assert plain_poisoned["status"] == "partial"
     assert ranked_poisoned["status"] == "mismatch"
     assert plain_poisoned != ranked_poisoned, (
         "the two failure classes should stay distinguishable from each "
-        "other too -- plain-match damage lands in 'unprobed', ranked-match "
-        "damage lands in 'problems'"
+        "other too -- plain-match damage lands in 'unprobed' (status "
+        "'partial'), ranked-match damage lands in 'problems' (status "
+        "'mismatch')"
     )
     assert "unprobed" in plain_poisoned and "problems" not in plain_poisoned
     assert "problems" in ranked_poisoned and "unprobed" not in ranked_poisoned
@@ -431,6 +446,115 @@ def test_mutation_control_dropping_the_unprobed_record_regresses_to_the_defect(e
     )
     assert result["status"] != "ok", "the real, fixed function must not collapse to this"
     conn.close()
+
+
+def test_combined_problems_and_unprobed_both_present_stays_mismatch(engram_db):
+    """The docstring explicitly claims 'unprobed' may appear alongside
+    'problems' without changing the verdict once problems is non-empty --
+    pin that case directly rather than leaving it implied. Poisons two
+    DIFFERENT terms on two different arms in the same sweep: 'apple' fails
+    at the plain-match stage, 'banana' fails at the ranked-match stage."""
+
+    class _RaisingOnBothArms(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            is_ranked = "ORDER BY rank" in sql
+            if args and "MATCH" in sql:
+                term = args[0][0].strip('"')
+                if not is_ranked and term == "apple":
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+                if is_ranked and term == "banana":
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+            return super().execute(sql, *args, **kwargs)
+
+    conn = sqlite3.connect(engram_db, factory=_RaisingOnBothArms)
+    result = engram_backup.check_fts_integrity(conn)
+    conn.close()
+
+    assert result["status"] == "mismatch", (
+        f"problems present must dominate regardless of unprobed -- got {result!r}"
+    )
+    assert result["problems"] == [
+        {"term": "banana", "error": "database disk image is malformed", "stage": "ranked_match"}
+    ]
+    assert result["unprobed"] == [
+        {"term": "apple", "error": "database disk image is malformed", "stage": "plain_match"}
+    ]
+    assert "probed_terms" not in result, (
+        "probed_terms is only meaningful for ok/partial, per the docstring"
+    )
+
+
+def test_mismatch_vs_partial_stay_distinguishable(engram_db):
+    """Ariadne's follow-up refinement (forum #398, raised before her
+    colleague read converged on 4e4436d): collapsing 'unprobed' and
+    'problems' into one 'mismatch' status would, on a hypothetical untested
+    tokenizer with a real plain-match syntax restriction, report confirmed
+    damage that was never actually observed -- the exact false-positive
+    shape that killed design 2, one layer up. A caller must be able to
+    tell CONFIRMED damage (mismatch) from an UNKNOWN (partial) apart from
+    a genuinely clean sweep (ok), using status alone -- not by having to
+    additionally inspect which keys are present."""
+    ok_conn = sqlite3.connect(engram_db)
+    ok_result = engram_backup.check_fts_integrity(ok_conn)
+    ok_conn.close()
+
+    partial_conn = _connect_raising_on_plain_query(
+        engram_db, "apple", sqlite3.DatabaseError("database disk image is malformed")
+    )
+    partial_result = engram_backup.check_fts_integrity(partial_conn)
+    partial_conn.close()
+
+    mismatch_conn = _connect_raising_on_ranked_query(
+        engram_db, "apple", sqlite3.DatabaseError("database disk image is malformed")
+    )
+    mismatch_result = engram_backup.check_fts_integrity(mismatch_conn)
+    mismatch_conn.close()
+
+    statuses = {ok_result["status"], partial_result["status"], mismatch_result["status"]}
+    assert statuses == {"ok", "partial", "mismatch"}, (
+        f"all three cases must produce three DIFFERENT status values -- got {statuses!r}"
+    )
+
+
+def test_mutation_control_collapsing_partial_into_mismatch_is_caught(engram_db):
+    """Required control: confirm the three-way status distinction is
+    actually load-bearing, not by mutating a copy of the real result (which
+    proves nothing about the real function -- see the sibling
+    test_mutation_control_dropping_the_unprobed_record_regresses_to_the_
+    defect for the correct idiom), but by hand-constructing the actual
+    pre-refinement (4e4436d) OUTPUT SHAPE for this exact input and showing
+    it is indistinguishable, AT THE STATUS LEVEL, from a genuine confirmed-
+    damage result -- exactly the ambiguity a caller checking `status` alone
+    could not have resolved before this fix."""
+    conn = _connect_raising_on_plain_query(
+        engram_db, "apple", sqlite3.DatabaseError("database disk image is malformed")
+    )
+    result = engram_backup.check_fts_integrity(conn)
+    conn.close()
+    assert result["status"] == "partial"
+
+    # The 4e4436d shape: status="mismatch" whenever EITHER bucket was
+    # non-empty -- this is what the function actually returned for this
+    # exact input before this commit, not a mutation of today's result.
+    pre_refinement_shape = {
+        "status": "mismatch",
+        "unprobed": result["unprobed"],
+    }
+
+    real_mismatch_conn = _connect_raising_on_ranked_query(
+        engram_db, "banana", sqlite3.DatabaseError("database disk image is malformed")
+    )
+    real_mismatch = engram_backup.check_fts_integrity(real_mismatch_conn)
+    real_mismatch_conn.close()
+
+    assert pre_refinement_shape["status"] == real_mismatch["status"] == "mismatch", (
+        "control failed: the pre-refinement shape's status must be "
+        "indistinguishable from a genuine confirmed-damage result -- that "
+        "collision is precisely the ambiguity this fix resolves"
+    )
+    assert result["status"] != pre_refinement_shape["status"], (
+        "the real, fixed function must not collapse to the pre-refinement shape"
+    )
 
 
 # The 24 real terms Borges's full-vocabulary sweep found poisoned on his own
