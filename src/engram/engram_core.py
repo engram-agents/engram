@@ -2018,7 +2018,7 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
-# The four nodes_fts sync-trigger names, single-sourced so
+# The five nodes_fts sync-trigger names, single-sourced so
 # _recreate_fts_sync_triggers and any standalone DROP-before-rebuild step
 # (migration rung 4, below) can't drift apart on the name list itself.
 _FTS_SYNC_TRIGGER_NAMES = (
@@ -2026,23 +2026,25 @@ _FTS_SYNC_TRIGGER_NAMES = (
     "nodes_fts_delete",
     "nodes_retract_remove_from_fts",
     "nodes_fts_supersede_remove",
+    "nodes_fts_rewrite_resync",
 )
 
 
 def _recreate_fts_sync_triggers(
     conn: sqlite3.Connection, cols: list[str], drop_first: bool
 ) -> None:
-    """Build and (re)create the four nodes_fts sync triggers for `cols`.
+    """Build and (re)create the five nodes_fts sync triggers for `cols`.
 
     Shared by two call sites that used to carry independently-written copies
-    of these four CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
-    reviewer-flagged duplication):
+    of these five CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
+    reviewer-flagged duplication; grew from four to five with #2742's
+    nodes_fts_rewrite_resync):
 
       - the always-run setup block above (`drop_first=False` — no DROP here;
         uses `CREATE TRIGGER IF NOT EXISTS` so a trigger already created by a
         prior call/process is left alone rather than being blindly recreated).
       - migration rung 4 below (`drop_first=True` — the caller has ALREADY
-        dropped the four triggers via `_FTS_SYNC_TRIGGER_NAMES` before
+        dropped the five triggers via `_FTS_SYNC_TRIGGER_NAMES` before
         delegating to `engram_backup.rebuild_fts_index` — see the ordering
         comment at that call site for why the drop must happen before, not
         during, this function's own call, which runs only after the FTS
@@ -2105,6 +2107,53 @@ def _recreate_fts_sync_triggers(
         BEGIN
             INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
             VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+        # Rewrite-resync trigger (#2742, forum #398 2026-09-07) — none of
+        # the four triggers above fire on a plain content edit (a recall-
+        # summary tightening pass, a claim correction, etc.): insert syncs
+        # a brand-new row, delete/retract/supersede remove a row leaving
+        # the graph, but nothing re-syncs a row whose TEXT changed while it
+        # stayed current. External-content FTS5 (content='nodes') then
+        # carries stale postings for whatever the edit dropped — the row's
+        # rowid is still indexed, so INSERT/DELETE-shaped checks (a plain
+        # MATCH, PRAGMA quick_check, even FTS5's own plain 'integrity-check'
+        # special command) all read clean; only ranking a dropped token
+        # (MATCH ... ORDER BY rank, which _similar_existing_matches's dedup
+        # gate and engram_query both use) touches the stale postings and
+        # raises SQLITE_CORRUPT_VTAB. This is the root cause behind the
+        # fleet-wide corruption engram-alpha#2678's detector surfaced (4 of
+        # 5 measured seats affected, forum #398) — a rewrite-in-place (most
+        # commonly a recall_summary/recall_keywords tightening pass, which
+        # can drop tokens the original claim carried) silently orphans
+        # whatever text the edit removed, with no trigger ever correcting it.
+        #
+        # WHEN clause composition (mirrors nodes_fts_supersede_remove's own
+        # COALESCE(NEW.status,'')!='retracted' guard against retract's
+        # combined status+is_current UPDATE): fires ONLY on a "pure" content
+        # rewrite where the row stays current and stays non-retracted
+        # THROUGH this exact statement. NEW.is_current=1 excludes a
+        # supersede sharing this UPDATE (nodes_fts_supersede_remove already
+        # owns that removal); NEW.status!='retracted' excludes a retract
+        # sharing this UPDATE (nodes_retract_remove_from_fts already owns
+        # that removal) — for any column NOT named in a given UPDATE's SET
+        # clause, SQLite's NEW.<col> already equals OLD.<col>, so a pure
+        # text-only edit naturally satisfies both without needing is_current/
+        # status to be re-stated. Not currently reachable via _supersede_impl
+        # or _retract_impl (neither touches text columns in the same
+        # UPDATE as today's code stands) but guarded defensively per spec,
+        # matching the existing supersede trigger's own defensive posture
+        # against a composition no current caller actually produces.
+        f"""
+        {create_clause} nodes_fts_rewrite_resync
+        AFTER UPDATE OF {trig_cols_sql} ON nodes
+        WHEN OLD.is_current = 1 AND NEW.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+            INSERT INTO nodes_fts(rowid, {trig_cols_sql})
+            VALUES (NEW.rowid, {new_vals_sql});
         END
         """,
     ]
@@ -2812,7 +2861,14 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # creation failed — fall back to Python cosine
 
-    # Rebuild FTS triggers — safe to run multiple times
+    # Rebuild FTS triggers — safe to run multiple times, and this always-run
+    # (non-version-gated) block is why a NEW graph, or an existing graph on
+    # any prior version, picks up nodes_fts_rewrite_resync (#2742) on its
+    # very next server start even before migration rung 6 below runs — rung
+    # 6 exists for the version-bump bookkeeping itself (this codebase's
+    # convention: schema-shape additions get a numbered rung even when, as
+    # here, the mechanical CREATE TRIGGER IF NOT EXISTS already happened
+    # here moments earlier in the same startup).
     #
     # Column list is single-sourced from engram_backup.NODES_FTS_COLUMNS
     # (#2077), same as the CREATE VIRTUAL TABLE block above — reuses the
@@ -2839,7 +2895,36 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # drop_first=False here: no DROP precedes this call, so CREATE TRIGGER
     # IF NOT EXISTS is used, matching this block's pre-existing idempotent,
     # safe-to-run-every-startup behavior.
-    _fts_trig_cols = [c.strip() for c in _fts_cols_sql.split(",")]
+    #
+    # #2742 fix: build the trigger set from whatever nodes_fts ACTUALLY
+    # has, not unconditionally the canonical target -- the self-heal block
+    # just above already computed this same "existing vs canonical"
+    # comparison and, for an in-memory/unattached-temp connection whose
+    # nodes_fts is stale, DELIBERATELY skips repairing the table itself
+    # (#2186's own documented reasoning: nothing on-disk to persist-repair).
+    # This trigger-creation step ran unconditionally against the canonical
+    # list regardless, so on that specific (narrow but real -- a mid-
+    # migration retry state, not just a test artifact) path, IF NOT EXISTS
+    # would create a trigger referencing columns the live table doesn't
+    # have, raising the moment it fires. Caught by
+    # test_2181_pre_migration_backup_skips_for_in_memory_connection's
+    # SECOND _run_db_one_time_setup call after adding nodes_fts_
+    # rewrite_resync -- not by any test named in #2742's own spec, and
+    # not unique to that new trigger: nodes_fts_supersede_remove already
+    # carried the identical latent exposure, just never exercised by a
+    # test whose repro touches is_current/status rather than claim.
+    # Re-derived independently here (own try/except) rather than reusing
+    # the self-heal block's _existing_fts_cols, which may be unbound if
+    # that block's own try raised before assigning it.
+    try:
+        _live_fts_cols = engram_backup._existing_fts_columns(conn)
+    except Exception:
+        _live_fts_cols = None
+    _fts_trig_cols = (
+        _live_fts_cols
+        if _live_fts_cols is not None
+        else [c.strip() for c in _fts_cols_sql.split(",")]
+    )
     _recreate_fts_sync_triggers(conn, _fts_trig_cols, drop_first=False)
 
     # One-shot migration (#274): remove existing retracted nodes from the FTS
@@ -2861,17 +2946,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
     # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 5 -> PRAGMA user_version = 5). No single named
+    # below (currently rung 6 -> PRAGMA user_version = 6). No single named
     # constant exists elsewhere in this function for "the latest schema
     # version" — each rung below hardcodes its own target inline — so this
     # local mirrors that existing convention rather than inventing a new
     # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 6. (Mechanically checked against the
+    # alongside adding any future rung 7. (Mechanically checked against the
     # rungs' own PRAGMA user_version = N literals by
     # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
     # — forgetting the bump fails loudly at test time instead of silently
     # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 5
+    _PRE_MIGRATION_LATEST_VERSION = 6
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -2923,9 +3008,29 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
             conn.execute("DROP TABLE IF EXISTS nodes_fts")
             # Drop old triggers so they can be recreated with new column list.
-            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_insert")
-            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_delete")
-            conn.execute("DROP TRIGGER IF EXISTS nodes_retract_remove_from_fts")
+            # Iterate the CURRENT full _FTS_SYNC_TRIGGER_NAMES tuple, not a
+            # hardcoded 3-name list frozen at this rung's original authoring
+            # (#2742 fix): the always-run setup block above (which runs
+            # BEFORE any migration rung, on every startup including this
+            # DB's very first) already created every trigger in that tuple
+            # against nodes_fts's CURRENT canonical column shape. This rung
+            # then drops+recreates nodes_fts with an OLDER, narrower,
+            # historically-frozen 5-column shape below (deliberately never
+            # touched — see that CREATE VIRTUAL TABLE's own "do not touch"
+            # scope note) -- but a trigger this rung doesn't know to drop
+            # survives pointing at columns the new table doesn't have. Real
+            # bug, not hypothetical: nodes_fts_rewrite_resync (added after
+            # this rung was written) fires on rung 4's own claim-backfill
+            # UPDATE, which runs in the window between this rung's narrower
+            # rebuild and rung 4's own drop-and-full-rebuild, raising
+            # "table nodes_fts has no column named recall_summary" and
+            # failing this whole migration -- caught by running the full
+            # test suite after adding that trigger, not by any test named
+            # in #2742's own spec. Only the DROP-list is widened here; the
+            # CREATE VIRTUAL TABLE column set two statements below is
+            # unchanged, preserving this rung's frozen historical shape.
+            for _rung2_trig in _FTS_SYNC_TRIGGER_NAMES:
+                conn.execute(f"DROP TRIGGER IF EXISTS {_rung2_trig}")
             # Recreate FTS table with 5-column schema.
             conn.execute(
                 """
@@ -3052,12 +3157,19 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Three pieces, in dependency order — NOTE the order is claim-backfill
     # THEN fts-reindex THEN re-embed, not the "a/b/c" issue-numbering order
     # above: nodes_fts is an external-content FTS5 table (content='nodes')
-    # kept in sync only by the four sync triggers below, and NONE of them
-    # fire on a plain UPDATE OF claim — so if the FTS reindex below ran
-    # BEFORE the claim backfill, it would index the OLD (still-truncated)
-    # claim text and there is no later trigger to re-sync it. Caught by this
-    # rung's own migration-check script during implementation (see PR
-    # handoff), not by any pre-existing test.
+    # kept in sync only by the sync triggers below, and at the time this rung
+    # was written NONE of them fired on a plain UPDATE OF claim — so if the
+    # FTS reindex below ran BEFORE the claim backfill, it would index the OLD
+    # (still-truncated) claim text and there was no later trigger to re-sync
+    # it. Caught by this rung's own migration-check script during
+    # implementation (see PR handoff), not by any pre-existing test.
+    # (#2742: a fifth trigger, nodes_fts_rewrite_resync, now DOES fire on
+    # UPDATE OF claim — but it doesn't change this rung's own ordering
+    # requirement, because it isn't live yet at this exact point: rung 2
+    # above dropped it along with the other four, and step 2 immediately
+    # below is what recreates all five against this rung's own drop-and-
+    # rebuild `cols`. So the claim-backfill-first ordering this comment
+    # explains is still exactly right, for the same reason it always was.)
     #   1. Claim backfill (#1875) — recompute claim for every feeling_report
     #      node from its (still-present, deliberately-kept — see #1952 PR2's
     #      PR description) reported_state column: full text + hedge prefix,
@@ -3521,6 +3633,45 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
                 "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
                 "backfill) FAILED, will retry on next startup: "
                 f"{_migration5_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 6 (#2742, forum #398 2026-09-07): version-bump
+    # bookkeeping for nodes_fts_rewrite_resync. The trigger itself is
+    # already live by this point in every startup (the always-run block
+    # above creates it via CREATE TRIGGER IF NOT EXISTS, unconditionally —
+    # see that block's own comment) — this rung's only job is the
+    # PRAGMA user_version bump, matching this codebase's convention that
+    # every schema-shape addition is versioned, not just mechanically
+    # applied. No backfill here: deliberately NOT rebuilding nodes_fts to
+    # repair rows already orphaned by a pre-existing rewrite (Kepler's
+    # explicit instruction, forum #398).
+    #
+    # Sequencing note, corrected before the colleague pass (Kepler's PR
+    # comment): the four seats known-damaged as of this PR (forum #398) were
+    # ALREADY per-seat rebuilt under Lei's emergency go (18:04-18:22Z),
+    # BEFORE this trigger existed and before this PR was opened — so the
+    # sequence for those seats is not "trigger, then rebuild" but the
+    # reverse: rebuilt-but-untriggered seats re-damage on their very next
+    # tighten-then-supersede, until this trigger reaches them on their next
+    # server start after the plugin upgrade carrying this migration. A
+    # SECOND per-seat rebuild is then needed — to clear whatever accumulated
+    # in the gap between the emergency rebuild and the trigger's arrival,
+    # and (once #2746's rebuild_fts_index contract fix lands) to move the
+    # seat onto the trigger's own contract, which currently disagrees with
+    # rebuild_fts_index about whether a superseded row belongs in the index.
+    # A graph landing on this rung may still carry orphaned postings from
+    # edits made before the trigger reached it; this rung only guarantees no
+    # NEW orphan is created going forward.
+    if _rung_ready(conn, 6, _pre_migration_backup_ok):
+        try:
+            conn.execute("PRAGMA user_version = 6")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration6_err:
+            print(
+                "[_run_db_one_time_setup] migration 6 (#2742 rewrite-resync "
+                "trigger version bump) FAILED, will retry on next startup: "
+                f"{_migration6_err!r}",
                 file=sys.stderr,
             )
 
