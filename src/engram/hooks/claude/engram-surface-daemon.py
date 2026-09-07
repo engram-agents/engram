@@ -177,6 +177,18 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 _last_activity = time.time()
 _shutdown = threading.Event()
 
+# Socket-ownership tracking (#2713 -- the daemon-side sibling of #2687's
+# hook-side socket-ownership guard). Set to True ONLY after this process's
+# own server.bind(SOCKET_PATH) succeeds in main(). cleanup()'s SOCKET_PATH
+# unlink is gated on THIS flag, independent of PID_PATH identity -- pidfile
+# identity answers "did I write the pidfile", not "did I bind the socket",
+# and on a two-daemon seat those two questions have different answers: the
+# hook-launched instance can write the pidfile while a DIFFERENT,
+# supervisor-launched instance holds the actual socket. Unlinking
+# SOCKET_PATH on pidfile identity alone deletes the live holder's socket
+# out from under it.
+_bound_socket = False
+
 
 def handle_client(conn, client):
     """Handle a single client connection."""
@@ -260,16 +272,31 @@ def idle_watchdog(idle_timeout: int):
 
 
 def cleanup(*args):
-    """Remove socket and PID files on exit -- but only if PID_PATH still
-    names THIS process (#1874 colleague-review suggestion).
+    """Remove socket and PID files on exit -- two independent resources,
+    two independent predicates. Do not conflate them (#2713).
 
-    Without this guard, a delayed SIGTERM (this process was already
-    superseded -- e.g. start-engram-daemon.sh's reap loop killed it, but
-    it was slow to actually exit) could fire its cleanup AFTER a newer
-    instance already wrote its own fresh PID file and bound its socket,
-    deleting the NEW instance's files out from under it and reproducing
-    the exact "unreachable-but-alive" shape #1874 reported, via a
-    different mechanism than the one that PR actually fixes.
+    PID_PATH: removed only if PID_PATH still names THIS process (#1874
+    colleague-review suggestion). Without this guard, a delayed SIGTERM
+    (this process was already superseded -- e.g. start-engram-daemon.sh's
+    reap loop killed it, but it was slow to actually exit) could fire its
+    cleanup AFTER a newer instance already wrote its own fresh PID file
+    and bound its socket, deleting the NEW instance's files out from
+    under it and reproducing the exact "unreachable-but-alive" shape
+    #1874 reported, via a different mechanism than the one that PR
+    actually fixes.
+
+    SOCKET_PATH: removed only if THIS process actually bound it
+    (`_bound_socket`, set in main() immediately after a successful
+    server.bind()) -- independent of PID_PATH identity (#2713). Pidfile
+    identity is a proxy for "did I bind the socket", and on a two-daemon
+    seat the proxy is wrong: the hook-launched instance is the one that
+    wrote the pidfile, but a DIFFERENT, supervisor-launched instance may
+    be the one actually serving SOCKET_PATH. Gating the unlink on pidfile
+    identity (or its absence -- "nothing to protect, proceed") deletes
+    the live holder's socket out from under it even though this process
+    never bound it. `_bound_socket` answers the only question that
+    matters for this resource; PID_PATH's absence/unreadability is no
+    longer sufficient, on its own, to unlink the socket.
     """
     _shutdown.set()
     still_ours = False
@@ -277,17 +304,19 @@ def cleanup(*args):
         with open(PID_PATH) as f:
             still_ours = int(f.read().strip()) == os.getpid()
     except (OSError, ValueError):
-        # No pidfile, or unreadable/garbage content -- nothing to protect,
-        # proceed with cleanup (matches the prior unconditional behavior
-        # for this case).
+        # No pidfile, or unreadable/garbage content -- nothing to protect
+        # for the PIDFILE, proceed with removing IT (matches the prior
+        # unconditional behavior for this case). Says nothing about the
+        # socket -- see _bound_socket above.
         still_ours = True
     if still_ours:
         try:
-            os.unlink(SOCKET_PATH)
+            os.unlink(PID_PATH)
         except FileNotFoundError:
             pass
+    if _bound_socket:
         try:
-            os.unlink(PID_PATH)
+            os.unlink(SOCKET_PATH)
         except FileNotFoundError:
             pass
     sys.exit(0)
@@ -317,7 +346,7 @@ def _recorded_pid_is_alive() -> bool:
 
 
 def main():
-    global _client
+    global _client, _bound_socket
 
     # #1874: only remove the socket if the PID it was bound by is
     # confirmably dead. The prior unconditional unlink let a fresh daemon
@@ -387,6 +416,12 @@ def main():
     # Create Unix socket server
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
+    # Ownership flag flips ONLY after bind() returns successfully (#2713)
+    # -- cleanup()'s SOCKET_PATH unlink is gated on this, not on pidfile
+    # identity. Set immediately after the call that establishes ownership,
+    # never before it (a mutation that flips this earlier would falsely
+    # claim ownership for a bind() that actually failed/raised).
+    _bound_socket = True
     # Remove any idle-shutdown tombstone — daemon is healthy and running (#1260).
     tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
     try:
