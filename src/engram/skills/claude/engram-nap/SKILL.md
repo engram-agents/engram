@@ -64,13 +64,33 @@ The `nap` mode:
 
 ```python
 result = engram_nap(message="...")
-db_backup = result.get("db_backup", {})
-if db_backup.get("status") not in ("ok", "skipped"):
-    # Surface visibly — a silently-degrading backup is discovered only when needed
-    print(f"⚠ binary backup FAILED: {db_backup.get('error', db_backup)}")
+vc = result.get("version_control") or {}
+db_backup = vc.get("db_backup") or {}
+binary_backup = vc.get("binary_backup") or {}
+# Both fields are nested under version_control, not top-level (#2680: an
+# earlier version of this check read result.get("db_backup", {}) directly
+# and always saw {}). Neither field ever carries a "status" key -- read
+# each function's own return contract directly (_write_binary_backup /
+# engram_snapshot_worker.write_durable_snapshot) rather than guessing a
+# shape: db_backup is one of {"path","bytes","pruned"}
+# (fresh write), {"skipped": "same-day copy exists", "path"} (idempotent
+# skip -- also healthy), or {"error": str}; binary_backup is one of
+# {"path","bytes","fsynced": True} or {"error": str}. In every shape, the
+# ONLY unhealthy outcome is an "error" key -- so that is the one thing to
+# check, not a "status"/"ok" string that never exists in either dict.
+db_ok = "error" not in db_backup
+binary_ok = "error" not in binary_backup
+if not (db_ok and binary_ok):
+    # Surface visibly — a silently-degrading backup is discovered only when needed.
+    # Join both errors (not just the first) so a same-nap dual failure isn't
+    # silently truncated to one displayed reason.
+    reasons = [e for e in (db_backup.get("error"), binary_backup.get("error")) if e]
+    print(f"⚠ backup FAILED: {'; '.join(reasons)}")
+else:
+    print("✓ backup ok")
 ```
 
-Log `✓ binary backup ok` / `⚠ binary backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+Log `✓ backup ok` / `⚠ backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
 
 ## Step 3.5 — Prune finished fairy worktrees
 
