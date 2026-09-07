@@ -7177,8 +7177,19 @@ def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
 # (#1952 PR1). Distinct from RECALL_SUMMARY_HARD_CAP (200) in
 # tools/recall_summary_validator.py, which governs the OLDER
 # engram_set_recall_summaries batch tool on a separate path — the two are
-# deliberately not unified (see #1952 comment 5-6). Target: agents should aim
-# for ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
+# deliberately not unified. Lei's ruling (#1952, the "Design addendum — Lei's
+# four answers folded in" comment, 2026-08-19 evening): "280 = filing-time
+# hard gate ... 200 = post-tightening hard gate applied code-side to the
+# fairy's output". Cite by distinctive title text, not an ordinal into the
+# comment list or a dev-repo permalink (this file ships publicly; a
+# dev-repo URL here trips scan-leaks) — an earlier version of this comment
+# cited "comment 5-6" and was wrong from the moment it was written: the
+# ruling is comment 7 by any measured timestamp, and a reader following the
+# stale ordinal lands on the (superseded) two-threshold draft the ruling
+# explicitly replaced, concluding this citation is empty and unifying the
+# two constants (found by Ariadne, forum #398, 2026-09-07, while confirming
+# for Borges that 200 vs 280 IS deliberate). Target: agents should aim for
+# ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
 # 280+.
 RECALL_SUMMARY_TARGET = 140
 RECALL_SUMMARY_HARD_REJECT_AT = 280
