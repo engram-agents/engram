@@ -23,6 +23,18 @@ import time
 import unittest
 from pathlib import Path
 
+# Cross-file reuse (mirrors the established
+# test_pgrep_liveness_reap_patterns._extract_reap_pattern import
+# convention): #2652 phase-0 unit 4's fold gates this file's reap-loop
+# scenarios behind the new supervisor-registration check, so
+# TestReapBeforeStart needs a deterministic way to force the
+# UNSUPERVISED state regardless of this host's own ambient systemctl
+# behavior (measured "Failed to connect to bus" here, which reads
+# `unavailable` and would otherwise make the reap loop unreachable for a
+# reason unrelated to what these tests are actually about).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 DAEMON_PY_PATH = DAEMON_DIR / "engram-surface-daemon.py"
@@ -150,6 +162,27 @@ class TestReapBeforeStart(unittest.TestCase):
         self.engram_home = self.tmp / "engram_home"
         self.engram_home.mkdir()
 
+        # #2652 phase-0 unit 4 fold: force the UNSUPERVISED/not-registered
+        # supervisor state deterministically -- see this file's own import
+        # comment for why (this host's real systemctl reads `unavailable`,
+        # which would otherwise make the reap loop below unreachable).
+        self._fake_systemctl_dir = self.tmp / "fakebin-systemctl"
+        self._fake_systemctl_dir.mkdir()
+        _make_fake_systemctl(
+            self._fake_systemctl_dir, mode="show",
+            load_state="not-found", active_state="inactive", sub_state="dead",
+        )
+
+    def _env(self) -> dict:
+        """Base env for every `subprocess.run(["bash", str(self.script)],
+        ...)` call below: ENGRAM_HOME plus the fake-systemctl-prepended
+        PATH (harmless for the branch-4 healthy-daemon scenario, which
+        exits before the supervisor check is ever reached)."""
+        env = dict(os.environ)
+        env["ENGRAM_HOME"] = str(self.engram_home)
+        env["PATH"] = f"{self._fake_systemctl_dir}:{env.get('PATH', '')}"
+        return env
+
     def _spawn_decoy_daemon(self, engram_home=None):
         """A real process whose argv contains the daemon script's own
         basename literally -- exactly the shape a stray prior instance
@@ -173,10 +206,8 @@ class TestReapBeforeStart(unittest.TestCase):
         try:
             self.assertIsNone(decoy.poll(), "decoy failed to start -- test setup broken")
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -212,10 +243,10 @@ class TestReapBeforeStart(unittest.TestCase):
                 unrelated_decoy.poll(), "decoy failed to start -- test setup broken"
             )
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)  # a DIFFERENT home than the decoy's
+            # self._env()'s ENGRAM_HOME is self.engram_home -- a DIFFERENT
+            # home than the decoy's.
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -244,10 +275,10 @@ class TestReapBeforeStart(unittest.TestCase):
         try:
             self.assertIsNone(decoy.poll(), "decoy failed to start -- test setup broken")
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)  # a PREFIX of the decoy's home
+            # self._env()'s ENGRAM_HOME is self.engram_home -- a PREFIX of
+            # the decoy's home.
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -283,10 +314,8 @@ class TestReapBeforeStart(unittest.TestCase):
             srv.bind(str(socket_path))
             srv.listen(1)
             try:
-                env = dict(os.environ)
-                env["ENGRAM_HOME"] = str(self.engram_home)
                 result = subprocess.run(
-                    ["bash", str(self.script)], env=env, capture_output=True,
+                    ["bash", str(self.script)], env=self._env(), capture_output=True,
                     text=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)

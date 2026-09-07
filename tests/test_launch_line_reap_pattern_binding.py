@@ -142,10 +142,17 @@ def _extract_sh_launch_line(script_path: Path) -> str:
     line (the `env ENGRAM_HOME=... {{PYTHON}} "$DAEMON_SCRIPT"
     "$ENGRAM_HOME" ... &` line). This is the regression-guard surface
     (spec item 4): this unit does not touch the .sh script, so this must
-    already pass and keep passing."""
+    already pass and keep passing.
+
+    #2652 phase-0 unit 4 FOLD: the leading `^` is now `^\\s*` -- the
+    restored launch line lives inside the UNSUPERVISED `case` arm and is
+    therefore indented, unlike its pre-fold column-0 position. Bash
+    indentation is purely cosmetic and carries no semantic meaning, so
+    tolerating leading whitespace here does not weaken what this
+    regression guard actually checks (the launch line's own argv shape)."""
     text = script_path.read_text()
     m = re.search(
-        r'^env ENGRAM_HOME="\$ENGRAM_HOME" (\{\{PYTHON\}\} "\$DAEMON_SCRIPT" "\$ENGRAM_HOME")',
+        r'^\s*env ENGRAM_HOME="\$ENGRAM_HOME" (\{\{PYTHON\}\} "\$DAEMON_SCRIPT" "\$ENGRAM_HOME")',
         text,
         re.MULTILINE,
     )
@@ -317,11 +324,20 @@ class TestCurrentTemplatesMatchReapPattern:
 
 
 class TestShScriptOwnLaunchLineStillMatches:
-    """Regression guard (spec item 4): this unit touches only the two
-    templates, never start-engram-daemon.sh itself. Confirm its own
-    launch line -- extracted fresh from the script text, not re-derived
-    from memory -- still matches its own _reap_pattern, unaffected by
-    this unit's changes."""
+    """Regression guard (spec item 4, AS OF unit 3): this unit touches
+    only the two templates, never start-engram-daemon.sh itself. Confirms
+    its own launch line -- extracted fresh from the script text, not
+    re-derived from memory -- still matches its own _reap_pattern,
+    unaffected by unit 3's changes.
+
+    #2652 phase-0 unit 4 FOLD: this class was retired (skipped) by unit
+    4's own build, which removed the launch line entirely. The fold
+    RESTORES it (conditionally, on the UNSUPERVISED/not-registered
+    supervisor-branch path only) -- see start-engram-daemon.sh's own
+    `case "$_supervisor_state"` block. `_extract_sh_launch_line` matches
+    on the literal launch-line text alone, regardless of what shell
+    construct now surrounds it, so this regression guard is un-skipped
+    and holds again unmodified."""
 
     def test_sh_launch_line_matches_its_own_reap_pattern(self):
         captured = _extract_sh_launch_line(_SH_SCRIPT)

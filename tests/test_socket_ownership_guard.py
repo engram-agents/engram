@@ -85,6 +85,16 @@ import time
 import unittest
 from pathlib import Path
 
+# Cross-file reuse (mirrors the established
+# test_pgrep_liveness_reap_patterns._extract_reap_pattern import
+# convention used by tests/test_launch_line_reap_pattern_binding.py):
+# #2652 phase-0 unit 4's fold gates every scenario in this file's
+# reap/rm site behind the new supervisor-registration check, so the
+# scenarios below need a deterministic way to force the UNSUPERVISED
+# state regardless of this host's own ambient systemctl behavior.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 START_SCRIPT_PATH = DAEMON_DIR / "start-engram-daemon.sh"
@@ -672,6 +682,38 @@ def _patch_in_race_hook(script_text: str) -> str:
     return script_text.replace(target, hook_call)
 
 
+class _ForceUnsupervisedMixin:
+    """#2652 phase-0 unit 4 fold: forces the four-state supervisor-
+    registration branch into its UNSUPERVISED (not-registered) state for
+    every `_run()` call in this mixed-in class, so the unit-2-era guard
+    scenarios below (written before the fold's supervisor check existed)
+    continue to exercise the actual reap/rm/launch site instead of
+    silently short-circuiting on this host's own real `systemctl`
+    (measured "Failed to connect to bus", exit 1 -- reads `unavailable`
+    here, which would make the guarded rm site unreachable for a reason
+    entirely unrelated to what each scenario is actually testing).
+
+    Applies ONLY to the classes below that run the LIVE script -- classes
+    using a frozen pre-fold SCRIPT_TEXT (e.g. _PRE_UNIT2_SCRIPT_TEXT,
+    _PRE_FOLD_SCRIPT_TEXT) never call systemctl at all, so mixing this in
+    there would be harmless but pointless; they are left unmixed."""
+
+    def setUp(self):
+        super().setUp()
+        self._fake_systemctl_dir = self.tmp / "fakebin-systemctl"
+        self._fake_systemctl_dir.mkdir()
+        _make_fake_systemctl(
+            self._fake_systemctl_dir, mode="show",
+            load_state="not-found", active_state="inactive", sub_state="dead",
+        )
+
+    def _run(self, timeout: float = 10.0, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+        merged_env = {"PATH": f"{self._fake_systemctl_dir}:{os.environ.get('PATH', '')}"}
+        if extra_env:
+            merged_env.update(extra_env)
+        return super()._run(timeout=timeout, extra_env=merged_env)
+
+
 class _SocketGuardFixture(unittest.TestCase):
     """Shared setup: a real, executable copy of start-engram-daemon.sh (or
     the frozen pre-unit-2 variant) with {{PYTHON}} substituted, next to a
@@ -826,7 +868,15 @@ class _SocketGuardFixture(unittest.TestCase):
 # ===========================================================================
 
 
-class TestNoSocketFile(_SocketGuardFixture):
+class TestNoSocketFile(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    """#2652 phase-0 unit 4 FOLD: un-skipped. Unit 4's own build removed
+    this guard's site entirely; the fold restores it on the
+    UNSUPERVISED/not-registered supervisor-branch path -- forced
+    deterministically here via _ForceUnsupervisedMixin (this host's own
+    real systemctl reads `unavailable`, which would otherwise make this
+    site unreachable for a reason unrelated to what this scenario tests).
+    See TestUnknownOwnerAgainstPreUnit2Script below (frozen baseline,
+    unaffected either way) for the historical incident record."""
     def test_no_op_no_report_line_script_proceeds(self):
         self.assertFalse(self.socket_path.exists(), "test setup: socket must not exist")
         result = self._run()
@@ -845,7 +895,9 @@ class TestNoSocketFile(_SocketGuardFixture):
 # ===========================================================================
 
 
-class TestOrphanedSocketAllowsDelete(_SocketGuardFixture):
+class TestOrphanedSocketAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    """#2652 phase-0 unit 4 FOLD: un-skipped -- see TestNoSocketFile's
+    class docstring above for the full explanation."""
     def setUp(self):
         super().setUp()
         # bind+listen+close leaves the on-disk inode behind with nothing
@@ -876,7 +928,11 @@ class TestOrphanedSocketAllowsDelete(_SocketGuardFixture):
 # ===========================================================================
 
 
-class TestHeldByKilledPidAllowsDelete(_SocketGuardFixture):
+class TestHeldByKilledPidAllowsDelete(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    """#2652 phase-0 unit 4 FOLD: un-skipped -- see TestNoSocketFile's
+    class docstring above for the full explanation. (Unit 4's own build
+    had removed this behavior entirely; the fold restores it on the
+    UNSUPERVISED path, forced deterministically here.)"""
     def setUp(self):
         super().setUp()
         self.holder = self._spawn_holder_process(match_reap_pattern=True)
@@ -907,8 +963,13 @@ class TestHeldByKilledPidAllowsDelete(_SocketGuardFixture):
 # ===========================================================================
 
 
-class TestUnknownOwnerNotMatchedByReap(_SocketGuardFixture):
-    """The live incident #2652 unit 2 exists to stop: a daemon launched by
+class TestUnknownOwnerNotMatchedByReap(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    """#2652 phase-0 unit 4 FOLD: un-skipped -- see TestNoSocketFile's
+    class docstring above for the full explanation. (Unit 4's own build
+    had removed this scenario's site entirely; the fold restores it on
+    the UNSUPERVISED path, forced deterministically here.)
+
+    The live incident #2652 unit 2 exists to stop: a daemon launched by
     a different surface (different argv) is invisible to `_reap_pattern`,
     so the reap loop matches zero processes -- and the guard must still
     refuse to delete a socket that a real, live, unrelated process holds.
@@ -1040,8 +1101,14 @@ class TestUnknownOwnerNotMatchedByReap(_SocketGuardFixture):
 # ===========================================================================
 
 
-class TestRaceDetectionBlocksEvenWithoutALiveHolder(_SocketGuardFixture):
-    """Simulates the socket file being replaced (unlinked + freshly bound)
+class TestRaceDetectionBlocksEvenWithoutALiveHolder(_ForceUnsupervisedMixin, _SocketGuardFixture):
+    """#2652 phase-0 unit 4 FOLD: un-skipped -- see TestNoSocketFile's
+    class docstring above for the full explanation. (Unit 4's own build
+    had removed this guard's pre/post-stat race detection along with the
+    `rm -f` site it protected; the fold restores both on the
+    UNSUPERVISED path, forced deterministically here.)
+
+    Simulates the socket file being replaced (unlinked + freshly bound)
     in the window between the guard's pre-kill-loop stat and its
     immediately-pre-delete stat, via the test-only race hook (see
     _patch_in_race_hook). Deliberately does NOT bind a new listener at the
