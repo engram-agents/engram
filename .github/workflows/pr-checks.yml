@@ -18,6 +18,13 @@ name: pr-checks
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
+#   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
+#      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
+#      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
+#      nightly full suite, so a plaintext-stdout regression to a shipped
+#      hook (#2700) went green through pr-checks and broke hours later in
+#      a nightly nobody watches live (#2717). Path-scoped so it does not
+#      reintroduce full-suite cost on every PR.)
 
 on:
   pull_request:
@@ -685,3 +692,55 @@ jobs:
           python3 tools/test_id_set_check.py \
             --base "$BASE_SHA" --head HEAD \
             --pr-body-file /tmp/pr_body.txt
+
+      # ── 9. hooks-stdout-audit ───────────────────────────────────────────
+      # #2718 — tests/test_hooks_json_stdout_audit.py previously ran ONLY in
+      # the nightly full suite (tests.yml). Per this repo's CI cost model, dev
+      # PRs run only pr-checks — so a PR adding a plaintext-stdout `echo` to a
+      # referenced shell hook was green on every gate that ran at PR time and
+      # failed hours later in a nightly nobody watches live. Measured: #2700
+      # (d266825b) passed fairy, colleague, and pr-checks, then broke the
+      # audit in the 13:38Z nightly (#2717). "A gate positioned outside the
+      # path where the decision is made cannot protect the thing it audits."
+      #
+      # Path-scoped (not unconditional) to avoid reintroducing full-suite-class
+      # cost on every PR: the audit itself is fast (<1s, pure stdlib+pytest —
+      # same carve-out as manifest-gate / stdlib-only guards above), but the
+      # PRINCIPLE from #1597 is per-check cost discipline, not just wall-clock
+      # — so it only runs when the diff could plausibly regress it.
+      #
+      # No existing paths:-filter idiom exists in this repo's workflows (the
+      # `on: pull_request` trigger above deliberately carries no `paths:`, and
+      # no workflow here uses dorny/paths-filter or an equivalent action) — so
+      # this follows the closest in-file idiom instead: the roster-check /
+      # scan pair in the name-leak-warn step above (id: + $GITHUB_OUTPUT +
+      # `if: steps.<id>.outputs.<flag>` on the next step), rather than
+      # inventing a new mechanism or adding a new action dependency.
+      #
+      # BLOCKING (unlike name-leak-warn's advisory pattern it borrows the
+      # shape from) — the whole point of this gate is that a real regression
+      # here is currently free at PR time; an advisory posture would leave it
+      # free, same reasoning as test-id-set-check above.
+      - name: hooks-stdout-audit — check whether the diff touches src/engram/hooks/ or hooks.json
+        id: hooks-diff-check
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          # --no-renames: --name-only collapses a detected rename to the
+          # destination path alone. A hook file moved OUT of
+          # src/engram/hooks/ while being modified (hooks.json untouched)
+          # would then show only the new path and the predicate below would
+          # miss it — a false SKIP on exactly the change most likely to
+          # break the audit. --no-renames forces both the old and new path
+          # to appear as separate entries so the predicate still matches.
+          CHANGED=$(git diff --no-renames --name-only "$BASE_REF...HEAD")
+          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$'; then
+            echo "Diff touches src/engram/hooks/ or hooks.json — audit will run."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Diff does not touch src/engram/hooks/ or hooks.json — audit self-skips."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: hooks-stdout-audit — run test_hooks_json_stdout_audit.py
+        if: steps.hooks-diff-check.outputs.run == 'true'
+        run: python3 -m pytest tests/test_hooks_json_stdout_audit.py -q
