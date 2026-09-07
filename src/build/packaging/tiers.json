@@ -225,6 +225,11 @@
       "note": "engram-alpha#2518: health-v2 SSoT loader for /api/health/v2 -- same tier as its v1 sibling health.py and the rest of the viz dashboard."
     },
     {
+      "path": "viz/data/health_workbench.py",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench backend loader (shipped-model curves/importance) -- developer tier only, per the issue's own tier ruling. viz/server.py references this module via a LAZY, function-scoped import (see server.py's _workbench_available()) so it stays invisible to the tier-closure static checker on a convenience/essential build, where this file is never copied."
+    },
+    {
       "path": "viz/data/stats.py",
       "tier": "convenience"
     },
@@ -266,9 +271,24 @@
       "tier": "convenience"
     },
     {
+      "path": "viz/templates/health_workbench.html",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench page shell -- developer tier only. server.py's _workbench_available() checks this file's presence to gate both the /health/workbench route and the detail-view header link, so a convenience/essential build (which never copies this file) never advertises or serves the page."
+    },
+    {
       "path": "viz/static/health-detail-math.js",
       "tier": "convenience",
       "note": "engram-alpha#2518 detail-view slice: pure distribution/histogram math for the history strip, served via <script src>, same tier as its sibling health.html and the rest of the viz dashboard."
+    },
+    {
+      "path": "viz/static/health-workbench-curve.js",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench's pure scoring math (piecewiseLinear/aspectScore/composeScore, ported line-for-line from health/curves.py + health/engine.py) -- developer tier only, same gate as its sibling health_workbench.html/health_workbench.py."
+    },
+    {
+      "path": "viz/static/health-workbench.js",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench page DOM/fetch logic -- developer tier only, same gate as its sibling health_workbench.html/health_workbench.py."
     },
     {
       "path": "viz/templates/stats.html",

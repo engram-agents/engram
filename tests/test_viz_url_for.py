@@ -295,7 +295,19 @@ class TestLiveServerLinkIntegrity(_LiveServerBase):
     """Gate 1c: crawl every internal href/src in every page's response and
     confirm each resolves to a known route (a page route, one of the 4
     static assets actually served, or an external absolute URL, which is
-    out of scope for this check)."""
+    out of scope for this check).
+
+    ``_EXTRA_KNOWN_TARGETS`` (engram-alpha#2727): dev-tier-only routes that
+    are not one of the 4 always-shipped ``_KNOWN_PAGE_PATHS`` (those drive
+    OTHER tests in this file that fetch each path expecting 200 under a
+    fixture with no registered agents -- adding a route here that 404s
+    under that fixture, or that has no matching nav tab, would break those,
+    not just this one). ``/health/workbench`` is a real, valid link target
+    the detail view's own header conditionally emits (see server.py's
+    ``_workbench_available()`` gate) -- deliberately allow-listed here,
+    separately, rather than folded into ``_KNOWN_PAGE_PATHS``."""
+
+    _EXTRA_KNOWN_TARGETS = {"/health/workbench"}
 
     def test_all_internal_refs_resolve(self):
         known_static = {f"/static/{p.name}" for p in _STATIC_DIR.iterdir() if p.is_file()}
@@ -308,7 +320,9 @@ class TestLiveServerLinkIntegrity(_LiveServerBase):
                     continue  # external -- out of scope for internal link integrity
                 bare = ref.split("?", 1)[0]
                 self.assertTrue(
-                    bare in _KNOWN_PAGE_PATHS or bare in known_static,
+                    bare in _KNOWN_PAGE_PATHS
+                    or bare in known_static
+                    or bare in self._EXTRA_KNOWN_TARGETS,
                     f"{path} response has an internal ref {ref!r} that "
                     f"resolves to neither a known page route nor a served "
                     f"static asset",

@@ -73,7 +73,7 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import agents as viz_agents
 from . import footer
@@ -114,6 +114,59 @@ _STATIC_CONTENT_TYPES = {
 _STATIC_CACHE_CONTROL = "public, max-age=3600"
 
 
+# ---------------------------------------------------------------------------
+# Curve Workbench (engram-alpha#2727) -- developer-tier only.
+#
+# JUDGMENT CALL (flagged in the coder-fairy's report): this codebase has NO
+# runtime ``install_tier`` check anywhere (grepped: `install_tier` is written
+# to $ENGRAM_HOME/config.json by tools/install-local-marketplace.sh and read
+# ONLY by that shell script and build-plugin.sh, both at BUILD time -- see
+# project CLAUDE.md's "Install tiers" section: "no post-install pruning").
+# So there is no existing mechanism this route could call. What DOES gate a
+# dev-tier feature, mechanically, is exactly what the manifest
+# (src/build/packaging/tiers.json) controls: whether the dev-tier-only files
+# for this feature were COPIED into the running install at all. Checking
+# whether those files are present/importable on THIS process is therefore
+# checking "the tier recorded in the plugin manifest" the only way that fact
+# is actually observable at runtime on a directory-source install (where the
+# SOURCE tree IS the live path -- project CLAUDE.md's "Plugin deploy" note).
+#
+# The import below is LAZY (function-scoped, guarded by try/except
+# ImportError) so it stays invisible to the tier-closure static checker
+# (src/build/engine/README.md, "Known gaps" #3: "Lazy imports are invisible
+# to the tier-closure check") -- this lets a "convenience"-tier module
+# (server.py) reference a "dev"-tier-only sibling
+# (viz/data/health_workbench.py) without tripping
+# test_import_dep_tier_consistency's "importer and importee must ship at
+# the same tier" rule, which only walks TOP-LEVEL module-scope imports.
+# ---------------------------------------------------------------------------
+
+_WORKBENCH_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent / "templates" / "health_workbench.html"
+)
+
+# Sentinel left in templates/health.html's header, replaced at request time
+# with either the real link (dev tier) or an empty string (every other
+# tier) -- same two-phase bake-then-splice shape as shell._NAV_PLACEHOLDER
+# / shell._FOOTER_PLACEHOLDER.
+_WORKBENCH_LINK_PLACEHOLDER = "<!--WORKBENCH_LINK_PLACEHOLDER-->"
+
+
+def _workbench_available() -> bool:
+    """True iff this build shipped the Curve Workbench's dev-tier files
+    (both the page template and its backend data module). A plain function
+    (not a cached module-level constant) so tests can monkeypatch it
+    directly to simulate flipping the tier gate on/off, without needing to
+    fake the filesystem or reinstall a different tier."""
+    if not _WORKBENCH_TEMPLATE_PATH.is_file():
+        return False
+    try:
+        from .data import health_workbench as _  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass  # suppress default access log
@@ -129,6 +182,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/agents":
             self._json({"agents": viz_agents.get_agents_meta(),
                         "default": viz_agents.DEFAULT_AGENT})
+            return
+
+        if path == "/health/workbench":
+            self._serve_workbench_page(parsed.query)
             return
 
         if path in routes.PAGE_ROUTES:
@@ -183,6 +240,21 @@ class Handler(BaseHTTPRequestHandler):
                 .replace(shell._NAV_PLACEHOLDER, nav_html)
                 .replace(shell._FOOTER_PLACEHOLDER, footer_html)
             )
+            if path == "/health":
+                # Dev-tier-only header link to the Curve Workbench
+                # (engram-alpha#2727) -- spliced at REQUEST time, same
+                # placeholder-substitution shape as the nav/footer above,
+                # so a non-dev build (which never has the placeholder's
+                # target route available -- see _workbench_available())
+                # renders the plain empty string instead of a dead link.
+                if _workbench_available():
+                    href = "/health/workbench"
+                    if agent_param:
+                        href += f"?{urlencode({'agent': agent_param})}"
+                    link_html = f'<a href="{href}" class="workbench-link">Curve Workbench</a>'
+                else:
+                    link_html = ""
+                page = page.replace(_WORKBENCH_LINK_PLACEHOLDER, link_html)
             self._html(page)
             return
 
@@ -263,6 +335,27 @@ class Handler(BaseHTTPRequestHandler):
                 resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
                 resp["agent"] = agent_name
                 self._json(resp)
+        elif path == "/api/health/v2/model":
+            # Curve Workbench (engram-alpha#2727) -- the SHIPPED scoring
+            # model's curve/importance/aspect-points declarations. NOT
+            # agent-scoped data (every seat on this install runs the SAME
+            # code, so there is exactly one shipped model to read) --
+            # unlike every other branch in this elif chain, this one does
+            # not consult db_path/agent_name at all. Dev-tier-gated: 404
+            # (not the fail-honest 200 the sibling `/series` endpoint
+            # uses) when this build didn't ship the Workbench's files --
+            # see _workbench_available()'s own docstring for why file
+            # presence IS the tier check here.
+            if not _workbench_available():
+                self._json(
+                    {"error": "Curve Workbench is not available in this "
+                              "install (developer tier only)",
+                     "reason": "not_developer_tier"},
+                    status=404,
+                )
+            else:
+                from .data import health_workbench as viz_health_workbench_data
+                self._json(viz_health_workbench_data.get_workbench_model())
         elif path == "/api/calibration":
             if not db_path:
                 self._json({"error": f"Unknown agent: {agent_name!r}",
@@ -374,6 +467,57 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _serve_workbench_page(self, query: str):
+        """GET /health/workbench?agent=<seat> -- the Curve Workbench page
+        (engram-alpha#2727), developer tier only.
+
+        Two fail-honest, non-200 cases, BOTH rendered as JSON (not HTML) --
+        JUDGMENT CALL (flagged in the coder-fairy's report): none of the
+        four existing whole-page routes (/, /health, /stats, /config) ever
+        404 on an unknown ?agent= (they render the shell regardless --
+        _resolve_agent's own docstring: "the exact requested name
+        unresolved-and-unmodified ... never silently swapped"), so there is
+        no PAGE-route precedent for "unknown agent" to mirror. The only
+        existing precedent for a distinguishable "unknown agent" error at
+        all is the AGENT-SCOPED API endpoints' `{"error": ..., "agent":
+        ...}` / 404 shape (e.g. /api/health/v2 above) -- reused here
+        because, unlike the four static shells, this page has nothing
+        meaningful to render for an agent with no data.
+
+          1. Tier gate closed (this build didn't ship the Workbench's
+             files) -- 404, same shape as /api/health/v2/model's own gate.
+          2. Unknown/unregistered ?agent= -- 404, same shape as every
+             other agent-scoped endpoint on this handler.
+        """
+        if not _workbench_available():
+            self._json(
+                {"error": "Curve Workbench is not available in this "
+                          "install (developer tier only)",
+                 "reason": "not_developer_tier"},
+                status=404,
+            )
+            return
+
+        agent_param, page_db_path = viz_agents._resolve_agent(query)
+        if not page_db_path:
+            self._json(
+                {"error": f"Unknown agent: {agent_param!r}", "agent": agent_param},
+                status=404,
+            )
+            return
+
+        nav_html = shell._render_nav("health", agent=agent_param)
+        data_dir = os.path.dirname(page_db_path) if page_db_path else None
+        footer_html = footer.render_footer(data_dir)
+        with open(_WORKBENCH_TEMPLATE_PATH, encoding="utf-8") as f:
+            template = f.read()
+        page = (
+            template
+            .replace(shell._NAV_PLACEHOLDER, nav_html)
+            .replace(shell._FOOTER_PLACEHOLDER, footer_html)
+        )
+        self._html(page)
 
     def _serve_static(self, filename: str):
         """Serve one file from viz/static/ (engram-alpha#2555 PR B
