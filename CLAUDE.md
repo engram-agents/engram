@@ -872,6 +872,23 @@ to encode in always-loaded identity rules.
 unwritten in the workflow doc; the hierarchy itself has been practiced
 since the multi-agent coordination work started in 2026-05.
 
+## Attribution convention — Lei's functional-vs-marker test (alpha#2270)
+
+**The rule is Lei's, ruled 2026-08-15, not open and not interim.** Naming a colleague in a shipped artifact — a PR comment, a code comment, a test docstring — is governed by whether the name is *functional and will mislead general users* (something a reader or a tool would act on, and misread as coming from a real contributor to the project) or a *marker* (attribution that identifies who did something, acted on by nobody). Both conjuncts must hold to prohibit — functional alone or misleading alone is not enough, only functional-and-misleading blocks. The inert-but-misleading case (a name that invites no tool action yet could still mislead a reader into believing a human they've never heard of is a project contributor) is exactly what keeps case 2 below open, rather than being settled by the functional prong the way case 1 is. Lei's own words, relayed verbatim by Borges from his graph (quote-verified, source_class user_stated):
+
+> "Fine as attribution, same rule as my name, as long as it's not functional and will mislead general users, it's fine as development markers."
+
+Kepler's own amendment on alpha#2270 states the relation between this test and the worked application below precisely: *"The governing rule is therefore Lei's FUNCTIONAL-vs-MARKER discriminator, not my handle-vs-human split — mine becomes the worked application (they agree on every case in front of us today, and come apart only at edges: his form permits a human name inside a pure attribution marker, and forbids an agent handle that is functional/misleading)."* The handle-vs-human split is not a competing axis; it's what applying Lei's test looks like in the one case decided so far.
+
+**Worked application — agent handles vs. human names:**
+
+1. **A bare agent handle as attribution** (Ariadne, Borges, Kepler, Clio, …) in a shipped comment or PR body ("Ariadne's catch, PR #2618") — **fine.** It's a marker: it credits, it invites nothing a general user's install can act on or fail against. An **`@handle` mention**, by contrast, is functional — it renders as a live notification to a real GitHub account the moment the text is quoted anywhere on the platform, which is a different case from a bare name and not covered by this paragraph.
+2. **A human name** other than Lei's own, inside a shipped artifact — held open deliberately pending Lei's explicit confirmation, though Lei's own "same rule as my name" arguably already reaches it. Do not extend the agent-handle answer to this case by inference.
+
+**Why the two related gates differ in severity, and that difference is principled, not accidental:** `no-new-shipped-node-ids` **blocks** because a shipped concrete node ID is functional-and-dead — it invites an `engram_inspect` that fails on every install but the author's, by construction (see "PR — issue closure" §Body-text trap discipline for the sibling case of a keyword the parser *does* act on). `name-leak-warn` **advises, never blocks** — because, unlike the node-ID gate, it cannot itself tell a citation from a leak (its own comment says so: "these may be valid citations or unintended leaks — please review each one"), so it asks the seat to decide rather than ruling.
+
+**For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name: it happened twice on this repo (engram-alpha#2618, #2697) before this paragraph landed, both scrubbing the same colleague's credit, both against Lei's already-ruled test.
+
 ## Project-as-bunch coordination (multi-agent mode)
 
 When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges), open
