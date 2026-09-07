@@ -2571,6 +2571,87 @@ class TestForensicCapture:
             f"pids={forensics['locks']['pids']!r}"
         )
 
+    # -- max_rows resolves _LOCK_ROWS_LIMIT at CALL time, not def time (#2714) -
+
+    def test_capture_locks_honors_runtime_reconfigured_limit(self, tmp_path, monkeypatch):
+        """#2714: `_capture_locks`'s `max_rows` must resolve `_LOCK_ROWS_LIMIT`
+        at CALL time, not def time — the same defect class #2705/#2712 fixed
+        for `_capture_fds`'s `max_scan`. A plain `max_rows: int =
+        _LOCK_ROWS_LIMIT` binds the module constant's value ONCE, when
+        `_capture_locks` is defined, so a caller that later monkeypatches
+        `engram_walguard._LOCK_ROWS_LIMIT` (exactly what this test does) has
+        ZERO effect on a call that omits the `max_rows` argument under the
+        pre-fix code — this is the red-first control for that.
+
+        Fake /proc/locks with five rows, each matching a distinct target
+        (device, inode) pair. Force `_LOCK_ROWS_LIMIT` down to 2 (below the
+        row count) and call `_capture_locks` with `max_rows` OMITTED. A
+        call-time-bound resolution honors the monkeypatched value and
+        truncates after 2 rows; a def-time-bound default silently keeps the
+        original 500-row cap and returns all 5 untruncated — the
+        discriminating shape between the two.
+        """
+        target_dev_inodes: set[tuple[int, int]] = set()
+        lines = []
+        for i in range(5):
+            dev = os.makedev(8, i)  # arbitrary but distinct major:minor
+            inode = 1000 + i
+            target_dev_inodes.add((dev, inode))
+            maj, minr = os.major(dev), os.minor(dev)
+            lines.append(
+                f"{i}: POSIX  ADVISORY  READ {900 + i} {maj:02x}:{minr:02x}:{inode} 0 EOF\n"
+            )
+        fake_locks_content = "".join(lines)
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/locks":
+                import io
+
+                return io.StringIO(fake_locks_content)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr(
+            os, "access", lambda p, m: True if p == "/proc/locks" else os.path.exists(p)
+        )
+
+        # Discrimination check: with the ORIGINAL (500) _LOCK_ROWS_LIMIT and
+        # max_rows omitted, all 5 planted rows are returned untruncated —
+        # confirms the fixture itself doesn't already trip the cap regardless
+        # of which value is honored.
+        baseline = engram_walguard._capture_locks(target_dev_inodes)
+        assert baseline["status"] == "ok"
+        assert len(baseline["rows"]) == 5 and baseline["truncated"] is False, (
+            "fixture assumption broken: the 5 planted rows already exceed "
+            "the untouched _LOCK_ROWS_LIMIT default — the discriminating "
+            "check below no longer holds"
+        )
+
+        # The actual regression guard: reconfigure _LOCK_ROWS_LIMIT to a
+        # value BELOW the row count, omit max_rows, and confirm the new
+        # limit is actually honored (call-time resolution) rather than
+        # silently ignored (def-time-bound default).
+        monkeypatch.setattr(engram_walguard, "_LOCK_ROWS_LIMIT", 2)
+        result = engram_walguard._capture_locks(target_dev_inodes)
+        assert result["status"] == "ok"
+        assert len(result["rows"]) == 2, (
+            f"expected the runtime-reconfigured _LOCK_ROWS_LIMIT=2 to be "
+            f"honored on a call that omits max_rows; got "
+            f"{len(result['rows'])} rows (def-time-bound default would "
+            f"silently keep returning all 5): {result}"
+        )
+        assert result["truncated"] is True
+
+        # An explicit max_rows= argument must still take precedence either
+        # way — unaffected by the module-constant monkeypatch, mirroring
+        # _capture_fds's max_scan= contract.
+        explicit = engram_walguard._capture_locks(target_dev_inodes, max_rows=1)
+        assert explicit["status"] == "ok"
+        assert len(explicit["rows"]) == 1
+        assert explicit["truncated"] is True
+
     # -- capture_forensics() must never raise ---------------------------------
 
     def test_capture_forensics_never_raises_on_internal_error(self):

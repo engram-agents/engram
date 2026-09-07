@@ -295,7 +295,7 @@ _LOCK_ROWS_LIMIT = 500     # cap on matching /proc/locks rows kept per capture
 
 
 def _capture_locks(
-    target_dev_inodes: set[tuple[int, int]], max_rows: int = _LOCK_ROWS_LIMIT
+    target_dev_inodes: set[tuple[int, int]], max_rows: Optional[int] = None
 ) -> dict:
     """Read /proc/locks, keep rows whose (device, inode) matches one of
     target_dev_inodes.
@@ -318,7 +318,19 @@ def _capture_locks(
     the same inode number on a different device to the target file, exactly
     the kind of false positive this capture exists to avoid producing in
     the "who else holds a read mark" field.
+
+    max_rows=None (the default) resolves _LOCK_ROWS_LIMIT at CALL time, not
+    def time (#2714) -- a plain `max_rows: int = _LOCK_ROWS_LIMIT` binds the
+    module constant's value once, when this function is defined, so a
+    caller that later monkeypatches `engram_walguard._LOCK_ROWS_LIMIT` (e.g.
+    a test that needs a cap value independent of whatever the production
+    default happens to be tuned to) has no effect on omitted-argument calls.
+    An explicit max_rows= argument (e.g. a size-guard test's max_rows=1) is
+    unaffected either way and still takes precedence. Same defect class as
+    #2705/#2712's `_capture_fds`/`max_scan` fix.
     """
+    if max_rows is None:
+        max_rows = _LOCK_ROWS_LIMIT
     path = "/proc/locks"
     if not os.access(path, os.R_OK):
         return {"status": "unavailable", "why": f"{path} not readable (os.access failed)"}
