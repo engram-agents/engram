@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -592,17 +593,23 @@ def _make_scratch_repo(tmp_path, *, tags=()):
     return repo
 
 
-def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None):
+def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None, extra_env=None):
     """Run the scratch repo's own installer copy with a temp ENGRAM_HOME.
 
     build_dir: when given, points ENGRAM_BUILD_DIR at a pre-populated fake
     plugin tree (via _write_fake_plugin) so a guard-passing run can reach the
     marketplace-assembly + .deployed-version-write steps. Guard-refusal runs
     don't need this — the guard dies before the build dir is ever consulted.
+
+    extra_env: additional env var overrides (e.g. ENGRAM_INSTALL_FETCH_TIMEOUT_SECS
+    for the #2711 round-3 timeout-path test, GIT_SSH_COMMAND to swap in a fake
+    ssh transport). Merged on top of ENGRAM_BUILD_DIR when both are given.
     """
     env_overrides = {}
     if build_dir is not None:
         env_overrides["ENGRAM_BUILD_DIR"] = str(build_dir)
+    if extra_env:
+        env_overrides.update(extra_env)
     return subprocess.run(
         ["bash", str(repo / "tools" / "install-local-marketplace.sh"),
          "--skip-add", "--skip-build", *extra_args],
@@ -709,4 +716,347 @@ def test_tag_guard_runs_before_target_dispatch(tmp_path):
     assert result.returncode != 0
     assert "not a tagged commit" in result.stderr
     assert "#2586" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+# ── #2711 — #794/#2586 guard ordering (detached HEAD at a deploy tag) ────────
+#
+# A detached HEAD's "branch name" is the literal string 'HEAD', which always
+# tripped the #794 branch guard before the #2586 tag exception got a chance
+# to fire (the exact fleet-upgrade repro in #2711: `git checkout
+# deploy/...` then the installer with no flags). These tests extend the
+# scratch-repo approach above with a two-commit 'dev' history, a REAL
+# fetchable 'origin' remote (a local-filesystem bare repo — no network
+# needed, but a genuine `git fetch` against it succeeds, which round 2's
+# fail-closed refresh requires: a stale ref faked via `git update-ref`
+# alone can't exercise a real fetch call), and a divergent unmerged branch
+# — so both halves of the #2711 predicate (deployable tag AND merged
+# history) are independently exercisable, plus round 2's fetch-failure
+# fail-closed case (below).
+
+
+def _make_scratch_repo_with_ancestry(tmp_path, *, fake_build_plugin=False):
+    """A scratch repo shaped for the #2711 ancestor-exception tests.
+
+    Commit graph:
+        A (annotated tag v1.0.0-ancestor-test; ancestor of dev's tip)
+        |
+        B (dev tip == refs/remotes/origin/dev; left UNTAGGED on purpose, so
+        |  tests that stay on 'dev' still exercise the unrelated #2586 guard
+        |  honestly rather than short-circuiting on a tag)
+        (branches off A)
+        D (on branch 'stray'; tagged deploy/2026-09-07-stray; NOT an
+           ancestor of origin/dev — simulates a same-named local tag on
+           unmerged work, which must NOT bypass #794)
+
+    Ends on 'dev'. Returns (repo, commits) with commits = {"a": sha, "b": sha, "d": sha}.
+
+    A real 'origin' remote (bare repo on local disk, at tmp_path /
+    "origin-bare.git") is configured with 'dev' and 'main' both at sha_b —
+    matching this repo's real topology where both branches exist upstream —
+    so the installer's own `git fetch origin dev main` (round 2's stale-ref
+    refresh, #2711) has something genuine to succeed against.
+
+    fake_build_plugin: when True, tools/build-plugin.sh in the scratch repo
+    is replaced with a stub that logs its argv to build-plugin-calls.log and
+    exits 0 — used to verify the --allow-branch flag this installer forwards
+    downstream, without needing a real (heavy) engine build.
+    """
+    repo = tmp_path / "scratch-repo"
+    (repo / "tools").mkdir(parents=True)
+    (repo / "src" / "engram").mkdir(parents=True)
+    (repo / "src" / "engram" / "server.py").write_text("# stub\n")
+    scratch_installer = repo / "tools" / "install-local-marketplace.sh"
+    scratch_installer.write_text(INSTALLER.read_text())
+    scratch_installer.chmod(0o755)
+
+    if fake_build_plugin:
+        build_plugin_log = repo / "build-plugin-calls.log"
+        fake_build_plugin_sh = repo / "tools" / "build-plugin.sh"
+        fake_build_plugin_sh.write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{build_plugin_log}"\n'
+        )
+        fake_build_plugin_sh.chmod(0o755)
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    _git("init", "-q", "-b", "dev")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "init")
+    sha_a = _git("rev-parse", "HEAD").stdout.strip()
+    # Annotated (not lightweight) on purpose — matches the real deploy tags
+    # named in #2711 and exercises `git rev-parse <tag>` returning the tag
+    # OBJECT rather than the commit, the exact trap #2711 calls out. The
+    # installer's own ancestry check must use HEAD, never this tag name
+    # directly, to sidestep it.
+    _git("tag", "-a", "v1.0.0-ancestor-test", "-m", "annotated deploy tag")
+
+    (repo / "second.txt").write_text("second commit\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "second")
+    sha_b = _git("rev-parse", "HEAD").stdout.strip()
+
+    # A REAL, fetchable 'origin' remote — a bare repo on the local
+    # filesystem, no network needed. 'dev' and 'main' both point at sha_b
+    # upstream (this repo's real topology has both branches present on
+    # origin). The explicit `fetch` at the end (rather than relying on
+    # `push`'s own opportunistic remote-tracking-ref update, which varies by
+    # git version/config) is what guarantees refs/remotes/origin/{dev,main}
+    # are populated before any test runs the installer's own
+    # `git fetch origin dev main` against this same remote.
+    origin_bare = tmp_path / "origin-bare.git"
+    _git("init", "-q", "-b", "dev", "--bare", str(origin_bare))
+    _git("remote", "add", "origin", str(origin_bare))
+    _git("push", "-q", "origin", "dev")
+    _git("push", "-q", "origin", "dev:refs/heads/main")
+    _git("fetch", "-q", "origin")
+
+    _git("checkout", "-q", "-b", "stray", sha_a)
+    (repo / "stray.txt").write_text("unmerged work\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "stray unmerged commit")
+    sha_d = _git("rev-parse", "HEAD").stdout.strip()
+    _git("tag", "deploy/2026-09-07-stray")
+
+    _git("checkout", "-q", "dev")
+
+    return repo, {"a": sha_a, "b": sha_b, "d": sha_d}
+
+
+def _checkout(repo, ref):
+    subprocess.run(
+        ["git", "checkout", "-q", ref], cwd=repo, check=True,
+        capture_output=True, text=True,
+    )
+
+
+def test_detached_head_at_ancestor_deploy_tag_builds_without_allow_branch(tmp_path):
+    """Test 1 (#2711): HEAD detached at a deployable tag that IS an
+    ancestor of origin/dev builds with NO --allow-branch."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "v1.0.0-ancestor-test")
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(repo, engram_home, build_dir=build_root)
+
+    assert result.returncode == 0, result.stderr
+    assert "Deployable tag(s) at HEAD" in result.stdout
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=v1.0.0-ancestor-test" in marker
+
+
+def test_detached_head_at_non_ancestor_commit_still_refuses(tmp_path):
+    """Test 2 (#2711): a deployable-pattern tag on a commit that is NOT
+    merged into origin/dev must still refuse without --allow-branch — a
+    same-named local tag on unmerged work is not the #2586 exception, being
+    ACTUALLY MERGED is. Without this test the fix is indistinguishable from
+    deleting the #794 guard outright."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "deploy/2026-09-07-stray")
+    engram_home = tmp_path / "engram-home"
+
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not 'dev'" in result.stderr
+    assert "#794" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_detached_head_at_non_ancestor_commit_builds_with_allow_branch(tmp_path):
+    """The --allow-branch override still works for the non-ancestor case —
+    the fix narrows the #794 exception, it doesn't remove the override."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "deploy/2026-09-07-stray")
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo, engram_home, extra_args=["--allow-branch"], build_dir=build_root
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dev_checkout_still_builds_without_allow_branch(tmp_path):
+    """Test 3 (#2711), first half: a normal 'dev' checkout still builds
+    without --allow-branch. dev's tip here is deliberately untagged, so
+    --allow-untagged is still required — that's the unrelated #2586 guard;
+    what this test asserts is that no #794 branch error appears."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo, engram_home, extra_args=["--allow-untagged"], build_dir=build_root
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "#794" not in (result.stdout + result.stderr)
+
+
+def test_genuine_feature_branch_still_refuses_without_allow_branch(tmp_path):
+    """Test 3 (#2711), second half: a genuine feature branch (no tag at
+    HEAD at all) is exactly what #794 must keep refusing — the ordering fix
+    must not turn into a guard deletion."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "feature/some-work"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    engram_home = tmp_path / "engram-home"
+
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not 'dev'" in result.stderr
+    assert "#794" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_ancestor_tag_checkout_forwards_allow_branch_to_build_plugin(tmp_path):
+    """build-plugin.sh (tools/engine/cli.py) carries its OWN, independent
+    #794 branch guard — this installer's own guard passing is not enough if
+    the downstream build call still gets no --allow-branch. #2711's fix
+    must forward the tag/ancestor exception into build_flags too."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path, fake_build_plugin=True)
+    _checkout(repo, "v1.0.0-ancestor-test")
+    engram_home = tmp_path / "engram-home"
+
+    result = subprocess.run(
+        ["bash", str(repo / "tools" / "install-local-marketplace.sh"), "--skip-add"],
+        cwd=repo,
+        env=_env(engram_home),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    # The installer's OWN #794 guard must not have fired (whatever happens
+    # downstream in the fake build-plugin.sh stub, which doesn't produce a
+    # real plugin.json and so the script dies afterward — irrelevant here).
+    assert "not 'dev'" not in result.stderr
+
+    log = (repo / "build-plugin-calls.log").read_text()
+    assert "--allow-branch" in log
+
+
+# ── #2711 round 2 — fail-closed on a failed origin refresh ───────────────────
+#
+# The ancestry check trusts refs/remotes/origin/{dev,main} without ever
+# re-fetching them, so a LOCAL remote-tracking ref that was correct at
+# fetch-time but is now stale (e.g. upstream force-pushed 'dev' back past a
+# bad merge) can still report ancestry for a commit that is no longer merged
+# history. The fix refreshes both refs immediately before trusting them, and
+# must FAIL CLOSED (never grant the exception) if that refresh itself fails
+# — an unreachable network must make the guard STRICTER, never looser.
+
+
+def test_fetch_failure_fails_closed_refuses_ancestor_tag_without_allow_branch(tmp_path):
+    """If the pre-check `git fetch origin dev main` fails (offline / no
+    remote / auth failure / ...), DEPLOYABLE_ANCESTOR must stay 0 — a
+    detached HEAD at a tag that WOULD otherwise pass the ancestor check
+    (v1.0.0-ancestor-test, genuinely merged into origin/dev) must still
+    REFUSE without --allow-branch. This is the mutation-control case: a
+    fail-OPEN implementation (leaving DEPLOYABLE_ANCESTOR=1 when the fetch
+    fails) makes this test go green->red; see the round-2 handoff for the
+    confirmed mutation result."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "v1.0.0-ancestor-test")
+    # Break the fetch deliberately by pointing 'origin' at a path that does
+    # not exist. No test can safely sever real network access, so this is
+    # the local-filesystem-remote equivalent: `git fetch origin ...` fails
+    # the same way (non-zero exit, no refs updated) whether the remote is
+    # unreachable over a network or simply absent on disk.
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git")],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    engram_home = tmp_path / "engram-home"
+
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not 'dev'" in result.stderr
+    assert "#794" in result.stderr
+
+
+# ── #2711 round 3 — bound the fetch, fail closed on a TIMEOUT specifically ──
+#
+# Round 2 fixed the fail-closed direction (above) but introduced a new hang
+# risk: `git fetch origin dev main` carried no timeout, so a silently-dropped
+# network (packets unrouted rather than refused) could leave it hanging
+# indefinitely instead of failing fast. This section covers the fix: the
+# fetch is now wrapped in `timeout $FETCH_TIMEOUT_SECS`, and a timeout must
+# land in the SAME fail-closed branch as any other fetch failure.
+
+
+def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tmp_path):
+    """A silently-dropped network can't be produced with a real socket in a
+    test without flakiness, so this simulates it the same way the coreutils
+    `timeout` documentation itself frames the failure: a subprocess that
+    accepts control but never returns. `GIT_SSH_COMMAND` swaps git's ssh
+    transport for a script that just sleeps, and the origin URL is switched
+    to an `ssh://` form so that transport is actually used (a bare local
+    path, as the round-2 test above uses, fails instantly rather than
+    hanging — it can't stand in for this case).
+
+    ENGRAM_INSTALL_FETCH_TIMEOUT_SECS overrides the installer's real 15s
+    default down to 2s purely so this test doesn't itself take 15s+ to run;
+    it asserts the override mechanism plus the fail-closed OUTCOME, not the
+    production duration (see the handoff for the chosen 15s figure and its
+    reasoning).
+
+    Mutation-control result for this test (fail OPEN on a timeout instead of
+    fail-closed): documented in the round-3 handoff rather than executed as
+    a second test here — the natural fail-open mutation (treating rc=124
+    the same as rc=0) does not hang this test, but a mutation that instead
+    DROPS the `timeout` wrapper entirely reintroduces the very hang this
+    fix exists to bound, and a test that can hang the suite is worse than
+    one that doesn't exist. The 2s cap plus this test's own runtime assertion
+    below is the safeguard against that specific mutation shape."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "v1.0.0-ancestor-test")
+
+    fake_ssh = tmp_path / "fake-ssh.sh"
+    fake_ssh.write_text("#!/usr/bin/env bash\nexec sleep 9999\n")
+    fake_ssh.chmod(0o755)
+    subprocess.run(
+        ["git", "remote", "set-url", "origin", "ssh://localhost/nonexistent-repo.git"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    engram_home = tmp_path / "engram-home"
+
+    start = time.monotonic()
+    result = _run_scratch_installer(
+        repo, engram_home,
+        extra_env={
+            "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": "2",
+            "GIT_SSH_COMMAND": str(fake_ssh),
+        },
+    )
+    elapsed = time.monotonic() - start
+
+    # Generous ceiling above the 2s cap (not a tight bound — CI/sandboxed
+    # hosts vary) but far below the 9999s the fake ssh sleeps for; this is
+    # what actually distinguishes "bounded" from "the timeout silently
+    # didn't apply" for a reader of this test's result, not just the exit
+    # code (which a hang would never even produce within a sane test run).
+    assert elapsed < 8, f"installer took {elapsed:.1f}s — the fetch was not bounded"
+    assert result.returncode != 0
+    assert "not 'dev'" in result.stderr
+    assert "#794" in result.stderr
+    assert "TIMED OUT" in result.stdout
+    assert not (engram_home / ".deployed-version").exists()
     assert not (engram_home / ".deployed-version").exists()

@@ -160,21 +160,120 @@ if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
 
-# #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set.
+# #2586's tag-guard predicate is computed HERE, before the #794 branch-name
+# check below, because #794 now also consults it (#2711): a detached HEAD's
+# "branch name" is the literal string 'HEAD' (or empty, depending on the git
+# command), which always tripped #794 before the #2586 tag exception ever
+# got a chance to fire — e.g. `git checkout deploy/2026-09-06-...` then
+# `install-local-marketplace.sh` with no flags. "Deployable" is defined
+# identically to test_health_version_gate.py's deployable_tags() —
+# refs/tags/v* UNION refs/tags/deploy/* — enumerated here with `git tag
+# --points-at HEAD` filtered to those two patterns rather than `for-each-ref`
+# (deployable_tags() scans every tag in the repo to find the max version;
+# this guard only needs to know what's AT HEAD). An unrelated tag (e.g.
+# foo/bar) does not count and is ignored below.
+DEPLOY_TAGS="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | grep -E '^(v|deploy/)' || true)"
+
+# A same-named LOCAL tag on genuinely unmerged work must NOT be able to
+# bypass #794 just by being named v*/deploy/* — that would defeat #794's
+# whole purpose (block deploying unmerged code). So the exception requires
+# BOTH a deployable tag at HEAD AND that HEAD is actually merged history: an
+# ancestor of origin/dev or origin/main. Uses HEAD itself, never a bare tag
+# name, for the ancestry check — not because a bare tag name is unsafe AT
+# THIS CALL (`git merge-base --is-ancestor` dereferences an annotated tag to
+# its commit automatically, so the `git rev-parse <annotated-tag>` trap —
+# returns the tag object, not the commit, #2711 — was never reachable here
+# either way; confirmed by mutating this line to a bare tag name and
+# re-running the suite, which stayed all-green). HEAD is still the right
+# choice: it's unambiguous when several tags point at the same commit, where
+# a bare tag name would need picking one arbitrarily. The rev-parse trap is
+# real elsewhere (anywhere a tag name is handed straight to `git rev-parse`)
+# — just not at this call.
+#
+# Before trusting origin/dev + origin/main for that ancestry check, refresh
+# them: a local remote-tracking ref that hasn't been re-fetched since a
+# merge can still show a LATER-REVERTED commit as an ancestor (e.g. dev gets
+# force-pushed back past a bad merge; the stale local ref still contains the
+# reverted commit, so this exception would wrongly fire for code that is no
+# longer merged history). FAIL CLOSED if the refresh itself doesn't succeed
+# — offline, no 'origin' remote configured, auth failure, whatever the
+# cause: an unreachable network must make this guard STRICTER, never
+# looser. A failed refresh falls through to the #794 guard below exactly as
+# if HEAD carried no deployable tag at all.
+#
+# BOUND THE FETCH (#2711 round 3): "fail closed" above assumes the fetch
+# call actually RETURNS. A silently-dropped network (packets unrouted
+# rather than refused) can leave `git fetch` hanging indefinitely with no
+# error and no timeout — worse than a refusal, because a refusal tells the
+# operator to pass --allow-branch and move on in seconds, while a hang gives
+# them nothing to act on and looks like the build is simply slow. Cap the
+# fetch at FETCH_TIMEOUT_SECS (default 15s — this fetch pulls two ref
+# updates over SSH, which on a working connection completes in well under a
+# second; 15s absorbs real congestion or slow DNS on a normal connection
+# without leaving a dropped one to hang for minutes) and route a timeout
+# into the SAME fail-closed branch as any other fetch failure, with a
+# message that names it as a timeout specifically so the operator knows to
+# retry rather than assume something is broken. Override via
+# ENGRAM_INSTALL_FETCH_TIMEOUT_SECS — test-only knob, not documented in
+# --help, so a real deploy always uses the 15s default.
+#
+# `timeout` (GNU coreutils) is not guaranteed on every seat this script
+# runs on: Linux seats ship it standard, but at least one macOS seat
+# (Luria's) does not carry it by default (BSD userland, no GNU coreutils).
+# Git's own http.lowSpeedLimit/http.lowSpeedTime knobs were considered
+# instead and rejected: they only bound the HTTP transport, and this
+# repo's origin is reached over SSH (git@github.com:...), so they would
+# never engage here. Prefer `timeout`; else try `gtimeout` — Homebrew's
+# coreutils installs GNU tools under a `g`-prefix on macOS (gtimeout,
+# gsed, gdate, ...), so a macOS seat that has coreutils at all is likely
+# to carry `gtimeout` rather than a bare `timeout` (reasoning about the
+# Homebrew convention, not a measurement — no macOS seat was available to
+# confirm `gtimeout` actually resolves on Luria's machine specifically).
+# Degrade to an UNBOUNDED fetch only if NEITHER resolves, rather than
+# breaking the fetch outright on a seat that lacks both — but that means a
+# seat with none of `timeout`, `gtimeout`, or an equivalent shim is NOT
+# protected by this fix; a dropped network there can still hang exactly as
+# before. That gap is real and left open rather than papered over with a
+# false sense of coverage.
+FETCH_TIMEOUT_SECS="${ENGRAM_INSTALL_FETCH_TIMEOUT_SECS:-15}"
+_TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  _TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  _TIMEOUT_BIN="gtimeout"
+fi
+DEPLOYABLE_ANCESTOR=0
+if [[ -n "$DEPLOY_TAGS" ]]; then
+  _fetch_rc=0
+  if [[ -n "$_TIMEOUT_BIN" ]]; then
+    "$_TIMEOUT_BIN" "$FETCH_TIMEOUT_SECS" git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
+  else
+    git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
+  fi
+  if [[ $_fetch_rc -eq 0 ]]; then
+    if git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/dev 2>/dev/null \
+       || git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+      DEPLOYABLE_ANCESTOR=1
+    fi
+  elif [[ $_fetch_rc -eq 124 ]]; then
+    log "WARNING: refreshing origin/dev + origin/main before the merged-history check TIMED OUT after ${FETCH_TIMEOUT_SECS}s (a silently-dropped connection, not an outright refusal — the network may be reachable but not responding). Retry once the connection is healthy, or pass --allow-branch now to proceed without the refresh. Treating HEAD as unconfirmed merged history — the #794 guard below will require --allow-branch unless HEAD is on 'dev' or 'main'."
+  else
+    log "WARNING: could not refresh origin/dev + origin/main before the merged-history check (offline? no 'origin' remote configured? git fetch --tags origin first if you suspect a stale remote). Treating HEAD as unconfirmed merged history — the #794 guard below will require --allow-branch unless HEAD is on 'dev' or 'main'."
+  fi
+fi
+
+# #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set,
+# OR HEAD is at a deployable tag that is merged history (the #2586/#2711 exception above).
 # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
-# Every other branch — PR branches, feature branches, etc. — requires --allow-branch to override.
+# Every other branch — PR branches, feature branches, etc. — requires --allow-branch to override
+# (or a deploy-tag checkout, which needs no flag at all).
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $ALLOW_BRANCH -eq 0 ]]; then
-  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
+if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $DEPLOYABLE_ANCESTOR -eq 0 && $ALLOW_BRANCH -eq 0 ]]; then
+  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts), or check out a deployable tag (v*/deploy/*) that is merged into origin/dev or origin/main — no flag needed for that. Guard per #794 (tag exception per #2586/#2711)."
 fi
 
 # #2586 tag guard: refuse builds from an untagged commit unless --allow-untagged
-# is set. "Deployable" is defined identically to test_health_version_gate.py's
-# deployable_tags() — refs/tags/v* UNION refs/tags/deploy/* — enumerated here
-# with `git tag --points-at HEAD` filtered to those two patterns rather than
-# `for-each-ref` (deployable_tags() scans every tag in the repo to find the max
-# version; this guard only needs to know what's AT HEAD). An unrelated tag
-# (e.g. foo/bar) does not count and is ignored below.
+# is set.
 #
 # This sits before the --target dispatch so both Claude and Codex install
 # paths get it — the guard lives in the script, not in the engram-upgrade
@@ -188,7 +287,6 @@ fi
 # alpha_tag, never the dev tip) in its own output, or a fully-consistent seat
 # reads as drifted against the wrong reference.
 ALPHA_UNTAGGED_OVERRIDE_FIRED=0
-DEPLOY_TAGS="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | grep -E '^(v|deploy/)' || true)"
 if [[ -z "$DEPLOY_TAGS" ]]; then
   SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   NEAREST_TAG="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null || echo none)"
@@ -246,7 +344,13 @@ else
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
   build_flags+=("--target" "$TARGET")
-  [[ $ALLOW_BRANCH -eq 1 ]] && build_flags+=("--allow-branch")
+  # build-plugin.sh (tools/engine/cli.py) carries its OWN independent #794
+  # branch guard, unrelated to the one above — passing our local tag/ancestor
+  # exception here too (not just $ALLOW_BRANCH) is what actually makes a
+  # deploy-tag checkout build end-to-end without --allow-branch; otherwise
+  # this guard would pass while the engine's own guard still refuses one
+  # call downstream. #2711.
+  [[ $ALLOW_BRANCH -eq 1 || $DEPLOYABLE_ANCESTOR -eq 1 ]] && build_flags+=("--allow-branch")
   log "Building plugin tree (target: $TARGET, flags: ${build_flags[*]:-none})"
   bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 fi

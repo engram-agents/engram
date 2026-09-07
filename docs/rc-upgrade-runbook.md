@@ -37,11 +37,22 @@ cascade_markers table at all); the migration + `/mcp` reconnect handles the thir
 ## Per-seat sequence (FOUR steps — step 4 is the one that historically gets dropped)
 
 1. **Rebuild the source tree at the target tag (see the Target-tag line above)**
-   `tools/install-local-marketplace.sh` from the tagged checkout.
+   `bash tools/install-local-marketplace.sh --target <claude-code|codex>` from the
+   tagged (detached-HEAD) checkout — no flags needed for a normal deploy tag.
    Hooks / skills / tools are live immediately (directory-source topology; hooks re-read per prompt).
-   The installer now refuses to build from an untagged HEAD (#2586); since this
+   The installer refuses to build from an untagged HEAD (#2586); since this
    runbook always upgrades from a tagged checkout that guard is a no-op here —
-   `--allow-untagged` is the override, not part of this flow.
+   `--allow-untagged` is the override, not part of this flow. **A detached HEAD
+   at a deployable tag also no longer needs `--allow-branch`** (#2711 — before
+   this fix, the #794 branch-name guard refused every detached-HEAD tag
+   checkout, since a detached HEAD's "branch name" is the literal string
+   `HEAD`; five seats hit this on the 2026-09-06/07 upgrade and improvised
+   `--allow-branch` as a workaround, forum #400). The bare command above is
+   now the correct form — no `--allow-branch` needed — as long as the target
+   tag is merged into `origin/dev` or `origin/main` (true for every normal
+   deploy tag; still needing `--allow-branch` on a fresh deploy tag would mean
+   something went wrong with how the tag was cut, not that the flag is
+   optional).
 
 2. **Refresh the agent cache** — `/plugin marketplace update engram-local` then `/reload-plugins`.
    AGENTS (dream-master, all fairies) load from the installPath CACHE snapshot, not the source tree.
