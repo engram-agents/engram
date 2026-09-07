@@ -2149,6 +2149,40 @@ class TestForensicCapture:
         reason="forensic capture requires /proc/self/fd and /proc/locks (Linux only)",
     )
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_fd_scan_cap(self, monkeypatch):
+        """#2705: make this whole class hermetic against the ambient fd
+        count of the surrounding pytest process, which is what actually
+        caused the order/host-dependent flakiness this fixture fixes.
+
+        `_capture_fds`'s scan is capped at `_FD_SCAN_LIMIT` entries and
+        truncates by SCAN POSITION, not by whether it has found a match —
+        it stops once it has examined that many numeric `/proc/self/fd`
+        entries, which `os.listdir` returns in ascending fd-number order on
+        Linux. A freshly-opened fd (this class's own planted shm handle) is
+        assigned the lowest available number, but in a process that
+        already holds many fds without gaps that number is HIGH — so it is
+        scanned LAST, and is exactly what gets silently dropped once the
+        process's own ambient fd count exceeds the cap. This is not a
+        concurrency bug: a real, unmodified `pytest tests/` run of this
+        repo (no synthetic load, no concurrent process) was measured
+        reaching an ambient fd count of 5295 in the SAME process by the
+        time this class executes — comfortably above the pre-#2705
+        default of 4096 — which is sufficient on its own to reproduce the
+        exact three-test failure this issue reports.
+
+        `_FD_SCAN_LIMIT` was raised as part of #2705's production fix, but
+        this class should not depend on that (or any future) production
+        tuning value being "big enough forever" as the test suite grows —
+        so pin it here to a value no realistic ambient fd count will ever
+        reach, independent of the production default.
+
+        Harmless to `test_fd_scan_truncates_with_flag_rather_than_unbounded`,
+        which passes its own explicit `max_scan=1` and is unaffected by a
+        patch to the DEFAULT only.
+        """
+        monkeypatch.setattr(engram_walguard, "_FD_SCAN_LIMIT", 10_000_000)
+
     @staticmethod
     def _naive_stub(db_path):
         """A no-op capture that always reports 'ok, nothing found' regardless
@@ -2374,6 +2408,108 @@ class TestForensicCapture:
         result = engram_walguard._capture_fds(paths, max_scan=1)
         assert result["status"] == "ok"
         assert result["truncated"] is True
+
+    # -- Order/host-dependent flakiness regression (#2705) --------------------
+
+    @_LINUX_PROC
+    def test_hermetic_against_high_ambient_fd_count(self, tmp_path, monkeypatch):
+        """#2705 can-it-fail control: reproduces, deterministically and
+        in-process, the exact root cause diagnosed for the order/host-
+        dependent flakiness reported against this class -- WITHOUT needing
+        an actual concurrent pytest process or a real multi-thousand-test
+        full-suite run to accumulate the fds.
+
+        Root cause (#2705): `_capture_fds`'s scan is capped at
+        `_FD_SCAN_LIMIT` entries and truncates by SCAN POSITION -- it stops
+        once it has examined that many numeric `/proc/self/fd` entries,
+        which `os.listdir` returns in ascending fd-number order on Linux.
+        A freshly-opened fd (this test's own planted shm handle, same
+        fixture shape as test_planted_positive_deleted_fd_is_detected) gets
+        the lowest AVAILABLE number, but in a process that already holds
+        many fds without gaps that number is HIGH -- so it is scanned
+        LAST, and is exactly what silently drops out once the process's
+        own ambient fd count exceeds the cap. This was measured live on a
+        real, unmodified `pytest tests/` run of this repo (no synthetic
+        load, no concurrent process): ambient fd count in the SAME process
+        reached 5295 by the time TestForensicCapture ran -- comfortably
+        above the pre-#2705 default of 4096, and sufficient on its own to
+        reproduce the exact three-test failure #2705 reports. It was
+        SEPARATELY confirmed (manual demonstration, not shipped as an
+        automated test -- see #2705's PR description) that the identical
+        failure and fix both hold with a genuine second `pytest` process
+        concurrently active on the host; ambient fd COUNT in this process,
+        not host concurrency per se, is the discriminating variable, which
+        is why this control reproduces it hermetically without needing a
+        second process at all.
+
+        Two-sided, so this is a genuine control and not one "that has only
+        ever been observed to fail" (or only ever pass):
+
+          - Discriminating NEGATIVE: with `_FD_SCAN_LIMIT` forced back down
+            to the pre-#2705 value (4096) while this test's own ambient fd
+            load (6000 planted throwaway fds, deliberately > 4096) is in
+            effect, the scan truncates before reaching the target fd and
+            the assertion FAILS -- proving this ambient-fd-count shape
+            really does trigger the defect when the cap is undersized
+            relative to it.
+          - The actual regression guard: with this class's own
+            `_hermetic_fd_scan_cap` fixture in effect (the fixed state --
+            applied automatically to every test in this class, including
+            this one), the SAME ambient load does not cause a miss.
+
+        Also discriminates against a plausible-but-inadequate fix: raising
+        the production default only "a little" (anything below 6000) would
+        still fail this test's positive assertion, since 6000 throwaway
+        fds are planted specifically to exceed a merely-slightly-larger
+        cap -- this control does not pass for any fix that doesn't
+        genuinely decouple the effective cap from a small, easily-exceeded
+        constant.
+        """
+        leaked: list = []
+        try:
+            for i in range(6000):
+                leaked.append(open(tmp_path / f"leak_{i}", "wb"))
+
+            db_path = str(tmp_path / "knowledge.db")
+            shm_path = db_path + "-shm"
+            f = open(shm_path, "wb")
+            try:
+                f.write(b"x")
+                f.flush()
+                os.unlink(shm_path)
+
+                # Discriminating negative: force the pre-#2705 cap back on
+                # for one call, to prove this ambient-fd-count shape really
+                # does reproduce the defect when the cap is undersized.
+                monkeypatch.setattr(engram_walguard, "_FD_SCAN_LIMIT", 4096)
+                pre_fix_forensics = engram_walguard.capture_forensics(db_path)
+                pre_fix_matches = [
+                    m for m in pre_fix_forensics["fds"]["matches"] if m["which"] == "shm"
+                ]
+                assert pre_fix_matches == [], (
+                    "fixture assumption broken: the pre-#2705 cap shape no "
+                    "longer reproduces the defect at this ambient fd count "
+                    "-- the discriminating negative above no longer holds"
+                )
+
+                # The actual regression guard: restore this class's own
+                # (much larger) hermetic cap -- see _hermetic_fd_scan_cap --
+                # and confirm the SAME ambient load no longer causes a miss.
+                monkeypatch.setattr(engram_walguard, "_FD_SCAN_LIMIT", 10_000_000)
+                forensics = engram_walguard.capture_forensics(db_path)
+                shm_matches = [
+                    m for m in forensics["fds"]["matches"] if m["which"] == "shm"
+                ]
+                assert shm_matches, (
+                    f"expected the planted fd to be found even under heavy "
+                    f"ambient fd load; got {forensics['fds']}"
+                )
+                assert shm_matches[0]["deleted"] is True
+            finally:
+                f.close()
+        finally:
+            for lf in leaked:
+                lf.close()
 
     # -- Lock matching is (device, inode), not inode alone (PR #2653 fold) ---
 

@@ -269,8 +269,29 @@ def detect_shm_displacement(db_path: str) -> Optional[dict]:
 # therefore returns an explicit "status" of "ok" or "unavailable", never a
 # bare empty list/dict standing in for "couldn't check".
 
-_FD_SCAN_LIMIT = 4096      # cap on /proc/self/fd entries scanned per capture
+_FD_SCAN_LIMIT = 200_000   # cap on /proc/self/fd entries scanned per capture
 _LOCK_ROWS_LIMIT = 500     # cap on matching /proc/locks rows kept per capture
+
+# #2705: this cap used to be 4096, tuned without evidence of a realistic
+# process's ambient fd count.  os.listdir("/proc/self/fd") returns entries
+# in ascending fd-number order on Linux, and this scan's own cap is
+# position-based (it stops after examining `max_scan` numeric entries,
+# regardless of whether it has found any of the (small, fixed) set of
+# target paths yet) -- so once a process's OWN total open-fd count exceeds
+# the cap, any fd whose number sits past the cutoff is silently invisible
+# to this scan, even though it is a genuine, currently-open fd. A freshly
+# opened fd is assigned the lowest available number, but in a process that
+# already holds many fds without gaps that is a HIGH number -- exactly the
+# kind of fd this capture exists to find (the shm fd this process just
+# touched at the moment of detection). Measured live on a real, unmodified
+# `pytest tests/` run of this repo (no synthetic load, no concurrent
+# process): ambient fd count in the SAME process reached 5295 by the time
+# TestForensicCapture ran, comfortably above the old 4096 cap -- so this
+# was not a pathological-load-only defect, and a long-lived MCP server
+# accumulating a few thousand fds over real uptime is exactly the
+# production case this capture is meant to serve. Raised to a large,
+# still-bounded value so realistic ambient fd counts (test-suite or
+# production) don't silently reintroduce the same truncation.
 
 
 def _capture_locks(
@@ -340,7 +361,7 @@ def _capture_locks(
     }
 
 
-def _capture_fds(paths: dict[str, str], max_scan: int = _FD_SCAN_LIMIT) -> dict:
+def _capture_fds(paths: dict[str, str], max_scan: Optional[int] = None) -> dict:
     """Resolve /proc/self/fd for every fd targeting one of `paths` (name→path).
 
     Returns one of:
@@ -358,7 +379,18 @@ def _capture_fds(paths: dict[str, str], max_scan: int = _FD_SCAN_LIMIT) -> dict:
     no longer resolves (covers both the deleted case and any other stat
     failure — e.g. the shm_replaced case where a live file exists at the
     path but under a different inode still resolves normally here).
+
+    max_scan=None (the default) resolves _FD_SCAN_LIMIT at CALL time, not
+    def time (#2705) -- a plain `max_scan: int = _FD_SCAN_LIMIT` binds the
+    module constant's value once, when this function is defined, so a
+    caller that later monkeypatches `engram_walguard._FD_SCAN_LIMIT` (e.g.
+    a test that needs a cap value independent of whatever the production
+    default happens to be tuned to) has no effect on omitted-argument calls.
+    An explicit max_scan= argument (e.g. the size-guard test's max_scan=1)
+    is unaffected either way and still takes precedence.
     """
+    if max_scan is None:
+        max_scan = _FD_SCAN_LIMIT
     proc_fd = "/proc/self/fd"
     if not os.path.isdir(proc_fd):
         return {
