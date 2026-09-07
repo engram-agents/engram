@@ -59,7 +59,7 @@ def test_reported_broken_order_passes():
     # reasons unrelated to this ordering regression (an added/removed/
     # skipped test in either file) -- that's the fix, not a sign the
     # ordering regression itself came back.
-    assert "85 passed" in proc.stdout, proc.stdout
+    assert "90 passed" in proc.stdout, proc.stdout
 
 
 def test_normal_order_still_passes():
@@ -75,7 +75,7 @@ def test_normal_order_still_passes():
     # reasons unrelated to this ordering regression (an added/removed/
     # skipped test in either file) -- that's the fix, not a sign the
     # ordering regression itself came back.
-    assert "85 passed" in proc.stdout, proc.stdout
+    assert "90 passed" in proc.stdout, proc.stdout
 
 
 def test_sibling_fresh_server_file_ordering_also_passes():

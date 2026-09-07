@@ -154,6 +154,223 @@ def test_nap_writes_a_real_snapshot_file_to_disk():
     assert "health-snapshots" in path
 
 
+def test_nap_runs_pragma_optimize_after_the_health_snapshot():
+    """#2559: PRAGMA optimize fires at every nap checkpoint, after the
+    health snapshot -- the fix that makes the dangling-evidence query's
+    O(N^2) cost (this file's own #1991 checkpoint wiring is what makes
+    that query run on every checkpoint in the first place) go away
+    fleet-wide, not just for the one query the composite index covers
+    deterministically. Verified by checking for sqlite_stat1/sqlite_stat4
+    -- SQLite creates these on PRAGMA optimize's own decision to analyze,
+    confirmed live to happen even on a freshly-created, near-empty DB
+    (not a documented guarantee for every SQLite version/table-size
+    combination, but this repo's own conftest.py pins the vendored
+    version, so it's checkable rather than merely asserted)."""
+    server = fresh_server()
+    conn = server.core._get_db()
+    before = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_stat%'"
+    ).fetchall()
+    assert not before, (
+        f"fixture assumption broken: expected no sqlite_stat* tables on a "
+        f"freshly-created DB before any checkpoint runs -- found {before}"
+    )
+
+    r = json.loads(server._nap_impl(message="checkpoint-wiring test PRAGMA optimize"))
+    assert "error" not in r, f"_nap_impl returned error: {r}"
+
+    after = conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_stat%'"
+    ).fetchall()
+    assert after, (
+        "expected PRAGMA optimize to have created sqlite_stat* tables "
+        "during the nap checkpoint -- found none; the #2559 fix may be "
+        "missing or no longer wired into _checkpoint_internal"
+    )
+
+
+def test_seed_analyze_runs_once_when_sqlite_stat1_absent(monkeypatch):
+    """engram-alpha#2685 review finding (Ariadne): on a table that has never
+    been analyzed, PRAGMA optimize alone does NOT reliably seed sqlite_stat1
+    -- measured zero rows inserted on her seat (SQLite 3.45.1) under every
+    documented mask, while a same-day re-run of her exact experiment on this
+    repo's own vendored SQLite (3.53.4) got the opposite result. Because
+    this environment's own SQLite apparently self-seeds via PRAGMA optimize
+    alone, an outcome-only assertion ("does sqlite_stat1 have rows after the
+    checkpoint?") would pass here even WITHOUT the #2685 fix -- it would not
+    discriminate old code from new code on this particular SQLite build,
+    even though the fix is genuinely needed on seats running older SQLite.
+    So this test instead spies on the SQL statements the checkpoint's
+    connection actually executes and asserts a bare ``ANALYZE`` call fires,
+    which proves the new seed code path ran independent of whatever this
+    build's own PRAGMA-optimize heuristic would have done anyway.
+
+    sqlite3.Connection.execute is a C-extension attribute and cannot be
+    monkeypatched directly on an instance -- wraps the real connection in a
+    recording proxy instead, mirroring the _OptimizeFailProxy pattern just
+    below (itself mirroring tests/test_walguard_786.py's established
+    approach for the identical constraint)."""
+    server = fresh_server()
+    real_conn = server.core._get_db()
+
+    before = real_conn.execute(
+        "SELECT name FROM sqlite_master WHERE name LIKE 'sqlite_stat%'"
+    ).fetchall()
+    assert not before, (
+        f"fixture assumption broken: expected no sqlite_stat* tables on a "
+        f"freshly-created DB before any checkpoint runs -- found {before}"
+    )
+
+    recorded_sql = []
+
+    class _RecordingProxy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            recorded_sql.append(sql.strip())
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    proxy = _RecordingProxy(real_conn)
+    monkeypatch.setattr(server.core, "_get_db", lambda: proxy)
+
+    r = json.loads(server._nap_impl(message="checkpoint-wiring test seed ANALYZE"))
+    assert "error" not in r, f"_nap_impl returned error: {r}"
+
+    analyze_calls = [sql for sql in recorded_sql if sql.strip().upper() == "ANALYZE"]
+    assert analyze_calls, (
+        f"expected a bare ANALYZE call to seed sqlite_stat1 when it did not "
+        f"yet exist -- found none; recorded SQL was: {recorded_sql}"
+    )
+
+
+def test_seed_analyze_does_not_rerun_once_sqlite_stat1_exists(monkeypatch):
+    """Unlike test_seed_analyze_runs_once_when_sqlite_stat1_absent above,
+    this test does NOT discriminate old code from new code -- old code never
+    calls ANALYZE either, so it would trivially pass under both. It exists
+    instead to pin down the NEW code's own skip-when-already-seeded
+    behavior: re-running a full ANALYZE on every checkpoint (rather than
+    once, at seed time) would reintroduce a cost on a fixed cadence instead
+    of paying it once, which is exactly what engram-alpha#2685's review
+    (Ariadne, ~8.5ms one-time seed cost measured on her 89MB graph) frames
+    the seed as avoiding.
+
+    Pre-seeds sqlite_stat1 by calling ANALYZE directly on the real
+    connection (simulating a prior checkpoint having already seeded it)
+    BEFORE installing the recording proxy, then runs a second checkpoint and
+    asserts no further ANALYZE call is recorded."""
+    server = fresh_server()
+    real_conn = server.core._get_db()
+    real_conn.execute("ANALYZE")
+
+    recorded_sql = []
+
+    class _RecordingProxy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            recorded_sql.append(sql.strip())
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    proxy = _RecordingProxy(real_conn)
+    monkeypatch.setattr(server.core, "_get_db", lambda: proxy)
+
+    r = json.loads(server._nap_impl(message="checkpoint-wiring test seed ANALYZE skip"))
+    assert "error" not in r, f"_nap_impl returned error: {r}"
+
+    analyze_calls = [sql for sql in recorded_sql if sql.strip().upper() == "ANALYZE"]
+    assert not analyze_calls, (
+        f"expected no ANALYZE call once sqlite_stat1 already exists -- "
+        f"the seed must be a one-time thing, not re-run on every "
+        f"checkpoint; recorded SQL was: {recorded_sql}"
+    )
+
+
+def test_seed_check_failure_does_not_prevent_pragma_optimize(monkeypatch):
+    """engram-alpha#2685 round-1 reviewer-fairy finding: the seed-check
+    SELECT + conditional ANALYZE and the PRAGMA optimize call originally
+    lived in ONE shared try/except, so a failure in the seed-check or the
+    ANALYZE silently prevented PRAGMA optimize from even being attempted
+    that checkpoint -- contradicting this block's own comment ("a failure
+    in the seed check or the ANALYZE must not prevent PRAGMA optimize from
+    at least being attempted"). Fixed by splitting into two independent
+    try/except blocks. This test raises on the seed-check's own SELECT and
+    asserts PRAGMA optimize still runs anyway -- the counterpart to
+    test_pragma_optimize_failure_does_not_break_nap just below, which
+    covers the other direction (a PRAGMA optimize failure must not stop
+    _nap_impl itself)."""
+    server = fresh_server()
+    real_conn = server.core._get_db()
+
+    recorded_sql = []
+
+    class _SeedCheckFailProxy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            recorded_sql.append(sql.strip())
+            if "sqlite_stat1" in sql:
+                raise RuntimeError("simulated seed-check failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    proxy = _SeedCheckFailProxy(real_conn)
+    monkeypatch.setattr(server.core, "_get_db", lambda: proxy)
+
+    r = json.loads(server._nap_impl(message="checkpoint-wiring test seed-check failure isolation"))
+    assert "error" not in r, f"_nap_impl should still succeed despite a seed-check failure: {r}"
+
+    optimize_calls = [sql for sql in recorded_sql if sql.strip().upper() == "PRAGMA OPTIMIZE"]
+    assert optimize_calls, (
+        f"expected PRAGMA optimize to still be attempted even though the "
+        f"seed check raised -- found no PRAGMA optimize call; recorded "
+        f"SQL was: {recorded_sql}"
+    )
+
+
+def test_pragma_optimize_failure_does_not_break_nap(monkeypatch):
+    """Best-effort, mirrors test_health_engine_failure_does_not_break_nap
+    just below: if PRAGMA optimize raises for any reason, _nap_impl must
+    still succeed -- this is hygiene piggybacked onto the checkpoint tool,
+    never allowed to be the thing that breaks it.
+
+    sqlite3.Connection.execute is a C-extension attribute and cannot be
+    monkeypatched directly on an instance (raises AttributeError: ...
+    read-only) -- wraps the real connection in a proxy instead, mirroring
+    the _IntegrityFailProxy pattern already established in
+    tests/test_walguard_786.py for the identical constraint."""
+    server = fresh_server()
+    real_conn = server.core._get_db()
+
+    class _OptimizeFailProxy:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().upper() == "PRAGMA OPTIMIZE":
+                raise RuntimeError("simulated PRAGMA optimize failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    proxy = _OptimizeFailProxy(real_conn)
+    monkeypatch.setattr(server.core, "_get_db", lambda: proxy)
+
+    r = json.loads(server._nap_impl(message="checkpoint-wiring test PRAGMA optimize failure isolation"))
+    assert "error" not in r, f"_nap_impl should still succeed despite a PRAGMA optimize failure: {r}"
+
+
 # ---------------------------------------------------------------------------
 # advance_turn -> checkpoint_mode "post_dream"
 # ---------------------------------------------------------------------------

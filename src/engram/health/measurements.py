@@ -451,23 +451,36 @@ def m_evidence_uncited(conn: sqlite3.Connection) -> int:
 
     What is NOT permanent is the ~1.3s/build cost first measured for it
     (engram-alpha#2556 thread, Ariadne, 4,597-node graph): Kepler traced it
-    to a missing ``ANALYZE`` — no seat in the fleet has ever run
-    ``ANALYZE``/``PRAGMA optimize``, so the query planner has no statistics
-    and falls back to a full ``idx_nodes_current`` scan per evidence node
-    instead of the existing ``idx_nodes_evidence_id``. Ariadne independently
-    confirmed on her own (largest measured, un-``ANALYZE``'d) seat: **758x**
-    on this query alone (1187.8ms → 1.6ms) and **45x** on the whole
+    to a missing ``ANALYZE`` — grepping ``src/engram`` (non-test) found zero
+    calls to ``ANALYZE`` or ``PRAGMA optimize`` in any shipped code path, and
+    ``sqlite_stat1`` was confirmed absent on the two seats actually measured
+    (Kepler's 1,940-node graph; Ariadne's 4,597-node graph) — so the query
+    planner had no statistics on either and fell back to a full
+    ``idx_nodes_current`` scan per evidence node instead of the existing
+    ``idx_nodes_evidence_id``. Ariadne independently confirmed on her own
+    (largest measured, un-``ANALYZE``'d at the time) seat: **758x** on this
+    query alone (1187.8ms → 1.6ms) and **45x** on the whole
     L0-measure-then-verify path (2749.8ms → 60.8ms), same result counts
-    before/after. Filed as engram-alpha#2559 (Kepler) with a fix + falsifier;
-    not yet landed as of this writing. Kepler ruled the design question
-    itself (keep the SSoT control always-on, unchanged) BEFORE the ANALYZE
-    cause was confirmed, on the grounds that a sometimes-on control is a
-    weaker control and the cost sits at the nap/``advance_turn`` checkpoint,
-    invisible to a user regardless of price — so the ruling does not depend
-    on #2559 landing. What #2559 changes is only how expensive "always-on"
-    turns out to actually be: ~1.3s/build on any seat that has never run
-    ANALYZE (which, as of this writing, is every seat) until it lands, ~30ms
-    after."""
+    before/after. Fixed as engram-alpha#2559 (Kepler): a composite index
+    ``nodes(evidence_id, is_current)`` makes the correct query plan
+    deterministic regardless of statistics freshness (the fix does not
+    depend on ``ANALYZE`` ever running), plus a one-time ``ANALYZE`` seed
+    (only when ``sqlite_stat1`` does not yet exist) followed by the
+    existing ``PRAGMA optimize`` at checkpoint close (nap / ``advance_turn``)
+    that together keep ``sqlite_stat1`` current fleet-wide for every other
+    query on the connection, not just this one — the seed is what actually
+    delivers that fleet-wide claim; see the checkpoint-close comment in
+    ``engram_lifecycle._checkpoint_internal`` (search ``#2685``) for the
+    measured, process-library-linkage-dependent reason ``PRAGMA optimize``
+    alone was found not to be sufficient on every seat. Kepler ruled the design
+    question itself (keep the SSoT
+    control always-on, unchanged) BEFORE the ANALYZE cause was confirmed,
+    on the grounds that a sometimes-on control is a weaker control and the
+    cost sits at the nap/``advance_turn`` checkpoint, invisible to a user
+    regardless of price — so the ruling never depended on #2559 landing.
+    What #2559 changes is only how expensive "always-on" turns out to
+    actually be: the price is gone by construction once it lands — ~1.3s/
+    build before, ~30ms after, on the seats measured."""
     return conn.execute(
         """SELECT COUNT(*) as c FROM nodes n
            WHERE n.type = 'evidence' AND n.is_current = 1

@@ -2480,6 +2480,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
         CREATE INDEX IF NOT EXISTS idx_nodes_current ON nodes(is_current);
         CREATE INDEX IF NOT EXISTS idx_nodes_evidence_id ON nodes(evidence_id);
+        -- #2559: the health dangling-evidence NOT EXISTS query (health/
+        -- measurements.py:m_evidence_uncited) correlates on evidence_id AND
+        -- filters on is_current in the same subquery. Without planner
+        -- statistics (no shipped code path runs ANALYZE), SQLite has no
+        -- cardinality info to choose between the two single-column indexes
+        -- above and picks idx_nodes_current -- nearly the whole table --
+        -- making the subquery O(N) per outer row, O(N^2) overall. This
+        -- covering index makes the correct plan deterministic regardless
+        -- of statistics freshness (measured: 758x on a 4,597-node graph,
+        -- Ariadne/forum#390; 105x->0.9ms on Kepler's 1,940-node graph).
+        CREATE INDEX IF NOT EXISTS idx_nodes_evidence_current ON nodes(evidence_id, is_current);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event);

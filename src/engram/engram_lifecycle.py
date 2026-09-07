@@ -352,6 +352,73 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "error": str(e),
             }
 
+        # #2559: seed + PRAGMA optimize, after the health snapshot, on EVERY
+        # checkpoint (both nap and advance_turn -- unlike the post_dream-only
+        # health series store below). No shipped code path ever ran ANALYZE
+        # before this, so sqlite_stat1 never existed and the query planner
+        # ran every multi-index query (not just the dangling-evidence one
+        # this issue was filed about) without cardinality statistics.
+        #
+        # #2685 review finding (Ariadne, on her own 5,320-node live graph,
+        # SQLite 3.45.1): PRAGMA optimize ALONE never seeds sqlite_stat1 on a
+        # table that has never been analyzed -- measured zero rows inserted
+        # under every documented mask (default, 0x02, 0x10002, 0xfffe) on a
+        # fresh connection with no prior writes. The original comment here
+        # claimed PRAGMA optimize's own low-cost heuristic would keep stats
+        # current fleet-wide; that claim silently depended on sqlite_stat1
+        # already existing, which on a from-scratch table it does not.
+        #
+        # A same-day re-run of Ariadne's exact experiment on this repo's own
+        # vendored SQLite (3.53.4) got the OPPOSITE result: PRAGMA optimize
+        # alone DID seed sqlite_stat1 immediately, under every mask. The
+        # first read of that disagreement (per-seat SQLite version) was
+        # ITSELF corrected within the hour: Ariadne re-ran both binaries on
+        # her OWN single host and found both outcomes live there, minutes
+        # apart -- her machine's standalone `sqlite3` CLI links a newer
+        # SQLite (3.53.0, seeds immediately) while the same host's ENGRAM
+        # venv Python links an older one (3.45.1, never seeds), on
+        # identical SQL and schema. So the boundary is per-PROCESS library
+        # linkage, not per-seat/per-agent version -- a fact no code running
+        # inside one process can observe about another process, which is
+        # exactly why the explicit seed below is not merely convenient but
+        # the ONLY deterministic option: a version-conditioned check cannot
+        # be written correctly (a process cannot know what a different
+        # process would have linked), so there is nothing to gate on except
+        # sqlite_stat1's own presence. With the seed, every checkpoint gets
+        # sqlite_stat1 populated unconditionally on first run, regardless of
+        # which SQLite build the calling process happens to have linked, and
+        # PRAGMA optimize then maintains it going forward (Ariadne measured
+        # the one-time seed cost at ~8.5ms on her 89MB graph).
+        #
+        # The seed is a plain, unscoped ANALYZE (deliberate -- analyzes the
+        # whole schema, not just the nodes table the composite index above
+        # targets) run exactly once, gated on sqlite_stat1 not existing yet;
+        # PRAGMA optimize is SQLite's own documented low-cost maintenance
+        # form and still runs every checkpoint after the gate, unconditionally
+        # (unlike a full ANALYZE on every open, which would be wasteful at
+        # nap frequency). Best-effort as a single unit, mirrors the health
+        # snapshot block just above: a failure in the seed check or the
+        # ANALYZE must not prevent PRAGMA optimize from at least being
+        # attempted, and neither may ever break the underlying nap/
+        # advance_turn checkpoint tool this is piggybacked onto.
+        # Two separate try/except blocks, not one -- #2685 reviewer-fairy
+        # finding: a single shared block let a seed-check/ANALYZE failure
+        # silently skip PRAGMA optimize too, contradicting the comment above.
+        # Splitting them means a failure in the seed step can never prevent
+        # the optimize attempt, and vice versa.
+        try:
+            _stat1_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+            ).fetchone()
+            if not _stat1_exists:
+                conn.execute("ANALYZE")
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
+
         # Health series store (engram-alpha#2575 PR C, design doc §4 "When it
         # runs"): ingest -> backfill -> derive, best-effort, POST-DREAM ONLY
         # (the design's "regular backfill mechanism" -- nightly cost is the
