@@ -420,11 +420,14 @@ exists to fix: a condition has no firing moment, and nobody watches for it.
 
 **A quiet week is not confirmation.** A preventive gate's successes are invisible
 by construction, so the falsifier can fire and the corresponding confirmation
-cannot. Read the falsifier log, not the silence. The log deliberately **does not
-start clean**: its first entry is a case where the box would have been filled in
-honestly — every claim enumerated, the unmeasured half named explicitly — and the
-claim sentence two paragraphs earlier still overstated it. That case is what line
-4 exists for.
+cannot. Read the falsifier log —
+engram-alpha's `docs/conclusion-warrant-falsifier-log.md`
+— not the silence. The log deliberately **does not start clean**: its first
+entry is a case where the box would have been filled in honestly — every claim
+enumerated, the unmeasured half named explicitly — and the claim sentence two
+paragraphs earlier still overstated it. That case is what line 4 exists for.
+The log has no denominator and can never confirm — it records cases, and its
+header says why.
 
 **Diagnostic aid, offered with its bounds.** Verification failures sort roughly
 into wrong **SET** (right axis, too few members), wrong **OBJECT** (right
