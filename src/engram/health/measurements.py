@@ -171,6 +171,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable, Union
 
+from . import model as _health_model
+from .signals import SIGNAL_DEFS
 from .version import MAJOR as RAW_SCHEMA_VERSION
 
 MeasurementValue = Union[int, bool, "tuple[str, ...]"]
@@ -856,6 +858,120 @@ def canonical_l0_hash() -> str:
         (d.name, d.population, list(d.definition_inputs))
         for d in MEASUREMENTS.values()
     )
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def canonical_derived_hash() -> str:
+    """SHA-256 hex digest over the canonical DERIVED-layer declaration set
+    (engram-alpha#2563 Gap 2): the declared scoring model ABOVE L0/L1 --
+    aspects, metric bindings, curve specs (incl. their now-declared
+    ``knots``, #2576/#2578), and signal definitions -- sorted and stably
+    JSON-encoded, same shape as ``canonical_l0_hash`` above.
+
+    This is the second of the gate's two hashes. ``required_severity()``
+    (``tests/test_health_version_gate.py``) computes MAJOR from a change to
+    THIS function's sibling above (the L0 set — what gets measured); it
+    computes MINOR from a change to THIS hash (the layers built on top of
+    L0 — how a measured signal turns into a curve-shaped, aspect-weighted
+    score). Before this function existed, a derived-only change (a curve
+    reshaped, an importance reweighted, a metric's aspect reassigned) had
+    NO detectable fingerprint at all, so ``required_severity`` could only
+    ever return ``MAJOR`` or ``NONE`` — a real MINOR-worthy change was
+    invisible to the gate and could land with no bump, silently.
+
+    Hashed, from ``health.model.MODEL_SPEC`` (the unvalidated module-level
+    spec — see that module's own docstring for why unvalidated is correct
+    here; this hash is over DECLARATION, not over a validated-against-
+    config object) and ``health.signals.SIGNAL_DEFS``:
+
+    - ``aspects``  — every ``AspectSpec``: ``(name, points,
+      reference_metric)``.
+    - ``metrics``  — every ``MetricBinding``: ``(signal, aspect, curve,
+      importance, detector, additional_detector, repair, dive_target)``,
+      where a ``DetectorRef`` (``detector``/``additional_detector``)
+      contributes its own ``(name, population)`` pair, or ``None``.
+    - ``curves``   — every ``CurveSpec`` in ``MODEL_SPEC.curves``, keyed by
+      curve name: ``(knots, monotone_direction, input_domain, output_range,
+      observed_range)``. Deliberately does NOT hash ``curve_fn`` — same
+      boundary as L0's ``compute_fn`` exclusion above: ``curve_fn`` is
+      DERIVED (``__post_init__``) from ``knots``, so hashing both would be
+      redundant, and a function object has no stable serialization anyway.
+      ``knots`` is what makes a curve's actual shape visible to this hash
+      (engram-alpha#2576 closed the gap where a curve's knots could
+      silently reshape underneath a byte-identical dataclass) —
+      ``curve_fn.keywords`` is never introspected anywhere, per that
+      module's own docstring; ``knots`` is read directly instead.
+    - ``signals``  — every ``SignalDef`` in ``SIGNAL_DEFS``, keyed by name:
+      ``(numerator, denominator, form, gates, doc)``. ``doc`` (prose) also
+      contributes, same "cheap insurance" reasoning as L0's ``population``
+      field above.
+
+    Deliberately does NOT hash ``MODEL_SPEC.signals`` (the dict of live
+    signal-computing CALLABLES health/engine.py builds) — that dict's
+    values have no stable serialization, same L0 boundary rule, and its
+    declared source (``SIGNAL_DEFS``, hashed above) is what actually
+    changes when a signal's arithmetic changes; the callables are compiled
+    FROM that data by ``health/signals.py``, not an independent fact about
+    it.
+
+    STATED BOUND (#2563's own unit spec explicitly asks for this to be
+    named, not left implicit): this hash covers what is DECLARED --
+    aspects, metrics, curves, signal formulas. It does NOT cover
+    ``health/engine.py``'s own AGGREGATION arithmetic -- ``_score_aspect``,
+    ``compose_aspect_scores``, ``score_signals`` and the weighted-mean-
+    with-renormalization rule that turns declared metric/aspect/curve data
+    into the composed L3->L4 score. That is genuine CODE, not data (unlike
+    everything hashed above), so a change to it (e.g. a different
+    renormalization rule) would be MINOR-worthy and is currently invisible
+    to this hash -- the same class of residual Borges/Ariadne identified
+    and closed for the curve-knots/signal-declaration layer on 2026-09-04/
+    05 (#2576/#2578/#2577), not yet closed for the aggregation layer.
+    """
+    import json
+    import hashlib
+
+    def _detector_tuple(ref):
+        return None if ref is None else (ref.name, ref.population)
+
+    aspects = sorted(
+        (a.name, a.points, a.reference_metric)
+        for a in _health_model.MODEL_SPEC.aspects
+    )
+    metrics = sorted(
+        (
+            m.signal,
+            m.aspect,
+            m.curve,
+            m.importance,
+            _detector_tuple(m.detector),
+            _detector_tuple(m.additional_detector),
+            m.repair,
+            m.dive_target,
+        )
+        for m in _health_model.MODEL_SPEC.metrics
+    )
+    curves = sorted(
+        (
+            name,
+            [list(k) for k in spec.knots],
+            spec.monotone_direction,
+            list(spec.input_domain) if spec.input_domain is not None else None,
+            list(spec.output_range),
+            list(spec.observed_range) if spec.observed_range is not None else None,
+        )
+        for name, spec in _health_model.MODEL_SPEC.curves.items()
+    )
+    signals = sorted(
+        (d.name, d.numerator, d.denominator, d.form, list(d.gates), d.doc)
+        for d in SIGNAL_DEFS.values()
+    )
+    canonical = {
+        "aspects": aspects,
+        "metrics": metrics,
+        "curves": curves,
+        "signals": signals,
+    }
     blob = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 

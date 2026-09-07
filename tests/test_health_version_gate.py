@@ -1,4 +1,4 @@
-"""Tests for the health-version tag-diff gate (engram-alpha#2563, Gap 3).
+"""Tests for the health-version tag-diff gate (engram-alpha#2563, Gaps 2+3).
 
 ## What this gate protects
 
@@ -30,15 +30,17 @@ by his 20:01Z comment and Lei's ruling recorded there):
      is a hard DENY, not a warning — an earlier draft of the design called it
      a warning; that was superseded.)
 
-**Gap 2 (the derived-layer hash) is NOT built in this PR** — so
-``required_severity()`` can only ever return ``"MAJOR"`` or ``"NONE"``, never
-``"MINOR"``. ``TODO(#2563 gap 2)``: once ``health.measurements`` grows a
-``canonical_derived_hash()`` (or equivalent) over curve specs / metric
-bindings / importances, wire it into ``required_severity()`` so a
-derived-only change can require (and be satisfied by) a MINOR bump. Until
-then a MINOR-only change is invisible to ``R`` and can only ever look like
-``NONE`` from this gate's point of view — do not fake a MINOR requirement
-path here.
+**Gap 2 (the derived-layer hash) is built** (engram-alpha#2563 Gap 2):
+``required_severity()`` takes TWO hash pairs — L0 (``health.measurements.
+canonical_l0_hash``) and derived (``health.measurements.
+canonical_derived_hash``, over ``aspects``/``metrics``/``CurveSpec``-incl-
+``knots``/``SIGNAL_DEFS``) — and can now return ``"MAJOR"`` (L0 differs,
+wins over a derived difference), ``"MINOR"`` (L0 same, derived differs), or
+``"NONE"`` (both same). A derived-only change (a curve reshaped, an
+importance reweighted, a metric reassigned to a different aspect, a
+signal's arithmetic changed) is now visible to ``R`` and correctly requires
+(and is satisfied by) a MINOR bump — before this gap landed it was
+invisible and could only ever look like ``NONE``.
 
 ## Deployable tag set
 
@@ -76,14 +78,15 @@ reason: the message contains the literal substring
 ``"no tagged health version yet — gate inactive"``, so a green result here
 is never mistaken for a checked one.
 
-The L0 hash at ``T`` is read from the ``_PINNED_L0_HASH`` constant in
-``git show <T's tag>:tests/test_health_measurements.py`` (regex, not
-import) — the pin test at that tag guarantees the constant equals the
-computed hash at that commit (it is itself a gate), and tags are cut from
-CI-green release PRs, so trusting the constant avoids importing a
-historical tree. If a tag carries ``version.py`` but NOT that pin constant,
-that is a broken tag (not an inactive gate) and this module fails loudly,
-naming the tag.
+The L0 hash at ``T`` is read from the ``_PINNED_L0_HASH`` constant, and the
+derived hash at ``T`` from the sibling ``_PINNED_DERIVED_HASH`` constant
+(Gap 2), both in ``git show <T's tag>:tests/test_health_measurements.py``
+(regex, not import) — the pin tests at that tag guarantee each constant
+equals its computed hash at that commit (each is itself a gate), and tags
+are cut from CI-green release PRs, so trusting the constants avoids
+importing a historical tree. If a tag carries ``version.py`` but NOT the L0
+pin constant, that is a broken tag (not an inactive gate) and this module
+fails loudly, naming the tag; same for the derived pin constant.
 
 A tie in T — two tags at the same max version with DIFFERENT pinned
 hashes — is a corrupted tag set and also fails loudly, naming both tags;
@@ -110,6 +113,7 @@ PIN_TEST_PATH = "tests/test_health_measurements.py"
 _MAJOR_RE = re.compile(r"^MAJOR = (\d+)$", re.MULTILINE)
 _MINOR_RE = re.compile(r"^MINOR = (\d+)$", re.MULTILINE)
 _PIN_RE = re.compile(r'_PINNED_L0_HASH\s*=\s*"([0-9a-fA-F]+)"')
+_DERIVED_PIN_RE = re.compile(r'_PINNED_DERIVED_HASH\s*=\s*"([0-9a-fA-F]+)"')
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +204,28 @@ def _read_version_at_tag(repo_path, tag: str) -> tuple[int, int] | None:
     return int(major_m.group(1)), int(minor_m.group(1))
 
 
-def _read_pinned_hash_at_tag(repo_path, tag: str) -> str | None:
-    """Regex ``_PINNED_L0_HASH`` out of the pin test at ``tag``. ``None`` if
-    the pin test file isn't present at that tag at all (distinct from
-    "present but missing the constant", which is the broken-tag case
-    resolve_T raises loudly on).
+def _read_pinned_constant_at_tag(
+    repo_path,
+    tag: str,
+    pattern: "re.Pattern[str]",
+    constant_name: str,
+    *,
+    required: bool,
+) -> str | None:
+    """Shared plumbing for ``_read_pinned_hash_at_tag`` (L0) and
+    ``_read_pinned_derived_hash_at_tag`` (Gap 2, derived) — regex
+    ``constant_name`` out of the pin test at ``tag`` via ``pattern``.
+
+    ``None`` if the pin test file isn't present at that tag at all. When
+    the file IS present but the constant isn't: ``required=True`` (L0 —
+    the constant has existed since before this gate did, so its absence
+    from an otherwise-readable pin test is a broken tag) raises loudly;
+    ``required=False`` (the derived pin, Gap 2 — a tag cut before Gap 2
+    landed legitimately has no such constant, which is "Gap 2 wasn't
+    active yet at this tag", not a broken tag) returns ``None`` instead.
+    A genuine git error (bad ref, a ``git show`` failure after ``cat-file
+    -e`` confirmed the path exists) raises regardless of ``required`` —
+    that is never "constant absent", it's an operational failure.
 
     Same ``git cat-file -e`` existence check as ``_read_version_at_tag`` --
     exit-code only, a bad ref ruled out first via ``_verify_tag_resolves``."""
@@ -217,25 +238,57 @@ def _read_pinned_hash_at_tag(repo_path, tag: str) -> str | None:
             f"git show failed for {tag!r}:{PIN_TEST_PATH} after cat-file -e "
             f"confirmed the path exists -- stderr: {result.stderr.strip()!r}"
         )
-    match = _PIN_RE.search(result.stdout)
+    match = pattern.search(result.stdout)
     if not match:
-        raise RuntimeError(
-            f"deployable tag {tag!r} carries {VERSION_PATH} but its "
-            f"{PIN_TEST_PATH} has no _PINNED_L0_HASH constant — broken tag, "
-            f"not an inactive gate."
-        )
+        if required:
+            raise RuntimeError(
+                f"deployable tag {tag!r} carries {VERSION_PATH} but its "
+                f"{PIN_TEST_PATH} has no {constant_name} constant — broken "
+                f"tag, not an inactive gate."
+            )
+        return None
     return match.group(1)
 
 
-def resolve_T(repo_path) -> tuple[tuple[int, int], str, str] | None:
+def _read_pinned_hash_at_tag(repo_path, tag: str) -> str | None:
+    """Regex ``_PINNED_L0_HASH`` out of the pin test at ``tag``. A tag
+    whose pin test lacks this constant is a BROKEN tag (``required=True``)
+    -- see ``_read_pinned_constant_at_tag`` for the full None/broken-tag
+    semantics."""
+    return _read_pinned_constant_at_tag(
+        repo_path, tag, _PIN_RE, "_PINNED_L0_HASH", required=True
+    )
+
+
+def _read_pinned_derived_hash_at_tag(repo_path, tag: str) -> str | None:
+    """Regex ``_PINNED_DERIVED_HASH`` out of the pin test at ``tag`` (Gap 2
+    sibling of ``_read_pinned_hash_at_tag``). ``required=False``: a tag cut
+    before Gap 2 landed legitimately has no such constant -- that is "Gap 2
+    inactive relative to this T", not a broken tag, so it returns ``None``
+    rather than raising. See ``_read_pinned_constant_at_tag`` for the full
+    semantics and the L0/derived asymmetry."""
+    return _read_pinned_constant_at_tag(
+        repo_path, tag, _DERIVED_PIN_RE, "_PINNED_DERIVED_HASH", required=False
+    )
+
+
+def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
     """Resolve T = (max (MAJOR, MINOR), the tag it came from, its pinned L0
-    hash) over the deployable tag set. ``None`` if no deployable tag carries
-    ``version.py`` at all — the caller must treat that as "gate inactive",
-    never as a bug.
+    hash, its pinned derived hash [Gap 2]) over the deployable tag set.
+    ``None`` if no deployable tag carries ``version.py`` at all — the
+    caller must treat that as "gate inactive", never as a bug.
+
+    The derived hash is ``None`` exactly when T's tag was cut before Gap 2
+    landed (no ``_PINNED_DERIVED_HASH`` constant at that tag) — a bootstrap
+    state, not a broken tag (``_read_pinned_derived_hash_at_tag``'s own
+    ``required=False``). ``required_severity`` degrades to L0-only
+    (MAJOR-or-NONE, same behavior as before Gap 2 existed) whenever T's
+    derived hash is ``None`` — see that function's own docstring.
 
     Raises loudly (never silently picks) on a tie in T across tags with
-    different pinned hashes, or on a tag that has version.py but no pin
-    constant.
+    different pinned L0 hashes, different pinned NON-``None`` derived
+    hashes, or on a tag that has version.py but no L0 pin constant (the
+    derived pin constant is exempt from this raise — see above).
     """
     tags = deployable_tags(repo_path)
     versions: dict[str, tuple[int, int]] = {}
@@ -251,6 +304,7 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str] | None:
     tags_at_max = sorted(tag for tag, v in versions.items() if v == max_version)
 
     hashes: dict[str, str] = {}
+    derived_hashes: dict[str, str | None] = {}
     for tag in tags_at_max:
         pinned = _read_pinned_hash_at_tag(repo_path, tag)
         if pinned is None:
@@ -260,6 +314,7 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str] | None:
                 f"tag, not an inactive gate."
             )
         hashes[tag] = pinned
+        derived_hashes[tag] = _read_pinned_derived_hash_at_tag(repo_path, tag)
 
     unique_hashes = set(hashes.values())
     if len(unique_hashes) > 1:
@@ -269,8 +324,16 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str] | None:
             f"{sorted(hashes.items())}"
         )
 
+    unique_derived = {v for v in derived_hashes.values() if v is not None}
+    if len(unique_derived) > 1:
+        raise RuntimeError(
+            f"deployable tags at max version {max_version} disagree on "
+            f"pinned derived hash — corrupted tag set: "
+            f"{sorted(derived_hashes.items())}"
+        )
+
     chosen_tag = tags_at_max[0]
-    return max_version, chosen_tag, hashes[chosen_tag]
+    return max_version, chosen_tag, hashes[chosen_tag], derived_hashes[chosen_tag]
 
 
 # ---------------------------------------------------------------------------
@@ -292,13 +355,30 @@ def classify_delta(t: tuple[int, int], s: tuple[int, int]) -> str:
     return "ILLEGAL"
 
 
-def required_severity(l0_hash_head: str, l0_hash_at_t: str) -> str:
-    """R, from hashes only. Gap 2 (derived hash) is not built in this PR, so
-    this can only ever return MAJOR or NONE — never MINOR.
-    TODO(#2563 gap 2): once a canonical_derived_hash() exists, this needs a
-    second hash pair and a MINOR branch (L0 same, derived differs -> MINOR)."""
+def required_severity(
+    l0_hash_head: str,
+    l0_hash_at_t: str,
+    derived_hash_head: str,
+    derived_hash_at_t: str | None,
+) -> str:
+    """R, from hashes only (engram-alpha#2563, Gap 2). L0 wins: a
+    MAJOR-worthy change (the measured L0 set itself changed) is reported as
+    MAJOR regardless of whether the derived layer also changed — MAJOR
+    already subsumes MINOR's snapshot-history guarantee, so a derived-layer
+    delta alongside an L0 delta needs no separate signal. Only when L0 is
+    unchanged does a derived-layer difference surface, as MINOR.
+
+    ``derived_hash_at_t`` is ``None`` exactly when T's tag predates Gap 2
+    (``resolve_T``'s own bootstrap state, not a broken tag) — in that case
+    this degrades to L0-only (MAJOR-or-NONE, the exact pre-Gap-2 behavior),
+    since there is no derived-layer baseline at T to compare HEAD against;
+    a MINOR-worthy change is invisible until a new tag lands carrying the
+    derived pin, same as the original Gap-3-only gate's own bootstrap for
+    T itself (no deployable tag -> gate inactive)."""
     if l0_hash_head != l0_hash_at_t:
         return "MAJOR"
+    if derived_hash_at_t is not None and derived_hash_head != derived_hash_at_t:
+        return "MINOR"
     return "NONE"
 
 
@@ -358,16 +438,20 @@ def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple
     """
     if b not in ("NONE", "MINOR", "MAJOR"):
         raise ValueError(f"verdict() called with a non-well-formed b: {b!r}")
-    if r not in ("NONE", "MAJOR"):
+    if r not in ("NONE", "MINOR", "MAJOR"):
         raise ValueError(f"verdict() called with an unsupported r: {r!r}")
 
     tmaj, tmin = t
 
     if b == r:
         status, message = "PASS", f"version delta matches required severity ({r})"
-    elif r == "MAJOR":
+        return status, _name_t(message, t, tag)
+
+    status = "DENY"
+
+    if r == "MAJOR" and b in ("NONE", "MINOR"):
+        # Insufficient: an L0-worthy change staged as NONE or MINOR.
         target = f"{tmaj + 1}.0"
-        status = "DENY"
         if b == "NONE":
             message = (
                 f"legal bump, insufficient — this change requires MAJOR "
@@ -380,45 +464,88 @@ def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple
                 f"(the L0 hash differs from the tagged commit); MINOR alone "
                 f"is not enough. Set MAJOR.MINOR to {target}."
             )
-    elif b == "MINOR":
-        # r == "NONE"
-        status = "DENY"
+    elif r == "MINOR" and b == "NONE":
+        # Insufficient (Gap 2, new cell): a derived-only change staged as
+        # NONE.
+        target = f"{tmaj}.{tmin + 1}"
         message = (
-            f"version bumped without cause — the L0 hash matches the "
-            f"tagged commit. Revert MAJOR.MINOR to {tmaj}.{tmin}. The "
-            f"derived-layer hash that would justify a MINOR is not yet "
-            f"implemented (#2563 gap 2), so this gate cannot see a "
-            f"MINOR-worthy cause. If this IS a derived-layer change, say so "
-            f"on the PR rather than reverting."
+            f"legal bump, insufficient — this change requires MINOR (the "
+            f"derived-layer hash differs from the tagged commit — a curve, "
+            f"metric, aspect, or signal declaration changed — while the L0 "
+            f"hash does not). Set MAJOR.MINOR to {target}."
+        )
+    elif b == "MINOR" and r == "NONE":
+        # Bumped without cause. NOT the "over-severity, unrecoverable"
+        # shape below — a MINOR bump is retro-applicable to every stored
+        # L0 snapshot (health.signals._rate's own docstring), so an
+        # unnecessary one costs nothing beyond the revert itself; it does
+        # not invalidate snapshot history the way an unnecessary MAJOR
+        # does. Gap 2 (derived-layer hash) makes this a genuine, checked
+        # "no" -- pre-Gap-2 this branch could only ever say the gate
+        # COULDN'T see a cause; now it has actually looked and found none.
+        message = (
+            f"version bumped without cause — neither the L0 hash nor the "
+            f"derived-layer hash differs from the tagged commit. Revert "
+            f"MAJOR.MINOR to {tmaj}.{tmin}. If this IS a derived-layer "
+            f"change, say so on the PR rather than reverting."
         )
     else:
-        # r == "NONE", b == "MAJOR"
-        status = "DENY"
+        # b == "MAJOR", r in ("NONE", "MINOR") -- over-severity, the hard
+        # DENY (Lei's 2026-09-04 20:01Z ruling on #2563): an unnecessary
+        # MAJOR needlessly invalidates snapshot history from the previous
+        # major version and is UNRECOVERABLE once tagged (the only
+        # correction would be a backwards delta, which this same gate
+        # forbids). Extended by Gap 2 to the r == "MINOR" case: staging
+        # MAJOR when only a derived-layer change occurred is the same
+        # needless invalidation, one severity level over.
+        target = f"{tmaj}.{tmin}" if r == "NONE" else f"{tmaj}.{tmin + 1}"
+        cause = (
+            "no MAJOR- or MINOR-worthy change occurred (neither the L0 nor "
+            "the derived-layer hash differs from the tagged commit)"
+            if r == "NONE" else
+            "only a derived-layer (MINOR-worthy) change occurred — the L0 "
+            "hash matches the tagged commit"
+        )
         message = (
-            f"over-severity — MAJOR staged but the L0 hash matches the tagged "
-            f"commit (no MAJOR-worthy change occurred). This needlessly "
-            f"invalidates snapshot history from the previous major version and "
-            f"is UNRECOVERABLE once tagged (the only correction would be a "
-            f"backwards delta, which this same gate forbids). Revert "
-            f"MAJOR.MINOR to {tmaj}.{tmin} (or {tmaj}.{tmin + 1} if a "
-            f"MINOR-worthy change is actually intended)."
+            f"over-severity — MAJOR staged but {cause}. This needlessly "
+            f"invalidates snapshot history from the previous major version "
+            f"and is UNRECOVERABLE once tagged (the only correction would "
+            f"be a backwards delta, which this same gate forbids). Revert "
+            f"MAJOR.MINOR to {target}."
         )
 
     return status, _name_t(message, t, tag)
 
 
-def evaluate_gate(t, s, get_l0_hash_head, get_l0_hash_at_t, tag: str | None = None) -> tuple[str, str]:
+def evaluate_gate(
+    t,
+    s,
+    get_l0_hash_head,
+    get_l0_hash_at_t,
+    get_derived_hash_head,
+    get_derived_hash_at_t,
+    tag: str | None = None,
+) -> tuple[str, str]:
     """The full two-step gate: WELL-FORMEDNESS first (never touches hashes
-    on an ILLEGAL delta), then ADEQUACY. ``get_l0_hash_head`` /
-    ``get_l0_hash_at_t`` are zero-arg callables, so a falsifier test can pass
-    a sentinel that raises if called, to prove ILLEGAL never reaches them.
-    ``tag`` is the deployable tag T was resolved from (or ``None`` for the
-    synthetic-``t``/``s`` unit falsifiers) -- threaded through to name T in
-    every produced message once the gate is active."""
+    on an ILLEGAL delta), then ADEQUACY. Every ``get_*`` arg is a zero-arg
+    callable, so a falsifier test can pass a sentinel that raises if
+    called, to prove ILLEGAL never reaches any of them. ``tag`` is the
+    deployable tag T was resolved from (or ``None`` for the synthetic-
+    ``t``/``s`` unit falsifiers) -- threaded through to name T in every
+    produced message once the gate is active.
+
+    ``get_derived_hash_at_t`` may return ``None`` (T's tag predates Gap 2)
+    -- ``required_severity`` degrades to L0-only in that case; see its own
+    docstring."""
     b = classify_delta(t, s)
     if b == "ILLEGAL":
         return _illegal_verdict(t, s, tag=tag)
-    r = required_severity(get_l0_hash_head(), get_l0_hash_at_t())
+    r = required_severity(
+        get_l0_hash_head(),
+        get_l0_hash_at_t(),
+        get_derived_hash_head(),
+        get_derived_hash_at_t(),
+    )
     return verdict(b, r, t, tag=tag)
 
 
@@ -439,17 +566,32 @@ def _l0_hash_at_head() -> str:
     return hem_l0.canonical_l0_hash()
 
 
+def _derived_hash_at_head() -> str:
+    """Gap 2 sibling of ``_l0_hash_at_head``."""
+    from health import measurements as hem_l0  # noqa: E402
+
+    return hem_l0.canonical_derived_hash()
+
+
 def run_live_gate(repo_path=REPO_ROOT) -> tuple[str, str]:
     """The live gate against a real repo checkout: resolve T, and either
     report the gate inactive or run the full evaluate_gate against HEAD's
-    real S and L0 hash. This is what both test_gate_on_this_repo and the
-    CI step / manual verification run."""
+    real S, L0 hash, and derived hash. This is what both
+    test_gate_on_this_repo and the CI step / manual verification run."""
     resolved = resolve_T(repo_path)
     if resolved is None:
         return "PASS", INACTIVE_MESSAGE
-    t, tag, pinned_hash = resolved
+    t, tag, pinned_hash, pinned_derived_hash = resolved
     s = _current_S()
-    return evaluate_gate(t, s, _l0_hash_at_head, lambda: pinned_hash, tag=tag)
+    return evaluate_gate(
+        t,
+        s,
+        _l0_hash_at_head,
+        lambda: pinned_hash,
+        _derived_hash_at_head,
+        lambda: pinned_derived_hash,
+        tag=tag,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,12 +629,24 @@ def _write_version_py(repo: Path, major: int, minor: int) -> None:
     )
 
 
-def _write_pin_test(repo: Path, pinned_hash: str) -> None:
+def _write_pin_test(
+    repo: Path, pinned_hash: str, derived_hash: str | None = "c" * 64
+) -> None:
+    """Write the scratch pin test. ``derived_hash=None`` writes NO
+    ``_PINNED_DERIVED_HASH`` constant at all -- simulates a tag cut before
+    Gap 2 landed (``_read_pinned_derived_hash_at_tag``'s ``required=False``
+    bootstrap case). The default (a fixed, distinct-from-HASH_A/HASH_B
+    literal) means every EXISTING call site that only cares about L0
+    behavior gets a real, present, non-varying derived pin for free --
+    Gap 2 stays inert for those tests without them needing to know it
+    exists."""
     path = repo / "tests" / "test_health_measurements.py"
     path.parent.mkdir(parents=True, exist_ok=True)
+    derived_line = f'_PINNED_DERIVED_HASH = "{derived_hash}"\n' if derived_hash is not None else ""
     path.write_text(
         f'"""fake pin test for the gate falsifier suite."""\n'
-        f'_PINNED_L0_HASH = "{pinned_hash}"\n',
+        f'_PINNED_L0_HASH = "{pinned_hash}"\n'
+        f'{derived_line}',
         encoding="utf-8",
     )
 
@@ -531,39 +685,182 @@ def _raising_hash():
 
 
 # --- direct evaluate_gate() falsifiers (no git needed for these) ----------
+#
+# Shorthand for these unit falsifiers: `_l0(head, at_t)` / `_derived(head,
+# at_t)` build the (get_head, get_at_t) callable pairs `evaluate_gate` needs,
+# so each test states its intent as "L0: same/differs, derived: same/
+# differs" rather than four positional lambdas.
+
+def _l0(head: str, at_t: str):
+    return (lambda: head), (lambda: at_t)
+
+
+def _derived(head: str, at_t: str | None):
+    return (lambda: head), (lambda: at_t)
+
 
 def test_under_bump():
-    status, message = evaluate_gate((1, 0), (1, 0), lambda: HASH_B, lambda: HASH_A)
+    l0 = _l0(HASH_B, HASH_A)  # L0 differs -> R = MAJOR
+    derived = _derived(HASH_A, HASH_A)
+    status, message = evaluate_gate((1, 0), (1, 0), *l0, *derived)
     assert status == "DENY"
     assert "2.0" in message
 
 
 def test_wrong_new_version():
-    status, message = evaluate_gate((1, 0), (1, 1), lambda: HASH_B, lambda: HASH_A)
+    l0 = _l0(HASH_B, HASH_A)  # L0 differs -> R = MAJOR
+    derived = _derived(HASH_A, HASH_A)
+    status, message = evaluate_gate((1, 0), (1, 1), *l0, *derived)
     assert status == "DENY"
     assert "2.0" in message
     assert "illegal" not in message.lower()
 
 
 def test_bump_without_cause():
-    status, message = evaluate_gate((1, 0), (1, 1), lambda: HASH_A, lambda: HASH_A)
+    """B = MINOR staged, but NEITHER hash differs from T -> R = NONE ->
+    DENY. Gap 2 rewrite (Kepler's #2563 note, 2026-09-05T15:41:35Z item 3):
+    before Gap 2, this DENY could only ever say the gate COULDN'T see a
+    MINOR-worthy cause (it had no derived hash to check); now it has
+    genuinely checked and found none, so the "gap 2"/"cannot see" hedge is
+    RETIRED -- its presence would now be a stale, false claim, not a
+    qualification. This is exactly the tripwire Kepler's note named: this
+    test failing (because the hedge it used to assert is gone) is the
+    intended signal that Gap 2 landed correctly."""
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_A, HASH_A)  # derived also matches -> R = NONE
+    status, message = evaluate_gate((1, 0), (1, 1), *l0, *derived)
     assert status == "DENY"
     assert "1.0" in message
-    # Borges ask 2: while Gap 2 (derived-layer hash) is unbuilt, R can never
-    # be MINOR, so this DENY must not claim "no cause" as a flat fact -- it
-    # must name the gap and qualify the claim.
-    assert "gap 2" in message
-    assert "derived-layer" in message.lower()
     assert "without cause" in message.lower()
+    assert "gap 2" not in message.lower()
+    assert "cannot see" not in message.lower()
 
 
 def test_over_severity_is_a_hard_deny():
-    status, message = evaluate_gate((1, 0), (2, 0), lambda: HASH_A, lambda: HASH_A)
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_A, HASH_A)  # both match -> R = NONE, B = MAJOR
+    status, message = evaluate_gate((1, 0), (2, 0), *l0, *derived)
     assert status == "DENY"
     msg_lower = message.lower()
     assert "snapshot" in msg_lower
     assert "unrecoverable" in msg_lower
     assert status != "WARN"
+
+
+# --- Gap 2 severity-cell falsifiers (engram-alpha#2563 unit spec item 4) --
+
+def test_derived_only_change_no_bump_is_denied():
+    """R = MINOR (derived differs, L0 same), B = NONE -> DENY, insufficient."""
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_B, HASH_A)
+    status, message = evaluate_gate((1, 0), (1, 0), *l0, *derived)
+    assert status == "DENY"
+    assert "1.1" in message
+    assert "minor" in message.lower()
+
+
+def test_derived_only_change_with_minor_bump_passes():
+    """R = MINOR, B = MINOR -> PASS. The cell Gap 2 exists to make
+    reachable at all -- unreachable before this PR (R could never be
+    MINOR)."""
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_B, HASH_A)
+    status, message = evaluate_gate((1, 0), (1, 1), *l0, *derived)
+    assert status == "PASS"
+
+
+def test_derived_only_change_with_major_bump_is_over_severity():
+    """R = MINOR, B = MAJOR -> DENY, over-severity -- staging MAJOR when
+    only a derived-layer change occurred needlessly invalidates snapshot
+    history one severity level early, same hard-DENY shape as the original
+    R = NONE / B = MAJOR case."""
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_B, HASH_A)
+    status, message = evaluate_gate((1, 0), (2, 0), *l0, *derived)
+    assert status == "DENY"
+    msg_lower = message.lower()
+    assert "over-severity" in msg_lower
+    assert "unrecoverable" in msg_lower
+    assert "1.1" in message  # names the actually-sufficient MINOR target
+
+
+def test_l0_change_with_minor_bump_is_insufficient():
+    """R = MAJOR (L0 differs -- wins even though derived also differs), B =
+    MINOR -> DENY, insufficient: MINOR alone is not enough when the L0 set
+    itself changed."""
+    l0 = _l0(HASH_B, HASH_A)
+    derived = _derived(HASH_B, HASH_A)  # derived ALSO differs; L0 must win
+    status, message = evaluate_gate((1, 0), (1, 1), *l0, *derived)
+    assert status == "DENY"
+    assert "2.0" in message
+    assert "not enough" in message.lower()
+
+
+def test_l0_and_derived_both_differ_major_bump_passes():
+    """R = MAJOR (L0 wins), B = MAJOR -> PASS. Confirms L0-wins is not just
+    a DENY-path rule -- a correctly-sized MAJOR bump passes even when the
+    derived hash ALSO changed alongside the L0 change."""
+    l0 = _l0(HASH_B, HASH_A)
+    derived = _derived(HASH_B, HASH_A)
+    status, message = evaluate_gate((1, 0), (2, 0), *l0, *derived)
+    assert status == "PASS"
+
+
+def test_mutation_control_reverting_to_l0_only_reddens_exactly_the_minor_cells():
+    """The required mutation control (#2563 unit spec item 4): revert
+    ``required_severity`` to its pre-Gap-2, L0-only form and show that
+    doing so reddens EXACTLY the new MINOR-shaped cells above, and nothing
+    else -- proving those tests actually exercise the derived hash rather
+    than passing for an unrelated reason."""
+
+    def pre_gap_2_required_severity(l0_head, l0_at_t, derived_head, derived_at_t):
+        if l0_head != l0_at_t:
+            return "MAJOR"
+        return "NONE"  # the old ceiling: MINOR is never reachable
+
+    l0_same = _l0(HASH_A, HASH_A)
+    l0_diff = _l0(HASH_B, HASH_A)
+    derived_same = _derived(HASH_A, HASH_A)
+    derived_diff = _derived(HASH_B, HASH_A)
+
+    def _b_under_mutation(t, s, l0, derived):
+        b = classify_delta(t, s)
+        r = pre_gap_2_required_severity(l0[0](), l0[1](), derived[0](), derived[1]())
+        status, _ = verdict(b, r, t)
+        return status
+
+    # The cell that SHOULD flip from PASS (real R = MINOR) to DENY (mutant
+    # R = NONE, since the mutant can never see a MINOR-worthy cause):
+    assert _b_under_mutation((1, 0), (1, 1), l0_same, derived_diff) == "DENY", (
+        "mutation control failed: reverting required_severity to L0-only "
+        "did NOT redden the derived-only/MINOR-bump cell -- Gap 2's own "
+        "tests above are not actually discriminating"
+    )
+    # Sanity: the same cell against the REAL required_severity is PASS
+    # (already asserted by test_derived_only_change_with_minor_bump_passes,
+    # re-confirmed here so the contrast is visible in one place).
+    real_r = required_severity(HASH_A, HASH_A, HASH_B, HASH_A)
+    assert real_r == "MINOR"
+    real_status, _ = verdict(classify_delta((1, 0), (1, 1)), real_r, (1, 0))
+    assert real_status == "PASS"
+
+    # Cells the mutation must NOT change (pure-L0 behavior, unaffected by
+    # the derived-layer regression): L0 AND derived both unchanged (real R
+    # = NONE, same as the mutant's only non-MAJOR value), and L0 changed
+    # (real R = MAJOR, L0-wins, same regardless of what the mutant can or
+    # can't see about the derived layer).
+    for t, s, l0, derived in [
+        ((1, 0), (1, 0), l0_same, derived_same),  # NONE vs NONE either way
+        ((1, 0), (2, 0), l0_diff, derived_diff),  # MAJOR vs MAJOR either way
+    ]:
+        b = classify_delta(t, s)
+        real_r = required_severity(l0[0](), l0[1](), derived[0](), derived[1]())
+        real_status, _ = verdict(b, real_r, t)
+        mutant_status = _b_under_mutation(t, s, l0, derived)
+        assert mutant_status == real_status, (
+            f"mutation control changed a pure-L0 cell it should not have "
+            f"touched: t={t} s={s} real={real_status} mutant={mutant_status}"
+        )
 
 
 @pytest.mark.parametrize(
@@ -577,18 +874,49 @@ def test_over_severity_is_a_hard_deny():
     ids=["skip-major", "skip-minor", "no-minor-reset", "backwards"],
 )
 def test_illegal_delta_never_consults_hashes(t, s, expected_reason):
-    status, message = evaluate_gate(t, s, _raising_hash, _raising_hash)
+    status, message = evaluate_gate(
+        t, s, _raising_hash, _raising_hash, _raising_hash, _raising_hash
+    )
     assert status == "DENY"
     assert expected_reason in message.lower()
 
 
+def test_illegal_delta_message_names_t_with_the_tag(tmp_path):
+    """Deferred item 1 (#2563's 2026-09-05T15:41:35Z note): ILLEGAL
+    messages thread T through ``_name_t`` (verified by direct invocation
+    when it was written), but no test asserted it end-to-end against a
+    REAL resolved tag until now. Scratch repo, one real tag, an ILLEGAL
+    delta staged against it."""
+    repo = _init_scratch_repo(tmp_path, 1, 0, HASH_A, "v1.0.0")
+    resolved = resolve_T(repo)
+    assert resolved is not None
+    t, tag, pinned_hash, pinned_derived_hash = resolved
+
+    status, message = evaluate_gate(
+        t,
+        (3, 0),  # skip-major -> ILLEGAL
+        _raising_hash,
+        _raising_hash,
+        _raising_hash,
+        _raising_hash,
+        tag=tag,
+    )
+    assert status == "DENY"
+    assert "T=" in message
+    assert f"tag {tag}" in message
+
+
 def test_passing_none():
-    status, message = evaluate_gate((1, 0), (1, 0), lambda: HASH_A, lambda: HASH_A)
+    l0 = _l0(HASH_A, HASH_A)
+    derived = _derived(HASH_A, HASH_A)
+    status, message = evaluate_gate((1, 0), (1, 0), *l0, *derived)
     assert status == "PASS"
 
 
 def test_passing_major():
-    status, message = evaluate_gate((1, 0), (2, 0), lambda: HASH_B, lambda: HASH_A)
+    l0 = _l0(HASH_B, HASH_A)
+    derived = _derived(HASH_A, HASH_A)
+    status, message = evaluate_gate((1, 0), (2, 0), *l0, *derived)
     assert status == "PASS"
 
 
@@ -596,7 +924,9 @@ def test_passing_major_batching_no_second_bump():
     """Second PR in the same batch: T is still 1.0 (not yet re-tagged), the
     L0 hash still differs from T, S is already staged at 2.0 from the first
     PR in the batch — PASS again, no further bump required."""
-    status, message = evaluate_gate((1, 0), (2, 0), lambda: HASH_B, lambda: HASH_A)
+    l0 = _l0(HASH_B, HASH_A)
+    derived = _derived(HASH_A, HASH_A)
+    status, message = evaluate_gate((1, 0), (2, 0), *l0, *derived)
     assert status == "PASS"
 
 
@@ -708,10 +1038,11 @@ def test_deployable_namespace_deploy_tag_wins_over_v_tag(tmp_path):
 
     resolved = resolve_T(repo)
     assert resolved is not None
-    version, tag, pinned_hash = resolved
+    version, tag, pinned_hash, pinned_derived_hash = resolved
     assert version == (2, 0)
     assert tag == "deploy/2026-09-05-x"
     assert pinned_hash == HASH_B
+    assert pinned_derived_hash == "c" * 64  # _write_pin_test's default
 
 
 def test_describe_blindness_control_tag_on_unreachable_branch(tmp_path):
@@ -759,10 +1090,11 @@ def test_describe_blindness_control_tag_on_unreachable_branch(tmp_path):
 
     resolved = resolve_T(repo)
     assert resolved is not None
-    version, tag, pinned_hash = resolved
+    version, tag, pinned_hash, pinned_derived_hash = resolved
     assert version == (2, 0)
     assert tag == "v2.0.0"
     assert pinned_hash == HASH_B
+    assert pinned_derived_hash == "c" * 64  # _write_pin_test's default
 
 
 def test_tie_in_T_with_different_pinned_hashes_fails_loudly(tmp_path):
@@ -791,6 +1123,37 @@ def test_tie_in_T_with_different_pinned_hashes_fails_loudly(tmp_path):
         resolve_T(repo)
 
 
+def test_tie_in_T_with_different_pinned_derived_hashes_fails_loudly(tmp_path):
+    """Gap 2 sibling of the L0 tie test above. Same version, same L0 hash
+    (so the L0 uniqueness check upstream doesn't fire first and mask this
+    one), but two tags disagree on their pinned DERIVED hash -- also a
+    corrupted tag set, and also must raise loudly rather than silently
+    picking one (reviewer-fairy suggestion on PR #2725, round 1: this path
+    was exercised in code by hand during review but had no direct test)."""
+    repo = tmp_path / "scratch-derived-tie"
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A, derived_hash=HASH_A)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "first v1.0")
+    _git_run(repo, "tag", "v1.0.0")
+
+    # A second commit, same (1, 0) version, SAME L0 hash (HASH_A), but a
+    # DIFFERENT derived hash -- corrupted at the derived layer specifically.
+    (repo / "unrelated.txt").write_text("noise\n", encoding="utf-8")
+    _write_pin_test(repo, HASH_A, derived_hash=HASH_B)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "second v1.0, same L0 hash, different derived hash")
+    _git_run(repo, "tag", "v1.0.1-same-version")
+
+    with pytest.raises(RuntimeError, match="pinned derived hash"):
+        resolve_T(repo)
+
+
 def test_full_history_scratch_repo_major_pass_and_under_bump(tmp_path):
     """A realistic history in one scratch repo (per this spec's own note:
     a tag's contents can't be rewritten after the fact, so a "changed pin at
@@ -816,17 +1179,25 @@ def test_full_history_scratch_repo_major_pass_and_under_bump(tmp_path):
     _git_run(repo, "tag", "v1.0.0")
 
     resolved = resolve_T(repo)
-    assert resolved == ((1, 0), "v1.0.0", HASH_A)
-    t, tag, pinned_hash_at_t = resolved
+    assert resolved == ((1, 0), "v1.0.0", HASH_A, "c" * 64)
+    t, tag, pinned_hash_at_t, pinned_derived_hash_at_t = resolved
 
     # Commit 2: L0 hash changed at HEAD, version NOT bumped -> under-bump.
+    # Derived hash held constant throughout ("c" * 64, _write_pin_test's
+    # default both times) — this scenario is pure-L0, same as before Gap 2.
     _write_pin_test(repo, HASH_B)  # simulates the NEW measured hash at HEAD
     _git_run(repo, "add", "-A")
     _git_run(repo, "commit", "-q", "-m", "L0 measurement changed, version not bumped yet")
 
     s_unbumped = (1, 0)
     status, message = evaluate_gate(
-        t, s_unbumped, lambda: HASH_B, lambda: pinned_hash_at_t, tag=tag
+        t,
+        s_unbumped,
+        lambda: HASH_B,
+        lambda: pinned_hash_at_t,
+        lambda: "c" * 64,
+        lambda: pinned_derived_hash_at_t,
+        tag=tag,
     )
     assert status == "DENY"
     assert "2.0" in message
@@ -839,7 +1210,13 @@ def test_full_history_scratch_repo_major_pass_and_under_bump(tmp_path):
 
     s_bumped = (2, 0)
     status, message = evaluate_gate(
-        t, s_bumped, lambda: HASH_B, lambda: pinned_hash_at_t, tag=tag
+        t,
+        s_bumped,
+        lambda: HASH_B,
+        lambda: pinned_hash_at_t,
+        lambda: "c" * 64,
+        lambda: pinned_derived_hash_at_t,
+        tag=tag,
     )
     assert status == "PASS"
     assert f"tag {tag}" in message

@@ -56,8 +56,11 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 import engram_core  # noqa: E402
 from health import measurements as hem_l0  # noqa: E402
 from health import metrics  # noqa: E402
+from health import model as health_model  # noqa: E402
 from health import version as health_version  # noqa: E402
 from health.config import UNAVAILABLE  # noqa: E402
+from health.curves import CurveSpec  # noqa: E402
+from health.signals import SIGNAL_DEFS  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +426,118 @@ class TestL0HashGate:
 
         assert perturbed_hash != real_hash, (
             "control failed: perturbing a population label did not change the hash"
+        )
+
+
+class TestDerivedHashGate:
+    """The DERIVED-layer hash gate (engram-alpha#2563, Gap 2). Same shape as
+    ``TestL0HashGate`` above, one layer up: pins a hash over the declared
+    scoring model built ON TOP of L0 — aspects, metric bindings, curve
+    specs (incl. ``knots``, #2576/#2578), and signal definitions — so a
+    derived-only change (a curve reshaped, an importance reweighted, a
+    metric reassigned to a different aspect, a signal's numerator/
+    denominator changed) fails this test until ``health.version.MINOR`` is
+    bumped and the hash below is re-pinned IN THE SAME COMMIT. See
+    ``health.measurements.canonical_derived_hash``'s own docstring for the
+    full design and the boundary it draws against L0's hash above.
+
+    HOW TO UPDATE THIS PIN, when a real MINOR-worthy change lands: bump
+    health.version.MINOR (or MAJOR, per ``required_severity``'s rule if the
+    L0 hash ALSO changed), run
+    ``python3 -c "import sys; sys.path.insert(0,'src/engram');
+    from health import measurements as h; print(h.canonical_derived_hash())"``,
+    paste the new digest below, in the SAME commit as the bump."""
+
+    _PINNED_DERIVED_HASH = "ba666b45f29b37f0927f5deeec42c3dd6e83bd7f528b30633820c83fb0cac35b"
+
+    def test_derived_set_hash_matches_pinned_value(self):
+        computed = hem_l0.canonical_derived_hash()
+        assert computed == self._PINNED_DERIVED_HASH, (
+            f"derived set changed (computed {computed!r} != pinned "
+            f"{self._PINNED_DERIVED_HASH!r}) — if this is a deliberate "
+            f"change to a curve/metric/aspect/signal declaration, bump "
+            f"health.version.MINOR (or MAJOR if the L0 hash also changed) "
+            f"and update _PINNED_DERIVED_HASH above IN THE SAME COMMIT; "
+            f"if it's accidental, revert the change that caused it."
+        )
+
+    def test_gate_actually_fails_on_a_perturbed_curve(self):
+        """The required control, same discipline as L0's own perturbation
+        test. Reshapes a real curve's ``knots`` THROUGH THE REAL
+        ``canonical_derived_hash()`` (via ``mock.patch.dict`` on the live
+        ``MODEL_SPEC.curves`` registry, not a hand-rolled reimplementation
+        of the hashing logic) and confirms the computed hash changes — the
+        exact property #2576 exists to protect (a curve's ``knots`` are the
+        one declared field its actual SHAPE is built from; reshaping them
+        must be visible to this hash, not silently absorbed by a
+        byte-identical dataclass elsewhere)."""
+        real_hash = hem_l0.canonical_derived_hash()
+        assert real_hash == self._PINNED_DERIVED_HASH  # sanity: matches the pin
+
+        some_name = next(iter(health_model.MODEL_SPEC.curves))
+        original = health_model.MODEL_SPEC.curves[some_name]
+        # A genuinely different, still-valid (sorted, non-degenerate) knot
+        # sequence over the same domain and direction — reshapes the curve
+        # without touching any OTHER declared field on it.
+        reshaped = CurveSpec(
+            name=original.name,
+            knots=((original.knots[0][0], original.knots[0][1]),
+                   (original.knots[-1][0], original.knots[-1][1])),
+            monotone_direction=original.monotone_direction,
+            output_range=original.output_range,
+        )
+
+        with mock.patch.dict(health_model.MODEL_SPEC.curves, {some_name: reshaped}):
+            perturbed_hash = hem_l0.canonical_derived_hash()
+
+        assert perturbed_hash != real_hash, (
+            "control failed: reshaping a curve's knots did not change the "
+            "derived hash"
+        )
+
+    def test_gate_actually_fails_on_a_perturbed_signal(self):
+        """Same control, one layer further: perturbing a ``SignalDef``'s
+        declared arithmetic (through the real ``SIGNAL_DEFS`` registry, not
+        a reimplementation) must also be visible to the derived hash — the
+        curve control above shows the L3 (curve) layer is covered, this
+        shows L2 (signal) is too."""
+        real_hash = hem_l0.canonical_derived_hash()
+        assert real_hash == self._PINNED_DERIVED_HASH  # sanity: matches the pin
+
+        some_name = next(iter(SIGNAL_DEFS))
+        perturbed_def = dataclasses.replace(
+            SIGNAL_DEFS[some_name],
+            doc=SIGNAL_DEFS[some_name].doc + " (perturbed)",
+        )
+
+        with mock.patch.dict(SIGNAL_DEFS, {some_name: perturbed_def}):
+            perturbed_hash = hem_l0.canonical_derived_hash()
+
+        assert perturbed_hash != real_hash, (
+            "control failed: perturbing a signal's doc did not change the "
+            "derived hash"
+        )
+
+    def test_derived_hash_unaffected_by_l0_only_change(self):
+        """The boundary the two hashes exist to draw: a change to an L0
+        measurement (what ``canonical_l0_hash`` covers) must NOT move the
+        derived hash — otherwise every MAJOR-worthy L0 change would also
+        force an unnecessary MINOR-shaped signal, defeating the point of
+        having two independent hashes that ``required_severity`` can tell
+        apart."""
+        real_derived_hash = hem_l0.canonical_derived_hash()
+
+        some_name = next(iter(hem_l0.MEASUREMENTS))
+        perturbed_def = dataclasses.replace(
+            hem_l0.MEASUREMENTS[some_name],
+            population=hem_l0.MEASUREMENTS[some_name].population + " (perturbed)",
+        )
+        with mock.patch.dict(hem_l0.MEASUREMENTS, {some_name: perturbed_def}):
+            still_derived_hash = hem_l0.canonical_derived_hash()
+
+        assert still_derived_hash == real_derived_hash, (
+            "an L0-only perturbation moved the derived hash — the two "
+            "hashes are supposed to be independent"
         )
 
 
