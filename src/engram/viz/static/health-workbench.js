@@ -73,6 +73,17 @@
     if (v === null || v === undefined) return "--";
     return typeof v === "number" ? v.toLocaleString("en-US") : String(v);
   }
+  // engram-alpha#2748 item 4: this file builds most markup via raw string
+  // concatenation (not the el() helper above), so an HTML-attribute value
+  // sourced from server text (e.g. a snapshot's "reason" string) needs its
+  // own escape before landing inside a quoted title= attribute.
+  function escAttr(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
   function fmtScore(v) {
     if (v === null || v === undefined || v === "UNAVAILABLE") return "--";
     return Number(v).toFixed(3);
@@ -986,8 +997,19 @@
       var r = s && s.has_snapshot ? (s.signal_rows || []).filter(function (x) { return x.name === signal; })[0] : null;
       var raw = r && r.today ? r.today.raw : null;
       var sc = scoreFor(signal, raw);
+      // engram-alpha#2748 item 4: no-snapshot seats render a bare "--" with
+      // no way to tell "no snapshot yet" from "not readable from this
+      // process" (relevant on a multi-UID host) -- carry whatever reason
+      // the /api/health/v2 payload exposes for THIS seat (s.reason, same
+      // field the current-agent path already surfaces at L882/L886 above)
+      // as a title= attribute on the cell, so a hover reveals which case
+      // it is instead of both reading identically.
+      var noSnapTitle = (!s || !s.has_snapshot)
+        ? ' title="' + escAttr((s && s.reason) || "no snapshot for this seat") + '"'
+        : "";
       seatRows += '<tr class="' + (a.name === state.agent ? "sel" : "") + '"><td>' + a.name +
-        '</td><td class="num">' + (raw === null || raw === undefined || raw === "UNAVAILABLE" ? "--" : fmtPct(raw)) +
+        '</td><td class="num"' + noSnapTitle + '>' +
+        (raw === null || raw === undefined || raw === "UNAVAILABLE" ? "--" : fmtPct(raw)) +
         '</td><td class="num">' + fmtScore(sc) + "</td></tr>";
     });
     var table = el("table", {
@@ -1233,19 +1255,27 @@
   // ---------------------------------------------------------------------
   function buildExportPayload() {
     var out = {};
+    // engram-alpha#2748 item 3: per-signal entries nest under "signals",
+    // mirroring health/series.py's export() shape ({aspects, composed,
+    // replay_decl_hash, scores_available, signals, version} -- aspects and
+    // signals as siblings) instead of sitting at the top level beside
+    // "aspects" -- a signal literally named "aspects" (or any future
+    // top-level block name) would otherwise be silently clobbered.
+    var signalsOut = {};
     Object.keys(state.edited).forEach(function (sig) {
       if (state.edited[sig] && state.curves[sig]) {
-        out[sig] = {
+        signalsOut[sig] = {
           knots: state.curves[sig].knots.map(function (p) { return [p[0], p[1]]; }),
           importance: state.curves[sig].importance,
         };
       }
     });
-    // R5.3: top-level "aspects" block, beside the per-signal entries above
-    // -- one entry per aspect whose STAGED reference differs from stored.
-    // Every metric rescaled by "set as reference" is separately captured
-    // as its own per-signal entry above (via markEdited), so this block
-    // carries only the reference-CHOICE itself.
+    if (Object.keys(signalsOut).length) out.signals = signalsOut;
+    // R5.3: top-level "aspects" block, sibling of "signals" above -- one
+    // entry per aspect whose STAGED reference differs from stored. Every
+    // metric rescaled by "set as reference" is separately captured as its
+    // own per-signal entry above (via markEdited), so this block carries
+    // only the reference-CHOICE itself.
     var aspectsOut = {};
     (state.model && state.model.model_defs && state.model.model_defs.aspects || []).forEach(function (a) {
       var staged = state.references[a.name];

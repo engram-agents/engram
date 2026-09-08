@@ -1,6 +1,8 @@
 """Export-decisions round-trip test (engram-alpha#2727): the Curve
 Workbench's "Export decisions" JSON shape,
-``{signal: {knots: [[x, y], ...], importance: n}}``, must validate through
+``{signals: {signal: {knots: [[x, y], ...], importance: n}}}`` (per-signal
+entries nested under a ``signals`` block, sibling of ``aspects`` --
+engram-alpha#2748 item 3), must validate through
 ``health.curves.CurveSpec`` construction (knots sorted ascending, a
 well-formed curve) for every REAL model signal -- using each signal's own
 real ``monotone_direction`` (read off the live ``health.engine.MODEL``,
@@ -26,23 +28,25 @@ class TestExportDecisionsRoundtrip(unittest.TestCase):
         """Build the SAME shape the page's 'Export decisions' box produces
         for a hand-edited signal: knots (unmodified from shipped, to keep
         this a pure shape/plumbing check) + importance, for every real
-        model signal."""
+        model signal -- nested under "signals" per engram-alpha#2748
+        item 3 (mirrors health/series.py's export() shape, where
+        "signals" and "aspects" are siblings)."""
         model = health_engine.MODEL
         model_defs = health_model.model_defs_jsonable(model)
-        payload = {}
+        signals = {}
         for m in model_defs["metrics"]:
             curve_def = model.curves[m["curve"]]
-            payload[m["signal"]] = {
+            signals[m["signal"]] = {
                 "knots": [[x, y] for x, y in curve_def.knots],
                 "importance": m["importance"],
             }
-        return payload
+        return {"signals": signals}
 
     def test_every_real_signal_round_trips_through_curvespec(self):
         model = health_engine.MODEL
         payload = self._export_payload_for_current_model()
-        self.assertTrue(payload, "expected at least one real model signal")
-        for signal, proposal in payload.items():
+        self.assertTrue(payload["signals"], "expected at least one real model signal")
+        for signal, proposal in payload["signals"].items():
             binding = next(mm for mm in model.metrics if mm.signal == signal)
             real_curve = model.curves[binding.curve]
             with self.subTest(signal=signal):

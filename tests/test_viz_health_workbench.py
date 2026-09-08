@@ -326,5 +326,86 @@ class TestWorkbenchTierGate(_LiveServerBase):
         self.assertNotIn("model_module_unavailable", body.get("reason", ""))
 
 
+class TestComputeStaticVersionStamp(unittest.TestCase):
+    """engram-alpha#2748 item 1: exercise both fallback branches of
+    ``_compute_static_version_stamp`` -- the mtime branch (git resolver
+    fails) and the terminal ``"0"`` branch (mtime also unresolvable). The
+    stamp is computed ONCE at import time into the module constant
+    ``_STATIC_VERSION_STAMP``, so these tests call the function directly
+    rather than depending on re-import order."""
+
+    def test_run_raises_oserror_falls_back_to_mtime(self):
+        """subprocess.run raising OSError (the installed-plugin-tree case
+        per the function's own docstring -- resolver binary missing) must
+        fall through to the mtime branch: a non-empty all-digit string
+        equal to str(int(max mtime of the two workbench JS files))."""
+        candidates = [
+            viz_server._STATIC_DIR / "health-workbench-curve.js",
+            viz_server._STATIC_DIR / "health-workbench.js",
+        ]
+        expected = str(int(max(p.stat().st_mtime for p in candidates if p.is_file())))
+
+        def _raise_oserror(*_a, **_k):
+            raise OSError("resolver binary missing")
+
+        original_run = viz_server.subprocess.run
+        viz_server.subprocess.run = _raise_oserror
+        try:
+            stamp = viz_server._compute_static_version_stamp()
+        finally:
+            viz_server.subprocess.run = original_run
+        self.assertTrue(stamp)
+        self.assertTrue(stamp.isdigit())
+        self.assertEqual(stamp, expected)
+
+    def test_run_nonzero_returncode_falls_back_to_mtime(self):
+        """subprocess.run returning rc != 0 (e.g. not inside any
+        resolvable tree) must also fall through to the mtime branch, same
+        as the OSError case above."""
+        candidates = [
+            viz_server._STATIC_DIR / "health-workbench-curve.js",
+            viz_server._STATIC_DIR / "health-workbench.js",
+        ]
+        expected = str(int(max(p.stat().st_mtime for p in candidates if p.is_file())))
+
+        class _FakeResult:
+            returncode = 128
+            stdout = ""
+
+        def _fake_run(*_a, **_k):
+            return _FakeResult()
+
+        original_run = viz_server.subprocess.run
+        viz_server.subprocess.run = _fake_run
+        try:
+            stamp = viz_server._compute_static_version_stamp()
+        finally:
+            viz_server.subprocess.run = original_run
+        self.assertTrue(stamp)
+        self.assertTrue(stamp.isdigit())
+        self.assertEqual(stamp, expected)
+
+    def test_run_fails_and_mtime_unresolvable_returns_terminal_zero(self):
+        """When the version-control resolver is unresolvable AND the two
+        candidate JS files aren't found at _STATIC_DIR (mtime lookup finds
+        nothing), the function must return the terminal fallback "0"."""
+
+        def _raise_oserror(*_a, **_k):
+            raise OSError("resolver binary missing")
+
+        empty_dir = Path(tempfile.mkdtemp())
+        original_run = viz_server.subprocess.run
+        original_static_dir = viz_server._STATIC_DIR
+        viz_server.subprocess.run = _raise_oserror
+        viz_server._STATIC_DIR = empty_dir
+        try:
+            stamp = viz_server._compute_static_version_stamp()
+        finally:
+            viz_server.subprocess.run = original_run
+            viz_server._STATIC_DIR = original_static_dir
+            shutil.rmtree(empty_dir, ignore_errors=True)
+        self.assertEqual(stamp, "0")
+
+
 if __name__ == "__main__":
     unittest.main()

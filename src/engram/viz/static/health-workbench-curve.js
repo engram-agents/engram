@@ -138,6 +138,15 @@ function validateImportance(newValue, storedValue) {
 // interior domain-preserving edit that shifts an endpoint slightly
 // without literally re-touching the edge value, which is friendlier UX
 // than requiring exact endpoint round-tripping on every edit.
+//
+// This looser interior-edit acceptance cannot reach CurveSpec.__post_init__
+// today ONLY because buildExportPayload omits input_domain/output_range
+// from the export entirely (see health-workbench.js) -- there is no
+// explicit input_domain on load for __post_init__'s equality check to
+// disagree with. A future consumer that reintroduces an explicit
+// input_domain on load (e.g. a round-trip import) would reopen the gap
+// between this editor's per-knot bounds check and CurveSpec's stricter
+// endpoint-equality rule.
 function validateKnots(knots, inputDomain, outputRange) {
   if (!knots || knots.length === 0) {
     return { ok: false, reason: "knots must contain at least one (x, y) pair" };
