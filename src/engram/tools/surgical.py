@@ -53,7 +53,10 @@ from engram_confidence import (
     PREDICTIVE_CONFIDENCE_CAP, REASONING_CLASS, REASONING_DISCOUNT,
     ABDUCTIVE_CONFIDENCE_CAP,
 )
-from engram_core import CASCADE_RELATIONS, CITATION_SUPPORT_RELATIONS
+from engram_core import (
+    CASCADE_RELATIONS, CITATION_SUPPORT_RELATIONS, EDGE_CLASSIFICATIONS,
+    _pending_markers_for_node,
+)
 
 DATA_DIR = Path(os.environ.get("ENGRAM_HOME") or os.path.expanduser("~/.engram"))
 DB_PATH = DATA_DIR / "knowledge.db"
@@ -163,6 +166,193 @@ def _fetch_node(conn: sqlite3.Connection, node_id: str) -> dict | None:
     if row is None:
         return None
     return dict(row)
+
+
+# ── Invariant checks (Item B, #405 slice 1) ─────────────────────────────
+#
+# Preview-time (and execute-time re-check) refuse-loud gate. Surgical
+# ops bypass every MCP-layer guardrail (DAG validity, cascade adjudication,
+# supersede semantics) -- this is the mechanical half of hardening that:
+# it does NOT gate on policy (no CLAUDE.md warning, no skill, no human
+# greenlight beyond the existing token handshake, no maturity gating --
+# those are #405's policy half and are explicitly out of scope here).
+#
+# Each finding is {"invariant": name, "severity": "refuse"|"warn", "detail": str}.
+# "refuse" findings block token issuance at preview and block execution
+# even given a stale-but-valid token (re-checked at execute time). A named
+# "refuse" can be downgraded to "warn" via --override-invariant <name> --
+# the default is refuse; the override must be named, never blanket.
+
+def _check_invariants(conn: sqlite3.Connection, operation: str, op_args: dict,
+                       overrides: list[str] | None = None) -> tuple[list[dict], list[str]]:
+    """Run the five preview-time invariant checks for `operation`.
+
+    Returns (findings, applied_overrides) -- applied_overrides names only the
+    invariants that were ACTUALLY downgraded from refuse to warn (i.e. an
+    override name that matched no real finding has no effect and is not
+    reported as applied).
+    """
+    override_set = set(overrides or [])
+    applied_overrides: set[str] = set()
+    findings: list[dict] = []
+
+    def _add(invariant: str, severity: str, detail: str) -> None:
+        if severity == "refuse" and invariant in override_set:
+            applied_overrides.add(invariant)
+            severity = "warn"
+            detail = f"[overridden by --override-invariant {invariant}] {detail}"
+        findings.append({"invariant": invariant, "severity": severity, "detail": detail})
+
+    # Which node(s) does this operation touch?
+    if operation in ("recompute_confidence", "metadata_patch", "field_patch"):
+        touched = [op_args.get("node_id")]
+    elif operation in ("edge_add", "edge_remove"):
+        touched = [op_args.get("source_id"), op_args.get("target_id")]
+    else:
+        touched = []
+
+    # 1. temporal_causal direction on edge_add -- read the classification
+    #    table from engram_core, never hard-code the temporal_causal set.
+    if operation == "edge_add":
+        relation = op_args.get("relation")
+        classification = EDGE_CLASSIFICATIONS.get(relation, {})
+        if classification.get("temporal_causal"):
+            source = _fetch_node(conn, op_args["source_id"])
+            target = _fetch_node(conn, op_args["target_id"])
+            s_created = source.get("created_at") if source else None
+            t_created = target.get("created_at") if target else None
+            if s_created and t_created:
+                if s_created < t_created:
+                    _add(
+                        "temporal_causal_direction", "refuse",
+                        f"source {op_args['source_id']} (created_at={s_created}) is OLDER "
+                        f"than target {op_args['target_id']} (created_at={t_created}) for "
+                        f"temporal_causal relation '{relation}' -- this anchors an older "
+                        f"node as deriving from a newer one (DAG violation).",
+                    )
+                elif s_created == t_created:
+                    _add(
+                        "temporal_causal_direction", "warn",
+                        f"source {op_args['source_id']} and target {op_args['target_id']} "
+                        f"share the same created_at ({s_created}) for temporal_causal "
+                        f"relation '{relation}'.",
+                    )
+
+    # 2. Pending cascade marker on any touched node -- surgery on a node
+    #    with an unadjudicated cascade hides a real problem rather than
+    #    fixing it (the issue's own framing).
+    for nid in touched:
+        if not nid:
+            continue
+        markers = _pending_markers_for_node(conn, nid)
+        if markers:
+            names = ", ".join(f"{m['root_op']}:{m['root_node']}" for m in markers)
+            _add(
+                "pending_cascade_marker", "refuse",
+                f"node {nid} carries {len(markers)} pending cascade marker(s) ({names}) -- "
+                f"adjudicate via the engram-resolve-cascade skill / engram_cascade_resolve "
+                f"before surgery.",
+            )
+
+    # 3. Legacy marker fields (pre-#2411 field form) -- markers are rows
+    #    now, adjudicated, not patched.
+    if operation == "metadata_patch":
+        patch = op_args.get("json_patch") or {}
+        hit = sorted(k for k in ("tainted_by", "stale_by") if k in patch)
+        if hit:
+            _add(
+                "legacy_marker_field", "refuse",
+                f"metadata_patch would set/clear legacy marker field(s) {hit} -- these are "
+                f"pre-#2411 fields; markers are rows now, adjudicated via "
+                f"engram_cascade_resolve, not patched directly.",
+            )
+    if operation == "field_patch":
+        field_name = op_args.get("field_name")
+        if field_name in ("tainted_by", "stale_by"):
+            _add(
+                "legacy_marker_field", "refuse",
+                f"field_patch targets legacy marker field '{field_name}' -- markers are "
+                f"rows now, adjudicated via engram_cascade_resolve, not patched directly.",
+            )
+
+    # 4. Orphan/strand on edge_remove -- advisory only (health penalises
+    #    orphans; it does not make them invalid).
+    if operation == "edge_remove":
+        source_id, target_id, relation = (
+            op_args.get("source_id"), op_args.get("target_id"), op_args.get("relation"),
+        )
+        for nid in (source_id, target_id):
+            if not nid:
+                continue
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS c FROM edges WHERE (source_id = ? OR target_id = ?) "
+                "AND NOT (source_id = ? AND target_id = ? AND relation = ?)",
+                (nid, nid, source_id, target_id, relation),
+            ).fetchone()
+            if remaining["c"] == 0:
+                _add(
+                    "orphan_strand", "warn",
+                    f"removing this edge would leave node {nid} with zero remaining "
+                    f"edges (orphaned).",
+                )
+
+    # 5. Non-current target -- advisory only (retracted/superseded rows are
+    #    audit history, not invalid targets).
+    for nid in touched:
+        if not nid:
+            continue
+        node = _fetch_node(conn, nid)
+        if node is not None and node.get("is_current") == 0:
+            _add(
+                "non_current_target", "warn",
+                f"node {nid} has is_current=0 (retracted/superseded) -- this row is "
+                f"audit history.",
+            )
+
+    return findings, sorted(applied_overrides)
+
+
+def _invariant_refuse_response(operation: str, phase: str, findings: list[dict],
+                               extra: dict) -> dict:
+    """Build the refuse-loud response for preview or execute. No
+    confirmation_token is ever included -- refusal means no token is issued
+    (preview) and a stale-but-valid token from an earlier, clean preview is
+    not honored (execute)."""
+    result = {
+        "operation": operation,
+        "phase": phase,
+        "error": "invariant_refused",
+        "invariant_findings": findings,
+        "instruction": (
+            "Refused: one or more blocking invariant(s) failed. Review "
+            "invariant_findings. To proceed anyway, re-run with "
+            "--override-invariant <name> for each named invariant you have "
+            "verified is a false positive -- never blanket-override."
+        ),
+    }
+    result.update(extra)
+    return result
+
+
+def _run_invariant_gate(conn: sqlite3.Connection, operation: str, phase: str,
+                        op_args: dict, overrides: list[str] | None,
+                        extra: dict) -> tuple[list[dict], list[str], dict | None]:
+    """Run `_check_invariants` and, if any refuse-severity finding survives
+    overrides, build the refuse-loud response. Shared by all five surgical
+    ops so the gate logic (and its position ahead of the token comparison)
+    lives in exactly one place.
+
+    Returns (findings, applied_overrides, refuse_response_or_None). Callers
+    that get a non-None refuse_response must `conn.close()` and return it
+    immediately -- this helper never closes the connection itself, since
+    the caller still needs `conn` for `_fetch_node` / follow-on queries in
+    the non-refuse case.
+    """
+    findings, applied_overrides = _check_invariants(conn, operation, op_args, overrides)
+    refuse_response = None
+    if any(f["severity"] == "refuse" for f in findings):
+        refuse_response = _invariant_refuse_response(operation, phase, findings, extra)
+    return findings, applied_overrides, refuse_response
 
 
 # ── Operations ───────────────────────────────────────────────────────────
@@ -290,7 +480,8 @@ def _get_downstream_nodes(conn: sqlite3.Connection, node_id: str) -> list[str]:
 
 
 def recompute_confidence(phase: str, node_id: str,
-                         reason: str, bug_ref: str, token: str = "") -> dict:
+                         reason: str, bug_ref: str, token: str = "",
+                         overrides: list[str] | None = None) -> dict:
     """Recompute a node's confidence from its formula inputs and cascade downstream.
 
     Does NOT accept an arbitrary number — recalculates from quote_type (observations),
@@ -332,6 +523,15 @@ def recompute_confidence(phase: str, node_id: str,
                 queue.append(ds_id)
 
     op_args = {"node_id": node_id, "reason": reason, "bug_ref": bug_ref}
+
+    findings, applied_overrides, refuse = _run_invariant_gate(
+        conn, "recompute_confidence", phase, op_args, overrides,
+        {"node_id": node_id, "reason": reason, "bug_ref": bug_ref},
+    )
+    if refuse:
+        conn.close()
+        return refuse
+
     expected_token = _generate_confirmation_token("recompute_confidence", op_args)
 
     result = {
@@ -347,6 +547,7 @@ def recompute_confidence(phase: str, node_id: str,
         "reason": reason,
         "bug_ref": bug_ref,
         "confirmation_token": expected_token,
+        "invariant_findings": findings,
     }
 
     if phase == "preview":
@@ -395,6 +596,7 @@ def recompute_confidence(phase: str, node_id: str,
             "recomputed_confidence": new_conf,
             "reason": reason,
             "bug_ref": bug_ref,
+            "invariant_overrides": applied_overrides,
         })
 
     # BFS cascade: recompute all downstream dependents
@@ -455,7 +657,8 @@ def recompute_confidence(phase: str, node_id: str,
 
 
 def metadata_patch(phase: str, node_id: str, json_patch: dict,
-                   reason: str, bug_ref: str, token: str = "") -> dict:
+                   reason: str, bug_ref: str, token: str = "",
+                   overrides: list[str] | None = None) -> dict:
     """Patch specific keys in a node's metadata JSON."""
     conn = _get_db()
     node = _fetch_node(conn, node_id)
@@ -467,6 +670,15 @@ def metadata_patch(phase: str, node_id: str, json_patch: dict,
 
     op_args = {"node_id": node_id, "json_patch": json_patch,
                "reason": reason, "bug_ref": bug_ref}
+
+    findings, applied_overrides, refuse = _run_invariant_gate(
+        conn, "metadata_patch", phase, op_args, overrides,
+        {"node_id": node_id, "reason": reason, "bug_ref": bug_ref},
+    )
+    if refuse:
+        conn.close()
+        return refuse
+
     expected_token = _generate_confirmation_token("metadata_patch", op_args)
 
     result = {
@@ -480,6 +692,7 @@ def metadata_patch(phase: str, node_id: str, json_patch: dict,
         "reason": reason,
         "bug_ref": bug_ref,
         "confirmation_token": expected_token,
+        "invariant_findings": findings,
     }
 
     if phase == "preview":
@@ -510,6 +723,7 @@ def metadata_patch(phase: str, node_id: str, json_patch: dict,
         "patch_applied": json_patch,
         "reason": reason,
         "bug_ref": bug_ref,
+        "invariant_overrides": applied_overrides,
     })
 
     conn.commit()
@@ -522,7 +736,8 @@ def metadata_patch(phase: str, node_id: str, json_patch: dict,
 
 
 def field_patch(phase: str, node_id: str, field_name: str, new_value: str,
-                reason: str, bug_ref: str, token: str = "") -> dict:
+                reason: str, bug_ref: str, token: str = "",
+                overrides: list[str] | None = None) -> dict:
     """Patch a specific field on a node (claim, quoted_text, interpretation, etc.)."""
     # Allowlist of patchable fields — prevent accidental ID or type changes
     ALLOWED_FIELDS = {
@@ -542,6 +757,15 @@ def field_patch(phase: str, node_id: str, field_name: str, new_value: str,
 
     op_args = {"node_id": node_id, "field_name": field_name,
                "new_value": new_value, "reason": reason, "bug_ref": bug_ref}
+
+    findings, applied_overrides, refuse = _run_invariant_gate(
+        conn, "field_patch", phase, op_args, overrides,
+        {"node_id": node_id, "field": field_name, "reason": reason, "bug_ref": bug_ref},
+    )
+    if refuse:
+        conn.close()
+        return refuse
+
     expected_token = _generate_confirmation_token("field_patch", op_args)
 
     result = {
@@ -554,6 +778,7 @@ def field_patch(phase: str, node_id: str, field_name: str, new_value: str,
         "reason": reason,
         "bug_ref": bug_ref,
         "confirmation_token": expected_token,
+        "invariant_findings": findings,
     }
 
     if phase == "preview":
@@ -585,6 +810,7 @@ def field_patch(phase: str, node_id: str, field_name: str, new_value: str,
         "new_value": str(new_value)[:500],
         "reason": reason,
         "bug_ref": bug_ref,
+        "invariant_overrides": applied_overrides,
     })
 
     conn.commit()
@@ -597,7 +823,8 @@ def field_patch(phase: str, node_id: str, field_name: str, new_value: str,
 
 
 def edge_add(phase: str, source_id: str, target_id: str, relation: str,
-             reason: str, bug_ref: str, token: str = "") -> dict:
+             reason: str, bug_ref: str, token: str = "",
+             overrides: list[str] | None = None) -> dict:
     """Add a missing edge between two nodes."""
     ALLOWED_RELATIONS = {
         "cites", "supported_by", "contradicts", "resolves",
@@ -625,6 +852,16 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
 
     op_args = {"source_id": source_id, "target_id": target_id,
                "relation": relation, "reason": reason, "bug_ref": bug_ref}
+
+    findings, applied_overrides, refuse = _run_invariant_gate(
+        conn, "edge_add", phase, op_args, overrides,
+        {"source_id": source_id, "target_id": target_id, "relation": relation,
+         "reason": reason, "bug_ref": bug_ref},
+    )
+    if refuse:
+        conn.close()
+        return refuse
+
     expected_token = _generate_confirmation_token("edge_add", op_args)
 
     result = {
@@ -639,6 +876,7 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
         "reason": reason,
         "bug_ref": bug_ref,
         "confirmation_token": expected_token,
+        "invariant_findings": findings,
     }
 
     if phase == "preview":
@@ -660,8 +898,8 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
     result["git_before"] = git_before
 
     conn.execute(
-        "INSERT INTO edges (source_id, target_id, relation) VALUES (?, ?, ?)",
-        (source_id, target_id, relation),
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
+        (source_id, target_id, relation, _now()),
     )
 
     _log_edit(conn, "surgical_edge_add", source_id, source["type"], {
@@ -669,6 +907,7 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
         "relation": relation,
         "reason": reason,
         "bug_ref": bug_ref,
+        "invariant_overrides": applied_overrides,
     })
 
     conn.commit()
@@ -681,7 +920,8 @@ def edge_add(phase: str, source_id: str, target_id: str, relation: str,
 
 
 def edge_remove(phase: str, source_id: str, target_id: str, relation: str,
-                reason: str, bug_ref: str, token: str = "") -> dict:
+                reason: str, bug_ref: str, token: str = "",
+                overrides: list[str] | None = None) -> dict:
     """Remove an incorrect edge between two nodes."""
     conn = _get_db()
 
@@ -698,6 +938,16 @@ def edge_remove(phase: str, source_id: str, target_id: str, relation: str,
 
     op_args = {"source_id": source_id, "target_id": target_id,
                "relation": relation, "reason": reason, "bug_ref": bug_ref}
+
+    findings, applied_overrides, refuse = _run_invariant_gate(
+        conn, "edge_remove", phase, op_args, overrides,
+        {"source_id": source_id, "target_id": target_id, "relation": relation,
+         "reason": reason, "bug_ref": bug_ref},
+    )
+    if refuse:
+        conn.close()
+        return refuse
+
     expected_token = _generate_confirmation_token("edge_remove", op_args)
 
     result = {
@@ -712,6 +962,7 @@ def edge_remove(phase: str, source_id: str, target_id: str, relation: str,
         "reason": reason,
         "bug_ref": bug_ref,
         "confirmation_token": expected_token,
+        "invariant_findings": findings,
     }
 
     if phase == "preview":
@@ -743,6 +994,7 @@ def edge_remove(phase: str, source_id: str, target_id: str, relation: str,
         "relation": relation,
         "reason": reason,
         "bug_ref": bug_ref,
+        "invariant_overrides": applied_overrides,
     })
 
     conn.commit()
@@ -778,6 +1030,12 @@ def main():
                         help="ENGRAM node ID (qu_ or ob_) documenting the bug")
     parser.add_argument("--token", default="",
                         help="Confirmation token from preview phase")
+    parser.add_argument("--override-invariant", action="append", default=[],
+                        dest="override_invariant", metavar="NAME",
+                        help="Downgrade a named refuse-severity invariant finding to "
+                             "warn (repeatable). The default is refuse; name the "
+                             "invariant you have verified is a false positive -- "
+                             "never blanket-override.")
 
     args = parser.parse_args()
 
@@ -794,6 +1052,7 @@ def main():
         result = recompute_confidence(
             args.phase, args.node_id,
             args.reason, args.bug_ref, args.token,
+            args.override_invariant,
         )
 
     elif args.operation == "metadata_patch":
@@ -808,6 +1067,7 @@ def main():
         result = metadata_patch(
             args.phase, args.node_id, patch,
             args.reason, args.bug_ref, args.token,
+            args.override_invariant,
         )
 
     elif args.operation == "field_patch":
@@ -817,6 +1077,7 @@ def main():
         result = field_patch(
             args.phase, args.node_id, args.field, args.value,
             args.reason, args.bug_ref, args.token,
+            args.override_invariant,
         )
 
     elif args.operation == "edge_add":
@@ -826,6 +1087,7 @@ def main():
         result = edge_add(
             args.phase, args.source_id, args.target_id, args.relation,
             args.reason, args.bug_ref, args.token,
+            args.override_invariant,
         )
 
     elif args.operation == "edge_remove":
@@ -835,6 +1097,7 @@ def main():
         result = edge_remove(
             args.phase, args.source_id, args.target_id, args.relation,
             args.reason, args.bug_ref, args.token,
+            args.override_invariant,
         )
 
     print(json.dumps(result, indent=2))
