@@ -20,6 +20,26 @@
   coder-fairy's report): the Google Fonts <link> (an external network
   fetch a dev tool shouldn't depend on to render at all) -- this page uses
   the same system-font stack the other four viz pages already use.
+
+  Round 2 (engram-alpha#2738, Lei's first-use feedback on PR #2730):
+  1) the top nav bar is REMOVED from this page -- "useless" on a dev tool
+     that stands alone (the FOOTER_PLACEHOLDER splice below is untouched;
+     only the NAV_PLACEHOLDER sentinel that _serve_workbench_page's
+     .replace() call used to fill is dropped from this template -- a
+     template-only change, since a dropped sentinel makes that .replace()
+     a no-op rather than requiring a server.py change);
+  2) value checks at edit-enter time (importance (0,+inf) with 0 reserved
+     for the hold-out/read-only state; knot x/y bounds mirroring
+     health/curves.py's CurveSpec.__post_init__) live in
+     health-workbench-curve.js's validateImportance/validateKnots and are
+     wired up in health-workbench.js;
+  3) a per-curve "reset this curve" button, distinct from "Reset all
+     edits" below;
+  4) a `.changed` highlight on any editable field that differs from the
+     model as served at page load;
+  5) the stored (version-loaded) curve overlaid dashed/muted under the
+     edited curve in the curve plot, shown only when that curve differs
+     from what was served.
 -->
 <title>Curve Workbench</title>
 <style>
@@ -98,10 +118,43 @@
   .decisions .btnrow{display:flex;gap:8px;margin-top:6px}
   .decisions button{background:var(--panel2);color:var(--text);border:1px solid var(--rule);border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer}
   .empty-state{text-align:center;padding:40px;color:var(--muted)}
+  input.changed,.knots label.changed input{outline:2px solid var(--warn);background:rgba(255,183,77,.14)}
+  .imp input.changed{outline:2px solid var(--warn);background:rgba(255,183,77,.14)}
+  .imp input:disabled{opacity:.55;cursor:not-allowed}
+  .hold-lock{color:var(--held);font-size:11px;margin-left:6px}
+  .warn-msg{color:var(--bad);font-size:11px;margin-top:6px}
+  .resetcurve{margin-top:8px}
+  /* R5.1: the "how stale is this checkpoint" suffix on the latest-checkpoint
+     label (#wb-status and each signal row's focus "who" line). */
+  .chkpt-age{color:var(--muted)}
+  /* R5.3: the per-metric "set as reference" control + the aspect-header
+     "reset aspect" button, and the .changed highlight on the aspect
+     header's own reference-line text (mirrors input.changed above, since
+     this target is a <span>, not an <input>). */
+  .refctl{margin-top:6px;font-size:11px;color:var(--held)}
+  .aspect-head .sub-wrap{display:flex;align-items:center;gap:8px;min-width:0}
+  span.sub.changed{color:var(--warn)}
+  /* R1 axis ticks / R2 focus marker (engram-alpha#2738 round 3) */
+  .axis-label{fill:var(--muted);font-size:9px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .focus-guide{stroke:var(--accent2);stroke-width:1;stroke-dasharray:2 2}
+  .focus-dot{fill:var(--accent);stroke:#1a1a2e;stroke-width:1}
+  .unavailable-marker{opacity:.85}
+  /* R5.4: the collapsed-UNAVAILABLE-run band on a history plot's baseline
+     (replaces the old per-point .unavailable-marker circle). */
+  .unavailable-band{opacity:.85}
+  svg[aria-label]{cursor:crosshair}
+  /* Round 4 (engram-alpha#2738 round 4, R2b/c/d): every plot lives in a
+     `.plot-container` so its `.focus-readout` (now an HTML overlay, not
+     SVG text -- see health-workbench.js's updateFocusReadout) can be
+     absolutely positioned over it without being clipped by the SVG's own
+     viewBox. `fitViewBox()` resizes the svg's viewBox to its own
+     content, so `svg{...height:auto}` above grows the plot to fit any
+     tilted label rather than clipping it. */
+  .plot-container{position:relative}
+  .focus-readout{position:absolute;pointer-events:none;background:rgba(15,52,96,.92);border:1px solid var(--rule);border-radius:4px;padding:3px 6px;color:var(--text);font-size:10px;line-height:1.35;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:normal;z-index:2}
   @media (max-width:1000px){.signal{grid-template-columns:1fr}.strip{grid-template-columns:1fr}}
 </style>
 <body>
-<!--NAV_PLACEHOLDER-->
 <main>
   <section>
     <h1>Curve Workbench: what the score sees, and why</h1>

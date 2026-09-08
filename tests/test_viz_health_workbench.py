@@ -17,11 +17,13 @@ available on this seat).
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from http.server import HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -165,9 +167,11 @@ class TestWorkbenchTierGate(_LiveServerBase):
     def setUp(self):
         super().setUp()
         self._saved_available = viz_server._workbench_available
+        self._saved_access_log_path = viz_server._ACCESS_LOG_PATH
 
     def tearDown(self):
         viz_server._workbench_available = self._saved_available
+        viz_server._ACCESS_LOG_PATH = self._saved_access_log_path
         super().tearDown()
 
     def test_real_gate_renders_200_for_real_seat_fixture(self):
@@ -228,6 +232,71 @@ class TestWorkbenchTierGate(_LiveServerBase):
         status, _headers, body = self._get("/health?agent=test_agent")
         self.assertEqual(status, 200)
         self.assertNotIn(b"/health/workbench", body)
+
+    # -- R5.2: cache-busting -------------------------------------------
+
+    def test_workbench_page_script_tags_carry_nonempty_version_stamp(self):
+        viz_server._workbench_available = lambda: True
+        status, _headers, body = self._get("/health/workbench?agent=test_agent")
+        self.assertEqual(status, 200)
+        m_curve = re.search(rb'src="/static/health-workbench-curve\.js\?v=([^"]+)"', body)
+        m_main = re.search(rb'src="/static/health-workbench\.js\?v=([^"]+)"', body)
+        self.assertIsNotNone(m_curve, body)
+        self.assertIsNotNone(m_main, body)
+        self.assertTrue(len(m_curve.group(1)) > 0)
+        self.assertTrue(len(m_main.group(1)) > 0)
+        # Both script tags carry the SAME stamp -- computed once at import
+        # time (see server.py's _compute_static_version_stamp), not
+        # per-tag or per-request.
+        self.assertEqual(m_curve.group(1), m_main.group(1))
+
+    def test_static_request_still_returns_cache_control_header(self):
+        # R5.2 keeps max-age=3600 for static files -- the version-stamp
+        # query string is what busts the cache, not a shortened TTL.
+        status, headers, body = self._get(
+            f"/static/health-workbench.js?v={viz_server._STATIC_VERSION_STAMP}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Cache-Control"), viz_server._STATIC_CACHE_CONTROL)
+        self.assertTrue(len(body) > 0)
+
+    # -- R5.5: opt-in access log -----------------------------------------
+
+    def test_access_log_off_by_default_no_file_written(self):
+        # Unset (the class default via setUp/tearDown save-restore) --
+        # requesting a route must not create a log file anywhere; there's
+        # no path configured to write to, so there's nothing to check
+        # beyond "the request still succeeds".
+        self.assertIsNone(viz_server._ACCESS_LOG_PATH)
+        status, _body = self._get_json("/api/agents")
+        self.assertEqual(status, 200)
+
+    def test_access_log_appends_well_formed_line(self):
+        tmpdir = tempfile.mkdtemp(prefix="engram_workbench_access_log_test_")
+        log_path = str(Path(tmpdir) / "access.log")
+        viz_server._ACCESS_LOG_PATH = log_path
+        try:
+            status, _body = self._get_json("/api/agents")
+            self.assertEqual(status, 200)
+            with open(log_path, encoding="utf-8") as f:
+                lines = f.readlines()
+            self.assertEqual(len(lines), 1)
+            line = lines[0].rstrip("\n")
+            # ISO-UTC method path status duration_ms remote
+            m = re.match(
+                r"^(\S+) (\S+) (\S+) (\d+) ([\d.]+) (\S+)$", line
+            )
+            self.assertIsNotNone(m, line)
+            ts, method, path, status_field, duration_ms, remote = m.groups()
+            # ISO-UTC timestamp parses.
+            datetime.fromisoformat(ts)
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/api/agents")
+            self.assertEqual(status_field, "200")
+            self.assertGreaterEqual(float(duration_ms), 0.0)
+            self.assertEqual(remote, "127.0.0.1")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_model_endpoint_jsonable_raise_is_fail_honest_not_500(self):
         """A future shape change making model_defs_jsonable/curve_defs_jsonable

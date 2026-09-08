@@ -70,7 +70,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -112,6 +114,64 @@ _STATIC_CONTENT_TYPES = {
 # INVOCATION NOTE above on why a changed source file needs an operator
 # restart to take effect).
 _STATIC_CACHE_CONTROL = "public, max-age=3600"
+
+
+def _compute_static_version_stamp() -> str:
+    """R5.2 cache-busting stamp for the Curve Workbench's two script tags
+    (health-workbench-curve.js / health-workbench.js) -- computed ONCE here
+    at import time, never per-request, per the requirement's own text.
+
+    A 1-hour Cache-Control (above) means a same-hour redeploy is otherwise
+    invisible to a browser holding the old file -- this bit Lei directly.
+    Appending `?v=<stamp>` to the script `src` makes the URL itself change
+    on a real code change, which busts the cache without shortening it for
+    everyone else (see _serve_static below: the query string is otherwise
+    unused by the server, browsers key their cache on the full URL
+    including it).
+
+    Prefers the git short SHA of the tree this file runs from (`git -C
+    <this dir> rev-parse --short HEAD` -- git itself walks up from that
+    directory to find the enclosing repo, so this resolves correctly
+    whether or not `viz/` itself is a repo root). Falls back to the max
+    mtime of the two workbench script files (as an integer string) when
+    git isn't resolvable at all (e.g. an installed plugin tree with no
+    `.git` anywhere above it) -- "if resolvable" per the requirement.
+    """
+    src_root = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(src_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if sha:
+                return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        candidates = [
+            _STATIC_DIR / "health-workbench-curve.js",
+            _STATIC_DIR / "health-workbench.js",
+        ]
+        mtimes = [p.stat().st_mtime for p in candidates if p.is_file()]
+        if mtimes:
+            return str(int(max(mtimes)))
+    except OSError:
+        pass
+    return "0"
+
+
+_STATIC_VERSION_STAMP = _compute_static_version_stamp()
+
+# R5.5 opt-in access log: a module-level path, unset (None) by default --
+# behavior is UNCHANGED (Handler.log_message stays a no-op) unless the
+# server is started with --access-log <path> (see main()). A plain module
+# attribute (not a class-level constant) so tests can set
+# `viz_server._ACCESS_LOG_PATH` directly the same way other startup state
+# in this module (viz_agents.AGENTS etc.) is monkeypatched, without going
+# through argparse/main().
+_ACCESS_LOG_PATH: "str | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +229,32 @@ def _workbench_available() -> bool:
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass  # suppress default access log
+        # R5.5: opt-in access log, off by default (unchanged behavior --
+        # still suppresses BaseHTTPRequestHandler's own stderr access log
+        # unless --access-log <path> was passed at startup, see main()).
+        # BaseHTTPRequestHandler.log_request() (called from send_response
+        # for every response on this Handler) invokes this with
+        # args = (self.requestline, str(code), size) -- args[1] is the
+        # status code as a string; method/path are read from self.command/
+        # self.path directly rather than re-parsed out of `fmt`/args[0],
+        # since both are already live attributes on this same instance at
+        # call time.
+        if not _ACCESS_LOG_PATH:
+            return
+        start = getattr(self, "_access_log_start", None)
+        duration_ms = (time.monotonic() - start) * 1000.0 if start is not None else 0.0
+        status = args[1] if len(args) > 1 else "-"
+        remote = self.client_address[0] if self.client_address else "-"
+        ts = datetime.now(timezone.utc).isoformat()
+        line = f"{ts} {self.command} {self.path} {status} {duration_ms:.2f} {remote}\n"
+        try:
+            with open(_ACCESS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass  # best-effort logging only -- never fail the request over it
 
     def do_GET(self):
+        self._access_log_start = time.monotonic()
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -512,10 +595,25 @@ class Handler(BaseHTTPRequestHandler):
         footer_html = footer.render_footer(data_dir)
         with open(_WORKBENCH_TEMPLATE_PATH, encoding="utf-8") as f:
             template = f.read()
+        # R5.2 cache-busting: rewrite the two workbench script tags to
+        # carry `?v=<stamp>` (computed once at import time -- see
+        # _compute_static_version_stamp) so a same-hour redeploy is
+        # visible to a browser holding the static handler's 1h
+        # Cache-Control. health-detail-math.js (the third script tag on
+        # this page) is deliberately NOT rewritten -- out of this
+        # requirement's stated scope (the two workbench-specific files).
         page = (
             template
             .replace(shell._NAV_PLACEHOLDER, nav_html)
             .replace(shell._FOOTER_PLACEHOLDER, footer_html)
+            .replace(
+                'src="/static/health-workbench-curve.js"',
+                f'src="/static/health-workbench-curve.js?v={_STATIC_VERSION_STAMP}"',
+            )
+            .replace(
+                'src="/static/health-workbench.js"',
+                f'src="/static/health-workbench.js?v={_STATIC_VERSION_STAMP}"',
+            )
         )
         self._html(page)
 
@@ -581,7 +679,16 @@ def main():
                         help="Address to bind to (default: 127.0.0.1)")
     parser.add_argument("--no-autodetect", action="store_true",
                         help="Disable auto-discovery; use only --config or --db.")
+    parser.add_argument("--access-log", default=None,
+                        help="Optional path to an access-log file. When set, appends "
+                             "one line per request (ISO-UTC method path status "
+                             "duration_ms remote). Default: off (no access logging, "
+                             "unchanged behavior).")
     args = parser.parse_args()
+
+    if args.access_log:
+        global _ACCESS_LOG_PATH
+        _ACCESS_LOG_PATH = os.path.expanduser(args.access_log)
 
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
