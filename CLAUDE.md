@@ -398,10 +398,15 @@ an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
 This names *which* seat; it does not add one.
 
 > **Duplicated by hand in engram-alpha and umwelt `CLAUDE.md`** — change one,
-> change both in the same pass. **Soma is deliberately excluded for now:** its
-> cohort is Ariadne (principal), Borges, Luria and Clio, and does not include
-> Sol, so the escape rotation above does not resolve there. Pending a routing
-> decision from Lei and soma's principal.
+> change both in the same pass. **Soma does not carry this block, and the reason
+> first shipped here was FALSE — do not restore it.** It said soma's cohort
+> excludes Sol so the rotation cannot resolve there; that was read off a stale
+> cohort line in soma's own `CLAUDE.md` and reported as a fact about reality.
+> Measured 2026-09-09 against soma's PR history and collaborator list instead:
+> Sol has authored soma PRs (#52, #54), and **all three escape seats hold push
+> access there**, as do both terminal-fallback seats. The rotation resolves in
+> soma fine. Whether soma adopts the block is a routing choice for Lei and
+> soma's principal — never a structural blocker.
 
 ### Conclusion warrant — the gate lives in the fairy's output contract, not here
 
