@@ -554,6 +554,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/fairy_report.py",
+      "tier": "dev"
+    },
+    {
       "path": "tools/release-cutover.py",
       "tier": "dev"
     },
@@ -1200,6 +1204,10 @@
     {
       "path": "tests/test_supervision_probe.py",
       "reason": "engram-alpha#2749 — the fleet-wide per-seat supervision probe's pytest suite (cgroup grep exit-code discipline incl. Ariadne's empty-file open question, zero/many pid resolution, /proc/<pid>/stat field-22 parsing, systemd LoadState/ActiveState/timing, launchd registration verdicts). Dev-tier (T3): a CI-only test suite for tools/supervision_probe.py (itself dev-tier, see the mechanisms[] entry above), never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_health_series.py precedent above."
+    },
+    {
+      "path": "tests/test_fairy_report.py",
+      "reason": "engram-alpha#2760 — the fairy-report-durability tool's pytest suite (task-notification envelope extraction across queue-operation/attachment record shapes, latest-wins on duplicate/re-fired notifications, malformed-line resilience, CLI --task/--grep contracts). Dev-tier (T3): a CI-only test suite for tools/fairy_report.py (itself dev-tier, see the mechanisms[] entry above), never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_supervision_probe.py precedent above."
     },
     {
       "path": ".github/",
