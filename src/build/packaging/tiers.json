@@ -394,6 +394,12 @@
       "note": "cascade-marker migration verification for the rc1->rc2 upgrade cycle (#2411). Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/rc-upgrade-verify.py) would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above)."
     },
     {
+      "path": "tools/coverage-diff.sh",
+      "tier": "dev",
+      "source": "tools/coverage-diff.sh",
+      "note": "Local diff-coverage helper (#2774) -- reports coverage of only the lines the current branch changes vs origin/dev, via diff-cover fed a coverage.xml from an affected-tests run. Dev tooling (T3): a developer convenience for local PR iteration, not part of any install path a shipped agent relies on. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/coverage-diff.sh) would wrongly flag this as dangling (same pattern as tools/rc-upgrade-verify.py's entry above)."
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
@@ -1248,6 +1254,10 @@
     {
       "path": "pytest.ini",
       "reason": "pytest configuration — dev test config, never shipped"
+    },
+    {
+      "path": ".coveragerc",
+      "reason": "coverage.py configuration for the #2774 coverage instrumentation (nightly.yml's --cov flags + tools/coverage-diff.sh) — dev/CI test config, never shipped"
     },
     {
       "path": "requirements/",
