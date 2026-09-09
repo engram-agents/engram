@@ -1,25 +1,34 @@
-"""Tests for the health-v2 DETAIL VIEW's history strip + distribution slice
-(engram-alpha#2518, detail-view slice over /api/health/v2/series).
+"""Tests for the health-v2 DETAIL VIEW's Curve-Workbench-fork slice
+(engram-alpha#2754 PR A -- read-only fork of health-workbench.js).
 
-Scope: this is the frontend slice that CONSUMES `/api/health/v2` and
-`/api/health/v2/series` -- both endpoints and their backend loaders
-(`viz/data/health_v2.py`, `health/series.py`) are already built and covered
-by `tests/test_viz_health_v2.py`; nothing here re-tests them.
+Scope: this is the frontend slice that CONSUMES `/api/health/v2`,
+`/api/health/v2/series`, and (optionally, as an enrichment layer)
+`/api/health/v2/model` -- all three endpoints and their backend loaders
+(`viz/data/health_v2.py`, `viz/data/health_workbench.py`, `health/series.py`)
+are already built and covered by `tests/test_viz_health_v2.py` /
+`tests/test_viz_health_workbench.py`; nothing here re-tests them.
+
+Before #2754, the Detail view's render logic lived entirely INSIDE
+health.html's inline `<script>` (plain string-built HTML, no DOM API), which
+let this file extract and run `renderHistoryStrip` etc. directly under
+`node`. #2754 PR A forked the Curve Workbench (health-workbench.js) instead,
+which builds its DOM via the real `document.createElementNS`/`.appendChild`
+API -- exactly like health-workbench.js's own render logic, which
+`tests/test_viz_health_workbench.py`'s own module docstring explicitly
+excludes from node-executed testing for that reason ("the page's client-side
+JS render logic" is "out of scope for THIS file", covered only by the pure-
+math parity tests + static string assertions). health-detail.js follows the
+same convention: its DOM-touching functions are covered by static
+string/structure assertions on the served page + the served static file,
+never by extracting-and-running them under plain `node` (no jsdom on this
+seat) -- the pure math it calls (piecewiseLinear, collapseUnavailableRuns,
+computeDistributionStats, ...) is already covered, unchanged, by
+tests/test_health_workbench_curve_parity.py, tests/test_health_workbench_
+round5_parity.py, and the TestDistributionMathViaNode class below.
 
 Same `_LiveServerBase` convention as `tests/test_viz_health_view_toggle.py`
 and `tests/test_viz_health_v2.py` (real `HTTPServer` thread + `urlopen`, no
-headless browser available on this seat) -- so the JS render logic itself is
-covered two ways:
-
-  1. STATIC assertions on the served `/health` page's inline `<script>` text
-     (function names, endpoint strings) -- the only thing a plain HTTP fetch
-     can observe about client-side JS without executing it.
-  2. A genuine PURE-MATH unit test for `computeDistributionStats` /
-     `computeHistogramBins` / `percentile`, run directly under `node` via
-     `subprocess` against the standalone `viz/static/health-detail-math.js`
-     file those functions live in (Node.js IS available on this seat --
-     `node --version` succeeds -- so this is real executed-JS coverage, not
-     a proxy).
+headless browser available on this seat).
 """
 from __future__ import annotations
 
@@ -46,6 +55,14 @@ _MATH_JS_PATH = (
     / "viz"
     / "static"
     / "health-detail-math.js"
+)
+_DETAIL_JS_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "engram"
+    / "viz"
+    / "static"
+    / "health-detail.js"
 )
 
 _NODE_AVAILABLE = shutil.which("node") is not None
@@ -78,187 +95,164 @@ class _LiveServerBase(unittest.TestCase):
         return self._get(path).body.decode()
 
 
-def _extract_inline_script(html_text: str) -> str:
-    m = re.search(r"<script>(.*?)</script>", html_text, re.DOTALL)
-    assert m is not None, "no inline <script> block found"
-    return m.group(1)
+class TestDetailScriptIncludesPresentAndOrdered(_LiveServerBase):
+    """health.html must load health-detail-math.js, then health-workbench-
+    curve.js (the shared pure-math library, per #2754's "share only the
+    pure math library, fork the page" ruling), then health-detail.js -- in
+    that order, and all three BEFORE the page's own inline <script> (which
+    synchronously calls the view-toggle's `applyView()`, whose Detail
+    branch calls `loadDetailView()` -- defined in health-detail.js -- at
+    page-load time when the initial view already resolves to 'detail')."""
 
-
-class TestDetailViewFunctionNamesPresent(_LiveServerBase):
-    """Static assertions: the new function names actually written into the
-    inline script, and that the detail-view section fetches both endpoints."""
-
-    def test_new_function_names_present_in_inline_script(self):
+    def test_three_script_tags_present_in_order(self):
         body = self._get_text("/health")
-        script = _extract_inline_script(body)
+        idx_math = body.index('<script src="/static/health-detail-math.js"></script>')
+        idx_curve = body.index('<script src="/static/health-workbench-curve.js"></script>')
+        idx_detail = body.index('<script src="/static/health-detail.js"></script>')
+        idx_inline = body.index("<script>")
+        self.assertLess(idx_math, idx_curve)
+        self.assertLess(idx_curve, idx_detail)
+        self.assertLess(idx_detail, idx_inline)
+
+    def test_detail_js_served_with_js_content_type(self):
+        resp = self._get("/static/health-detail.js")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.headers.get("Content-Type"), "application/javascript")
+
+    def test_curve_js_served_with_js_content_type(self):
+        """Sibling regression guard for the tiers.json retag this PR makes
+        (dev -> convenience for health-workbench-curve.js): the static
+        route itself doesn't consult tiers.json (that's a BUILD-time
+        filter, not a request-time gate), so this only confirms the file is
+        still served correctly from source -- the tier retag's actual
+        purpose (surviving a --tier convenience build) is a packaging-time
+        property, not something a live-server test can exercise."""
+        resp = self._get("/static/health-workbench-curve.js")
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.headers.get("Content-Type"), "application/javascript")
+
+
+class TestDetailJsFileContract(unittest.TestCase):
+    """Static assertions on health-detail.js's own source -- the entry
+    point contract, and that every editing affordance named in the issue's
+    strip-list is actually gone."""
+
+    def setUp(self):
+        self.src = _DETAIL_JS_PATH.read_text(encoding="utf-8")
+
+    def test_file_exists(self):
+        self.assertTrue(_DETAIL_JS_PATH.is_file(), f"missing {_DETAIL_JS_PATH}")
+
+    def test_exposes_global_entry_point(self):
+        self.assertIn("window.loadDetailView", self.src)
+
+    def test_wrapped_in_iife_no_leaked_globals(self):
+        """health.html's inline <script> declares its OWN `render`/`el`-
+        shaped globals for the Normal view -- an unscoped health-workbench.
+        js-style helper set would silently collide. Confirm the fork stays
+        wrapped -- stripping the leading `//`-comment block first (the
+        module docstring), since the IIFE itself is the first STATEMENT,
+        not necessarily the first line of the file."""
+        body_without_leading_comments = re.sub(r"^(\s*//.*\n)+", "", self.src)
+        self.assertRegex(body_without_leading_comments.strip(), r"^\(function \(\) \{")
+        self.assertRegex(self.src.strip(), r"\}\)\(\);\s*$")
+
+    def test_no_knot_drag_or_insert_ui(self):
+        for gone in ("insertMidKnot", "delBtn", "plusBtn", "kbtn add"):
+            self.assertNotIn(gone, self.src, f"editing affordance {gone!r} should be stripped")
+
+    def test_no_importance_input_element(self):
+        # The workbench's editable importance <input> -- replaced here by a
+        # plain read-only <div class="metric"> readout (see
+        # renderSignalCard).
+        self.assertNotIn('"data-imp"', self.src)
+        self.assertNotIn("validateImportance", self.src)
+
+    def test_no_export_apply_reset(self):
+        for gone in ("buildExportPayload", "refreshExportBox", "wb-export", "saveEdits", "loadEdits"):
+            self.assertNotIn(gone, self.src, f"export/persistence affordance {gone!r} should be stripped")
+
+    def test_no_set_as_reference_control_but_markers_survive(self):
+        # No functional "set as reference" control (the button/click-handler
+        # this fork removes) -- a comment MAY still mention the phrase
+        # (documenting what health-workbench.js's own control looked like),
+        # so this checks for the functional markers, not the bare string.
+        self.assertNotIn("setReference(", self.src)
+        self.assertNotIn("refBtn", self.src)
+        self.assertIn("hold-out metric", self.src)
+        self.assertIn("current reference", self.src)
+
+    def test_no_changed_highlight_overlay(self):
+        # curvesDiffer / the stored-vs-edited dashed overlay -- moot here
+        # since nothing is ever edited.
+        self.assertNotIn("curvesDiffer", self.src)
+        self.assertNotIn('"changed"', self.src)
+
+    def test_reuses_shared_math_functions_by_name(self):
+        # These are NOT redeclared in health-detail.js -- they're globals
+        # from health-workbench-curve.js, loaded first (see the script-
+        # order test above). Referencing them by name here confirms the
+        # fork didn't accidentally duplicate the math instead of sharing
+        # it, per the issue's "share only the pure math library" ruling.
         for name in (
-            "loadDetailView",
-            "renderDetailView",
-            "renderHistoryStrip",
-            "renderDistributionPanel",
-            "computeDistributionStats",
-            "computeHistogramBins",
+            "piecewiseLinear", "aspectScore", "composeScore",
+            "collapseUnavailableRuns", "dominantReasonKey",
+            "formatCheckpointLabel", "computeAxisTicks", "clamp",
         ):
-            self.assertIn(name, script, f"{name} not found in inline script")
+            self.assertIn(name, self.src)
 
-    def test_fetches_both_health_v2_endpoints(self):
-        body = self._get_text("/health")
-        script = _extract_inline_script(body)
-        self.assertIn("_withAgent('/api/health/v2')", script)
-        self.assertIn("_withAgent('/api/health/v2/series')", script)
+    def test_gracefully_degrades_when_model_unavailable(self):
+        self.assertIn("modelAvailable", self.src)
+        self.assertIn("renderFlat", self.src)
 
-    def test_series_fetch_has_non_fatal_catch(self):
-        """Per the spec: the series fetch (unlike the /api/health/v2 fetch)
-        matches loadHealth()'s existing `.catch(() => null)` pattern for a
-        non-fatal fetch."""
-        body = self._get_text("/health")
-        script = _extract_inline_script(body)
-        series_idx = script.find("_withAgent('/api/health/v2/series')")
-        self.assertGreater(series_idx, -1)
-        # The catch clause should appear on the same statement, shortly after.
-        tail = script[series_idx:series_idx + 200]
-        self.assertIn(".catch(() => null)", tail)
 
-    def test_fetch_only_once_per_page_load_guard_present(self):
-        """loadDetailView() must guard on a single-fetch flag (e.g.
-        `_detailLoaded`) so Normal<->Detail toggling doesn't refetch."""
+class TestDetailViewMarkup(_LiveServerBase):
+    def test_detail_content_containers_present(self):
         body = self._get_text("/health")
-        script = _extract_inline_script(body)
-        fn_match = re.search(
-            r"function loadDetailView\(\)\s*\{(.*?)\n  \}", script, re.DOTALL
-        )
-        self.assertIsNotNone(fn_match, "couldn't find loadDetailView()")
-        fn_body = fn_match.group(1)
-        self.assertIn("if (_detailLoaded) return;", fn_body)
-        self.assertIn("_detailLoaded = true;", fn_body)
+        for elem_id in (
+            "detail-empty-state",
+            "detail-content",
+            "detail-scores-note",
+            "detail-composed-block",
+            "detail-aspect-sections",
+        ):
+            self.assertIn(f'id="{elem_id}"', body)
+
+    def test_old_flat_containers_removed(self):
+        """The pre-fork flat-list containers (#2518) are gone -- replaced
+        by #detail-aspect-sections, which renders either aspect-grouped
+        (model available) or flat (model unavailable) content at runtime,
+        per health-detail.js's own render()/renderFlat()/
+        renderAspectGrouped()."""
+        body = self._get_text("/health")
+        self.assertNotIn('id="detail-signal-rows"', body)
+        self.assertNotIn('id="detail-aspect-tiles"', body)
+
+    def test_detail_content_hidden_by_default(self):
+        body = self._get_text("/health")
+        m = re.search(r'<div id="detail-content"([^>]*)>', body)
+        self.assertIsNotNone(m)
+        self.assertIn("display:none", m.group(1).replace(" ", ""))
+
+    def test_empty_state_message_still_present(self):
+        """The pre-existing slice-1 placeholder text must survive as the
+        served (pre-JS) markup -- test_viz_health_view_toggle.py already
+        asserts this too; re-asserted here since this slice touches the
+        same div."""
+        body = self._get_text("/health")
+        self.assertIn("No detail-view snapshot data yet", body)
 
     def test_apply_view_hooks_load_detail_view(self):
-        """applyView()'s detail branch must call loadDetailView() -- the
-        hook that covers both the initial-page-load-in-detail case and a
-        later Normal->Detail toggle click."""
+        """applyView()'s detail branch must still call loadDetailView() --
+        now the global entry point health-detail.js exposes -- the hook
+        that covers both the initial-page-load-in-detail case and a later
+        Normal->Detail toggle click. Unchanged by this PR (out of scope:
+        the spec explicitly keeps this hook's trigger condition untouched,
+        only what it calls)."""
         body = self._get_text("/health")
-        script = _extract_inline_script(body)
-        fn_match = re.search(
-            r"function applyView\(view, persist\)\s*\{(.*?)\n  \}", script, re.DOTALL
-        )
-        self.assertIsNotNone(fn_match, "couldn't find applyView()")
-        fn_body = fn_match.group(1)
-        self.assertIn("loadDetailView()", fn_body)
-
-
-def _extract_function(script: str, name: str) -> str:
-    """Extract a top-level `function <name>(...) { ... }` block via brace
-    counting -- more robust than a `\n  }`-anchored regex, needed here
-    because `renderHistoryStrip` itself contains inner `.map(m => {...})`
-    callback bodies that a naive "first line starting with two spaces and a
-    closing brace" regex would stop at prematurely."""
-    m = re.search(r"function\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", script)
-    assert m is not None, f"{name} not found in inline script"
-    start = m.end() - 1  # position of the opening brace itself
-    depth = 0
-    for i in range(start, len(script)):
-        if script[i] == "{":
-            depth += 1
-        elif script[i] == "}":
-            depth -= 1
-            if depth == 0:
-                return script[m.start():i + 1]
-    raise AssertionError(f"unbalanced braces extracting {name}")
-
-
-@unittest.skipUnless(_NODE_AVAILABLE, "node not available on this seat")
-class TestTodayMarkerUnreplayableFold(_LiveServerBase):
-    """#2625 (fold on #2622/a36dbc72): the history strip's "(today)" marker
-    must be computed from the chronologically-latest point (max `t`) across
-    ALL points, not from `plotted[plotted.length - 1]` -- `plotted` has
-    unreplayable points filtered OUT, so the old computation silently
-    promoted an older point to "today" whenever the true latest point was
-    itself unreplayable.
-
-    `renderHistoryStrip` isn't in the standalone `health-detail-math.js`
-    file that `TestDistributionMathViaNode` above runs directly under
-    `node` -- it lives in `health.html`'s inline `<script>`, alongside DOM
-    calls it doesn't itself make (it only ever touches its `containerEl`
-    parameter). So it's extracted (with its two callees, `esc` and
-    `_unreplayableLabel`) straight out of the served inline script by brace
-    counting and executed for real under `node`, same genuine
-    executed-JS-coverage principle as the math tests above -- not a DOM
-    harness, since none of these three functions need one.
-    """
-
-    def _render(self, points_js: str) -> str:
-        body = self._get_text("/health")
-        script = _extract_inline_script(body)
-        src = "\n".join(
-            _extract_function(script, name)
-            for name in ("esc", "_unreplayableLabel", "renderHistoryStrip")
-        )
-        harness = f"""
-        {src}
-        var container = {{
-          _html: '',
-          set innerHTML(v) {{ this._html = v; }},
-          get innerHTML() {{ return this._html; }}
-        }};
-        var points = {points_js};
-        renderHistoryStrip(container, points);
-        console.log(JSON.stringify({{html: container._html}}));
-        """
-        result = subprocess.run(
-            ["node", "-e", harness],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        self.assertEqual(
-            result.returncode, 0,
-            f"node script failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
-        )
-        return json.loads(result.stdout)["html"]
-
-    def test_today_marker_lands_on_unreplayable_true_latest_point(self):
-        """Series: t=1,2 plottable; t=3 (the true latest, max `t`) is
-        unreplayable. The stale bug renders "(today)" on the t=2 circle
-        (`plotted[plotted.length - 1]`); the fix must NOT label any plotted
-        circle "(today)", and must instead render the unreplayable marker
-        for t=3 with a "(today — unreplayable: ...)" tooltip at that
-        point's own x-position."""
-        points_js = (
-            "[{t:1,value:10,unreplayable:null},"
-            "{t:2,value:20,unreplayable:null},"
-            "{t:3,value:null,unreplayable:{num:{reason:'stripped_from_dump',class:'declared'}}}]"
-        )
-        html = self._render(points_js)
-        # No plotted (older) point promoted to "today".
-        self.assertNotIn("(today)", html)
-        # The true-latest (index 2 of 3, 0-based) unreplayable point carries
-        # the today-labeled tooltip and the underlying reason text.
-        self.assertIn("today — unreplayable: stripped_from_dump", html)
-        # Positioned at that point's own x (todayIdx=2, n=3, w=300, pad=10:
-        # xScale(2) = 10 + (2/2)*(300-20) = 290) -- confirms the marker
-        # isn't merely present anywhere, but at the true-latest point's
-        # x-coordinate specifically.
-        self.assertIn('cx="290"', html)
-        self.assertIn('class="detail-unreplayable-today-marker"', html)
-
-    def test_today_marker_lands_on_true_latest_when_plottable(self):
-        """No-regression control: when the true latest point IS plottable
-        (the common case), "(today)" renders exactly as before -- on that
-        point's own circle, not on some other index."""
-        points_js = (
-            "[{t:1,value:10,unreplayable:null},"
-            "{t:2,value:20,unreplayable:null},"
-            "{t:3,value:30,unreplayable:null}]"
-        )
-        html = self._render(points_js)
-        self.assertIn("(today)", html)
-        self.assertNotIn("unreplayable: ", html)
-        # Exactly one circle carries "(today)", and it's the t=3 value.
-        self.assertEqual(html.count("(today)"), 1)
-        today_pos = html.index("(today)")
-        # The title text immediately preceding "(today)" must be the t=3
-        # value (30), not an older point's value.
-        self.assertIn("30 (today)", html[max(0, today_pos - 10):today_pos + len("(today)")])
+        m = re.search(r"function applyView\(view, persist\)\s*\{(.*?)\n  \}", body, re.DOTALL)
+        self.assertIsNotNone(m, "couldn't find applyView()")
+        self.assertIn("loadDetailView()", m.group(1))
 
 
 class TestMathFileServedAndReferenced(_LiveServerBase):
@@ -275,40 +269,14 @@ class TestMathFileServedAndReferenced(_LiveServerBase):
         self.assertIn("function computeHistogramBins", body)
 
 
-class TestDetailViewMarkup(_LiveServerBase):
-    def test_detail_content_containers_present(self):
-        body = self._get_text("/health")
-        for elem_id in (
-            "detail-empty-state",
-            "detail-content",
-            "detail-scores-note",
-            "detail-composed-block",
-            "detail-signal-rows",
-            "detail-aspect-tiles",
-        ):
-            self.assertIn(f'id="{elem_id}"', body)
-
-    def test_detail_content_hidden_by_default(self):
-        body = self._get_text("/health")
-        m = re.search(r'<div id="detail-content"([^>]*)>', body)
-        self.assertIsNotNone(m)
-        self.assertIn("display:none", m.group(1).replace(" ", ""))
-
-    def test_empty_state_message_still_present(self):
-        """The pre-existing slice-1 placeholder text must survive as the
-        served (pre-JS) markup -- test_viz_health_view_toggle.py already
-        asserts this too; re-asserted here since this slice touches the
-        same div."""
-        body = self._get_text("/health")
-        self.assertIn("No detail-view snapshot data yet", body)
-
-
 @unittest.skipUnless(_NODE_AVAILABLE, "node not available on this seat")
 class TestDistributionMathViaNode(unittest.TestCase):
     """Genuine executed-JS coverage for the pure math: requires the actual
     `health-detail-math.js` file under `node` and asserts on known
     inputs -> known outputs (percentile nearest-rank, population sd,
-    Freedman-Diaconis with Sturges fallback)."""
+    Freedman-Diaconis with Sturges fallback). Unchanged by #2754 -- this
+    file's own math is untouched, only its consumers (health-detail.js
+    instead of the old inline renderDistributionPanel) changed."""
 
     def _run_node(self, script: str):
         result = subprocess.run(

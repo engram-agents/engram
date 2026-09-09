@@ -282,13 +282,18 @@
     },
     {
       "path": "viz/static/health-workbench-curve.js",
-      "tier": "dev",
-      "note": "engram-alpha#2727: Curve Workbench's pure scoring math (piecewiseLinear/aspectScore/composeScore, ported line-for-line from health/curves.py + health/engine.py) -- developer tier only, same gate as its sibling health_workbench.html/health_workbench.py."
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR A RETAG (was \"dev\"): this pure scoring math (piecewiseLinear/aspectScore/composeScore, ported line-for-line from health/curves.py + health/engine.py) is now a genuinely shared library -- health.html's convenience-tier Detail tab (health-detail.js) loads it via <script src> unconditionally, same as the developer-tier Curve Workbench (health-workbench.js) still does. Leaving this tagged \"dev\" would 404 that <script> tag on every convenience-tier (the DEFAULT tier) build, silently breaking the Detail tab with a ReferenceError the moment health-detail.js calls piecewiseLinear/aspectScore/etc. Retagging the shared library, not duplicating it, per the issue's own \"it is a library, not a page\" instruction."
     },
     {
       "path": "viz/static/health-workbench.js",
       "tier": "dev",
       "note": "engram-alpha#2727: Curve Workbench page DOM/fetch logic -- developer tier only, same gate as its sibling health_workbench.html/health_workbench.py."
+    },
+    {
+      "path": "viz/static/health-detail.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR A: read-only fork of the Curve Workbench (health-workbench.js) for the health dashboard's user-facing Detail tab -- convenience tier per the issue's own tier ruling, same tier as health.html and the rest of the viz dashboard. Enrichment (aspect grouping, curve plot, reference/hold-out markers) degrades gracefully when /api/health/v2/model 404s on a build that didn't ship the dev-tier health_workbench.py/.html (this file never touches that gate itself)."
     },
     {
       "path": "viz/templates/stats.html",

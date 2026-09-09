@@ -93,41 +93,62 @@
     /* Detail-view empty state -- matches #loading's visual treatment
        (text-align/padding/color), per the existing dark theme. */
     .detail-empty-state { text-align: center; padding: 40px; color: #888; }
-    /* Detail-view real content -- history strip + distribution (#2518,
-       history-strip/distribution slice). "detail-" prefix per the existing
-       .detail-empty-state convention; kept specific to #detail-view's own
-       elements so nothing here can leak into #normal-view's cards. */
+    /* Detail-view real content (engram-alpha#2754 PR A) -- a read-only fork
+       of the Curve Workbench (health-workbench.js/health-workbench-curve.js),
+       restyled to sit inside this dashboard rather than the Workbench's own
+       dark :root theme. "detail-" prefix per the pre-existing convention;
+       scoped to #detail-view's own elements so nothing here leaks into
+       #normal-view's cards. See health-detail.js's own module docstring for
+       the full fork rationale. */
     .detail-scores-note { background: #2a1f00; color: #ffb74d; border: 1px solid #5c4500;
                            border-radius: 4px; padding: 8px 12px; margin-bottom: 12px;
                            font-size: 0.85em; }
     .detail-composed-value { font-size: 2em; font-weight: 700; color: #00d4ff;
                               text-align: center; margin: 4px 0; }
     .detail-provenance { text-align: center; color: #888; font-size: 0.8em; margin-bottom: 8px; }
+    .detail-chkpt-age { color: #888; }
     .detail-status-badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
                             font-size: 0.7em; font-weight: 600; margin-left: 6px; vertical-align: middle; }
     .detail-status-badge.good { background: #1b5e20; color: #a5d6a7; }
     .detail-status-badge.warn { background: #4a3200; color: #ffcc80; }
     .detail-status-badge.danger { background: #b71c1c; color: #ef9a9a; }
+    .detail-aspect-tag { color: #7ecfff; font-size: 0.75em; }
     .detail-signal-row { margin-bottom: 12px; }
+    .detail-held { opacity: 0.85; }
+    .detail-plot-label { font-size: 0.7em; letter-spacing: 0.06em; text-transform: uppercase;
+                          color: #888; margin: 10px 0 4px; }
     .detail-strip-dist-container { margin-top: 8px; }
     /* Scaled-down modifier on the existing .view-toggle/.view-toggle-btn
-       pattern (never a copy-paste) -- one Series/Histogram toggle per
+       pattern (never a copy-paste) -- one strip-mode toggle per
        strip+distribution block. */
     .detail-mini-toggle { margin: 6px 0; }
     .detail-mini-toggle-btn { padding: 3px 8px; font-size: 0.72em; }
-    /* Adapts the existing .trend/SVG pattern; a bare "unreplayable" tick
-       mark needs its own stroke since .trend only styles path/circle. */
-    .detail-unreplayable-tick { stroke: #ff9800; stroke-width: 2; stroke-dasharray: 3,3; }
-    /* #2625: when the chronologically-latest point is itself unreplayable,
-       the "today" marker becomes a hollow circle (not a solid/plotted
-       circle, since there's no value) at that point's x -- stroked in the
-       same orange as .detail-unreplayable-tick so it reads as part of the
-       same "unreplayable" visual family, distinguished from an ordinary
-       tick only by shape + its "(today — unreplayable: ...)" tooltip. */
-    .detail-unreplayable-today-marker { fill: none; stroke: #ff9800; stroke-width: 2; }
-    .detail-strip-empty, .detail-dist-empty, .detail-series-note {
-      color: #888; font-size: 0.78em; font-style: italic; padding: 6px 0; }
-    .detail-histogram { margin-top: 4px; }
+    .detail-series-note { color: #888; font-size: 0.78em; font-style: italic; padding: 6px 0; }
+    /* Ported from health-workbench.js's plot/focus-marker machinery
+       (engram-alpha#2738 round 2-4), restyled to this page's own color
+       literals instead of the Workbench's --muted/--accent/--rule CSS
+       vars -- no dashboard equivalent exists for these SVG-plot-specific
+       rules, so they're ported directly rather than reusing .trend. */
+    .detail-axis-label { fill: #888; font-size: 9px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .detail-focus-guide { stroke: #7ecfff; stroke-width: 1; stroke-dasharray: 2 2; }
+    .detail-focus-dot { fill: #00d4ff; stroke: #16213e; stroke-width: 1; }
+    .detail-unavailable-band { opacity: 0.85; }
+    .detail-plot-container { position: relative; }
+    .detail-plot-container svg { display: block; width: 100%; height: auto; cursor: crosshair; }
+    .detail-focus-readout { position: absolute; pointer-events: none; background: rgba(15,52,96,.92);
+                             border: 1px solid #0f3460; border-radius: 4px; padding: 3px 6px;
+                             color: #e0e0e0; font-size: 10px; line-height: 1.35;
+                             font-family: ui-monospace, Menlo, Consolas, monospace;
+                             white-space: normal; z-index: 2; }
+    .detail-statst { margin-top: 4px; border: 1px solid #0f3460; border-collapse: collapse; width: 100%; }
+    .detail-statst th, .detail-statst td { font-size: 11px; padding: 3px 6px; border: 1px solid #0f3460; text-align: right; }
+    .detail-statst th:first-child, .detail-statst td:first-child { text-align: left; color: #7ecfff; }
+    .detail-statst thead th { background: #0f3460; color: #888; }
+    .detail-aspect-section { border-top: 1px solid #0f3460; padding-top: 12px; margin-top: 12px; }
+    .detail-aspect-section h2 { color: #7ecfff; font-size: 1.1em; margin: 0 0 4px; }
+    .detail-aspect-score { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8em; color: #00d4ff; }
+    .detail-aspect-sub { color: #888; font-size: 0.78em; margin-bottom: 8px; }
+    .detail-refctl { margin-top: 6px; font-size: 11px; color: #7a8aa0; }
   </style>
 </head>
 <body>
@@ -155,12 +176,13 @@
     <div id="detail-content" style="display:none;">
       <div class="detail-scores-note" id="detail-scores-note" style="display:none;"></div>
       <div id="detail-composed-block"></div>
-      <div id="detail-signal-rows"></div>
-      <div id="detail-aspect-tiles"></div>
+      <div id="detail-aspect-sections"></div>
     </div>
   </div>
 
   <script src="/static/health-detail-math.js"></script>
+  <script src="/static/health-workbench-curve.js"></script>
+  <script src="/static/health-detail.js"></script>
   <script>
   function _currentAgent() {
     return new URL(window.location.href).searchParams.get('agent');
@@ -545,331 +567,6 @@
     cards.innerHTML += cardHtml;
   }
 
-  // ── Detail view: history strip + distribution over /api/health/v2/series
-  //    (engram-alpha#2518 detail-view slice) ───────────────────────────────
-  // Lazy-loaded once (see applyView()'s `if (isDetail) { loadDetailView(); }`
-  // hook above) -- fetches /api/health/v2 (today's snapshot: signal_rows,
-  // aspect_tile, composed, provenance) and /api/health/v2/series (per-point
-  // history for the composed score and every signal) in parallel, then
-  // renders the whole #detail-view content in one pass. computeDistribution
-  // Stats/computeHistogramBins live in the separately-loaded
-  // /static/health-detail-math.js (pure math, DOM-free, unit-tested
-  // directly under `node` -- see tests/test_viz_health_v2_detail_view.py).
-
-  var _detailLoaded = false;
-
-  function loadDetailView() {
-    if (_detailLoaded) return;
-    _detailLoaded = true;
-    Promise.all([
-      fetch(_withAgent('/api/health/v2')).then(r => r.json()),
-      fetch(_withAgent('/api/health/v2/series')).then(r => r.json()).catch(() => null),
-    ]).then(([data, seriesData]) => {
-      renderDetailView(data, seriesData);
-    }).catch(e => {
-      var emptyEl = document.getElementById('detail-empty-state');
-      var contentEl = document.getElementById('detail-content');
-      emptyEl.textContent = 'Error loading detail view: ' + e.message;
-      emptyEl.style.display = '';
-      contentEl.style.display = 'none';
-    });
-  }
-
-  // Classifies the /api/health/v2/series response into one shape every
-  // renderer below reads uniformly, regardless of WHY the series is
-  // unavailable (a `.catch(() => null)` network failure vs. a fail-honest
-  // `{error, reason}` dict from the endpoint itself) -- per the spec's
-  // error-states requirement, both collapse to "show an inline note instead
-  // of a chart", never a broken/blank chart.
-  function _classifySeries(seriesData) {
-    if (!seriesData || seriesData.error) {
-      var note;
-      if (!seriesData) {
-        note = 'no history yet on this seat';
-      } else if (seriesData.reason === 'no_db') {
-        note = 'no history yet on this seat';
-      } else {
-        note = seriesData.error;
-      }
-      return { ok: false, note: note, data: null, scoresAvailable: false };
-    }
-    return {
-      ok: true,
-      note: null,
-      data: seriesData,
-      scoresAvailable: seriesData.scores_available !== false,
-    };
-  }
-
-  function _statusClass(status) {
-    // JUDGMENT CALL (flagged in the dispatching report): the spec asks for
-    // "a small distinct visual treatment" per status but doesn't prescribe
-    // which of the existing .value.warn/.danger/.good buckets each of the
-    // four statuses maps to. "scored" (fully counted) reads as good;
-    // "unavailable" (this run's own raw value declined) reads as danger;
-    // "held_out" and "measured_not_scored" are both "not currently moving
-    // the composed score" but for structurally different reasons -- both
-    // land on warn rather than good/danger since neither is a failure.
-    if (status === 'scored') return 'good';
-    if (status === 'unavailable') return 'danger';
-    if (status === 'held_out' || status === 'measured_not_scored') return 'warn';
-    return '';
-  }
-
-  function renderDetailView(data, seriesData) {
-    var emptyEl = document.getElementById('detail-empty-state');
-    var contentEl = document.getElementById('detail-content');
-    if (!data || data.has_snapshot === false) {
-      emptyEl.textContent = (data && data.reason) ? data.reason
-        : 'No detail-view snapshot data yet — this view is under construction.';
-      emptyEl.style.display = '';
-      contentEl.style.display = 'none';
-      return;
-    }
-    emptyEl.style.display = 'none';
-    contentEl.style.display = '';
-
-    var seriesInfo = _classifySeries(seriesData);
-
-    var noteEl = document.getElementById('detail-scores-note');
-    if (seriesInfo.ok && !seriesInfo.scoresAvailable) {
-      noteEl.textContent = 'score history unavailable for this model version — showing raw values.';
-      noteEl.style.display = '';
-    } else {
-      noteEl.style.display = 'none';
-    }
-
-    renderComposedBlock(data, seriesInfo);
-    renderSignalRows(data.signal_rows || [], seriesInfo);
-    renderAspectTiles(data.aspect_tile || []);
-  }
-
-  function renderComposedBlock(data, seriesInfo) {
-    var prov = data.provenance || {};
-    var composed = data.composed || {};
-    var el = document.getElementById('detail-composed-block');
-    el.innerHTML = '<div class="card">' +
-        '<h3>Composed Score</h3>' +
-        '<div class="detail-composed-value">' + esc(composed.value) + '</div>' +
-        '<div class="detail-provenance">as of ' + esc(prov.written_at || 'unknown') + '</div>' +
-        '<div class="metric"><span class="label">snapshot</span><span class="value">' + esc(prov.snapshot_id) + '</span></div>' +
-        '<div class="metric"><span class="label">turn</span><span class="value">' + esc(prov.turn) + '</span></div>' +
-        '<div class="metric"><span class="label">checkpoint_mode</span><span class="value">' + esc(prov.checkpoint_mode) + '</span></div>' +
-        '<div class="metric"><span class="label">health_version</span><span class="value">' + esc(prov.health_version) + '</span></div>' +
-        '<div class="detail-strip-dist-container" id="detail-composed-strip-dist"></div>' +
-      '</div>';
-    var container = document.getElementById('detail-composed-strip-dist');
-    if (!seriesInfo.ok) {
-      renderStripAndDistribution(container, [], seriesInfo.note);
-      return;
-    }
-    var points = (seriesInfo.data.composed || []).map(p => ({ t: p.t, value: p.value, unreplayable: null }));
-    // Anchor-overlay hook point: a future anchors overlay (known_bad/
-    // known_good/incident/repair markers from the not-yet-built
-    // /api/health/v2/anchors) would render into this same strip container,
-    // keyed by point .t -- not built in this slice (#2518 §5 ownership).
-    renderStripAndDistribution(container, points, null);
-  }
-
-  function renderSignalRows(signalRows, seriesInfo) {
-    var el = document.getElementById('detail-signal-rows');
-    el.innerHTML = signalRows.map((row, idx) => {
-      var def = row.definition || {};
-      var today = row.today || {};
-      var num = def.numerator || {};
-      var den = def.denominator || {};
-      return '<div class="card detail-signal-row">' +
-        '<h3>' + esc(row.name) + ' <span class="detail-status-badge ' + _statusClass(row.status) + '">' + esc(row.status) + '</span></h3>' +
-        '<div class="metric"><span class="label">formula</span><span class="value">' + esc(def.formula) + '</span></div>' +
-        '<div class="metric"><span class="label">' + esc(num.label) + '</span><span class="value">' + esc(num.value) + '</span></div>' +
-        '<div class="metric"><span class="label">' + esc(den.label) + '</span><span class="value">' + esc(den.value) + '</span></div>' +
-        '<div class="metric"><span class="label">raw</span><span class="value">' + esc(today.raw) + '</span></div>' +
-        '<div class="metric"><span class="label">score</span><span class="value">' + esc(today.score) + '</span></div>' +
-        '<div class="detail-strip-dist-container" id="detail-signal-strip-' + idx + '"></div>' +
-      '</div>';
-    }).join('');
-
-    signalRows.forEach((row, idx) => {
-      var container = document.getElementById('detail-signal-strip-' + idx);
-      if (!seriesInfo.ok) {
-        renderStripAndDistribution(container, [], seriesInfo.note);
-        return;
-      }
-      // Scope decision (yours-to-keep, per the spec): drive the strip off
-      // `score` when series.scores_available is true, else off `raw` --
-      // ONE strip per row in this slice, not a separate raw-and-score pair.
-      var valueKey = seriesInfo.scoresAvailable ? 'score' : 'raw';
-      var seriesArr = (seriesInfo.data.signals || {})[row.name] || [];
-      var points = seriesArr.map(p => ({ t: p.t, value: p[valueKey], unreplayable: p.unreplayable }));
-      renderStripAndDistribution(container, points, null);
-    });
-  }
-
-  function renderAspectTiles(aspectTile) {
-    var el = document.getElementById('detail-aspect-tiles');
-    if (!aspectTile.length) { el.innerHTML = ''; return; }
-    // Plain list, no history/distribution -- explicitly out of scope for
-    // aspects in this slice (#2518 §2c).
-    el.innerHTML = '<div class="card"><h3>Aspects</h3>' +
-      aspectTile.map(a => {
-        var label = esc(a.name) + (a.unscored ? ' (unscored)' : '');
-        var value = esc(a.score) + (a.coverage !== undefined && a.coverage !== null ? ' · coverage ' + esc(a.coverage) : '');
-        return '<div class="metric"><span class="label">' + label + '</span><span class="value">' + value + '</span></div>';
-      }).join('') +
-      '</div>';
-  }
-
-  // One Series/Histogram toggle + its strip container + its distribution
-  // container, OR (when `note` is given) a small inline note instead of a
-  // chart -- shared by the composed block and every signal row.
-  var _detailStripCounter = 0;
-
-  function renderStripAndDistribution(parentEl, points, note) {
-    if (note) {
-      parentEl.innerHTML = '<div class="detail-series-note">' + esc(note) + '</div>';
-      return;
-    }
-    var idBase = 'detail-ds-' + (_detailStripCounter++);
-    var stripId = idBase + '-strip';
-    var distId = idBase + '-dist';
-    parentEl.innerHTML =
-      '<div class="view-toggle detail-mini-toggle">' +
-        '<button type="button" class="view-toggle-btn detail-mini-toggle-btn active" data-mode="series">Series</button>' +
-        '<button type="button" class="view-toggle-btn detail-mini-toggle-btn" data-mode="histogram">Histogram</button>' +
-      '</div>' +
-      '<div class="detail-strip trend" id="' + stripId + '"></div>' +
-      '<div class="detail-distribution" id="' + distId + '" style="display:none;"></div>';
-
-    var stripEl = document.getElementById(stripId);
-    var distEl = document.getElementById(distId);
-    renderHistoryStrip(stripEl, points);
-    var plottedValues = points
-      .filter(p => p.value !== null && p.value !== 'UNAVAILABLE' && p.value !== undefined)
-      .map(p => p.value);
-    renderDistributionPanel(distEl, plottedValues);
-
-    var btns = parentEl.querySelectorAll('.detail-mini-toggle-btn');
-    btns.forEach(btn => {
-      btn.addEventListener('click', () => {
-        var mode = btn.getAttribute('data-mode');
-        btns.forEach(b => b.classList.toggle('active', b === btn));
-        stripEl.style.display = mode === 'series' ? '' : 'none';
-        distEl.style.display = mode === 'histogram' ? '' : 'none';
-      });
-    });
-  }
-
-  // Adapts the existing drawTrend() SVG pattern (path + circles, <title>
-  // tooltips) rather than inventing a new charting approach -- reuses
-  // .trend's own path/circle CSS (stroke/fill) via the container's "trend"
-  // class; per-circle overrides below use an inline `style=` (not a bare
-  // `fill=` attribute) since a CSS class declaration always wins over a
-  // plain SVG presentation attribute of the same specificity.
-  // `p.unreplayable` (per series.export()'s own code, not just its prose
-  // docstring -- read directly from health/series.py:3488-3503 to confirm)
-  // is NOT a plain string: it's `{numKey: {reason, class}, denKey: {reason,
-  // class}}` (only the keys that are actually unreplayable are present), or
-  // `null`/`undefined` when neither is. Pull the human-readable `.reason`
-  // text(s) out rather than `String()`-ing the object directly (which would
-  // render the useless literal "[object Object]").
-  function _unreplayableLabel(unrep) {
-    if (!unrep || typeof unrep !== 'object') return 'unavailable';
-    var reasons = Object.keys(unrep).map(k => {
-      var info = unrep[k];
-      return (info && info.reason) ? String(info.reason) : String(info);
-    });
-    return reasons.length ? reasons.join('; ') : 'unavailable';
-  }
-
-  function renderHistoryStrip(containerEl, points) {
-    // Points already arrive ordered by `t` ascending (export()'s own
-    // docstring) -- this sort is defensive insurance, a no-op when already
-    // sorted, never assumed away.
-    var pts = points.slice().sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
-    var w = 300, h = 60, pad = 10;
-    var n = pts.length;
-    if (n === 0) {
-      containerEl.innerHTML = '<div class="detail-strip-empty">no history yet</div>';
-      return;
-    }
-    // "Today" is the chronologically-latest point (max `t`) across ALL
-    // points -- computed here, BEFORE the unreplayable filter below, so an
-    // unreplayable true-latest point is never silently promoted-away in
-    // favor of an older plotted point (#2625: the old `idx === plotted.length
-    // - 1` computed "today" from the FILTERED array, which excludes
-    // unreplayable points and so picked a stale point whenever the true
-    // latest was itself unreplayable).
-    var todayIdx = n - 1;
-    var plotted = [];
-    var markers = [];
-    pts.forEach((p, i) => {
-      if (p.value === null || p.value === 'UNAVAILABLE' || p.value === undefined) {
-        markers.push({ i: i, unreplayable: p.unreplayable });
-      } else {
-        plotted.push({ i: i, value: p.value });
-      }
-    });
-    if (plotted.length === 0) {
-      containerEl.innerHTML = '<div class="detail-strip-empty">no plottable points</div>';
-      return;
-    }
-    var values = plotted.map(p => p.value);
-    var mn = Math.min(...values), mx = Math.max(...values);
-    if (mn === mx) { mn -= 1; mx += 1; }
-    var xScale = i => pad + (n > 1 ? i / (n - 1) : 0.5) * (w - 2 * pad);
-    var yScale = v => h - pad - (v - mn) / (mx - mn) * (h - 2 * pad);
-    var pathPts = plotted.map(p => xScale(p.i) + ',' + yScale(p.value));
-    var circles = plotted.map(p => {
-      var isToday = p.i === todayIdx; // true latest point, and it's plottable
-      var r = isToday ? 5 : 3;
-      var styleAttr = isToday ? ' style="fill:#fff"' : '';
-      var titleText = esc(String(p.value)) + (isToday ? ' (today)' : '');
-      return '<circle cx="' + xScale(p.i) + '" cy="' + yScale(p.value) + '" r="' + r + '"' + styleAttr + '><title>' + titleText + '</title></circle>';
-    }).join('');
-    var ticks = markers.map(m => {
-      var x = xScale(m.i);
-      var label = _unreplayableLabel(m.unreplayable);
-      if (m.i === todayIdx) {
-        // True latest point, but unreplayable: do NOT promote an older
-        // plotted point to "today" (#2625). Render a hollow-circle marker
-        // -- stroked like the ordinary unreplayable tick, distinguished
-        // from it only by shape + tooltip -- instead of the dashed tick
-        // line, at this same x. No plotted circle above gets "(today)".
-        var todayTitle = '(today — unreplayable: ' + label + ')';
-        return '<circle class="detail-unreplayable-today-marker" cx="' + x + '" cy="' + (h / 2) + '" r="5"><title>' + esc(todayTitle) + '</title></circle>';
-      }
-      return '<line class="detail-unreplayable-tick" x1="' + x + '" y1="' + pad + '" x2="' + x + '" y2="' + (h - pad) + '"><title>' + esc(label) + '</title></line>';
-    }).join('');
-    containerEl.innerHTML = '<svg viewBox="0 0 ' + w + ' ' + h + '">' +
-      ticks +
-      '<path d="M' + pathPts.join(' L') + '"/>' +
-      circles +
-      '</svg>';
-  }
-
-  function renderDistributionPanel(containerEl, values) {
-    var stats = computeDistributionStats(values);
-    if (!stats) {
-      containerEl.innerHTML = '<div class="detail-dist-empty">insufficient data</div>';
-      return;
-    }
-    var statsHtml = '<div class="detail-stats-table">' +
-      ['min', 'p10', 'p25', 'p50', 'p75', 'p90', 'max', 'mean', 'sd'].map(k =>
-        '<div class="metric"><span class="label">' + k + '</span><span class="value">' + stats[k].toFixed(3) + '</span></div>'
-      ).join('') +
-      '</div>';
-    var hist = computeHistogramBins(values);
-    var maxCount = Math.max(...hist.counts, 1);
-    var barsHtml = '<div class="bar-chart detail-histogram">' +
-      hist.counts.map((c, i) => {
-        var lo = hist.edges[i], hi = hist.edges[i + 1];
-        var label = lo.toFixed(2) + '–' + hi.toFixed(2);
-        return '<div class="bar" style="height:' + Math.max(c / maxCount * 80, 2) + 'px;">' +
-          '<span class="bar-value">' + c + '</span><span class="bar-label">' + esc(label) + '</span></div>';
-      }).join('') +
-      '</div>';
-    containerEl.innerHTML = statsHtml + barsHtml;
-  }
   </script>
 <script src="/static/nav.js"></script>
 <!--FOOTER_PLACEHOLDER-->
