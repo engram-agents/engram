@@ -199,14 +199,15 @@
     Promise.all([
       fetch(_withAgent('/api/health')).then(r => r.json()),
       fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
-    ]).then(([data, calData]) => {
+      fetch(_withAgent('/api/health/v2')).then(r => r.json()).catch(() => null),
+    ]).then(([data, calData, v2]) => {
         document.getElementById('loading').style.display = 'none';
         document.getElementById('dashboard').style.display = 'block';
         if (data.error) {
           document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
           return;
         }
-        render(data);
+        render(data, v2);
         if (calData && !calData.error) {
           renderCalibration(calData);
         }
@@ -282,21 +283,64 @@
   // page load, so no per-tab wiring is needed here.
   loadHealth();
 
-  function render(d) {
+  function render(d, v2) {
     const cards = document.getElementById('cards');
     let html = '';
 
-    // Health score gauge. engram-alpha#2524: null (import failure) is
-    // rendered distinctly from a real score -- never as a fabricated
-    // number the reader can't tell apart from a genuinely-bad graph.
-    const scoreKnown = d.health_score !== null && d.health_score !== undefined;
+    // Health score gauge -- health-v2 composed score (#2757), NOT v1's
+    // d.health_score. d.health_score's OTHER uses (the separate "Health
+    // Score Trend" card further down) are untouched -- out of scope here.
+    // REBASE NOTE (#2757 onto #2524/#2763): #2524 added a `scoreKnown`
+    // fail-honest guard to this same card for v1's d.health_score (never
+    // fabricate 0 on ImportError) -- moot here, not lost: this card no
+    // longer displays d.health_score at all, v2's own independent
+    // fail-honest branch below (composed.value null/UNAVAILABLE) is the
+    // one now guarding what actually renders in this card. #2524's OTHER
+    // change (drawGauge()'s own null/undefined guard, a separate
+    // non-overlapping location in this file) is untouched by this rebase.
+    const v2Score = (v2 && v2.has_snapshot === true && v2.composed &&
+                     v2.composed.value !== null && v2.composed.value !== undefined &&
+                     v2.composed.value !== 'UNAVAILABLE')
+      ? v2.composed.value : null;
+
+    let scoreValueHtml, scoreFootHtml;
+    if (v2Score !== null) {
+      const writtenAt = (v2.provenance && v2.provenance.written_at) || 'unknown';
+      scoreValueHtml = `<div class="score" style="color:${scoreColor(v2Score)}">${esc(v2Score)}</div>`;
+      // Coverage caveat (#2757 round 2, per Ariadne's contract): composed.value
+      // is only ever computed over the SCORED aspects -- when composed_coverage
+      // is < 1.0 the score is silently partial, and rendering the number alone
+      // (e.g. 94.7) reads as a full-coverage figure it never was. Additive
+      // only -- a fully-scored snapshot (coverage === 1.0, or the field is
+      // absent/null) shows nothing extra here.
+      const coverage = v2.composed && v2.composed.composed_coverage;
+      let coverageHtml = '';
+      if (coverage !== null && coverage !== undefined && coverage < 1) {
+        const coveragePct = Math.round(coverage * 100);
+        const unscoredAspects = (v2.composed.unscored_aspects || []).join(', ');
+        const unscoredNote = unscoredAspects ? ` (${esc(unscoredAspects)} unavailable)` : '';
+        coverageHtml = `<div class="detail-provenance">${esc(coveragePct)}% coverage${unscoredNote}</div>`;
+      }
+      scoreFootHtml = `<div class="detail-provenance">as of ${esc(writtenAt)}</div>${coverageHtml}`;
+    } else {
+      // FAIL-HONEST (#2757, mirrors #2524's own fix): never fabricate a 0
+      // or fall back to the v1 score here, and never draw a gauge arc for
+      // a number that doesn't exist (see the drawGauge() call below).
+      const reasonText = (v2 && v2.reason) ? esc(v2.reason) : '';
+      scoreValueHtml = `<div style="font-size:0.85em; color:#888; padding-top:44px;">health-v2 score unavailable</div>`;
+      scoreFootHtml = reasonText ? `<div class="detail-provenance">${reasonText}</div>` : '';
+    }
+
     html += `<div class="card" style="text-align:center">
       <h3>Health Score</h3>
       <div class="gauge"><canvas id="gauge" width="120" height="120"></canvas>
-        <div class="score" style="color:${scoreKnown ? scoreColor(d.health_score) : '#888'}">${scoreKnown ? d.health_score : 'unavailable'}</div>
+        ${scoreValueHtml}
       </div>
-      ${scoreKnown ? '' : `<div style="font-size:0.8em; color:#f44336">${d.health_score_error || 'health_score unavailable'}</div>`}
+      ${scoreFootHtml}
       <div style="font-size:0.8em; color:#888">Turn ${d.current_turn}</div>
+      <div style="margin-top:6px;">
+        <a href="/health?view=detail" id="score-panel-details-link" onclick="applyView('detail', true); return false;">View details &rarr;</a>
+      </div>
     </div>`;
 
     // Overview
@@ -377,8 +421,9 @@
 
     cards.innerHTML = html;
 
-    // Draw gauge
-    drawGauge(d.health_score);
+    // Draw gauge -- only when a real v2 composed score exists; never draw a
+    // placeholder arc for the unavailable case (#2757 fail-honest).
+    if (v2Score !== null) drawGauge(v2Score);
 
     // Draw trend line
     if (trend.length > 1) drawTrend(trend);
