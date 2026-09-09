@@ -1,13 +1,28 @@
-"""Tests for the Curve Workbench route + tier gate (engram-alpha#2727).
+"""Tests for the Curve Workbench (engram-alpha#2727, moved to its own
+standalone entry point by engram-alpha#2754 PR B).
 
-Scope: the SERVER-side route/gate behavior only --
-``/health/workbench`` and ``/api/health/v2/model`` in ``viz/server.py``,
-plus ``viz.data.health_workbench.get_workbench_model``. Not covered here:
-the page's client-side JS render logic (covered separately by
-``tests/test_health_workbench_curve_parity.py`` for the pure math, and by
-static string assertions the way ``tests/test_viz_health_v2_detail_view.py``
-covers the detail view -- out of scope for THIS file per the dispatching
-brief's test list).
+Scope, post-#2754 PR B:
+
+* ``viz.data.health_workbench.get_workbench_model`` -- unchanged, tested
+  directly (no HTTP layer).
+* ``viz.workbench`` -- the NEW standalone ``:5021`` entry point that now
+  owns the editable page + its own copies of the four read-only APIs it
+  needs. This is where the OLD ``TestWorkbenchTierGate`` class's coverage
+  moved to (adapted: there is no per-request tier gate on this process
+  any more -- see ``viz.workbench``'s own module docstring, JUDGMENT
+  CALL 1 -- so the "gate closed" test pairs are gone; what remains is the
+  positive-path coverage plus the cache-busting / static-serving
+  regression tests, which ARE still load-bearing).
+* ``viz.server`` -- a small regression suite confirming the OLD
+  ``/health/workbench`` route and the ``/health`` page's Curve Workbench
+  header link are BOTH gone from ``:5001`` now that the page lives
+  elsewhere (PR B's own explicit requirement).
+
+Not covered here: the page's client-side JS render logic (covered
+separately by ``tests/test_health_workbench_curve_parity.py`` for the
+pure math, and by static string assertions the way
+``tests/test_viz_health_v2_detail_view.py`` covers the detail view --
+out of scope for THIS file per the dispatching brief's test list).
 
 Style follows ``tests/test_viz_health_v2.py``'s ``_LiveServerBase``
 convention (real ``HTTPServer`` thread + ``urlopen``, no headless browser
@@ -23,7 +38,6 @@ import sys
 import tempfile
 import threading
 import unittest
-from datetime import datetime
 from http.server import HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -33,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from viz import agents as viz_agents  # noqa: E402
 from viz import server as viz_server  # noqa: E402
+from viz import workbench as viz_workbench  # noqa: E402
 from viz.data import health_workbench as viz_health_workbench_data  # noqa: E402
 
 
@@ -84,8 +99,16 @@ def _make_fixture_snapshot(turn: int) -> dict:
 
 
 class _LiveServerBase(unittest.TestCase):
+    """Live-server harness parameterized by *HANDLER_CLASS* -- a real
+    ``HTTPServer`` thread running the given Handler class + ``urlopen``,
+    no headless browser available on this seat. Subclasses set
+    ``HANDLER_CLASS`` to either ``viz_server.Handler`` (:5001) or
+    ``viz_workbench.Handler`` (:5021, the new standalone entry point)."""
+
+    HANDLER_CLASS = None  # set by subclasses
+
     def setUp(self):
-        self.server = HTTPServer(("127.0.0.1", 0), viz_server.Handler)
+        self.server = HTTPServer(("127.0.0.1", 0), self.HANDLER_CLASS)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.daemon = True
@@ -133,15 +156,73 @@ class TestWorkbenchModelData(unittest.TestCase):
             self.assertIn("points", a)
 
 
-class TestWorkbenchTierGate(_LiveServerBase):
-    """Both directions of the tier gate -- flipped via monkeypatching
-    ``viz_server._workbench_available`` directly (the function is
-    deliberately a plain function, not a cached constant, exactly so tests
-    can do this without faking the filesystem)."""
+class TestWorkbenchServerNoLongerHosts(_LiveServerBase):
+    """engram-alpha#2754 PR B: the OLD /health/workbench route and the
+    /health page's Curve Workbench header link are BOTH removed from
+    viz.server (:5001) now that the page moved to its own standalone
+    entry point (viz.workbench, :5021). This is the direct regression
+    coverage for that removal -- the OLD TestWorkbenchTierGate class's
+    "gate open/closed" pairs tested THIS process's own
+    _workbench_available(); that function no longer exists on
+    viz.server at all (removed, not just gated closed), so there is no
+    monkeypatch-based equivalent to carry forward here -- the route is
+    unconditionally gone."""
+
+    HANDLER_CLASS = viz_server.Handler
 
     @classmethod
     def setUpClass(cls):
-        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_http_test_")
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_removed_http_test_")
+        cls.engram_home = Path(cls.tmpdir) / "agent_dir"
+        cls.engram_home.mkdir()
+        cls.db_path = cls.engram_home / "knowledge.db"
+        cls.db_path.write_bytes(b"")
+
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
+            "test_agent": {"name": "test_agent", "label": "Test", "db": str(cls.db_path)}
+        }
+        viz_agents.DEFAULT_AGENT = "test_agent"
+
+    @classmethod
+    def tearDownClass(cls):
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_workbench_route_gone_from_5001(self):
+        status, _headers, _body = self._get("/health/workbench?agent=test_agent")
+        self.assertEqual(status, 404)
+
+    def test_health_page_never_carries_workbench_link_or_placeholder(self):
+        status, _headers, body = self._get("/health?agent=test_agent")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"/health/workbench", body)
+        self.assertNotIn(b"WORKBENCH_LINK_PLACEHOLDER", body)
+
+    def test_model_endpoint_still_served_on_5001(self):
+        # Explicit requirement: the four read-only APIs (including this
+        # one) stay on :5001 even though the PAGE moved.
+        status, body = self._get_json("/api/health/v2/model")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("available"), body.get("reason"))
+        self.assertIn("model_defs", body)
+
+
+class TestWorkbenchStandaloneServer(_LiveServerBase):
+    """viz.workbench (:5021 by default) -- the NEW standalone entry
+    point. No per-request tier gate exists on this process (see that
+    module's own docstring, JUDGMENT CALL 1): this process only runs at
+    all because the dev-tier files are present, checked once at import
+    time, not per-request -- so there is no "gate closed" pairing to
+    test here, only the positive path."""
+
+    HANDLER_CLASS = viz_workbench.Handler
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_standalone_http_test_")
         cls.engram_home = Path(cls.tmpdir) / "agent_dir"
         cls.engram_home.mkdir()
         cls.db_path = cls.engram_home / "knowledge.db"
@@ -164,80 +245,48 @@ class TestWorkbenchTierGate(_LiveServerBase):
         viz_agents.DEFAULT_AGENT = cls._saved_default
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
-    def setUp(self):
-        super().setUp()
-        self._saved_available = viz_server._workbench_available
-        self._saved_access_log_path = viz_server._ACCESS_LOG_PATH
-
-    def tearDown(self):
-        viz_server._workbench_available = self._saved_available
-        viz_server._ACCESS_LOG_PATH = self._saved_access_log_path
-        super().tearDown()
-
-    def test_real_gate_renders_200_for_real_seat_fixture(self):
-        # No monkeypatching -- this exercises the REAL _workbench_available()
-        # against the actual files on disk in this checkout (which do ship
-        # health_workbench.html/.py, since this is the source tree, not a
-        # built convenience/essential plugin bundle).
-        status, headers, body = self._get("/health/workbench?agent=test_agent")
+    def test_page_renders_200_at_root(self):
+        status, headers, body = self._get("/?agent=test_agent")
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers.get("Content-Type", ""))
         self.assertIn(b"Curve Workbench", body)
 
-    def test_gate_closed_page_404(self):
-        viz_server._workbench_available = lambda: False
-        status, body = self._get_json("/health/workbench?agent=test_agent")
+    def test_unknown_agent_returns_404_same_shape_as_sibling_endpoints(self):
+        status, body = self._get_json("/?agent=nope")
         self.assertEqual(status, 404)
         self.assertIn("error", body)
-        self.assertEqual(body.get("reason"), "not_developer_tier")
+        self.assertEqual(body["agent"], "nope")
 
-    def test_gate_closed_model_endpoint_404(self):
-        viz_server._workbench_available = lambda: False
-        status, body = self._get_json("/api/health/v2/model")
-        self.assertEqual(status, 404)
-        self.assertEqual(body.get("reason"), "not_developer_tier")
-
-    def test_gate_open_page_renders_200(self):
-        # MUTATION per the dispatching brief: flip the gate, assert it
-        # opens -- this is the discriminating direction (a gate that is
-        # ALWAYS closed would also pass a "closed" assertion).
-        viz_server._workbench_available = lambda: True
-        status, headers, body = self._get("/health/workbench?agent=test_agent")
-        self.assertEqual(status, 200)
-        self.assertIn("text/html", headers.get("Content-Type", ""))
-        self.assertIn(b"Curve Workbench", body)
-
-    def test_gate_open_model_endpoint_200(self):
-        viz_server._workbench_available = lambda: True
+    def test_model_endpoint_200_unconditionally(self):
         status, body = self._get_json("/api/health/v2/model")
         self.assertEqual(status, 200)
         self.assertTrue(body.get("available"))
         self.assertIn("model_defs", body)
 
-    def test_unknown_agent_returns_404_same_shape_as_sibling_endpoints(self):
-        viz_server._workbench_available = lambda: True
-        status, body = self._get_json("/health/workbench?agent=nope")
+    def test_health_v2_endpoint_served(self):
+        status, body = self._get_json("/api/health/v2?agent=test_agent")
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("agent"), "test_agent")
+
+    def test_health_v2_series_endpoint_served(self):
+        status, body = self._get_json("/api/health/v2/series?agent=test_agent")
+        self.assertEqual(status, 200)
+        self.assertEqual(body.get("agent"), "test_agent")
+
+    def test_agents_endpoint_served(self):
+        status, body = self._get_json("/api/agents")
+        self.assertEqual(status, 200)
+        self.assertIn("agents", body)
+        self.assertEqual(body.get("default"), "test_agent")
+
+    def test_unknown_route_404s(self):
+        status, _headers, _body = self._get("/api/health")  # a :5001-only route
         self.assertEqual(status, 404)
-        self.assertIn("error", body)
-        self.assertEqual(body["agent"], "nope")
 
-    def test_health_page_header_link_present_when_gate_open(self):
-        viz_server._workbench_available = lambda: True
-        status, _headers, body = self._get("/health?agent=test_agent")
-        self.assertEqual(status, 200)
-        self.assertIn(b"/health/workbench", body)
-
-    def test_health_page_header_link_absent_when_gate_closed(self):
-        viz_server._workbench_available = lambda: False
-        status, _headers, body = self._get("/health?agent=test_agent")
-        self.assertEqual(status, 200)
-        self.assertNotIn(b"/health/workbench", body)
-
-    # -- R5.2: cache-busting -------------------------------------------
+    # -- cache-busting -----------------------------------------------
 
     def test_workbench_page_script_tags_carry_nonempty_version_stamp(self):
-        viz_server._workbench_available = lambda: True
-        status, _headers, body = self._get("/health/workbench?agent=test_agent")
+        status, _headers, body = self._get("/?agent=test_agent")
         self.assertEqual(status, 200)
         m_curve = re.search(rb'src="/static/health-workbench-curve\.js\?v=([^"]+)"', body)
         m_main = re.search(rb'src="/static/health-workbench\.js\?v=([^"]+)"', body)
@@ -246,70 +295,31 @@ class TestWorkbenchTierGate(_LiveServerBase):
         self.assertTrue(len(m_curve.group(1)) > 0)
         self.assertTrue(len(m_main.group(1)) > 0)
         # Both script tags carry the SAME stamp -- computed once at import
-        # time (see server.py's _compute_static_version_stamp), not
+        # time (see viz.workbench._compute_static_version_stamp), not
         # per-tag or per-request.
         self.assertEqual(m_curve.group(1), m_main.group(1))
 
     def test_static_request_still_returns_cache_control_header(self):
-        # R5.2 keeps max-age=3600 for static files -- the version-stamp
-        # query string is what busts the cache, not a shortened TTL.
+        # The version-stamp query string is what busts the cache, not a
+        # shortened TTL -- static/ still caches for 1h.
         status, headers, body = self._get(
-            f"/static/health-workbench.js?v={viz_server._STATIC_VERSION_STAMP}"
+            f"/static/health-workbench.js?v={viz_workbench._STATIC_VERSION_STAMP}"
         )
         self.assertEqual(status, 200)
-        self.assertEqual(headers.get("Cache-Control"), viz_server._STATIC_CACHE_CONTROL)
+        self.assertEqual(
+            headers.get("Cache-Control"),
+            viz_workbench.static_serve._STATIC_CACHE_CONTROL,
+        )
         self.assertTrue(len(body) > 0)
-
-    # -- R5.5: opt-in access log -----------------------------------------
-
-    def test_access_log_off_by_default_no_file_written(self):
-        # Unset (the class default via setUp/tearDown save-restore) --
-        # requesting a route must not create a log file anywhere; there's
-        # no path configured to write to, so there's nothing to check
-        # beyond "the request still succeeds".
-        self.assertIsNone(viz_server._ACCESS_LOG_PATH)
-        status, _body = self._get_json("/api/agents")
-        self.assertEqual(status, 200)
-
-    def test_access_log_appends_well_formed_line(self):
-        tmpdir = tempfile.mkdtemp(prefix="engram_workbench_access_log_test_")
-        log_path = str(Path(tmpdir) / "access.log")
-        viz_server._ACCESS_LOG_PATH = log_path
-        try:
-            status, _body = self._get_json("/api/agents")
-            self.assertEqual(status, 200)
-            with open(log_path, encoding="utf-8") as f:
-                lines = f.readlines()
-            self.assertEqual(len(lines), 1)
-            line = lines[0].rstrip("\n")
-            # ISO-UTC method path status duration_ms remote
-            m = re.match(
-                r"^(\S+) (\S+) (\S+) (\d+) ([\d.]+) (\S+)$", line
-            )
-            self.assertIsNotNone(m, line)
-            ts, method, path, status_field, duration_ms, remote = m.groups()
-            # ISO-UTC timestamp parses.
-            datetime.fromisoformat(ts)
-            self.assertEqual(method, "GET")
-            self.assertEqual(path, "/api/agents")
-            self.assertEqual(status_field, "200")
-            self.assertGreaterEqual(float(duration_ms), 0.0)
-            self.assertEqual(remote, "127.0.0.1")
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_model_endpoint_jsonable_raise_is_fail_honest_not_500(self):
         """A future shape change making model_defs_jsonable/curve_defs_jsonable
         raise must still hit the endpoint's documented ``{"available": False,
         "reason": ...}`` fail-honest shape -- not a 500 -- end-to-end, not just
         on the import boundary (engram-alpha#2730, reviewer-fairy suggestion 2).
-        Same HTTP status (200) as the sibling gate-open-but-fails path uses:
-        this endpoint is fail-honest-via-200, not fail-honest-via-404 (that
-        status is reserved for the tier gate itself -- see
-        test_gate_closed_model_endpoint_404 above)."""
+        Same HTTP status (200) as the sibling gate-open-but-fails path uses."""
         from health import model as health_model
 
-        viz_server._workbench_available = lambda: True
         original = health_model.model_defs_jsonable
 
         def _boom(*_a, **_k):
@@ -323,11 +333,12 @@ class TestWorkbenchTierGate(_LiveServerBase):
         self.assertEqual(status, 200)
         self.assertFalse(body.get("available"))
         self.assertIn("boom-from-test", body.get("reason", ""))
-        self.assertNotIn("model_module_unavailable", body.get("reason", ""))
 
 
 class TestComputeStaticVersionStamp(unittest.TestCase):
-    """engram-alpha#2748 item 1: exercise both fallback branches of
+    """engram-alpha#2748 item 1 (moved to viz.workbench by engram-alpha#2754
+    PR B, since that's the only process serving a page that references
+    these two script tags now): exercise both fallback branches of
     ``_compute_static_version_stamp`` -- the mtime branch (git resolver
     fails) and the terminal ``"0"`` branch (mtime also unresolvable). The
     stamp is computed ONCE at import time into the module constant
@@ -339,21 +350,23 @@ class TestComputeStaticVersionStamp(unittest.TestCase):
         per the function's own docstring -- resolver binary missing) must
         fall through to the mtime branch: a non-empty all-digit string
         equal to str(int(max mtime of the two workbench JS files))."""
+        import subprocess
+
         candidates = [
-            viz_server._STATIC_DIR / "health-workbench-curve.js",
-            viz_server._STATIC_DIR / "health-workbench.js",
+            viz_workbench.static_serve._STATIC_DIR / "health-workbench-curve.js",
+            viz_workbench.static_serve._STATIC_DIR / "health-workbench.js",
         ]
         expected = str(int(max(p.stat().st_mtime for p in candidates if p.is_file())))
 
         def _raise_oserror(*_a, **_k):
             raise OSError("resolver binary missing")
 
-        original_run = viz_server.subprocess.run
-        viz_server.subprocess.run = _raise_oserror
+        original_run = subprocess.run
+        subprocess.run = _raise_oserror
         try:
-            stamp = viz_server._compute_static_version_stamp()
+            stamp = viz_workbench._compute_static_version_stamp()
         finally:
-            viz_server.subprocess.run = original_run
+            subprocess.run = original_run
         self.assertTrue(stamp)
         self.assertTrue(stamp.isdigit())
         self.assertEqual(stamp, expected)
@@ -362,9 +375,11 @@ class TestComputeStaticVersionStamp(unittest.TestCase):
         """subprocess.run returning rc != 0 (e.g. not inside any
         resolvable tree) must also fall through to the mtime branch, same
         as the OSError case above."""
+        import subprocess
+
         candidates = [
-            viz_server._STATIC_DIR / "health-workbench-curve.js",
-            viz_server._STATIC_DIR / "health-workbench.js",
+            viz_workbench.static_serve._STATIC_DIR / "health-workbench-curve.js",
+            viz_workbench.static_serve._STATIC_DIR / "health-workbench.js",
         ]
         expected = str(int(max(p.stat().st_mtime for p in candidates if p.is_file())))
 
@@ -375,34 +390,36 @@ class TestComputeStaticVersionStamp(unittest.TestCase):
         def _fake_run(*_a, **_k):
             return _FakeResult()
 
-        original_run = viz_server.subprocess.run
-        viz_server.subprocess.run = _fake_run
+        original_run = subprocess.run
+        subprocess.run = _fake_run
         try:
-            stamp = viz_server._compute_static_version_stamp()
+            stamp = viz_workbench._compute_static_version_stamp()
         finally:
-            viz_server.subprocess.run = original_run
+            subprocess.run = original_run
         self.assertTrue(stamp)
         self.assertTrue(stamp.isdigit())
         self.assertEqual(stamp, expected)
 
     def test_run_fails_and_mtime_unresolvable_returns_terminal_zero(self):
         """When the version-control resolver is unresolvable AND the two
-        candidate JS files aren't found at _STATIC_DIR (mtime lookup finds
-        nothing), the function must return the terminal fallback "0"."""
+        candidate JS files aren't found at static_serve._STATIC_DIR (mtime
+        lookup finds nothing), the function must return the terminal
+        fallback "0"."""
+        import subprocess
 
         def _raise_oserror(*_a, **_k):
             raise OSError("resolver binary missing")
 
         empty_dir = Path(tempfile.mkdtemp())
-        original_run = viz_server.subprocess.run
-        original_static_dir = viz_server._STATIC_DIR
-        viz_server.subprocess.run = _raise_oserror
-        viz_server._STATIC_DIR = empty_dir
+        original_run = subprocess.run
+        original_static_dir = viz_workbench.static_serve._STATIC_DIR
+        subprocess.run = _raise_oserror
+        viz_workbench.static_serve._STATIC_DIR = empty_dir
         try:
-            stamp = viz_server._compute_static_version_stamp()
+            stamp = viz_workbench._compute_static_version_stamp()
         finally:
-            viz_server.subprocess.run = original_run
-            viz_server._STATIC_DIR = original_static_dir
+            subprocess.run = original_run
+            viz_workbench.static_serve._STATIC_DIR = original_static_dir
             shutil.rmtree(empty_dir, ignore_errors=True)
         self.assertEqual(stamp, "0")
 

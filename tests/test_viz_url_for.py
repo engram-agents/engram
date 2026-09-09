@@ -297,17 +297,15 @@ class TestLiveServerLinkIntegrity(_LiveServerBase):
     static assets actually served, or an external absolute URL, which is
     out of scope for this check).
 
-    ``_EXTRA_KNOWN_TARGETS`` (engram-alpha#2727): dev-tier-only routes that
-    are not one of the 4 always-shipped ``_KNOWN_PAGE_PATHS`` (those drive
-    OTHER tests in this file that fetch each path expecting 200 under a
-    fixture with no registered agents -- adding a route here that 404s
-    under that fixture, or that has no matching nav tab, would break those,
-    not just this one). ``/health/workbench`` is a real, valid link target
-    the detail view's own header conditionally emits (see server.py's
-    ``_workbench_available()`` gate) -- deliberately allow-listed here,
-    separately, rather than folded into ``_KNOWN_PAGE_PATHS``."""
-
-    _EXTRA_KNOWN_TARGETS = {"/health/workbench"}
+    engram-alpha#2754 PR B: the Curve Workbench's ``/health/workbench``
+    link (formerly allow-listed here as ``_EXTRA_KNOWN_TARGETS``, per
+    engram-alpha#2727) is REMOVED -- the workbench page moved off :5001
+    to its own standalone entry point (``viz.workbench``, :5021), and
+    the ``/health`` page's header no longer emits that link at all (see
+    ``tests/test_viz_health_workbench.py``'s
+    ``TestWorkbenchServerNoLongerHosts`` for the direct regression
+    coverage of that removal). No allow-list beyond ``_KNOWN_PAGE_PATHS``
+    / served static assets is needed any more."""
 
     def test_all_internal_refs_resolve(self):
         known_static = {f"/static/{p.name}" for p in _STATIC_DIR.iterdir() if p.is_file()}
@@ -321,8 +319,7 @@ class TestLiveServerLinkIntegrity(_LiveServerBase):
                 bare = ref.split("?", 1)[0]
                 self.assertTrue(
                     bare in _KNOWN_PAGE_PATHS
-                    or bare in known_static
-                    or bare in self._EXTRA_KNOWN_TARGETS,
+                    or bare in known_static,
                     f"{path} response has an internal ref {ref!r} that "
                     f"resolves to neither a known page route nor a served "
                     f"static asset",

@@ -70,17 +70,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
 from . import footer
 from . import routes
 from . import shell
+from . import static_serve
 from . import urls as viz_urls
 from .data import calibration as viz_calibration_data
 from .data import config as viz_config_data
@@ -93,76 +92,15 @@ from .data import stats as viz_stats_data
 # ---------------------------------------------------------------------------
 # Static assets (engram-alpha#2555 PR B amendment-1, requirement 5): CSS/JS
 # served from one real /static/<filename> route with cache headers, instead
-# of PR A's baked-into-Python-string-constants shape. static/ is a FLAT
-# directory (base.css, nav.js, graph.css, graph.js,
-# graph-agent-select.js) -- no subdirectories are ever a legitimate request,
-# which is what makes the path-traversal guard below simple to get right:
-# reject any filename containing a path separator or '..' outright, rather
-# than trying to canonicalize-and-compare against arbitrarily nested input.
+# of PR A's baked-into-Python-string-constants shape.
+#
+# engram-alpha#2754 PR B: the actual path-traversal-guarded serving logic +
+# _STATIC_DIR/_STATIC_CONTENT_TYPES/_STATIC_CACHE_CONTROL now live in
+# viz.static_serve, shared with viz.workbench (the new :5021 Curve
+# Workbench entry point this same PR adds) so both processes serve the
+# same flat viz/static/ directory through ONE code path -- see that
+# module for the constants/logic itself.
 # ---------------------------------------------------------------------------
-
-_STATIC_DIR = (Path(__file__).resolve().parent / "static").resolve()
-
-_STATIC_CONTENT_TYPES = {
-    ".css": "text/css",
-    ".js": "application/javascript",
-}
-
-# These are static assets bundled with the plugin (not per-agent dynamic
-# content) -- a 1-hour cache is a reasonable default; nothing here changes
-# without a plugin upgrade, which is a process restart anyway (see the
-# INVOCATION NOTE above on why a changed source file needs an operator
-# restart to take effect).
-_STATIC_CACHE_CONTROL = "public, max-age=3600"
-
-
-def _compute_static_version_stamp() -> str:
-    """R5.2 cache-busting stamp for the Curve Workbench's two script tags
-    (health-workbench-curve.js / health-workbench.js) -- computed ONCE here
-    at import time, never per-request, per the requirement's own text.
-
-    A 1-hour Cache-Control (above) means a same-hour redeploy is otherwise
-    invisible to a browser holding the old file -- this bit Lei directly.
-    Appending `?v=<stamp>` to the script `src` makes the URL itself change
-    on a real code change, which busts the cache without shortening it for
-    everyone else (see _serve_static below: the query string is otherwise
-    unused by the server, browsers key their cache on the full URL
-    including it).
-
-    Prefers the git short SHA of the tree this file runs from (`git -C
-    <this dir> rev-parse --short HEAD` -- git itself walks up from that
-    directory to find the enclosing repo, so this resolves correctly
-    whether or not `viz/` itself is a repo root). Falls back to the max
-    mtime of the two workbench script files (as an integer string) when
-    git isn't resolvable at all (e.g. an installed plugin tree with no
-    `.git` anywhere above it) -- "if resolvable" per the requirement.
-    """
-    src_root = Path(__file__).resolve().parent
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(src_root), "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            sha = result.stdout.strip()
-            if sha:
-                return sha
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        candidates = [
-            _STATIC_DIR / "health-workbench-curve.js",
-            _STATIC_DIR / "health-workbench.js",
-        ]
-        mtimes = [p.stat().st_mtime for p in candidates if p.is_file()]
-        if mtimes:
-            return str(int(max(mtimes)))
-    except OSError:
-        pass
-    return "0"
-
-
-_STATIC_VERSION_STAMP = _compute_static_version_stamp()
 
 # R5.5 opt-in access log: a module-level path, unset (None) by default --
 # behavior is UNCHANGED (Handler.log_message stays a no-op) unless the
@@ -175,51 +113,40 @@ _ACCESS_LOG_PATH: "str | None" = None
 
 
 # ---------------------------------------------------------------------------
-# Curve Workbench (engram-alpha#2727) -- developer-tier only.
+# Curve Workbench data (engram-alpha#2727) -- developer-tier only.
 #
-# JUDGMENT CALL (flagged in the coder-fairy's report): this codebase has NO
-# runtime ``install_tier`` check anywhere (grepped: `install_tier` is written
-# to $ENGRAM_HOME/config.json by tools/install-local-marketplace.sh and read
-# ONLY by that shell script and build-plugin.sh, both at BUILD time -- see
-# project CLAUDE.md's "Install tiers" section: "no post-install pruning").
-# So there is no existing mechanism this route could call. What DOES gate a
-# dev-tier feature, mechanically, is exactly what the manifest
-# (src/build/packaging/tiers.json) controls: whether the dev-tier-only files
-# for this feature were COPIED into the running install at all. Checking
-# whether those files are present/importable on THIS process is therefore
-# checking "the tier recorded in the plugin manifest" the only way that fact
-# is actually observable at runtime on a directory-source install (where the
-# SOURCE tree IS the live path -- project CLAUDE.md's "Plugin deploy" note).
-#
-# The import below is LAZY (function-scoped, guarded by try/except
-# ImportError) so it stays invisible to the tier-closure static checker
-# (src/build/engine/README.md, "Known gaps" #3: "Lazy imports are invisible
-# to the tier-closure check") -- this lets a "convenience"-tier module
-# (server.py) reference a "dev"-tier-only sibling
-# (viz/data/health_workbench.py) without tripping
+# engram-alpha#2754 PR B moved the Curve Workbench PAGE (and its dev-tier
+# header link) off :5001 entirely, onto its own standalone entry point
+# (viz.workbench, :5021 by default) -- see that module for the page-serving
+# side of this feature, and its own docstring for the judgment call on
+# whether a tier gate is still needed there (short answer: no, launching
+# that module at all is itself the gate). The OLD, now-removed
+# _workbench_available() gated THREE things at once (the health.html header
+# link, the /health/workbench page route, and this one API endpoint); with
+# the first two gone, only this endpoint's gate survives here, scoped down
+# to what it alone still needs: viz.data.health_workbench's importability
+# (NOT the page template's presence, which is irrelevant to an API
+# response). :5001 still serves /api/health/v2/model per the issue's own
+# text (only the workbench PAGE and header LINK leave :5001) -- but
+# viz/data/health_workbench.py itself remains dev-tier-only
+# (src/build/packaging/tiers.json), so an unconditional top-level import
+# here would ImportError-crash a convenience/essential-tier :5001 process
+# at import time. This lazy, function-scoped import is what the OLD
+# _workbench_available() used for the same reason (see
+# src/build/engine/README.md, "Known gaps" #3: "Lazy imports are invisible
+# to the tier-closure check") -- lets this "convenience"-tier module
+# reference a "dev"-tier-only sibling without tripping
 # test_import_dep_tier_consistency's "importer and importee must ship at
 # the same tier" rule, which only walks TOP-LEVEL module-scope imports.
 # ---------------------------------------------------------------------------
 
-_WORKBENCH_TEMPLATE_PATH = (
-    Path(__file__).resolve().parent / "templates" / "health_workbench.html"
-)
 
-# Sentinel left in templates/health.html's header, replaced at request time
-# with either the real link (dev tier) or an empty string (every other
-# tier) -- same two-phase bake-then-splice shape as shell._NAV_PLACEHOLDER
-# / shell._FOOTER_PLACEHOLDER.
-_WORKBENCH_LINK_PLACEHOLDER = "<!--WORKBENCH_LINK_PLACEHOLDER-->"
-
-
-def _workbench_available() -> bool:
-    """True iff this build shipped the Curve Workbench's dev-tier files
-    (both the page template and its backend data module). A plain function
-    (not a cached module-level constant) so tests can monkeypatch it
-    directly to simulate flipping the tier gate on/off, without needing to
-    fake the filesystem or reinstall a different tier."""
-    if not _WORKBENCH_TEMPLATE_PATH.is_file():
-        return False
+def _health_workbench_model_available() -> bool:
+    """True iff viz.data.health_workbench is importable in this process --
+    i.e. this build shipped the Curve Workbench's dev-tier data module. A
+    plain function (not a cached module-level constant) so tests can
+    monkeypatch it directly to simulate flipping the tier gate on/off,
+    without needing to fake the filesystem or reinstall a different tier."""
     try:
         from .data import health_workbench as _  # noqa: F401
     except ImportError:
@@ -259,16 +186,12 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path.startswith("/static/"):
-            self._serve_static(path[len("/static/"):])
+            static_serve.serve_static(self, path[len("/static/"):])
             return
 
         if path == "/api/agents":
             self._json({"agents": viz_agents.get_agents_meta(),
                         "default": viz_agents.DEFAULT_AGENT})
-            return
-
-        if path == "/health/workbench":
-            self._serve_workbench_page(parsed.query)
             return
 
         if path in routes.PAGE_ROUTES:
@@ -323,21 +246,6 @@ class Handler(BaseHTTPRequestHandler):
                 .replace(shell._NAV_PLACEHOLDER, nav_html)
                 .replace(shell._FOOTER_PLACEHOLDER, footer_html)
             )
-            if path == "/health":
-                # Dev-tier-only header link to the Curve Workbench
-                # (engram-alpha#2727) -- spliced at REQUEST time, same
-                # placeholder-substitution shape as the nav/footer above,
-                # so a non-dev build (which never has the placeholder's
-                # target route available -- see _workbench_available())
-                # renders the plain empty string instead of a dead link.
-                if _workbench_available():
-                    href = "/health/workbench"
-                    if agent_param:
-                        href += f"?{urlencode({'agent': agent_param})}"
-                    link_html = f'<a href="{href}" class="workbench-link">Curve Workbench</a>'
-                else:
-                    link_html = ""
-                page = page.replace(_WORKBENCH_LINK_PLACEHOLDER, link_html)
             self._html(page)
             return
 
@@ -426,10 +334,14 @@ class Handler(BaseHTTPRequestHandler):
             # unlike every other branch in this elif chain, this one does
             # not consult db_path/agent_name at all. Dev-tier-gated: 404
             # (not the fail-honest 200 the sibling `/series` endpoint
-            # uses) when this build didn't ship the Workbench's files --
-            # see _workbench_available()'s own docstring for why file
-            # presence IS the tier check here.
-            if not _workbench_available():
+            # uses) when this build didn't ship the Workbench's data
+            # module -- see _health_workbench_model_available()'s own
+            # docstring. This endpoint stays on :5001 per engram-alpha#2754
+            # PR B ("only the workbench PAGE and header LINK leave :5001")
+            # even though the workbench PAGE itself has moved to its own
+            # standalone entry point (viz.workbench, :5021 by default),
+            # which serves its OWN unconditional copy of this same data.
+            if not _health_workbench_model_available():
                 self._json(
                     {"error": "Curve Workbench is not available in this "
                               "install (developer tier only)",
@@ -551,111 +463,6 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_workbench_page(self, query: str):
-        """GET /health/workbench?agent=<seat> -- the Curve Workbench page
-        (engram-alpha#2727), developer tier only.
-
-        Two fail-honest, non-200 cases, BOTH rendered as JSON (not HTML) --
-        JUDGMENT CALL (flagged in the coder-fairy's report): none of the
-        four existing whole-page routes (/, /health, /stats, /config) ever
-        404 on an unknown ?agent= (they render the shell regardless --
-        _resolve_agent's own docstring: "the exact requested name
-        unresolved-and-unmodified ... never silently swapped"), so there is
-        no PAGE-route precedent for "unknown agent" to mirror. The only
-        existing precedent for a distinguishable "unknown agent" error at
-        all is the AGENT-SCOPED API endpoints' `{"error": ..., "agent":
-        ...}` / 404 shape (e.g. /api/health/v2 above) -- reused here
-        because, unlike the four static shells, this page has nothing
-        meaningful to render for an agent with no data.
-
-          1. Tier gate closed (this build didn't ship the Workbench's
-             files) -- 404, same shape as /api/health/v2/model's own gate.
-          2. Unknown/unregistered ?agent= -- 404, same shape as every
-             other agent-scoped endpoint on this handler.
-        """
-        if not _workbench_available():
-            self._json(
-                {"error": "Curve Workbench is not available in this "
-                          "install (developer tier only)",
-                 "reason": "not_developer_tier"},
-                status=404,
-            )
-            return
-
-        agent_param, page_db_path = viz_agents._resolve_agent(query)
-        if not page_db_path:
-            self._json(
-                {"error": f"Unknown agent: {agent_param!r}", "agent": agent_param},
-                status=404,
-            )
-            return
-
-        nav_html = shell._render_nav("health", agent=agent_param)
-        data_dir = os.path.dirname(page_db_path) if page_db_path else None
-        footer_html = footer.render_footer(data_dir)
-        with open(_WORKBENCH_TEMPLATE_PATH, encoding="utf-8") as f:
-            template = f.read()
-        # R5.2 cache-busting: rewrite the two workbench script tags to
-        # carry `?v=<stamp>` (computed once at import time -- see
-        # _compute_static_version_stamp) so a same-hour redeploy is
-        # visible to a browser holding the static handler's 1h
-        # Cache-Control. health-detail-math.js (the third script tag on
-        # this page) is deliberately NOT rewritten -- out of this
-        # requirement's stated scope (the two workbench-specific files).
-        page = (
-            template
-            .replace(shell._NAV_PLACEHOLDER, nav_html)
-            .replace(shell._FOOTER_PLACEHOLDER, footer_html)
-            .replace(
-                'src="/static/health-workbench-curve.js"',
-                f'src="/static/health-workbench-curve.js?v={_STATIC_VERSION_STAMP}"',
-            )
-            .replace(
-                'src="/static/health-workbench.js"',
-                f'src="/static/health-workbench.js?v={_STATIC_VERSION_STAMP}"',
-            )
-        )
-        self._html(page)
-
-    def _serve_static(self, filename: str):
-        """Serve one file from viz/static/ (engram-alpha#2555 PR B
-        amendment-1, requirement 5). *filename* is everything after
-        "/static/" in the request path -- NOT yet validated.
-
-        Path-traversal guard: static/ is a flat directory, so any filename
-        containing a path separator or a '..' component is rejected
-        outright as 404, rather than attempting to canonicalize-and-compare
-        (the flat-directory invariant makes the reject-outright form both
-        simpler and strictly more conservative than that would be).
-        """
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        target = _STATIC_DIR / filename
-        if not target.is_file():
-            self.send_response(404)
-            self.end_headers()
-            return
-        # Belt-and-suspenders: confirm the resolved path is still directly
-        # inside _STATIC_DIR (guards against the target itself being a
-        # symlink that escapes static/, which the string-level checks above
-        # don't see).
-        if target.resolve().parent != _STATIC_DIR:
-            self.send_response(404)
-            self.end_headers()
-            return
-
-        content_type = _STATIC_CONTENT_TYPES.get(target.suffix, "application/octet-stream")
-        body = target.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", _STATIC_CACHE_CONTROL)
-        self.end_headers()
-        self.wfile.write(body)
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -693,58 +500,14 @@ def main():
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
 
-    # AGENTS/DEFAULT_AGENT/_AGENT_STARTUP_MODE/_AGENT_STARTUP_CONFIG/
-    # _AGENT_CACHE_TS all live in viz.agents and are REASSIGNED there (not
-    # mutated in place) — so this function sets them via attribute
-    # assignment on the live viz_agents module object, never a local
-    # `global` (that would only rebind a name in THIS module, not the one
-    # every other module reads through `viz_agents.<name>` attribute
-    # access). See viz/agents.py's own module docstring for the full
-    # account of this hazard.
-    if args.db:
-        # Explicit --db always forces single-agent mode (unchanged behavior).
-        db = os.path.expanduser(args.db)
-        if os.path.isdir(db):
-            db = os.path.join(db, "knowledge.db")
-        viz_agents.AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
-        viz_agents.DEFAULT_AGENT = "default"
-        viz_agents._AGENT_STARTUP_MODE = "single_db"
-    elif args.no_autodetect:
-        # Opt-out: explicit-config-only path (old behavior).
-        if args.config:
-            viz_agents.AGENTS, viz_agents.DEFAULT_AGENT = viz_agents._load_config(args.config)
-            viz_agents._AGENT_STARTUP_MODE = "config_only"
-            viz_agents._AGENT_STARTUP_CONFIG = args.config
-        else:
-            db = viz_agents.DEFAULT_DB
-            viz_agents.AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
-            viz_agents.DEFAULT_AGENT = "default"
-            viz_agents._AGENT_STARTUP_MODE = "single_db"
-    else:
-        # Default path: auto-detect is the base.
-        discovered = viz_agents.discover_agents()
-        if args.config:
-            # Layer explicit config on top of discovered.
-            viz_agents.AGENTS, viz_agents.DEFAULT_AGENT = viz_agents._merge_config_over_discovered(
-                discovered, args.config
-            )
-            viz_agents._AGENT_STARTUP_MODE = "discover_merge"
-            viz_agents._AGENT_STARTUP_CONFIG = args.config
-        elif discovered:
-            # Pure auto-detect: prefer the launching context's own agent as
-            # default; fall back to alphabetically first for determinism.
-            viz_agents.AGENTS = discovered
-            viz_agents.DEFAULT_AGENT = viz_agents._pick_default(viz_agents.AGENTS)
-            viz_agents._AGENT_STARTUP_MODE = "discover_only"
-        else:
-            # Nothing discovered and no config — fall back to single-agent default.
-            db = viz_agents.DEFAULT_DB
-            viz_agents.AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
-            viz_agents.DEFAULT_AGENT = "default"
-            viz_agents._AGENT_STARTUP_MODE = "discover_fallback"
-
-    # Seed the live-refresh cache timestamp so the first request is a cache hit.
-    viz_agents._AGENT_CACHE_TS = time.monotonic()
+    # Resolves AGENTS/DEFAULT_AGENT/_AGENT_STARTUP_MODE/_AGENT_STARTUP_CONFIG/
+    # _AGENT_CACHE_TS from these same --db/--config/--no-autodetect flags.
+    # Extracted to viz.agents (engram-alpha#2754 PR B) so viz.workbench's
+    # own main() resolves the IDENTICAL agent set from the same flags --
+    # see that function's own docstring for the full account of why this
+    # moved and the hazard it's careful about (module-attribute reassignment,
+    # not a local `global`).
+    viz_agents.configure_agents_from_args(args)
 
     HTTPServer.allow_reuse_address = True
     bind = args.bind or "127.0.0.1"

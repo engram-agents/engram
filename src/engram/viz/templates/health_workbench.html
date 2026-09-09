@@ -13,8 +13,10 @@
   Two-phase bake-then-splice, same convention as the other four viz pages
   (see shell.py's module docstring): everything below except the literal
   <!--NAV_PLACEHOLDER--> / <!--FOOTER_PLACEHOLDER--> sentinels is served
-  as-is; server.py's _serve_workbench_page splices those two at request
-  time.
+  as-is. As of engram-alpha#2754 this page is served from its own
+  standalone viz.workbench module (its own :5021 entry point, not a route
+  on server.py's :5001) -- viz.workbench's own page-serving function
+  splices those two placeholders at request time.
 
   Dropped from the fixture (deliberate, not an oversight -- flagged in the
   coder-fairy's report): the Google Fonts <link> (an external network

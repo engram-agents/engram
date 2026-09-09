@@ -194,9 +194,19 @@
       "note": "engram-alpha#2555 PR B amendment-1, requirement 4: the shared page footer -- new module, same tier as its viz/ package siblings."
     },
     {
+      "path": "viz/static_serve.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR B: shared /static/<filename> file-serving logic, extracted out of viz/server.py's original _serve_static/_STATIC_DIR/etc so both viz.server (:5001) and the new dev-tier viz.workbench (:5021) serve the same flat viz/static/ directory through one code path. Ships at 'convenience' (not 'dev') even though viz.workbench -- a dev-tier module -- also imports it: dev is cumulative over convenience (Essential ⊂ Convenience ⊂ Dev), so a convenience-tier build (viz.server's own tier) still ships this file, and a dev-tier build ships it too via the cumulative inclusion. Tagging it 'dev' instead would break viz.server's own import on a convenience-tier build."
+    },
+    {
       "path": "viz/server.py",
       "tier": "convenience",
       "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."
+    },
+    {
+      "path": "viz/workbench.py",
+      "tier": "dev",
+      "note": "engram-alpha#2754 PR B: standalone Curve Workbench entry point (python -m viz.workbench, :5021 by default) -- the editable dev-tool page moved off the shared :5001 viz.server process onto its own port per the issue's own ruling ('Port, not file'). Dev tier because it top-level-imports viz/data/health_workbench.py (also dev tier) and viz/templates/health_workbench.html (also dev tier) -- both already dev-tier-only per their own manifest entries below -- and fails loud at import time if either is missing from the install, rather than gating per-request the way the old, now-removed viz.server._workbench_available() had to (this module's own invocation IS the gate; see its module docstring's JUDGMENT CALL 1 for the full reasoning)."
     },
     {
       "path": "viz/data/__init__.py",
@@ -227,7 +237,7 @@
     {
       "path": "viz/data/health_workbench.py",
       "tier": "dev",
-      "note": "engram-alpha#2727: Curve Workbench backend loader (shipped-model curves/importance) -- developer tier only, per the issue's own tier ruling. viz/server.py references this module via a LAZY, function-scoped import (see server.py's _workbench_available()) so it stays invisible to the tier-closure static checker on a convenience/essential build, where this file is never copied."
+      "note": "engram-alpha#2727: Curve Workbench backend loader (shipped-model curves/importance) -- developer tier only, per the issue's own tier ruling. As of engram-alpha#2754, viz/workbench.py top-level-imports this module (its own invocation is now the tier gate, per its module docstring); viz/server.py still references it via a LAZY, function-scoped import (see server.py's _health_workbench_model_available(), scoped only to the surviving /api/health/v2/model endpoint) so it stays invisible to the tier-closure static checker on a convenience/essential build, where this file is never copied."
     },
     {
       "path": "viz/data/stats.py",
@@ -273,7 +283,7 @@
     {
       "path": "viz/templates/health_workbench.html",
       "tier": "dev",
-      "note": "engram-alpha#2727: Curve Workbench page shell -- developer tier only. server.py's _workbench_available() checks this file's presence to gate both the /health/workbench route and the detail-view header link, so a convenience/essential build (which never copies this file) never advertises or serves the page."
+      "note": "engram-alpha#2727: Curve Workbench page shell -- developer tier only. As of engram-alpha#2754 this page is served by the standalone viz/workbench.py module (its own :5021 entry point) rather than a route on server.py's :5001 -- server.py no longer references this file at all; viz/workbench.py's own module-import-time check fails loud if it's missing from a convenience/essential build."
     },
     {
       "path": "viz/static/health-detail-math.js",

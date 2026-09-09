@@ -368,6 +368,84 @@ def _resolve_agent(query_string: str) -> tuple[str, str]:
     return name or "", ""
 
 
+def configure_agents_from_args(args) -> None:
+    """Resolve AGENTS/DEFAULT_AGENT/_AGENT_STARTUP_MODE/_AGENT_STARTUP_CONFIG
+    from parsed CLI args, and seed _AGENT_CACHE_TS so the first live-refresh
+    check is a cache hit (engram-alpha#2754 PR B).
+
+    Extracted out of ``viz.server.main()`` (where this exact ~50-line block
+    originally lived, byte-identical in behavior) so BOTH ``viz.server``
+    (``:5001``) and ``viz.workbench`` (``:5021``, the new standalone Curve
+    Workbench entry point this same PR adds) resolve the IDENTICAL agent
+    set from the same flags -- the issue's own words: "against the same
+    operator config." A hand-copied second implementation would drift the
+    moment one caller's resolution logic changed and the other's didn't.
+
+    *args* is any object exposing ``.db``, ``.config``, ``.no_autodetect``
+    attributes matching this module's ``--db``/``--config``/
+    ``--no-autodetect`` argparse flags (an ``argparse.Namespace`` from
+    either caller's own parser satisfies this structurally -- no shared
+    parser object is required). Callers remain responsible for their OWN
+    ``--config``/``--db`` mutual-exclusivity validation via their own
+    ``parser.error(...)`` before calling this (that check needs the
+    caller's own parser instance for its usage message, so it isn't
+    extracted here).
+
+    Mutates THIS module's own AGENTS/DEFAULT_AGENT/etc. via ``global``
+    assignment -- never attribute-assignment on some OTHER module object.
+    This is the same hazard this module's own docstring already documents
+    for every reader of AGENTS/DEFAULT_AGENT: a caller reassigns via
+    ``viz_agents.AGENTS = ...`` (attribute access on the live module
+    object); this function, being IN the module, reassigns via ``global``
+    instead -- both forms rebind the SAME module attribute, so every other
+    module's ``viz_agents.AGENTS`` read sees the update either way.
+    """
+    global AGENTS, DEFAULT_AGENT, _AGENT_STARTUP_MODE, _AGENT_STARTUP_CONFIG, _AGENT_CACHE_TS
+
+    if args.db:
+        # Explicit --db always forces single-agent mode (unchanged behavior).
+        db = os.path.expanduser(args.db)
+        if os.path.isdir(db):
+            db = os.path.join(db, "knowledge.db")
+        AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+        DEFAULT_AGENT = "default"
+        _AGENT_STARTUP_MODE = "single_db"
+    elif args.no_autodetect:
+        # Opt-out: explicit-config-only path (old behavior).
+        if args.config:
+            AGENTS, DEFAULT_AGENT = _load_config(args.config)
+            _AGENT_STARTUP_MODE = "config_only"
+            _AGENT_STARTUP_CONFIG = args.config
+        else:
+            db = DEFAULT_DB
+            AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+            DEFAULT_AGENT = "default"
+            _AGENT_STARTUP_MODE = "single_db"
+    else:
+        # Default path: auto-detect is the base.
+        discovered = discover_agents()
+        if args.config:
+            # Layer explicit config on top of discovered.
+            AGENTS, DEFAULT_AGENT = _merge_config_over_discovered(discovered, args.config)
+            _AGENT_STARTUP_MODE = "discover_merge"
+            _AGENT_STARTUP_CONFIG = args.config
+        elif discovered:
+            # Pure auto-detect: prefer the launching context's own agent as
+            # default; fall back to alphabetically first for determinism.
+            AGENTS = discovered
+            DEFAULT_AGENT = _pick_default(AGENTS)
+            _AGENT_STARTUP_MODE = "discover_only"
+        else:
+            # Nothing discovered and no config — fall back to single-agent default.
+            db = DEFAULT_DB
+            AGENTS = {"default": {"name": "default", "label": "Default", "db": db}}
+            DEFAULT_AGENT = "default"
+            _AGENT_STARTUP_MODE = "discover_fallback"
+
+    # Seed the live-refresh cache timestamp so the first request is a cache hit.
+    _AGENT_CACHE_TS = time.monotonic()
+
+
 def get_agents_meta() -> list:
     """Per-agent status snapshot for /api/agents (drives the UI dropdown)."""
     _refresh_agents_if_stale()

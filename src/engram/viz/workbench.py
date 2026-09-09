@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+viz.workbench — the Curve Workbench's standalone entry point
+(engram-alpha#2754 PR B).
+
+The Curve Workbench (engram-alpha#2727) -- an editable dev-tool for
+picking health-v2 curve knots and per-metric importance against real
+history -- used to be a route on the main ``:5001`` dashboard
+(``viz.server``), gated by a request-time tier check
+(``_workbench_available()``). Per issue #2754's ruling ("a new port
+sounds good" / "Port, not file"), the Workbench moves to its OWN
+standalone HTTP server process on its own port (``:5021`` by default),
+serving ONLY: the editable page itself, the three static JS files it
+needs, and the four read-only APIs it depends on
+(``/api/health/v2``, ``/api/health/v2/series``, ``/api/health/v2/model``,
+``/api/agents``) -- all against the SAME operator config ``viz.server``
+would use (``--db``/``--config``/``--no-autodetect``, resolved through
+the identical ``viz.agents.configure_agents_from_args`` helper both
+entry points call).
+
+``:5001`` drops the ``/health/workbench`` route and the header link
+entirely (see ``viz.server``'s own history for what was removed); this
+module is a genuinely separate process, not a mode flag on the old one.
+Same-origin (this page only ever talks to ITS OWN port's APIs), so no
+CORS change and no new security surface versus the old in-process route.
+
+JUDGMENT CALL 1 (tier gate) -- flagged for the parent's review: the OLD
+``_workbench_available()`` existed because a SHARED, always-running
+``:5001`` process had to re-check, on every request, whether THIS
+particular build shipped the dev-tier files (checking file-presence was
+the only observable proxy for "did this install ship the dev tier" --
+see that function's own removed docstring / server.py's history for the
+full reasoning, which still holds). This module's situation is
+different in kind, not just degree: launching ``python -m viz.workbench``
+at all is itself an OPERATOR's deliberate choice, made once, out-of-band
+from any browser request -- there is no request-time branching left to
+protect, because there is no other route on this process a tier-gate
+could be defending. So no PER-REQUEST gate is needed here. What IS kept,
+per this file's own lean toward "some defensive check is cheap": a
+STARTUP-time (module-import-time) check that this build actually shipped
+the dev-tier files this module needs (below) -- fails loud with a clear
+operator-facing message before any socket is ever bound, rather than
+letting a bare ``ImportError`` traceback (or, worse, a half-started
+server) be the first sign something's wrong. This is strictly less
+machinery than the old per-request gate, not a re-implementation of it.
+
+JUDGMENT CALL 2 (route shape) -- the page is served at ``/`` (root), not
+``/health/workbench``: this whole process IS the Workbench now, so
+nothing else competes for ``/`` on this port. No ``/health/workbench``
+alias/redirect is provided for old bookmarks (a nice-to-have the issue
+doesn't require; skipped as not worth the extra route on a brand-new
+entry point nobody has bookmarked yet).
+
+JUDGMENT CALL 3 (default port) -- ``5021``, per the issue's own text.
+No live precedent for a ":5021 pattern from rounds 1-5" was found
+anywhere in this codebase's source or git history (grepped both); per
+the issue's own fallback guidance, ``5021`` is used as a bare default
+constant.
+
+Usage::
+
+    python -m viz.workbench                                   # auto-detect
+    python -m viz.workbench --port 5021 --db /path/to/knowledge.db
+    python -m viz.workbench --config /path/to/agents.json
+
+No systemd unit / launch script ships with this module -- per the issue's
+own words, "no systemd unit needed -- Lei runs it when he wants it." This
+is a foreground, operator-launched developer tool, not managed
+infrastructure like ``viz.server``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from . import agents as viz_agents
+from . import footer
+from . import shell
+from . import static_serve
+from .data import health_v2 as viz_health_v2_data
+
+# ---------------------------------------------------------------------------
+# Startup-time dev-tier check (see JUDGMENT CALL 1 above). Both the data
+# module AND the page template are required for this process to do
+# anything meaningful -- checked together, at IMPORT time, so a
+# convenience/essential-tier build fails loud and early (before any
+# argparse, before any socket bind) rather than with a bare traceback the
+# first time a request actually needs the missing piece.
+#
+# Unlike viz.server's OLD _workbench_available() (removed in this PR),
+# this import is a plain TOP-LEVEL one, not a lazy function-scoped one --
+# deliberately: this module itself ships at "dev" tier in
+# src/build/packaging/tiers.json, the SAME tier as
+# viz/data/health_workbench.py, so test_import_dep_tier_consistency's
+# "importer and importee must ship at the same tier" rule is satisfied
+# directly, with no need for the lazy-import trick that hid the OLD
+# ("convenience"-tier server.py importing a "dev"-tier sibling) mismatch
+# from that same static checker.
+# ---------------------------------------------------------------------------
+
+_WORKBENCH_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent / "templates" / "health_workbench.html"
+)
+
+try:
+    from .data import health_workbench as viz_health_workbench_data
+except ImportError as exc:  # pragma: no cover -- exercised only on a
+    # convenience/essential-tier build that doesn't ship this file at all.
+    raise SystemExit(
+        "viz.workbench requires the Curve Workbench's dev-tier files, "
+        "which this install does not ship (viz/data/health_workbench.py "
+        f"is not importable: {exc}). Build/install with the 'dev' tier to "
+        "use this entry point."
+    ) from exc
+
+if not _WORKBENCH_TEMPLATE_PATH.is_file():  # pragma: no cover -- same reason.
+    raise SystemExit(
+        "viz.workbench requires the Curve Workbench's dev-tier files, "
+        f"which this install does not ship: {_WORKBENCH_TEMPLATE_PATH} is "
+        "missing. Build/install with the 'dev' tier to use this entry point."
+    )
+
+
+# ---------------------------------------------------------------------------
+# R5.2-equivalent cache-busting stamp for the workbench's two own script
+# tags (health-workbench-curve.js / health-workbench.js) -- moved
+# wholesale from viz.server (engram-alpha#2555/#2727 R5.2), which no
+# longer serves any page that references those two tags once this PR
+# lands. Computed ONCE here, at import time, never per-request -- same
+# reasoning as the original: a same-hour redeploy is otherwise invisible
+# to a browser holding static_serve's 1h Cache-Control.
+# ---------------------------------------------------------------------------
+
+def _compute_static_version_stamp() -> str:
+    """Prefers the git short SHA of the tree this file runs from (`git -C
+    <this dir> rev-parse --short HEAD` -- git itself walks up from that
+    directory to find the enclosing repo, so this resolves correctly
+    whether or not `viz/` itself is a repo root). Falls back to the max
+    mtime of the two workbench script files (as an integer string) when
+    git isn't resolvable at all (e.g. an installed plugin tree with no
+    `.git` anywhere above it).
+    """
+    import subprocess
+
+    src_root = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(src_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if sha:
+                return sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        candidates = [
+            static_serve._STATIC_DIR / "health-workbench-curve.js",
+            static_serve._STATIC_DIR / "health-workbench.js",
+        ]
+        mtimes = [p.stat().st_mtime for p in candidates if p.is_file()]
+        if mtimes:
+            return str(int(max(mtimes)))
+    except OSError:
+        pass
+    return "0"
+
+
+_STATIC_VERSION_STAMP = _compute_static_version_stamp()
+
+_DEFAULT_PORT = 5021
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Suppress BaseHTTPRequestHandler's noisy default stderr access
+        # log -- this is a foreground developer tool an operator watches
+        # directly; there's no --access-log flag here (unlike viz.server's
+        # R5.5), so there is nothing to opt INTO logging.
+        pass
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path.startswith("/static/"):
+            static_serve.serve_static(self, path[len("/static/"):])
+            return
+
+        if path == "/api/agents":
+            self._json({"agents": viz_agents.get_agents_meta(),
+                        "default": viz_agents.DEFAULT_AGENT})
+            return
+
+        if path == "/":
+            self._serve_page(parsed.query)
+            return
+
+        # Endpoints below are agent-scoped.
+        agent_name, db_path = viz_agents._resolve_agent(parsed.query)
+
+        if path == "/api/health/v2":
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                resp = viz_health_v2_data.get_health_v2_data(agent_name)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/health/v2/series":
+            if not db_path:
+                self._json({"error": f"Unknown agent: {agent_name!r}",
+                            "agent": agent_name}, status=404)
+            else:
+                qs = parse_qs(parsed.query or "")
+                version = (qs.get("version", [None])[0]) or None
+                signal = (qs.get("signal", [None])[0]) or None
+                resp = viz_health_v2_data.get_health_v2_series(agent_name, version, signal)
+                resp["agent"] = agent_name
+                self._json(resp)
+        elif path == "/api/health/v2/model":
+            # NOT agent-scoped (every seat on this install runs the SAME
+            # code, so there is exactly one shipped model to read) --
+            # same as viz.server's sibling copy of this endpoint. No tier
+            # gate here: this process only runs at all because the
+            # dev-tier files (including this data module) are present --
+            # see the startup-time check at module-import time above.
+            self._json(viz_health_workbench_data.get_workbench_model())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def _serve_page(self, query: str):
+        """GET /?agent=<seat> -- the Curve Workbench page itself.
+
+        Preserves the one load-bearing fail-honest case from the OLD
+        ``viz.server._serve_workbench_page`` (removed in this PR): an
+        unknown/unregistered ``?agent=`` 404s with the same
+        ``{"error": ..., "agent": ...}`` shape every agent-scoped
+        endpoint on this handler uses -- this page has nothing meaningful
+        to render for an agent with no data. The OLD method's tier-gate
+        branch is NOT carried over (moot here -- see JUDGMENT CALL 1 in
+        this module's own docstring), and its nav-bar splice is DROPPED,
+        not carried over either: ``health_workbench.html``'s own docstring
+        confirms the nav placeholder was already removed from this
+        template in round 2, making that ``.replace()`` call a
+        pre-existing no-op even in the OLD code.
+        """
+        agent_param, page_db_path = viz_agents._resolve_agent(query)
+        if not page_db_path:
+            self._json(
+                {"error": f"Unknown agent: {agent_param!r}", "agent": agent_param},
+                status=404,
+            )
+            return
+
+        data_dir = os.path.dirname(page_db_path) if page_db_path else None
+        footer_html = footer.render_footer(data_dir)
+        with open(_WORKBENCH_TEMPLATE_PATH, encoding="utf-8") as f:
+            template = f.read()
+        # Cache-busting: rewrite the two workbench script tags to carry
+        # `?v=<stamp>` (computed once at import time -- see
+        # _compute_static_version_stamp above) so a same-hour redeploy is
+        # visible to a browser holding static_serve's 1h Cache-Control.
+        # health-detail-math.js (the third script tag on this page) is
+        # deliberately NOT rewritten -- same scope this cache-busting
+        # mechanism always had (the two workbench-specific files only).
+        page = (
+            template
+            .replace(shell._FOOTER_PLACEHOLDER, footer_html)
+            .replace(
+                'src="/static/health-workbench-curve.js"',
+                f'src="/static/health-workbench-curve.js?v={_STATIC_VERSION_STAMP}"',
+            )
+            .replace(
+                'src="/static/health-workbench.js"',
+                f'src="/static/health-workbench.js?v={_STATIC_VERSION_STAMP}"',
+            )
+        )
+        self._html(page)
+
+    def _json(self, data: dict, status: int = 200):
+        body = json.dumps(data, default=str).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html(self, html: str):
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="ENGRAM Curve Workbench — standalone developer-tier "
+                     "entry point for editing health-v2 curves/importance "
+                     "(engram-alpha#2754). No systemd unit needed -- run "
+                     "this yourself when you want it."
+    )
+    parser.add_argument("--port", type=int, default=_DEFAULT_PORT,
+                        help=f"Port to listen on (default: {_DEFAULT_PORT})")
+    parser.add_argument("--db", default=None,
+                        help="Single-agent mode: register one anonymous "
+                             "'default' agent at PATH (a knowledge.db file or "
+                             f"a directory containing one). Default: {viz_agents.DEFAULT_DB}")
+    parser.add_argument("--config", default=None,
+                        help="Optional config JSON: override labels/default/exclude "
+                             "for auto-detected agents, or add agents with explicit db. "
+                             "Without --no-autodetect, auto-detect is always the base.")
+    parser.add_argument("--bind", default="127.0.0.1",
+                        help="Address to bind to (default: 127.0.0.1)")
+    parser.add_argument("--no-autodetect", action="store_true",
+                        help="Disable auto-discovery; use only --config or --db.")
+    args = parser.parse_args()
+
+    if args.config and args.db:
+        parser.error("--config and --db are mutually exclusive")
+
+    # Resolves AGENTS/DEFAULT_AGENT/etc from the SAME flags viz.server's own
+    # main() uses, via the SAME shared helper -- "against the same operator
+    # config" per the issue's own text.
+    viz_agents.configure_agents_from_args(args)
+
+    HTTPServer.allow_reuse_address = True
+    bind = args.bind or "127.0.0.1"
+    server = HTTPServer((bind, args.port), Handler)
+    print(f"ENGRAM Curve Workbench →  http://localhost:{args.port}")
+    print("Agents registered:")
+    for name, info in viz_agents.AGENTS.items():
+        marker = " (default)" if name == viz_agents.DEFAULT_AGENT else ""
+        exists = "" if os.path.exists(info["db"]) else " [MISSING]"
+        print(f"   - {name}{marker}: {info['db']}{exists}")
+    print("Press Ctrl-C to stop.\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()
