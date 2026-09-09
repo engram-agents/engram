@@ -6205,20 +6205,64 @@ def _current_successor(conn, node_id: str) -> "str | None":
 # ---------------------------------------------------------------------------
 # Reflect-family helpers promoted for engram_lifecycle use.
 # ---------------------------------------------------------------------------
+# Both are DISPLAY-ONLY bounds applied by _reflect_rs_or_claim below; neither
+# validates or rejects anything on write. Public (no leading underscore) so
+# tests can import them instead of re-hardcoding the numbers -- same
+# convention engram_query.py's LIST_CLAIM_SUMMARY_DISPLAY_CAP /
+# LIST_CLAIM_FALLBACK_DISPLAY_CAP already use for _list_impl's analogous pair
+# (#2721).
 
-def _reflect_rs_or_claim(row, claim_field: str = "claim", max_len: int = 160) -> str:
-    """Return recall_summary (capped at 200) or claim truncated to max_len.
+# Display truncation for a populated recall_summary, in engram_reflect's
+# output. Deliberately its OWN constant, not an import/alias of
+# engram_query.LIST_CLAIM_SUMMARY_DISPLAY_CAP, even though both are 200 today
+# -- from PR #2721's round-6 review (the fallback-cap follow-up, #2773):
+# "Not LIST_CLAIM_SUMMARY_DISPLAY_CAP -- different module, different tool,
+# different consumer. Binding them makes an engram_list triage-display change
+# silently alter engram_reflect output." Also NOT the same bound as
+# engram_lifecycle._REFLECT_FIELD_MAX (also 200, also on the reflect path --
+# the tempting misbinding): that function trims to MAX-1 content chars plus a
+# ONE-char ellipsis (exactly 200 out), while this one appends a THREE-char
+# "..." past its own 200-char slice (203 out) -- "a bound that produces a
+# value three chars past _REFLECT_FIELD_MAX and is then trimmed BY
+# _REFLECT_FIELD_MAX cannot BE _REFLECT_FIELD_MAX. They compose; they do not
+# coincide." Its equality with LIST_CLAIM_SUMMARY_DISPLAY_CAP is a numeric
+# convention, not a dependency -- same relationship #2721 already documented
+# between that constant and RECALL_SUMMARY_HARD_CAP.
+REFLECT_SUMMARY_DISPLAY_CAP = 200
+
+# Display truncation for the raw `claim` fallback, used only when a row has
+# no recall_summary yet. Deliberately NOT named (or valued) the same as
+# engram_query.LIST_CLAIM_FALLBACK_DISPLAY_CAP (130) -- #2721's round-6 review
+# measured these as genuinely different computations, not two names for one
+# bound: "the claim fallbacks differ (160 vs 130), and _reflect_rs_or_claim
+# emits rs[:200] + '...' unconditionally past its cap while _list_impl's
+# at-cap branch returns the value as-is -- so the two produce different
+# lengths on the same input. A shared helper would assert a binding that does
+# not exist." Confirmed at #2773 filing: all 11 call sites of this function
+# (10 in engram_lifecycle.py, 1 in server.py's forwarder) rely on the 160
+# default -- none overrides max_len.
+REFLECT_CLAIM_FALLBACK_DISPLAY_CAP = 160
+
+
+def _reflect_rs_or_claim(
+    row, claim_field: str = "claim", max_len: int = REFLECT_CLAIM_FALLBACK_DISPLAY_CAP,
+) -> str:
+    """Return recall_summary (capped at REFLECT_SUMMARY_DISPLAY_CAP) or claim
+    truncated to max_len.
 
     Used by engram_reflect's low-volume source-swap and high-volume Tier-1
     claim rendering. Row must have recall_summary and the named claim_field.
-    Safety bound: recall_summary > 200 chars → truncated to 200 + "..."
-    (matches Wave D round-2 convention).
+    Safety bound: recall_summary > REFLECT_SUMMARY_DISPLAY_CAP chars →
+    truncated to REFLECT_SUMMARY_DISPLAY_CAP + "..." (matches Wave D round-2
+    convention). See the module-level constants just above for why this cap
+    and the claim-fallback default are each their own named constant rather
+    than sharing a name with engram_query.py's analogous (but distinct) pair.
     """
     rs = row["recall_summary"] if "recall_summary" in row.keys() else None
     rs = (rs or "").strip()
     if rs:
-        if len(rs) > 200:
-            rs = rs[:200] + "..."
+        if len(rs) > REFLECT_SUMMARY_DISPLAY_CAP:
+            rs = rs[:REFLECT_SUMMARY_DISPLAY_CAP] + "..."
         return rs
     raw = row[claim_field] or ""
     return (raw[:max_len] + "...") if len(raw) > max_len else raw

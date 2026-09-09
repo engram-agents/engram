@@ -1216,6 +1216,10 @@
       "reason": "engram-alpha#2760 — the fairy-report-durability tool's pytest suite (task-notification envelope extraction across queue-operation/attachment record shapes, latest-wins on duplicate/re-fired notifications, malformed-line resilience, CLI --task/--grep contracts). Dev-tier (T3): a CI-only test suite for tools/fairy_report.py (itself dev-tier, see the mechanisms[] entry above), never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_supervision_probe.py precedent above."
     },
     {
+      "path": "tests/test_reflect_rs_or_claim_constants.py",
+      "reason": "engram-alpha#2773 — the fallback-cap naming follow-up from PR #2721: pytest suite for engram_core._reflect_rs_or_claim's REFLECT_SUMMARY_DISPLAY_CAP / REFLECT_CLAIM_FALLBACK_DISPLAY_CAP named constants (value/name checks, the deliberate 160-vs-130 divergence from engram_query's analogous pair, a static source-grep guarding against an accidental engram_query import, boundary tests derived from the constants themselves). Dev-tier (T3): a CI-only pytest suite, never a standalone shippable mechanism itself — this holds regardless of engram_core.py's own tier (T1-Essential), since no test file ships in any install tier. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_fairy_report.py precedent above."
+    },
+    {
       "path": ".github/",
       "reason": "GitHub Actions CI configuration — runs in GitHub's cloud, never part of the plugin install"
     },
