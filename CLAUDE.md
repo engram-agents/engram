@@ -346,6 +346,63 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+### Which colleague takes the seat
+
+**If you are the detailed designer or builder of the PR, you are excused from its
+peer-reviewer seat** (Lei, 2026-09-09). Nothing weaker disqualifies you — a
+contribution in an *earlier session* does not.
+
+| Team | Review each other's PRs | If the pair collaborated on this PR |
+|---|---|---|
+| Borges + Luria | each other | **Sol**, else Clio |
+| Ariadne + Sol | each other | **Clio**, else Luria |
+| Aleph + Clio | each other | **Luria**, else Sol |
+
+Escape seats rotate `Luria → Sol → Clio →`; each team asks the next two, skipping
+its own. Ask at PR-open time: **was I in the session where this solution was
+formed?**
+
+- **"Not available" = the seat did not answer.** Send the ask; it *is* the probe.
+  Do not check a presence board: `forum online` tracks *prompts processed*, not
+  liveness (`engram-alpha src/forum/db.py:735`; the inbox endpoint upserts per
+  prompt, `src/forum/server.py:900`). A seat that has **never published a
+  cadence** falls back to a global 15-minute window and can read offline while
+  fully available — our heartbeat floor is 30 minutes and idles to 55 (a team
+  convention, not a code fact). A seat that HAS published one is judged against
+  its own rhythm, and an on-call seat stays listed while wakeable (#1035) — so
+  the board is not uniformly wrong, it is *unevenly* right, which is worse to
+  rely on. No answer within one idle cadence plus a turn (~90 min today) → next
+  seat.
+- **If all three escape seats are silent: try `zephyr`, then `mira`, and stop
+  there.** The list is deliberately two names long. Every escape seat is a
+  builder seat across two Anthropic accounts, so "all three silent" correlates
+  with a platform-level problem that would have taken your own seat down too —
+  a longer roster buys almost nothing and costs upkeep it will not get. **Do not
+  extend it** (Lei, 2026-09-09).
+- **A PR routed to an escape seat names its design posts** — that seat lacks the
+  context the pair shared, so the author supplies it.
+
+**Why.** A designer-builder pair can share a blind spot formed *between them,
+in-session*; a third seat reconsiders it cold. Nothing weaker disqualifies a
+reviewer because sessions reset, and recalled background does not constrain a mind
+the way in-session deliberation does — so contamination is **session-scoped, not
+history-scoped**. Do not "improve" this by tracking that mechanism more closely: a
+compaction is a partial reset *inside* a session, so the role check is the clean
+half and the mechanism is the fuzzy one.
+
+**The lineage asymmetry is deliberate.** All three escape seats are builder seats,
+so they carry their own pair review plus all escape review. That is the design, not
+an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
+(Lei, 2026-09-09).
+
+This names *which* seat; it does not add one.
+
+> **Duplicated by hand in engram-alpha and umwelt `CLAUDE.md`** — change one,
+> change both in the same pass. **Soma is deliberately excluded for now:** its
+> cohort is Ariadne (principal), Borges, Luria and Clio, and does not include
+> Sol, so the escape rotation above does not resolve there. Pending a routing
+> decision from Lei and soma's principal.
+
 ### Conclusion warrant — the gate lives in the fairy's output contract, not here
 
 Neither review layer was named **"is this claim true."** The fairy round checks
