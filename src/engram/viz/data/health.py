@@ -18,12 +18,24 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+def _format_import_error(exc: BaseException) -> str:
+    """A human-readable reason string for an ImportError -- falls back to
+    the exception's own class name when str(exc) is empty (some ImportError
+    subclasses/constructions carry no message). Factored out of the
+    try/except below so it's independently unit-testable (engram-alpha#2524,
+    reviewer-fairy round 1 on PR #2763: the original inline expression had
+    no test exercising its own empty-message fallback branch)."""
+    return str(exc) or type(exc).__name__
+
+
 try:
     from engram_stats import _compute_health_score  # noqa: E402
     _HEALTH_SCORE_AVAILABLE = True
-except ImportError:
+    _HEALTH_SCORE_IMPORT_ERROR: str | None = None
+except ImportError as _health_score_import_error:  # engram-alpha#2524
     _HEALTH_SCORE_AVAILABLE = False
     _compute_health_score = None  # type: ignore[assignment]
+    _HEALTH_SCORE_IMPORT_ERROR = _format_import_error(_health_score_import_error)
 
 
 def get_health_data(db_path: str) -> dict:
@@ -179,8 +191,19 @@ def get_health_data(db_path: str) -> dict:
         # violations → full -20 penalty → wrong score (issue #1148).
         if _HEALTH_SCORE_AVAILABLE:
             data["health_score"] = _compute_health_score(conn)
+            data["health_score_error"] = None
         else:
-            data["health_score"] = 0.0
+            # engram-alpha#2524: an import failure (version skew, a moved
+            # module, a broken venv) is not a health signal. The previous
+            # `health_score = 0.0` fallback fabricated a "maximally
+            # unhealthy" reading indistinguishable from a real one -- same
+            # class as the fabricated-neutral-default the #2520 hold-out
+            # ruling rejected at the aspect level (an unscored aspect
+            # reports `unscored`, never a number). Render null + the reason
+            # instead, loudly, so the panel can't be silently misread as
+            # "the graph is fine, it just scored zero."
+            data["health_score"] = None
+            data["health_score_error"] = f"health_score unavailable: {_HEALTH_SCORE_IMPORT_ERROR}"
 
         conn.close()
         return data

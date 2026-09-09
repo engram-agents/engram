@@ -265,12 +265,16 @@
     const cards = document.getElementById('cards');
     let html = '';
 
-    // Health score gauge
+    // Health score gauge. engram-alpha#2524: null (import failure) is
+    // rendered distinctly from a real score -- never as a fabricated
+    // number the reader can't tell apart from a genuinely-bad graph.
+    const scoreKnown = d.health_score !== null && d.health_score !== undefined;
     html += `<div class="card" style="text-align:center">
       <h3>Health Score</h3>
       <div class="gauge"><canvas id="gauge" width="120" height="120"></canvas>
-        <div class="score" style="color:${scoreColor(d.health_score)}">${d.health_score}</div>
+        <div class="score" style="color:${scoreKnown ? scoreColor(d.health_score) : '#888'}">${scoreKnown ? d.health_score : 'unavailable'}</div>
       </div>
+      ${scoreKnown ? '' : `<div style="font-size:0.8em; color:#f44336">${d.health_score_error || 'health_score unavailable'}</div>`}
       <div style="font-size:0.8em; color:#888">Turn ${d.current_turn}</div>
     </div>`;
 
@@ -388,6 +392,11 @@
     ctx.lineWidth = 10;
     ctx.lineCap = 'round';
     ctx.stroke();
+    // engram-alpha#2524: score === null/undefined means "unavailable", not
+    // "zero" -- (null / 100) coerces to 0 in JS arithmetic, which would
+    // silently draw the exact same empty arc a real score=0 draws. Skip the
+    // score arc entirely rather than let the two states look identical.
+    if (score === null || score === undefined) return;
     // Score arc
     const angle = 0.75 * Math.PI + (score / 100) * 1.5 * Math.PI;
     ctx.beginPath();
