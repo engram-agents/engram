@@ -1084,19 +1084,56 @@ class TestSnapshotWebPdfFetchFailures:
         )
 
 
-def test_dual_copy_in_sync():
-    """The shipped src/engram/tools/ copy must stay byte-identical to the
-    repo-root tools/ copy.
+def test_root_copy_is_symlink_to_shipped_copy():
+    """tools/engram-snapshot must be a symlink resolving to
+    src/engram/tools/engram-snapshot -- NOT a second, independently-editable
+    copy.
 
-    Peer tools (baton.py, ia.py, engram-pkg) keep dual copies and the manifest
-    ships from src/engram/tools/; there is no automated sync, so an edit to only
-    one copy would silently ship stale code. This catches that drift.
+    This is the structural fix for the drift class that used to require a
+    dual-copy content-sync guard: src/engram/tools/engram-snapshot is the one
+    authoritative copy (`src/` is authoritative per #2781), and
+    tools/engram-snapshot is a symlink onto it, matching its five peers
+    (tools/baton.py, tools/ia.py, tools/engram-pkg, tools/forum.py,
+    tools/verify_quote.py -- all mode 120000 pointing at
+    ../src/engram/tools/<name>). A symlink cannot drift from its target by
+    definition, so there is no content to keep "in sync" -- what this test
+    guards against instead is someone converting the symlink back into a
+    regular file (accidentally, e.g. via a sed -i that follows the link and
+    rewrites through it) and thereby reintroducing the second copy this fix
+    eliminated.
+
+    A note on what the symlink is NOT protecting: the build never reads
+    the repo-root tools/ path at all. The manifest entry for
+    tools/engram-snapshot (src/build/packaging/tiers.json) carries no
+    "source" override, so _copy_manifest_entry() (src/build/engine/
+    build.py) resolves it under source_root ("src/engram") -- landing on
+    src/engram/tools/engram-snapshot, the same authoritative copy named
+    above, not on tools/engram-snapshot itself. There is no shutil.copy2
+    dereference of the root copy to reason about, because the root copy
+    was never read in the first place -- the dual-copy drift this fix
+    eliminates was never a build-shipping risk. What the symlink buys is
+    dev-ergonomics and consistency instead: anyone invoking
+    tools/engram-snapshot directly, or any tooling that hardcodes that
+    path, now sees current content rather than a copy that could silently
+    diverge -- the same guarantee the five peers above already give their
+    own direct callers.
+
+    This is also why a symlink assertion is a strictly stronger guard than
+    the byte-equality check it replaced: swap the symlink for a
+    byte-identical regular file and root_copy.is_symlink() still fails,
+    where byte equality would have passed it.
     """
     repo_root = Path(__file__).resolve().parents[1]
     root_copy = repo_root / "tools" / "engram-snapshot"
     shipped_copy = repo_root / "src" / "engram" / "tools" / "engram-snapshot"
+
     assert shipped_copy.exists(), f"shipped copy missing: {shipped_copy}"
-    assert root_copy.read_bytes() == shipped_copy.read_bytes(), (
-        "tools/engram-snapshot and src/engram/tools/engram-snapshot have drifted "
-        "— edit both copies together (no automated sync exists)."
+    assert root_copy.is_symlink(), (
+        "tools/engram-snapshot must be a symlink, not a regular file -- "
+        "a regular file here re-creates the dual-copy drift class this "
+        "test exists to make structurally impossible."
+    )
+    assert root_copy.resolve() == shipped_copy.resolve(), (
+        f"tools/engram-snapshot resolves to {root_copy.resolve()}, "
+        f"expected {shipped_copy.resolve()}"
     )
