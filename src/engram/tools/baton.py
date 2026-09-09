@@ -816,6 +816,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             "turn_reason": init_reason,
             "github": github_anchor,
             "participants": participants,
+            "colleague": colleague_name,
         })
     except ForumNetworkError as e:
         print(f"baton init: {e}", file=sys.stderr)
@@ -1859,6 +1860,75 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: set-colleague  (#2764)
+# ---------------------------------------------------------------------------
+
+def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Set or change the colleague: field on an existing baton.
+
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter), then delegates the write to the forum
+    API via client.post — the AUTHORITATIVE authorization check (caller must
+    already be a participant OR the current turn holder) is server-side
+    (set_colleague() in coordination.projects), same split as
+    cmd_add_participant.
+    """
+    _require_multi_agent(config)
+
+    project_id = args.project_id
+    colleague = args.colleague.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if not colleague:
+        print(
+            "baton set-colleague: <colleague> must be non-empty.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, _body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton set-colleague: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        resp = client.post(f"/api/projects/{project_id}/colleague", {
+            "agent": agent_name or "baton",
+            "colleague": colleague,
+        })
+    except ForumNetworkError as e:
+        print(f"baton set-colleague: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton set-colleague: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        if e.status == 403:
+            print(
+                f"baton set-colleague: '{agent_name or 'you'}' must already be a "
+                f"participant of '{project_id}', or its current turn holder, "
+                "to set colleague.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton set-colleague: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    participant_added = resp.get("participant_added", False)
+    suffix = " (added as participant)" if participant_added else ""
+    print(f"baton set-colleague: {project_id} colleague → {colleague}{suffix}")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
@@ -2452,6 +2522,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent name to add as a participant",
     )
 
+    # -- set-colleague --
+    p_set_colleague = subparsers.add_parser(
+        "set-colleague",
+        help="Set or change the colleague: field on an existing baton (#2764)",
+        description=(
+            "Set or replace the colleague: frontmatter field on an existing "
+            "baton, atomically, and add <colleague> to participants (dedup) "
+            "in the same write -- exactly the behavior 'baton init "
+            "--colleague' already has, now available after init too, and "
+            "now persisted (pre-#2764, --colleague at init never wrote "
+            "anything server-side, so 'baton show' could never render it). "
+            "The invoking agent must already be a participant of the baton, "
+            "OR its current turn holder (server-side authorization) -- this "
+            "is what lets the baton's holder name a colleague who then has "
+            "no need to add themselves. Does not change what the flip-time "
+            "colleague-gate enforces (still participants-derived); this is "
+            "about making the colleague identity settable and visible, not "
+            "about changing enforcement."
+        ),
+    )
+    p_set_colleague.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_set_colleague.add_argument(
+        "colleague",
+        metavar="COLLEAGUE",
+        help="Agent name to set as the expected colleague reviewer",
+    )
+
     # -- merge --
     p_merge = subparsers.add_parser(
         "merge",
@@ -2532,6 +2633,8 @@ def main() -> None:
         cmd_anchor(args, config, agent_name, client)
     elif args.subcommand == "add-participant":
         cmd_add_participant(args, config, agent_name, client)
+    elif args.subcommand == "set-colleague":
+        cmd_set_colleague(args, config, agent_name, client)
     elif args.subcommand == "merge":
         cmd_merge(args, config, agent_name, client)
     else:

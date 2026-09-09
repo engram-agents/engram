@@ -2199,6 +2199,144 @@ class TestAddParticipant:
         assert body["to_agent"] == "dana"
 
 
+# ===========================================================================
+# CATEGORY 15: set-colleague subcommand (#2764)
+# ===========================================================================
+
+class TestSetColleague:
+    """baton set-colleague: arg wiring, error mapping, and the init-time
+    --colleague payload fix (colleague is now actually sent to the server,
+    not just used to shape participants + a client-side print)."""
+
+    def test_set_colleague_posts_agent_and_colleague(self):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-700")},
+        )
+        args = argparse.Namespace(project_id="PR-700", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-700/colleague"
+        assert body["agent"] == "borges"
+        assert body["colleague"] == "alex"
+
+    def test_set_colleague_normalizes_case(self):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-701")},
+        )
+        args = argparse.Namespace(project_id="PR-701", colleague="  ALEX ")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] == "alex"
+
+    def test_set_colleague_missing_project_exits_nonzero(self, capsys):
+        client = _make_client()
+        client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        args = argparse.Namespace(project_id="PR-NONE", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower() or "PR-NONE" in captured.err
+
+    def test_set_colleague_bad_project_id_exits_nonzero(self, engram_home):
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, "set-colleague", "not a valid id!", "alex",
+        )
+        assert rc != 0
+
+    def test_set_colleague_empty_colleague_exits_nonzero(self, capsys):
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-702")})
+        args = argparse.Namespace(project_id="PR-702", colleague="   ")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_set_colleague_server_403_maps_to_exit_validation(self, capsys):
+        """Server-side auth guard (agent not a participant/holder) → EXIT_VALIDATION."""
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-703")})
+        client.post.side_effect = ForumHttpError(403, '{"error": "not authorized"}')
+        args = argparse.Namespace(project_id="PR-703", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "participant" in captured.err.lower() or "holder" in captured.err.lower()
+
+    def test_set_colleague_404_maps_to_exit_state(self, capsys):
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-704")})
+        client.post.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        args = argparse.Namespace(project_id="PR-704", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+
+    def test_set_colleague_prints_participant_added_suffix(self, capsys):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-705")},
+        )
+        args = argparse.Namespace(project_id="PR-705", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        captured = capsys.readouterr()
+        assert "added as participant" in captured.out.lower()
+
+    def test_set_colleague_no_suffix_when_already_participant(self, capsys):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": False},
+            get_return={"raw": _make_raw_baton("PR-706", participants="[borges, alex]")},
+        )
+        args = argparse.Namespace(project_id="PR-706", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        captured = capsys.readouterr()
+        assert "added as participant" not in captured.out.lower()
+
+    def test_set_colleague_single_agent_mode_exits_state(self):
+        """set-colleague in single-agent mode refuses (write command)."""
+        client = _make_client()
+        args = argparse.Namespace(project_id="PR-707", colleague="alex")
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, {"mode": "single"}, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+
+    def test_init_sends_colleague_to_server(self, monkeypatch):
+        """#2764: --colleague at init is now actually POSTed, not dropped
+        after being used client-side to shape participants + a print."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-708", title="t", participants="borges",
+            turn=None, status="in-progress", github=None, repo=None,
+            colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] == "ariadne"
+
+    def test_init_without_colleague_sends_none(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-709", title="t", participants="borges",
+            turn=None, status="in-progress", github=None, repo=None,
+            colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] is None
+
+
 # ---------------------------------------------------------------------------
 # #1715: repo-qualified PR anchors (fixes PR-baton IDs colliding across repos)
 # ---------------------------------------------------------------------------
