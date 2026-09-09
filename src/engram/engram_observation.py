@@ -752,17 +752,35 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         return None  # Found via equivalence normalization
 
     # All strategies failed — try to find near matches for the agent
+    is_pdf_source = file_path.lower().endswith(".pdf")
     near = _find_near_matches(content, escaped, file_path)
-    msg = (
-        f"Quoted text not found in '{os.path.basename(file_path)}'. "
-        "The quoted_text must be a verbatim substring of the evidence source. "
-        "Do not paraphrase, summarize, or fabricate quotes.\n\n"
-        "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
-        "pre-verification script. For JSONL files, messages may not have flushed "
-        "yet — verify the quote exists in the file BEFORE calling this tool. "
-        "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
-    )
-    if near:
+    if is_pdf_source:
+        # engram-alpha#2765: a PDF archive holds raw bytes, not extracted
+        # text — the generic "verbatim substring" message sends the agent
+        # hunting for a typo in an otherwise-correct quote. Name the format
+        # gap explicitly, and say so plainly (Ariadne's amendment on #2765:
+        # "Your quote may be exactly correct" is the load-bearing sentence).
+        msg = (
+            f"Quoted text not found in '{os.path.basename(file_path)}'. "
+            "This source is a PDF: quotes cannot be verified against PDF bytes, "
+            "only against extracted text. Extract first (pdftotext <f> <f>.txt), "
+            "snapshot the .txt, and cite that. Your quote may be exactly correct."
+        )
+    else:
+        msg = (
+            f"Quoted text not found in '{os.path.basename(file_path)}'. "
+            "The quoted_text must be a verbatim substring of the evidence source. "
+            "Do not paraphrase, summarize, or fabricate quotes.\n\n"
+            "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
+            "pre-verification script. For JSONL files, messages may not have flushed "
+            "yet — verify the quote exists in the file BEFORE calling this tool. "
+            "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
+        )
+    # Near-matches are computed against `content` -- for a PDF that's raw
+    # bytes decoded as UTF-8 with errors="replace", i.e. noise. Suggesting
+    # "copy from a match above" on garbage would contradict the PDF message's
+    # own "your quote may be exactly correct" — skip the suggestion path.
+    if near and not is_pdf_source:
         suggestions = []
         for i, m in enumerate(near, 1):
             suggestions.append(
@@ -1582,12 +1600,29 @@ def _add_observation_impl(
             "quote_verified": quote_verified,
         }
         if not quote_verified:
-            result["quote_provenance_warning"] = (
-                "Web-sourced quoted_text is unverified at encoding — no page fetch "
-                "occurs at observation creation time. The quote may not appear verbatim "
-                "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
-                "citations, verify manually. See #1204."
-            )
+            if ev_url.lower().endswith(".pdf"):
+                # engram-alpha#2765: a url:-sourced PDF observation never gets
+                # a page fetch at creation time, same as any other web
+                # source -- but for a PDF the check could NEVER have run
+                # even with a fetch (quotes verify against extracted text,
+                # not raw bytes). The generic web-source caveat reads
+                # identically for "we didn't fetch" and "this format can't
+                # verify"; name the PDF case so it doesn't read as an
+                # ordinary, softer caveat.
+                result["quote_provenance_warning"] = (
+                    "This source is a PDF: the quote check could not run on it, and "
+                    "could not have, even with a page fetch — PDF quotes verify only "
+                    "against extracted text, never raw bytes. Extract first "
+                    "(pdftotext <f> <f>.txt), snapshot the .txt, and cite that for a "
+                    "verifiable quote. See #2765."
+                )
+            else:
+                result["quote_provenance_warning"] = (
+                    "Web-sourced quoted_text is unverified at encoding — no page fetch "
+                    "occurs at observation creation time. The quote may not appear verbatim "
+                    "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
+                    "citations, verify manually. See #1204."
+                )
 
         # Advisory hard-token anchoring (#2602 facet 2) — attaches to every
         # write, all quote types; never refuses, never changes confidence.

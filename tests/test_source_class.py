@@ -340,6 +340,33 @@ def test_https_url_accepted():
     assert r["status"] == "created"
 
 
+def test_pdf_url_provenance_warning_names_the_format_gap():
+    """#2765: a url:-sourced PDF observation is always quote_verified=False
+    (no fetch at creation time, same as any other web source) -- but for a
+    PDF the check could never have run even with a fetch, since quotes
+    verify against extracted text, not raw bytes. The provenance warning
+    must name the PDF case, not read like the ordinary, softer
+    could-not-fetch caveat every other web source gets."""
+    client = fresh_client()
+    r = client.call("engram_add_observation", {
+        "url": "https://example.com/paper.pdf",
+        "title": "A PDF paper",
+        "quoted_text": "Some data.",
+        "interpretation": "Test.",
+        "claim": "PDF source test claim",
+        "quote_type": "hard_data",
+    })
+    assert r["status"] == "created"
+    assert r["quote_verified"] is False
+    warning = r["quote_provenance_warning"]
+    assert "This source is a PDF" in warning
+    assert "extracted text" in warning
+    assert "#2765" in warning
+    # The generic web-source caveat's own wording must NOT appear here --
+    # this is a replacement for the PDF case, not an addition.
+    assert "no page fetch" not in warning
+
+
 def test_file_evidence_per_observation_versioning():
     """Same file URL → same evidence node, regardless of content. Per-observation
     versioning (dv_0547): each observation carries its own git_sha + content_hash.

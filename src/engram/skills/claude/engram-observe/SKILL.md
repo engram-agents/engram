@@ -74,6 +74,15 @@ For web pages: fetch the page first (WebFetch / curl), save to a file, then
 content-hash-pinned and verbatim-checkable even if the original source
 changes or disappears later.
 
+**PDFs are the one source shape where a quote can never verify against the
+raw file.** `engram-snapshot`'s `pdf:<url>`/`file:<path.pdf>` archives raw
+PDF bytes; a quote copied from the document's *extracted text* is never a
+substring of those bytes, so the verbatim-quote check always fails —
+correctly, since it genuinely cannot read a PDF, not because the quote is
+wrong. Extract to text first (`pdftotext <f> <f>.txt`), then
+`engram-snapshot file:<f>.txt` and cite the `.txt` archive — that quote can
+verify. (#2765)
+
 **Citing the current session directly (no snapshot needed for the simple
 case)**: pass your injected `session_id`. A wrong or stale `session_id`
 fails loud via the same server-side verbatim-quote check used by every other

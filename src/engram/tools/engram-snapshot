@@ -787,7 +787,8 @@ def build_parser() -> argparse.ArgumentParser:
             "'jsonl:<session-id>' (session transcript span), "
             "'jsonl:' (bare — current session transcript). "
             "P1.5: 'file:<path>' (arbitrary local file; absolute, relative, or ~-prefixed). "
-            "P2: 'web:<url>' (archives raw HTML bytes), 'pdf:<url>' (archives raw PDF bytes) "
+            "P2: 'web:<url>' (archives raw HTML bytes), 'pdf:<url>' (archives raw PDF bytes "
+            "— quotes cannot be verified against a PDF; extract to text first) "
             "— http:// or https:// only."
         ),
     )
