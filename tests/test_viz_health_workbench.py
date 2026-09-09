@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from http.server import HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -333,6 +334,198 @@ class TestWorkbenchStandaloneServer(_LiveServerBase):
         self.assertEqual(status, 200)
         self.assertFalse(body.get("available"))
         self.assertIn("boom-from-test", body.get("reason", ""))
+
+
+class TestWorkbenchAccessLog(_LiveServerBase):
+    """engram-alpha#2767: viz.workbench.Handler.log_message mirrors
+    viz.server's own opt-in R5.5 access log -- off by default
+    (_ACCESS_LOG_PATH is None, matching viz.server's own default), one
+    line per request when a path is set. Toggled directly on the module
+    attribute (the same monkeypatch shape viz.server's own tests would
+    use, per that module's docstring: "so tests can set
+    viz_server._ACCESS_LOG_PATH directly ... without going through
+    argparse/main()")."""
+
+    HANDLER_CLASS = viz_workbench.Handler
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_access_log_test_")
+        cls.engram_home = Path(cls.tmpdir) / "agent_dir"
+        cls.engram_home.mkdir()
+        cls.db_path = cls.engram_home / "knowledge.db"
+        cls.db_path.write_bytes(b"")
+
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
+            "test_agent": {"name": "test_agent", "label": "Test", "db": str(cls.db_path)}
+        }
+        viz_agents.DEFAULT_AGENT = "test_agent"
+
+    @classmethod
+    def tearDownClass(cls):
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        super().setUp()
+        self._saved_access_log_path = viz_workbench._ACCESS_LOG_PATH
+
+    def tearDown(self):
+        viz_workbench._ACCESS_LOG_PATH = self._saved_access_log_path
+        super().tearDown()
+
+    def test_off_by_default_no_file_written(self):
+        # Matches viz.server's own default (None, unchanged behavior) --
+        # a request must not create anything at a path nobody set.
+        log_path = Path(self.tmpdir) / "unset-access.log"
+        viz_workbench._ACCESS_LOG_PATH = None
+        status, _headers, _body = self._get("/api/agents")
+        self.assertEqual(status, 200)
+        self.assertFalse(log_path.exists())
+
+    def test_appends_well_formed_line_when_set(self):
+        log_path = Path(self.tmpdir) / "access.log"
+        viz_workbench._ACCESS_LOG_PATH = str(log_path)
+        status, _headers, _body = self._get("/api/agents")
+        self.assertEqual(status, 200)
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        # ISO-UTC method path status duration_ms remote -- same shape as
+        # viz.server's own log line.
+        ts, method, path, code, duration_ms, remote = lines[0].split(" ")
+        self.assertEqual(method, "GET")
+        self.assertEqual(path, "/api/agents")
+        self.assertEqual(code, "200")
+        self.assertGreaterEqual(float(duration_ms), 0.0)
+        self.assertEqual(remote, "127.0.0.1")
+        # Parses as a real ISO-8601 UTC timestamp.
+        datetime.fromisoformat(ts)
+
+    def test_appends_one_line_per_request(self):
+        log_path = Path(self.tmpdir) / "multi.log"
+        viz_workbench._ACCESS_LOG_PATH = str(log_path)
+        for _ in range(3):
+            status, _headers, _body = self._get("/api/agents")
+            self.assertEqual(status, 200)
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 3)
+
+
+class TestAccessLogParityWithServer(unittest.TestCase):
+    """engram-alpha#2769 (Borges's held-for-one-test request, forum #405
+    #8313): #2767 mirrored viz.server's log_message onto viz.workbench BY
+    HAND, which is exactly the mechanism that let the two drift apart in
+    the first place -- two independently-maintained copies of the same
+    logic, no shared implementation, no test tying them together. This
+    test is that tie: it runs BOTH servers side by side, hits the SAME
+    route (`/api/agents`, served identically on both) with identical
+    inputs, and asserts the two resulting log lines have the IDENTICAL
+    SHAPE -- same field count, same field types in the same order. A
+    future edit to one Handler's log_message that isn't mirrored to the
+    other's fails HERE, not silently."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_access_log_parity_test_")
+        cls.engram_home = Path(cls.tmpdir) / "agent_dir"
+        cls.engram_home.mkdir()
+        cls.db_path = cls.engram_home / "knowledge.db"
+        cls.db_path.write_bytes(b"")
+
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
+            "test_agent": {"name": "test_agent", "label": "Test", "db": str(cls.db_path)}
+        }
+        viz_agents.DEFAULT_AGENT = "test_agent"
+
+        cls.server_srv = HTTPServer(("127.0.0.1", 0), viz_server.Handler)
+        cls.server_port = cls.server_srv.server_address[1]
+        cls.server_thread = threading.Thread(target=cls.server_srv.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+        cls.workbench_srv = HTTPServer(("127.0.0.1", 0), viz_workbench.Handler)
+        cls.workbench_port = cls.workbench_srv.server_address[1]
+        cls.workbench_thread = threading.Thread(target=cls.workbench_srv.serve_forever)
+        cls.workbench_thread.daemon = True
+        cls.workbench_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server_srv.shutdown()
+        cls.workbench_srv.shutdown()
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self._saved_server_path = viz_server._ACCESS_LOG_PATH
+        self._saved_workbench_path = viz_workbench._ACCESS_LOG_PATH
+
+    def tearDown(self):
+        viz_server._ACCESS_LOG_PATH = self._saved_server_path
+        viz_workbench._ACCESS_LOG_PATH = self._saved_workbench_path
+
+    def _line_shape(self, line: str) -> tuple:
+        """(field_count, method_type_ok, path_type_ok, status_type_ok,
+        duration_type_ok, remote_type_ok) -- the SHAPE of a log line,
+        independent of its specific values (timestamps/ports differ
+        between the two servers by construction)."""
+        fields = line.split(" ")
+        if len(fields) != 6:
+            return (len(fields),)
+        ts, method, path, code, duration_ms, remote = fields
+        return (
+            len(fields),
+            isinstance(method, str) and method.isalpha(),
+            path.startswith("/"),
+            code.isdigit(),
+            _is_float(duration_ms),
+            remote.count(".") == 3 or remote == "-",
+        )
+
+    def test_log_line_shape_is_identical_between_server_and_workbench(self):
+        server_log = Path(self.tmpdir) / "server-access.log"
+        workbench_log = Path(self.tmpdir) / "workbench-access.log"
+        viz_server._ACCESS_LOG_PATH = str(server_log)
+        viz_workbench._ACCESS_LOG_PATH = str(workbench_log)
+
+        with urlopen(f"http://127.0.0.1:{self.server_port}/api/agents", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+        with urlopen(f"http://127.0.0.1:{self.workbench_port}/api/agents", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+
+        server_lines = server_log.read_text(encoding="utf-8").splitlines()
+        workbench_lines = workbench_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(server_lines), 1)
+        self.assertEqual(len(workbench_lines), 1)
+
+        server_shape = self._line_shape(server_lines[0])
+        workbench_shape = self._line_shape(workbench_lines[0])
+        self.assertEqual(
+            server_shape, workbench_shape,
+            f"viz.server line: {server_lines[0]!r}\n"
+            f"viz.workbench line: {workbench_lines[0]!r}\n"
+            "Shapes diverged -- the two Handler.log_message implementations "
+            "are no longer mirrored (engram-alpha#2769's own drift mechanism)."
+        )
+        # Both requested the SAME route with the SAME method -- those two
+        # fields should be byte-identical, not merely same-shaped.
+        self.assertEqual(server_lines[0].split(" ")[1], workbench_lines[0].split(" ")[1])
+        self.assertEqual(server_lines[0].split(" ")[2], workbench_lines[0].split(" ")[2])
+        self.assertEqual(server_lines[0].split(" ")[3], workbench_lines[0].split(" ")[3])
+
+
+def _is_float(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
 
 
 class TestComputeStaticVersionStamp(unittest.TestCase):

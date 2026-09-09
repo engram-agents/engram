@@ -74,6 +74,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -176,16 +178,35 @@ _STATIC_VERSION_STAMP = _compute_static_version_stamp()
 
 _DEFAULT_PORT = 5021
 
+# engram-alpha#2767: viz.server's R5.5 opt-in access log, mirrored here for
+# parity -- an operator debugging THIS process had no equivalent to
+# viz.server's opt-in request log. Same shape: unset (None) by default, so
+# behavior is UNCHANGED (Handler.log_message stays a no-op) unless
+# --access-log <path> is passed at startup (see main()).
+_ACCESS_LOG_PATH: "str | None" = None
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        # Suppress BaseHTTPRequestHandler's noisy default stderr access
-        # log -- this is a foreground developer tool an operator watches
-        # directly; there's no --access-log flag here (unlike viz.server's
-        # R5.5), so there is nothing to opt INTO logging.
-        pass
+        # Mirrors viz.server.Handler.log_message exactly (engram-alpha#2767)
+        # -- see that method's own docstring for why args[1]/self.command/
+        # self.path are read directly rather than re-parsed out of fmt.
+        if not _ACCESS_LOG_PATH:
+            return
+        start = getattr(self, "_access_log_start", None)
+        duration_ms = (time.monotonic() - start) * 1000.0 if start is not None else 0.0
+        status = args[1] if len(args) > 1 else "-"
+        remote = self.client_address[0] if self.client_address else "-"
+        ts = datetime.now(timezone.utc).isoformat()
+        line = f"{ts} {self.command} {self.path} {status} {duration_ms:.2f} {remote}\n"
+        try:
+            with open(_ACCESS_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError:
+            pass  # best-effort logging only -- never fail the request over it
 
     def do_GET(self):
+        self._access_log_start = time.monotonic()
         parsed = urlparse(self.path)
         path = parsed.path
 
@@ -328,7 +349,17 @@ def main():
                         help="Address to bind to (default: 127.0.0.1)")
     parser.add_argument("--no-autodetect", action="store_true",
                         help="Disable auto-discovery; use only --config or --db.")
+    parser.add_argument("--access-log", default=None,
+                        help="Optional path to an access-log file. When set, appends "
+                             "one line per request (ISO-UTC method path status "
+                             "duration_ms remote). Default: off (no access logging, "
+                             "unchanged behavior). Mirrors viz.server's own flag "
+                             "(engram-alpha#2767).")
     args = parser.parse_args()
+
+    if args.access_log:
+        global _ACCESS_LOG_PATH
+        _ACCESS_LOG_PATH = os.path.expanduser(args.access_log)
 
     if args.config and args.db:
         parser.error("--config and --db are mutually exclusive")
