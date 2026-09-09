@@ -6969,7 +6969,9 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 #
 # Two modes, mutually exclusive:
 #   Single-field mode (backward compat): node_type and/or status as plain
-#     strings. Compact triage shape with claim truncated to 130 chars.
+#     strings. Compact triage shape; `claim` carries recall_summary
+#     (truncated to 200 chars with an ellipsis if longer) when populated,
+#     else the claim truncated to 130 chars.
 #   Structured-filter mode (issue #81): filters_json with recursive condition
 #     tree. AND/OR/NOT composition, text contains, ID-range, date-range,
 #     NULL handling, cross-table cites/cited_by virtual fields. fields_json
@@ -7012,8 +7014,10 @@ def engram_list(payload_json: str = "{}") -> str:
     Two modes, mutually exclusive:
 
     Single-field mode (default, backward compat): pass node_type and/or
-    status as plain strings. Returns the compact triage shape with claim
-    truncated to 130 chars.
+    status as plain strings. Returns the compact triage shape; the `claim`
+    key carries `recall_summary` when populated — truncated to 200 chars
+    with an ellipsis if longer — falling back to the claim truncated to
+    130 chars.
 
     Structured-filter mode (issue #81): pass filters_json with a recursive
     condition tree. Supports multi-field AND/OR/NOT composition, text
