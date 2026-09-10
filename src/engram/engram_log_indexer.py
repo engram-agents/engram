@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -65,14 +66,55 @@ _CREATE_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_events_tool_name ON events(tool_name)",
 ]
 
+# file_state — per-file size gate (alpha #2785). Lets run_once() skip
+# re-reading a JSONL file whose size hasn't changed since the last tick,
+# instead of re-parsing every line of every file on every 60s pass.
+#
+# Keyed on SIZE, not mtime: session files are append-only (single writer,
+# engram_log_emitter.py, "a"-mode open/close per event), and on ext4-under-
+# WSL2 mtime granularity (~3.92ms) let 400 consecutive appends collapse to a
+# single mtime value while size changed on every one -- an mtime gate has a
+# silent permanent row-loss race (a final append lands in the same mtime
+# bucket, the session ends, and that line is never indexed). Size is
+# strictly monotone under append-only and changes on every write, at
+# identical implementation cost. Do not add mtime as a second condition --
+# it can only cause spurious re-reads, never catch anything size misses.
+_CREATE_FILE_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS file_state (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    indexed_at TEXT
+)
+"""
+
 
 def _init_schema(conn: sqlite3.Connection) -> None:
-    """Create events table and all indexes if they don't already exist."""
+    """Create events table, file_state table, and all indexes if they don't
+    already exist."""
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(_CREATE_EVENTS_TABLE)
+    conn.execute(_CREATE_FILE_STATE_TABLE)
     for stmt in _CREATE_INDEXES:
         conn.execute(stmt)
     conn.commit()
+
+
+# In-process dedup for the per-line malformed/non-object/missing-ts warnings
+# emitted by _index_file. Deliberately NOT persisted to index.db or any
+# other cross-process store: a daemon restart SHOULD re-report a bad line,
+# because a restart is when someone is looking. Keyed on (path, lineno) so
+# a genuinely new bad line in a growing file still warns.
+_WARNED_LINES: set[tuple[str, int]] = set()
+
+
+def _warn_once(path_key: str, lineno: int, message: str) -> None:
+    """Print `message` to stderr the first time (path_key, lineno) is seen
+    in this process; silently skip on subsequent occurrences."""
+    key = (path_key, lineno)
+    if key in _WARNED_LINES:
+        return
+    _WARNED_LINES.add(key)
+    print(message, file=sys.stderr)
 
 
 def _extract_promoted(event_type: str, data: dict) -> dict:
@@ -168,9 +210,10 @@ def _index_file(conn: sqlite3.Connection, jsonl_path: Path, session_id: str, lev
             try:
                 event = json.loads(raw_line)
             except json.JSONDecodeError as exc:
-                print(
+                _warn_once(
+                    str(jsonl_path),
+                    lineno,
                     f"[engram-indexer] malformed JSON in {jsonl_path}:{lineno}: {exc}; skipping",
-                    file=sys.stderr,
                 )
                 continue
 
@@ -179,18 +222,20 @@ def _index_file(conn: sqlite3.Connection, jsonl_path: Path, session_id: str, lev
             # generated JSONL files could contain anything. Skip with log.
             # Bug found by F4 integration tests 2026-05-17.
             if not isinstance(event, dict):
-                print(
+                _warn_once(
+                    str(jsonl_path),
+                    lineno,
                     f"[engram-indexer] non-object JSON in {jsonl_path}:{lineno} "
                     f"(got {type(event).__name__}); skipping",
-                    file=sys.stderr,
                 )
                 continue
 
             event_ts = event.get("ts")
             if event_ts is None:
-                print(
+                _warn_once(
+                    str(jsonl_path),
+                    lineno,
                     f"[engram-indexer] missing 'ts' in {jsonl_path}:{lineno}; skipping",
-                    file=sys.stderr,
                 )
                 continue
 
@@ -222,9 +267,13 @@ def _index_file(conn: sqlite3.Connection, jsonl_path: Path, session_id: str, lev
             conn.execute(_INSERT_EVENT, params)
             rows_inserted += 1
 
-    if rows_inserted > 0:
-        conn.commit()
-
+    # Deliberately no commit here (alpha #2785 item 2, round 2): the sole
+    # caller (run_once) commits once, after it also writes the file_state
+    # row for this file -- rows and file_state land in the SAME
+    # transaction, so a crash between them rolls back both rather than
+    # durably recording file_state while the rows it accounts for are
+    # lost. Two commits per file (as before) doubled lock-acquisition
+    # frequency for no correctness benefit.
     return rows_inserted
 
 
@@ -270,8 +319,18 @@ class Indexer:
         Malformed lines are logged to stderr and skipped.
 
         Returns a summary dict with keys:
-            files_processed, rows_inserted, errors (count of malformed lines
-            is not returned here — it goes to stderr).
+            files_processed — files actually opened and parsed this tick
+                (unchanged-size files are NOT counted here; see
+                files_skipped).
+            files_skipped — files whose on-disk size matched the stored
+                file_state size, or whose stat() failed (vanished mid-tick,
+                or a real I/O error warned via _warn_once) and so were not
+                opened this tick.
+            rows_inserted, errors (count of malformed lines is not returned
+                here — it goes to stderr).
+            file_state_pruned — number of file_state rows removed this
+                tick because their path no longer appears among the
+                session files glob() found (alpha #2785 item 4).
         """
         if logs_dir is None:
             logs_dir = _default_logs_dir()
@@ -288,7 +347,16 @@ class Indexer:
             _init_schema(conn)
 
             files_processed = 0
+            files_skipped = 0
             total_rows_inserted = 0
+
+            # Paths seen this tick across BOTH levels (alpha #2785 item 4:
+            # orphan file_state pruning). Populated from glob() results
+            # directly, not gated on a successful stat() -- a file that
+            # fails to stat (the OSError branch above) still exists on
+            # disk and must not be pruned just because it couldn't be read
+            # this tick.
+            seen_paths: set[str] = set()
 
             # Process l1 and l2 JSONL files — both are indexed (privacy
             # partitioning is the emitter's job; the indexer reads both)
@@ -297,9 +365,103 @@ class Indexer:
                     # Derive session_id from filename: <session_id>.l1.jsonl
                     stem = jsonl_path.name  # e.g. "abc-123.l1.jsonl"
                     session_id = stem[: stem.index(f".l{level}.jsonl")]
+                    path_key = str(jsonl_path)
+                    seen_paths.add(path_key)
+
+                    # Size gate (alpha #2785): stat BEFORE reading, and it is
+                    # this pre-read size -- not a post-read re-stat or EOF
+                    # offset -- that gets persisted below. A post-read stat
+                    # would silently drop any bytes appended DURING the
+                    # read: they'd already be in the file when we re-stat,
+                    # so the gate would record them as already-indexed and
+                    # the next tick would skip them forever. Recording the
+                    # pre-read size means an append landing mid-read is
+                    # simply not yet reflected in the stored size, so the
+                    # next tick sees size > stored and re-parses the whole
+                    # file -- safe, because the ts high-water mark + INSERT
+                    # OR IGNORE make a full re-parse idempotent.
+                    try:
+                        current_size = os.stat(jsonl_path).st_size
+                    except FileNotFoundError:
+                        # File vanished between glob() and stat() -- benign,
+                        # skip silently for this tick rather than
+                        # propagating.
+                        files_skipped += 1
+                        continue
+                    except OSError as exc:
+                        # A real I/O failure (PermissionError,
+                        # IsADirectoryError, disk error, ...) distinct from
+                        # the benign vanished-file case above. Warn once,
+                        # then skip only this file -- never let it
+                        # propagate, which would abort the tick for every
+                        # remaining file. Keyed on lineno=0 (a file-level
+                        # condition, not a line) because per-line warnings
+                        # use real 1-based line numbers, so 0 cannot
+                        # collide with one.
+                        _warn_once(
+                            path_key,
+                            0,
+                            f"[engram-indexer] cannot stat {jsonl_path}: "
+                            f"{exc}; skipping",
+                        )
+                        files_skipped += 1
+                        continue
+
+                    row = conn.execute(
+                        "SELECT size FROM file_state WHERE path = ?",
+                        (path_key,),
+                    ).fetchone()
+                    stored_size = row[0] if row else None
+
+                    if stored_size is not None and current_size == stored_size:
+                        # Unchanged since last tick -- do not open the file.
+                        files_skipped += 1
+                        continue
+
+                    if stored_size is not None and current_size < stored_size:
+                        # Shrink is impossible under the append-only
+                        # invariant (single writer, "a"-mode opens only) --
+                        # something violated it. Don't crash; warn once and
+                        # fall through to re-index like any changed file.
+                        print(
+                            f"[engram-indexer] file shrank: {jsonl_path} "
+                            f"({stored_size} -> {current_size} bytes); "
+                            f"re-indexing",
+                            file=sys.stderr,
+                        )
+
                     rows = _index_file(conn, jsonl_path, session_id, level)
                     files_processed += 1
                     total_rows_inserted += rows
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO file_state (path, size, indexed_at) "
+                        "VALUES (?, ?, ?)",
+                        (path_key, current_size, datetime.now(timezone.utc).isoformat()),
+                    )
+                    conn.commit()
+
+            # Orphan file_state pruning (alpha #2785 item 4): a session
+            # file's row must not outlive the file itself, or file_state
+            # accumulates rows for sessions deleted long ago. Scoped to
+            # seen_paths (the paths this tick's glob() actually returned
+            # across BOTH levels) rather than an os.path.exists() check
+            # per stored row -- same result, no extra stat syscalls, and
+            # it cannot race a file being created mid-tick. Done ONCE here,
+            # after both levels have run, not inside the level loop above:
+            # an l2 file is not orphaned merely because the l1 pass didn't
+            # see it.
+            existing_paths = {
+                row[0] for row in conn.execute("SELECT path FROM file_state").fetchall()
+            }
+            orphaned_paths = existing_paths - seen_paths
+            file_state_pruned = len(orphaned_paths)
+            if orphaned_paths:
+                conn.executemany(
+                    "DELETE FROM file_state WHERE path = ?",
+                    [(p,) for p in orphaned_paths],
+                )
+                conn.commit()
 
             # Drain the WAL to zero (#2571). An immutable=1 reader (viz's
             # /api/stats -- see viz/data/stats.py) ignores -wal entirely, so
@@ -322,7 +484,8 @@ class Indexer:
             # counts and byte sizes are illustrative of one rig, not constants
             # to match against a real index.db.
             # So log the busy status rather than discarding it. No data
-            # is at risk (_index_file commits before this runs) and the state
+            # is at risk (this loop already commits per file, and the
+            # pruning step above commits its own delete) and the state
             # self-heals on the next pass, but a reader that lands inside the
             # window sees a short count, and without this log there is nothing
             # to correlate that against.
@@ -331,7 +494,12 @@ class Indexer:
         finally:
             conn.close()
 
-        return {"files_processed": files_processed, "rows_inserted": total_rows_inserted}
+        return {
+            "files_processed": files_processed,
+            "files_skipped": files_skipped,
+            "rows_inserted": total_rows_inserted,
+            "file_state_pruned": file_state_pruned,
+        }
 
     @staticmethod
     def full_rebuild(logs_dir: Optional[Path] = None) -> dict:
@@ -347,6 +515,13 @@ class Indexer:
         logs_dir = Path(logs_dir)
 
         db_path = logs_dir / "index.db"
+
+        # Clear the in-process warn-once dedup set: a full rebuild is
+        # exactly the "someone is looking" recovery moment the _WARNED_LINES
+        # design comment says should re-report every bad line, not silently
+        # rely on whatever this process happened to have already warned
+        # about before the rebuild was requested.
+        _WARNED_LINES.clear()
 
         # Drop existing index by removing the file (SQLite: simplest reset)
         if db_path.exists():
