@@ -20,7 +20,7 @@ from health import version as health_version  # noqa: E402
 
 class TestFormatVersion:
     def test_default_formats_current_major_minor(self):
-        assert health_version.format_version() == "health-v1.0"
+        assert health_version.format_version() == "health-v1.1"
 
     def test_explicit_args_override_defaults(self):
         assert health_version.format_version(2, 5) == "health-v2.5"
@@ -60,10 +60,12 @@ class TestCurrent:
             health_version.MAJOR, health_version.MINOR
         )
 
-    def test_current_is_health_v1_0_today(self):
-        """Pinned literally, not just structurally — starts at health-v1.0
-        regardless of ENGRAM's own version, per the module docstring."""
-        assert health_version.CURRENT == "health-v1.0"
+    def test_current_is_health_v1_1_today(self):
+        """Pinned literally, not just structurally — health-v1.1 as of
+        engram-alpha#2788's MINOR bump (curve knots moved to curves.json
+        and reshaped to Lei's placeholder curves), regardless of ENGRAM's
+        own version, per the module docstring."""
+        assert health_version.CURRENT == "health-v1.1"
 
     def test_current_never_looks_like_an_engram_build_string(self):
         """The collision this module exists to prevent: no ENGRAM-shaped

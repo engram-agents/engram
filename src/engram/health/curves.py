@@ -44,7 +44,9 @@ work, gated on the D1/D2 rulings still pending with Lei.
 from __future__ import annotations
 
 import functools
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal
 
 
@@ -296,48 +298,107 @@ one.
 
 
 # ---------------------------------------------------------------------------
-# BADNESS_DEFAULT_CURVE — engram-alpha#1991 PR5 ("the dream-side contract"),
-# Kepler's clarification 3, 2026-09-03.
+# BADNESS_DEFAULT_CURVE / GOODNESS_DEFAULT_CURVE — DATA-LOADED from
+# curves.json, not Python literals (engram-alpha#2788, "curve knots as a
+# versioned DATA file (not Python constants) + placeholder identity / 1-x
+# curves so every wiring can be tested before Lei's final shapes").
+#
+# WHY DATA, NOT CODE: a curve's knots are Lei's design-owner call, not an
+# engineering decision — keeping them as hardcoded Python literals mixed
+# load-bearing SHAPE data into the same file as the CurveSpec /
+# piecewise_linear machinery, so every future reshape meant touching (and
+# re-reviewing) code. The knots now live in a sibling DATA file,
+# curves.json, resolved relative to THIS file's own path — never a
+# cwd-relative path (this repo's own CLAUDE.md, "Plugin build restructures
+# code paths", flags exactly this class of silently-wrong-path bug for a
+# different subsystem; the same discipline applies here).
+#
+# VALIDATION: unchanged — ``CurveSpec.__post_init__`` is still the single
+# validation path (monotone knot order, domain/knots consistency); a
+# malformed ``curves.json`` raises through that same constructor, never a
+# second loader-side check.
 # ---------------------------------------------------------------------------
 
-BADNESS_DEFAULT_CURVE = CurveSpec(
-    name="badness_default",
-    knots=((0.0, 1.0), (0.99, 0.01), (1.0, 0.01)),
-    input_domain=(0.0, 1.0),
-    monotone_direction="decreasing",
-    # JUDGMENT CALL (flagged in the PR5 report): no observed_range set here,
-    # unlike LEGACY_GOODNESS_TRANSITION_CURVE's (0.012, 0.105) — that range
-    # is the stale-derivation-rate natural experiment specifically, and this
-    # curve is now shared across the health-v2 model's SIX admitted metrics
-    # (health/model.py), with plausibly very different natural
-    # ranges (embedding_coverage's typical badness rate is not
-    # stale_derivation_rate's). Stamping one metric's observed range onto a
-    # now general-purpose curve would misrepresent it as the shared
-    # normal-operating range for all six; leaving it unset is the honest
-    # default until real per-metric ranges are recorded (this PR's own
-    # "observed_range auto-population" carrier, still out of scope, per
-    # PR4's original deferral).
-    observed_range=None,
-)
-"""The v1 default curve for EVERY admitted metric in health/model.py's
-``MODEL`` (engram-alpha#1991 PR5) — the SAME decreasing piecewise-linear
-shape as ``LEGACY_GOODNESS_TRANSITION_CURVE`` above (``(0.0,1.0) ->
-(0.99,0.01) -> (1.0,0.01)``), reproducing ``health.metrics.
-metric_goodness``'s exact transform rescaled to this library's ``[0,1]``
-contract — see that constant's own docstring for the full derivation; it is
-not repeated here since the shape is byte-for-byte identical.
+CURVES_JSON_PATH = Path(__file__).parent / "curves.json"
+"""Resolved relative to this module's own file, never the process cwd —
+see the module-comment above for why a cwd-relative resolution would be a
+silent path bug (correct today, wrong the moment this module is imported
+from a different working directory)."""
+
+
+def _load_curve_defs(path: Path = CURVES_JSON_PATH) -> dict:
+    """Load and return the raw ``{name: {knots, monotone_direction,
+    provenance}}`` dict from a ``curves.json``-shaped file at ``path``
+    (defaults to this module's own ``curves.json``).
+
+    Exposed as a function — not inlined at module scope — so a test can
+    load an EDITED COPY of the file (a different ``path``) without needing
+    to re-import this module, per engram-alpha#2788's own
+    "edit-the-file-and-watch-the-score" test
+    (tests/test_health_engine_curve_transition.py)."""
+    with path.open() as f:
+        return json.load(f)
+
+
+_CURVE_DEFS: dict = _load_curve_defs()
+
+
+def _curve_from_defs(name: str, defs: dict = _CURVE_DEFS) -> CurveSpec:
+    """Build a ``CurveSpec`` named ``name`` from a loaded curve-defs dict
+    (``defs``, defaulting to this module's own ``_CURVE_DEFS``). Only
+    ``knots`` and ``monotone_direction`` are read from the data — a
+    ``CurveSpec``'s ``input_domain``/``output_range`` stay DERIVED/
+    DEFAULTED by ``__post_init__``, exactly as they were for the hardcoded
+    literals this loader replaces (#2788: "only serialize what's not
+    derivable" — ``curves.json`` does not carry those two fields)."""
+    data = defs[name]
+    return CurveSpec(
+        name=name,
+        knots=tuple(tuple(k) for k in data["knots"]),
+        monotone_direction=data["monotone_direction"],
+    )
+
+
+CURVE_PROVENANCE: dict[str, str] = {
+    name: data["provenance"] for name, data in _CURVE_DEFS.items()
+}
+"""Informational metadata only — deliberately NOT a ``CurveSpec`` field
+(judgment call, engram-alpha#2788: nothing in the property-contract,
+hashing, or snapshot-serialization path needs ``provenance`` on the
+dataclass itself, so widening ``CurveSpec``'s schema for it was rejected in
+favor of this sibling read-only mirror of ``curves.json``'s own
+``provenance`` key — kept available for logging/tooling, e.g. a future
+Curve Workbench display, that wants to say WHY a curve's current shape is
+what it is). ``curves.json`` (and its git history) remains the source of
+truth; this dict is a convenience read of it, not a second copy anything
+else is expected to keep in sync."""
+
+
+BADNESS_DEFAULT_CURVE = _curve_from_defs("badness_default")
+"""The v1 default curve for every admitted "badness-rate" metric in
+health/model.py's ``MODEL`` (engram-alpha#1991 PR5) — DATA-LOADED from
+``curves.json`` (engram-alpha#2788), not a Python literal.
+
+CURRENT SHAPE — ``CURVE_PROVENANCE["badness_default"]`` (2026-09-09, Lei's
+placeholder ruling): decreasing, knots ``((0.0, 1.0), (1.0, 0.0))``, i.e.
+``curve(x) == 1 - x``, the simplest curve satisfying the Layer-3 contract
+in the decreasing direction. This is explicitly a PLACEHOLDER, not a
+considered design — Lei's final shape is still pending; the placeholder
+exists so every metric-to-curve wiring (``MetricBinding``, the composition
+path, the version/derived-hash gates, the property-contract suite) can be
+exercised and tested end-to-end before that final shape lands.
+
+This SUPERSEDES the earlier hand-tuned hardcoded shape (rescaled from
+``health.metrics.metric_goodness``, matching ``LEGACY_GOODNESS_TRANSITION_
+CURVE`` above byte-for-byte) — see that constant's own docstring for the
+retired derivation; it is kept there only as a regression-safety artifact
+for the pre-curve-layer formula, not as this curve's current shape.
 
 WHY A SEPARATE CONSTANT rather than reusing ``LEGACY_GOODNESS_TRANSITION_
-CURVE`` directly (Kepler's clarification 3, "the judgment call, accepted"):
-one curve, shipped under an HONEST v1 name — "badness_default" says what it
-is (the default curve for badness-rate metrics, v1) rather than "legacy" or
-"transition", which would misdescribe its role once it is the REAL curve
-driving REAL scores, not a regression-safety artifact for a formula that no
-longer exists in the composition path. Building it as a genuinely separate
-object (not a ``dataclasses.replace`` of the legacy one) also means
-tests/test_health_engine_curves.py's existing property-contract suite,
-which imports ``LEGACY_GOODNESS_TRANSITION_CURVE`` by name, needs ZERO
-changes — "least churn", per the PR5 spec's explicit preference.
+CURVE`` directly — unchanged rationale from Kepler's PR5 clarification 3:
+one curve, shipped under an HONEST v1 name ("badness_default" says what it
+is) rather than "legacy" or "transition", which would misdescribe its role
+now that it drives REAL scores.
 
 WHAT THIS IS **NOT**: not a claim that one curve shape suits every metric
 forever — see health/model.py's module docstring and its
@@ -347,53 +408,32 @@ scoped by.
 """
 
 
-# ---------------------------------------------------------------------------
-# GOODNESS_DEFAULT_CURVE — engram-alpha#2518 (health-v2 engine: flip
-# Aspect-B (retrievability) signals from badness-complement to literal
-# coverage, with direction moved into the curve). Lei's ruling,
-# 2026-09-03T23:22Z, charge-board record: raw signal = literal meaning of
-# its own name; ALL direction, including polarity, lives in the curve.
-# ---------------------------------------------------------------------------
-
-GOODNESS_DEFAULT_CURVE = CurveSpec(
-    name="goodness_default",
-    knots=((0.0, 0.01), (0.01, 0.01), (1.0, 1.0)),
-    input_domain=(0.0, 1.0),
-    monotone_direction="increasing",
-    # Same reasoning as BADNESS_DEFAULT_CURVE's own observed_range=None
-    # above: no natural-experiment data has been recorded yet for any of
-    # the four literal-coverage metrics this curve now scores
-    # (embedding_coverage, recall_summary_coverage, recall_keywords_
-    # coverage, giant_component_fraction) — leaving it unset is the honest
-    # default until real per-metric ranges exist.
-    observed_range=None,
-)
+GOODNESS_DEFAULT_CURVE = _curve_from_defs("goodness_default")
 """The v1 default curve for the four literal-coverage Aspect-B
 (retrievability) metrics in health/model.py's ``MODEL``
 (``embedding_coverage``, ``recall_summary_coverage``,
-``recall_keywords_coverage``, ``giant_component_fraction``) — bound as
-``"goodness_default"`` in that module's ``CURVES`` registry, replacing
-``"badness_default"`` on exactly those four ``MetricBinding``s.
+``recall_keywords_coverage``, ``giant_component_fraction``) — DATA-LOADED
+from ``curves.json`` (engram-alpha#2788), not a Python literal. Bound as
+``"goodness_default"`` in ``health/model.py``'s ``CURVES`` registry,
+engram-alpha#2518.
 
-MIRROR DERIVATION (so a future reader can re-verify these knots without
-re-deriving from scratch): this is NOT a new curve shape — it is
-``BADNESS_DEFAULT_CURVE`` reflected through the badness/coverage identity
-``c = 1 - r``, chosen so the SAME underlying badness level always produces
-the SAME score whether read through the old badness-rate signal or the new
-literal-coverage signal (i.e. an unchanged graph's composed score does not
-move because of this PR). Concretely, for every literal-coverage input
-``c`` this curve must satisfy ``g(c) == f(1 - c)``, where ``f`` is
-``BADNESS_DEFAULT_CURVE``'s own ``curve_fn`` (knots
-``((0.0, 1.0), (0.99, 0.01), (1.0, 0.01))`` on badness-rate input ``r``).
-Evaluating that identity at ``f``'s own three knots gives this curve's three
-knots directly: ``g(0.0) = f(1.0) = 0.01``; ``g(0.01) = f(0.99) = 0.01``;
-``g(1.0) = f(0.0) = 1.0`` — already in increasing-``c`` order, no
-re-sorting needed. Verified by direct computation (both curve functions
-evaluated and compared, not just algebraically reasoned) at
-``c in {0.0, 0.005, 0.01, 0.02, 0.3, 0.5, 0.7, 0.9, 0.99, 0.995, 1.0}``,
-matching to floating-point precision at every sample; the same property is
-pinned as a permanent regression test in
-tests/test_health_engine_curves.py.
+CURRENT SHAPE — ``CURVE_PROVENANCE["goodness_default"]`` (2026-09-09,
+Lei's placeholder ruling): increasing, knots ``((0.0, 0.0), (1.0, 1.0))``,
+i.e. the identity curve, ``curve(x) == x``. Explicitly a PLACEHOLDER (see
+``BADNESS_DEFAULT_CURVE``'s own docstring for why one exists at all);
+Lei's final shape is still pending.
+
+STILL AN EXACT MIRROR of ``BADNESS_DEFAULT_CURVE`` — by construction of
+the two placeholder shapes, not a hand-derivation step: for every ``c``,
+``GOODNESS_DEFAULT_CURVE.curve_fn(c) == BADNESS_DEFAULT_CURVE.curve_fn(1 -
+c)`` still holds (``identity(c) == c == 1 - (1 - c)``, and ``1 - (1 - c)``
+is exactly what ``BADNESS_DEFAULT_CURVE.curve_fn(1 - c)`` computes), so an
+unchanged graph's composed score still does not move between the
+badness-rate and literal-coverage readings of a metric — pinned as a
+permanent regression test in tests/test_health_engine_curves.py, unaffected
+by this data-file migration. This supersedes the earlier hand-derived
+mirror (worked out against the pre-#2788 ``BADNESS_DEFAULT_CURVE``'s own
+three knots); see git history for that derivation.
 """
 
 

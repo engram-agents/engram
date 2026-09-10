@@ -1,0 +1,12 @@
+{
+  "badness_default": {
+    "knots": [[0.0, 1.0], [1.0, 0.0]],
+    "monotone_direction": "decreasing",
+    "provenance": "placeholder — Lei 2026-09-09: identity / 1-x until final shapes"
+  },
+  "goodness_default": {
+    "knots": [[0.0, 0.0], [1.0, 1.0]],
+    "monotone_direction": "increasing",
+    "provenance": "placeholder — Lei 2026-09-09: identity / 1-x until final shapes"
+  }
+}

@@ -99,14 +99,21 @@ _TRIVIAL_INCREASING_CURVE = CurveSpec(
 )
 
 # GOODNESS_DEFAULT_CURVE (engram-alpha#2518) is the shipped increasing
-# mirror of BADNESS_DEFAULT_CURVE — genuinely NEW as of this PR (unlike
-# BADNESS_DEFAULT_CURVE itself, whose shape is byte-for-byte identical to
-# LEGACY_GOODNESS_TRANSITION_CURVE above and so has no separate entry here),
-# so it gets its own property-contract coverage.
+# mirror of BADNESS_DEFAULT_CURVE, with its own property-contract coverage
+# below.
+#
+# BADNESS_DEFAULT_CURVE itself: prior to engram-alpha#2788, its shape was
+# byte-for-byte identical to LEGACY_GOODNESS_TRANSITION_CURVE above, so it
+# had no separate entry here — the legacy curve's coverage stood in for it.
+# As of #2788, BADNESS_DEFAULT_CURVE is DATA-LOADED from curves.json and
+# ships Lei's placeholder ``1 - x`` shape, genuinely different from the
+# legacy curve's three-knot floor shape — so it now gets its own explicit
+# entry rather than relying on that coincidence.
 _ALL_CURVE_SPECS: tuple[CurveSpec, ...] = (
     LEGACY_GOODNESS_TRANSITION_CURVE,
     _TRIVIAL_INCREASING_CURVE,
     GOODNESS_DEFAULT_CURVE,
+    BADNESS_DEFAULT_CURVE,
 )
 
 
@@ -288,11 +295,12 @@ class TestGoodnessDefaultCurveMirrorsBadnessDefault:
             ), f"mirror identity failed at c={c}"
 
     def test_knots_match_hand_derivation(self):
-        """Pins the exact three knots derived in GOODNESS_DEFAULT_CURVE's
-        own docstring (health/curves.py), so a future edit to either
-        curve's knots is caught here even if the dense mirror-identity
-        check above were ever weakened."""
-        assert GOODNESS_DEFAULT_CURVE.curve_fn(0.0) == pytest.approx(0.01)
+        """Pins the exact knots declared in curves.json for
+        ``goodness_default`` (currently Lei's placeholder identity curve,
+        engram-alpha#2788), so a future edit to either curve's knots is
+        caught here even if the dense mirror-identity check above were
+        ever weakened."""
+        assert GOODNESS_DEFAULT_CURVE.curve_fn(0.0) == pytest.approx(0.0)
         assert GOODNESS_DEFAULT_CURVE.curve_fn(0.01) == pytest.approx(0.01)
         assert GOODNESS_DEFAULT_CURVE.curve_fn(1.0) == pytest.approx(1.0)
 

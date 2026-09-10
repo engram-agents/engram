@@ -71,10 +71,14 @@ whenever a measurement in ``health.measurements.MEASUREMENTS`` is added,
 removed, or redefined — enforced mechanically by the L0 hash gate
 (``tests/test_health_measurements.py``), not left to memory."""
 
-MINOR = 0
+MINOR = 1
 """Identity of everything DERIVED from L0 — formulas, curves, importances,
-aspect points, the unavailability policy. Slice 1 introduces no derived
-layer changes, so this starts at 0 and is not this PR's to bump."""
+aspect points, the unavailability policy. Started at 0 (slice 1 introduced
+no derived-layer changes); bumped to 1 by engram-alpha#2788 (curve knots
+moved to a versioned data file, curves.json, and reshaped to Lei's
+placeholder identity/``1 - x`` curves) — a curve reshape is exactly the
+class of change this counter exists to track, per the derived-layer hash
+gate in tests/test_health_measurements.py."""
 
 
 def format_version(major: int = MAJOR, minor: int = MINOR) -> str:

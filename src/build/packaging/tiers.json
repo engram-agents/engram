@@ -112,6 +112,10 @@
       "tier": "essential"
     },
     {
+      "path": "health/curves.json",
+      "tier": "essential"
+    },
+    {
       "path": "health/model.py",
       "tier": "essential"
     },

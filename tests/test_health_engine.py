@@ -1142,12 +1142,13 @@ class TestBuildSnapshot:
         binding = hem_model.METRIC_BY_SIGNAL["open_contradiction_rate"]
         curve = health_engine.MODEL.curves[binding.curve]
         assert snap["scores"]["metrics"]["open_contradiction_rate"] == curve.curve_fn(raw)
-        # Numerically, badness_default's shape still matches the OLD
-        # metric_goodness transform divided by 100 (by construction — see
-        # health/curves.py's BADNESS_DEFAULT_CURVE docstring) — this
-        # is the one place the old and new numbers stay directly comparable.
+        # As of engram-alpha#2788, badness_default is DATA-LOADED from
+        # curves.json and ships Lei's placeholder curve(x) == 1 - x, not
+        # the earlier hand-tuned reproduction of the retired
+        # metric_goodness transform — pin against that explicit
+        # placeholder shape instead.
         assert snap["scores"]["metrics"]["open_contradiction_rate"] == pytest.approx(
-            hem.metric_goodness(raw) / 100.0
+            1.0 - raw
         )
 
 
@@ -1710,8 +1711,12 @@ class TestDreamProjection:
         projection2 = json.loads(open(snap2["_dream_projection_path"], encoding="utf-8").read())
         entry = projection2["metrics"]["stale_derivation_rate"]
         assert entry["signal"] == 1.0
-        assert entry["score"] == pytest.approx(0.01)  # badness_default floor
-        assert entry["delta_since_last"] == pytest.approx(0.01 - 1.0)
+        # As of engram-alpha#2788, badness_default is the DATA-LOADED
+        # placeholder curve(x) == 1 - x (curves.json) -- no floor anymore,
+        # so a rate of 1.0 scores exactly 0.0 (was the 0.01 floor under
+        # the old hand-tuned shape).
+        assert entry["score"] == pytest.approx(0.0)  # badness_default(1.0) == 1 - 1.0
+        assert entry["delta_since_last"] == pytest.approx(0.0 - 1.0)
 
     def test_unavailable_signal_projects_as_the_string_literal(self, tmp_path, monkeypatch):
         """Empty graph -> most metrics UNAVAILABLE — the projection must

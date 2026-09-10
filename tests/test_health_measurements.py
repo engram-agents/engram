@@ -448,7 +448,11 @@ class TestDerivedHashGate:
     from health import measurements as h; print(h.canonical_derived_hash())"``,
     paste the new digest below, in the SAME commit as the bump."""
 
-    _PINNED_DERIVED_HASH = "ba666b45f29b37f0927f5deeec42c3dd6e83bd7f528b30633820c83fb0cac35b"
+    _PINNED_DERIVED_HASH = "9f9c135ae176ba90bf140993c3e6ab129127f014e618deef727b4cc2ab461087"
+    # Re-pinned by engram-alpha#2788 (curve knots moved to curves.json,
+    # reshaped to Lei's 2026-09-09 placeholder identity/1-x curves) in the
+    # same commit as health.version.MINOR's bump to 1, per this class's own
+    # docstring instructions.
 
     def test_derived_set_hash_matches_pinned_value(self):
         computed = hem_l0.canonical_derived_hash()
@@ -476,13 +480,19 @@ class TestDerivedHashGate:
 
         some_name = next(iter(health_model.MODEL_SPEC.curves))
         original = health_model.MODEL_SPEC.curves[some_name]
-        # A genuinely different, still-valid (sorted, non-degenerate) knot
-        # sequence over the same domain and direction — reshapes the curve
-        # without touching any OTHER declared field on it.
+        # A genuinely different, still-valid (sorted x, same domain and
+        # direction) knot sequence — nudges the FINAL knot's y by a small
+        # epsilon, which stays a real reshape no matter how many knots the
+        # curve currently has. (Engram-alpha#2788 shrank badness_default —
+        # the first curve in this dict, hence `some_name` here — to two
+        # knots, which made the PREVIOUS "keep only the first and last
+        # knot" construction a no-op for a curve that already had only
+        # two; nudging a y-value instead of dropping knots is robust to
+        # knot count.)
+        last_x, last_y = original.knots[-1]
         reshaped = CurveSpec(
             name=original.name,
-            knots=((original.knots[0][0], original.knots[0][1]),
-                   (original.knots[-1][0], original.knots[-1][1])),
+            knots=original.knots[:-1] + ((last_x, last_y + 0.001),),
             monotone_direction=original.monotone_direction,
             output_range=original.output_range,
         )

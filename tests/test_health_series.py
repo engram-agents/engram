@@ -2927,43 +2927,58 @@ def test_derive_false_positive_control_config_mutation_still_agrees(tmp_path):
 
 
 def test_derive_versions_independently_recomputed_d41(tmp_path):
+    # `current_v`/`next_v` (not hardcoded "health-v1.0"/"health-v1.1"
+    # literals): `current_v` must equal `health.version.CURRENT` for r1's
+    # seed-from-live branch to fire at all (derive()'s own contract); a
+    # hardcoded "health-v1.0" broke this test the moment CURRENT moved past
+    # it (engram-alpha#2788's MINOR bump). `next_v` only needs to differ
+    # from `current_v` -- "health-v1.99" is a deliberately synthetic label
+    # (same convention as this file's "health-v9.9"/"health-v0.9" elsewhere)
+    # that can't collide with a real CURRENT for a long time.
+    current_v = series.health_version_module.CURRENT
+    next_v = "health-v1.99"
+
     repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
 
-    r1 = series.derive(db_path, health_version="health-v1.0", snapshots_dir=snapshots_dir)
+    r1 = series.derive(db_path, health_version=current_v, snapshots_dir=snapshots_dir)
     assert r1["status"] == "ok"
     conn = series.open_store(db_path)
     v1_rows_before = {
         (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
         for r in conn.execute(
             "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
-            "WHERE health_version = 'health-v1.0'"
+            "WHERE health_version = ?",
+            (current_v,),
         ).fetchall()
     }
 
-    # Insert a synthetic health-v1.1 declaration with different curve knots.
+    # Insert a synthetic next-version declaration with different curve knots.
     signal_defs = conn.execute(
-        "SELECT signal_defs FROM declarations WHERE health_version = 'health-v1.0'"
+        "SELECT signal_defs FROM declarations WHERE health_version = ?",
+        (current_v,),
     ).fetchone()["signal_defs"]
     curve_defs = json.loads(
         conn.execute(
-            "SELECT curve_defs FROM declarations WHERE health_version = 'health-v1.0'"
+            "SELECT curve_defs FROM declarations WHERE health_version = ?",
+            (current_v,),
         ).fetchone()["curve_defs"]
     )
     model_defs = conn.execute(
-        "SELECT model_defs FROM declarations WHERE health_version = 'health-v1.0'"
+        "SELECT model_defs FROM declarations WHERE health_version = ?",
+        (current_v,),
     ).fetchone()["model_defs"]
     for spec in curve_defs.values():
         spec["knots"][0] = [spec["knots"][0][0], 1.0 - spec["knots"][0][1]]
     conn.execute(
         "INSERT INTO declarations (health_version, signal_defs, curve_defs, config, "
         "model_defs, first_seen_commit, first_seen_file, engine_build) "
-        "VALUES ('health-v1.1', ?, ?, '{}', ?, NULL, 'synthetic', 'test')",
-        (signal_defs, json.dumps(curve_defs), model_defs),
+        "VALUES (?, ?, ?, '{}', ?, NULL, 'synthetic', 'test')",
+        (next_v, signal_defs, json.dumps(curve_defs), model_defs),
     )
     conn.commit()
     conn.close()
 
-    r2 = series.derive(db_path, health_version="health-v1.1", snapshots_dir=snapshots_dir)
+    r2 = series.derive(db_path, health_version=next_v, snapshots_dir=snapshots_dir)
     assert r2["status"] == "ok"
 
     conn = series.open_store(db_path)
@@ -2971,14 +2986,16 @@ def test_derive_versions_independently_recomputed_d41(tmp_path):
         (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
         for r in conn.execute(
             "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
-            "WHERE health_version = 'health-v1.0'"
+            "WHERE health_version = ?",
+            (current_v,),
         ).fetchall()
     }
     v11_rows = {
         (r["commit_sha"], r["l0_source"]): (r["signals"], r["scores"])
         for r in conn.execute(
             "SELECT commit_sha, l0_source, signals, scores FROM derived_points "
-            "WHERE health_version = 'health-v1.1'"
+            "WHERE health_version = ?",
+            (next_v,),
         ).fetchall()
     }
     conn.close()
@@ -3237,7 +3254,11 @@ def test_export_shape_ordering_num_den_unreplayable_and_signal_filter(tmp_path):
     series.derive(db_path, snapshots_dir=snapshots_dir)
 
     ex = series.export(db_path)
-    assert ex["version"] == "health-v1.0"
+    # Not a hardcoded "health-v1.0" literal -- derive() above seeds from
+    # the live CURRENT version, so the exported version must match it
+    # dynamically (a hardcoded literal broke this test the moment CURRENT
+    # moved past it, engram-alpha#2788's MINOR bump).
+    assert ex["version"] == series.health_version_module.CURRENT
     assert set(ex.keys()) == {"version", "replay_decl_hash", "signals", "aspects", "composed", "scores_available"}
     assert set(ex["signals"].keys()) == set(snap["signal_defs"].keys())
 
