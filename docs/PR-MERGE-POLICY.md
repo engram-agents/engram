@@ -136,6 +136,20 @@ mechanism, not luck:
   the literal strings are not broken links). Two holders taking rungs of one stack
   independently is how a base gets deleted under an open PR or a rung merges
   onto a tip its CI never saw.
+- **Security PRs — Mira's approval is the merge gate, not Lei.** Two
+  directions, attributed separately by provenance event — both verbatim
+  Lei, quote-verified against the session transcript: Borges's security PRs
+  → Kepler's mechanical merge on Mira's exact-tip approval + CI green (Lei,
+  2026-09-09 23:50Z, verbatim, relayed by Kepler: *"Yes, go ahead and merge
+  Borges's security PRs yourself once Mira approves."*); security PRs
+  Kepler's seat cannot verify → Borges merges, same gates (Lei, 2026-09-09
+  23:29Z, verbatim, relayed by Kepler: *"for security-specific PRs, if you
+  can't verify it yourself, you can ask Borges to merge in those cases"* —
+  *"asking me to merge is purely formality in these technical cases"*). No
+  security-PR merge click goes to Lei under this ruling — a narrow exception
+  scoped to PRs Mira has reviewed; it does not relax the ⛔ list below for a
+  security PR that also carries substrate-concept changes outside Mira's
+  review scope.
 
 So "flip to Lei for substrate" is an **engram-alpha** rule. Do not extend it to a delegated-authority repo; do not relax it inside engram-alpha. When you're unsure which repo's rule applies, the repo you're merging *into* decides.
 
