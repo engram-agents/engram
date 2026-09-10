@@ -95,6 +95,7 @@ never picked silently.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -272,6 +273,46 @@ def _read_pinned_derived_hash_at_tag(repo_path, tag: str) -> str | None:
     )
 
 
+def _read_tag_creation_info(repo_path, tag: str) -> tuple[str, str]:
+    """Read ``(objecttype, taggerdate_unix)`` for ``tag`` via ``git
+    for-each-ref`` (engram-alpha#2796, Lei's ruling 2026-09-10 13:17Z --
+    exact command form: ``git for-each-ref --format='%(objecttype)
+    %(taggerdate:unix) %(refname:short)'``). Never ``git log`` or the
+    underlying commit's own date -- the tag object's tagger date is a
+    DIFFERENT clock from the commit it points at (measured on this repo's
+    real tags: ``v0.3.2``'s tagger date is 16 days after its commit date,
+    which is exactly why the *tagger* date is the tag's creation time, not
+    the commit date).
+
+    ``objecttype`` is ``"tag"`` for an ANNOTATED tag (a real tag object
+    exists, hence a tagger date) and ``"commit"`` for a LIGHTWEIGHT tag
+    (the ref points straight at the commit -- no tag object, no tagger
+    date at all; ``taggerdate_unix`` is then the empty string).
+
+    Exact-ref lookup (``refs/tags/<tag>``), not a glob pattern --
+    ``deployable_tags`` has already confirmed the ref exists, so an empty
+    result here is a plumbing failure, not a legitimate "tag absent" case,
+    and raises loudly rather than being read as such."""
+    result = _git(
+        repo_path,
+        [
+            "for-each-ref",
+            "--format=%(objecttype) %(taggerdate:unix)",
+            f"refs/tags/{tag}",
+        ],
+    )
+    result.check_returncode()
+    line = result.stdout.strip()
+    if not line:
+        raise RuntimeError(
+            f"git for-each-ref returned nothing for refs/tags/{tag!r} -- "
+            f"expected an existing ref (deployable_tags already enumerated "
+            f"it as one)"
+        )
+    objecttype, _, taggerdate = line.partition(" ")
+    return objecttype, taggerdate
+
+
 def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
     """Resolve T = (max (MAJOR, MINOR), the tag it came from, its pinned L0
     hash, its pinned derived hash [Gap 2]) over the deployable tag set.
@@ -289,6 +330,68 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
     different pinned L0 hashes, different pinned NON-``None`` derived
     hashes, or on a tag that has version.py but no L0 pin constant (the
     derived pin constant is exempt from this raise — see above).
+
+    Tie-break (engram-alpha#2796, Lei's ruling 2026-09-10 13:17Z --
+    SUPERSEDES an earlier pin-preference tie-break tried on this same
+    issue): when multiple tags survive the agreement checks above at the
+    max version (so every non-``None`` derived hash among them, and every
+    L0 hash among them, is already guaranteed identical), the tag CHOSEN
+    TO REPORT is the one with the LATEST tag CREATION time -- its own
+    ``%(taggerdate:unix)`` -- never lexical order, and never a preference
+    for whichever tag happens to carry a derived pin. Lei's own words,
+    ruling out both of those: "Lexical is arbitrary, don't use that. Can
+    we get the tag creation time? Can we use the most recent one?" The
+    tagger date is the tag OBJECT's own creation timestamp, a clock
+    distinct from the commit it points at -- measured on this repo's real
+    tags, ``v0.3.2``'s tagger date is 16 days after its commit date.
+
+    This selection only ever runs when a genuine tie exists (more than one
+    tag survives to this point) -- a single tag at the max version is
+    trivially T, whether or not it happens to be a lightweight tag; there
+    is nothing to disambiguate, so nothing about it is inspected. Once a
+    tie genuinely exists, two states are refused loudly rather than
+    silently resolved (Lei's ruling, via Kepler: "Both are operational
+    defects in the tag set, not a bootstrap."):
+
+    - a candidate is a LIGHTWEIGHT tag (no tag object, hence no tagger
+      date to compare it by) -- the tie cannot be broken by creation time
+      at all;
+    - two or more candidates share an IDENTICAL tagger timestamp -- the
+      tie cannot be broken by creation time either, since there is no
+      unique latest.
+
+    The raises above do NOT guarantee this choice is inert on the derived
+    hash (Ariadne's colleague-review catch on this PR): they guarantee
+    every candidate's L0 hash agrees, and that any two candidates who both
+    carry a non-``None`` derived pin agree with EACH OTHER -- but a
+    candidate with no pin at all (``None``) is excluded from that
+    agreement check entirely, so a ``None`` candidate can tie against a
+    pinned one without raising. Picking between them is exactly the
+    difference that matters: it is what determines whether
+    ``required_severity`` has a derived baseline to compare against at
+    all. On today's live tag set the most-recent tag by tagger date
+    happens to be the pinned one, so the choice is inert THERE -- but that
+    is a fact about today's tags, not a guarantee this function enforces.
+    Which is the actual argument for "most recent wins": it is the one
+    rule among the ties that keeps pace with which tag is newest, so a
+    freshly pin-carrying tag is picked the moment it exists rather than
+    depending on luck.
+
+    This tie-break is still the missing link Ariadne's colleague review
+    diagnosed on #2796, restated for the corrected mechanism: before this
+    fix, ``required_severity``'s own docstring described a self-clearing
+    bootstrap ("a MINOR-worthy change is invisible until a new tag lands
+    carrying the derived pin"), but nothing connected a new tag's ARRIVAL
+    to WHICH tag this function selected -- a same-version tag set could
+    accumulate a pin-carrying tag and this function would still never
+    report it, because a fixed rule (lexical order, or a pin-preference
+    that ignores recency) does not track which tag is actually the
+    newest. Selecting by tag creation time closes that loop directly:
+    whichever tag was cut MOST RECENTLY at a given version is always the
+    one reported as T, so the bootstrap clears itself the moment any new
+    tag is cut at that version -- with a derived pin or without one,
+    since T is now simply "the current state at this version," not a
+    guess about which tag looks more authoritative.
     """
     tags = deployable_tags(repo_path)
     versions: dict[str, tuple[int, int]] = {}
@@ -324,6 +427,15 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
             f"{sorted(hashes.items())}"
         )
 
+    # This raise -- and the L0-agreement raise above it -- must keep seeing
+    # EVERY tag at max version, pinned or not: both loop over the full,
+    # unfiltered tags_at_max built above, never a subset pre-filtered to
+    # pinned tags. Two pinned tags at max is a state this repo will
+    # genuinely enter at the next tag cut, and filtering tags_at_max before
+    # this point (the "obvious" but wrong way to implement the tie-break
+    # below) silently drops this check -- and the broken-tag raise above --
+    # for whatever gets filtered out (#2796, Ariadne's colleague-review
+    # finding; see the two-armed mutation control in the falsifier suite).
     unique_derived = {v for v in derived_hashes.values() if v is not None}
     if len(unique_derived) > 1:
         raise RuntimeError(
@@ -332,7 +444,42 @@ def resolve_T(repo_path) -> tuple[tuple[int, int], str, str, str | None] | None:
             f"{sorted(derived_hashes.items())}"
         )
 
-    chosen_tag = tags_at_max[0]
+    # Tie-break (see the docstring's "Tie-break" paragraph): most-recent
+    # tag by CREATION time wins, never lexical order, never pin
+    # preference. Only exercised when a genuine tie exists -- a single
+    # candidate is trivially chosen, whether or not it is lightweight;
+    # there is nothing to disambiguate.
+    if len(tags_at_max) == 1:
+        chosen_tag = tags_at_max[0]
+    else:
+        tagger_dates: dict[str, int] = {}
+        for tag in tags_at_max:
+            objecttype, taggerdate_str = _read_tag_creation_info(repo_path, tag)
+            if objecttype != "tag":
+                raise RuntimeError(
+                    f"deployable tag {tag!r} is one of {len(tags_at_max)} "
+                    f"tags tied at max version {max_version} but is a "
+                    f"LIGHTWEIGHT tag (objecttype {objecttype!r}, no tagger "
+                    f"date) — the tie cannot be broken by tag creation "
+                    f"time; corrupted tag set, not a bootstrap: "
+                    f"{sorted(tags_at_max)}"
+                )
+            tagger_dates[tag] = int(taggerdate_str)
+
+        dates_seen: dict[int, list[str]] = {}
+        for tag, date in tagger_dates.items():
+            dates_seen.setdefault(date, []).append(tag)
+        for date, tags_sharing_date in dates_seen.items():
+            if len(tags_sharing_date) > 1:
+                raise RuntimeError(
+                    f"deployable tags at max version {max_version} share "
+                    f"an identical tagger timestamp ({date}) — the tie "
+                    f"cannot be broken by tag creation time; corrupted "
+                    f"tag set: {sorted(tags_sharing_date)}"
+                )
+
+        chosen_tag = max(tags_at_max, key=lambda t: tagger_dates[t])
+
     return max_version, chosen_tag, hashes[chosen_tag], derived_hashes[chosen_tag]
 
 
@@ -421,7 +568,13 @@ def _illegal_verdict(t: tuple[int, int], s: tuple[int, int], tag: str | None = N
     return "DENY", _name_t(message, t, tag)
 
 
-def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple[str, str]:
+def verdict(
+    b: str,
+    r: str,
+    t: tuple[int, int],
+    tag: str | None = None,
+    derived_available: bool = True,
+) -> tuple[str, str]:
     """The ADEQUACY comparison B vs R, with the exact target version named
     in every DENY message (never just "bump the version"). ``t`` is needed
     (beyond the bare (b, r) pair) purely to render the concrete target
@@ -431,6 +584,36 @@ def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple
     ``tag`` (the deployable tag T came from) is threaded through so that,
     once a real tag exists, every PASS/DENY message names ``T`` -- see
     ``_name_t``.
+
+    ``derived_available`` (engram-alpha#2793) disambiguates the underlying
+    THREE states ``required_severity`` can now be in (Ariadne's
+    colleague-review framing, folded in from #2796: collapsing the middle
+    one into the first is exactly what produced the #2794 detour) --
+
+    (a) **compared and genuinely equal**: T carries a derived pin, HEAD's
+        derived hash was compared against it, and they matched
+        (``derived_available=True``, the default).
+    (b) **no derived pin exists at T's tag**: ``required_severity`` degraded
+        to L0-only because T's tag predates Gap 2 and carries no
+        ``_PINNED_DERIVED_HASH`` (its L0 pin still exists -- only the
+        derived pin is ever absent, per ``_read_pinned_derived_hash_at_tag``'s
+        ``required=False``), so the derived hash was never compared at all
+        (``derived_available=False``).
+    (c) **compared against a pin, and it differs**: this is ``r ==
+        "MINOR"``, not ``"NONE"`` -- it is already unambiguous (the MINOR
+        message names the derived-layer difference directly) and needs no
+        flag, since ``required_severity`` can only ever return ``"MINOR"``
+        when a derived pin existed to compare against in the first place.
+
+    So ``r == "NONE"`` alone conflates (a) and (b) -- both parameters
+    together (``r``, ``derived_available``) recover all three states. This
+    flag disambiguates ONLY the ``r == "NONE"``-reachable DENY messages
+    below, which otherwise falsely claim "the derived-layer hash does not
+    differ from the tagged commit" in case (b), when in fact it was never
+    checked because there was nothing to check it against. It changes ONLY
+    the phrasing of those messages in case (b) -- it never changes
+    ``status``, and it never touches any PASS-path message or the case-(a)
+    wording.
 
     Precondition: b must already be well-formed (NONE/MINOR/MAJOR) — an
     ILLEGAL b must be handled by _illegal_verdict before R is ever computed,
@@ -483,12 +666,26 @@ def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple
         # does. Gap 2 (derived-layer hash) makes this a genuine, checked
         # "no" -- pre-Gap-2 this branch could only ever say the gate
         # COULDN'T see a cause; now it has actually looked and found none.
-        message = (
-            f"version bumped without cause — neither the L0 hash nor the "
-            f"derived-layer hash differs from the tagged commit. Revert "
-            f"MAJOR.MINOR to {tmaj}.{tmin}. If this IS a derived-layer "
-            f"change, say so on the PR rather than reverting."
-        )
+        if derived_available:
+            message = (
+                f"version bumped without cause — neither the L0 hash nor the "
+                f"derived-layer hash differs from the tagged commit. Revert "
+                f"MAJOR.MINOR to {tmaj}.{tmin}. If this IS a derived-layer "
+                f"change, say so on the PR rather than reverting."
+            )
+        else:
+            # #2793: r == "NONE" here because required_severity degraded to
+            # L0-only (T's tag predates Gap 2, no derived pin) -- the
+            # derived hash was never compared, so it is false to claim it
+            # "does not differ". Name the real reason instead.
+            message = (
+                f"version bumped without cause — the L0 hash does not "
+                f"differ from the tagged commit, and the derived-layer hash "
+                f"has no baseline to compare against yet (T's tag predates "
+                f"Gap 2). Revert MAJOR.MINOR to {tmaj}.{tmin}. If this IS a "
+                f"derived-layer change, say so on the PR rather than "
+                f"reverting."
+            )
     else:
         # b == "MAJOR", r in ("NONE", "MINOR") -- over-severity, the hard
         # DENY (Lei's 2026-09-04 20:01Z ruling on #2563): an unnecessary
@@ -499,13 +696,27 @@ def verdict(b: str, r: str, t: tuple[int, int], tag: str | None = None) -> tuple
         # MAJOR when only a derived-layer change occurred is the same
         # needless invalidation, one severity level over.
         target = f"{tmaj}.{tmin}" if r == "NONE" else f"{tmaj}.{tmin + 1}"
-        cause = (
-            "no MAJOR- or MINOR-worthy change occurred (neither the L0 nor "
-            "the derived-layer hash differs from the tagged commit)"
-            if r == "NONE" else
-            "only a derived-layer (MINOR-worthy) change occurred — the L0 "
-            "hash matches the tagged commit"
-        )
+        if r == "NONE" and derived_available:
+            cause = (
+                "no MAJOR- or MINOR-worthy change occurred (neither the L0 "
+                "nor the derived-layer hash differs from the tagged commit)"
+            )
+        elif r == "NONE":
+            # #2793: same conflation as the "bumped without cause" branch
+            # above, reachable via the identical r == "NONE"-degraded-from-
+            # unavailable path -- do not claim the derived hash "does not
+            # differ" when it was never compared.
+            cause = (
+                "no MAJOR-worthy change occurred (the L0 hash does not "
+                "differ from the tagged commit) — the derived-layer hash "
+                "has no baseline to compare against yet (T's tag predates "
+                "Gap 2)"
+            )
+        else:  # r == "MINOR" -- always derived_available=True, unambiguous
+            cause = (
+                "only a derived-layer (MINOR-worthy) change occurred — the L0 "
+                "hash matches the tagged commit"
+            )
         message = (
             f"over-severity — MAJOR staged but {cause}. This needlessly "
             f"invalidates snapshot history from the previous major version "
@@ -536,17 +747,22 @@ def evaluate_gate(
 
     ``get_derived_hash_at_t`` may return ``None`` (T's tag predates Gap 2)
     -- ``required_severity`` degrades to L0-only in that case; see its own
-    docstring."""
+    docstring. That same ``None``-ness is captured once here (as
+    ``derived_available``, #2793) and threaded into ``verdict`` so its
+    ``r == "NONE"``-reachable DENY messages can distinguish "compared and
+    genuinely equal" from "no derived baseline existed to compare against"
+    -- see ``verdict``'s own docstring for the full three-state framing."""
     b = classify_delta(t, s)
     if b == "ILLEGAL":
         return _illegal_verdict(t, s, tag=tag)
+    derived_hash_at_t = get_derived_hash_at_t()
     r = required_severity(
         get_l0_hash_head(),
         get_l0_hash_at_t(),
         get_derived_hash_head(),
-        get_derived_hash_at_t(),
+        derived_hash_at_t,
     )
-    return verdict(b, r, t, tag=tag)
+    return verdict(b, r, t, tag=tag, derived_available=derived_hash_at_t is not None)
 
 
 INACTIVE_MESSAGE = "no tagged health version yet — gate inactive"
@@ -660,6 +876,28 @@ def _git_run(repo: Path, *args: str) -> None:
     )
 
 
+def _git_tag_annotated(repo: Path, tag: str, *, committer_date: str) -> None:
+    """Create an ANNOTATED tag (``git tag -a``) at HEAD with a CONTROLLED
+    tagger date, via ``GIT_COMMITTER_DATE`` -- empirically verified (not
+    assumed) as the env var that moves an annotated tag's own tagger date:
+    a scratch-repo probe showed ``GIT_COMMITTER_DATE=2020-01-01T00:00:00``
+    on ``git tag -a`` produces ``%(taggerdate:unix)`` == 1577854800 (the
+    exact instant requested), while ``GIT_AUTHOR_DATE`` alone has NO
+    effect on a tag's tagger date at all (a tag object has no author
+    field -- only a tagger, populated the same way a commit's COMMITTER
+    is, never its author). ``committer_date`` accepts any date string
+    ``git`` itself parses (e.g. ``"2026-09-05T00:00:00"``)."""
+    env = dict(os.environ)
+    env["GIT_COMMITTER_DATE"] = committer_date
+    subprocess.run(
+        ["git", "-C", str(repo), "tag", "-a", tag, "-m", f"tag {tag}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
 def _init_scratch_repo(tmp_path: Path, major: int, minor: int, pinned_hash: str, tag: str) -> Path:
     """A scratch git repo with a fake version.py + pin test, committed and
     tagged at (major, minor) / pinned_hash."""
@@ -745,6 +983,69 @@ def test_over_severity_is_a_hard_deny():
     assert "snapshot" in msg_lower
     assert "unrecoverable" in msg_lower
     assert status != "WARN"
+
+
+# --- verdict() derived_available message falsifiers (engram-alpha#2793) ---
+# Direct verdict() calls, not evaluate_gate: these exercise the two
+# r == "NONE"-reachable DENY branches under BOTH derived_available states,
+# to prove (a) the new "unavailable" phrasing lands when it should, and
+# (b) the ORIGINAL "compared and equal" phrasing is untouched -- a
+# mutation-style control catching an accidental edit to the case-(a) text.
+
+def test_bump_without_cause_message_unchanged_when_derived_genuinely_compared_and_equal():
+    """Mutation-style control for #2793's fix: derived_available=True (the
+    default, and the genuinely-both-compared-and-equal case) must produce
+    EXACTLY the original wording -- if the fix accidentally changed this
+    branch too, this test catches it."""
+    status, message = verdict("MINOR", "NONE", (1, 0), derived_available=True)
+    assert status == "DENY"
+    assert (
+        "version bumped without cause — neither the L0 hash nor the "
+        "derived-layer hash differs from the tagged commit. Revert "
+        "MAJOR.MINOR to 1.0. If this IS a derived-layer change, say so on "
+        "the PR rather than reverting."
+    ) in message
+
+
+def test_bump_without_cause_message_names_unavailable_baseline_when_derived_pin_missing():
+    """Fix for #2793: when required_severity degrades to L0-only because
+    T's tag predates Gap 2 (no derived pin), R can still come out NONE --
+    but NOT because the derived hash was compared and found equal. The old
+    message asserted "neither...differs", which is false when the derived
+    hash was never compared at all. derived_available=False must produce
+    the accurate 'no baseline to compare against yet' phrasing instead, and
+    must NOT repeat the false "differs" claim about the derived hash."""
+    status, message = verdict("MINOR", "NONE", (1, 0), derived_available=False)
+    assert status == "DENY"
+    msg_lower = message.lower()
+    assert "neither the l0 hash nor the derived-layer hash differs" not in msg_lower
+    assert "no baseline to compare against" in msg_lower
+    assert "predates gap 2" in msg_lower
+    assert "1.0" in message  # still names the revert target
+
+
+def test_over_severity_message_unchanged_when_derived_genuinely_compared_and_equal():
+    """Mutation-style control mirroring the pair above, for the
+    over-severity branch (#2793's diagnosis: this branch is reachable via
+    the identical r == "NONE"-degraded-from-unavailable path, so it carries
+    the same conflation defect and needed the same fix)."""
+    status, message = verdict("MAJOR", "NONE", (1, 0), derived_available=True)
+    assert status == "DENY"
+    assert (
+        "no MAJOR- or MINOR-worthy change occurred (neither the L0 nor the "
+        "derived-layer hash differs from the tagged commit)"
+    ) in message
+
+
+def test_over_severity_message_names_unavailable_baseline_when_derived_pin_missing():
+    """Fix for #2793, over-severity branch: derived_available=False must
+    not claim the derived hash was compared and found equal here either."""
+    status, message = verdict("MAJOR", "NONE", (1, 0), derived_available=False)
+    assert status == "DENY"
+    msg_lower = message.lower()
+    assert "neither the l0 nor the derived-layer hash differs" not in msg_lower
+    assert "no baseline to compare against" in msg_lower
+    assert "predates gap 2" in msg_lower
 
 
 # --- Gap 2 severity-cell falsifiers (engram-alpha#2563 unit spec item 4) --
@@ -1151,6 +1452,271 @@ def test_tie_in_T_with_different_pinned_derived_hashes_fails_loudly(tmp_path):
     _git_run(repo, "tag", "v1.0.1-same-version")
 
     with pytest.raises(RuntimeError, match="pinned derived hash"):
+        resolve_T(repo)
+
+
+# --- resolve_T() tie-break falsifiers (engram-alpha#2796) -----------------
+#
+# Lei's ruling, 2026-09-10 13:17Z (relayed by Kepler on the issue thread):
+# the tie-break is by TAG CREATION TIME (tagger date), most-recent wins --
+# never lexical, and never a preference for whichever tag carries a
+# derived pin. This supersedes an earlier round on this same issue that
+# implemented (and tested) a pin-preference tie-break; that cluster of
+# tests is replaced wholesale below, not reworded in place, because the
+# selection RULE itself changed, not just its wording.
+
+def test_tie_break_prefers_latest_tagger_date_over_lexical_order(tmp_path):
+    """Falsifier for #2796 (tagger-date mechanism): among tags tied at max
+    version, resolve_T must pick the tag with the LATEST tag CREATION
+    time (its own ``%(taggerdate:unix)``) -- never the lexically-first (or
+    -last) tag, and never a preference for whichever tag happens to carry
+    a derived pin.
+
+    Tag NAMES are deliberately disconnected from their tagger dates so a
+    lexical pick and a time pick DISAGREE: the tag with the OLDER tagger
+    date is named to sort FIRST lexically -- exactly what
+    ``sorted(tags_at_max)[0]`` (the OLD, reverted behavior; see the
+    mutation control below) would wrongly choose -- while the tag with the
+    NEWER tagger date is named to sort LAST. A fixture where the
+    temporally-newest tag also happens to sort first (or last) lexically
+    can't tell a tagger-date implementation from a lexical-sort one --
+    exactly the 'passes for the wrong reason' trap Ariadne's #2796
+    colleague review named for the pin-preference falsifier this test
+    replaces."""
+    repo = tmp_path / "scratch-tiebreak-taggerdate"
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    # First commit/tag: sorts lexically FIRST ("aaa..."), but tagged with
+    # the OLDER tagger date -- what a lexical-first pick would (wrongly)
+    # choose.
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, tagged with the OLDER tagger date")
+    _git_tag_annotated(
+        repo, "deploy/aaa-older-by-tagger-date", committer_date="2020-01-01T00:00:00"
+    )
+
+    # Second commit: SAME version, SAME L0 + derived hash (so the
+    # agreement checks upstream don't fire), sorts lexically LAST
+    # ("zzz..."), but tagged with the NEWER tagger date -- the tag
+    # resolve_T must actually choose.
+    (repo / "unrelated.txt").write_text("noise\n", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, tagged with the NEWER tagger date")
+    _git_tag_annotated(
+        repo, "deploy/zzz-newer-by-tagger-date", committer_date="2026-01-01T00:00:00"
+    )
+
+    tags_at_max = deployable_tags(repo)
+    assert sorted(tags_at_max)[0] == "deploy/aaa-older-by-tagger-date", (
+        "test setup bug: the lexically-first tag must be the OLDER one by "
+        "tagger date for this fixture to disagree with a lexical pick"
+    )
+
+    resolved = resolve_T(repo)
+    assert resolved is not None
+    version, tag, pinned_hash, pinned_derived_hash = resolved
+    assert version == (1, 0)
+    assert tag == "deploy/zzz-newer-by-tagger-date", (
+        f"tie-break picked {tag!r} -- expected the tag with the LATEST "
+        f"tagger date, not the lexically-first one"
+    )
+    assert pinned_hash == HASH_A
+    assert pinned_derived_hash == "c" * 64  # _write_pin_test's default
+
+
+def test_mutation_control_reverting_tiebreak_to_lexical_reddens_the_tagger_date_case(tmp_path):
+    """Mutation control (#2796's own required falsifier convention): revert
+    the tie-break to the OLD unconditional ``sorted(tags_at_max)[0]``
+    behavior and confirm it would have picked the WRONG (older-by-tagger-
+    date) tag on the fixture above -- proving the falsifier actually
+    discriminates the tagger-date fix, not something that was already
+    true. This is a read of ``tags_at_max`` computed the same way
+    ``resolve_T`` computes it (not a monkeypatch of the real function),
+    contrasted with what the real, fixed ``resolve_T`` returns on the
+    identical repo -- same shape as the pin-preference mutation control
+    this test replaces, retargeted at the corrected mechanism."""
+    repo = tmp_path / "scratch-tiebreak-mutation-lexical"
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, tagged with the OLDER tagger date")
+    _git_tag_annotated(
+        repo, "deploy/aaa-older-by-tagger-date", committer_date="2020-01-01T00:00:00"
+    )
+
+    (repo / "unrelated.txt").write_text("noise\n", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, tagged with the NEWER tagger date")
+    _git_tag_annotated(
+        repo, "deploy/zzz-newer-by-tagger-date", committer_date="2026-01-01T00:00:00"
+    )
+
+    tags_at_max = deployable_tags(repo)  # both tags carry version.py at v1.0
+    old_tie_break_choice = sorted(tags_at_max)[0]
+    assert old_tie_break_choice == "deploy/aaa-older-by-tagger-date", (
+        "test setup bug: the OLD (lexical) tie-break must pick the "
+        "older-by-tagger-date tag here for this to be a discriminating "
+        "fixture"
+    )
+
+    resolved = resolve_T(repo)
+    assert resolved is not None
+    _, real_chosen_tag, _, _ = resolved
+    assert real_chosen_tag == "deploy/zzz-newer-by-tagger-date"
+
+    assert old_tie_break_choice != real_chosen_tag, (
+        "mutation control failed: the OLD (lexical) tie-break and the "
+        "real, fixed resolve_T agree on this fixture -- it is not "
+        "discriminating the fix"
+    )
+
+
+def test_lightweight_tag_among_candidates_fails_loudly(tmp_path):
+    """Refusal test 1/2 for #2796's tagger-date tie-break: a LIGHTWEIGHT
+    tag (created via plain ``git tag``, no ``-a``) has no tag object and
+    hence no tagger date at all. If it is one of several tags tied at max
+    version, the tie cannot be broken by tag creation time -- resolve_T
+    must raise loudly rather than silently pick (Lei's ruling, via Kepler:
+    "Both are operational defects in the tag set, not a bootstrap."),
+    never crash unexpectedly or silently fall back to some other order."""
+    repo = tmp_path / "scratch-tiebreak-lightweight"
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    # First tag: properly annotated.
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, annotated tag")
+    _git_tag_annotated(repo, "deploy/annotated-tag", committer_date="2020-01-01T00:00:00")
+
+    # Second tag: SAME version, SAME L0 + derived hash (so the agreement
+    # checks upstream don't fire) -- but LIGHTWEIGHT (plain `git tag`, no
+    # `-a`), so it has no tagger date to break the tie by.
+    (repo / "unrelated.txt").write_text("noise\n", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, lightweight tag")
+    _git_run(repo, "tag", "deploy/lightweight-tag")
+
+    with pytest.raises(RuntimeError, match="LIGHTWEIGHT"):
+        resolve_T(repo)
+
+
+def test_duplicate_tagger_timestamps_among_candidates_fails_loudly(tmp_path):
+    """Refusal test 2/2 for #2796's tagger-date tie-break: two candidates
+    at max version with an IDENTICAL tagger timestamp cannot be
+    disambiguated by tag creation time either -- there is no unique
+    latest. resolve_T must raise loudly rather than silently picking
+    whichever one happens to come first in some incidental order."""
+    repo = tmp_path / "scratch-tiebreak-duplicate-timestamp"
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, first tag")
+    _git_tag_annotated(repo, "deploy/tag-one", committer_date="2020-01-01T00:00:00")
+
+    # SAME version, SAME hashes, SAME tagger timestamp as tag-one --
+    # exactly the "corrupted tag set" state the raise exists to name.
+    (repo / "unrelated.txt").write_text("noise\n", encoding="utf-8")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "v1.0, second tag, identical tagger date")
+    _git_tag_annotated(repo, "deploy/tag-two", committer_date="2020-01-01T00:00:00")
+
+    with pytest.raises(RuntimeError, match="identical tagger timestamp"):
+        resolve_T(repo)
+
+
+def _build_three_tag_broken_guard_fixture(tmp_path, name: str) -> Path:
+    """Shared fixture for the test below (Ariadne's colleague-review repro
+    on #2796, generalized past the pin-preference mechanism it was
+    originally built to catch): three tags at the same max version --
+
+    - ``deploy/aaa-unpinned``: pinned L0, NO derived pin.
+    - ``deploy/bbb-pinned``:   pinned L0, WITH a derived pin.
+    - ``deploy/ccc-broken``:  version.py present, but the pin test file is
+      REMOVED entirely (no L0 pin at all) -- genuinely broken.
+
+    All three tags are LIGHTWEIGHT (plain ``git tag``) here deliberately:
+    the property this fixture exercises (below) is that the broken-tag
+    guard fires from INSIDE the loop that populates
+    ``hashes``/``derived_hashes``, before resolve_T ever reaches tie-break
+    selection -- so it is unaffected by whichever selection rule the
+    tie-break itself uses, tagger-date or otherwise. The pin/no-pin split
+    on aaa/bbb no longer determines anything about selection (#2796's
+    tie-break is now by tag creation time, not pin presence); it is kept
+    as fixture data for continuity with the original repro. Only ``ccc``'s
+    brokenness is load-bearing to the assertion below."""
+    repo = tmp_path / name
+    repo.mkdir()
+    _git_run(repo, "init", "-q")
+    _git_run(repo, "config", "user.email", "fairy@example.com")
+    _git_run(repo, "config", "user.name", "gate-falsifier")
+
+    _write_version_py(repo, 1, 0)
+    _write_pin_test(repo, HASH_A, derived_hash=None)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "aaa: v1.0, no derived pin")
+    _git_run(repo, "tag", "deploy/aaa-unpinned")
+
+    (repo / "unrelated-1.txt").write_text("noise\n", encoding="utf-8")
+    _write_pin_test(repo, HASH_A, derived_hash=HASH_B)
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "bbb: v1.0, with a derived pin")
+    _git_run(repo, "tag", "deploy/bbb-pinned")
+
+    (repo / "unrelated-2.txt").write_text("noise\n", encoding="utf-8")
+    _git_run(repo, "rm", "-q", PIN_TEST_PATH)
+    _git_run(repo, "commit", "-q", "-m", "ccc: v1.0, pin test removed entirely")
+    _git_run(repo, "tag", "deploy/ccc-broken")
+
+    return repo
+
+
+def test_tie_break_does_not_mask_a_genuinely_broken_tag_at_max_version(tmp_path):
+    """Ariadne's colleague-review finding on #2796, restated generically
+    (orthogonal to which selection rule the tie-break uses -- see
+    ``resolve_T``'s own docstring, "This raise -- and the L0-agreement
+    raise above it -- must keep seeing EVERY tag at max version"): the
+    broken-tag / L0-agreement / derived-agreement guards must run over the
+    FULL, unfiltered ``tags_at_max`` before any candidate is filtered out
+    for tie-break purposes. A tie-break implementation that filters
+    candidates down BEFORE those guards run -- the 'obvious' but wrong
+    shape, first caught here for a pin-preference filter -- silently drops
+    those guards for whatever gets filtered out. The broken-tag raise must
+    still fire even though other, valid candidates exist at the same max
+    version.
+
+    NOTE on the tagger-date mechanism's analogous trap (an annotated-tag-
+    only filter applied before these guards): this fixture does NOT
+    demonstrate coverage of that mutant -- all three of its tags are
+    lightweight, so such a filter empties the candidate set here and the
+    failure surfaces as an uninformative ``max() iterable argument is
+    empty`` rather than this test's own ``match="deploy/ccc-broken"``.
+    That mutant IS caught cleanly, just by a different test:
+    ``test_lightweight_tag_among_candidates_fails_loudly``, whose fixture
+    mixes one lightweight and one annotated candidate and gets the
+    informative "DID NOT RAISE" failure. (Verified by reviewer-fairy round
+    1 on #2796, hand-built mutation control.)"""
+    repo = _build_three_tag_broken_guard_fixture(tmp_path, "scratch-tiebreak-broken-guard")
+
+    with pytest.raises(RuntimeError, match="deploy/ccc-broken"):
         resolve_T(repo)
 
 
