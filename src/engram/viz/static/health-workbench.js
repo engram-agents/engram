@@ -1007,7 +1007,7 @@
       var noSnapTitle = (!s || !s.has_snapshot)
         ? ' title="' + escAttr((s && s.reason) || "no snapshot for this seat") + '"'
         : "";
-      seatRows += '<tr class="' + (a.name === state.agent ? "sel" : "") + '"><td>' + a.name +
+      seatRows += '<tr class="' + (a.name === state.agent ? "sel" : "") + '"><td>' + escAttr(a.name) +
         '</td><td class="num"' + noSnapTitle + '>' +
         (raw === null || raw === undefined || raw === "UNAVAILABLE" ? "--" : fmtPct(raw)) +
         '</td><td class="num">' + fmtScore(sc) + "</td></tr>";
