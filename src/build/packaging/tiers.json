@@ -404,6 +404,12 @@
       "note": "Local diff-coverage helper (#2774) -- reports coverage of only the lines the current branch changes vs origin/dev, via diff-cover fed a coverage.xml from an affected-tests run. Dev tooling (T3): a developer convenience for local PR iteration, not part of any install path a shipped agent relies on. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/coverage-diff.sh) would wrongly flag this as dangling (same pattern as tools/rc-upgrade-verify.py's entry above)."
     },
     {
+      "path": "tools/recall_harness",
+      "tier": "dev",
+      "source": "tools/recall_harness",
+      "note": "Recall-measurement harness package, ported from the per-seat borges-desk scratch project (code only -- the golden set and any snapshot .db are per-seat private artifacts and are never copied here). Dev tooling (T3): scores ENGRAM's retrieval against a curated golden set; cannot run end-to-end in this repo without a golden set supplied via ENGRAM_RECALL_GOLDEN_DIR + ENGRAM_RECALL_SNAPSHOT, which is intentional. Real directory directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/recall_harness) would wrongly flag this as dangling (same pattern as tools/coverage-diff.sh's entry above)."
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
