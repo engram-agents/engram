@@ -266,11 +266,73 @@ cat ~/.engram/.deployed-version          # marker SHA = the commit you built (fo
 rm -f ~/.engram/.upgrade-pre-sha         # pre-upgrade SHA scratch file no longer needed
 ```
 
-Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count — this proves the new server is running against your graph (preserved across the upgrade, though possibly migrated in place per Step 5). On Codex, also verify installed-cache files match the marketplace if hooks are the upgrade target. If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done — Step 5's restore procedure is the recovery path.
+Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` and confirm it returns your real node count. **Read carefully what that does and does not establish — the obvious reading is wrong, and it is the reading this step used to endorse.**
+
+**It establishes:** the DB is readable, and *some* server answered (your graph is preserved across the upgrade, though possibly migrated in place per Step 5). If `engram_stats` errors or the node count is implausible, stop and investigate before declaring the upgrade done — Step 5's restore procedure is the recovery path.
+
+**It does NOT establish that the new server is running.** A node count cannot discriminate a reconnected process from one that never restarted. And the `version` block in the same response is *worse* than merely silent about it: the `version` section of `engram_stats.py` does a `read_text` on `~/.engram/.deployed-version` **inside the request handler**, at call time, with no caching — and Step 3 rewrote that marker. **So a server that never reconnected reports the new `alpha_sha` identically.** (Finding: Mira, 2026-09-07, from correcting an over-confident upgrade certification; re-verified against the source 2026-09-10.)
+
+### The check that DOES discriminate
+
+Run this in addition, not instead. Paste it whole — the guards are the point, not decoration.
+
+```bash
+# Anchor on python as argv[0]. A bare 'plugins/engram/server.py' pattern ALSO
+# matches the shell you are running this in, whose own command line contains
+# that string -- so the naive form returns two pids, one of which then exits.
+PAT='^[^ ]*python3? .*plugins/engram/server\.py'
+P=$(pgrep -u "$USER" -f "$PAT")
+N=$(printf '%s\n' "$P" | grep -c .)
+[ "$N" = 1 ] || { echo "FAIL: expected 1 server, found $N"; exit 1; }
+
+NOW=$(date -u +%s); ET=$(ps -o etimes= -p "$P" | tr -d ' ')      # Linux; see macOS note
+[ -n "$ET" ] || { echo "FAIL: ps returned nothing for pid $P"; exit 1; }
+echo "server born at epoch $((NOW-ET)) -- must be AFTER your /mcp reconnect"
+
+ARGV=$(ps -p "$P" -o command=)
+[ -n "$ARGV" ] || { echo "FAIL: empty argv -- the checks below would report PASS without running"; exit 1; }
+echo "$ARGV" | grep -q 'plugins/engram' || { echo "FAIL control: pattern not live"; exit 1; }
+echo "$ARGV" | grep -q 'plugins/cache' && { echo "FAIL: server is running from the plugin CACHE, not the marketplace source"; exit 1; }
+echo "PASS: 1 server, born after the epoch above, argv = marketplace source"
+```
+
+**Why every guard is there — each one is a failure this block was observed to produce before they were added** (measured 2026-09-10 while writing this step, by running it rather than reasoning about it):
+
+- **The pid-count assertion.** `pgrep -f` self-matched the invoking shell and returned two pids; `ps -p "6507 23770"` then errored.
+- **The empty-`ARGV` assertion, which is the important one.** With `ps` erroring, `grep -c 'plugins/cache'` on the empty stream returned **`0` — which is the PASS value.** The block reported a clean seat from a check that never ran. A step written to fix a false-verification problem had a false-verification bug of exactly the same shape.
+- **The `control` line** is what caught it: it read `0` where it must read `1`. Keep it. A zero from an inert pattern is indistinguishable from a zero from a healthy seat, and only the must-be-present control separates them.
+
+Three directions were exercised, on the block as extracted from this file rather than a copy:
+
+```
+healthy seat                  -> exit 0,  "PASS: 1 server, born after the epoch above, argv = marketplace source"
+no such server                -> exit 1,  "FAIL: expected 1 server, found 0"
+argv matching the plugin cache-> exit 1,  "FAIL: server is running from the plugin CACHE, not the marketplace source"
+```
+
+A check never observed to fail is not yet a check.
+
+**macOS:** `etimes` is Linux-only (procps), so the born-at-epoch line does not port — and it does not merely *invert*, it **breaks**. `ps -o etime=` renders `[[dd-]hh:]mm:ss`, not an integer, so `$((NOW-ET))` is a hard bash syntax error (measured on this seat: `ET=24:02` → `syntax error in expression (error token is ":02")`). Do not swap `etimes`→`etime` and keep the arithmetic.
+
+Instead, on Darwin, drop the epoch line and read the elapsed string directly — the **direction inverts**, so you are checking it is *smaller* than the time since your reconnect, not that a start time is late:
+
+```bash
+ps -p "$P" -o etime=    # e.g. "24:02" = 24m02s ago. Must be LESS than time since your /mcp reconnect.
+```
+
+Every other line — the anchored `pgrep`, the pid-count assert, the `ARGV` non-empty assert, the control, and the cache gate — is *believed* to port unchanged; see the bound below, which covers this claim too.
+
+**The Darwin path is untested — I have no Darwin seat, and the bound covers BOTH claims above, not just the format one.** Two separate assertions ride together here and it would be easy to read the hedge as discharging only the first: (1) the `etime` rendering — measured on Linux, where `ps` is procps rather than BSD, so the BSD rendering is *believed* identical and I have not run it; and (2) the ports-unchanged claim about every other line, which I have not exercised on BSD `ps`/`grep` at all. Whoever runs this on a Mac first should confirm or correct both here rather than assume either.
+
+⚠ **Use `etimes`/`etime`, never `ps -o lstart`.** `lstart` prints **local** time with no timezone token, so whatever you hand it re-parses it in the wrong zone silently — including a real converter: `date -u -d "$(ps -o lstart= ...)"` applies a *zero* shift, because `date -d` reads the timezone-less string as UTC. That has produced wrong published times on this project repeatedly, once defeating an otherwise-correct converter. `etimes` is an integer of seconds and cannot fail this way.
+
+On Codex, also verify installed-cache files match the marketplace if hooks are the upgrade target.
 
 **For a thorough operational health check** (recommended after any upgrade): load and run the `engram-health-exam` skill. It covers the full runtime layer — hook delivery, surface daemon, viz server, config sanity, schema/migration — beyond the single `engram_stats` probe above. The `engram_stats` call here is the minimum gate; `engram-health-exam` is the full exam.
 
-**Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph through the new server + `.upgrade-pre-sha` scratch file removed.
+**Checkpoint**: marker SHA matches the intended commit + `engram_stats` returns the expected graph + **the discriminating block above exits 0** (one server; argv is the marketplace source, not the cache — both hard-gated) + **you read the born-at epoch yourself and it is after your reconnect** + `.upgrade-pre-sha` scratch file removed.
+
+Note which half is mechanical and which is yours: the block *enforces* the pid count, the non-empty reads, the control, and the cache check — any of those failing exits 1. It **cannot** enforce the birth time, because only you know when you ran the reconnect; it prints the epoch and you compare. Do not read `exit 0` as covering that one. The `engram_stats` call alone establishes none of it.
 
 ---
 
