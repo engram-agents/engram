@@ -2,9 +2,13 @@
 
 import json
 import os
+import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +20,43 @@ def _env(tmp_path, **overrides):
     env.pop("ENGRAM_BUILD_DIR", None)
     env.update({key: str(value) for key, value in overrides.items()})
     return env
+
+
+def _path_without_timeout_wrappers(dest_dir):
+    """Build a PATH value that genuinely has no `timeout` or `gtimeout`
+    binary reachable anywhere on it, for engram-alpha#2810's falsifier.
+
+    `command -v timeout` (what the installer itself checks) only fails when
+    NO directory anywhere on PATH carries an executable named `timeout` —
+    a directory earlier on PATH lacking the name does not shadow a real one
+    later on PATH, and a non-executable same-named placeholder is skipped
+    by `command -v` in favor of a later, executable match. So the only
+    reliable way to mask the wrapper is to symlink every OTHER
+    currently-reachable executable name into a fresh directory and point
+    PATH at that directory alone — everything the installer needs (bash,
+    git, mkdir, ...) stays resolvable; only `timeout`/`gtimeout` do not.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            names = os.listdir(entry)
+        except OSError:
+            continue
+        for name in names:
+            if name in ("timeout", "gtimeout") or name in seen:
+                continue
+            src = os.path.join(entry, name)
+            if not os.path.isfile(src) or not os.access(src, os.X_OK):
+                continue
+            try:
+                os.symlink(src, dest_dir / name)
+            except OSError:
+                continue
+            seen.add(name)
+    return str(dest_dir)
 
 
 def _write_fake_plugin(build_root, *, platform=None, codex_agent=False):
@@ -593,7 +634,7 @@ def _make_scratch_repo(tmp_path, *, tags=()):
     return repo
 
 
-def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None, extra_env=None):
+def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None, extra_env=None, timeout=None):
     """Run the scratch repo's own installer copy with a temp ENGRAM_HOME.
 
     build_dir: when given, points ENGRAM_BUILD_DIR at a pre-populated fake
@@ -604,21 +645,70 @@ def _run_scratch_installer(repo, engram_home, *, extra_args=(), build_dir=None, 
     extra_env: additional env var overrides (e.g. ENGRAM_INSTALL_FETCH_TIMEOUT_SECS
     for the #2711 round-3 timeout-path test, GIT_SSH_COMMAND to swap in a fake
     ssh transport). Merged on top of ENGRAM_BUILD_DIR when both are given.
+
+    timeout: optional hard wall-clock bound (seconds). None (the default)
+    preserves every existing caller's behavior exactly — no bound at all,
+    same as before this parameter existed, and the plain `subprocess.run(...,
+    timeout=None)` path below (no process-group machinery) is used unchanged.
+    Callers that exercise a path where the shell's own `timeout`/`gtimeout`
+    wrapper might be unavailable (engram-alpha #2810: a stock-macOS seat
+    lacking both binaries degrades the installer's own fetch to genuinely
+    UNBOUNDED, by documented design) should pass a generous-but-finite value
+    here so a hang fails the test loudly instead of hanging the whole suite.
+    On expiry this raises subprocess.TimeoutExpired, which callers may catch
+    or let propagate as a (loud, non-hanging) test failure/error.
+
+    When timeout is not None, the installer subprocess is launched with
+    start_new_session=True (its own process group) and, on TimeoutExpired,
+    the ENTIRE process group is SIGKILLed before the exception propagates —
+    not just the immediate bash child. subprocess.run's own timeout= only
+    kills the process it directly spawned (bash here); it does NOT reach
+    bash's own children (the `git fetch` it runs, a hanging fake-ssh
+    transport underneath, etc.), which is exactly the orphan risk this
+    helper exists to close for every timeout-bounded caller, not only the
+    hang-discrimination falsifier below.
     """
     env_overrides = {}
     if build_dir is not None:
         env_overrides["ENGRAM_BUILD_DIR"] = str(build_dir)
     if extra_env:
         env_overrides.update(extra_env)
-    return subprocess.run(
-        ["bash", str(repo / "tools" / "install-local-marketplace.sh"),
-         "--skip-add", "--skip-build", *extra_args],
+    argv = ["bash", str(repo / "tools" / "install-local-marketplace.sh"),
+            "--skip-add", "--skip-build", *extra_args]
+    run_env = _env(engram_home, **env_overrides)
+
+    if timeout is None:
+        return subprocess.run(
+            argv,
+            cwd=repo,
+            env=run_env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=None,
+            check=False,
+        )
+
+    proc = subprocess.Popen(
+        argv,
         cwd=repo,
-        env=_env(engram_home, **env_overrides),
+        env=run_env,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        check=False,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5)
+        raise
+    return subprocess.CompletedProcess(
+        argv, proc.returncode, stdout=stdout, stderr=stderr
     )
 
 
@@ -1002,6 +1092,10 @@ def test_fetch_failure_fails_closed_refuses_ancestor_tag_without_allow_branch(tm
 # land in the SAME fail-closed branch as any other fetch failure.
 
 
+@pytest.mark.skipif(
+    shutil.which("timeout") is None and shutil.which("gtimeout") is None,
+    reason="installer degrades to an unbounded fetch with no timeout binary; this test would hang (see engram-alpha#2810)",
+)
 def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tmp_path):
     """A silently-dropped network can't be produced with a real socket in a
     test without flakiness, so this simulates it the same way the coreutils
@@ -1025,7 +1119,17 @@ def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tm
     DROPS the `timeout` wrapper entirely reintroduces the very hang this
     fix exists to bound, and a test that can hang the suite is worse than
     one that doesn't exist. The 2s cap plus this test's own runtime assertion
-    below is the safeguard against that specific mutation shape."""
+    below is the safeguard against that specific mutation shape.
+
+    engram-alpha#2810: on a seat with NEITHER `timeout` nor `gtimeout` on
+    PATH, the installer's own fetch is genuinely unbounded by documented
+    design (see the WARNING added to the script's no-wrapper branch), and
+    this test — which relies entirely on the shell's own wrapper to cap the
+    hanging fake-ssh transport below — would hang the whole suite. The
+    skipif above guards that; the `timeout=` kwarg below is an independent,
+    unconditional second line of defense (belt-and-suspenders, not a
+    substitute for the skip) in case the wrapper resolves but somehow fails
+    to actually bound the child."""
     repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
     _checkout(repo, "v1.0.0-ancestor-test")
 
@@ -1045,6 +1149,7 @@ def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tm
             "ENGRAM_INSTALL_FETCH_TIMEOUT_SECS": "2",
             "GIT_SSH_COMMAND": str(fake_ssh),
         },
+        timeout=30,
     )
     elapsed = time.monotonic() - start
 
@@ -1060,3 +1165,112 @@ def test_fetch_timeout_fails_closed_refuses_ancestor_tag_without_allow_branch(tm
     assert "TIMED OUT" in result.stdout
     assert not (engram_home / ".deployed-version").exists()
     assert not (engram_home / ".deployed-version").exists()
+
+
+# ── engram-alpha#2810 — falsifiers for the skipif guard + the new WARNING ──
+#
+# #2810: on a seat with NEITHER `timeout` nor `gtimeout` on PATH (stock
+# macOS), the installer's fetch above degrades to genuinely UNBOUNDED, by
+# documented design (see the block comment above FETCH_TIMEOUT_SECS in the
+# script). The round-3 test above relies entirely on the shell's own
+# wrapper to cap a deliberately-hanging fake ssh transport — on a seat
+# lacking both binaries it would hang the whole suite, hence the skipif
+# marker added to it. A `skipif` marker is evaluated once, at COLLECTION
+# time, from a real `shutil.which()` call — it is not something a
+# per-test mock can exercise — so the falsifier for it is necessarily a
+# different, lower-level probe: does the PRODUCTION SCRIPT itself actually
+# detect "no wrapper resolves" and take the documented no-wrapper branch
+# (WARNING + genuinely unbounded fetch), using a fetch target that fails
+# FAST (not the slow-ssh hang trick, which needs the very wrapper this
+# test masks away).
+
+
+def test_fetch_no_wrapper_warns_and_takes_documented_unbounded_branch(tmp_path):
+    """Falsifier for fix 1 (skipif) and fix 3 (WARNING text).
+
+    Builds a PATH with every real, currently-resolvable executable name
+    EXCEPT `timeout`/`gtimeout` (see _path_without_timeout_wrappers), so
+    `command -v timeout` / `command -v gtimeout` inside the real installer
+    genuinely fail — the same predicate a stock-macOS seat hits, produced
+    without needing one. Uses `_make_scratch_repo` (no 'origin' remote
+    configured at all) with a deploy tag at HEAD, so the fetch block runs
+    but `git fetch origin ...` fails FAST ("'origin' does not appear to be
+    a git repository") rather than hanging — proving the WARNING fires and
+    the script proceeds through its documented degraded path, not proving
+    anything about the (separately-tested) timeout-wrapper-present case.
+    """
+    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-nowrapper-test"])
+    engram_home = tmp_path / "engram-home"
+    masked_path = _path_without_timeout_wrappers(tmp_path / "masked-path-bin")
+
+    result = _run_scratch_installer(
+        repo, engram_home,
+        extra_env={"PATH": masked_path},
+        timeout=30,
+    )
+
+    assert (
+        "neither 'timeout' nor 'gtimeout' is on PATH" in result.stdout
+    ), result.stdout
+    assert "brew install coreutils" in result.stdout, result.stdout
+    # The fetch itself still ran (and failed fast, per the no-'origin'-remote
+    # scratch repo) and routed into the SAME fail-closed WARNING branch as
+    # any other fetch failure -- confirming the masked PATH didn't silently
+    # skip the fetch attempt entirely.
+    assert "could not refresh origin/dev + origin/main" in result.stdout, result.stdout
+
+
+def test_run_scratch_installer_timeout_kwarg_bounds_a_genuine_hang(tmp_path):
+    """Falsifier for fix 2 (the hard, unconditional test-side timeout bound).
+
+    Reuses the round-3 test's own hanging-ssh trick (GIT_SSH_COMMAND pointed
+    at a script that `exec sleep 9999`), but WITHOUT any shell-side
+    `timeout`/`gtimeout` protection — the fetch is masked to genuinely
+    unbounded here, same predicate as the falsifier above, plus a real hang
+    source. Proves it is `_run_scratch_installer()`'s OWN `timeout=` kwarg
+    that bounds the call (rather than a shell wrapper, which is deliberately
+    absent here): it must raise subprocess.TimeoutExpired well under 9999s.
+
+    This is the test that would have caught #2810 directly: pre-fix (no
+    `timeout=` kwarg reaching `_run_scratch_installer()`'s own subprocess
+    call at all), this exact call hangs for the full 9999s. See the handoff
+    for the re-verification that actually exercised this by temporarily
+    reverting the production `timeout=` wiring.
+
+    Calls `_run_scratch_installer()` directly (matching the round-3 test's
+    own call shape above) rather than driving subprocess.Popen by hand — an
+    earlier version of this test bypassed the shared helper entirely and so
+    never actually exercised the kwarg it claimed to falsify. The helper
+    itself is what now does the orphan-safe process-group cleanup (see its
+    docstring): on TimeoutExpired it SIGKILLs the whole process group
+    (bash, the git fetch it spawns, the fake-ssh script, and the sleep 9999
+    underneath) via `os.killpg`, launched with `start_new_session=True` — a
+    PID-scoped cleanup of exactly this call's own subtree, never a
+    name/pattern match over the host's process table.
+    """
+    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-hang-test"])
+    engram_home = tmp_path / "engram-home"
+    masked_path = _path_without_timeout_wrappers(tmp_path / "masked-path-bin-hang")
+
+    fake_ssh = tmp_path / "fake-ssh-hang.sh"
+    fake_ssh.write_text("#!/usr/bin/env bash\nexec sleep 9999\n")
+    fake_ssh.chmod(0o755)
+    subprocess.run(
+        ["git", "remote", "add", "origin", "ssh://localhost/nonexistent-repo.git"],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_scratch_installer(
+            repo, engram_home,
+            extra_env={"PATH": masked_path, "GIT_SSH_COMMAND": str(fake_ssh)},
+            timeout=5,
+        )
+    elapsed = time.monotonic() - start
+
+    # Confirms the discrimination this test exists for: the call actually
+    # returned (via the raised TimeoutExpired) near the 5s bound, not near
+    # the 9999s the fake ssh sleeps for.
+    assert elapsed < 9999, f"took {elapsed:.1f}s — did not discriminate a real hang"
+    assert elapsed < 15, f"took {elapsed:.1f}s — timeout= did not bound the wait"

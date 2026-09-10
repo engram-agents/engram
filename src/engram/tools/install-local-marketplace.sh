@@ -248,6 +248,7 @@ if [[ -n "$DEPLOY_TAGS" ]]; then
   if [[ -n "$_TIMEOUT_BIN" ]]; then
     "$_TIMEOUT_BIN" "$FETCH_TIMEOUT_SECS" git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
   else
+    log "WARNING: neither 'timeout' nor 'gtimeout' is on PATH, so the pre-build 'git fetch origin dev main' below is running UNBOUNDED on this seat — a silently-dropped connection can hang this install indefinitely instead of failing fast after ${FETCH_TIMEOUT_SECS}s. Run 'brew install coreutils' (macOS) to restore the bound."
     git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
   fi
   if [[ $_fetch_rc -eq 0 ]]; then
