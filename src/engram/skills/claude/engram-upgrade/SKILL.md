@@ -277,10 +277,40 @@ Then through the **plugin MCP** (after Step 5's reconnect): call `engram_stats` 
 Run this in addition, not instead. Paste it whole — the guards are the point, not decoration.
 
 ```bash
-# Anchor on python as argv[0]. A bare 'plugins/engram/server.py' pattern ALSO
-# matches the shell you are running this in, whose own command line contains
-# that string -- so the naive form returns two pids, one of which then exits.
-PAT='^[^ ]*python3? .*plugins/engram/server\.py'
+# Anchor on the interpreter as argv[0]. A bare 'plugins/engram/server.py'
+# pattern ALSO matches the shell you are running this in, whose own command
+# line contains that string -- so the naive form returns two pids, one of
+# which then exits.
+#
+# Each piece guards a DIFFERENT case; all three are load-bearing, and the
+# two anchors are not interchangeable (#2797 round 2 shipped one without
+# the other and a bare `ls` read as a healthy server):
+#   ^[^ ]*    the interpreter must be argv[0]. [^ ]* cannot cross a space,
+#             so a python PATH appearing as a later ARGUMENT -- `ls -la
+#             /usr/bin/python3 .../server.py`, an editor, strace, any
+#             wrapper naming both -- cannot match. Dropping this in favour
+#             of a (^|/) alternation is the regression referred to above:
+#             (^|/) matches a python token after ANY slash, anywhere in the
+#             command line.
+#   [Pp]      a Homebrew Framework build's argv[0] basename is 'Python'.
+#   [^/ ]*    covers every real suffix -- '3.12', a pyenv shim, '3.13t'
+#             (free-threaded), '3.12-dbg' -- while EXCLUDING '/' is what
+#             stops the suffix running past the basename, so
+#             /opt/python-tools/bin/foo (a non-Python binary in a
+#             python-named DIRECTORY) does not match.
+# NOT covered, deliberately -- and this list is the WHOLE of it, because
+# "not covered: pypy3" alone would imply everything else is:
+#   (a) pypy3 and other non-CPython interpreter names. ENGRAM's venv is
+#       CPython and the server needs native wheels.
+#   (b) any WRAPPER-launched server -- sudo/env/nohup/timeout -- since the
+#       wrapper, not the interpreter, is then argv[0]. Verified: all four
+#       fail to match. This is safe today because the real launcher execs
+#       the interpreter directly (launch-engram-server.sh:12,
+#       `exec "$VENV_PY" "$SCRIPT_DIR/server.py" "$@"`), so argv[0] IS the
+#       interpreter in deployment.
+# Both misses fail in the SAME safe direction: "no server" -> exit 1, a
+# loud false alarm, never a silent pass. Widen if either premise changes.
+PAT='^[^ ]*[Pp]ython[^/ ]* .*plugins/engram/server\.py'
 P=$(pgrep -u "$USER" -f "$PAT")
 N=$(printf '%s\n' "$P" | grep -c .)
 [ "$N" = 1 ] || { echo "FAIL: expected 1 server, found $N"; exit 1; }
@@ -320,9 +350,13 @@ Instead, on Darwin, drop the epoch line and read the elapsed string directly —
 ps -p "$P" -o etime=    # e.g. "24:02" = 24m02s ago. Must be LESS than time since your /mcp reconnect.
 ```
 
-Every other line — the anchored `pgrep`, the pid-count assert, the `ARGV` non-empty assert, the control, and the cache gate — is *believed* to port unchanged; see the bound below, which covers this claim too.
+Every other line — the anchored `pgrep`, the pid-count assert, the `ARGV` non-empty assert, the control, and the cache gate — ports unchanged. The `pgrep` pattern needed widening to get there (#2797) and now covers Homebrew Framework `Python` as well as versioned interpreters; see the bound below for what remains unexercised on BSD.
 
-**The Darwin path is untested — I have no Darwin seat, and the bound covers BOTH claims above, not just the format one.** Two separate assertions ride together here and it would be easy to read the hedge as discharging only the first: (1) the `etime` rendering — measured on Linux, where `ps` is procps rather than BSD, so the BSD rendering is *believed* identical and I have not run it; and (2) the ports-unchanged claim about every other line, which I have not exercised on BSD `ps`/`grep` at all. Whoever runs this on a Mac first should confirm or correct both here rather than assume either.
+**The Darwin path is partly tested now, and the part that was tested came back FALSE — which is worth more than the hedge was.** Original bound: two assertions rode together, (1) the `etime` rendering, measured on Linux where `ps` is procps rather than BSD, and (2) the ports-unchanged claim, unexercised on BSD entirely.
+
+A colleague ran the block on a real Mac and **falsified (2)** — the `pgrep` pattern silently matched nothing against a Homebrew Framework `Python`, reported as #2797 and fixed above. Note where the doubt was mis-aimed: the hedge scoped its uncertainty to *Darwin*, and measuring the class afterwards showed the pattern also missed `python3.12` and pyenv shims, which are **ordinary Linux**. So the marker protected the platform that could not be tested while the pattern was already broken on the one that could. Five argv shapes cost nothing to check and only one had been checked — my own.
+
+**Still unexercised on BSD:** the `etime` rendering itself, and whether `ps -o command=` and the guards behave identically under BSD `ps`. The pattern fix was verified by matching, not by running on Darwin. Confirm or correct here rather than assume.
 
 ⚠ **Use `etimes`/`etime`, never `ps -o lstart`.** `lstart` prints **local** time with no timezone token, so whatever you hand it re-parses it in the wrong zone silently — including a real converter: `date -u -d "$(ps -o lstart= ...)"` applies a *zero* shift, because `date -d` reads the timezone-less string as UTC. That has produced wrong published times on this project repeatedly, once defeating an otherwise-correct converter. `etimes` is an integer of seconds and cannot fail this way.
 
