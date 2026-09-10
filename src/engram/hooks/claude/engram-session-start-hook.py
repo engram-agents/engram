@@ -368,6 +368,352 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
+# ── Viz-server health probe (#2783) ─────────────────────────────────────────
+# The MCP probe above is deliberately tri-state (#1754); the viz server needs
+# a REQUIRED fourth state -- see _check_viz_server_health's docstring for why
+# "not-configured" is a correct, common-case verdict rather than a degraded
+# one, and must not be folded into "down" or omitted.
+
+_VIZ_LAUNCHD_LABEL = "com.engram.viz-server"
+_VIZ_SYSTEMD_UNIT = "engram-viz-user.service"
+
+
+def _viz_supervision_layer() -> str:
+    """Which OS-level service supervisor (if any) this platform offers for
+    reading per-account viz-server registration state.
+
+    Analogous in STYLE to _startup_mcp_health_probe_allowed (short, commented,
+    returns a simple discriminator) but a genuinely different AXIS: that
+    function distinguishes Claude-plugin vs Codex runtime relationships (does
+    this hook's own runtime share a process boundary with the MCP server?);
+    this one distinguishes which OS this seat runs on, because the viz
+    server's supervision layer is macOS-launchd vs Linux-systemd -- not a
+    Claude-vs-Codex question at all (#2783).
+
+    Returns "launchd" (macOS), "systemd" (Linux -- systemd-user-bus
+    availability itself is re-checked inside _check_viz_health_systemd,
+    since a Linux box can have the binary but no usable user bus), or "none"
+    (anything else, e.g. Windows). A platform this function cannot place
+    NEVER escalates to "indeterminate": no supervision layer to ask is
+    exactly what "not-configured" means, not an unexpected error.
+    """
+    if sys.platform == "darwin":
+        return "launchd"
+    if sys.platform.startswith("linux"):
+        return "systemd"
+    return "none"
+
+
+def _viz_plist_stale_reason() -> str | None:
+    """Best-effort enrichment for the "down" reason: does the installed
+    LaunchAgent plist still reference the pre-#2555 `viz_server.py` script
+    entrypoint (removed by e69ba53a, #2562) instead of the current
+    `-m viz.server` module invocation?
+
+    This is facet-2 territory (#2783's own secondary facet) and deliberately
+    NOT a detection path of its own -- a stale plist already shows up as
+    "down" via the launchctl registered-but-not-running signal in
+    _check_viz_health_launchd; this helper only makes that "down" reason
+    LOUD and actionable, per the issue's own observation that facet 1 can
+    close facet 2 simply by reporting the stale state loudly. It never
+    repairs anything (no write to the plist, no launchctl mutation) --
+    matches the probe-only posture of #198 and every other _check_* helper
+    in this file.
+
+    Returns None on any error, missing plutil, or a missing/non-stale plist
+    -- silently omits the hint rather than raising or changing the caller's
+    state.
+    """
+    try:
+        plist_path = os.path.expanduser(
+            f"~/Library/LaunchAgents/{_VIZ_LAUNCHD_LABEL}.plist"
+        )
+        if not os.path.exists(plist_path):
+            return None
+        result = subprocess.run(
+            ["plutil", "-p", plist_path],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return None
+        if "viz_server.py" in result.stdout and "viz.server" not in result.stdout:
+            return (
+                "plist references removed viz_server.py entrypoint — "
+                "run tools/operator-setup-viz.sh to refresh"
+            )
+        return None
+    except Exception:
+        return None
+
+
+def _check_viz_health_launchd() -> tuple[str, str | None]:
+    """macOS supervision-layer probe for the viz server.
+
+    Never probes the network port (see _check_viz_server_health's docstring
+    for why); asks launchd directly whether THIS account has a
+    "com.engram.viz-server" job registered, and whether it is currently
+    running. `launchctl list <label>` (the single-label form, not the bare
+    `launchctl list | grep` pipe) is used deliberately: it exits nonzero when
+    no such label is registered for this account (measured live: exit 113,
+    "Could not find service ... in domain for port"), so "registered" vs
+    "not registered" is a return-code check rather than a grep-match check,
+    and when registered it prints a structured (NeXTSTEP-plist-style, not
+    JSON) key/value block with a "PID" key present only while the job is
+    actually running (measured live against a real, currently-not-running
+    com.engram.* LaunchAgent).
+
+    Returns:
+        ("up", None) — label registered AND a PID key is present (running).
+        ("down", reason) — label registered but no PID key (not currently
+            running); reason includes LastExitStatus when parseable, plus a
+            facet-2 stale-plist hint when detected (see
+            _viz_plist_stale_reason).
+        ("not-configured", None) — launchctl returned nonzero: no
+            LaunchAgent registered under this label for this account. The
+            common, correct verdict for most of the fleet (#2783) -- NOT an
+            error.
+        ("indeterminate", reason) — the probe itself timed out or raised an
+            unexpected exception. Never silently "up" -- see
+            _check_viz_server_health's docstring for why this probe's
+            exception-handling posture deliberately differs from
+            _check_mcp_health's.
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", _VIZ_LAUNCHD_LABEL],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return "not-configured", None
+
+        stdout = result.stdout
+        if re.search(r'"PID"\s*=\s*\d+;', stdout):
+            return "up", None
+
+        exit_match = re.search(r'"LastExitStatus"\s*=\s*(-?\d+);', stdout)
+        reason = (
+            f"launchd job registered but not running (last exit status {exit_match.group(1)})"
+            if exit_match
+            else "launchd job registered but not running"
+        )
+        stale_hint = _viz_plist_stale_reason()
+        if stale_hint:
+            reason = f"{reason}; {stale_hint}"
+        return "down", reason
+    except subprocess.TimeoutExpired:
+        return "indeterminate", "launchctl list timed out"
+    except Exception as exc:
+        return "indeterminate", f"launchctl probe failed unexpectedly: {exc}"
+
+
+def _check_viz_health_systemd() -> tuple[str, str | None]:
+    """Linux supervision-layer probe for the viz server.
+
+    Checks the ONE per-seat systemd-user unit this repo actually ships
+    (templates/engram-viz-user.service.template, installed by
+    tools/operator-setup-viz.sh to
+    ~/.config/systemd/user/engram-viz-user.service) -- not an invented name.
+
+    Three-step, so "no unit installed" and "bus unreachable" are never
+    conflated into the same silent verdict (#2795 colleague review,
+    demonstrated live on a real fleet seat rather than reasoned): first
+    confirm systemd exists on this box at all (_shutil.which -- unchanged
+    from before); then check the unit FILE's existence directly on disk --
+    this needs no bus round-trip at all, mirroring how the launchd branch's
+    stale-plist enrichment already checks a plist file's existence rather
+    than a launchctl round-trip (see _viz_plist_stale_reason); only once the
+    file is confirmed present do we ask whether this account has a usable
+    systemd-user bus. A Linux account can have the unit file on disk
+    (installed in a richer, interactive session at operator-setup-viz.sh
+    time) and still have no reachable user bus at hook-invocation time --
+    measured live on a real seat: XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+    both unset, both bus-availability calls below exit 1 with "Failed to
+    connect to bus: No medium found", while the SYSTEM bus (no --user) on
+    that same seat works fine, and genuine per-seat units sat on disk under
+    ~/.config/systemd/user/ needing no bus to see. That case used to
+    collapse into "not-configured" (silent) when the true state was "cannot
+    tell" -- exactly the failure mode this probe exists to prevent, one
+    layer down from where #2783 first drew the up/down/indeterminate/
+    not-configured line.
+
+    Returns:
+        ("up", None) — unit file present, user bus reachable, unit loaded
+            and ActiveState=active.
+        ("down", reason) — unit file present, user bus reachable, unit
+            loaded (LoadState != "not-found") but not active.
+        ("not-configured", None) — no systemd on this box at all, OR no
+            engram-viz-user.service unit FILE installed at
+            ~/.config/systemd/user/. The common, correct verdict for most
+            of the fleet (#2783) -- NOT an error.
+        ("indeterminate", reason) — the unit FILE is present but the
+            systemd-user bus is unreachable (reason names
+            XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS as the likely cause --
+            the actionable diagnostic that surfaced this fix), or the probe
+            timed out, or an unexpected exception occurred while the bus
+            itself was confirmed usable. Never "not-configured" once a unit
+            file genuinely exists -- an inconclusive probe is not evidence
+            of absence.
+    """
+    import shutil as _shutil
+
+    if not _shutil.which("systemctl"):
+        # No systemd on this Linux box at all -- no supervision layer to
+        # probe, not an error.
+        return "not-configured", None
+
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{_VIZ_SYSTEMD_UNIT}")
+    if not os.path.exists(unit_path):
+        # No per-seat unit FILE installed for this account -- genuinely
+        # nothing to check. This needs no bus round-trip, unlike everything
+        # below; deciding "not-configured" here never depends on whether the
+        # user bus happens to be reachable right now.
+        return "not-configured", None
+
+    try:
+        bus_check = subprocess.run(
+            ["systemctl", "--user", "--quiet", "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if bus_check.returncode != 0:
+            bus_check = subprocess.run(
+                ["systemctl", "--user", "--quiet", "status", "default.target"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        if bus_check.returncode != 0:
+            # The unit FILE exists but we cannot reach the user bus to ask
+            # systemd about its state -- "cannot tell", never "nothing
+            # installed". See the docstring above for the measured
+            # XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS root cause.
+            return (
+                "indeterminate",
+                "systemd user bus unreachable — XDG_RUNTIME_DIR/"
+                "DBUS_SESSION_BUS_ADDRESS unset?",
+            )
+
+        result = subprocess.run(
+            [
+                "systemctl", "--user", "show",
+                "-p", "LoadState,ActiveState",
+                "--no-pager", _VIZ_SYSTEMD_UNIT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return "indeterminate", "systemctl --user show failed unexpectedly"
+
+        props = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        load_state = props.get("LoadState", "")
+        active_state = props.get("ActiveState", "")
+
+        if load_state == "not-found":
+            return "not-configured", None
+        if active_state == "active":
+            return "up", None
+        return (
+            "down",
+            f"systemd unit {_VIZ_SYSTEMD_UNIT} loaded but {active_state or 'inactive'}",
+        )
+    except subprocess.TimeoutExpired:
+        return "indeterminate", "systemctl --user probe timed out"
+    except Exception as exc:
+        return "indeterminate", f"systemctl probe failed unexpectedly: {exc}"
+
+
+def _check_viz_server_health(engram_home: str) -> tuple[str, str | None]:
+    """Check whether the ENGRAM viz server (health dashboard, canonically
+    port 5001) is actually running -- mirrors _check_mcp_health's tri-state
+    pattern (#1754) but with a REQUIRED fourth state (#2783).
+
+    Four-state result:
+        "up"             — a per-seat service definition exists for this
+                            account AND the job is currently running. Silent
+                            (matches #198's silent-when-healthy convention).
+        "down"           — a per-seat service definition exists for this
+                            account but the job is confirmed NOT running.
+                            Hard alarm, same posture as the MCP OFFLINE case
+                            -- this seat expects viz and it silently isn't
+                            there.
+        "indeterminate"  — the probe itself could not get a clear answer
+                            (unexpected error, timeout). Soft note, never a
+                            hard alarm -- same reasoning as the MCP `None`
+                            case (#1754): an inconclusive probe is not
+                            evidence of absence.
+        "not-configured" — no per-seat service definition exists for this
+                            account. Silent, same as "up" -- and this is NOT
+                            a degenerate/error case, it is the CORRECT,
+                            common-case verdict for the MAJORITY of the
+                            fleet: a shared multi-tenant viz server with no
+                            per-seat unit, or a seat riding another
+                            account's live process with no LaunchAgent/
+                            systemd unit of its own. Measured 2026-09-09
+                            across 3 real seats: 1 macOS per-seat-LaunchAgent
+                            seat (up/down applies), 2 seats with no per-seat
+                            unit at all (not-configured, correctly silent).
+                            Collapsing this into "down", or omitting it
+                            entirely, makes the probe cry wolf on most of the
+                            fleet -- exactly the failure mode #2783 exists to
+                            prevent.
+
+    NEVER probes the network port (127.0.0.1:5001) directly: loopback is not
+    per-user namespaced, so on a host where ANY account runs a viz server,
+    every other account's curl reaches THAT instance and gets 200 --
+    indistinguishable from "my own service is healthy" (measured directly on
+    the filing agent's host: two different accounts' curls returned 200 from
+    the SAME process, and one of those accounts has no viz service of its
+    own at all). Always probes the supervision layer instead (launchctl /
+    systemctl --user), which is scoped per-account by construction.
+
+    Probe-only -- never starts, restarts, repairs, or otherwise mutates any
+    service state. Same posture as #198's MCP probe.
+
+    Exception-handling posture DELIBERATELY differs from _check_mcp_health's:
+    an unexpected exception here returns "indeterminate", NEVER a silent
+    "up". _check_mcp_health's fail-open-to-True-on-any-exception only makes
+    sense in a world with no dedicated silent state for the benign case --
+    there, collapsing an unexpected error into silence was the only way to
+    avoid a false OFFLINE alarm. Here a dedicated silent state already
+    exists for the genuinely-benign case ("not-configured"), so an
+    unexpected error is NOT that case and deserves a soft note instead of
+    silence.
+
+    Args:
+        engram_home: accepted for signature parity with the other _check_*
+            probes in this file (_check_mcp_health, _check_backup_staleness)
+            and in case a future per-seat override needs it. Unused today --
+            no per-account config currently changes which launchd label /
+            systemd unit name this probe checks; both are fixed, shared
+            conventions (see templates/engram-viz-server.plist.template and
+            templates/engram-viz-user.service.template).
+
+    Returns:
+        (status, reason): status is one of "up" / "down" / "indeterminate" /
+                          "not-configured"; reason is a human string for the
+                          "down" / "indeterminate" cases, else None.
+    """
+    del engram_home  # unused; see Args note above
+
+    layer = _viz_supervision_layer()
+    if layer == "launchd":
+        return _check_viz_health_launchd()
+    if layer == "systemd":
+        return _check_viz_health_systemd()
+    # No supervision layer this probe knows how to read (e.g. Windows) --
+    # nothing to probe, not an error.
+    return "not-configured", None
+
+
 def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -> str:
     """Render a 6-10 line calibration anchor for session start.
 
@@ -2803,8 +3149,17 @@ def main() -> None:
     # the old PID in the marker yet. Same class of false alarm as the daemon-
     # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
     # hook) where the race window is long past.
+    #
+    # Viz-server probe (#2783) added alongside the two checks above: the viz
+    # dashboard is the one substrate component with no other surface that
+    # would ever show its own absence (its absence is displayed ON the
+    # dashboard) — see _check_viz_server_health's docstring for the four-state
+    # contract (a REQUIRED "not-configured" silent state beyond the MCP
+    # tri-state, because most seats correctly have no per-seat service
+    # definition at all).
     mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
+    viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
 
     # Tri-state (#1754): False = confirmed absent (hard alarm); None =
     # indeterminate probe (soft note, no "tell the user immediately" — a
@@ -2812,7 +3167,16 @@ def main() -> None:
     mcp_offline = mcp_status is False
     mcp_inconclusive = mcp_status is None
 
-    if mcp_offline or mcp_inconclusive or not stale_ok:
+    # Four-state (#2783): "down" is the viz-server hard-alarm analogue of
+    # mcp_offline; "indeterminate" is the soft-note analogue of
+    # mcp_inconclusive. "up" and "not-configured" are BOTH silent — see
+    # _check_viz_server_health's docstring for why "not-configured" is a
+    # correct common-case verdict, not a degraded one, and must never be
+    # folded into "down".
+    viz_down = viz_status == "down"
+    viz_inconclusive = viz_status == "indeterminate"
+
+    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
         lines.append("")
         lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
@@ -2823,6 +3187,11 @@ def main() -> None:
         if not stale_ok:
             lines.append(f"  Git backup: {stale_reason}")
             lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+        if viz_down:
+            lines.append(f"  Viz server: DOWN ({viz_reason})")
+            lines.append("  → Tell the user; the health dashboard is unreachable.")
+        elif viz_inconclusive:
+            lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
 
     output_obj = {
         "hookSpecificOutput": {
