@@ -87,15 +87,23 @@ from . import static_serve
 from .data import health_v2 as viz_health_v2_data
 
 # ---------------------------------------------------------------------------
-# Startup-time dev-tier check (see JUDGMENT CALL 1 above). Both the data
-# module AND the page template are required for this process to do
-# anything meaningful -- checked together, at IMPORT time, so a
-# convenience/essential-tier build fails loud and early (before any
-# argparse, before any socket bind) rather than with a bare traceback the
-# first time a request actually needs the missing piece.
+# Startup-time dev-tier check (see JUDGMENT CALL 1 above). ALL FIVE files
+# the page route (``/``) depends on -- the page template, the backend
+# data module, and the three ``<script>`` tags the template itself loads
+# (``health-workbench.js`` / ``health-workbench-curve.js`` /
+# ``health-detail-math.js``) -- are
+# required for this process to do anything meaningful, checked together,
+# at IMPORT time, so a convenience/essential-tier build (or a build whose
+# manifest ships only part of the set) fails loud and early (before any
+# argparse, before any socket bind) rather than with a bare traceback --
+# or, worse, a half-started server whose page 404s on its own <script>
+# tags -- the first time a request actually needs a missing piece
+# (engram-alpha#2735: the OLD viz.server._workbench_available() checked
+# only the template + data module, not the two scripts the page also
+# loads, so a build shipping half the set silently passed its gate).
 #
-# Unlike viz.server's OLD _workbench_available() (removed in this PR),
-# this import is a plain TOP-LEVEL one, not a lazy function-scoped one --
+# Unlike viz.server's OLD _workbench_available() (removed in #2754), this
+# import is a plain TOP-LEVEL one, not a lazy function-scoped one --
 # deliberately: this module itself ships at "dev" tier in
 # src/build/packaging/tiers.json, the SAME tier as
 # viz/data/health_workbench.py, so test_import_dep_tier_consistency's
@@ -108,24 +116,83 @@ from .data import health_v2 as viz_health_v2_data
 _WORKBENCH_TEMPLATE_PATH = (
     Path(__file__).resolve().parent / "templates" / "health_workbench.html"
 )
+_WORKBENCH_JS_PATH = static_serve._STATIC_DIR / "health-workbench.js"
+_WORKBENCH_CURVE_JS_PATH = static_serve._STATIC_DIR / "health-workbench-curve.js"
+_WORKBENCH_DETAIL_MATH_JS_PATH = static_serve._STATIC_DIR / "health-detail-math.js"
 
-try:
-    from .data import health_workbench as viz_health_workbench_data
-except ImportError as exc:  # pragma: no cover -- exercised only on a
-    # convenience/essential-tier build that doesn't ship this file at all.
-    raise SystemExit(
-        "viz.workbench requires the Curve Workbench's dev-tier files, "
-        "which this install does not ship (viz/data/health_workbench.py "
-        f"is not importable: {exc}). Build/install with the 'dev' tier to "
-        "use this entry point."
-    ) from exc
 
-if not _WORKBENCH_TEMPLATE_PATH.is_file():  # pragma: no cover -- same reason.
-    raise SystemExit(
-        "viz.workbench requires the Curve Workbench's dev-tier files, "
-        f"which this install does not ship: {_WORKBENCH_TEMPLATE_PATH} is "
-        "missing. Build/install with the 'dev' tier to use this entry point."
+def _missing_workbench_deps(
+    template_path=None,
+    js_path=None,
+    curve_js_path=None,
+    detail_math_js_path=None,
+    import_data_module=None,
+):
+    """Names of the Curve Workbench's dependencies that are NOT present /
+    importable -- the five files the ``/`` page route depends on: the
+    page template, the three ``<script>`` tags it loads, and the backend
+    data module (``viz/data/health_workbench.py``). Empty list = every
+    dependency is present, gate open.
+
+    A plain, parameterized function -- not folded directly into
+    module-import-time code -- so tests can mutate each dependency
+    independently (pass an alternate path for one of the four file
+    checks, or a raising ``import_data_module`` callable for the fifth)
+    and call this directly, without needing to fake the filesystem or
+    re-import this module. This preserves the same testability the OLD,
+    now-removed ``viz.server._workbench_available()`` had ("a plain
+    function, not a cached module-level constant, exactly so tests can
+    [flip it] without needing to fake the filesystem") in the closest
+    equivalent shape for a startup-time check.
+
+    Defaults (when called with no arguments -- what module-import time
+    below actually does) resolve to the real module-level path constants
+    and the real import of ``.data.health_workbench``.
+    """
+    template_path = _WORKBENCH_TEMPLATE_PATH if template_path is None else template_path
+    js_path = _WORKBENCH_JS_PATH if js_path is None else js_path
+    curve_js_path = _WORKBENCH_CURVE_JS_PATH if curve_js_path is None else curve_js_path
+    detail_math_js_path = (
+        _WORKBENCH_DETAIL_MATH_JS_PATH if detail_math_js_path is None else detail_math_js_path
     )
+
+    missing = []
+    if not template_path.is_file():
+        missing.append(str(template_path))
+    if not js_path.is_file():
+        missing.append(str(js_path))
+    if not curve_js_path.is_file():
+        missing.append(str(curve_js_path))
+    if not detail_math_js_path.is_file():
+        missing.append(str(detail_math_js_path))
+
+    if import_data_module is None:
+        def import_data_module():
+            from .data import health_workbench as _  # noqa: F401
+    try:
+        import_data_module()
+    except ImportError as exc:
+        missing.append(f"viz/data/health_workbench.py (not importable: {exc})")
+
+    return missing
+
+
+_MISSING_WORKBENCH_DEPS = _missing_workbench_deps()
+if _MISSING_WORKBENCH_DEPS:  # pragma: no cover -- exercised only on a
+    # convenience/essential-tier build, or a dev-tier build whose manifest
+    # shipped only part of the set, that doesn't ship all five files this
+    # process needs.
+    raise SystemExit(
+        "viz.workbench requires the Curve Workbench's dev-tier files, "
+        "which this install does not ship or cannot import: "
+        f"{'; '.join(_MISSING_WORKBENCH_DEPS)}. Build/install with the "
+        "'dev' tier to use this entry point."
+    )
+
+# Real import for actual use by the Handler below -- guaranteed to
+# succeed at this point since _missing_workbench_deps() above already
+# confirmed it imports cleanly (or this module would already have exited).
+from .data import health_workbench as viz_health_workbench_data
 
 
 # ---------------------------------------------------------------------------

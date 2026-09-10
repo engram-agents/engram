@@ -57,6 +57,20 @@ def get_workbench_model() -> dict:
     ``health.curves.curve_defs_jsonable``'s own docstrings for the full
     field list -- this function does not reshape either.
     """
+    # `stage` is an explicit flag, set at each point in this function where
+    # a distinct failure could occur, rather than inferred after the fact
+    # from which locals happen to be bound (engram-alpha#2735): the OLD
+    # `"health_engine" not in locals()` discriminator mislabeled an import
+    # failure of `health.model` (the THIRD of the three imports below) as
+    # an export failure, because by the time that import statement runs,
+    # `health_curves` and `health_engine` -- the two imports before it --
+    # are ALREADY bound in locals(), so the locals()-based check read
+    # False even though nothing had exported yet. Since this is a
+    # never-raises function, `reason` is the entire diagnostic surface for
+    # whoever's debugging why the workbench is unavailable, so it must
+    # name the actual failing stage, not a guess reconstructed from
+    # incidental binding state.
+    stage = "model_module_unavailable"
     try:
         # Lazy import -- same convention as viz.data.health_v2's own
         # "one deliberate exception" import of health.series (see that
@@ -67,12 +81,18 @@ def get_workbench_model() -> dict:
         # no extra path surgery needed here. Function-scoped (not
         # module-level) so this module stays importable, and this whole
         # feature stays gateable, even in a build/environment where
-        # health/ isn't on the path at all -- see server.py's
-        # `_workbench_available()` for the caller-side half of that gate.
+        # health/ isn't on the path at all -- see viz.workbench's
+        # startup-time dependency check for the caller-side half of that
+        # gate (viz.server's old `_workbench_available()`, which this
+        # comment used to cite, was removed by engram-alpha#2754).
         from health import curves as health_curves
         from health import engine as health_engine
         from health import model as health_model
 
+        # All three imports above succeeded -- any failure from here on
+        # is a genuine EXPORT failure (the *_jsonable() calls), not an
+        # import failure.
+        stage = "model_export_failed"
         model = health_engine.MODEL
         model_defs = health_model.model_defs_jsonable(model)
         curve_defs = health_curves.curve_defs_jsonable(model.curves)
@@ -82,10 +102,7 @@ def get_workbench_model() -> dict:
         # not just across the import boundary: a future shape change in
         # health.model or health.curves could make model_defs_jsonable /
         # curve_defs_jsonable raise too, and that must fail-honest the same
-        # way an import failure does, not bubble up as a 500. `stage`
-        # distinguishes "couldn't import health/" from "health/ imported
-        # fine but a *_jsonable export raised" for whoever's debugging.
-        stage = "model_module_unavailable" if "health_engine" not in locals() else "model_export_failed"
+        # way an import failure does, not bubble up as a 500.
         return {"available": False, "reason": f"{stage}: {exc}"}
 
     return {

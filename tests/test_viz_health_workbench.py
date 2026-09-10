@@ -3,16 +3,27 @@ standalone entry point by engram-alpha#2754 PR B).
 
 Scope, post-#2754 PR B:
 
-* ``viz.data.health_workbench.get_workbench_model`` -- unchanged, tested
-  directly (no HTTP layer).
+* ``viz.data.health_workbench.get_workbench_model`` -- tested directly
+  (no HTTP layer), including (engram-alpha#2735)
+  ``TestWorkbenchModelReasonStageDiscrimination``, which distinguishes
+  an IMPORT failure of ``health.model`` from an EXPORT (``*_jsonable``)
+  failure in the function's own fail-honest ``reason`` string.
 * ``viz.workbench`` -- the NEW standalone ``:5021`` entry point that now
   owns the editable page + its own copies of the four read-only APIs it
   needs. This is where the OLD ``TestWorkbenchTierGate`` class's coverage
-  moved to (adapted: there is no per-request tier gate on this process
+  moved to (adapted: there is no per-REQUEST tier gate on this process
   any more -- see ``viz.workbench``'s own module docstring, JUDGMENT
-  CALL 1 -- so the "gate closed" test pairs are gone; what remains is the
-  positive-path coverage plus the cache-busting / static-serving
-  regression tests, which ARE still load-bearing).
+  CALL 1 -- so there is no HTTP-level "gate closed" pairing). What
+  replaced it (engram-alpha#2735): ``TestWorkbenchStartupDepsGate``
+  exercises the STARTUP-time gate's own diagnostic core,
+  ``viz.workbench._missing_workbench_deps()``, directly -- mutating each
+  of the five dependencies (template, the three ``<script>`` tags, and the
+  data module) absent in turn, the same "plain function, not a cached
+  constant, so tests can flip it directly" testability the OLD
+  ``_workbench_available()`` had, adapted to a startup-time check. The
+  remaining coverage is the positive-path HTTP tests plus the
+  cache-busting / static-serving regression tests, which ARE still
+  load-bearing.
 * ``viz.server`` -- a small regression suite confirming the OLD
   ``/health/workbench`` route and the ``/health`` page's Curve Workbench
   header link are BOTH gone from ``:5001`` now that the page lives
@@ -155,6 +166,152 @@ class TestWorkbenchModelData(unittest.TestCase):
         for a in aspects:
             self.assertIn("name", a)
             self.assertIn("points", a)
+
+
+class TestWorkbenchModelReasonStageDiscrimination(unittest.TestCase):
+    """engram-alpha#2735: get_workbench_model()'s ``reason`` string must
+    distinguish an IMPORT failure of ``health.model`` from an EXPORT
+    (``*_jsonable``) failure. The OLD ``locals()``-based discriminator
+    (``"health_engine" not in locals()"``) mislabeled a ``health.model``
+    import failure as an export failure: by the time that import
+    statement runs, ``health_curves`` and ``health_engine`` -- the two
+    imports before it -- are ALREADY bound in ``locals()``, so the check
+    read False (export-failed) even though nothing had exported yet.
+
+    Forcing a real import failure of an already-imported submodule needs
+    two mutations, not one: removing the ``model`` attribute from the
+    live ``health`` package object (Python's ``from pkg import name``
+    first tries a plain ``getattr(pkg, name)`` before falling back to
+    the full import machinery, so a stale attribute alone masks
+    ``sys.modules`` tampering) AND setting ``sys.modules["health.model"]
+    = None`` (the standard forced-ImportError sentinel). Both are
+    restored in ``finally``.
+    """
+
+    def test_import_failure_of_health_model_reports_module_unavailable_stage(self):
+        health_pkg = sys.modules.get("health")
+        self.assertIsNotNone(health_pkg, "health package must already be imported")
+        had_attr = hasattr(health_pkg, "model")
+        saved_attr = getattr(health_pkg, "model", None)
+        _UNSET = object()
+        saved_mod = sys.modules.get("health.model", _UNSET)
+
+        if had_attr:
+            delattr(health_pkg, "model")
+        sys.modules["health.model"] = None
+        try:
+            result = viz_health_workbench_data.get_workbench_model()
+        finally:
+            if had_attr:
+                setattr(health_pkg, "model", saved_attr)
+            if saved_mod is _UNSET:
+                sys.modules.pop("health.model", None)
+            else:
+                sys.modules["health.model"] = saved_mod
+
+        self.assertFalse(result["available"])
+        self.assertTrue(
+            result["reason"].startswith("model_module_unavailable:"),
+            result["reason"],
+        )
+
+        # Restored: the real, working call still succeeds (guards against
+        # the mutation leaking into later tests).
+        restored = viz_health_workbench_data.get_workbench_model()
+        self.assertTrue(restored["available"], restored.get("reason"))
+
+    def test_export_failure_reports_export_failed_stage(self):
+        # Distinct induced failure mode from the import-failure test above:
+        # here every import succeeds, and only the *_jsonable() export
+        # call raises.
+        from health import model as health_model
+
+        original = health_model.model_defs_jsonable
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("boom-from-export-stage-test")
+
+        health_model.model_defs_jsonable = _boom
+        try:
+            result = viz_health_workbench_data.get_workbench_model()
+        finally:
+            health_model.model_defs_jsonable = original
+
+        self.assertFalse(result["available"])
+        self.assertTrue(
+            result["reason"].startswith("model_export_failed:"),
+            result["reason"],
+        )
+        self.assertIn("boom-from-export-stage-test", result["reason"])
+
+
+class TestWorkbenchStartupDepsGate(unittest.TestCase):
+    """engram-alpha#2735: ``viz.workbench._missing_workbench_deps()`` --
+    the startup-time gate's own diagnostic core -- must enumerate ALL
+    FIVE files the ``/`` page route depends on (template, the three
+    ``<script>`` tags -- ``health-workbench.js``,
+    ``health-workbench-curve.js``, ``health-detail-math.js`` -- and the
+    backend data module), not just the template + data module the OLD,
+    now-removed ``viz.server._workbench_available()`` checked. Same shape
+    as that function's own tier-gate mutation tests (see the OLD
+    ``TestWorkbenchTierGate`` class, preserved in git history at
+    engram-alpha#2754's removal commit): each dependency is mutated
+    ABSENT independently and the gate must report it missing; with
+    every dependency mutated back to present, the gate must report
+    empty (open). This is a discriminating test in both directions --
+    a gate that is ALWAYS closed would also pass a "closed" assertion
+    alone; ``test_all_four_present_returns_empty`` is what rules that
+    out.
+    """
+
+    def setUp(self):
+        self._nonexistent = Path(tempfile.mkdtemp()) / "does-not-exist.file"
+
+    def test_all_four_present_returns_empty(self):
+        # The discriminating direction: exercised against the REAL paths
+        # on disk in this checkout (which does ship all four files, since
+        # this is the source tree, not a built convenience/essential
+        # plugin bundle) -- a gate that always reports "missing" would
+        # fail this, not just the four below.
+        self.assertEqual(viz_workbench._missing_workbench_deps(), [])
+
+    def test_missing_template_flips_gate_closed(self):
+        missing = viz_workbench._missing_workbench_deps(template_path=self._nonexistent)
+        self.assertEqual(missing, [str(self._nonexistent)])
+
+    def test_missing_js_flips_gate_closed(self):
+        missing = viz_workbench._missing_workbench_deps(js_path=self._nonexistent)
+        self.assertEqual(missing, [str(self._nonexistent)])
+
+    def test_missing_curve_js_flips_gate_closed(self):
+        missing = viz_workbench._missing_workbench_deps(curve_js_path=self._nonexistent)
+        self.assertEqual(missing, [str(self._nonexistent)])
+
+    def test_missing_detail_math_js_flips_gate_closed(self):
+        missing = viz_workbench._missing_workbench_deps(detail_math_js_path=self._nonexistent)
+        self.assertEqual(missing, [str(self._nonexistent)])
+
+    def test_missing_data_module_flips_gate_closed(self):
+        def _raise_import_error():
+            raise ImportError("simulated missing viz/data/health_workbench.py")
+
+        missing = viz_workbench._missing_workbench_deps(import_data_module=_raise_import_error)
+        self.assertEqual(len(missing), 1)
+        self.assertIn("viz/data/health_workbench.py", missing[0])
+        self.assertIn("simulated missing", missing[0])
+
+    def test_all_five_missing_simultaneously_reports_all_five(self):
+        def _raise_import_error():
+            raise ImportError("simulated missing viz/data/health_workbench.py")
+
+        missing = viz_workbench._missing_workbench_deps(
+            template_path=self._nonexistent,
+            js_path=self._nonexistent,
+            curve_js_path=self._nonexistent,
+            detail_math_js_path=self._nonexistent,
+            import_data_module=_raise_import_error,
+        )
+        self.assertEqual(len(missing), 5)
 
 
 class TestWorkbenchServerNoLongerHosts(_LiveServerBase):
