@@ -719,8 +719,8 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   leave it un-renewable by the pusher — that is the distinction the setting
   exists to draw, not a guarantee for every push: #2338 below is a
   content-changing push on this same `dev` base whose approval survived. Under
-  gh-stack's own auto-rebase mechanism there is exactly one measurement to
-  date, and it dismissed: measured 2026-09-02 on the #1991 health-score stack —
+  gh-stack's own auto-rebase mechanism there are **two measurements to date,
+  and both dismissed**. FIRST, measured 2026-09-02 on the #1991 health-score stack —
   when #2187 merged as `aa7275dd`, GitHub's own auto-rebase moved #2189 from
   `0871821a` to `9f6b6cfe`, and the approval standing on the pre-rebase tip
   `0871821a` was `DISMISSED`, read directly off `pulls/2189/reviews`. That
@@ -731,9 +731,62 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   and the byte total then varies by clone; `0f8999b8` is #2187's pre-merge
   branch tip, NOT `dev` and not the squash commit — name it explicitly, because
   a reviewer who reaches for a plausible-looking base instead gets a different
-  number). **n=1 — one observation is not a basis for asserting the auto-rebase
-  always dismisses; that is the whole reason the read-back below matters, not a
-  formality.** Separately, the same `dismiss_stale_reviews_on_push: true`
+  number). **SECOND, measured 2026-09-11 on the #2753 stack, and this one
+  establishes CAUSATION rather than leaving it inferred:** when #2812 merged as
+  `1998f071`, #2814's `review_dismissed` and `head_ref_force_pushed` events carry
+  **the same second — `2026-09-11T18:38:55Z` — and the same actor**, the merge seat
+  running `gh stack merge`; the approval (submitted 2026-09-10T18:43:17Z against
+  `66f4efd9`) predates both by a day. Membership was confirmed server-side —
+  `pulls/2814` returns `stack: {id 1029225, number 2815, position 2, size 2}` —
+  against the control that `pulls/2834` returns `stack: null`. **`2815` is the
+  STACK's own number, not a typo for `2814`**: the parent `pulls/2812` reports the
+  identical `id`/`number` at `position: 1`, and `2815` 404s as a PR or issue, so a
+  stack consumes a number from the same namespace PRs and issues draw from.
+  **In a hurry — this bullet carries TWO operational instructions and they are
+  NOT adjacent.** First: read `id`/`number`/`position`/`size` off the stack
+  object and ignore `base.sha`. Then go straight to the read-the-approval-back
+  instruction that ENDS this bullet; it is the one that governs what you
+  actually do when a layer merges. Everything between them is evidence and
+  case detail. **Measured 2026-09-11, by
+  two independent methods that reconcile with zero residue.** (1) Sweeping
+  every one of this repo's 1439 PR numbers for a non-null `stack` (GraphQL
+  `pullRequest(number:N){stack{id number}}`, batched 50 at a time, 0 errored
+  batches) finds 14 member PRs across six stacks — `2386`, `2441`, `2466`,
+  `2610`, `2633`, `2815` — each of which 404s as both a PR and an issue. (2)
+  Counting the NAMESPACE instead: its ceiling is `2845`, an ISSUE rather than
+  a PR — so the ceiling is the max over BOTH kinds, and taking the highest PR
+  number is the easy way to get this wrong — against 1439 PRs and 1399 issues,
+  leaving exactly seven unoccupied numbers: the six above plus `1326`, which
+  resolves as an issue transferred to another repo. **The second method BOUNDS
+  what the first could have missed**, and the bound is narrower than it first
+  reads, so state it exactly: among stacks numbered at or below the scanned
+  ceiling, none is invisible to both methods — one the per-PR read missed
+  would still consume a number, and no unexplained number remains for it to
+  occupy. It does NOT reach a stack numbered ABOVE that ceiling, and it rests
+  on a premise that is inductive rather than documented — that a stack
+  reserves its number for as long as it exists, true of all six here and not a
+  published GitHub guarantee. The first method's own worst case was checked
+  directly and does not happen: a merged stack's members do NOT go `stack:
+  null` and drop out of the sweep — all three already-merged pairs still
+  report their `stack.number`. Each earlier draft of this count was calibrated
+  to what had been measured that session rather than to what was measurable;
+  the enumeration that settles it costs one scripted pass. Still only this
+  repo, and only as of that date: the shape of the numbering here, not a
+  documented guarantee. Read `id`/`number`/`position`/`size` and not the
+  stack's `base.sha`, which is transient — observed once: it read `1998f071`
+  minutes after the merge and reads `null` now. **The timestamps are what make
+  this a second observation rather than a second anecdote:** a current-state
+  read tells you a review *is* dismissed, never *when* or *by what*, and #2814
+  also carries an EARLIER force-push (2026-09-10T18:31:43Z, a different agent)
+  that the approval postdates — so co-occurrence alone would not have settled
+  it.
+  **n=2 — and
+  two is two: this still does not establish that the auto-rebase ALWAYS
+  dismisses, so the read-back below remains the thing that settles any given
+  case rather than a formality.** What the second observation does retire is
+  the weaker worry, that the first might have been some other push wearing the
+  auto-rebase's clothes.
+  Separately, the same `dismiss_stale_reviews_on_push: true`
   setting has been seen NOT to dismiss on this repo — but under a manual
   force-push, not gh-stack's auto-rebase: on #2338, review `5055356943` was
   submitted 2026-08-28T21:50:49Z against commit `990de705`, whose
@@ -764,8 +817,8 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   And read `submitted_at` against the commit's own creation time, never the
   review STATE — #2338 also carries two genuinely fresh approvals on the same
   commit, so a state-based read (dismiss-then-approve) cannot tell migration
-  from re-approval by itself. So: the auto-rebase path has exactly one
-  observation and it dismissed; the migration case belongs to a different
+  from re-approval by itself. So: the auto-rebase path has two
+  observations and both dismissed; the migration case belongs to a different
   mechanism — a manual force-push, not the auto-rebase — and does not bear on
   what the auto-rebase does. Plan for dismissal, read the approval back off
   `pulls/<N>/reviews` after every layer, and never reason about whether it
