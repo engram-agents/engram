@@ -91,6 +91,24 @@ _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
 if _RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _RUNTIME_DIR)
 
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-session-start-hook.py:main"
+_HOOK_FIRE_SITE = "session-start-hook.hook_fire"
+
 try:
     from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
     _HOOKLIB_OK = True
@@ -2791,6 +2809,10 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     try:
@@ -3205,15 +3227,30 @@ def main() -> None:
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
     # Emit engram.hook.fire event. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5) -- the session_id/transcript_path extraction below is data
+    # prep, not construction, so it sits outside the narrowed try.
+    _session_id = hook_input.get("session_id", "unknown") or "unknown"
+    _transcript_path = hook_input.get("transcript_path", "") or ""
+    _emitter = None
     try:
-        _session_id = hook_input.get("session_id", "unknown") or "unknown"
-        _transcript_path = hook_input.get("transcript_path", "") or ""
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=_session_id,
             transcript_path=_transcript_path,
         )
-        _emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -3224,9 +3261,13 @@ def main() -> None:
                 "stdout_bytes": len(output_str.encode("utf-8")),
                 "stderr_bytes": 0,
             },
+            site="session-start-hook.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

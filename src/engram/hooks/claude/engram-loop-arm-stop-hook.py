@@ -341,6 +341,32 @@ try:
         sys.path.insert(0, _RUNTIME_DIR)
 except Exception:
     pass
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+# Guarded the same way as the emitter resolver above -- same fail-toward-
+# emitting posture this whole file uses (this new addition does not touch
+# the existing bootstrap above it).
+try:
+    from _hooklib import resolve_runtime_dir as _resolve_runtime_dir_for_telemetry
+    _TELEMETRY_RUNTIME_DIR = _resolve_runtime_dir_for_telemetry(ENGRAM_HOME, "engram_telemetry_store.py")
+    if _TELEMETRY_RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+except Exception:
+    pass
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-loop-arm-stop-hook.py:main"
+_HOOK_FIRE_SITE = "loop-arm-stop-hook.hook_fire"
+
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -609,6 +635,10 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     session_id = "unknown"
@@ -689,13 +719,27 @@ def main() -> None:
 
     # Emit engram.hook.fire event, matching the sibling Stop hooks'
     # observability convention. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5).
+    _emitter = None
     try:
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id,
             transcript_path=transcript_path,
         )
-        _emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -704,9 +748,13 @@ def main() -> None:
                 "duration_ms": _duration_ms,
                 "exit_code": 0,
             },
+            site="loop-arm-stop-hook.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

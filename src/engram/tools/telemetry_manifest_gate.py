@@ -107,7 +107,14 @@ EMIT_FUNC_NAMES = {"emit", "emit_if_initialized"}
 # reader (or a --report consumer) can name the exclusion explicitly rather
 # than rediscover it.
 TRANSPORT_EXCLUSION_FILE = "engram_log_emitter.py"
-TRANSPORT_EXCLUSION_LINENO = 260
+# alpha #2574 WS3 (line-number drift, not a design change): WS3's `site`
+# param addition to Emitter.emit()/_emit_inner() shifted this file's own
+# source lines, moving `emit_if_initialized`'s `return emitter.emit(...)`
+# from :260 to :281. Re-verify with `--report` after any future
+# engram_log_emitter.py edit -- this is exactly the stale-line-number
+# failure mode docs/2574-telemetry-design.md §1 warns against, one level
+# down in this gate's own exclusion constant rather than in a manifest_id.
+TRANSPORT_EXCLUSION_LINENO = 281
 
 FuncKey = tuple  # (file: str, name: str) — kept untyped for py3.8 dataclass friendliness
 

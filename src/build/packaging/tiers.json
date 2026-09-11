@@ -199,7 +199,7 @@
       "path": "engram_log_emitter.py",
       "tier": "essential",
       "telemetry": [],
-      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :260 IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
+      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :281 (line drifted from :260 by WS3's additive `site` param on emit()/_emit_inner() -- see telemetry_manifest_gate.py's TRANSPORT_EXCLUSION_LINENO) IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
     },
     {
       "path": "engram_telemetry_store.py",
@@ -688,13 +688,19 @@
       "path": "hooks/claude/engram-surface-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-surface-hook.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "surface-hook.surface_fire", "trigger": "UserPromptSubmit hook main()"},
+        {"site": "surface-hook.trigger_fire", "trigger": "UserPromptSubmit hook main()"},
+        {"site": "surface-hook.render_size", "trigger": "UserPromptSubmit hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-session-start-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-session-start-hook.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "session-start-hook.hook_fire", "trigger": "SessionStart hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-stale-tree-pull-hook.py",
@@ -715,7 +721,9 @@
       "path": "hooks/claude/engram-postcompact-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-postcompact-hook.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "postcompact-hook.hook_fire", "trigger": "PostCompact hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-toolcall-repair.py",
@@ -731,7 +739,9 @@
       "path": "hooks/claude/engram-stop-hook.py",
       "tier": "essential",
       "dest": "hooks/engram-stop-hook.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "stop-hook.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/_stophooklib.py",
@@ -747,13 +757,17 @@
       "path": "hooks/claude/engram-deference-detector-prompt.py",
       "tier": "convenience",
       "dest": "hooks/engram-deference-detector-prompt.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "deference-detector-prompt.hook_fire", "trigger": "UserPromptSubmit hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-deference-detector-stop.py",
       "tier": "convenience",
       "dest": "hooks/engram-deference-detector-stop.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "deference-detector-stop.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-end-of-day-hook.py",
@@ -800,13 +814,18 @@
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
       "tier": "convenience",
       "dest": "hooks/engram-utility-credit-mention-stop.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "utility-credit-mention-stop.enactment", "trigger": "Stop hook main()"},
+        {"site": "utility-credit-mention-stop.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-loop-arm-stop-hook.py",
       "tier": "convenience",
       "dest": "hooks/engram-loop-arm-stop-hook.py",
-      "telemetry": []
+      "telemetry": [
+        {"site": "loop-arm-stop-hook.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",

@@ -49,6 +49,23 @@ _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
 if _RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _RUNTIME_DIR)
 
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-deference-detector-prompt.py:main"
+
 # ---------------------------------------------------------------------------
 # loop_prompt import — SSoT for the loop-wake marker.
 #
@@ -138,31 +155,59 @@ def _is_cron_prompt(prompt: str, loop_marker_path: str) -> bool:
     return False
 
 
+_HOOK_FIRE_SITE = "deference-detector-prompt.hook_fire"
+
+
 def _emit_hook_fire(session_id: str, transcript_path: str, duration_ms: int, stdout_bytes: int) -> None:
-    """Emit engram.hook.fire event. Failure must not break the hook."""
+    """Emit engram.hook.fire event. Failure must not break the hook.
+
+    alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
+    own try/except so an INIT_FAILED outcome is recordable and distinct from
+    an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5) -- the
+    previous single wide try made a failure after a successful emit
+    indistinguishable from a construction failure.
+    """
+    _emitter = None
     try:
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id or "unknown",
             transcript_path=transcript_path or "",
         )
-        _emitter.emit(
-            event_type="engram.hook.fire",
-            level=1,
-            data={
-                "hook_name": "engram-deference-detector-prompt",
-                "hook_type": "UserPromptSubmit",
-                "duration_ms": duration_ms,
-                "exit_code": 0,
-                "stdout_bytes": stdout_bytes,
-                "stderr_bytes": 0,
-            },
-        )
     except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+        return
+
+    _uid = _emitter.emit(
+        event_type="engram.hook.fire",
+        level=1,
+        data={
+            "hook_name": "engram-deference-detector-prompt",
+            "hook_type": "UserPromptSubmit",
+            "duration_ms": duration_ms,
+            "exit_code": 0,
+            "stdout_bytes": stdout_bytes,
+            "stderr_bytes": 0,
+        },
+        site="deference-detector-prompt.hook_fire",
+    )
+    write_telemetry_record(
+        manifest_id=_HOOK_FIRE_SITE,
+        event_type="engram.hook.fire",
+        fields={"outcome": "delivered" if _uid is not None else "dropped"},
+    )
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function (docs/2574-telemetry-design.md §1 NEGATIVE
+    # EVIDENCE / TRIGGER ENTRY).
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     # Parse stdin for session_id + transcript_path + prompt (hook protocol).

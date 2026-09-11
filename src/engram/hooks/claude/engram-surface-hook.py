@@ -69,6 +69,29 @@ _EMITTER_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
 if _EMITTER_RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _EMITTER_RUNTIME_DIR)
 
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line. All
+# three of this file's emit sites share this one `main` dispatch target
+# (docs/2574-telemetry-design.md §1: "engram-surface-hook.py's three sites
+# share main, so one reached covers all three").
+_MAIN_MANIFEST_ID = "hooks/claude/engram-surface-hook.py:main"
+_SURFACE_FIRE_SITE = "surface-hook.surface_fire"
+_TRIGGER_FIRE_SITE = "surface-hook.trigger_fire"
+_RENDER_SIZE_SITE = "surface-hook.render_size"
+
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
     """Lightweight SQLite probe. Returns (True, 'ok') or (False, reason).
@@ -3115,6 +3138,10 @@ def format_nap_warning(count: int) -> str:
 
 
 def main():
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return/exit in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
@@ -3184,14 +3211,29 @@ def main():
     # See alpha #175.
     # Failure-mode contract: emitter.emit NEVER raises; if init fails or
     # the import itself fails, we degrade silently to a no-op.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5) -- the matched-ids extraction below is data prep, not
+    # construction, so it sits outside the narrowed try.
+    _emitter = None
     try:
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=hook_input.get("session_id", "unknown"),
             transcript_path=hook_input.get("transcript_path", ""),
         )
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_SURFACE_FIRE_SITE,
+            event_type="engram.surface.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
         _surface_matched = result.get("matched_ids", []) if result else []
-        _emitter.emit(
+        _uid = _emitter.emit(
             event_type="engram.surface.fire",
             level=1,
             data={
@@ -3205,10 +3247,13 @@ def main():
                 # composite scores, etc.) require server.py-side instrumentation
                 # — Phase 3 fairy F1 scope per DESIGN.md §4.1.
             },
+            site="surface-hook.surface_fire",
         )
-    except Exception:
-        # Emitter failures must not break the hook — drop silently.
-        pass
+        write_telemetry_record(
+            manifest_id=_SURFACE_FIRE_SITE,
+            event_type="engram.surface.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
     # Build context parts
     parts = []
@@ -3238,14 +3283,38 @@ def main():
     # (matched_ids, prompt_count) -> (text, rendered) function with no
     # hook_input/session_id threading of its own.
     if _principle_rendered:
+        # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
+        # to its own try/except so an INIT_FAILED outcome is recordable and
+        # distinct from an ordinary DROPPED emit
+        # (docs/2574-telemetry-design.md §1/§5). This is the decisive case
+        # §1 names: the `for _kind, _pid, _entry, _mid in _principle_rendered`
+        # unpack used to sit INSIDE the same wide try as construction, so an
+        # unpack ValueError after a successful emit reported INIT-FAILED for
+        # a site that was actually delivering. The loop now sits outside the
+        # narrowed try; each iteration's emit is its own outcome row.
+        _emitter3 = None
         try:
             from engram_log_emitter import Emitter
             _emitter3 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),
                 transcript_path=hook_input.get("transcript_path", ""),
             )
+        except Exception:
+            write_telemetry_record(
+                manifest_id=_TRIGGER_FIRE_SITE,
+                event_type="engram.trigger.fire",
+                fields={"outcome": "init_failed"},
+            )
+
+        if _emitter3 is not None:
+            # This loop is now outside the narrowed construction-try (WS3):
+            # a malformed `_principle_rendered` entry (a producer bug, not a
+            # telemetry failure) will raise uncaught here rather than being
+            # silently swallowed as before -- see the PR body's own note on
+            # this behavior change. `_principle_rendered` is currently always
+            # well-formed 4-tuples from `check_principle_triggers_full`.
             for _kind, _pid, _entry, _mid in _principle_rendered:
-                _emitter3.emit(
+                _uid = _emitter3.emit(
                     event_type="engram.trigger.fire",
                     level=1,
                     data={
@@ -3254,10 +3323,13 @@ def main():
                         "trigger_id": _mid,
                         "prompt_seq": counter["prompts_since_compaction"],
                     },
+                    site="surface-hook.trigger_fire",
                 )
-        except Exception:
-            # Emitter failures must not break the hook — drop silently.
-            pass
+                write_telemetry_record(
+                    manifest_id=_TRIGGER_FIRE_SITE,
+                    event_type="engram.trigger.fire",
+                    fields={"outcome": "delivered" if _uid is not None else "dropped"},
+                )
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a
@@ -3432,20 +3504,36 @@ def main():
     # fires when format_nudge actually ran (_render_stats non-empty) — see
     # its out-parameter docstring for why an untouched {} means "skipped".
     if _render_stats:
+        # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
+        # to its own try/except so an INIT_FAILED outcome is recordable and
+        # distinct from an ordinary DROPPED emit
+        # (docs/2574-telemetry-design.md §1/§5).
+        _emitter2 = None
         try:
             from engram_log_emitter import Emitter
             _emitter2 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),
                 transcript_path=hook_input.get("transcript_path", ""),
             )
-            _emitter2.emit(
+        except Exception:
+            write_telemetry_record(
+                manifest_id=_RENDER_SIZE_SITE,
+                event_type="engram.surface.render_size",
+                fields={"outcome": "init_failed"},
+            )
+
+        if _emitter2 is not None:
+            _uid = _emitter2.emit(
                 event_type="engram.surface.render_size",
                 level=1,
                 data=dict(_render_stats),
+                site="surface-hook.render_size",
             )
-        except Exception:
-            # Emitter failures must not break the hook — drop silently.
-            pass
+            write_telemetry_record(
+                manifest_id=_RENDER_SIZE_SITE,
+                event_type="engram.surface.render_size",
+                fields={"outcome": "delivered" if _uid is not None else "dropped"},
+            )
 
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()
