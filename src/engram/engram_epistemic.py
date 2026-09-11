@@ -894,6 +894,7 @@ def _add_lesson_impl(
     prevention_type: str = "advisory",
     recall_summary: str = "",
     recall_keywords: list = None,
+    generalized_by: str = "",
 ) -> str:
     """Internal implementation — see engram_add_lesson MCP tool for the public
     payload schema. Kept callable with named kwargs for in-server callers.
@@ -961,6 +962,16 @@ def _add_lesson_impl(
             (flagged needs_tightening); rejected at 280+ chars.
         recall_keywords: Always provide when you can — 3-6 short content keywords.
             Never rejected regardless of count.
+        generalized_by: Comma-separated IDs of principle nodes that
+            generalize this lesson (#2753 epic WS1, D4). Must be current
+            nodes of type lesson or cornerstone (a lesson->lesson
+            meta-lesson pair, or cornerstone->lesson — see
+            GENERALIZES_ALLOWED_PAIRS). Writes
+            `<parent> generalizes <new lesson>` edges at mint time,
+            cycle-guarded. Strict: an invalid parent (missing, non-current,
+            or wrong-type pair) refuses the whole call before anything is
+            created — `generalizes` establishes structural taxonomy, unlike
+            incident_ids/context_ids this is not a best-effort field.
 
     Returns:
         JSON with lesson ID, linked incidents, and similar existing
@@ -1057,6 +1068,49 @@ def _add_lesson_impl(
                          f"Cannot cite: {', '.join(wrong_type)}.",
             })
 
+        # `generalized_by` validation (#2753 epic WS1, D4) — STRICT,
+        # fail-before-insert: unlike incident_ids/context_ids (which either
+        # hard-fail on missing incidents or best-effort skip missing
+        # context), a `generalizes` parent establishes structural taxonomy,
+        # and a mechanically-enforced endpoint gate already exists
+        # everywhere else this relation is written (_add_edge_impl in
+        # engram_cornerstone.py) — silently skipping an invalid parent here
+        # would leave a lesson dangling out of its intended abstraction
+        # hierarchy with no signal that happened.
+        generalized_by_ids = list(dict.fromkeys(
+            s.strip() for s in core._as_csv(generalized_by).split(",") if s.strip()
+        ))
+        for pid in generalized_by_ids:
+            prow = conn.execute(
+                "SELECT id, type, is_current FROM nodes WHERE id = ?", (pid,)
+            ).fetchone()
+            if not prow:
+                return json.dumps({
+                    "error": f"generalized_by parent '{pid}' not found."
+                })
+            if not prow["is_current"]:
+                return json.dumps({
+                    "error": (
+                        f"generalized_by parent '{pid}' is not current "
+                        f"(retracted or superseded). Use "
+                        f"engram_inspect('{pid}') to find the current "
+                        f"successor."
+                    )
+                })
+            pair = (prow["type"], "lesson")
+            if pair not in core.GENERALIZES_ALLOWED_PAIRS:
+                allowed_sources = sorted(
+                    t for t, tgt in core.GENERALIZES_ALLOWED_PAIRS if tgt == "lesson"
+                )
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' does not accept a "
+                        f"{prow['type']} -> lesson pair (parent '{pid}'). "
+                        f"Allowed source types for a lesson target: "
+                        f"{allowed_sources}."
+                    )
+                })
+
         # Similarity check against existing lessons BEFORE insert.
         # Helper extracted 2026-05-14 (#143 §3.1) — shared with
         # engram_add_observation; lesson FTS now also filters on the
@@ -1143,6 +1197,31 @@ def _add_lesson_impl(
                 except sqlite3.IntegrityError:
                     pass
 
+        # `generalized_by` edge writes (#2753 epic WS1, D4): `<parent>
+        # generalizes <new lesson>`, cycle-guarded. Structurally
+        # unreachable for a brand-new node (it carries no prior generalizes
+        # edges of its own), but checked anyway — every `generalizes` write
+        # path goes through the same guard (core._generalizes_cycle_path),
+        # so the invariant is uniform and grep-able rather than "trust the
+        # caller can't construct a cycle here."
+        generalizing_parents = []
+        for pid in generalized_by_ids:
+            cycle_path = core._generalizes_cycle_path(conn, pid, node_id)
+            if cycle_path is not None:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' edge {pid} -> {node_id} would "
+                        f"close a cycle among live `generalizes` edges: "
+                        f"{' -> '.join(cycle_path)}. Refused — see #2753 "
+                        f"epic D1 (write-time cycle guard)."
+                    )
+                })
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'generalizes', ?)",
+                (pid, node_id, now),
+            )
+            generalizing_parents.append(pid)
+
         # Lessons are importance-anchored at a fixed value (2.0), like goals
         # and cornerstones — lessons persist. Pass importance_base directly
         # so _stamp_new_node writes the anchor in one pass instead of
@@ -1202,6 +1281,8 @@ def _add_lesson_impl(
             "context_nodes": ctx,
             "importance_anchored": True,
         }
+        if generalizing_parents:
+            result["generalized_by"] = generalizing_parents
 
         if similar_lessons:
             result["similar_existing_lessons"] = core._strip_similar_block(similar_lessons)

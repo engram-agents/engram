@@ -564,6 +564,30 @@ INSTANTIATES_TARGET_TYPES = {
 }
 
 
+# Allowed (source_type, target_type) endpoint pairs for `generalizes`
+# (#2753 epic D1, WS1). Direction: general -> specific — source is the MORE
+# general node, target is the MORE specific one it generalizes.
+#
+# NOT for concrete nodes: incident -> lesson stays `exemplifies`, obs ->
+# cornerstone stays `instantiates` — those are the example anchors a
+# generalization_chain walk starts FROM (see generalization_chain below),
+# never a `generalizes` endpoint themselves.
+GENERALIZES_ALLOWED_PAIRS = frozenset({
+    ("lesson", "lesson"),            # meta-lesson
+    ("cornerstone", "lesson"),
+    ("cornerstone", "cornerstone"),
+    ("axiom", "cornerstone"),
+    ("goal", "cornerstone"),
+})
+
+# The node types that can participate in `generalizes` at all (either side
+# of GENERALIZES_ALLOWED_PAIRS) — the "principle family". Derived, not
+# hand-listed twice, so a future pair addition can't silently desync the two.
+GENERALIZES_PRINCIPLE_TYPES = frozenset(
+    t for pair in GENERALIZES_ALLOWED_PAIRS for t in pair
+)
+
+
 VALID_RELATIONS = {
     "cites",
     "supported_by",
@@ -628,6 +652,26 @@ VALID_RELATIONS = {
                      # Deliberately backwards in creation time (see its
                      # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
                      # by the cascade-resolution machinery once #2349 lands.
+    "generalizes",  # #2753 epic, WS1: general -> specific abstraction edge
+                     # (source is the more general node, target the more
+                     # specific one it generalizes). Allowed endpoints:
+                     # lesson->lesson (meta-lesson), cornerstone->lesson,
+                     # cornerstone->cornerstone, axiom->cornerstone,
+                     # goal->cornerstone — see GENERALIZES_ALLOWED_PAIRS.
+                     # Concrete nodes keep `exemplifies` (incident->lesson) /
+                     # `instantiates` (claim->principle); those are the
+                     # example anchors a generalization_chain walk starts
+                     # FROM, never a `generalizes` endpoint. Classification
+                     # tier: no confidence, no cascade — a pure routing edge
+                     # that COEXISTS with `supported_by` (never replaces it).
+                     # Whitelisted in engram_add_edge/engram_remove_edge
+                     # (addable_after_creation/removable both True). Also
+                     # writable at mint time via `generalized_by` on
+                     # engram_add_lesson/engram_add_cornerstone.
+                     # dag=True (real structural acyclicity — see its
+                     # EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
+                     # WRITE TIME (see _generalizes_cycle_path below), not
+                     # merely audited after the fact.
 }
 
 
@@ -714,6 +758,35 @@ EDGE_CLASSIFICATIONS = {
         "cascade": False,
         "temporal_causal": False,    # advisory check exempts exemplifies (lesson edges, the exemplifies-dag-exempt observation)
         "dag": False,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
+    "generalizes": {
+        # #2753 epic, WS1 (D1). Lei's ruling: semantically a membership/
+        # abstraction edge (classification tier — see EDGE_TIERS below), no
+        # confidence, no cascade, a routing edge coexisting with
+        # `supported_by` (never a replacement for it). temporal_causal=False
+        # is deliberate: a later concrete cornerstone can still generalize
+        # to an older principle — the edge is allowed to point backwards in
+        # time, same shape as `instantiates`/`serves`.
+        #
+        # dag=True is the flag that matters here (wording fix on #2753,
+        # 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
+        # generalization/exemplification makes no sense, so `generalizes`
+        # joins the relation set `engram_dag_conformance` walks (see
+        # DAG_RELATIONS below) AND is cycle-guarded at WRITE time (see
+        # _generalizes_cycle_path) — conformance is the after-the-fact
+        # audit, the write guard is what stops a cycle landing.
+        #
+        # classification-tier + dag=True is a combination present nowhere
+        # else in this table (every classification-tier relation today —
+        # instantiates/serves/exemplifies — is dag=False); this is an
+        # INTENTIONAL divergence from the tier's usual dag pattern,
+        # acknowledged in EDGE_TIER_DIVERGENCE_ACK below.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag": True,
         "removable": True,
         "addable_after_creation": True,
         "provenance": False,
@@ -997,6 +1070,14 @@ EDGE_TIERS: dict[str, str] = {
     "instantiates": "classification",
     "serves":       "classification",
     "exemplifies":  "classification",
+    "generalizes":  "classification",  # #2753 epic, WS1: membership/
+                                    # abstraction edge, temporal_causal=False
+                                    # (matches this tier's expectation — the
+                                    # INTENTIONAL divergence here is on the
+                                    # `dag` flag, not `temporal_causal`; see
+                                    # EDGE_TIER_DIVERGENCE_ACK below and the
+                                    # hard-failing test in
+                                    # test_edge_tier_audit.py that checks it).
 }
 
 # Intentional-divergence acknowledgment table.
@@ -1004,12 +1085,30 @@ EDGE_TIERS: dict[str, str] = {
 # expectation, add it here with a short reason string. The audit test
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
+#
+# #2753 WS1 widening: also the home for an intentional `dag`/tier divergence
+# (distinct from the temporal_causal divergence above — see `generalizes`
+# below, the first relation where the two kinds differ). The soft warn in
+# test_edge_tier_audit.py checks temporal_causal only and would NOT catch a
+# `dag`-only divergence's absence here; test_edge_tier_audit.py also carries
+# a HARD-FAILING test for exactly that gap (added alongside this entry).
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
     "acknowledged_derives_from": (
         "#2357: deliberately backwards in creation time — the acknowledging "
         "node necessarily predates the replacement it acknowledges. Real "
         "acyclicity is still enforced via dag=True, checked by an edge walk "
         "rather than the temporal_causal timestamp comparison."
+    ),
+    "generalizes": (
+        "#2753 epic WS1, R1 (Lei's ruling, 2026-09-08 16:28Z): classification "
+        "tier, but dag=True — every other classification-tier relation today "
+        "(instantiates/serves/exemplifies) is dag=False. Real structural "
+        "acyclicity genuinely matters here (a cycle in generalization/"
+        "exemplification makes no sense), so this is an intentional "
+        "divergence on the `dag` flag, not `temporal_causal` (which matches "
+        "its tier's expectation at False, unremarkable on its own). Cycle "
+        "prevention is enforced at WRITE time (see _generalizes_cycle_path) "
+        "as well as by the batch conformance walk (DAG_RELATIONS)."
     ),
 }
 
@@ -1029,6 +1128,417 @@ DAG_EXEMPT_RELATIONS = frozenset(
 # purely to bound the cycle-detection walk — see
 # engram_dag_conformance.check_dag_conformance.
 DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
+
+
+# ---------------------------------------------------------------------------
+# `generalizes` substrate (#2753 epic, WS1).
+# ---------------------------------------------------------------------------
+
+def _generalizes_cycle_path(
+    conn: sqlite3.Connection, source_id: str, target_id: str
+) -> "list[str] | None":
+    """Would inserting ``source_id --generalizes--> target_id`` close a
+    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    ids, first == last) if so, else None.
+
+    #2753 epic WS1 (D1): the write-time cycle guard — refuse the edge and
+    return the cycle path in the error. Conformance
+    (``engram_dag_conformance.check_dag_conformance``) is the after-the-fact
+    BATCH audit; this is the TARGETED check that stops a cycle landing in
+    the first place, called from every ``generalizes``-writing path (the
+    generic ``engram_add_edge``, and the ``generalized_by`` mint-time wiring
+    on ``engram_add_lesson``/``engram_add_cornerstone``).
+
+    Scoped to the ``generalizes`` relation ONLY, not the full
+    ``DAG_RELATIONS`` set — ``generalizes`` is a distinct specialization/
+    abstraction hierarchy from e.g. ``cites``/``derives_from``/
+    ``subtask_of``, and folding unrelated dag-bearing relations into one
+    targeted write-time check would conflate independent hierarchies that
+    happen to share the ``dag: True`` flag for unrelated reasons. (The
+    full-graph, all-``DAG_RELATIONS`` batch walk is what
+    ``engram_dag_conformance`` already does, separately.)
+
+    BFS from ``target_id`` over existing LIVE ``generalizes`` edges
+    (source->target, i.e. general->specific): if ``source_id`` is reachable
+    FROM ``target_id``, the candidate edge would close
+    ``target_id -> ... -> source_id -> target_id``. CURRENT-only
+    (``is_current = 1`` nodes/edges), same convention as
+    ``check_dag_conformance``.
+    """
+    if source_id == target_id:
+        return [source_id, target_id]
+
+    # Walk the RESOLVED generalizes graph -- every edge's endpoints put
+    # through _resolve_to_current, exactly as generalization_chain resolves
+    # them on the read side.
+    #
+    # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
+    # instead, and that was a real hole (found in #2812 review). An edge
+    # whose endpoint is superseded through the GENERIC engram_supersede --
+    # which carries no generalizes edges, and is the ONLY supersede path
+    # that exists for lesson/axiom/goal, engram_outgrow_cornerstone being
+    # cornerstone-only -- became invisible HERE while the read-side walk
+    # still traversed it via resolution. So the guard would pass an edge
+    # that generalization_chain then rendered as a live cycle, and rendered
+    # it as `heads: []` + `truncated: False`, which is indistinguishable
+    # from a clean complete walk. Guard and walk must see the same graph or
+    # one can admit exactly what the other reports.
+    _resolved: "dict[str, str | None]" = {}
+
+    def _res(nid: str) -> "str | None":
+        if nid not in _resolved:
+            _resolved[nid] = _resolve_to_current(conn, nid)
+        return _resolved[nid]
+
+    adjacency: "dict[str, set]" = {}
+    for row in conn.execute(
+        "SELECT source_id, target_id FROM edges WHERE relation = 'generalizes'"
+    ):
+        r_src = _res(row["source_id"])
+        r_tgt = _res(row["target_id"])
+        if r_src is None or r_tgt is None:
+            continue  # dead-ended chain: no live node to attribute the edge to
+        adjacency.setdefault(r_src, set()).add(r_tgt)
+
+    start = _res(target_id) or target_id
+    goal = _res(source_id) or source_id
+    if start == goal:
+        # target resolves onto source itself -- a self-cycle once written
+        return [source_id, target_id]
+
+    parent: "dict[str, str | None]" = {start: None}
+    queue = [start]
+    while queue:
+        current = queue.pop(0)
+        if current == goal:
+            path = []
+            node = current
+            while node is not None:
+                path.append(node)
+                node = parent[node]
+            path.reverse()  # (resolved) target -> ... -> source
+            return [source_id] + path
+        for nxt in sorted(adjacency.get(current, ())):
+            if nxt not in parent:
+                parent[nxt] = current
+                queue.append(nxt)
+    return None
+
+
+def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
+    """Resolve ``node_id`` to its CURRENT version via the supersedes chain.
+
+    Returns ``node_id`` itself if it is already current, the current
+    successor (via ``_current_successor``) if not, or None if ``node_id``
+    doesn't exist or its chain dead-ends without reaching a current node
+    (e.g. a retracted node with no replacement).
+
+    #2753 epic WS1: shared by ``generalization_chain`` ("every rung
+    resolves through supersedes to its CURRENT version" — the #1195
+    508-vs-162-vs-143 hazard this fixes at read time) and by the
+    ``generalizes`` edge-carry path (``engram_outgrow_cornerstone``).
+    """
+    row = conn.execute(
+        "SELECT is_current FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return None
+    if row["is_current"] == 1:
+        return node_id
+    return _current_successor(conn, node_id)
+
+
+def generalization_chain(
+    conn: sqlite3.Connection, node_id: str, max_depth: int = 4
+) -> dict:
+    """The generalization chain for ``node_id`` — #2753 epic WS1 (D2).
+
+    For a PRINCIPLE node P (type in ``GENERALIZES_PRINCIPLE_TYPES`` — lesson/
+    cornerstone/axiom/goal): P (resolved to its current version), then every
+    node that ``generalizes`` P, transitively, to the HEADS (nodes with no
+    incoming ``generalizes`` edge). Multiple parents allowed — a lesson may
+    sit under two cornerstones; the walk is a small DAG, not a strict linear
+    chain, and a node with >1 incoming ``generalizes`` edge appears once
+    with multiple entries in its ``parents`` list.
+
+    For a CONCRETE node C (e.g. observation/derivation, anything outside
+    ``GENERALIZES_PRINCIPLE_TYPES``): its principles are the (resolved)
+    targets of C's own ``exemplifies``/``instantiates`` edges; the walk
+    starts from each of those roots instead of from C itself.
+
+    Every rung resolves through ``supersedes`` to its CURRENT version
+    (``_resolve_to_current``) before being walked further — a chain must
+    never surface retired text (the #1195 508-vs-162-vs-143 hazard the
+    epic's design section names).
+
+    Depth-capped at ``max_depth`` rungs from the roots (root = depth 0, its
+    parents = depth 1, ...) — a malformed cyclic graph (which the write-time
+    guard, ``_generalizes_cycle_path``, should make unreachable in practice,
+    but conformance is a batch audit that runs later, not a live guarantee
+    at read time) must still terminate; the cap does that structurally
+    (bounded iteration, not recursion, and each node is expanded at most
+    once) even when the underlying data violates the DAG invariant.
+
+    Returns a dict:
+        {
+            "start_id": node_id,               # the id the caller passed in
+            "start_resolved_id": str | None,   # start's CURRENT version, or
+                                                # None if it doesn't resolve
+                                                # to one (missing / dead-end
+                                                # supersede chain)
+            "roots": [str, ...],   # the immediate principle id(s) the walk
+                                    # began from (resolved-current) — the
+                                    # (resolved) start itself for a
+                                    # principle node, or the (resolved)
+                                    # exemplifies/instantiates targets for a
+                                    # concrete node
+            "nodes": {
+                resolved_id: {
+                    "original_id": str,    # the id actually pointed at by
+                                            # the generalizes/exemplifies/
+                                            # instantiates edge, PRE-resolve
+                    "parents": [resolved_id, ...],  # nodes this one is
+                                            # directly generalized BY (one
+                                            # rung up, resolved-current);
+                                            # [] for a head or a node whose
+                                            # expansion was cut off by
+                                            # max_depth
+                    "depth": int,           # rungs from the nearest root
+                                            # this node was first reached at
+                                            # (0 = a root)
+                    "recall_summary": str | None,   # hydrated for EVERY
+                                            # reached node — bounded (<=140)
+                                            # and what D3 renders per rung.
+                                            # None if the node carries none.
+                    "claim": str | None,    # HEADS ONLY — present on entries
+                                            # whose id is in "heads", absent
+                                            # on middle rungs by design:
+                                            # claim is unbounded and D3 wants
+                                            # it for the head alone. Use
+                                            # .get("claim") rather than [].
+                },
+                ...  # one entry per node reached, keyed by its CURRENT
+                     # (resolved) id — deduped, so a node reached via two
+                     # branches appears once with both parents recorded
+            },
+            "heads": [resolved_id, ...],   # resolved-current ids with NO
+                                            # incoming generalizes edge —
+                                            # rendered last per the epic's D3
+            "truncated": bool,  # True if max_depth was hit while nodes were
+                                 # still pending expansion (their "parents"
+                                 # were never queried, so they are NOT
+                                 # necessarily heads)
+            "cycle_detected": bool,  # True if the walk completed (not
+                                 # truncated) over a non-empty node set and
+                                 # found NO head -- structurally impossible
+                                 # in a valid DAG, so it means the resolved
+                                 # graph contains a cycle. Distinct from
+                                 # `truncated`: without this field the two
+                                 # states are indistinguishable to a caller
+                                 # and an empty `heads` reads as benign.
+        }
+
+    Public helper — WS2 (render) consumes this directly; keep the return
+    shape stable across a signature change (add fields, don't repurpose
+    existing ones) once WS2 branches off this tip.
+    """
+    start_row = conn.execute(
+        "SELECT id, type FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not start_row:
+        return {
+            "start_id": node_id,
+            "start_resolved_id": None,
+            "roots": [],
+            "nodes": {},
+            "heads": [],
+            "truncated": False,
+        }
+
+    start_resolved = _resolve_to_current(conn, node_id)
+
+    roots_raw: "list[str]" = []
+    if start_row["type"] in GENERALIZES_PRINCIPLE_TYPES:
+        if start_resolved is not None:
+            roots_raw = [start_resolved]
+    else:
+        rows = conn.execute(
+            """SELECT target_id FROM edges
+               WHERE source_id = ? AND relation IN ('exemplifies', 'instantiates')""",
+            (node_id,),
+        ).fetchall()
+        roots_raw = [r["target_id"] for r in rows]
+
+    nodes: dict = {}
+    heads: "list[str]" = []
+    roots: "list[str]" = []
+    frontier: "list[str]" = []
+
+    for raw in roots_raw:
+        resolved = _resolve_to_current(conn, raw)
+        if resolved is None:
+            continue
+        if resolved not in nodes:
+            nodes[resolved] = {"original_id": raw, "parents": [], "depth": 0}
+            frontier.append(resolved)
+            roots.append(resolved)
+
+    depth = 0
+    while frontier and depth < max_depth:
+        next_frontier: "list[str]" = []
+        for current in frontier:
+            parent_edges = conn.execute(
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+                (current,),
+            ).fetchall()
+            if not parent_edges:
+                if current not in heads:
+                    heads.append(current)
+                continue
+            # A head is a node with no LIVE parent -- not merely one with no
+            # parent-edge ROWS. A node whose every generalizes parent
+            # dead-ends (retracted with no replacement, so
+            # _resolve_to_current returns None) has no live parent and is a
+            # head by the same definition, reached by a different route.
+            # Before #2812 round 2 such a node was neither appended to heads
+            # nor connected to anything: the walk fell out of both branches
+            # silently, and the cycle_detected inference added in that round
+            # then fired on it -- a false positive on a graph with no cycle.
+            resolved_any_parent = False
+            for pe in parent_edges:
+                raw_parent = pe["source_id"]
+                resolved_parent = _resolve_to_current(conn, raw_parent)
+                if resolved_parent is None:
+                    continue
+                resolved_any_parent = True
+                if resolved_parent not in nodes[current]["parents"]:
+                    nodes[current]["parents"].append(resolved_parent)
+                if resolved_parent not in nodes:
+                    nodes[resolved_parent] = {
+                        "original_id": raw_parent,
+                        "parents": [],
+                        "depth": depth + 1,
+                    }
+                    next_frontier.append(resolved_parent)
+            if not resolved_any_parent and current not in heads:
+                heads.append(current)
+        frontier = next_frontier
+        depth += 1
+
+    truncated = bool(frontier)
+
+    # Does the REACHED subgraph contain a cycle? Answered by walking it,
+    # not inferred from a summary property of it.
+    #
+    # This started as `not heads and not truncated` -- the reasoning being
+    # that a finite walk must terminate at a head unless the cap cut it off.
+    # That inference is GLOBAL, and `generalization_chain` is explicitly
+    # multi-parent ("a lesson may sit under two cornerstones"), so a single
+    # genuine head on ANY branch keeps `heads` non-empty and silences the
+    # signal while a different branch loops. Found in #2812 colleague review
+    # with a real repro: X with two parents, one resolving to a head and one
+    # into a live 2-cycle, reported cycle_detected=False with the cycle
+    # sitting in the returned `nodes`. That is a false NEGATIVE, which is the
+    # direction that matters -- WS2 is told it can depend on this field.
+    #
+    # Two earlier attempts at this field were both summary-property
+    # inferences and both were wrong (a false positive on a dead-ended
+    # parent, then this false negative). So this is a direct DFS over the
+    # already-materialized parents adjacency instead: iterative, colour-
+    # marked, back-edge = cycle. It needs no `truncated` special case --
+    # a depth-capped node simply has an empty `parents` list and terminates
+    # its branch -- so a cycle inside a truncated walk is now caught too,
+    # which the old form could not do by construction.
+    WHITE, GREY, BLACK = 0, 1, 2
+    _colour: "dict[str, int]" = {nid: WHITE for nid in nodes}
+    cycle_detected = False
+    for _root in nodes:
+        if _colour[_root] != WHITE:
+            continue
+        # (node, parents-iterator) stack; GREY == on the current DFS path.
+        _stack = [(_root, iter(nodes[_root]["parents"]))]
+        _colour[_root] = GREY
+        while _stack:
+            _node, _it = _stack[-1]
+            _advanced = False
+            for _parent in _it:
+                if _parent not in _colour:
+                    continue  # defensive: parent outside the reached set
+                if _colour[_parent] == GREY:
+                    cycle_detected = True  # back-edge onto the active path
+                    _stack = []
+                    break
+                if _colour[_parent] == WHITE:
+                    _colour[_parent] = GREY
+                    _stack.append((_parent, iter(nodes[_parent]["parents"])))
+                    _advanced = True
+                    break
+            if cycle_detected:
+                break
+            if not _advanced and _stack:
+                _done, _ = _stack.pop()
+                _colour[_done] = BLACK
+        if cycle_detected:
+            break
+
+    # ---- text hydration (#2753 WS1; contract settled on forum #407) --------
+    # The walk above deliberately keeps _resolve_to_current's ONE-column
+    # ``SELECT is_current`` — there is no row already in hand to widen, so
+    # adding text there would take a 1-column PER-RUNG query to 3 on the
+    # PreToolUse path (the hottest surface in the system). Hydrate ONCE here
+    # instead, now that the reached set is known: TWO queries total,
+    # independent of chain size, and no N+1 for the render side (WS2).
+    #
+    # The two fields are NOT one decision:
+    #   recall_summary — bounded (<=140 by construction) and rendered per rung
+    #                    by D3, so every reached node carries it.
+    #   claim          — UNBOUNDED, and D3 wants it for the HEAD only ("the
+    #                    head's claim in full, middle rungs as one-liners"),
+    #                    so it never touches a middle rung.
+    #
+    # COUPLING, named rather than coded around: the IN-list's parameter count
+    # scales with the REACHED SET -- and ``max_depth`` bounds only that set's
+    # DEPTH. Its BREADTH is bounded by nothing here: a node may be generalized
+    # by several parents, so each rung can widen, and the only real ceiling is
+    # the graph's population of principle nodes (each is expanded at most
+    # once). At the default depth 4, on a graph whose lesson/cornerstone/
+    # axiom/goal count is in the hundreds, the list is trivially small. So the
+    # knob that would bite first is principle-node GROWTH or a raised
+    # max_depth -- not chain length -- against SQLite's build-dependent
+    # variable limit (999 on pre-3.32 builds, 32766 since). Chunk the IN-list
+    # if either ever approaches it.
+    if nodes:
+        _ph = ",".join("?" * len(nodes))
+        for _row in conn.execute(
+            f"SELECT id, recall_summary FROM nodes WHERE id IN ({_ph})",
+            tuple(nodes),
+        ):
+            if _row[0] in nodes:
+                nodes[_row[0]]["recall_summary"] = _row[1]
+    for _nid in nodes:
+        nodes[_nid].setdefault("recall_summary", None)
+
+    if heads:
+        _ph = ",".join("?" * len(heads))
+        for _row in conn.execute(
+            f"SELECT id, claim FROM nodes WHERE id IN ({_ph})",
+            tuple(heads),
+        ):
+            if _row[0] in nodes:
+                nodes[_row[0]]["claim"] = _row[1]
+    for _hid in heads:
+        if _hid in nodes:
+            nodes[_hid].setdefault("claim", None)
+
+    return {
+        "start_id": node_id,
+        "start_resolved_id": start_resolved,
+        "roots": roots,
+        "nodes": nodes,
+        "heads": heads,
+        "truncated": truncated,
+        "cycle_detected": cycle_detected,
+    }
 
 
 _ADDABLE_AFTER_CREATION_RELATIONS = frozenset(

@@ -4490,7 +4490,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
     "tag", "title", "new_frame",
-    "prior_frame", "triggering_experience", "supporting_ids",
+    "prior_frame", "triggering_experience", "supporting_ids", "generalized_by",
 })
 
 
@@ -4547,6 +4547,13 @@ def engram_add_cornerstone(payload_json: str) -> str:
             prior_frame (str, optional): What I operated under before.
             triggering_experience (str, optional): Narrative of the experience that caused the reframe.
             supporting_ids (str, optional): Comma-separated IDs of supporting nodes.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this cornerstone (#2753 epic WS1, D4).
+                Must be current nodes of type cornerstone, axiom, or goal.
+                Writes `<parent> generalizes <new cornerstone>` edges at
+                mint time, cycle-guarded. Strict: an invalid parent
+                (missing, non-current, or wrong-type pair) refuses the
+                whole call.
 
     Returns:
         JSON with the new cornerstone node ID and linked supporting nodes.
@@ -4803,8 +4810,8 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_remove_edge",
     capability=(
         "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
-        "serves, exemplifies, instantiates). Cascade/provenance edges blocked — use "
-        "engram-surgical."
+        "serves, exemplifies, instantiates, generalizes). Cascade/provenance edges "
+        "blocked — use engram-surgical."
     ),
     annotations={
         "title": "Remove a Non-Cascade Edge Between Nodes",
@@ -4861,8 +4868,9 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # adding non-cascade relational edges (e.g. relevance-marker edges, subtask
 # groupings) previously required engram-surgical or an engram_supersede call.
 #
-# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions.
-# All are non-cascade, non-structural-commitment, non-provenance relations.
+# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
+# generalizes. All are non-cascade, non-structural-commitment, non-provenance
+# relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
 #   - Provenance-bearing: every relation with `provenance: True` in
@@ -4906,7 +4914,8 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_add_edge",
     capability=(
         "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
-        "exemplifies, serves, subtask_of, tensions, instantiates). Idempotent."
+        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes). "
+        "Idempotent."
     ),
     annotations={
         "title": "Add a Non-Cascade Edge Between Nodes",
@@ -4920,12 +4929,12 @@ def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
     Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
-    tensions). Cascade / structural / provenance edges blocked — those must
-    be created at node-add time (via the source node's payload) or via the
-    dedicated mutation tool (supersede / retract). Generic add-edge is only
-    for non-claim-bearing topological edges.
+    tensions, generalizes). Cascade / structural / provenance edges blocked
+    — those must be created at node-add time (via the source node's
+    payload) or via the dedicated mutation tool (supersede / retract).
+    Generic add-edge is only for non-claim-bearing topological edges.
 
-    Relation boundaries (the three-way split):
+    Relation boundaries (the four-way split):
       exemplifies  — this incident is an instance of this lesson's
                      error/success pattern (incident → lesson ONLY; feeds
                      the tripwire engine).
@@ -4937,6 +4946,14 @@ def engram_add_edge(payload_json: str) -> str:
                      pointer to exemplifies). The post-hoc wiring tool for
                      goal realizations and axiom grounding from practice
                      observations.
+      generalizes  — this principle IS THE MORE GENERAL FORM of that
+                     principle (#2753 epic WS1; general → specific;
+                     lesson→lesson, cornerstone→lesson,
+                     cornerstone→cornerstone, axiom→cornerstone, or
+                     goal→cornerstone ONLY — concrete nodes stay on
+                     exemplifies/instantiates). Cycle-guarded at write
+                     time. Coexists with `supported_by` — never a
+                     replacement for it.
 
     Idempotent: no_op_already_exists is a successful return.
 
@@ -5142,7 +5159,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "prevention_type", "recall_summary", "recall_keywords",
+    "prevention_type", "recall_summary", "recall_keywords", "generalized_by",
 })
 
 
@@ -5250,6 +5267,12 @@ def engram_add_lesson(payload_json: str) -> str:
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this lesson (#2753 epic WS1, D4). Must
+                be current nodes of type lesson (meta-lesson) or cornerstone.
+                Writes `<parent> generalizes <new lesson>` edges at mint
+                time, cycle-guarded. Strict: an invalid parent (missing,
+                non-current, or wrong-type pair) refuses the whole call.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
