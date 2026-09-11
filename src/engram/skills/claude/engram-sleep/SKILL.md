@@ -450,18 +450,23 @@ fi
 > all dispatched every night.** A weight-aging lottery (`tools/dream_lottery.py`)
 > draws a small subset each cycle — see Step 6 below for the mechanism. **The
 > all-or-nothing invariant still holds, just at a different grain: once the
-> lottery has decided tonight's set (the draw plus any cascade-interrupt
-> force-includes), that ENTIRE set is mandatory — never drop a category the
-> lottery drew "for context economy."** The lottery itself, not agent
-> discretion, is now the only sanctioned mechanism for a category not running
-> on a given night. Skipping a drawn category is exactly the 2026-06-24
-> incident this invariant was written to prevent; running fewer categories
-> than the draw is not a lighter version of the routine, it's the same failure
-> in a new shape.
+> lottery has decided tonight's set, that ENTIRE set is mandatory — never drop
+> a category the lottery drew "for context economy."** The lottery itself, not
+> agent discretion, is now the only sanctioned mechanism for a category not
+> running on a given night. Skipping a drawn category is exactly the
+> 2026-06-24 incident this invariant was written to prevent; running fewer
+> categories than the draw is not a lighter version of the routine, it's the
+> same failure in a new shape.
 >
 > Design of record: Lei, converged with Kepler 2026-08-03
 > (engram-alpha#1901), refined same night to three classes (comment on
-> #1901):
+> #1901). The third class — an urgency interrupt that force-included
+> cascade-sensitive categories when the day's retraction/supersede-cascade
+> markers met a threshold — was **removed 2026-09-11 (issue #2399, Lei's
+> ruling)**: the #2013 cascade-frontier machine (this skill's own mode-B
+> sweep, below) made nightly marker cleanup an unconditional dream-master
+> obligation, and a scan that already runs every night needs no forcing.
+> What remains is a two-class split:
 >
 > 1. **Always-on** — the batch-summary (`recall_summary`) cohort step (Steps
 >    5–7.5 below). Its work scales with the day's new-node cohort and is
@@ -471,16 +476,6 @@ fi
 >    `dream_lottery.py`'s `CATEGORIES` dict is the count's SSoT). Exactly one is
 >    drawn per sleep by default (`--count` can raise this later per the
 >    design note "maybe two later").
-> 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
->    markers meet a threshold, cascade-sensitive categories are force-included
->    regardless of the draw. Lottery = frequency; interrupt = urgency.
->    **Currently unarmed pending #2013:** #2137 emptied the default
->    force-include set (`DEFAULT_INTERRUPT_TYPES = frozenset()`), so on the
->    default config there is nothing for the interrupt to force-include and
->    it structurally cannot fire — the mechanism above describes what
->    `--interrupt-types` re-arms, not the current default behavior. It
->    re-arms when the #2013 cascade machine gives dreams a principled
->    marker-resolution path.
 >
 > **Window semantics under rotation (the audit precondition #1901 asked for,
 > before wiring the lottery in):** a category that doesn't run every night
@@ -695,11 +690,10 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
   --turn <CURRENT_TURN>   # from engram_stats / engram_reflect — the turn this cohort is closing, pre-advance
 ```
 
-(Omit `--state`/`--interrupt-types`/`--interrupt-threshold` to use the defaults documented in `dream_lottery.py`'s module docstring; override only if the standing design call has changed.) The command prints and persists a JSON result:
+(Omit `--state` to use the defaults documented in `dream_lottery.py`'s module docstring; override only if the standing design call has changed.) The command prints and persists a JSON result:
 
-- `types_to_run` — the category numbers to dispatch this cycle (drawn ∪ interrupt-forced; disjoint, so no category is double-counted).
+- `types_to_run` — the category numbers to dispatch this cycle (the drawn set).
 - `types_to_run_slugs` — `{category_num: slug}` for the categories above, for building dispatch prompts.
-- `interrupt_fired` / `interrupt_types` / `cascade_marker_count` — whether the cascade-urgency interrupt forced any categories in tonight, and why.
 - `window_params` — `{category_num: prev_last_run_at_or_null}` for the window-scoped categories (currently 6 and 7 — see the Phase B audit note above). Only present for categories that are both window-scoped AND running tonight.
 - `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`~/.engram/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
 
@@ -908,7 +902,7 @@ Agent(
     automatically, so a missed transcription here is recoverable from that file — but
     still transcribe it; the dream record is the reviewable narrative copy, the history
     file is the raw mechanical backstop, not a substitute):
-    - Drawn: <drawn_types_slugs> | Interrupt-forced: <interrupt_types_slugs, or "none — cascade_marker_count <N> below threshold <T>">
+    - Drawn: <drawn_types_slugs>
     - weights_before: <weights_before JSON> -> weights_after: <weights_after JSON>
 
     DREAM-FAIRY REPORTS (full content on disk — read each before integrating; this cycle's
@@ -940,7 +934,7 @@ Agent(
     FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
     (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
 
-    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -987,7 +981,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
-- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
+- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set. `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn counts per category, cycles counted). (The urgency-interrupt mechanism this module once carried was removed 2026-09-11, issue #2399 — see Phase B's design-of-record note above.)
 - **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one category per dispatch (roster SSoT: `dream_lottery.py`'s `CATEGORIES` dict), the lottery-drawn subset each night (was all-categories-nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 

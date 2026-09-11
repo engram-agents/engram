@@ -215,7 +215,7 @@ is zero (the data is already in hand); the dream-cycle turn savings are large.
 The dream-master currently re-calls `engram_inspect` on every finding before
 acting.  With snapshots pre-packed in each finding, it reads however many fairy
 reports this cycle drew (per the weight-aging lottery, #1901 — typically 1,
-occasionally a few more when the cascade interrupt fires) and goes straight to
+occasionally more if `--count` is raised) and goes straight to
 bucketing + execution.
 Estimated savings, at the pre-lottery all-9-nightly baseline: ~50 turns → ~10
 turns per cycle — now smaller still on a typical lottery night, since there are

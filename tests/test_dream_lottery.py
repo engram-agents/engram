@@ -15,72 +15,66 @@ Covers:
     8. last_run_turn / last_run_at are stamped only on types that ran this cycle.
     9. Un-drawn types' last_run_turn / last_run_at are left untouched.
 
-  cascade interrupt:
-    10. Below threshold -> interrupt does not fire, draw proceeds normally.
-    11. At/above threshold -> interrupt fires, forces the configured types in
-        regardless of the random draw, and their weight still resets to 0.
-    12. Interrupt-forced types are excluded from the random-draw pool (an
-        interrupted type is never *also* separately drawn).
-    13. count draws still happen even when the interrupt fires (frequency and
-        urgency are independent, per the design).
-
   window_params (per-type watermark for window-scoped categories):
-    14. A window-scoped category (7) that ran gets its PRE-update last_run_at
+    10. A window-scoped category (7) that ran gets its PRE-update last_run_at
         as its window_params value (so "since" reflects the last time IT
         actually ran, not this run).
-    15. A never-run window-scoped category gets None (no prior watermark ->
+    11. A never-run window-scoped category gets None (no prior watermark ->
         caller falls back to full-history scan).
-    16. A non-window-scoped category that ran does NOT appear in window_params.
+    12. A non-window-scoped category that ran does NOT appear in window_params.
 
   state persistence:
-    17. save_state then load_state round-trips exactly.
-    18. load_state on a missing file returns default_state().
-    19. load_state on a state file missing a newer category key back-fills it
+    13. save_state then load_state round-trips exactly.
+    14. load_state on a missing file returns default_state().
+    15. load_state on a state file missing a newer category key back-fills it
         (forward-compat with an added category).
 
-  cascade counting:
-    20. count_cascade_markers counts only the four cascade actions, not
-        unrelated edit_history rows, and respects the since_iso cutoff.
-
   draw-history (append-only, issue #1909):
-    21. A real `draw` CLI invocation appends exactly one JSONL line; three
+    16. A real `draw` CLI invocation appends exactly one JSONL line; three
         draws append three lines.
-    22. `--dry-run` writes neither state nor history.
-    23. The default history path derives correctly from a custom `--state`.
-    24. A history-write failure (unwritable path) does not break the draw:
+    17. `--dry-run` writes neither state nor history.
+    18. The default history path derives correctly from a custom `--state`.
+    19. A history-write failure (unwritable path) does not break the draw:
         the CLI still exits 0 and state is still saved.
-    25. The `history` subcommand tally is correct and distinguishes
-        drawn-by-lottery from interrupt-forced counts.
-    26. A malformed/truncated line is skipped and counted in
+    20. The `history` subcommand tally is correct.
+    21. A malformed/truncated line is skipped and counted in
         `skipped_malformed`, not fatal.
-    27. A missing history file tallies as a valid, all-zero empty result.
+    22. A missing history file tallies as a valid, all-zero empty result.
 
   re-entrancy guard (issue #1907):
-    28. A second real draw for the same --turn is refused (non-zero exit,
+    23. A second real draw for the same --turn is refused (non-zero exit,
         no second state/history write) unless --force is passed.
-    29. --force overrides the guard and the second draw proceeds normally.
-    30. --dry-run is exempt from the guard even when a real draw already
+    24. --force overrides the guard and the second draw proceeds normally.
+    25. --dry-run is exempt from the guard even when a real draw already
         ran this turn (dry-run never persists, so nothing to corrupt).
-    31. A draw for a genuinely different --turn is never blocked.
+    26. A draw for a genuinely different --turn is never blocked.
 
   history --limit false-clean fix (issue #1911):
-    32. --limit 0 means "no limit", not "return nothing".
-    33. A negative --limit also means "no limit".
-    34. A positive --limit still restricts to the most recent N raw lines
+    27. --limit 0 means "no limit", not "return nothing".
+    28. A negative --limit also means "no limit".
+    29. A positive --limit still restricts to the most recent N raw lines
         (sanity-checks the existing behavior stays intact).
 
   --count validation (reviewer-fairy finding on #1912's own review):
-    35. --count 0 is rejected outright, before any write.
-    36. A negative --count is rejected outright, before any write.
-    37. Regression: two real --count 0 draws for the same turn both used
+    30. --count 0 is rejected outright, before any write.
+    31. A negative --count is rejected outright, before any write.
+    32. Regression: two real --count 0 draws for the same turn both used
         to succeed silently (the guard's blind spot) -- both must now be
         rejected.
 
-  --interrupt-threshold validation (Borges's third instance of the class):
-    38. --interrupt-threshold 0 is rejected outright, before any write.
-    39. A negative --interrupt-threshold is rejected outright.
-    40. Regression: threshold 0 against a graph with zero cascade activity
-        used to still report interrupt_fired=True -- must now be rejected.
+  cascade-interrupt removal (issue #2399, 2026-09-11 -- Lei's ruling: the
+  #2013 cascade-frontier machine made nightly marker cleanup an
+  unconditional dream-master obligation, so the urgency-interrupt
+  mechanism was retired rather than re-pointed):
+    33. run_draw() no longer accepts interrupt_types / interrupt_threshold
+        -- passing either raises TypeError.
+    34. tally_history() reads an OLD-format history line (written by
+        pre-#2399 code, still carrying interrupt_types/interrupt_fired
+        keys) without error and without surfacing an interrupt_cycles key.
+    35. A draw result dict never contains cascade_marker_count /
+        interrupt_fired / interrupt_types / interrupt_threshold.
+    36. --interrupt-types / --interrupt-threshold are no longer valid
+        `draw` CLI flags -- argparse rejects them.
 """
 
 from __future__ import annotations
@@ -101,7 +95,6 @@ if PROJECT_ROOT not in sys.path:
 from tools.dream_lottery import (  # noqa: E402
     CATEGORIES,
     WINDOW_SCOPED_CATEGORIES,
-    count_cascade_markers,
     default_state,
     history_path_for_state,
     load_state,
@@ -116,17 +109,6 @@ from tools.dream_lottery import (  # noqa: E402
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------
-
-def _warm_state(checked_at: str = "2026-08-03T00:00:00Z") -> dict:
-    """default_state() with last_interrupt_check_at seeded -- simulates a
-    state file that has already been through at least one draw, so the
-    interrupt's since-filter has a real baseline (as opposed to the
-    cold-start None case, which counts 0 by design -- see
-    test_cold_start_does_not_replay_all_history_as_interrupt)."""
-    state = default_state()
-    state["last_interrupt_check_at"] = checked_at
-    return state
-
 
 def _make_edit_history_db(tmp_path: Path, rows: list[tuple[str, str]]) -> Path:
     """rows: list of (action, timestamp_iso)."""
@@ -233,152 +215,12 @@ def test_unrun_types_untouched(tmp_path):
     state["types"]["3"]["last_run_turn"] = 2
     state["types"]["3"]["last_run_at"] = "2026-08-01T00:00:00Z"
     state["types"]["3"]["weight"] = 0  # deterministically excluded: P(draw)=0 while others > 0
-    outcome = run_draw(state, db_path=str(db), turn=10, count=1, interrupt_types=frozenset(), rng=random.Random(0))
+    outcome = run_draw(state, db_path=str(db), turn=10, count=1, rng=random.Random(0))
     new_state = outcome["state"]
     assert 3 not in outcome["result"]["types_to_run"]  # sanity: this test needs "3" to NOT be drawn
     assert new_state["types"]["3"]["last_run_turn"] == 2
     assert new_state["types"]["3"]["last_run_at"] == "2026-08-01T00:00:00Z"
     assert new_state["types"]["3"]["weight"] == 1  # aged by 1 from 0
-
-
-# ---------------------------------------------------------------------------
-# Cascade interrupt
-# ---------------------------------------------------------------------------
-
-def test_interrupt_does_not_fire_below_threshold(tmp_path):
-    db = _make_edit_history_db(tmp_path, [("retracted", "2026-08-04T00:00:00Z")] * 2)
-    outcome = run_draw(
-        _warm_state(), db_path=str(db), turn=1, interrupt_threshold=3, rng=random.Random(0)
-    )
-    assert outcome["result"]["cascade_marker_count"] == 2
-    assert outcome["result"]["interrupt_fired"] is False
-    assert outcome["result"]["interrupt_types"] == []
-
-
-def test_interrupt_fires_at_threshold_and_forces_types(tmp_path):
-    rows = [("retracted", "2026-08-04T00:00:00Z")] * 2 + [("superseded", "2026-08-04T00:00:01Z")]
-    db = _make_edit_history_db(tmp_path, rows)
-    outcome = run_draw(
-        _warm_state(),
-        db_path=str(db),
-        turn=1,
-        interrupt_threshold=3,
-        interrupt_types=frozenset({2, 5}),
-        rng=random.Random(0),
-    )
-    r = outcome["result"]
-    assert r["cascade_marker_count"] == 3
-    assert r["interrupt_fired"] is True
-    assert r["interrupt_types"] == [2, 5]
-    assert {2, 5}.issubset(set(r["types_to_run"]))
-    new_state = outcome["state"]
-    assert new_state["types"]["2"]["weight"] == 0
-    assert new_state["types"]["5"]["weight"] == 0
-
-
-def test_interrupted_types_excluded_from_random_pool(tmp_path):
-    """An interrupt-forced type must not ALSO show up in drawn_types (no
-    double bookkeeping -- it ran because of the interrupt, not the draw)."""
-    rows = [("retracted", "2026-08-04T00:00:00Z")] * 5
-    db = _make_edit_history_db(tmp_path, rows)
-    outcome = run_draw(
-        _warm_state(),
-        db_path=str(db),
-        turn=1,
-        interrupt_threshold=3,
-        interrupt_types=frozenset({2, 5}),
-        count=1,
-        rng=random.Random(0),
-    )
-    r = outcome["result"]
-    assert not set(r["drawn_types"]) & {2, 5}
-
-
-def test_interrupt_and_draw_both_happen(tmp_path):
-    rows = [("retracted", "2026-08-04T00:00:00Z")] * 5
-    db = _make_edit_history_db(tmp_path, rows)
-    outcome = run_draw(
-        _warm_state(),
-        db_path=str(db),
-        turn=1,
-        interrupt_threshold=3,
-        interrupt_types=frozenset({2, 5}),
-        count=1,
-        rng=random.Random(0),
-    )
-    r = outcome["result"]
-    assert len(r["drawn_types"]) == 1
-    assert len(r["interrupt_types"]) == 2
-    assert len(r["types_to_run"]) == 3  # 1 drawn + 2 interrupt, disjoint
-
-
-# ---------------------------------------------------------------------------
-# Default interrupt-types now empty (issue #1992, 2026-08-19): the {2,5}
-# force-set checked contradiction/taint NODES, not the day's stale/taint
-# MARKERS the interrupt intends, and dominated rotation (12 of 19 fairy runs
-# forced over the first 11 real draws). Force-triggering is disabled by
-# default until #2013's cascade machine gives dreams a principled
-# marker-resolution path; --interrupt-types still forces exactly as before
-# when passed explicitly (covered above).
-# ---------------------------------------------------------------------------
-
-def test_default_interrupt_types_is_empty():
-    from tools.dream_lottery import DEFAULT_INTERRUPT_TYPES
-
-    assert DEFAULT_INTERRUPT_TYPES == frozenset()
-
-
-def test_default_draw_forces_no_types_even_above_threshold(tmp_path):
-    """With the (now-empty) default interrupt_types, a cascade count at or
-    above the threshold must NOT force any category -- interrupt_fired must
-    be False, and cascade_marker_count is still recorded (see next test)."""
-    rows = [("retracted", "2026-08-04T00:00:00Z")] * 5
-    db = _make_edit_history_db(tmp_path, rows)
-    outcome = run_draw(
-        _warm_state(),
-        db_path=str(db),
-        turn=1,
-        interrupt_threshold=3,
-        # interrupt_types not passed -> defaults to DEFAULT_INTERRUPT_TYPES
-        count=1,
-        rng=random.Random(0),
-    )
-    r = outcome["result"]
-    assert r["cascade_marker_count"] == 5  # still computed and recorded
-    assert r["interrupt_fired"] is False  # empty type set -> nothing to force
-    assert r["interrupt_types"] == []
-    assert len(r["types_to_run"]) == 1  # only the random draw, no forced types
-
-
-def test_default_draw_cli_forces_no_types(tmp_path, capsys):
-    """CLI-level counterpart: a real `draw` with no --interrupt-types passed
-    (module default) must not force categories 2/5 even with heavy cascade
-    activity, and cascade_marker_count is still present in the record."""
-    state_path = tmp_path / "dream-lottery.json"
-    db = _make_edit_history_db(tmp_path, [])
-
-    rc1 = _draw_cli(state_path, db, turn=1, seed=0)
-    out1 = json.loads(capsys.readouterr().out)
-    assert rc1 == 0
-    assert out1["interrupt_fired"] is False
-
-    conn = sqlite3.connect(str(db))
-    for i in range(5):
-        conn.execute(
-            "INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details) "
-            "VALUES (?, 1, 'retracted', ?, 'observation', '{}')",
-            (out1["now"], f"ob_y{i:02d}"),
-        )
-    conn.commit()
-    conn.close()
-
-    rc2 = _draw_cli(state_path, db, turn=2, seed=2)  # no --interrupt-types
-    out2 = json.loads(capsys.readouterr().out)
-    assert rc2 == 0
-    assert "cascade_marker_count" in out2
-    assert out2["cascade_marker_count"] >= 3  # threshold met
-    assert out2["interrupt_fired"] is False  # but default set is empty
-    assert out2["interrupt_types"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -455,39 +297,6 @@ def test_load_backfills_missing_category(tmp_path):
     reloaded = load_state(str(path))
     assert "9" in reloaded["types"]
     assert reloaded["types"]["9"]["weight"] == 1
-
-
-# ---------------------------------------------------------------------------
-# Cascade counting
-# ---------------------------------------------------------------------------
-
-def test_cold_start_does_not_replay_all_history_as_interrupt(tmp_path):
-    """Regression: a fresh state (last_interrupt_check_at=None) must NOT
-    scan/count all-time cascade markers -- caught live via manual dry-run
-    against the real graph, where 81 lifetime markers spuriously tripped a
-    threshold=3 interrupt on turn 1. Cold start seeds the baseline to now
-    (0 markers), same as the forum monitors' seed-to-current convention."""
-    rows = [("retracted", "2020-01-01T00:00:00Z")] * 50  # lots of ancient history
-    db = _make_edit_history_db(tmp_path, rows)
-    state = default_state()
-    assert state["last_interrupt_check_at"] is None
-    outcome = run_draw(state, db_path=str(db), turn=1, interrupt_threshold=3, rng=random.Random(0))
-    assert outcome["result"]["cascade_marker_count"] == 0
-    assert outcome["result"]["interrupt_fired"] is False
-
-
-def test_count_cascade_markers_filters_action_and_since(tmp_path):
-    rows = [
-        ("retracted", "2026-08-01T00:00:00Z"),
-        ("superseded", "2026-08-02T00:00:00Z"),
-        ("created", "2026-08-03T00:00:00Z"),  # not a cascade action
-        ("stale_flagged", "2026-08-03T12:00:00Z"),
-        ("support_lost", "2026-08-04T00:00:00Z"),
-    ]
-    db = _make_edit_history_db(tmp_path, rows)
-    assert count_cascade_markers(str(db), None) == 4  # all cascade actions, any time
-    assert count_cascade_markers(str(db), "2026-08-03T00:00:00Z") == 2  # stale_flagged + support_lost
-    assert count_cascade_markers(str(db), "2026-08-10T00:00:00Z") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -577,69 +386,6 @@ def test_history_write_failure_does_not_break_draw(tmp_path, capsys):
         assert result["turn"] == 1
     finally:
         readonly_dir.chmod(0o755)  # allow tmp_path cleanup
-
-
-def test_history_subcommand_distinguishes_drawn_from_interrupt_forced(tmp_path, capsys):
-    state_path = tmp_path / "dream-lottery.json"
-    db = _make_edit_history_db(tmp_path, [])
-
-    # Draw 1: cold start, no interrupt possible (last_interrupt_check_at is
-    # None on a fresh state -> cascade_marker_count is seeded to 0 by
-    # design). Picks one category by the random draw. seed=0 draws category
-    # 8 (verified against weighted_draw directly) -- deliberately NOT 2 or
-    # 5, so draw 1's random pick and draw 2's interrupt-forced set below
-    # stay disjoint and the drawn-vs-forced assertions are unambiguous.
-    rc1 = _draw_cli(state_path, db, turn=1, seed=0)
-    out1 = json.loads(capsys.readouterr().out)
-    assert rc1 == 0
-    assert out1["interrupt_fired"] is False
-
-    # Add cascade rows timestamped at/after draw 1's own `now`, at the
-    # default interrupt_threshold (3), so draw 2's since-filter (seeded
-    # from draw 1's last_interrupt_check_at) picks them all up.
-    conn = sqlite3.connect(str(db))
-    for i in range(3):
-        conn.execute(
-            "INSERT INTO edit_history (timestamp, turn, action, node_id, node_type, details) "
-            "VALUES (?, 1, 'retracted', ?, 'observation', '{}')",
-            (out1["now"], f"ob_x{i:02d}"),
-        )
-    conn.commit()
-    conn.close()
-
-    # DEFAULT_INTERRUPT_TYPES is empty as of 2026-08-19 (#1992) -- this test
-    # exercises the CLI-level interrupt-forced bookkeeping (history tally
-    # distinguishing drawn vs forced), which still needs a non-empty
-    # --interrupt-types to exercise at all, so it's passed explicitly here
-    # rather than relying on the (now-empty) default.
-    rc2 = _draw_cli(
-        state_path, db, turn=2, seed=2, extra=["--interrupt-types", "2,5"]
-    )
-    out2 = json.loads(capsys.readouterr().out)
-    assert rc2 == 0
-    assert out2["interrupt_fired"] is True
-    assert out2["interrupt_types"] == [2, 5]  # explicit --interrupt-types, not the default
-
-    history_path = tmp_path / "dream-lottery-history.jsonl"
-    tally = tally_history(str(history_path))
-    assert tally["cycles_counted"] == 2
-    assert tally["interrupt_cycles"] == 1
-    assert tally["skipped_malformed"] == 0
-
-    by_cat = {c["category"]: c for c in tally["categories"]}
-    drawn1 = out1["drawn_types"][0]
-    drawn2 = out2["drawn_types"][0]
-
-    assert by_cat[drawn1]["drawn_count"] >= 1
-    assert by_cat[drawn2]["drawn_count"] >= 1
-    assert by_cat[2]["interrupt_forced_count"] == 1
-    assert by_cat[2]["drawn_count"] == 0
-    assert by_cat[5]["interrupt_forced_count"] == 1
-    assert by_cat[5]["drawn_count"] == 0
-    # Drawn and interrupt-forced are tallied separately even for the same
-    # category, and total_runs is their sum.
-    for cat in tally["categories"]:
-        assert cat["total_runs"] == cat["drawn_count"] + cat["interrupt_forced_count"]
 
 
 def test_malformed_line_skipped_and_counted(tmp_path):
@@ -827,42 +573,107 @@ def test_count_zero_no_longer_defeats_reentrancy_guard(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# --interrupt-threshold validation (Borges's third instance of the same
-# class, found on #1912's own review): threshold <= 0 makes
-# `interrupt_fired = cascade_count >= interrupt_threshold` unconditionally
-# true, silently forcing the interrupt-mapped categories in every single
-# night regardless of real cascade activity.
+# cascade-interrupt removal (issue #2399, 2026-09-11)
 # ---------------------------------------------------------------------------
 
-def test_interrupt_threshold_zero_is_rejected(tmp_path, capsys):
+def test_run_draw_no_longer_accepts_interrupt_types(tmp_path):
+    db = _make_edit_history_db(tmp_path, [])
+    with pytest.raises(TypeError):
+        run_draw(
+            default_state(),
+            db_path=str(db),
+            turn=1,
+            interrupt_types=frozenset({2, 5}),
+            rng=random.Random(0),
+        )
+
+
+def test_run_draw_no_longer_accepts_interrupt_threshold(tmp_path):
+    db = _make_edit_history_db(tmp_path, [])
+    with pytest.raises(TypeError):
+        run_draw(
+            default_state(),
+            db_path=str(db),
+            turn=1,
+            interrupt_threshold=3,
+            rng=random.Random(0),
+        )
+
+
+def test_tally_history_handles_old_format_line_with_interrupt_fields(tmp_path):
+    """Backward compat: `dream-lottery-history.jsonl` lines written by
+    pre-#2399 code still carry `interrupt_types`/`interrupt_fired` keys.
+    tally_history() must read such a line without error and must not
+    surface an `interrupt_cycles` key in its own output."""
+    history_path = tmp_path / "dream-lottery-history.jsonl"
+    old_format_line = json.dumps(
+        {
+            "turn": 1,
+            "now": "2026-08-04T00:00:00Z",
+            "drawn_types": [1],
+            "types_to_run": [1],
+            "interrupt_types": [2, 5],
+            "interrupt_fired": True,
+            "interrupt_threshold": 3,
+            "cascade_marker_count": 7,
+        },
+        sort_keys=True,
+    )
+    history_path.write_text(old_format_line + "\n")
+    tally = tally_history(str(history_path))
+    assert tally["cycles_counted"] == 1
+    assert tally["skipped_malformed"] == 0
+    assert "interrupt_cycles" not in tally
+    by_cat = {c["category"]: c for c in tally["categories"]}
+    assert by_cat[1]["drawn_count"] == 1
+
+
+def test_draw_result_omits_interrupt_and_cascade_keys(tmp_path):
+    db = _make_edit_history_db(tmp_path, [])
+    outcome = run_draw(default_state(), db_path=str(db), turn=1, rng=random.Random(0))
+    r = outcome["result"]
+    for removed_key in (
+        "cascade_marker_count",
+        "interrupt_fired",
+        "interrupt_types",
+        "interrupt_threshold",
+    ):
+        assert removed_key not in r
+    assert "last_interrupt_check_at" not in outcome["state"]
+
+
+def test_interrupt_cli_flags_no_longer_valid(tmp_path, capsys):
     state_path = tmp_path / "dream-lottery.json"
     db = _make_edit_history_db(tmp_path, [])
-    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "0"])
-    out = capsys.readouterr()
-    assert rc != 0
-    assert "interrupt-threshold must be" in out.err.lower()
-    assert not state_path.exists()
-
-
-def test_interrupt_threshold_negative_is_rejected(tmp_path, capsys):
-    state_path = tmp_path / "dream-lottery.json"
-    db = _make_edit_history_db(tmp_path, [])
-    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "-1"])
-    out = capsys.readouterr()
-    assert rc != 0
-    assert "interrupt-threshold must be" in out.err.lower()
-    assert not state_path.exists()
-
-
-def test_interrupt_threshold_zero_no_longer_fires_unconditionally(tmp_path, capsys):
-    """Regression test for Borges's exact reproduction: threshold=0 (or
-    negative) against a graph with ZERO cascade activity used to still
-    report interrupt_fired=True, silently forcing categories 2/5 in every
-    night and defeating the lottery's whole rotation premise. Must now be
-    rejected before any draw computation happens."""
-    state_path = tmp_path / "dream-lottery.json"
-    db = _make_edit_history_db(tmp_path, [])  # zero cascade rows
-    rc = _draw_cli(state_path, db, turn=1, extra=["--interrupt-threshold", "0"])
+    with pytest.raises(SystemExit) as exc1:
+        main(
+            [
+                "draw",
+                "--state",
+                str(state_path),
+                "--db",
+                str(db),
+                "--turn",
+                "1",
+                "--interrupt-types",
+                "2,5",
+            ]
+        )
     capsys.readouterr()
-    assert rc != 0
-    assert not state_path.exists()
+    assert exc1.value.code == 2
+    with pytest.raises(SystemExit) as exc2:
+        main(
+            [
+                "draw",
+                "--state",
+                str(state_path),
+                "--db",
+                str(db),
+                "--turn",
+                "1",
+                "--interrupt-threshold",
+                "3",
+            ]
+        )
+    capsys.readouterr()
+    assert exc2.value.code == 2
