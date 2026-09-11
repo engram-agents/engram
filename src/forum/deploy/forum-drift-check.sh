@@ -149,7 +149,8 @@ _is_excluded() {
 # (git ls-tree / git show — never the working tree, so a stale local checkout
 # cannot reproduce this same bug one level up).
 # ---------------------------------------------------------------------------
-mapfile -t _SRC_ALL < <(git -C "$SRC" ls-tree -r --name-only "$REF" -- src/forum/ | sed 's#^src/forum/##')
+_SRC_ALL=()
+while IFS= read -r _line; do _SRC_ALL+=("$_line"); done < <(git -C "$SRC" ls-tree -r --name-only "$REF" -- src/forum/ | sed 's#^src/forum/##')
 SRC_FILES=()
 for rel in "${_SRC_ALL[@]}"; do
   _is_excluded "$rel" || SRC_FILES+=("$rel")
@@ -159,7 +160,8 @@ done
 # Enumerate the deployed side: files under $DEPLOYED, pruning __pycache__/.venv
 # so we never even descend into them (perf + they may be unreadable).
 # ---------------------------------------------------------------------------
-mapfile -t _DEPLOYED_ALL < <(
+_DEPLOYED_ALL=()
+while IFS= read -r _line; do _DEPLOYED_ALL+=("$_line"); done < <(
   cd "$DEPLOYED" && find . \( -type d \( -name '__pycache__' -o -name '.venv' \) -prune \) -o -type f -print \
     | sed 's#^\./##' | sort
 )
@@ -171,7 +173,8 @@ done
 # ---------------------------------------------------------------------------
 # Union of relpaths, sorted, deduped.
 # ---------------------------------------------------------------------------
-mapfile -t ALL_RELPATHS < <(printf '%s\n' "${SRC_FILES[@]}" "${DEPLOYED_FILES[@]}" | sort -u)
+ALL_RELPATHS=()
+while IFS= read -r _line; do ALL_RELPATHS+=("$_line"); done < <(printf '%s\n' "${SRC_FILES[@]}" "${DEPLOYED_FILES[@]}" | sort -u)
 
 _in_array() {
   local needle="$1"; shift
