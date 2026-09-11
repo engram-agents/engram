@@ -359,14 +359,25 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # ran every multi-index query (not just the dangling-evidence one
         # this issue was filed about) without cardinality statistics.
         #
-        # #2685 review finding (Ariadne, on her own 5,320-node live graph,
-        # SQLite 3.45.1): PRAGMA optimize ALONE never seeds sqlite_stat1 on a
-        # table that has never been analyzed -- measured zero rows inserted
-        # under every documented mask (default, 0x02, 0x10002, 0xfffe) on a
-        # fresh connection with no prior writes. The original comment here
-        # claimed PRAGMA optimize's own low-cost heuristic would keep stats
-        # current fleet-wide; that claim silently depended on sqlite_stat1
-        # already existing, which on a from-scratch table it does not.
+        # #2685 review finding (Ariadne, SQLite 3.45.1), CORRECTED 2026-09-11
+        # on a ~5,750-node live graph -- the earlier wording of this comment
+        # overstated the measurement it rested on, so read the bound with the
+        # claim: PRAGMA optimize alone seeds nothing ON A CONNECTION THAT HAS
+        # ISSUED NO QUERY (zero rows under every documented mask -- default,
+        # 0x02, 0x10002, 0xfffe). It does NOT follow, and is false, that
+        # optimize can never bootstrap a never-analyzed table: on the same
+        # 3.45.1 process, once a query has touched `nodes`, optimize seeds it
+        # (8 rows). The operative parameter is whether the table was queried
+        # in THIS connection, not whether it has ever been analyzed.
+        #
+        # That correction does not weaken the case for the seed -- it moves
+        # it. What optimize cannot do is COVER THE SCHEMA: it only ever
+        # analyzes the tables the calling process happened to query, so a
+        # checkpoint would seed whatever subset that process touched and
+        # nothing else. Measured on the same graph: the unscoped ANALYZE
+        # below produces 32 rows across 17 tables; optimize alone in the same
+        # process produces 8 rows across 1. The other 16 tables would keep
+        # planning without statistics indefinitely.
         #
         # A same-day re-run of Ariadne's exact experiment on this repo's own
         # vendored SQLite (3.53.4) got the OPPOSITE result: PRAGMA optimize
@@ -375,9 +386,15 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # ITSELF corrected within the hour: Ariadne re-ran both binaries on
         # her OWN single host and found both outcomes live there, minutes
         # apart -- her machine's standalone `sqlite3` CLI links a newer
-        # SQLite (3.53.0, seeds immediately) while the same host's ENGRAM
-        # venv Python links an older one (3.45.1, never seeds), on
-        # identical SQL and schema. So the boundary is per-PROCESS library
+        # SQLite (3.53.0) while the same host's ENGRAM venv Python links an
+        # older one (3.45.1), on identical SQL and schema. Re-measured
+        # 2026-09-11 with the queried-vs-unqueried parameter above held
+        # explicit, which is what makes the two separable: 3.53.0 seeds in
+        # BOTH conditions (28 rows either way), 3.45.1 only when the table
+        # was queried first (0 unqueried, 8 queried). So linked-library
+        # version is a genuine discriminator and does not reduce to the
+        # queried-in-this-connection parameter; it shows up specifically in
+        # the unqueried condition. The boundary is per-PROCESS library
         # linkage, not per-seat/per-agent version -- a fact no code running
         # inside one process can observe about another process, which is
         # exactly why the explicit seed below is not merely convenient but
@@ -386,9 +403,31 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # process would have linked), so there is nothing to gate on except
         # sqlite_stat1's own presence. With the seed, every checkpoint gets
         # sqlite_stat1 populated unconditionally on first run, regardless of
-        # which SQLite build the calling process happens to have linked, and
-        # PRAGMA optimize then maintains it going forward (Ariadne measured
-        # the one-time seed cost at ~8.5ms on her 89MB graph).
+        # which SQLite build the calling process happens to have linked.
+        #
+        # Costs, all re-measured 2026-09-11 on a ~5,750-node graph, n=12 per
+        # variant. ONE-TIME SEED: unscoped ANALYZE (what ships) median 28.6ms
+        # (25.2-36.8); scoped `ANALYZE nodes` median 24.3ms (21.3-32.5). An
+        # earlier version of this comment said ~8.5ms; that does not reproduce
+        # under either variant. STEADY-STATE PRAGMA optimize once stats exist:
+        # median 0.004ms (0.003-0.022) -- which is what makes the unconditional
+        # every-checkpoint call free at nap frequency.
+        #
+        # READ THE ORDER OF MAGNITUDE AS THE CLAIM, not any single figure:
+        # these are wall-clock and load-dependent, and an independent re-run on
+        # the same host produced a 97.3ms outlier on the unscoped seed. What
+        # survives the noise is the shape -- tens of milliseconds once, then
+        # microseconds forever.
+        #
+        # DO NOT read "and PRAGMA optimize maintains it thereafter" into the
+        # above -- an earlier version of this comment said exactly that and it
+        # is NOT true on 3.45.1: after a 16x row growth the seeded stats stayed
+        # frozen under all three variants (table queried first, fresh
+        # connection, explicit 0xfffe mask), while an explicit ANALYZE on the
+        # same data updated them. Tracked as #2732; what bounds the drift today
+        # is nothing in this block, only whatever cadence re-seeds after a
+        # sqlite_stat1-absent state. The seed fixes "no statistics at all";
+        # it does not promise "statistics that stay current".
         #
         # The seed is a plain, unscoped ANALYZE (deliberate -- analyzes the
         # whole schema, not just the nodes table the composite index above
