@@ -95,6 +95,18 @@ def _table_exists(db_path: Path, table_name: str) -> bool:
         conn.close()
 
 
+def _get_verdict_rows(db_path: Path) -> list[dict]:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM projection_verdicts ORDER BY id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def _get_index_names(db_path: Path) -> set[str]:
     conn = sqlite3.connect(str(db_path))
     try:
@@ -399,6 +411,188 @@ class TestPromotedColumns(IndexerTestBase):
         row = rows[0]
         self.assertIsNone(row["daemon_latency_ms"])
         self.assertIsNone(row["fallback_to_fts"])
+
+
+class TestUnprojectedVerdictRows(IndexerTestBase):
+    """A stored event_type with no declared projection gets a verdict row,
+    not a silent NULL-columns skip -- and a projected type does NOT get one."""
+
+    def test_unprojected_type_gets_verdict_row_projected_type_does_not(self):
+        session_id = "sess-verdict"
+        events = [
+            # Unprojected: engram.x.y matches no _PROJECTIONS entry.
+            _make_event(session_id=session_id, turn=1, event_type="engram.x.y",
+                        ts="2026-05-17T15:00:01.000Z", data={"anything": 1}),
+            _make_event(session_id=session_id, turn=2, event_type="engram.x.y",
+                        ts="2026-05-17T15:00:02.000Z", data={"anything": 2}),
+            # Projected: engram.hook.fire has a real projector.
+            _make_event(session_id=session_id, turn=3, event_type="engram.hook.fire",
+                        ts="2026-05-17T15:00:03.000Z",
+                        data={"hook_name": "x", "duration_ms": 5, "exit_code": 0}),
+        ]
+        _write_jsonl(self.sessions_dir / f"{session_id}.l1.jsonl", events)
+        result = Indexer.run_once(logs_dir=self.logs_dir)
+
+        verdicts = _get_verdict_rows(self.db_path)
+        # Positive assertion: the unprojected type got exactly one verdict
+        # row, count=2 (both occurrences aggregated within this one tick).
+        matching = [v for v in verdicts if v["event_type"] == "engram.x.y"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["count"], 2)
+        self.assertIsNone(matching[0]["manifest_id"])
+        self.assertIsNotNone(matching[0]["ts_utc"])
+
+        # Negative assertion (the decoy control): the PROJECTED type must
+        # NOT have a verdict row. Without this assertion, an implementation
+        # that writes a verdict row for every event_type (projected or not)
+        # would pass the positive assertion above while getting the actual
+        # property wrong.
+        self.assertEqual(
+            [v for v in verdicts if v["event_type"] == "engram.hook.fire"], [],
+            "a projected type must never get a projection_verdicts row",
+        )
+
+        self.assertEqual(result["verdict_rows_written"], 1)
+
+    def test_ts_utc_is_unambiguously_utc(self):
+        """The verdict row's ts_utc must carry an explicit UTC marker
+        (Z or +00:00), never a naive local-time string."""
+        session_id = "sess-verdict-utc"
+        _write_jsonl(
+            self.sessions_dir / f"{session_id}.l1.jsonl",
+            [_make_event(session_id=session_id, event_type="engram.x.y",
+                          ts="2026-05-17T15:00:01.000Z")],
+        )
+        Indexer.run_once(logs_dir=self.logs_dir)
+        verdicts = _get_verdict_rows(self.db_path)
+        self.assertEqual(len(verdicts), 1)
+        ts = verdicts[0]["ts_utc"]
+        self.assertTrue(
+            ts.endswith("Z") or ts.endswith("+00:00"),
+            f"ts_utc must carry an explicit UTC marker, got: {ts!r}",
+        )
+
+
+class _MixedRowsConn:
+    """Proxies a real sqlite3.Connection, splicing a NOT-NULL-violating row
+    into the executemany() call _write_verdict_rows issues against
+    projection_verdicts -- same pattern as _CrashBeforeCommitConn above,
+    needed here because sqlite3.Connection instances cannot have their
+    methods monkeypatched directly: instance-level patch.object(conn,
+    "executemany", ...) raises "AttributeError: 'sqlite3.Connection' object
+    attribute 'executemany' is read-only" (confirmed empirically), the same
+    read-only-slot restriction _CrashBeforeCommitConn's own docstring
+    documents for class-level patching. __getattr__ delegates everything
+    else -- including .commit/.rollback/.in_transaction -- straight to the
+    real connection, so _write_verdict_rows and _checkpoint_wal both see a
+    real, fully-functional connection except for the one spliced call.
+    """
+
+    def __init__(self, real_conn):
+        self._real = real_conn
+
+    def executemany(self, sql, rows):
+        if "INSERT INTO projection_verdicts" in sql:
+            rows = list(rows) + [("2026-01-01T00:00:00+00:00", None, None, 1)]
+        return self._real.executemany(sql, rows)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestVerdictWriteFailureRollsBack(IndexerTestBase):
+    """A failure inside _write_verdict_rows (e.g. one row in the batch violates
+    a constraint, or a real write-lock/disk-full condition on commit) must not
+    leave the connection in an open transaction -- that would make the very
+    next statement in run_once() (_checkpoint_wal, on the SAME connection) raise
+    'database table is locked', silently aborting the tick and falsifying this
+    function's own docstring claim that a verdict-write failure never aborts
+    the tick. Reproduced with a REAL constraint violation, not a mock -- the
+    second row's event_type is None, violating the NOT NULL column.
+
+    Uses the _MixedRowsConn connect-boundary proxy (not instance-level
+    patch.object) -- see that class's docstring for why."""
+
+    def tearDown(self):
+        # This test deliberately drives _write_verdict_rows into its except
+        # branch, which increments the module-global _VERDICT_WRITE_DROP_COUNT
+        # and -- correctly, on the failure path -- never resets it (only a
+        # SUCCESSFUL write resets it, per the self-healing fold-in design).
+        # Left uncleaned, a nonzero count leaks into whichever test runs next
+        # in the same pytest process and calls _write_verdict_rows
+        # successfully: that call folds in an unexpected extra
+        # "engram.indexer.verdict_write_dropped" row, breaking any test
+        # asserting an exact row count. Reset here so this test's own
+        # side effect on shared module state doesn't leak across tests --
+        # exactly the risk the original reviewer-fairy round flagged in
+        # advance, reproduced directly by re-running this test ahead of
+        # TestUnprojectedVerdictRows in a subset invocation.
+        engram_log_indexer._VERDICT_WRITE_DROP_COUNT = 0
+        super().tearDown()
+
+    def test_failed_write_rolls_back_so_checkpoint_still_succeeds(self):
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        real_conn = sqlite3.connect(str(self.db_path))
+        engram_log_indexer._init_schema(real_conn)
+        conn = _MixedRowsConn(real_conn)
+
+        result = engram_log_indexer._write_verdict_rows(
+            conn, {("engram.x.y", None): 1}
+        )
+
+        self.assertEqual(result, 0, "a failed write must report 0 rows written")
+        self.assertFalse(
+            conn.in_transaction,
+            "the connection must not be left in an open transaction after a "
+            "caught write failure -- rollback() must run in the except branch",
+        )
+
+        # The real regression: the next statement run_once() actually executes
+        # after _write_verdict_rows() is _checkpoint_wal on this SAME connection.
+        # Before the fix, this call raises sqlite3.OperationalError: database
+        # table is locked. It must now succeed cleanly.
+        row = engram_log_indexer._checkpoint_wal(conn, self.db_path)
+        self.assertEqual(row, (0, 0, 0))
+
+        conn.close()
+
+    def test_failed_batch_drop_count_reflects_entries_lost_not_flat_one(self):
+        """The drop counter must record how many distinct verdict-row
+        entries were lost in a failed attempt (len(rows)), not a flat 1
+        regardless of batch size -- a flat 1 discards magnitude information
+        a future reader of the eventual fold-in row needs. This is the
+        discriminating case: a 3-entry tick_unprojected dict must increment
+        the counter by 3, not 1, on failure."""
+        # Explicit entry-state reset, independent of execution order: this
+        # test's own correctness must not depend on whether some earlier
+        # test already left the counter at 0 (this class's tearDown resets
+        # it on exit, but that says nothing about entry state if a test
+        # outside this class were ever to leave it dirty).
+        engram_log_indexer._VERDICT_WRITE_DROP_COUNT = 0
+
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        real_conn = sqlite3.connect(str(self.db_path))
+        engram_log_indexer._init_schema(real_conn)
+        conn = _MixedRowsConn(real_conn)
+
+        tick_unprojected = {
+            ("engram.a.b", None): 1,
+            ("engram.c.d", None): 2,
+            ("engram.e.f", None): 3,
+        }
+        result = engram_log_indexer._write_verdict_rows(conn, tick_unprojected)
+
+        self.assertEqual(result, 0, "a failed write must report 0 rows written")
+        self.assertEqual(
+            engram_log_indexer._VERDICT_WRITE_DROP_COUNT,
+            len(tick_unprojected),
+            "the drop counter must equal the number of distinct verdict-row "
+            "entries in the failed batch (len(rows)), not a flat 1 -- a "
+            "regression to flat-1 accounting would leave this at 1 instead "
+            "of 3",
+        )
+
+        conn.close()
 
 
 class TestMalformedLines(IndexerTestBase):
