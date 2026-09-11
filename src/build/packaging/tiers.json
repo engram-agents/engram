@@ -10,6 +10,34 @@
   },
   "default_tier": "convenience",
   "source_root": "src/engram",
+  "telemetry": {
+    "degraded_threshold": 0.5,
+    "dynamic_dispatch_exclusions": [
+      {
+        "file": "engram_client.py",
+        "line": 453,
+        "reason": "Test/SDK harness (ClientHarness.call) invokes already-terminal @mcp.tool dispatch targets by name via a dict built from getattr(server, name); walk correctness is unaffected because dispatch targets are the walk's own stopping point, not an intermediate hop toward one."
+      },
+      {
+        "file": "tools/release_gates.py",
+        "line": 795,
+        "reason": "Release-scorecard gate-runner dispatch table (local lambdas closing over run_G2/etc.); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
+        "zero_emit_file": true
+      },
+      {
+        "file": "tools/release_gates.py",
+        "line": 797,
+        "reason": "Same dispatch table as :795 (list-comprehension form); same exclusion rationale.",
+        "zero_emit_file": true
+      },
+      {
+        "file": "tools/codex-umwelt-wake.py",
+        "line": 515,
+        "reason": "Codex RPC notification-drain dispatch (getattr(rpc, 'drain_buffered_notifications', None)); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
+        "zero_emit_file": true
+      }
+    ]
+  },
   "mechanisms": [
     {
       "path": "server.py",
@@ -69,7 +97,8 @@
     },
     {
       "path": "engram_derive.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": []
     },
     {
       "path": "engram_tasks.py",
@@ -77,7 +106,8 @@
     },
     {
       "path": "engram_revision.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": []
     },
     {
       "path": "engram_stats.py",
@@ -129,11 +159,13 @@
     },
     {
       "path": "engram_query.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": []
     },
     {
       "path": "engram_observation.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": []
     },
     {
       "path": "engram_anchoring.py",
@@ -165,7 +197,9 @@
     },
     {
       "path": "engram_log_emitter.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": [],
+      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :260 IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
     },
     {
       "path": "engram_log_indexer.py",
@@ -632,6 +666,10 @@
       "tier": "dev"
     },
     {
+      "path": "tools/telemetry_manifest_gate.py",
+      "tier": "dev"
+    },
+    {
       "path": "hooks/claude/start-engram-daemon.sh",
       "tier": "essential",
       "dest": "hooks/start-engram-daemon.sh"
@@ -644,12 +682,14 @@
     {
       "path": "hooks/claude/engram-surface-hook.py",
       "tier": "essential",
-      "dest": "hooks/engram-surface-hook.py"
+      "dest": "hooks/engram-surface-hook.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-session-start-hook.py",
       "tier": "essential",
-      "dest": "hooks/engram-session-start-hook.py"
+      "dest": "hooks/engram-session-start-hook.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-stale-tree-pull-hook.py",
@@ -669,7 +709,8 @@
     {
       "path": "hooks/claude/engram-postcompact-hook.py",
       "tier": "essential",
-      "dest": "hooks/engram-postcompact-hook.py"
+      "dest": "hooks/engram-postcompact-hook.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-toolcall-repair.py",
@@ -684,7 +725,8 @@
     {
       "path": "hooks/claude/engram-stop-hook.py",
       "tier": "essential",
-      "dest": "hooks/engram-stop-hook.py"
+      "dest": "hooks/engram-stop-hook.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/_stophooklib.py",
@@ -699,12 +741,14 @@
     {
       "path": "hooks/claude/engram-deference-detector-prompt.py",
       "tier": "convenience",
-      "dest": "hooks/engram-deference-detector-prompt.py"
+      "dest": "hooks/engram-deference-detector-prompt.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-deference-detector-stop.py",
       "tier": "convenience",
-      "dest": "hooks/engram-deference-detector-stop.py"
+      "dest": "hooks/engram-deference-detector-stop.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-end-of-day-hook.py",
@@ -750,12 +794,14 @@
     {
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
       "tier": "convenience",
-      "dest": "hooks/engram-utility-credit-mention-stop.py"
+      "dest": "hooks/engram-utility-credit-mention-stop.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-loop-arm-stop-hook.py",
       "tier": "convenience",
-      "dest": "hooks/engram-loop-arm-stop-hook.py"
+      "dest": "hooks/engram-loop-arm-stop-hook.py",
+      "telemetry": []
     },
     {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",

@@ -382,6 +382,13 @@
       "note": "The checker reports an ABSENCE (no bash-4-only constructs in shipped shell scripts), and an absence-reporting tool is trustworthy only if its detector demonstrably fires on a positive. The mapped suite therefore weights the detector's falsifiability — every pattern matches a known-positive AND rejects the portable bash-3.2 equivalent — over its plumbing. The hyphenated filename means it is loaded by path, not imported, so it has no import-graph edge and would otherwise be layer-1-unreachable."
     },
     {
+      "path_prefix_or_glob": "tools/telemetry_manifest_gate.py",
+      "test_globs": [
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "The §4a telemetry-manifest gate (engram-alpha#2574 WS2): AST-extracts the declared/emitted site-id sets and the backward call-graph walk deriving each site's dispatch-target set, plus the dynamic-dispatch static scan. Mapped to test_tiers_manifest.py, which carries this module's own tests (participation/static test, manifest-key-required test, and the dynamic-dispatch discriminating control) alongside the pre-existing tag-once manifest gate tests. The real module lives at src/engram/tools/telemetry_manifest_gate.py; this path is the dual-copy symlink per #2782's convention, so it has no import-graph edge of its own and would otherwise be layer-1-unreachable, same shape as tools/os-harness-check.py above."
+    },
+    {
       "path_prefix_or_glob": "tools/release-cutover.py",
       "test_globs": [
         "tests/test_release_cutover.py"

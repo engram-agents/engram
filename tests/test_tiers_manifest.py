@@ -103,12 +103,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import tempfile
 
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 BUILD_PLUGIN_SH = os.path.join(REPO_ROOT, "tools", "build-plugin.sh")
+
+sys.path.insert(0, REPO_ROOT)
+from tools import telemetry_manifest_gate as telemetry_gate  # noqa: E402
 
 VALID_TIERS = {"essential", "convenience", "dev"}
 
@@ -829,3 +834,226 @@ def test_import_dep_tier_consistency():
         f"Import-dep tier/flag inconsistencies found ({len(violations)}):\n"
         + "\n".join(f"  {v}" for v in violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# Telemetry manifest gate (issue #2574, workstream WS2 — §4a)
+#
+# See docs/2574-telemetry-design.md §1 (PARTICIPATION DEFINITION) and §4a
+# (the registry) for the design. tools/telemetry_manifest_gate.py holds the
+# extraction/walk/scan logic these tests exercise; see its own module
+# docstring and `--self-test` for the synthetic positive/negative fixtures
+# that pin the extraction logic itself (independent of these pytest tests,
+# which focus on the MANIFEST-facing contract).
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_key_required_on_emitting_mechanisms():
+    """Any manifest entry whose path is a hook or tool that CAN emit must
+    carry a `telemetry` key — either `telemetry: []` (declaring, explicitly,
+    that it emits from nowhere) or one record per call site.
+
+    The required-declaration population is MECHANICAL (AST-derived from the
+    real source tree), not a hand-maintained list — a newly added emit call
+    automatically enters this test's population, same discipline as
+    ``test_every_shippable_path_is_tagged``'s filesystem-derived candidate
+    enumeration above.
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    sites = telemetry_gate.find_emit_call_sites(src_root)
+    emitting_paths = telemetry_gate.emitting_mechanism_paths(manifest, src_root, sites)
+
+    path_to_entry = {e["path"]: e for e in manifest["mechanisms"]}
+    missing = sorted(p for p in emitting_paths if "telemetry" not in path_to_entry.get(p, {}))
+
+    assert not missing, (
+        "packaging/tiers.json is missing a `telemetry` key for these "
+        "emitting mechanism paths (add `telemetry: []` or per-call-site "
+        "records — see docs/2574-telemetry-design.md §4a):\n"
+        + "\n".join(f"  {p}" for p in missing)
+    )
+
+
+def test_telemetry_gate_clean_on_real_tree():
+    """The §4a gate (NOT_WIRED / UNDECLARED / unresolved dynamic-dispatch)
+    must report clean on the real manifest + real source tree.
+
+    Today L = M = ∅ everywhere (no `site=` kwarg exists in source yet — that
+    is WS3's job), so NOT_WIRED and UNDECLARED are trivially empty; this test
+    would catch either set becoming non-empty (WS3 wiring a site whose id
+    doesn't match a manifest record, or vice versa) as well as a REGRESSION
+    in the dynamic-dispatch exclusion set (a new dynamic-dispatch call site
+    appearing in the tree with no matching declared exclusion).
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    report = telemetry_gate.run_gate(src_root, manifest)
+
+    assert not report.not_wired, f"NOT WIRED (manifest declares, source never emits): {sorted(report.not_wired)}"
+    assert not report.undeclared, f"UNDECLARED (source emits, manifest has no record): {sorted(report.undeclared)}"
+    assert not report.unresolved_dynamic_hits, (
+        "Unresolved dynamic-dispatch hits (declare an exclusion with a reason "
+        "in packaging/tiers.json's telemetry.dynamic_dispatch_exclusions, or "
+        "show the backward walk cannot reach a declared site):\n"
+        + "\n".join(f"  {h.file}:{h.lineno} (shape {h.shape}) — {h.snippet}" for h in report.unresolved_dynamic_hits)
+    )
+
+
+def test_telemetry_participation_static_not_wired_control():
+    """§9 test 2 — the participation/static test ('round-6 correction').
+
+    Add a manifest site record whose literal id has NO matching
+    `emit(..., site=...)` call anywhere in source; assert the §4a gate
+    reports it under NOT_WIRED (M - L). Purely static — no window is run
+    and no trigger is fired, per the design's own bound: conflating this
+    with a runtime test made an earlier draft's stored observables
+    identical to the time-axis test's, which made the design unfalsifiable
+    exactly where it claimed to be falsifiable (§9 note on test 2).
+
+    Uses synthetic manifest data over the REAL source tree's L (which is
+    ∅ today) rather than mutating the real manifest file.
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    sites = telemetry_gate.find_emit_call_sites(src_root)
+    L = telemetry_gate.compute_L(sites)
+
+    phantom_manifest = {
+        "mechanisms": [
+            {
+                "path": "hooks/claude/engram-postcompact-hook.py",
+                "telemetry": [
+                    {"site": "phantom.site.never_emitted", "trigger": "PostCompact"},
+                ],
+            },
+        ],
+    }
+    M = telemetry_gate.compute_M(phantom_manifest)
+
+    nw = telemetry_gate.not_wired(L, M)
+    assert nw == {"phantom.site.never_emitted"}, (
+        f"expected NOT_WIRED == {{'phantom.site.never_emitted'}}, got {nw}"
+    )
+
+
+def test_telemetry_manifest_gate_test_missing_telemetry_key():
+    """§9 test 3 — the manifest gate test.
+
+    Add a hook path with no `telemetry` key at all; assert the manifest-gate
+    logic (the same logic ``test_telemetry_key_required_on_emitting_mechanisms``
+    runs on the real manifest) fails, naming the offending path.
+
+    Built as a synthetic fixture tree + synthetic manifest (same pattern as
+    ``test_whole_tree_synthetic_undeclared_path_is_flagged`` above) rather
+    than mutating the real manifest.
+    """
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-test3-") as tmp:
+        hook_path = os.path.join(tmp, "hooks", "claude", "fake-emitting-hook.py")
+        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+        with open(hook_path, "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def main():\n"
+                '    emit_if_initialized("engram.fake.fired", 1, {})\n\n'
+                'if __name__ == "__main__":\n'
+                "    main()\n"
+            )
+
+        fake_manifest = {
+            "mechanisms": [
+                {"path": "hooks/claude/fake-emitting-hook.py"},  # no "telemetry" key — the defect
+            ],
+        }
+
+        sites = telemetry_gate.find_emit_call_sites(tmp)
+        emitting_paths = telemetry_gate.emitting_mechanism_paths(fake_manifest, tmp, sites)
+        path_to_entry = {e["path"]: e for e in fake_manifest["mechanisms"]}
+        missing = sorted(p for p in emitting_paths if "telemetry" not in path_to_entry.get(p, {}))
+
+        assert missing == ["hooks/claude/fake-emitting-hook.py"], (
+            f"expected the manifest gate to flag the missing telemetry key, got missing={missing}"
+        )
+
+
+def test_telemetry_dynamic_dispatch_discriminating_control():
+    """§9 test 3b's SECOND control — 'on the gate rather than the runtime'.
+
+    The discriminating case (round 11's correction) is a site with ONE
+    DIRECT caller (a real dispatch target) PLUS one dynamic caller elsewhere
+    in the tree — NOT a site reachable only through a dynamic call, which
+    reddens via the zero-target disjunct alone and never exercises the
+    dynamic-dispatch-scan clause specifically (round 10's non-discriminating
+    version). With one direct caller the walk returns a NON-EMPTY target
+    set, so only the static dynamic-dispatch scan can fail this fixture.
+
+    Uses a synthetic fixture tree (mirrors
+    ``telemetry_manifest_gate.py``'s own ``--self-test`` discriminating
+    fixture, exposed here as a first-class pytest test per the design's
+    §9/§10 assignment of this control to WS2).
+    """
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-test3b-") as tmp:
+        with open(os.path.join(tmp, "disc_impl.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def _disc_impl():\n"
+                '    emit_if_initialized("engram.disc.fired", 1, {}, site="engram.disc.fired")\n'
+            )
+        with open(os.path.join(tmp, "disc_server.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import disc_impl as _impl_mod\n\n"
+                "class mcp:\n"
+                "    @staticmethod\n"
+                "    def tool():\n"
+                "        def deco(f):\n"
+                "            return f\n"
+                "        return deco\n\n"
+                "@mcp.tool()\n"
+                "def disc_tool():\n"
+                "    return _impl_mod._disc_impl()\n"
+            )
+        with open(os.path.join(tmp, "disc_dynamic_caller.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def maybe_call_it():\n"
+                "    table = {'x': None}\n"
+                "    table['x']()\n"
+            )
+
+        graph = telemetry_gate.build_call_graph(tmp)
+        sites = telemetry_gate.find_emit_call_sites(tmp)
+        site = next(s for s in sites if s.file == "disc_impl.py")
+        found = telemetry_gate.derive_dispatch_targets(graph, telemetry_gate.enclosing_key_for_site(site))
+
+        # The direct-caller path IS resolved -- the zero-target disjunct
+        # must stay silent, so this control actually discriminates.
+        assert found == {("disc_server.py", "disc_tool")}, (
+            f"expected a NON-EMPTY dispatch-target set (the discriminating "
+            f"precondition), got {found}"
+        )
+
+        manifest = {
+            "mechanisms": [
+                {
+                    "path": "disc_impl.py",
+                    "telemetry": [{"site": "engram.disc.fired", "trigger": "MCP tool body"}],
+                },
+            ],
+        }
+        report = telemetry_gate.run_gate(tmp, manifest)
+
+        # The gate must still FAIL CI -- on the unresolved dynamic-dispatch
+        # hit alone, since NOT_WIRED/UNDECLARED are clean and the target set
+        # is non-empty.
+        assert not report.not_wired
+        assert not report.undeclared
+        assert report.unresolved_dynamic_hits, (
+            "expected an UNRESOLVED dynamic-dispatch hit in "
+            "disc_dynamic_caller.py; finding none means the static-scan "
+            "clause is silently non-discriminating (the round-10 defect)."
+        )
+        assert not telemetry_gate.check_ok(report), (
+            "expected check_ok() == False (unresolved dynamic-dispatch hit "
+            "must fail CI even though the target set is non-empty)"
+        )
