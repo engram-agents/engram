@@ -7439,24 +7439,118 @@ def _embedding_cache_status(model_name: str) -> bool:
     model load) stays on the daemon thread in `_prewarm_embeddings` below,
     per the #276 constraint (synchronous pre-warm can exceed Claude Code's
     30s MCP connection timeout).
+
+    #2835: mirrors all THREE clauses of `SentenceTransformer.__init__`'s
+    name-resolution branch (sentence_transformers 5.3.0,
+    `SentenceTransformer.py:301-308`), not just the org-prefix rule -- a
+    partial mirror let a local absolute path (the documented workaround for
+    a network where the Hub is blocked) raise `HFValidationError` out of
+    this gate instead of returning a clean verdict.
     """
     from huggingface_hub import try_to_load_from_cache
 
-    # Mirror SentenceTransformer's own prefixing rule (verified against the
-    # installed sentence_transformers 5.3.0: SentenceTransformer.__init__
-    # only prepends the "sentence-transformers/" org prefix when the
-    # configured name contains no "/"). A name that already contains "/"
-    # (e.g. an org-qualified model like "BAAI/bge-small-en") is used as-is
-    # by the loader, so the cache-check key must match -- prefixing it here
-    # would look up a repo id that was never the one actually loaded,
-    # producing a guaranteed cache-miss false negative for any such model.
-    if "/" in model_name:
-        cache_repo_id = model_name
-    else:
-        cache_repo_id = f"sentence-transformers/{model_name}"
+    # Clause 1 -- the loader tests os.path.exists FIRST. If the name is a path
+    # that exists, it is a local model and the Hub is never consulted. That is
+    # the documented workaround where the Hub is blocked at the network edge:
+    # download the model elsewhere, point embedding.model at the directory.
+    # The local analogue of the hub arm's config.json probe is to require one
+    # of the two files the loader will actually read: modules.json (a
+    # sentence-transformers export -> _load_sbert_model) or config.json (a
+    # plain transformer dir -> _load_auto_model). An existing-but-EMPTY
+    # directory must still fail the gate, or #345's hole reopens for
+    # local-path installs -- the server would boot and file NULL embeddings.
+    # Deliberately no expanduser(): the loader does not expand "~" either, so
+    # mirroring means "~/models/x" is correctly refused (with the path-shaped
+    # remedy message from the caller), not silently resolved.
+    #
+    # Disclosed gap (#2841 round 1): a PEFT/LoRA adapter directory carrying
+    # only adapter_config.json has NEITHER of these files, and the loader
+    # does accept it -- Transformer._load_config calls
+    # find_adapter_config_file unconditionally on any local path, ahead of
+    # any config.json requirement. So this gate refuses a layout the loader
+    # would load. That is deliberate, not an oversight: an adapter directory
+    # names a BASE model it does not contain, and resolving that base is
+    # exactly what reaches the Hub. Accepting adapter_config.json here would
+    # pass the gate and then fail the base-model fetch on the background
+    # thread -- a silent degrade to NULL embeddings, in precisely the
+    # Hub-blocked network this fix exists to serve. A loud refusal is the
+    # right error for that case; real adapter support needs the base model
+    # local too, which is a larger change than a filename.
+    #
+    # Boundary, stated because "a false PASS is the severe failure" is this
+    # gate's whole premise: the check is presence-only, not content. A
+    # directory holding an empty or malformed modules.json passes here and
+    # fails later on the background thread, which degrades rather than
+    # exits. That is the loader's own precondition strength
+    # (is_sentence_transformer_model also only tests existence) and the same
+    # tradeoff clause 3 already makes (a cached config.json does not prove
+    # the weights are cached). What is new is the POPULATION: before this
+    # change every local path raised, so no local directory could reach that
+    # tradeoff at all.
+    if os.path.exists(model_name):
+        return any(
+            os.path.isfile(os.path.join(model_name, f))
+            for f in ("modules.json", "config.json")
+        )
 
-    cached = try_to_load_from_cache(cache_repo_id, "config.json")
-    return cached is not None
+    # Clause 2 -- not a path, and a shape the loader refuses outright with
+    # FileNotFoundError. A cache lookup here is meaningless, and it is what
+    # raised HFValidationError out of this gate (#2835). Refuse cleanly.
+    if "\\" in model_name or model_name.count("/") > 1:
+        return False
+
+    # Clause 3 -- a hub repo id. The loader prepends the org prefix only when
+    # the name contains no "/" AND is not one of the 68 legacy no-org names in
+    # `basic_transformer_models`. That list is a FUNCTION-LOCAL variable inside
+    # SentenceTransformer.__init__ (5.3.0, line 230) -- not importable, so an
+    # exact mirror would mean copying 68 literals here and drifting silently
+    # from upstream. Probe BOTH candidate repo ids instead: the prefixed form
+    # (the common case) then the bare form (the legacy case). This can never
+    # produce a false cache-MISS, which is the failure that refuses to boot a
+    # correctly-configured server. The residual imprecision is a false HIT only
+    # if a legacy bare name is cached ONLY under a "sentence-transformers/"
+    # -prefixed repo id that does not exist upstream.
+    candidates = [model_name]
+    if "/" not in model_name:
+        candidates.insert(0, f"sentence-transformers/{model_name}")
+
+    for repo_id in candidates:
+        try:
+            if try_to_load_from_cache(repo_id, "config.json") is not None:
+                return True
+        except ValueError:
+            # HFValidationError subclasses ValueError. A repo id this gate
+            # built and the hub rejects is a clean negative here, never a
+            # traceback out of a startup gate.
+            #
+            # Not widened to `except Exception` on purpose (#2841 round 1).
+            # Traced against huggingface_hub 1.8.0: the only ValueError
+            # reachable at this call site is HFValidationError from the
+            # repo-id validator; a genuinely corrupted cache raises OSError
+            # from the os.path/os.listdir calls inside, and that still
+            # propagates. Swallowing it would turn "your cache is broken"
+            # into "your model is not cached", and send the operator to
+            # pre-warm a cache that is present and unreadable. A loud
+            # traceback is the better error there: the goal is no traceback
+            # for a CONFIGURATION mistake, not no traceback ever.
+            continue
+    return False
+
+
+def _looks_like_local_model_path(model_name: str) -> bool:
+    """True when the configured embedding model name is path-shaped.
+
+    Deliberately does NOT treat a single "/" as path evidence:
+    "BAAI/bge-small-en" is an org-qualified hub repo id, not a path. Used only
+    to choose which recovery message the startup gate prints (#2835) -- the
+    pre-warm one-liner is wrong advice for a path.
+    """
+    return (
+        os.path.isabs(model_name)
+        or model_name.startswith(("~", "./", "../", ".\\", "..\\"))
+        or "\\" in model_name
+        or model_name.count("/") > 1
+    )
 
 
 def _prewarm_embeddings(model_name: str) -> None:
@@ -7464,8 +7558,9 @@ def _prewarm_embeddings(model_name: str) -> None:
 
     Called on a daemon thread at startup (#276), AFTER the synchronous
     startup gate in __main__ has already confirmed (via
-    `_embedding_cache_status`) that the model is present in the local
-    HuggingFace cache — so a cache miss can no longer reach this function.
+    `_embedding_cache_status`) that the model is available locally -- either
+    present in the local HuggingFace cache, or (since #2835) an on-disk model
+    directory that was never in that cache at all — so a cache miss can no longer reach this function.
     This function does only the expensive part (the actual model load), off
     the main thread so mcp.run() can start serving connections immediately
     rather than blocking on it.
@@ -7584,20 +7679,42 @@ def _embedding_startup_gate() -> None:
     model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
 
     if not _embedding_cache_status(model_name):
-        print(
-            f"[engram] FATAL: embedding model '{model_name}' is not cached "
-            f"locally. Embeddings are mandatory (#345) — starting anyway "
-            f"would file nodes with NULL embeddings, permanently excluded "
-            f"from semantic recall at any threshold, for any query.",
-            file=sys.stderr,
-        )
-        print("", file=sys.stderr)
-        print("  To fix, pre-warm the cache once:", file=sys.stderr)
-        print(
-            f"  python -c \"from sentence_transformers import "
-            f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
-            file=sys.stderr,
-        )
+        if _looks_like_local_model_path(model_name):
+            # #2835: a path-shaped name that failed the gate is not a cache
+            # miss -- the pre-warm one-liner below is wrong advice for it
+            # (SentenceTransformer('/opt/models/x') fails the same way, Hub
+            # never consulted). Point at the directory contract instead.
+            print(
+                f"[engram] FATAL: embedding model directory '{model_name}' "
+                f"is not usable. Embeddings are mandatory (#345) — starting "
+                f"anyway would file nodes with NULL embeddings, permanently "
+                f"excluded from semantic recall at any threshold, for any "
+                f"query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(
+                "  To fix, check that the directory exists and contains "
+                "modules.json (a sentence-transformers export) or "
+                "config.json (a plain transformer directory). Note: \"~\" "
+                "is not expanded here -- use an absolute path.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[engram] FATAL: embedding model '{model_name}' is not cached "
+                f"locally. Embeddings are mandatory (#345) — starting anyway "
+                f"would file nodes with NULL embeddings, permanently excluded "
+                f"from semantic recall at any threshold, for any query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print("  To fix, pre-warm the cache once:", file=sys.stderr)
+            print(
+                f"  python -c \"from sentence_transformers import "
+                f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
+                file=sys.stderr,
+            )
         print("", file=sys.stderr)
         print(
             "  To start deliberately degraded (test/dev only): "

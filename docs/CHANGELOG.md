@@ -9,6 +9,33 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A local embedding-model directory now works when the HuggingFace Hub is
+  unreachable** (#2835). If your network blocks the Hub, the documented
+  workaround is to download the model elsewhere, put it on disk, and point
+  `embedding.model` at that directory. That did not work: the server refused
+  to start and printed a HuggingFace `HFValidationError` traceback instead of
+  the message that tells you what to fix. It now starts.
+
+  **If you use a local model directory, two things to check on upgrade:**
+
+  - Give the **absolute** path. `~` is not expanded — `~/models/my-model`
+    will still be refused. Use `/home/you/models/my-model`.
+  - The directory must contain **`modules.json`** (a sentence-transformers
+    export) or **`config.json`** (a plain transformer directory). A directory
+    with neither is refused on purpose, because starting without a usable
+    model would file nodes with no embedding at all, and those are invisible
+    to semantic recall afterwards with no way to tell.
+
+  When something is wrong, the startup message now names the directory and
+  says which of those files it looked for, instead of showing a stack trace.
+
+  Two related cases are fixed by the same change: a model name that is one of
+  the older no-organization names (e.g. `bert-base-uncased`) is no longer
+  reported as uncached when it is in fact cached, and a malformed path is
+  refused cleanly rather than by raising.
+
 ## [v0.5.0] - 2026-08-30
 
 **The cascade-machine release.** One epic dominates the 100-commit range since
