@@ -119,6 +119,35 @@ class TestCgroupVerdict:
         verdict = sp._read_cgroup_verdict("103", str(synthetic_proc))
         assert verdict.status == "ERROR"
 
+    def test_procfs_zero_stat_size_with_real_content_reads_pass(
+        self, synthetic_proc, monkeypatch
+    ):
+        """#2790 regression: real procfs always reports st_size == 0 via
+        stat() (`os.path.getsize`) regardless of actual content -- the old
+        code gated emptiness on that lying stat call, so it read ERROR on
+        EVERY live Linux run, unconditionally, and the grep check below it
+        never ran in production. The synthetic fixture files this test
+        suite otherwise uses are REGULAR files, where st_size correctly
+        reflects content length -- so only mocking getsize() to lie (as
+        procfs itself does) exercises the actual bug. Marker absent -> PASS,
+        proving the content-gated fix reaches the grep check instead of
+        false-ERRORing on the fake zero size."""
+        _write_cgroup(synthetic_proc, "104", b"0::/user.slice/user@501.service\n")
+        monkeypatch.setattr(os.path, "getsize", lambda path: 0)
+        verdict = sp._read_cgroup_verdict("104", str(synthetic_proc))
+        assert verdict.status == "PASS"
+
+    def test_procfs_zero_stat_size_with_real_content_reads_fail(
+        self, synthetic_proc, monkeypatch
+    ):
+        """Same procfs-lying-stat simulation as above, but with the session
+        marker present -- must reach FAIL, not the false ERROR the
+        getsize()-gated code would have returned on every live run."""
+        _write_cgroup(synthetic_proc, "105", b"0::/user.slice/agent-session@luria.service\n")
+        monkeypatch.setattr(os.path, "getsize", lambda path: 0)
+        verdict = sp._read_cgroup_verdict("105", str(synthetic_proc))
+        assert verdict.status == "FAIL"
+
 
 # ---------------------------------------------------------------------------
 # pid resolution: zero-or-many

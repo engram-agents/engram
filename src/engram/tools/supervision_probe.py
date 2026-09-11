@@ -354,11 +354,20 @@ def _read_cgroup_verdict(pid: str, proc_root: str = "/proc") -> Verdict:
     this at a synthetic fixture instead of a real systemd session slice.
     """
     cgroup_path = f"{proc_root}/{pid}/cgroup"
+    # #2790: procfs pseudo-files always report st_size == 0 via stat(),
+    # regardless of actual content -- os.path.getsize() (which is stat()-
+    # backed) is therefore never a valid emptiness check here. Read the
+    # actual content and gate on THAT instead; grep below already reads
+    # the real bytes directly and was never affected by this. Binary mode
+    # (matching `_proc_identity.py`'s convention for reading procfs
+    # pseudo-files) so no decode step exists to raise on odd bytes -- an
+    # emptiness check needs only the byte count, never the text.
     try:
-        size = os.path.getsize(cgroup_path)
+        with open(cgroup_path, "rb") as f:
+            content = f.read()
     except OSError as e:
         return Verdict("ERROR", f"unreadable ({e.__class__.__name__})")
-    if size == 0:
+    if not content:
         # Answers Ariadne's named open question: an empty file gives grep
         # the same exit 1 as a genuine non-match -- do not let that read as
         # PASS. A dead instrument must never read as a clean answer.
