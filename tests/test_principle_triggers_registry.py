@@ -615,7 +615,7 @@ def test_load_tripwires_returns_axiom_and_goal_rows_with_surfacing_nudge(tmp_pat
         claim="Goal claim text.",
     )
     tripwires = hook.load_tripwires(db_path=db)
-    nudges = [n for _p, n in tripwires]
+    nudges = [n for _p, n, _nid in tripwires]
     assert "Axiom surfacing nudge." in nudges
     assert "Goal surfacing nudge." in nudges
 
@@ -634,7 +634,7 @@ def test_load_tripwires_falls_back_to_claim_when_no_nudge_field(tmp_path):
         claim="Cornerstone claim used as fallback nudge.",
     )
     tripwires = hook.load_tripwires(db_path=db)
-    nudges = [n for _p, n in tripwires]
+    nudges = [n for _p, n, _nid in tripwires]
     assert "Cornerstone claim used as fallback nudge." in nudges, (
         "row with situation_pattern but no nudge field must fall back to "
         "claim, not be silently dropped"

@@ -1241,6 +1241,170 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     return candidates, sets_checked
 
 
+# ---------------------------------------------------------------------------
+# #2753 epic WS2 — generalization-chain render at prompt-time recall (D3
+# point 2). ADDITIVE, after Specials + Top claims are fully built: for every
+# node id that actually rendered in either section this prompt, check
+# whether it has a principle chain (generalization_chain(), WS1) and render
+# ONE "Triggered principles" section, heads deduped across the whole
+# recalled set for this one prompt (Case 1 in the issue's D3 -- same rule
+# the tripwire hook applies per-fire). Matched nodes in Specials/Top claims
+# are unchanged; this is a pure addition after them.
+# ---------------------------------------------------------------------------
+
+_TRIGGERED_PRINCIPLES_FULL_CAP = 2
+
+
+def _import_generalization_chain():
+    """Lazily import generalization_chain from engram_core (#2753 WS1) --
+    never raises; resolved via the shared _hooklib.resolve_runtime_dir
+    already imported at module scope (one call per module actually
+    imported, per that helper's own docstring)."""
+    try:
+        runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_core.py")
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        from engram_core import generalization_chain
+        return generalization_chain
+    except Exception:
+        return None
+
+
+def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None" = None) -> str:
+    """#2753 epic WS2, D3 point 2: for every node id that actually rendered
+    in Specials or Top claims this prompt (`ordered_ids`, in render-priority
+    order -- the caller passes Specials before Top claims, matching the
+    order they were built in above), check whether it has a principle chain
+    and render ONE additive "Triggered principles" section, heads deduped
+    across the WHOLE recalled set for this one prompt (Case 1 in the
+    issue's D3 -- same dedupe rule the tripwire hook applies per-fire; Case
+    2, the existing per-node suppression/cooldown machinery, is untouched
+    and not this function's concern).
+
+    Per DISTINCT head (first-seen order across ordered_ids): a FULL line
+    "↑ principle: <head_id> — <head recall_summary>", capped at
+    _TRIGGERED_PRINCIPLES_FULL_CAP (2) heads per prompt -- any further
+    distinct head renders as a BARE id line ("↑ principle: <head_id>", no
+    summary) instead, per the issue's D3 point 2 budget ("at most 2 full
+    chain blocks per prompt; the rest as IDs"). Matched nodes in
+    Specials/Top claims are unchanged -- this function only ever returns a
+    block to be APPENDED after them.
+
+    Returns "" on: no candidate ids, no importable generalization_chain,
+    any DB/walk failure, or no candidate producing a real chain and no
+    candidate reporting cycle_detected (i.e. every candidate is already a
+    head with nothing above it). Never raises.
+
+    #2753 WS2 round 2 -- `cycle_detected` (WS1's cycle-guard fix, 5e14f83b):
+    a candidate whose chain comes back with `cycle_detected: True` has NO
+    valid head to render (structurally impossible in a valid DAG). It
+    renders its own standalone malformed-data line instead of the normal
+    "↑ principle: ..." line and is excluded from the head-dedupe/cap
+    machinery above -- see the sibling tripwire-hook function's docstring
+    for the full rationale (identical here; not restated).
+
+    #2753 WS2 round 3 -- `truncated` (present since WS1's original commit,
+    read here for the first time): a candidate whose chain reports
+    `heads: []`, `cycle_detected: False`, and `truncated: True` has real
+    partial ancestry -- `max_depth` was hit before a head was reached, not
+    a malformed graph. Falling into the same silent skip as the
+    no-ancestor case would misreport "no chain exists"; it renders its own
+    one-line "chain truncated" notice instead (no rungs shown, `…` marker
+    rather than `⚠`, to read as incomplete-but-honest rather than corrupt)
+    and is excluded from the head-dedupe/cap machinery, same as a
+    cycle-detected candidate -- see the sibling tripwire-hook function's
+    docstring for the full rationale (identical here; not restated).
+    `cycle_detected` and `truncated` are mutually exclusive by
+    generalization_chain's own contract, so the two checks never both fire
+    on the same candidate.
+
+    db_path defaults to None (resolved to the module-level KNOWLEDGE_DB_PATH
+    INSIDE the function body, not as a mutable default-argument value) so a
+    test that monkeypatches KNOWLEDGE_DB_PATH after import is honored on the
+    no-arg call path — see the sibling tripwire-hook function's docstring
+    for the same footgun this avoids.
+    """
+    if not ordered_ids:
+        return ""
+    if db_path is None:
+        db_path = KNOWLEDGE_DB_PATH
+    generalization_chain = _import_generalization_chain()
+    if generalization_chain is None:
+        return ""
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        head_order: list = []
+        head_summaries: dict = {}  # head_id -> recall_summary (from its own chain entry)
+        # #2753 WS2 round 2 -- candidate ids whose own chain() call reported
+        # cycle_detected: True. See render_triggered_principles's sibling
+        # comment in the tripwire hook -- same rationale, same exclusion
+        # from head_order/head_summaries above (cycle_detected implies
+        # heads == [], so there is nothing to merge into).
+        cycle_detected_ids: list = []
+        # #2753 WS2 round 3 -- candidate ids whose own chain() call reported
+        # heads == [] with truncated: True (real ancestry exists, the walk
+        # was just cut off before reaching a head). Kept separate from
+        # cycle_detected_ids -- the two states are mutually exclusive and
+        # read differently to a human -- same rationale as the sibling
+        # tripwire-hook function.
+        truncated_ids: list = []
+        for nid in ordered_ids:
+            chain = generalization_chain(conn, nid)
+            nodes = chain.get("nodes") or {}
+            start_resolved = chain.get("start_resolved_id")
+            heads = chain.get("heads") or []
+            if chain.get("cycle_detected"):
+                if nid not in cycle_detected_ids:
+                    cycle_detected_ids.append(nid)
+                continue
+            if not heads and chain.get("truncated"):
+                if nid not in truncated_ids:
+                    truncated_ids.append(nid)
+                continue
+            # No generalizes ancestor at all -- already a head with nothing
+            # above it. Nothing to render for this candidate.
+            if not heads or (len(nodes) <= 1 and start_resolved in nodes):
+                continue
+            for head_id in heads:
+                if head_id not in head_summaries:
+                    head_entry = nodes.get(head_id, {})
+                    head_summaries[head_id] = head_entry.get("recall_summary") or ""
+                    head_order.append(head_id)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not head_order and not cycle_detected_ids and not truncated_ids:
+        return ""
+
+    lines = ["  Triggered principles:"]
+    for nid in cycle_detected_ids:
+        lines.append(
+            f"    ⚠ principle-chain data malformed for {nid} (a cycle was "
+            "detected in the resolved generalizes graph); chain not shown"
+        )
+    for nid in truncated_ids:
+        lines.append(
+            f"    … principle chain truncated for {nid} (max depth reached "
+            "before a head was found); further ancestry likely exists but "
+            "is not shown"
+        )
+    for i, head_id in enumerate(head_order):
+        if i < _TRIGGERED_PRINCIPLES_FULL_CAP and head_summaries[head_id]:
+            lines.append(f"    ↑ principle: {head_id} — {head_summaries[head_id]}")
+        else:
+            lines.append(f"    ↑ principle: {head_id}")
+    return "\n".join(lines)
+
+
 def _get_attached_packs() -> list[dict]:
     """Read attached_packs from $ENGRAM_HOME/config.json.
 
@@ -2031,6 +2195,30 @@ def format_nudge(
     # full-summary nodes only (Specials + Top claims tiers) — NOT
     # Others/reservation lines".
     specials_and_topclaims_ids = set(rendered_ids_this_prompt)
+
+    # #2753 epic WS2 (D3 point 2) — generalization-chain render, ADDITIVE
+    # after both "Specials:" and "Top claims:" are fully built and BEFORE
+    # the not-recalled slot-reservation logic below (which depends on
+    # rendered_ids_this_prompt bookkeeping this section does not touch).
+    # Reuses specials_and_topclaims_ids (just captured above) as the
+    # membership test, per spec — not rebuilt. `special`/`top_claims` (the
+    # same local lists the loops above already built from, read-only here)
+    # supply a stable Specials-before-Top-claims priority ORDER for which
+    # candidates are considered first for the 2-full-chain-block cap; the
+    # membership set itself is untouched. Independently guarded: a failure
+    # here must never affect Specials/Top claims, which already rendered
+    # above.
+    try:
+        _principle_candidate_order: list = []
+        for _cand in list(special[:3] if special else []) + list(top_claims[:3] if top_claims else []):
+            _cid = _cand.get("id")
+            if _cid in specials_and_topclaims_ids and _cid not in _principle_candidate_order:
+                _principle_candidate_order.append(_cid)
+        _principles_block = _render_triggered_principles_section(_principle_candidate_order)
+    except Exception:
+        _principles_block = ""
+    if _principles_block:
+        lines.append(_principles_block)
 
     matched_meta = result.get("matched_meta") or []
 

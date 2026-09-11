@@ -144,7 +144,7 @@ class TestLoadTripwires(unittest.TestCase):
         tripwires = load_tripwires(db_path=db)
         hits = check_command("forum reply 42", tripwires)
         self.assertEqual(len(hits), 1)
-        self.assertIn("stdin", hits[0])
+        self.assertIn("stdin", hits[0]["nudge"])
 
     def test_non_matching_command_returns_empty(self):
         """A command that doesn't match any pattern → empty list."""
@@ -200,7 +200,7 @@ class TestMcpToolMatching(unittest.TestCase):
         match_target = 'mcp__plugin_engram_engram__engram_add_observation {"payload_json":"{}"}'
         hits = check_command(match_target, tripwires)
         self.assertEqual(len(hits), 1)
-        self.assertIn("verify_quote", hits[0])
+        self.assertIn("verify_quote", hits[0]["nudge"])
 
     def test_mcp_tool_no_match(self):
         """A forum-reply pattern does not fire on an unrelated MCP tool call."""
@@ -253,7 +253,7 @@ class TestPreToolUseEnvelope(unittest.TestCase):
         """Lesson-tripwire context-only output must omit permissionDecision."""
         out = _run_hook_main(
             {"tool_name": "Bash", "tool_input": {"command": "forum reply 42"}},
-            tripwires=[(r"forum reply", "Read body from stdin.")],
+            tripwires=[(r"forum reply", "Read body from stdin.", "ls_forumreply")],
         )
         self.assertTrue(out.strip(), "Expected JSON output")
         response = json.loads(out.strip())
@@ -338,8 +338,13 @@ class TestSituationPatternStoredViaMcp(unittest.TestCase):
 
         # Also verify that load_tripwires returns this lesson
         tripwires = load_tripwires(db_path=db_path)
-        patterns_in_tripwires = [p for p, _ in tripwires]
+        patterns_in_tripwires = [p for p, _nudge, _node_id in tripwires]
         self.assertIn(pattern, patterns_in_tripwires, "Pattern must appear in load_tripwires output")
+        # #2753 epic WS2: the 3rd tuple element is the firing node's own id
+        # (the lesson_id minted above), so a caller can call
+        # generalization_chain() on the actual hit.
+        node_ids_in_tripwires = [nid for _p, _nudge, nid in tripwires]
+        self.assertIn(lesson_id, node_ids_in_tripwires, "load_tripwires must carry the lesson's own node id")
 
 
 if __name__ == "__main__":
@@ -499,7 +504,7 @@ class TestMainShadowBlockIntegration(unittest.TestCase):
 
     def test_shadow_match_logs_but_output_unchanged_vs_no_shadow(self):
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         prevention_lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
 
         with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
@@ -519,7 +524,7 @@ class TestMainShadowBlockIntegration(unittest.TestCase):
 
     def test_ledger_write_failure_does_not_break_tripwire_output(self):
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         prevention_lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
         bad_path = Path(self.tmp)  # a directory — forces the ledger write to fail
 
@@ -656,7 +661,7 @@ class TestMainDenyIntegration(unittest.TestCase):
             "tool_name": "Bash",
             "tool_input": {"command": 'ENGRAM_OVERRIDE="ls_b: verified safe" rm -rf /tmp/x'},
         }
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         prevention_lessons = [
             {"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "Think twice."}
         ]
@@ -682,7 +687,7 @@ class TestMainDenyIntegration(unittest.TestCase):
         denied — infra failure is never a reason to block (Kepler's design
         point 5: the only reachable failure mode is loud-advisory)."""
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         output_buf = io.StringIO()
         with (
             unittest.mock.patch.object(_hook, "load_tripwires", return_value=tripwires),
@@ -703,7 +708,7 @@ class TestMainDenyIntegration(unittest.TestCase):
 
     def test_shadow_match_never_denies_end_to_end(self):
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         prevention_lessons = [
             {"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow", "nudge": "Think twice."}
         ]
@@ -885,7 +890,7 @@ class TestMainDemotionIntegration(unittest.TestCase):
             {"lesson_id": "ls_b", "override_present": True, "ts": now - 5},
         ])
         hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
-        tripwires = [("rm -rf", "Think twice before rm -rf.")]
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
         prevention_lessons = [
             {"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "Think twice."}
         ]

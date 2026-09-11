@@ -44,13 +44,14 @@ from pathlib import Path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
 
 _QUERY = """
 SELECT
+    id,
     COALESCE(
         json_extract(metadata, '$.scaffolding_nudge'),
         json_extract(metadata, '$.anchor_line'),
@@ -68,28 +69,268 @@ WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
 
 
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str) from active lessons with situation_pattern."""
+    """Return list of (pattern_str, nudge_str, node_id) from active lessons
+    with situation_pattern.
+
+    #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
+    of the pre-existing (pattern, nudge) shape) so check_command's hits can
+    carry the firing node's id for generalization_chain() lookups, without
+    touching what the existing nudge block renders."""
     if not db_path.exists():
         return []
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
         conn.close()
-        return [(row[1], row[0]) for row in rows if row[0] and row[1]]
+        return [(row[2], row[1], row[0]) for row in rows if row[1] and row[2]]
     except Exception:
         return []
 
 
 def check_command(match_target: str, tripwires) -> list:
-    """Return list of scaffolding nudges whose situation_pattern matches match_target."""
+    """Return list of {"nudge": str, "node_id": str} dicts for every
+    situation_pattern that matches match_target.
+
+    #2753 epic WS2: hits carry node_id (in addition to the pre-existing
+    nudge text) so the caller can compute generalization_chain() per hit for
+    the additive "[triggered principles]" section, without changing what
+    the existing nudge block renders (main() reads hit["nudge"] where it
+    used to read the hit string directly)."""
     hits = []
-    for pattern, nudge in tripwires:
+    for pattern, nudge, node_id in tripwires:
         try:
             if re.search(pattern, match_target, re.IGNORECASE):
-                hits.append(nudge)
+                hits.append({"nudge": nudge, "node_id": node_id})
         except re.error:
             pass  # malformed pattern — skip silently
     return hits
+
+
+# ---------------------------------------------------------------------------
+# #2753 epic WS2 — generalization-chain render at the tripwire (D3 point 1)
+# ---------------------------------------------------------------------------
+# ADDITIVE to the existing nudge block above: for each hit this fire, walk
+# generalization_chain() on its node id and render one merged, deduped-by-
+# head "[triggered principles]" section. Dedupe is scoped to THIS ONE fire
+# (Case 1 in the issue's D3) -- no new cooldown/suppression across fires
+# (Case 2 is explicitly unchanged, per the issue). Never raises: the call
+# site in main() wraps this in its own try/except, matching
+# check_in_turn_recall's posture -- a failure here must never suppress the
+# existing nudge block, and vice versa.
+
+_GENERALIZATION_CHAIN_FN = None
+_GENERALIZATION_CHAIN_IMPORT_ATTEMPTED = False
+
+
+def _import_generalization_chain():
+    """Lazily import generalization_chain from engram_core (#2753 WS1) --
+    lazy, like engram_idf's import in check_in_turn_recall below, so this
+    hook never crashes at import time if engram_core isn't yet resolvable
+    (e.g. a partial/mid-upgrade install). Memoized (including a failed
+    lookup) so a missing module doesn't re-pay the resolve+import cost on
+    every hit within one process; each hook invocation is a fresh process
+    anyway, so the memo only helps within a single fire's multiple hits."""
+    global _GENERALIZATION_CHAIN_FN, _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED
+    if _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED:
+        return _GENERALIZATION_CHAIN_FN
+    _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED = True
+    try:
+        runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_core.py")
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        from engram_core import generalization_chain
+        _GENERALIZATION_CHAIN_FN = generalization_chain
+    except Exception:
+        _GENERALIZATION_CHAIN_FN = None
+    return _GENERALIZATION_CHAIN_FN
+
+
+def _truncate_for_label(text: str, limit: int = 60) -> str:
+    """Short, single-line excerpt for the merged-head summary line -- never
+    raises on a non-string/None input (defensive: claim/recall_summary are
+    both nullable per generalization_chain's own docstring)."""
+    if not text:
+        return ""
+    text = str(text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> str:
+    """#2753 epic WS2, D3 point 1: for this ONE tripwire fire, walk each
+    hit's generalization_chain() and render ONE additive "[triggered
+    principles]" section, deduped by HEAD across all of this fire's hits
+    (D3's Case 1 -- within one fire; Case 2, the existing per-node
+    recent-id/repeat-count cooldown machinery, is untouched and not this
+    function's concern).
+
+    Per head: every non-head node reached (from any hit sharing that head,
+    merged into one subgraph, ordered by depth) renders as a one-liner
+    (`recall_summary` only -- never `claim`, which is absent on non-head
+    entries by generalization_chain's own contract); the head itself
+    renders its `claim` IN FULL. When more than one of this fire's
+    chain-bearing hits share a head, one line names the convergence
+    ("N of these M matches sit under <head_id> (<short label>)") before the
+    merged rungs.
+
+    A hit whose own node has NO generalizes ancestor at all (already a head
+    with nothing above it -- chain contains only the node itself) renders
+    NOTHING for that hit; the section is emitted at all only when at least
+    one hit produced a real chain OR at least one hit's chain reported
+    `cycle_detected` (see below).
+
+    #2753 WS2 round 2 -- `cycle_detected` (WS1's cycle-guard fix, 5e14f83b):
+    a hit whose chain comes back with `cycle_detected: True` has NO valid
+    head to render (structurally impossible in a valid DAG -- the resolved
+    graph actually contains a cycle). Rendering the normal head/rung
+    structure is impossible (there is no head), and silently skipping it
+    like the no-ancestor case above would be the exact bug WS1 fixed one
+    layer down: an omitted section reads as "no chain exists", which is
+    false -- a chain WAS found, it's just corrupt. So a cycle-detected hit
+    renders its own one-line malformed-data notice instead, visibly
+    distinct from both a normal rendered chain and from omission.
+
+    #2753 WS2 round 3 -- `truncated` (present since WS1's original commit,
+    read by this function for the first time): a hit whose chain reports
+    `heads: []` and `cycle_detected: False` and `truncated: True` has real
+    partial ancestry -- `max_depth` was hit while nodes were still pending
+    expansion, so a head genuinely exists above what was walked, it just
+    wasn't reached. Falling into the same silent skip as the no-ancestor
+    case would misreport "no chain exists" exactly as the cycle_detected
+    case would -- a milder instance of the same problem, since the data
+    here is incomplete rather than corrupt. So a truncated-with-no-head hit
+    renders its own one-line "chain truncated" notice (no rungs shown --
+    the walk never reached far enough to have any to show) -- worded and
+    marked (`…`, not `⚠`) to read as incomplete-but-honest data rather than
+    malformed data, and never both: `cycle_detected` and
+    `truncated` are mutually exclusive by generalization_chain's own
+    contract (`cycle_detected` requires `truncated: False`), so the two
+    checks below never fire on the same hit.
+
+    Returns "" on: no hits, no importable generalization_chain, any DB/walk
+    failure, or no hit producing a real chain and no hit reporting
+    cycle_detected or a truncated-with-no-head walk. Never raises -- this
+    hook's T2 "never blocks" contract (see module docstring) applies to
+    this additive section exactly as it does to the pre-existing nudge
+    block.
+
+    db_path defaults to None (resolved to the module-level DB_PATH INSIDE
+    the function body, not as a mutable default-argument value) so a test
+    that monkeypatches DB_PATH after this module is imported is honored on
+    the no-arg call path main() uses -- a `db_path: Path = DB_PATH` default
+    would instead freeze at the value DB_PATH held at function-definition
+    time (import time), same footgun load_tripwires's own default already
+    carries (harmless there since every caller passes db_path explicitly).
+    """
+    if not hits:
+        return ""
+    if db_path is None:
+        db_path = DB_PATH
+    generalization_chain = _import_generalization_chain()
+    if generalization_chain is None:
+        return ""
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        # head_id -> {"nodes": {resolved_id: entry, ...}, "hit_ids": [node_id, ...]}
+        heads_seen: dict = {}
+        head_order: list = []
+        relevant_hit_count = 0
+        # #2753 WS2 round 2 -- node ids whose own chain() call reported
+        # cycle_detected: True (WS1 5e14f83b). Kept separate from
+        # heads_seen: a cycle-detected chain has NO head to merge into, by
+        # definition (cycle_detected implies heads == []), so it is never a
+        # candidate for the head-dedupe machinery above -- it renders its
+        # own standalone malformed-data line instead. Dedup by node_id in
+        # first-seen order (a hit list should not repeat a node_id in
+        # practice, but this stays cheap insurance).
+        cycle_detected_ids: list = []
+        # #2753 WS2 round 3 -- node ids whose own chain() call reported
+        # heads == [] with truncated: True (real ancestry exists, the walk
+        # was just cut off by max_depth before reaching a head). Kept
+        # separate from heads_seen for the same reason cycle_detected_ids
+        # is: there is no head to merge into. Kept separate from
+        # cycle_detected_ids too, even though both are "heads == [] and
+        # nothing to merge into" -- the two states are mutually exclusive
+        # (see docstring) and read differently to a human, so each gets its
+        # own notice line and its own dedup list.
+        truncated_ids: list = []
+        for hit in hits:
+            node_id = hit.get("node_id") if isinstance(hit, dict) else None
+            if not node_id:
+                continue
+            chain = generalization_chain(conn, node_id)
+            nodes = chain.get("nodes") or {}
+            start_resolved = chain.get("start_resolved_id")
+            heads = chain.get("heads") or []
+            if chain.get("cycle_detected"):
+                if node_id not in cycle_detected_ids:
+                    cycle_detected_ids.append(node_id)
+                continue
+            if not heads and chain.get("truncated"):
+                if node_id not in truncated_ids:
+                    truncated_ids.append(node_id)
+                continue
+            # No generalizes ancestor at all -- already a head with nothing
+            # above it. Nothing to render for this hit (D3: "render nothing
+            # extra for it; only render the section when there is an
+            # actual chain to show").
+            if not heads or (len(nodes) <= 1 and start_resolved in nodes):
+                continue
+            relevant_hit_count += 1
+            for head_id in heads:
+                if head_id not in heads_seen:
+                    heads_seen[head_id] = {"nodes": {}, "hit_ids": []}
+                    head_order.append(head_id)
+                heads_seen[head_id]["hit_ids"].append(node_id)
+                heads_seen[head_id]["nodes"].update(nodes)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not heads_seen and not cycle_detected_ids and not truncated_ids:
+        return ""
+
+    lines = ["[triggered principles]"]
+    for node_id in cycle_detected_ids:
+        lines.append(
+            f"  ⚠ {node_id} — principle-chain data is malformed (a cycle "
+            "was detected in the resolved generalizes graph); chain not shown"
+        )
+    for node_id in truncated_ids:
+        lines.append(
+            f"  … {node_id} — principle chain truncated (max depth reached "
+            "before a head was found); further ancestry likely exists but "
+            "is not shown"
+        )
+    for head_id in head_order:
+        entry = heads_seen[head_id]
+        merged_nodes = entry["nodes"]
+        contributing = entry["hit_ids"]
+        head_entry = merged_nodes.get(head_id, {})
+        if len(contributing) > 1:
+            label = _truncate_for_label(head_entry.get("claim") or head_entry.get("recall_summary"))
+            lines.append(
+                f"  {len(contributing)} of these {relevant_hit_count} matches sit under "
+                f"{head_id} ({label})" if label else
+                f"  {len(contributing)} of these {relevant_hit_count} matches sit under {head_id}"
+            )
+        non_head_ids = sorted(
+            (nid for nid in merged_nodes if nid != head_id),
+            key=lambda nid: merged_nodes[nid].get("depth", 0),
+        )
+        for nid in non_head_ids:
+            summary = merged_nodes[nid].get("recall_summary") or ""
+            lines.append(f"  ↑ {nid} — {summary}")
+        head_claim = head_entry.get("claim") or ""
+        lines.append(f"  ↑ {head_id} — {head_claim}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -913,11 +1154,24 @@ def main() -> None:
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires) if tripwires else []
         if hits:
-            nudge_lines = "\n".join(f"  • {h}" for h in hits)
+            nudge_lines = "\n".join(f"  • {h['nudge']}" for h in hits)
             parts.append(
                 "[lesson-tripwire] Action-moment pattern matched — remember:\n"
                 f"{nudge_lines}"
             )
+
+        # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
+        # after the nudge block above and independently guarded: a failure
+        # computing the principles section must NEVER suppress the existing
+        # nudge (already appended above), and vice versa (the existing nudge
+        # append above already ran and is untouched by anything below).
+        if hits:
+            try:
+                principles_block = render_triggered_principles(hits)
+            except Exception:
+                principles_block = ""
+            if principles_block:
+                parts.append(principles_block)
 
         # alpha#1944 step 2 — shadow-block logging. Independently guarded,
         # same posture as in-turn recall below: a logging failure must never
