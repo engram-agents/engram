@@ -9,7 +9,9 @@ checker doesn't also check CASCADE_RELATIONS taint propagation.
 
 THE PROPERTY THIS MODULE PROTECTS: no live edge among the relations flagged
 ``dag: True`` in ``core.EDGE_CLASSIFICATIONS`` (``core.DAG_RELATIONS``) forms
-a cycle when walked over ``is_current = 1`` nodes and edges.
+a cycle when walked over the graph's CURRENT nodes — each edge's endpoints
+resolved through the supersedes chain to their current node (#2813), not
+merely nodes/edges that happen to already carry ``is_current = 1`` raw.
 
 Why this needs a real walk, not the timestamp comparison every other
 dag-flag consumer uses (``_supersede_impl``, ``_add_edge_impl``'s generic
@@ -31,12 +33,30 @@ on a reachability walker that exists only on an unmerged branch (#2349); see
 that issue for the write-time guard. This module does not need it and does
 not wait for it.
 
-CURRENT-ONLY, same convention as engram_conformance.py (Lei, 2026-08-28
-ruling on #2300 Defect 2): the walk considers only ``is_current = 1`` nodes
-and edges — a cycle that exists solely among superseded/retracted history is
-not a live hazard, and the remediation channel (supersede/retract) is how a
-real violation would be fixed, so counting non-current state could never let
-the metric register progress.
+CURRENT-ONLY (Lei, 2026-08-28 ruling on #2300 Defect 2) — but the MECHANISM
+here diverges from engram_conformance.py's own CURRENT-ONLY invariants as of
+#2813, and it is a DERIVATION from the same ruling, not an exception to it.
+``_invariant_1`` there states its reason plainly: "both endpoints filtered to
+``is_current = 1``. The remediation for a violation IS superseding or
+retracting the offending node, so a non-current endpoint must not keep
+counting — otherwise the fix could never move this diagnostic." That reason
+is sound for a partition invariant, where superseding the offending node
+genuinely IS the fix.
+
+It inverts for a DAG cycle. Superseding a node inside a cycle is NOT the
+remediation — the cycle survives through the node's current successor, so
+dropping the superseded endpoint at the SQL level does not let a real
+violation clear; it makes the audit blind to a cycle that only appears once
+you resolve that endpoint (the exact bug #2813 fixes; write-time twin:
+``core._generalizes_cycle_path``, found in #2812's review). So this module
+resolves each edge's endpoints through the supersedes chain to their current
+successor before walking (``_live_dag_edges``'s ``_resolve_current`` helper)
+rather than filtering raw ``is_current = 1`` — an edge is only dropped when
+that chain dead-ends with no live node to attribute it to (e.g. a retracted
+node with no replacement), never merely because one endpoint is superseded.
+Same ruling, same CURRENT-ONLY policy, applied to a case where the stated
+reason for the mechanism points the opposite way — don't assume the two
+modules resolve edges identically just because both are "CURRENT-ONLY."
 """
 
 from __future__ import annotations
@@ -46,26 +66,76 @@ import sqlite3
 import engram_core as core
 
 
+def _resolve_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
+    """Resolve ``node_id`` to its CURRENT version via the supersedes chain.
+
+    Returns ``node_id`` itself if it is already current, the current
+    successor (via ``core._current_successor``) if not, or None if
+    ``node_id`` doesn't exist or its chain dead-ends without reaching a
+    current node (e.g. a retracted node with no replacement).
+
+    #2813: the batch-walk twin of the write-time guard fixed for the
+    ``generalizes`` relation in #2812's review (``core._generalizes_cycle_path``
+    / ``core._resolve_to_current``) — same shape, same reason: an edge
+    touching a superseded endpoint should attribute to that endpoint's
+    CURRENT successor, not vanish from the walk.
+    """
+    row = conn.execute(
+        "SELECT is_current FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return None
+    if row["is_current"] == 1:
+        return node_id
+    return core._current_successor(conn, node_id)
+
+
 def _live_dag_edges(conn: sqlite3.Connection) -> "list[tuple[str, str]]":
-    """(source_id, target_id) for every live edge on a `dag: True` relation.
+    """(source_id, target_id) for every live edge on a `dag: True` relation,
+    with both endpoints resolved through the supersedes chain to their
+    CURRENT node.
 
     Derived from ``core.DAG_RELATIONS`` at call time, never hand-enumerated —
     same discipline as engram_conformance.py's cb/ncb/cascade derivations.
+
+    #2813: an earlier version filtered ``s.is_current = 1 AND t.is_current =
+    1`` at the SQL level instead — any edge touching a superseded endpoint
+    vanished from the walk entirely rather than being resolved onto that
+    endpoint's current successor, so the batch cycle audit was blind to a
+    cycle that only appears once you resolve a superseded endpoint to its
+    current replacement. Now: select every edge on a dag relation with no
+    currency filter at the SQL level, then resolve each endpoint in Python
+    via ``_resolve_current``; an edge is dropped only when a resolution
+    dead-ends with no live node to attribute it to (e.g. a retracted node
+    with no replacement) — the same "dead-ended chain" reasoning
+    ``core._generalizes_cycle_path`` uses for its own resolve-then-walk.
     """
     relations = sorted(core.DAG_RELATIONS)
     if not relations:
         return []
     placeholders = ",".join("?" * len(relations))
     rows = conn.execute(
-        f"""SELECT e.source_id AS sid, e.target_id AS tid
-            FROM edges e
-            JOIN nodes s ON e.source_id = s.id
-            JOIN nodes t ON e.target_id = t.id
-            WHERE e.relation IN ({placeholders})
-              AND s.is_current = 1 AND t.is_current = 1""",
+        f"""SELECT source_id AS sid, target_id AS tid
+            FROM edges
+            WHERE relation IN ({placeholders})""",
         tuple(relations),
     ).fetchall()
-    return [(r["sid"], r["tid"]) for r in rows]
+
+    _resolved: "dict[str, str | None]" = {}
+
+    def _res(nid: str) -> "str | None":
+        if nid not in _resolved:
+            _resolved[nid] = _resolve_current(conn, nid)
+        return _resolved[nid]
+
+    edges: "set[tuple[str, str]]" = set()
+    for row in rows:
+        r_sid = _res(row["sid"])
+        r_tid = _res(row["tid"])
+        if r_sid is None or r_tid is None:
+            continue  # dead-ended chain: no live node to attribute the edge to
+        edges.add((r_sid, r_tid))
+    return sorted(edges)
 
 
 def _find_cycle(edges: "list[tuple[str, str]]") -> "list[str] | None":

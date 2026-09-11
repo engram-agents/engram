@@ -2,7 +2,9 @@
 
 Fixture shape: same discipline as test_partition_conformance.py — a minimal
 in-memory sqlite3 db carrying only the columns `check_dag_conformance`
-actually reads (nodes: id/is_current; edges: source_id/target_id/relation).
+(and, as of #2813, `_live_dag_edges`'s supersedes-resolution) actually
+reads (nodes: id/is_current/superseded_by; edges:
+source_id/target_id/relation).
 
 Coverage:
   1. Clean graph (no dag=True edges at all) -> cycle_found False.
@@ -26,6 +28,20 @@ Coverage:
   6. Control: monkeypatching DAG_RELATIONS empty makes a genuine cycle
      invisible — proves the checker actually walks the relation set it's
      given rather than being vacuously clean by construction.
+  7. #2813 regression: a cycle that only closes once a superseded
+     endpoint is resolved through the REAL supersedes mechanism
+     (is_current=0 + superseded_by, no edge) to its current successor —
+     the old SQL-level `is_current = 1` filter dropped the edge outright
+     and missed this; must now be caught, with the superseded node itself
+     never appearing in the resolved cycle path.
+  8. #2813 control: a dag-relation edge touching a node whose supersedes
+     chain dead-ends (retracted, no replacement) must be dropped safely —
+     no crash, no false cycle.
+
+(Two more tests exist below — test_deep_chain_no_recursion_error and
+test_deep_chain_with_cycle_still_found — pre-existing at #2813 time and
+not enumerated in this list before this file was touched; left as found,
+not renumbered, since fixing that drift is outside #2813's scope.)
 
 Import-pattern contract (#948 wave C): imports engram_core and
 engram_dag_conformance directly; no ``import server``.
@@ -51,6 +67,7 @@ def _new_conn() -> sqlite3.Connection:
             id TEXT PRIMARY KEY,
             type TEXT NOT NULL,
             is_current INTEGER DEFAULT 1,
+            superseded_by TEXT,
             created_at TEXT
         )"""
     )
@@ -66,10 +83,11 @@ def _new_conn() -> sqlite3.Connection:
     return conn
 
 
-def _add_node(conn, node_id, is_current=1):
+def _add_node(conn, node_id, is_current=1, superseded_by=None):
     conn.execute(
-        "INSERT INTO nodes (id, type, is_current, created_at) VALUES (?, 'observation_factual', ?, 't')",
-        (node_id, is_current),
+        "INSERT INTO nodes (id, type, is_current, superseded_by, created_at) "
+        "VALUES (?, 'observation_factual', ?, ?, 't')",
+        (node_id, is_current, superseded_by),
     )
 
 
@@ -148,6 +166,100 @@ def test_cycle_among_noncurrent_nodes_not_flagged():
     assert out["cycle_found"] is False, (
         "a cycle among non-current nodes must not be flagged — CURRENT-ONLY"
     )
+
+
+def test_cycle_through_superseded_endpoint_is_caught():
+    """#2813: the exact bug this issue fixes. The OLD `_live_dag_edges`
+    filtered edges on `s.is_current = 1 AND t.is_current = 1` at the SQL
+    level -- so once `a` is superseded (real mechanism: is_current=0,
+    superseded_by='a2', no edge created for the supersession itself), the
+    a->b edge simply vanished from the walk instead of being resolved onto
+    a2->b, and the resulting a2 -> b -> a2 cycle went undetected.
+
+    Regression: assert the cycle IS caught, and that the superseded node
+    `a` itself never appears in the resolved cycle path (only its current
+    successor a2 should) -- exactly the resolve-through-supersedes behavior
+    the old SQL-level filter never performed."""
+    conn = _new_conn()
+    _add_node(conn, "a", is_current=0, superseded_by="a2")
+    _add_node(conn, "b", is_current=1)
+    _add_node(conn, "a2", is_current=1)
+    _add_edge(conn, "a", "b", "derives_from")  # a -> b (a now superseded by a2)
+    _add_edge(conn, "b", "a2", "derives_from")  # b -> a2, closing a2 -> b -> a2
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is True, (
+        "resolving a's supersede chain onto a2 turns a->b into a2->b, which "
+        "closes a2 -> b -> a2 via the existing b->a2 edge; this must be caught"
+    )
+    assert {"a2", "b"}.issubset(set(out["cycle_path"])), (
+        f"cycle path {out['cycle_path']} should include both a2 and b"
+    )
+    assert "a" not in out["cycle_path"], (
+        "the superseded node a must never appear in a resolved cycle path -- "
+        "only its current successor a2 should"
+    )
+
+
+def test_cycle_through_superseded_endpoint_as_target_is_caught():
+    """#2813 reviewer-fairy round-1 finding: the sibling test above only ever
+    puts the superseded node in the edge SOURCE position (`a -> b`), so a
+    plausible-wrong implementation that resolves the source endpoint but
+    leaves the TARGET endpoint raw still passes it -- in that graph the raw
+    and resolved target ids happen to coincide. This test puts the
+    superseded node ONLY in the edge TARGET position: `p_old` never appears
+    as a source in the raw edge set.
+
+    p (current), q (current), p_old (superseded, superseded_by='p'). Raw
+    edges: p -> q, q -> p_old. Resolving p_old onto p turns q -> p_old into
+    q -> p, closing p -> q -> p -- a cycle invisible until the TARGET
+    endpoint is resolved."""
+    conn = _new_conn()
+    _add_node(conn, "p", is_current=1)
+    _add_node(conn, "q", is_current=1)
+    _add_node(conn, "p_old", is_current=0, superseded_by="p")
+    _add_edge(conn, "p", "q", "derives_from")       # p -> q
+    _add_edge(conn, "q", "p_old", "derives_from")   # q -> p_old (p_old superseded by p)
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is True, (
+        "resolving p_old's supersede chain onto p turns q->p_old into q->p, "
+        "which closes p -> q -> p via the existing p->q edge; this must be "
+        "caught"
+    )
+    assert {"p", "q"}.issubset(set(out["cycle_path"])), (
+        f"cycle path {out['cycle_path']} should include both p and q"
+    )
+    assert "p_old" not in out["cycle_path"], (
+        "the superseded node p_old must never appear in a resolved cycle "
+        "path -- only its current successor p should"
+    )
+
+
+def test_dead_ended_supersede_chain_dropped_not_crashed():
+    """#2813 control: a retracted node with NO replacement (is_current=0,
+    superseded_by=NULL) that carries a dag-relation edge to a live node
+    must have that edge silently dropped -- there is no live node left to
+    attribute it to -- not crash the walk and not manufacture a false
+    cycle. Mirrors the "dead-ended chain: no live node to attribute the
+    edge to" reasoning `core._generalizes_cycle_path` uses for its own
+    resolve-then-walk. This graph has exactly one dag-relation edge, and
+    it is the one that gets dropped, so zero live edges remain -- the only
+    correct answer is cycle_found False."""
+    conn = _new_conn()
+    _add_node(conn, "x", is_current=0, superseded_by=None)  # retracted, no successor
+    _add_node(conn, "y", is_current=1)
+    _add_edge(conn, "x", "y", "derives_from")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is False, (
+        "x's chain dead-ends (retracted, no superseded_by) -- the x->y edge "
+        "must be dropped, leaving zero live dag edges to cycle over"
+    )
+    assert out["cycle_path"] == []
 
 
 def test_non_dag_relation_cycle_not_flagged():
