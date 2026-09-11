@@ -202,6 +202,11 @@
       "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :260 IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
     },
     {
+      "path": "engram_telemetry_store.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path -- and as of this PR nothing in the T1 surface calls into it at all (WS1 ships the store mechanism only; WS3, a later workstream, is what wires call sites). Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier."
+    },
+    {
       "path": "engram_log_indexer.py",
       "tier": "essential"
     },
