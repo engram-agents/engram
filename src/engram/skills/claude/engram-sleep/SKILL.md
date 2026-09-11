@@ -522,8 +522,12 @@ fi
 **As of #1952 PR3, the batch-summary fairy is reviewer of outliers, not
 author of record.** Write-time `recall_summary`/`recall_keywords` (#1952 PR1)
 means most new nodes already carry a fine summary by the time sleep runs —
-the fairy's cohort is now the union of two outlier classes, capped at 50
-total, and should be near-zero most nights:
+the fairy's cohort is the union of two outlier classes. **The original design
+expectation was that this would be near-zero most nights; measured 2026-09-10 it is
+not, and the doc said otherwise until this line was corrected** — 203 live outliers
+graph-wide immediately AFTER that night's 50 were applied, on a night whose fresh
+half alone was 53. Treat a non-trivial cohort as the normal case, and read the
+near-zero framing as an aspiration write-time authoring has not yet reached:
 
 1. **`needs_tightening`-flagged** — a write-time summary was soft-accepted
    over the 140-char target (under the 280-char hard-reject gate), OR a
@@ -561,30 +565,90 @@ Use `engram_list` in structured-filter mode to enumerate today's-cohort node IDs
 }
 ```
 
-If today's-cohort count < 50, top up from the backlog:
+**Pass `unlimited: true` on this call — it is load-bearing now that the fresh half has no cap.**
+`engram_list` defaults to `limit` 100, so a day that produces more than 100 outliers would silently
+return exactly 100 and read as a complete cohort; the truncation appears only in `total_matched`,
+which nothing else in this step tells you to compare. Under the old 50-node cap the default could
+never bind and this was safe to leave unsaid — **removing the cap is what made the default
+dangerous**, which is the kind of dependency a cap change carries invisibly.
 
-- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter — DROP the `created_at` lower bound — sort by `created_at` ascending (oldest first), limit to fill to 50
+**Then hand the expected total to `prepare --expect-total` — do not merely eyeball it.** Reading the
+number back is vigilance and gets skipped; passing it makes the pipeline itself refuse a truncated
+cohort. `prepare` compares it against the resolved id count and, on mismatch, exits non-zero having
+written NOTHING (no chunk dirs, no payloads, no manifest), so there is no half-prepared cohort to
+mistake for a good one. It also names the likely cause when the received count is exactly 100.
+
+⚠ **There are TWO `engram_list` calls feeding ONE cohort, so `--expect-total` is NOT either call's
+`total_matched` on its own.** Compute it:
+
+```
+COHORT_TOTAL = fresh_total_matched + min(backfill_total_matched, 60)
+```
+
+Both wrong readings fail the same way and fail LOUDLY-BUT-FALSELY, which is the dangerous kind —
+a gate that cries wolf nightly gets worked around, and then you have neither the gate nor the
+vigilance it replaced. Passing the fresh call's `total_matched` alone under-counts by the whole
+backfill. Summing both RAW over-counts whenever the real backlog exceeds its 60 cap — which, at the
+backlog sizes measured above, is the normal case and not an edge one. The `min()` is doing the work,
+and it is exact only because the two queries partition on `PREV_SLEEP` rather than overlap.
+
+**The fresh cohort is UNCAPPED — take every matching node since the last sleep, however many there are.**
+Then top up from the older backlog, capped at **60**:
+
+- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter, but **REPLACE the `created_at >= PREV_SLEEP` bound with `created_at < PREV_SLEEP`** — sort by `created_at` ascending (oldest first), limit **60**, and pass `unlimited: false` here (the 60 IS the limit)
+- **Replace the bound, do not merely drop it.** Dropping it makes the two queries OVERLAP rather than partition: the backfill's oldest-first scan only avoids today's nodes while the genuine backlog still exceeds 60, so the overlap appears *precisely once this redesign succeeds at draining the backlog* — and then `prepare` dedups the duplicates away, the id count lands under the expected total, and the truncation gate fires falsely on a correct cohort. An upper bound makes fresh and backfill disjoint by construction, which is also what makes the expected-total arithmetic below EXACT rather than approximate
+- The backfill cap is independent of the fresh cohort, not a fill-to-N remainder: a heavy writing day does NOT reduce the backfill, and a quiet one does not inflate it
 - This is the attrition pattern: every cycle drains the oldest outlier nodes, `needs_tightening` and legacy-NULL alike
 
 > Evidence nodes (`ev_*`) are URL + verbatim-quote citations, not claim-bearing — they don't render via `engram_surface` and don't benefit from a recall_summary. Excluding them from the cohort prevents wasted summary-fairy compute and lets the real backfill drain faster. The exclusion is applied client-side on the returned set — `ev_*` IDs are prefix-typed, so `type != 'evidence'` works even if a tool's return doesn't surface a `type` field.
 
-Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy-NULL pool over many cycles; the `needs_tightening` pool should stay small night-to-night by design (a growing one is worth investigating, not just draining).
+**Why the fresh half is uncapped and only the backfill is bounded** (Lei, 2026-09-10, replacing a
+flat 50-node cap on the union). A single cap over both classes made the two failure modes trade
+against each other: on 2026-09-10 the fresh cohort alone was 53 — over the cap by itself — so the
+backfill got ZERO and the pool grew on a night that looked fully processed. That was the third
+consecutive carry-over. A node's one cheap chance at a summary is the cycle that closes the turn it
+was written in; miss it and it becomes indistinguishable from decade-old backlog. So the fresh half
+must never be rationed — its size is bounded by how much the agent actually wrote that day, which is
+self-limiting in a way a backlog is not. The backfill is the half that can be arbitrarily large, so
+it is the half that carries the cap. **A backfill that stays pinned at 60 night after night is a
+signal to raise it or file an issue, not to keep draining**; the `needs_tightening` pool in
+particular should stay small by design, and a growing one is worth investigating.
 
 **If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
 **Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files.
-**Pass the cohort IDs inline via `--ids`** — the list from the step above fits
-comfortably in a shell variable (50 ids max, per the cap above), so there is
-no need for an intermediate file at all:
+
+Run this step from the repo root — `cohort_dispatch` is invoked via `python3 -m tools.cohort_dispatch`, which requires cwd = the repo root.
+
+**Pass the cohort IDs inline via `--ids` when the list is small enough to read
+in one glance** (roughly the historical 50-id shape), so there is no intermediate
+file. **With the fresh half uncapped the list no longer has a fixed ceiling.** The
+constraint is NOT the shell: measured 2026-09-10, `ARG_MAX` is 2 MB here and a
+300-id list is 2399 bytes — 0.1% of it — so an inline variable would carry
+thousands of ids without complaint. The constraint is that **you cannot eyeball a
+300-id list for correctness**, and a silently wrong cohort list produces a clean-
+looking run over the wrong nodes. So above roughly the size you would actually read,
+use `--ids-file` and write the list under your OWN `$HOME/.engram/tmp/` (never a
+shared `/tmp` path — see the collision note below; `prepare` enforces an owner-uid
+check), where it can be diffed and re-read:
 
 ```bash
 COHORT_IDS="ob_XXXX,ob_YYYY,..."  # comma-separated list from the step above
-COHORT_DIR=.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)
+# Truncation gate. NOT either call's total_matched alone — see the formula above.
+# Fill these two in from the two engram_list calls you just made:
+FRESH_TOTAL_MATCHED=<total_matched from the FRESH call (created_at >= PREV_SLEEP)>
+BACKFILL_TOTAL_MATCHED=<total_matched from the BACKFILL call (created_at < PREV_SLEEP)>
+COHORT_TOTAL=$(( FRESH_TOTAL_MATCHED + (BACKFILL_TOTAL_MATCHED < 60 ? BACKFILL_TOTAL_MATCHED : 60) ))
+COHORT_DIR="$(pwd)/.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)"  # ABSOLUTE — Step 7.5 hands
+# this path to engram_set_recall_summaries, which runs in the MCP server's own
+# long-lived process (a different cwd than this shell); a relative path there
+# would resolve against the wrong directory.
 
 python3 -m tools.cohort_dispatch prepare \
   --ids "$COHORT_IDS" \
   --out "$COHORT_DIR" \
   --chunk-size 15 \
+  --expect-total "$COHORT_TOTAL" \
   --db ~/.engram/knowledge.db
 ```
 
@@ -664,7 +728,7 @@ Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_N
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
 
-**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
+**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (4 chunks for a 50-node cohort at chunk-size=15; **the count now scales with the cohort and is no longer bounded by a 50-node cap**, so read it off the manifest rather than assuming a small number). **This is the one place uncapping changes FAN-OUT rather than just volume** — the chunk count is the fairy count. It stays bounded because the fresh half is limited by a single day's writing and the backfill half is capped at 60. **Order of magnitude, REASONED FROM two measured points rather than observed across nights** — 2026-09-10 produced ~77 nodes and a 53-node fresh cohort, so a heavy night plus a full backfill is roughly 140 nodes ≈ 10 chunks. **Numeric trip-wire, so the trigger is not your in-the-moment comfort: if `prepare` returns MORE THAN 12 CHUNKS (>180 nodes), stop and raise it with Lei before dispatching.** Do not silently trim the cohort to get under it — trimming is the failure this uncapping exists to remove, and a genuine >12-chunk night is information about the backlog, not a dispatch problem to be hidden. For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
 ```
 Read your input payload from: <chunk_dir>/payload.json
@@ -676,7 +740,7 @@ Use `_build_initial_prompt(payload_path, output_path)` from `tools/cohort_dispat
 
 All fairies fire in parallel with `run_in_background=true`; the harness fires a task-notification when each completes.
 
-**Why batch-summary replaces serial summary-fairy**: the serial engram-summary-fairy uses ~56 turns / ~2.37M tokens for a 50-node cohort. Parallel batch fairies at chunk-size=15 cover a 50-node cohort (4 chunks) at ~110K tokens total — ~95% token reduction. Quality validated empirically on 2026-05-27 (mean Δ cosine = +0.043, pooled stdev = 0.118, ratio = 0.36 — well below 1.0 "indistinguishable from ground truth" threshold).
+**Why batch-summary replaces serial summary-fairy** (both figures measured at a 50-node cohort, which was the cap at the time and is no longer a ceiling — they are a per-node rate, not a budget): the serial engram-summary-fairy uses ~56 turns / ~2.37M tokens for a 50-node cohort. Parallel batch fairies at chunk-size=15 cover a 50-node cohort (4 chunks) at ~110K tokens total — ~95% token reduction. Quality validated empirically on 2026-05-27 (mean Δ cosine = +0.043, pooled stdev = 0.118, ratio = 0.36 — well below 1.0 "indistinguishable from ground truth" threshold).
 
 ### Step 7 — Wait for all fairies + collect reports; run validate + retry loop
 
@@ -803,13 +867,22 @@ When `final_payload.json` exists, the parent applies recall summaries now — be
 - The dream master's spawn prompt is leaner (no payload inline)
 - The dream master focuses purely on consolidation (reflect → buckets → resolve/supersede/retract/derive → turn-advance → dream record)
 
-Read `$COHORT_DIR/final_payload.json` and apply via the MCP tool:
+Apply `$COHORT_DIR/final_payload.json` via the MCP tool's file-based input path —
+pass the path, not the file's contents:
 
 ```python
-engram_set_recall_summaries(payload_json=open(f"{COHORT_DIR}/final_payload.json").read())
+engram_set_recall_summaries(payload_json=json.dumps({"summaries_file": f"{COHORT_DIR}/final_payload.json"}))
 ```
 
-(This is a Claude tool call, not a shell command. The payload is the `{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py validate` / `incorporate`.)
+(This is a Claude tool call, not a shell command. `final_payload.json` — the
+`{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py
+validate` / `incorporate` — is what the tool reads once it receives the path;
+`$COHORT_DIR` must be absolute, per its definition above. A live cohort
+payload runs tens of KB with the cohort cap removed, and re-emitting it
+verbatim through the model to pass inline is pure transcription waste with a
+silent failure mode — the file-path form has the tool read the file itself
+instead. The response echoes back `summaries_file`, confirming which file was
+actually read.)
 
 Log the result: X summaries applied, Y failures deferred to next cycle.
 
@@ -849,7 +922,7 @@ Agent(
     ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
     - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
     - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
-    - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
+    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved". They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)

@@ -47,7 +47,7 @@ engram_resolve: Pure-wire: wires a resolves edge from an EXISTING claim-bearing 
 engram_retract: Error correction (never-was-valid) — node preserved for audit, downstream TAINTED not deleted. Not for a valid-then claim — use engram_supersede.
 engram_scan_emergence: [Sleep-cycle] Scans for clusters that could seed a new cornerstone — surfaces candidates only, creates nothing. Wasteful awake, not destructive.
 engram_set_person_lineage: Parses a model_id into provider/family/version onto a person node — a narrow patch, not a general field updater (use engram_update_person).
-engram_set_recall_summaries: Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, partial failures don't roll back the batch.
+engram_set_recall_summaries: Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, partial failures don't roll back the batch. Accepts either inline 'summaries' or an absolute-path 'summaries_file' pointing at a JSON file of the same shape.
 engram_set_trust_tier: Sets a person's persistent trust tier. primary_user/user_family/our_side are approval-gated (requires justification + an attestation the server cannot itself verify); tier='self' is exempt via its own is_self structural attestation, not this gate.
 engram_stats: Fixed graph-level sections (counts, confidence distribution, memory tiers) — NOT arbitrary group-bys. mode= restricts to a recent creation-time window.
 engram_supersede: Pure-wire epistemic-evolution link (old was valid-at-the-time). Does NOT create the replacement node. Not error correction — use engram_retract.

@@ -6919,7 +6919,8 @@ def engram_focus_delete_set(payload_json: str) -> str:
     name="engram_set_recall_summaries",
     capability=(
         "Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, "
-        "partial failures don't roll back the batch."
+        "partial failures don't roll back the batch. Accepts either inline 'summaries' or "
+        "an absolute-path 'summaries_file' pointing at a JSON file of the same shape."
     ),
     annotations={
         "title": "Batch-Set Recall Summaries and Keywords",
@@ -6937,20 +6938,33 @@ def engram_set_recall_summaries(payload_json: str) -> str:
     backfill operations.
 
     Args:
-        payload_json: JSON object string with required key:
+        payload_json: JSON object string with EXACTLY ONE of:
             summaries (list): list of entry objects, each with:
                 node_id (str): target node. Must exist + is_current=1.
                 recall_summary (str): curated summary. Authoring target ≤120
                     chars; hard cap 200 chars (defensive guard).
                 recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
                     no duplicates (case-sensitive).
+            summaries_file (str): ABSOLUTE path to a JSON file on disk with
+                the same {"summaries": [...], "failures": [...]} shape as
+                above (the shape cohort_dispatch's "validate" subcommand
+                writes to final_payload.json, and PayloadBuilder.to_json()
+                emits). Use this for large batches instead of re-typing the
+                whole payload inline — the sleep cycle's cohort dispatch
+                already writes this file; pass its path instead of its
+                contents. MUST be absolute: the MCP server is a long-lived
+                process whose cwd is not guaranteed to track the calling
+                agent's own. Relative paths are rejected. Providing BOTH
+                "summaries" and "summaries_file" is a loud error (ambiguous
+                input, nothing applied); providing NEITHER is also an error.
 
     Returns:
         JSON: {
             "ok": [{"node_id": "..."}, ...],
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
-            "failed": M
+            "failed": M,
+            "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """
     return _attach_walguard_banner(_recall_summaries_mod._set_recall_summaries_impl(payload_json))
