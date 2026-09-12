@@ -47,6 +47,7 @@ headless browser available on this seat).
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -375,6 +376,17 @@ _DOM_HARNESS_JS = r"""
       } : null,
       composedStripTop: stripTopEl ? { childCount: stripTopEl.children.length } : null,
       composedHasDistStrip: !!findClassToken(detailComposedBlock, "detail-strip-dist-container"),
+      // Borges's #2872 post-merge finding: the fixture already carries a
+      // held-out (importance:0) metric inside provenance_integrity, and
+      // the code guards it twice (aspectScoreForToday's `importance <= 0`
+      // skip, composedScoreForToday's null-check) -- but nothing asserted
+      // the RENDERED text is a finite number rather than "NaN"/"--". Pull
+      // the actual .detail-composed-value element's text so the Python
+      // side can pin it.
+      composedValueText: (function () {
+        var el = findClassToken(detailComposedBlock, "detail-composed-value");
+        return el ? String(el.textContent) : null;
+      })(),
       firstAspectHead: aspectHeadEl ? { childCount: aspectHeadEl.children.length } : null,
     };
 
@@ -771,6 +783,45 @@ class TestDetailViewRealDOMStructure(unittest.TestCase):
         head = d["firstAspectHead"]
         self.assertIsNotNone(head, "no .detail-aspect-head element found in the rendered tree")
         self.assertEqual(head["childCount"], 3, f"expected 3 cells (name, sub, tile), got {head['childCount']}")
+
+    def test_composed_score_finite_with_held_out_aspect_member(self):
+        """#2872 post-merge finding (Borges, PR #2872): the fixture's
+        `provenance_integrity` aspect already carries a held-out metric
+        (url_resolvability_rate, importance:0) alongside two admitted ones,
+        but nothing previously asserted the RENDERED .detail-composed-value
+        text is a finite number rather than "NaN" or "--" -- 34 tests
+        passed without a single one naming this outcome.
+
+        Round-1 reviewer-fairy correction on this PR (verified, kept):
+        this test pins TODAY's render as finite on THIS fixture; it does
+        NOT exercise or discriminate the weighting-guard logic
+        (aspectScoreForToday's `importance <= 0` skip, composedScoreForToday
+        's null-check, aspectScore's `total > 0` check) at all. Measured by
+        disabling all three simultaneously against the real source: still
+        35/35 green, still a finite render. The reason is arithmetic, not
+        guard interaction -- provenance_integrity always retains two
+        importance:1 metrics with concrete raw values, so the held-out
+        metric's own weighted contribution is exactly zero regardless of
+        whether any guard fires; none of the three guards' trigger
+        conditions (null raw, zero total importance) actually occur on
+        this fixture. A genuine guard-discriminating test would need a
+        fixture where an aspect's ADMITTED importance total is itself
+        driven to zero (e.g. a fully-held-out aspect) -- not built here,
+        left as a documented gap rather than a false claim of coverage.
+
+        The fixture's `available: true` model makes composedScoreForToday()
+        take the live compose-from-aspects path (not the flat snapshot.
+        composed.value fallback), so this is a real computation, not a
+        hardcoded fixture number -- that much holds."""
+        text = self.report["detail"]["composedValueText"]
+        self.assertIsNotNone(text, "no .detail-composed-value element found")
+        self.assertNotIn("NaN", text, "composed score rendered NaN with a held-out aspect member present")
+        self.assertNotEqual(text, "--", "composed score rendered the null placeholder, not a computed value")
+        try:
+            value = float(text)
+        except ValueError:
+            self.fail(f"composed score text {text!r} is not parseable as a finite number")
+        self.assertTrue(math.isfinite(value), f"composed score {value} is not finite")
 
     def test_workbench_signal_row_is_three_column_grid_control(self):
         """Control for the grid-structure checks above: the workbench's own
