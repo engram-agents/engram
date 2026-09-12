@@ -39,7 +39,8 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
-from _hooklib import resolve_runtime_dir
+from _hooklib import resolve_runtime_dir, emit_context
+from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import (
         is_own_server_py_running as _is_own_server_py_running_impl,
@@ -3137,6 +3138,58 @@ def format_nap_warning(count: int) -> str:
     return ""
 
 
+def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
+    """Build the UserPromptSubmit response dict from this prompt's fired
+    head/body blocks, routed through the shared bounded renderer
+    `_hooklib.emit_context()` (engram-alpha#2863 WS2).
+
+    `head_blocks` / `body_blocks` are the lists of already-rendered,
+    non-empty block strings `main()` collected this prompt (see the
+    "# Build context parts" section below) -- this function does no
+    filtering of its own beyond the "did anything fire at all" check. Split
+    out from `main()` purely for testability (exercising this logic needs
+    no stdin plumbing); `main()`'s own behavior is otherwise unchanged.
+
+    Returns `{}` when nothing fired this prompt (mirrors the pre-migration
+    `if not parts:` early exit) -- `emit_context()` is never called with
+    two empty inputs. Otherwise returns the full
+    `{"hookSpecificOutput": {...}}` response dict, ready for `json.dumps()`.
+    """
+    head = "\n\n".join(head_blocks)
+    body = list(body_blocks)
+    if not head and not body:
+        return {}
+
+    harness = detect_harness()
+    budgets = get_harness_budgets(harness)
+    rendered = emit_context(
+        head,
+        body,
+        budget=budgets["budget"],
+        # Deliberate, not head_budget (engram-alpha#2863 WS2 spec): this
+        # hook's content (principle triggers, recall nudges) is already
+        # what the agent receives in full every prompt today, so the soft
+        # ceiling IS the hard ceiling here -- render should use everything
+        # up to the hard budget before cutting anything.
+        target=budgets["budget"],
+        # Protects principle_triggers, the largest body item, in the rare
+        # combined-outage case where head is also non-trivial.
+        allow_single_overflow=True,
+        # No shared overflow-persistence helper exists yet in _hooklib.py
+        # (only the tripwire hook's own bespoke, hook-specific writer) --
+        # cut content is dropped with a "M cut" count and no "-- see
+        # <path>" pointer. A shared overflow-writer helper is a clean
+        # fast-follow, not built here.
+        overflow_writer=None,
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": rendered,
+        }
+    }
+
+
 def main():
     # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
     # return/exit in this function.
@@ -3255,8 +3308,15 @@ def main():
             fields={"outcome": "delivered" if _uid is not None else "dropped"},
         )
 
-    # Build context parts
-    parts = []
+    # Build context parts (engram-alpha#2863 WS2: split into head_blocks
+    # (short, urgent, joined "\n\n") and body_blocks (ordered,
+    # priority-first) so _assemble_response() below can route them through
+    # emit_context() for a combined-budget bound -- see that function's
+    # docstring and the WS2 spec's mapping table for which block goes
+    # where. Preserves the exact existing if/elif branching for what fires
+    # this prompt; only WHERE the resulting string goes has changed.
+    head_blocks: list = []
+    body_blocks: list = []
 
     # Unified principle-trigger check (#1698 slice 2) — one registry, four
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
@@ -3273,7 +3333,7 @@ def main():
         principle_triggers = check_error_patterns(prompt)
         _principle_rendered = []  # keyword fallback has no registry firing to emit telemetry for
     if principle_triggers:
-        parts.append(principle_triggers)
+        body_blocks.append(principle_triggers)
 
     # #1698 slice 3 §1.3 — engram.trigger.fire telemetry, one emission per
     # rendered principle firing. Call-site placement (spec's preferred
@@ -3360,7 +3420,7 @@ def main():
         except Exception:
             warming_up = False   # fail-safe: when in doubt, the louder CRITICAL
         if warming_up:
-            parts.append(
+            head_blocks.append(
                 f"[ENGRAM: surface daemon warming up (cold model load) — "
                 f"semantic recall resumes in a few seconds; ranking is "
                 f"lexical-only meanwhile. No action needed unless this "
@@ -3380,14 +3440,14 @@ def main():
             except Exception:
                 pass
             if _is_idle_shutdown:
-                parts.append(
+                head_blocks.append(
                     f"[ENGRAM: surface daemon was idle-shutdown (idle timeout) — "
                     f"restarting automatically, semantic recall resumes in a few "
                     f"seconds. No action needed unless this persists past the next "
                     f"prompt. Recovery if it persists: bash {daemon_script}]"
                 )
             else:
-                parts.append(
+                head_blocks.append(
                     f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
                     f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
                     f"immediately — recall quality is severely impaired. "
@@ -3410,7 +3470,7 @@ def main():
     # possibilities and point at a reality-test rather than alarming unconditionally.
     write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
     if not write_ok:
-        parts.append(
+        head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
             f"  → Marker PID is dead and no live server.py was found for this seat. "
@@ -3427,7 +3487,7 @@ def main():
         # PR #1839's colleague review: a suppressed condition must
         # still surface informationally or the next real incident goes
         # unnoticed the way #1772 almost did.
-        parts.append(
+        head_blocks.append(
             f"ℹ️  ENGRAM substrate health: MCP write-tool liveness OK ({write_reason})."
         )
 
@@ -3436,7 +3496,7 @@ def main():
     # (WAL failure, disk I/O error, corruption). See #1218 / #786.
     db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
     if not db_ok:
-        parts.append(
+        head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  DB liveness: FAILED ({db_reason})\n"
             f"  → MCP tool calls will fail. Surface nodes above may be stale pre-failure cache.\n"
@@ -3464,7 +3524,7 @@ def main():
             stats=_render_stats,
         )
         if nudge:
-            parts.append(nudge)
+            body_blocks.append(nudge)
         elif pack_results:
             # Own-graph returned 0 matches (match_count=0) but we have pack hits
             # — surface them as a standalone mini-nudge.
@@ -3480,7 +3540,7 @@ def main():
             pack_lines.append(
                 "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
             )
-            parts.append("\n".join(pack_lines))
+            body_blocks.append("\n".join(pack_lines))
     elif pack_results:
         # Own-graph query failed entirely (result is None) but we have pack hits.
         pack_lines = ["[ENGRAM Recall: own-graph unavailable; attached libraries:"]
@@ -3495,7 +3555,7 @@ def main():
         pack_lines.append(
             "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
         )
-        parts.append("\n".join(pack_lines))
+        body_blocks.append("\n".join(pack_lines))
 
     # Emit engram.surface.render_size event for the structured event log
     # (recall-triggering blueprint §3-P4, issue #1692). Mirrors the
@@ -3538,25 +3598,25 @@ def main():
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()
     if write_reminder:
-        parts.append(write_reminder)
+        body_blocks.append(write_reminder)
 
     # Tool-call repair notification (from PreToolUse repair hook)
     repair_notice = check_repair_marker()
     if repair_notice:
-        parts.append(repair_notice)
+        body_blocks.append(repair_notice)
 
     # Feeling-nudge (post-compact wake-up). Read-only — does NOT clear the
     # marker; only engram_report_feeling clears it.
     feeling_nudge = check_feeling_nudge_marker()
     if feeling_nudge:
-        parts.append(feeling_nudge)
+        body_blocks.append(feeling_nudge)
 
     # Warm-restart briefing pointer (first prompt after compaction only).
     # Delivered as a pointer, not full injection — the agent discovers and
     # chooses to read the note, like Lucy finding Henry's journal.
     warm_briefing = check_warm_briefing(counter["prompts_since_compaction"])
     if warm_briefing:
-        parts.append(warm_briefing)
+        body_blocks.append(warm_briefing)
 
     # Nap warning (if approaching compaction) — uses JSONL-based context tracker
     try:
@@ -3572,23 +3632,18 @@ def main():
         if usage:
             nap_warning = format_drowsiness(usage)
             if nap_warning:
-                parts.append(nap_warning)
+                body_blocks.append(nap_warning)
     except ImportError:
         # Fallback to prompt count if context tracker not available
         nap_warning = format_nap_warning(counter["prompts_since_compaction"])
         if nap_warning:
-            parts.append(nap_warning)
+            body_blocks.append(nap_warning)
 
-    if not parts:
+    response = _assemble_response(head_blocks, body_blocks)
+    if not response:
         print(json.dumps({}))
         sys.exit(0)
 
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "\n".join(parts),
-        }
-    }
     print(json.dumps(response))
     sys.exit(0)
 

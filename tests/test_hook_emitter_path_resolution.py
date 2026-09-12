@@ -61,7 +61,13 @@ PYTHON = sys.executable
 # in the flattened hooks/ directory. Copied verbatim from source -- these
 # are the real modules, not stubs, so the test exercises real import
 # behavior for the shared-library layer.
-_SHARED_SIBLINGS = ("_hooklib.py", "_stophooklib.py", "context_tracker.py")
+#
+# _harness.py (engram-alpha#2863 WS2): engram-surface-hook.py now imports
+# this module-scope, unguarded, alongside _hooklib.py -- both live in the
+# SAME directory in both build topologies (see _harness.py's own
+# docstring), so it belongs in this fixture's sibling set for the same
+# reason _hooklib.py already is.
+_SHARED_SIBLINGS = ("_hooklib.py", "_harness.py", "_stophooklib.py", "context_tracker.py")
 
 # All eight emitter-importing hooks (gh#2570's own enumeration, confirmed
 # via `grep -l engram_log_emitter src/engram/hooks/claude/*.py`).
