@@ -17,14 +17,28 @@ API -- exactly like health-workbench.js's own render logic, which
 `tests/test_viz_health_workbench.py`'s own module docstring explicitly
 excludes from node-executed testing for that reason ("the page's client-side
 JS render logic" is "out of scope for THIS file", covered only by the pure-
-math parity tests + static string assertions). health-detail.js follows the
-same convention: its DOM-touching functions are covered by static
-string/structure assertions on the served page + the served static file,
-never by extracting-and-running them under plain `node` (no jsdom on this
-seat) -- the pure math it calls (piecewiseLinear, collapseUnavailableRuns,
-computeDistributionStats, ...) is already covered, unchanged, by
+math parity tests + static string assertions). health-detail.js followed the same convention through #2754 PR A: its
+DOM-touching functions were covered only by static string/structure
+assertions on the served page + the served static file, never by
+extracting-and-running them under plain `node` (no jsdom on this seat) --
+the pure math it calls (piecewiseLinear, collapseUnavailableRuns,
+computeDistributionStats, ...) is covered, unchanged, by
 tests/test_health_workbench_curve_parity.py, tests/test_health_workbench_
 round5_parity.py, and the TestDistributionMathViaNode class below.
+
+engram-alpha#2868 (the three-column-grid fork fix) is the ONE exception to
+that convention, and deliberately so: the defect it fixes (everything
+stacked in one column instead of the workbench's three-panel grid) is
+exactly the kind of layout-SHAPE bug that a string/structure assertion on
+source text cannot see -- the pre-fix source already contained every
+correct string a naive check would look for, just arranged in the wrong
+DOM shape. TestDetailViewRealDOMStructure below evaluates health-detail.js
+(and, as a control, health-workbench.js) in a hand-rolled `vm`-based DOM
+shim -- no jsdom dependency added -- and inspects the ACTUAL constructed
+element tree. This is narrowly scoped to the one class of bug static
+assertions structurally cannot catch; it is not a general reversal of the
+no-jsdom convention, and new tests for this file should still default to
+the static-assertion style above unless they're testing DOM shape.
 
 Same `_LiveServerBase` convention as `tests/test_viz_health_view_toggle.py`
 and `tests/test_viz_health_v2.py` (real `HTTPServer` thread + `urlopen`, no
@@ -64,8 +78,346 @@ _DETAIL_JS_PATH = (
     / "static"
     / "health-detail.js"
 )
+_CURVE_JS_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "engram"
+    / "viz"
+    / "static"
+    / "health-workbench-curve.js"
+)
+_WORKBENCH_JS_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "src"
+    / "engram"
+    / "viz"
+    / "static"
+    / "health-workbench.js"
+)
 
 _NODE_AVAILABLE = shutil.which("node") is not None
+
+# Minimal, hand-rolled DOM shim + fixture-driven harness used by
+# TestDetailViewRealDOMStructure below -- see that class's own docstring for
+# why this exists (no jsdom on this seat, and static string assertions on
+# source can't tell "the DOM is a single column" from "the DOM is three
+# columns"). Placeholders (__MATH_PATH__ etc.) are substituted with
+# json.dumps'd absolute paths at test-run time -- see _run_harness().
+_DOM_HARNESS_JS = r"""
+(function () {
+  "use strict";
+  var fs = require("fs");
+  var vm = require("vm");
+
+  // ---- Minimal fake DOM -----------------------------------------------
+  var idMap = {};
+
+  function FakeElement(tag) {
+    this.tagName = String(tag || "div").toUpperCase();
+    this.children = [];
+    this.parentNode = null;
+    this.attributes = {};
+    this.dataset = {};
+    this.style = {};
+    this._className = "";
+    this._innerHTML = "";
+    this._textContent = undefined;
+    this.disabled = false;
+    this.value = undefined;
+  }
+  FakeElement.prototype.setAttribute = function (k, v) {
+    v = String(v);
+    this.attributes[k] = v;
+    if (k === "id") idMap[v] = this;
+    if (k === "class") this._className = v;
+    if (k.indexOf("data-") === 0) {
+      var camel = k.slice(5).replace(/-([a-z0-9])/g, function (m, c) { return c.toUpperCase(); });
+      this.dataset[camel] = v;
+    }
+    if (k === "disabled") this.disabled = true;
+  };
+  FakeElement.prototype.getAttribute = function (k) {
+    return Object.prototype.hasOwnProperty.call(this.attributes, k) ? this.attributes[k] : null;
+  };
+  FakeElement.prototype.appendChild = function (c) {
+    c.parentNode = this;
+    this.children.push(c);
+    return c;
+  };
+  FakeElement.prototype.addEventListener = function () {};
+  FakeElement.prototype.removeEventListener = function () {};
+  FakeElement.prototype.select = function () {};
+  FakeElement.prototype.querySelector = function (sel) { return domQuerySelector(sel); };
+  Object.defineProperty(FakeElement.prototype, "className", {
+    get: function () { return this._className; },
+    set: function (v) { this._className = v; this.attributes["class"] = v; },
+  });
+  Object.defineProperty(FakeElement.prototype, "innerHTML", {
+    get: function () { return this._innerHTML; },
+    set: function (v) { this._innerHTML = v; this.children = []; },
+  });
+  Object.defineProperty(FakeElement.prototype, "textContent", {
+    get: function () {
+      if (this._textContent !== undefined) return this._textContent;
+      if (this.children.length === 0) return this._innerHTML || "";
+      return this.children.map(function (c) { return c.textContent; }).join("");
+    },
+    set: function (v) { this._textContent = v; this.children = []; },
+  });
+
+  function domQuerySelector(sel) {
+    if (sel.charAt(0) === "#") return idMap[sel.slice(1)] || null;
+    return null; // only #id selectors are used anywhere in these two files
+  }
+
+  var fakeDocument = {
+    _listeners: {},
+    createElement: function (tag) { return new FakeElement(tag); },
+    createElementNS: function (ns, tag) { return new FakeElement(tag); },
+    querySelector: function (sel) { return domQuerySelector(sel); },
+    addEventListener: function (type, cb) {
+      (this._listeners[type] = this._listeners[type] || []).push(cb);
+    },
+    createTextNode: function (text) {
+      var e = new FakeElement("#text");
+      e._textContent = String(text);
+      return e;
+    },
+    _dispatch: function (type) {
+      (this._listeners[type] || []).slice().forEach(function (cb) { cb({}); });
+    },
+  };
+
+  global.document = fakeDocument;
+  global.window = { location: { href: "http://localhost/health", search: "" } };
+  global.requestAnimationFrame = function () {}; // never invokes its callback -- see class docstring
+  global.confirm = function () { return false; };
+
+  // ---- Traversal helpers (self-inclusive) ------------------------------
+  function forEachNode(root, fn) {
+    if (!root) return;
+    fn(root);
+    (root.children || []).forEach(function (c) { forEachNode(c, fn); });
+  }
+  function hasClassToken(n, token) {
+    return !!(n._className && n._className.split(/\s+/).indexOf(token) >= 0);
+  }
+  function findFirst(root, predicate) {
+    var found = null;
+    forEachNode(root, function (n) { if (!found && predicate(n)) found = n; });
+    return found;
+  }
+  function countAll(root, predicate) {
+    var c = 0;
+    forEachNode(root, function (n) { if (predicate(n)) c++; });
+    return c;
+  }
+  function findTag(root, tag) { return findFirst(root, function (n) { return n.tagName === tag; }); }
+  function findClassToken(root, token) { return findFirst(root, function (n) { return hasClassToken(n, token); }); }
+
+  // ---- Editing-control probe --------------------------------------------
+  var EXPORT_IDS = ["wb-export-section", "wb-export-json", "wb-export-refresh", "wb-export-download", "wb-export-copy", "wb-export-reset"];
+  var TEXT_MARKERS = ["reset aspect", "reset this curve", "set as reference"];
+  function probeEditingControls(root) {
+    var hits = [];
+    forEachNode(root, function (n) {
+      if (Object.prototype.hasOwnProperty.call(n.attributes, "data-sig")) hits.push("data-sig::" + n.attributes["data-sig"]);
+      if (Object.prototype.hasOwnProperty.call(n.attributes, "data-imp")) hits.push("data-imp::" + n.attributes["data-imp"]);
+      if (n._className && /\bkbtn\b/.test(n._className)) hits.push("kbtn::" + n._className);
+      var idAttr = n.attributes["id"];
+      if (idAttr && EXPORT_IDS.indexOf(idAttr) >= 0) hits.push("id=" + idAttr + "::" + idAttr);
+      if (n.tagName === "INPUT") hits.push("tag=INPUT::(input)");
+      var txt = (n._textContent !== undefined ? String(n._textContent) : "").trim();
+      if (txt && TEXT_MARKERS.indexOf(txt) >= 0) hits.push("text=" + txt + "::" + txt);
+    });
+    return hits;
+  }
+
+  // ---- Fixture data -------------------------------------------------
+  // Four metrics across two aspects -- deliberately includes ALL FOUR
+  // per-row branches health-detail.js/health-workbench.js distinguish:
+  // (a) the aspect's current reference (quote_verification_rate),
+  // (b) a non-held, non-reference metric -- the ONLY case that renders the
+  //     workbench's "set as reference" BUTTON (git_versioning_rate),
+  // (c) a held-out metric (url_resolvability_rate),
+  // (d) a single-member aspect where the lone metric is its own reference
+  //     (claim_bearing_rate).
+  var CURVE_DEFS = { curve_pass_rate: { knots: [[0, 0], [0.5, 0.5], [1, 1]], input_domain: [0, 1], output_range: [0, 1] } };
+  var METRICS = [
+    { signal: "quote_verification_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 1 },
+    { signal: "git_versioning_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 1 },
+    { signal: "url_resolvability_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 0 },
+    { signal: "claim_bearing_rate", aspect: "claim_bearing_current", curve: "curve_pass_rate", importance: 2 },
+  ];
+  var ASPECTS = [
+    { name: "provenance_integrity", points: 40, reference_metric: "quote_verification_rate" },
+    { name: "claim_bearing_current", points: 60, reference_metric: "claim_bearing_rate" },
+  ];
+  var MODEL_FIXTURE = { available: true, model_defs: { metrics: METRICS, aspects: ASPECTS }, curve_defs: CURVE_DEFS };
+  var AGENTS_FIXTURE = { agents: [{ name: "sol", label: "Sol" }], default: "sol" };
+
+  function signalRow(name, raw, score, status) {
+    return {
+      name: name,
+      status: status,
+      definition: {
+        formula: name + "_verified / " + name + "_total",
+        numerator: { key: name + "_num", label: name + "_num", value: 80 },
+        denominator: { key: name + "_den", label: name + "_den", value: 100 },
+      },
+      today: { raw: raw, score: score, curve: null },
+    };
+  }
+  var SNAPSHOT_FIXTURE = {
+    has_snapshot: true,
+    provenance: {
+      snapshot_id: "snap-0001", turn: 42, checkpoint_mode: "manual",
+      written_at: "2026-09-12T00:00:00Z", health_version: "v2",
+    },
+    signal_rows: [
+      signalRow("quote_verification_rate", 0.8, 0.8, "scored"),
+      signalRow("git_versioning_rate", 0.7, 0.7, "scored"),
+      signalRow("url_resolvability_rate", 0.6, null, "held_out"),
+      signalRow("claim_bearing_rate", 0.9, 0.9, "scored"),
+    ],
+    aspect_tile: [
+      { name: "provenance_integrity", score: 0.8, unscored: false },
+      { name: "claim_bearing_current", score: 0.9, unscored: false },
+    ],
+    composed: { value: 86.0, composed_coverage: 1.0, unscored_aspects: [] },
+  };
+  function seriesPoints(base) {
+    return [
+      { t: "2026-09-10T00:00:00Z", raw: base - 0.05, score: base - 0.05, unreplayable: null },
+      { t: "2026-09-11T00:00:00Z", raw: base, score: base, unreplayable: null },
+    ];
+  }
+  var ALL_SIGNALS = {
+    quote_verification_rate: seriesPoints(0.8),
+    git_versioning_rate: seriesPoints(0.7),
+    url_resolvability_rate: seriesPoints(0.6),
+    claim_bearing_rate: seriesPoints(0.9),
+  };
+  var COMPOSED_SERIES = [
+    { t: "2026-09-10T00:00:00Z", value: 82.0 },
+    { t: "2026-09-11T00:00:00Z", value: 86.0 },
+  ];
+  var COMBINED_SERIES_FIXTURE = { signals: ALL_SIGNALS, composed: COMPOSED_SERIES, scores_available: true };
+  function seriesForSignal(sig) {
+    var out = {};
+    out[sig] = ALL_SIGNALS[sig] || [];
+    return { signals: out, composed: COMPOSED_SERIES, scores_available: true };
+  }
+
+  global.fetch = function (url) {
+    var path = url.split("?")[0];
+    var data;
+    if (path === "/api/health/v2/model") data = MODEL_FIXTURE;
+    else if (path === "/api/agents") data = AGENTS_FIXTURE;
+    else if (path === "/api/health/v2/series") {
+      var m = /signal=([^&]+)/.exec(url);
+      data = m ? seriesForSignal(decodeURIComponent(m[1])) : COMBINED_SERIES_FIXTURE;
+    } else if (path === "/api/health/v2") data = SNAPSHOT_FIXTURE;
+    else return Promise.reject(new Error("unmocked fetch url: " + url));
+    return Promise.resolve({ json: function () { return Promise.resolve(data); } });
+  };
+
+  function evalFile(path) {
+    var code = fs.readFileSync(path, "utf8");
+    vm.runInThisContext(code, { filename: path });
+  }
+  function flush(ms) {
+    return new Promise(function (resolve) { setTimeout(resolve, ms || 80); });
+  }
+  function makeContainer(id, tag) {
+    var e = new FakeElement(tag || "div");
+    e.setAttribute("id", id);
+    return e;
+  }
+
+  async function main() {
+    // ---- Detail side ----------------------------------------------------
+    var detailComposedBlock = makeContainer("detail-composed-block");
+    var detailAspectSections = makeContainer("detail-aspect-sections");
+    makeContainer("detail-empty-state");
+    makeContainer("detail-content");
+    makeContainer("detail-scores-note");
+
+    evalFile(__MATH_PATH__);
+    evalFile(__CURVE_PATH__);
+    evalFile(__DETAIL_PATH__);
+
+    window.loadDetailView();
+    await flush(100);
+
+    var detailRoot = new FakeElement("div");
+    detailRoot.appendChild(detailComposedBlock);
+    detailRoot.appendChild(detailAspectSections);
+
+    var signalGridEl = findClassToken(detailRoot, "detail-signal-grid");
+    var stripTopEl = findClassToken(detailRoot, "detail-strip-top");
+    var aspectHeadEl = findClassToken(detailRoot, "detail-aspect-head");
+
+    var detailReport = {
+      signalCardCount: countAll(detailRoot, function (n) { return hasClassToken(n, "detail-signal-row"); }),
+      composedBlockRendered: detailComposedBlock.children.length > 0,
+      aspectSectionCount: countAll(detailRoot, function (n) { return hasClassToken(n, "detail-aspect-section"); }),
+      editingHits: probeEditingControls(detailRoot),
+      firstSignalGrid: signalGridEl ? {
+        className: signalGridEl._className,
+        childCount: signalGridEl.children.length,
+        leftHasH3: !!(signalGridEl.children[0] && findTag(signalGridEl.children[0], "H3")),
+        midHasStrip: !!(signalGridEl.children[1] && findClassToken(signalGridEl.children[1], "detail-strip-dist-container")),
+        rightHasCurveOrImportance: !!(signalGridEl.children[2] && (
+          findClassToken(signalGridEl.children[2], "detail-plot-container") ||
+          findClassToken(signalGridEl.children[2], "metric")
+        )),
+      } : null,
+      composedStripTop: stripTopEl ? { childCount: stripTopEl.children.length } : null,
+      composedHasDistStrip: !!findClassToken(detailComposedBlock, "detail-strip-dist-container"),
+      firstAspectHead: aspectHeadEl ? { childCount: aspectHeadEl.children.length } : null,
+    };
+
+    // ---- Workbench side (control) ---------------------------------------
+    makeContainer("wb-agent", "select");
+    makeContainer("wb-status", "span");
+    makeContainer("wb-strip", "section");
+    makeContainer("wb-composed", "span");
+    makeContainer("wb-pip", "span");
+    makeContainer("wb-bandmark", "i");
+    makeContainer("wb-empty", "div");
+    var wbAspects = makeContainer("wb-aspects", "div");
+    var wbExportSection = makeContainer("wb-export-section", "section");
+    wbExportSection.appendChild(makeContainer("wb-export-json", "textarea"));
+    wbExportSection.appendChild(makeContainer("wb-export-refresh", "button"));
+    wbExportSection.appendChild(makeContainer("wb-export-download", "button"));
+    wbExportSection.appendChild(makeContainer("wb-export-copy", "button"));
+    wbExportSection.appendChild(makeContainer("wb-export-reset", "button"));
+
+    evalFile(__WORKBENCH_PATH__);
+    document._dispatch("DOMContentLoaded");
+    await flush(150);
+
+    var wbRoot = new FakeElement("div");
+    wbRoot.appendChild(wbAspects);
+    wbRoot.appendChild(wbExportSection);
+
+    var wbSignalRow = findClassToken(wbRoot, "signal");
+    var workbenchReport = {
+      signalRowCount: countAll(wbRoot, function (n) { return hasClassToken(n, "signal"); }),
+      editingHits: probeEditingControls(wbRoot),
+      firstSignalRow: wbSignalRow ? { childCount: wbSignalRow.children.length } : null,
+    };
+
+    process.stdout.write(JSON.stringify({ detail: detailReport, workbench: workbenchReport }));
+  }
+
+  main().catch(function (e) {
+    process.stderr.write("HARNESS ERROR: " + (e && e.stack || e) + "\n");
+    process.exit(1);
+  });
+})();
+"""
 
 # `.status`/`.headers` on an `http.client.HTTPResponse` are populated
 # up-front and remain readable after close; `.read()` needs the still-open
@@ -267,6 +619,168 @@ class TestMathFileServedAndReferenced(_LiveServerBase):
         body = resp.body.decode()
         self.assertIn("function computeDistributionStats", body)
         self.assertIn("function computeHistogramBins", body)
+
+
+# ---------------------------------------------------------------------------
+# Real-DOM-execution control (engram-alpha#2868): the module docstring above
+# and TestDetailJsFileContract both explain that this file's own convention
+# is STATIC STRING assertions on source, never executing the render
+# functions under a real DOM -- which is exactly why 62 pre-#2868 tests never
+# caught that renderSignalCard/renderComposedBlock/renderAspectGrouped were
+# still emitting a single stacked column: nothing ever called them and
+# inspected the resulting tree, only grepped for identifier strings in the
+# source text. This class closes that specific gap with a minimal,
+# hand-rolled DOM shim (no jsdom/npm dependency -- deliberately, matching
+# this repo's "no jsdom on this seat" convention cited above) that actually
+# evaluates health-detail.js (and, as the acceptance criterion's own control,
+# health-workbench.js) via Node's `vm.runInThisContext`, drives their real
+# entry points (`window.loadDetailView()` / the workbench's `DOMContentLoaded`
+# -> `init()` chain) against realistic fixture data through a stubbed
+# `fetch`, and inspects the REAL resulting element tree -- not source text.
+#
+# Scope note: this shim implements only what these two files' RENDER-TIME
+# code path touches (createElement/createElementNS, setAttribute/dataset,
+# className/textContent/innerHTML, appendChild, a `#id`-only querySelector,
+# and no-op event wiring). It deliberately does NOT implement SVG geometry
+# (`getBBox`/`getBoundingClientRect`/`viewBox.baseVal`) -- every call site
+# that needs those lives inside `fitViewBox`'s `requestAnimationFrame`
+# callback or a mouse-event handler, neither of which this test invokes (the
+# shim's `requestAnimationFrame` is a no-op that never runs its callback), so
+# the structural assertions below never depend on them. No interactive
+# testing (clicks/hovers) is performed or claimed.
+@unittest.skipUnless(_NODE_AVAILABLE, "node not available on this seat")
+class TestDetailViewRealDOMStructure(unittest.TestCase):
+    """Drives health-detail.js's real render functions (via loadDetailView())
+    against fixture data shaped like the real /api/health/v2(+/series,
+    +/model) payloads, and asserts on the ACTUAL constructed DOM tree:
+
+    1. None of the workbench's editing-control identifiers (enumerated from
+       health-workbench.js's own source below, per the issue's own
+       instruction not to guess them) appear anywhere in the Detail
+       render's tree.
+    2. The per-signal row, the composed-score block, and the aspect header
+       are actually built as multi-column grid containers with the expected
+       child elements -- not merely that the CSS class names exist in the
+       stylesheet.
+
+    Control (same acceptance criterion, other half): the identical probe
+    run against health-workbench.js's OWN real render (driven through its
+    actual `DOMContentLoaded` -> `init()` entry point, the same fixture
+    shape) DOES find every one of those identifiers -- proving the probe
+    itself is capable of finding them, so the negative result on the Detail
+    side isn't vacuous (a probe that finds nothing anywhere would pass on
+    an empty page for a boring reason)."""
+
+    _EDITING_MARKERS = [
+        "data-sig",  # knot x/y <input>s
+        "data-imp",  # importance <input>
+        "kbtn",  # every workbench edit-button class (delete/+/reset/reference)
+        "id=wb-export-section",
+        "id=wb-export-json",
+        "id=wb-export-refresh",
+        "id=wb-export-download",
+        "id=wb-export-copy",
+        "id=wb-export-reset",
+        "text=reset aspect",
+        "text=reset this curve",
+        "text=set as reference",
+        "tag=INPUT",
+    ]
+
+    def _run_harness(self):
+        script = _DOM_HARNESS_JS
+        script = script.replace("__MATH_PATH__", json.dumps(str(_MATH_JS_PATH)))
+        script = script.replace("__CURVE_PATH__", json.dumps(str(_CURVE_JS_PATH)))
+        script = script.replace("__DETAIL_PATH__", json.dumps(str(_DETAIL_JS_PATH)))
+        script = script.replace("__WORKBENCH_PATH__", json.dumps(str(_WORKBENCH_JS_PATH)))
+        result = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"DOM-harness node script failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}",
+        )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            self.fail(f"DOM-harness produced non-JSON stdout:\n{result.stdout}\nSTDERR: {result.stderr}")
+
+    def setUp(self):
+        self.report = self._run_harness()
+
+    def test_detail_render_actually_ran(self):
+        """Sanity check that the harness genuinely drove renderSignalCard/
+        renderAspectGrouped/renderComposedBlock with real-shaped data, not
+        an empty page -- the required control for the negative assertions
+        below to mean anything at all."""
+        d = self.report["detail"]
+        self.assertGreaterEqual(d["signalCardCount"], 2, "expected >=2 rendered signal cards")
+        self.assertTrue(d["composedBlockRendered"])
+        self.assertGreaterEqual(d["aspectSectionCount"], 2, "expected >=2 rendered aspect sections")
+
+    def test_detail_render_contains_no_editing_controls(self):
+        d = self.report["detail"]
+        self.assertEqual(
+            d["editingHits"], [],
+            f"Detail render must contain NONE of the editing-control identifiers, found: {d['editingHits']}",
+        )
+
+    def test_workbench_render_contains_editing_controls_control(self):
+        """The control half of the acceptance criterion: the SAME probe,
+        run against health-workbench.js's own real render, must find every
+        identifier enumerated in _EDITING_MARKERS -- proving the probe is
+        capable of finding them (so the Detail-side negative result is
+        meaningful, not a probe that never matches anything)."""
+        w = self.report["workbench"]
+        self.assertGreaterEqual(w["signalRowCount"], 2, "expected >=2 rendered workbench signal rows")
+        found_kinds = {hit.split("::", 1)[0] for hit in w["editingHits"]}
+        expected_kinds = set(self._EDITING_MARKERS)
+        missing = expected_kinds - found_kinds
+        self.assertEqual(
+            missing, set(),
+            f"control failed -- probe did not find these editing markers in the "
+            f"workbench's own real render (probe or fixture bug): {missing}",
+        )
+
+    def test_detail_signal_row_is_three_column_grid(self):
+        """Structural check, not a CSS-class-string check: the DOM node
+        health-detail.js actually appends for one signal_rows entry has the
+        `detail-signal-grid` class AND exactly 3 direct child elements
+        (left/middle/right), with content markers in each."""
+        d = self.report["detail"]
+        row = d["firstSignalGrid"]
+        self.assertIsNotNone(row, "no .detail-signal-grid element found in the rendered tree")
+        self.assertIn("detail-signal-grid", row["className"])
+        self.assertEqual(row["childCount"], 3, f"expected 3 grid columns, got {row['childCount']}")
+        self.assertTrue(row["leftHasH3"], "left column should contain the signal's <h3> header")
+        self.assertTrue(row["midHasStrip"], "middle column should contain the strip/distribution container")
+        self.assertTrue(row["rightHasCurveOrImportance"], "right column should contain the curve plot or importance readout")
+
+    def test_detail_composed_block_is_two_column_strip(self):
+        d = self.report["detail"]
+        top = d["composedStripTop"]
+        self.assertIsNotNone(top, "no .detail-strip-top element found under #detail-composed-block")
+        self.assertEqual(top["childCount"], 2, f"expected 2 columns (score, meaning), got {top['childCount']}")
+        self.assertTrue(d["composedHasDistStrip"], "a history/distribution strip should follow the top strip")
+
+    def test_detail_aspect_head_is_three_cell_grid(self):
+        d = self.report["detail"]
+        head = d["firstAspectHead"]
+        self.assertIsNotNone(head, "no .detail-aspect-head element found in the rendered tree")
+        self.assertEqual(head["childCount"], 3, f"expected 3 cells (name, sub, tile), got {head['childCount']}")
+
+    def test_workbench_signal_row_is_three_column_grid_control(self):
+        """Control for the grid-structure checks above: the workbench's own
+        `.signal` row (unmodified by this PR) is independently confirmed to
+        still be a 3-child grid container by the SAME traversal code,
+        establishing the traversal itself is sound."""
+        w = self.report["workbench"]
+        row = w["firstSignalRow"]
+        self.assertIsNotNone(row, "no .signal element found in the rendered workbench tree")
+        self.assertEqual(row["childCount"], 3, f"expected 3 grid columns (left/mid/right), got {row['childCount']}")
 
 
 @unittest.skipUnless(_NODE_AVAILABLE, "node not available on this seat")

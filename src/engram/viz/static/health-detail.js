@@ -731,9 +731,21 @@
   }
 
   // -----------------------------------------------------------------------
-  // Per-signal row -- definition/raw-counts card + strip, plus (when the
-  // model is available) the curve plot, importance readout, and the
-  // held-out / current-reference text markers.
+  // Per-signal row -- a three-column grid, per the #2868 fork ruling
+  // (health_workbench.html's `.signal` shape, ported to this page's own
+  // `.detail-signal-grid` class -- see health.html's own comment on that
+  // rule). Column split is the issue's own explicit assignment (NOT a
+  // verbatim copy of health-workbench.js's LEFT/MIDDLE/RIGHT split, which
+  // puts importance/hold-out-marker content in its own RIGHT column
+  // alongside its curve editor -- this fork's assignment matches that
+  // placement, just without the editing controls):
+  //   LEFT   -- definition/raw-counts card content (header, formula, raw
+  //             counts, today's raw + score).
+  //   MIDDLE -- the existing renderStripAndDistribution output (history +
+  //             distribution, unchanged internals).
+  //   RIGHT  -- the existing curve plot + importance readout + hold-out/
+  //             current-reference text markers (unchanged content, just
+  //             relocated).
   // -----------------------------------------------------------------------
   function renderSignalCard(row) {
     var signal = row.name;
@@ -741,30 +753,46 @@
     var cd = curveDefForSignal(signal);
     var held = metric ? metric.importance <= 0 : row.status === "held_out";
 
-    var card = el("div", { class: "card detail-signal-row" + (held ? " detail-held" : "") });
-    card.appendChild(el("h3", {
+    var card = el("div", { class: "card detail-signal-row detail-signal-grid" + (held ? " detail-held" : "") });
+
+    // ---- LEFT: definition + raw counts ----
+    var left = el("div", {});
+    left.appendChild(el("h3", {
       html: escAttr(signal) + ' <span class="detail-status-badge ' + statusClass(row.status) + '">' + escAttr(row.status) + "</span>"
         + (metric ? ' <span class="detail-aspect-tag">aspect: ' + escAttr(metric.aspect) + "</span>" : ""),
     }));
 
     var def = row.definition || {};
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">formula</span><span class="value">' + escAttr(def.formula) + "</span>" }));
+    left.appendChild(el("div", { class: "metric", html: '<span class="label">formula</span><span class="value">' + escAttr(def.formula) + "</span>" }));
     var num = def.numerator || {}, den = def.denominator || {};
     var haveCounts = num.value !== null && num.value !== undefined && den.value !== null && den.value !== undefined;
-    card.appendChild(el("div", {
+    left.appendChild(el("div", {
       class: "metric",
       html: haveCounts
         ? '<span class="label">raw counts</span><span class="value">' + fmtNum(num.value) + " / " + fmtNum(den.value) + "</span>"
         : '<span class="label">raw counts</span><span class="value">unavailable</span>',
     }));
     var today = row.today || {};
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">raw</span><span class="value">' + fmtPct(today.raw) + "</span>" }));
+    left.appendChild(el("div", { class: "metric", html: '<span class="label">raw</span><span class="value">' + fmtPct(today.raw) + "</span>" }));
     var todayScore = typeof today.score === "number" ? today.score
       : (typeof today.raw === "number" ? scoreForSignal(signal, today.raw) : null);
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">score</span><span class="value">' + fmtScore(todayScore) + "</span>" }));
+    left.appendChild(el("div", { class: "metric", html: '<span class="label">score</span><span class="value">' + fmtScore(todayScore) + "</span>" }));
+    card.appendChild(left);
 
+    // ---- MIDDLE: history & distribution ----
+    var mid = el("div", {});
+    mid.appendChild(el("div", { class: "detail-plot-label", html: "History &amp; distribution" }));
+    var stripHost = el("div", { class: "detail-strip-dist-container" });
+    mid.appendChild(stripHost);
+    var seriesArr = (state.series && state.series.signals && state.series.signals[signal]) || [];
+    var modes = [["raw", "raw series"], ["rawhist", "raw histogram"], ["score", "score series"], ["hist", "score histogram"]];
+    renderStripAndDistribution(stripHost, signal, seriesArr, modes, "raw");
+    card.appendChild(mid);
+
+    // ---- RIGHT: curve plot + importance + hold-out/current-reference ----
+    var right = el("div", {});
     if (metric) {
-      card.appendChild(el("div", { class: "metric", html: '<span class="label">importance</span><span class="value">' + fmtNum(metric.importance) + "</span>" }));
+      right.appendChild(el("div", { class: "metric", html: '<span class="label">importance</span><span class="value">' + fmtNum(metric.importance) + "</span>" }));
     }
 
     // Hold-out / current-reference TEXT markers -- Lei's ruling on #2754:
@@ -776,51 +804,71 @@
       var aspectDef = (state.model.model_defs.aspects || []).filter(function (a) { return a.name === metric.aspect; })[0];
       var refSignal = aspectDef ? aspectDef.reference_metric : null;
       if (held) {
-        card.appendChild(el("div", { class: "detail-refctl", html: "hold-out metric" }));
+        right.appendChild(el("div", { class: "detail-refctl", html: "hold-out metric" }));
       } else if (refSignal === signal) {
-        card.appendChild(el("div", { class: "detail-refctl", html: "current reference" }));
+        right.appendChild(el("div", { class: "detail-refctl", html: "current reference" }));
       }
     }
 
     if (cd) {
-      card.appendChild(el("div", { class: "detail-plot-label", html: "raw → score curve" }));
+      right.appendChild(el("div", { class: "detail-plot-label", html: "raw → score curve" }));
       var curveHost = el("div", { class: "detail-plot-container" });
-      card.appendChild(curveHost);
+      right.appendChild(curveHost);
       var curveEl = curveSVG(curveHost, signal, cd);
       fitViewBox(curveEl, 4);
     }
-
-    var stripLabel = el("div", { class: "detail-plot-label", html: "History &amp; distribution" });
-    card.appendChild(stripLabel);
-    var stripHost = el("div", { class: "detail-strip-dist-container" });
-    card.appendChild(stripHost);
-    var seriesArr = (state.series && state.series.signals && state.series.signals[signal]) || [];
-    var modes = [["raw", "raw series"], ["rawhist", "raw histogram"], ["score", "score series"], ["hist", "score histogram"]];
-    renderStripAndDistribution(stripHost, signal, seriesArr, modes, "raw");
+    card.appendChild(right);
 
     return card;
   }
 
   // -----------------------------------------------------------------------
-  // Composed-score block -- card + its own history/distribution strip
-  // (score-only: there is no single "raw" value for a composed score).
+  // Composed-score block -- the workbench's top `.strip` two-column shape
+  // (score panel | explanatory-text panel, ported to this page's own
+  // `.detail-strip-top` class -- see health.html's own comment on that
+  // rule), plus its own history/distribution strip below (score-only:
+  // there is no single "raw" value for a composed score). The workbench's
+  // own `.strip` has no history/distribution content at all (it never
+  // displays composed-score history -- see this file's own module
+  // docstring) -- JUDGMENT CALL, flagged in the dispatching report: with
+  // no workbench placement to port, the strip is placed full-width below
+  // the two-column score/meaning row rather than inside either column.
   // -----------------------------------------------------------------------
   function renderComposedBlock() {
     var prov = state.snapshot.provenance || {};
     var el1 = qs("#detail-composed-block");
     var composedValue = composedScoreForToday();
     el1.innerHTML = "";
-    var card = el("div", { class: "card" });
-    card.appendChild(el("h3", { html: "Composed Score" }));
-    card.appendChild(el("div", { class: "detail-composed-value", html: composedValue === null ? "--" : Number(composedValue).toFixed(1) }));
-    card.appendChild(el("div", { class: "detail-provenance", html: checkpointLabelHTML(prov) }));
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">snapshot</span><span class="value">' + escAttr(prov.snapshot_id) + "</span>" }));
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">turn</span><span class="value">' + escAttr(prov.turn) + "</span>" }));
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">checkpoint_mode</span><span class="value">' + escAttr(prov.checkpoint_mode) + "</span>" }));
-    card.appendChild(el("div", { class: "metric", html: '<span class="label">health_version</span><span class="value">' + escAttr(prov.health_version) + "</span>" }));
+
+    var top = el("div", { class: "detail-strip-top" });
+
+    var scoreCard = el("div", { class: "card" });
+    scoreCard.appendChild(el("h3", { html: "Composed Score" }));
+    scoreCard.appendChild(el("div", { class: "detail-composed-value", html: composedValue === null ? "--" : Number(composedValue).toFixed(1) }));
+    scoreCard.appendChild(el("div", { class: "detail-provenance", html: checkpointLabelHTML(prov) }));
+    scoreCard.appendChild(el("div", { class: "metric", html: '<span class="label">snapshot</span><span class="value">' + escAttr(prov.snapshot_id) + "</span>" }));
+    scoreCard.appendChild(el("div", { class: "metric", html: '<span class="label">turn</span><span class="value">' + escAttr(prov.turn) + "</span>" }));
+    scoreCard.appendChild(el("div", { class: "metric", html: '<span class="label">checkpoint_mode</span><span class="value">' + escAttr(prov.checkpoint_mode) + "</span>" }));
+    scoreCard.appendChild(el("div", { class: "metric", html: '<span class="label">health_version</span><span class="value">' + escAttr(prov.health_version) + "</span>" }));
+    top.appendChild(scoreCard);
+
+    // JUDGMENT CALL (flagged in the dispatching report): the workbench's
+    // `.meaning` panel disclaims EDITING ("Nothing on this page writes the
+    // substrate, the model, or any file on disk") -- reworded here since
+    // this read-only fork has no editing to disclaim in the first place,
+    // but the underlying fact (this page never writes anything) still
+    // holds and is worth keeping, per health-detail.js's own module
+    // docstring ("This page NEVER writes the substrate...").
+    var meaningCard = el("div", { class: "card detail-meaning-panel" });
+    meaningCard.appendChild(el("p", {
+      html: "This is the same importance-weighted-mean / points-weighted composition the shipped scoring model uses, recomputed here in JS from the model&rsquo;s shipped curves and importance (see <code>/static/health-workbench-curve.js</code>) for read-only display. This page never writes the substrate, the model, or any file on disk.",
+    }));
+    top.appendChild(meaningCard);
+
+    el1.appendChild(top);
+
     var stripHost = el("div", { class: "detail-strip-dist-container" });
-    card.appendChild(stripHost);
-    el1.appendChild(card);
+    el1.appendChild(stripHost);
 
     var points = ((state.series && state.series.composed) || []).map(function (p) {
       return { t: p.t, score: p.value, raw: null, unreplayable: null };
@@ -841,15 +889,26 @@
       var members = metricsForAspect(aspect.name);
       var section = el("section", { class: "detail-aspect-section" });
       var aScore = aspectScoreForToday(aspect.name);
-      section.appendChild(el("h2", {
-        html: escAttr(aspect.name) + ' <span class="detail-aspect-score">'
-          + (aScore === null ? "--" : Number(aScore).toFixed(3)) + " · "
-          + Number(aspect.points).toFixed(1) + " pts declared</span>",
-      }));
-      section.appendChild(el("div", {
+
+      // Aspect header -- the workbench's `.aspect-head` grid shape (name |
+      // sub-text | composed sub-score badge), ported to this page's own
+      // `.detail-aspect-head`/`.detail-atile` classes -- see health.html's
+      // own comment on those rules. Drops only the workbench's "reset
+      // aspect" button (an editing control this fork has nothing to
+      // reset).
+      var head = el("div", { class: "detail-aspect-head" });
+      head.appendChild(el("h2", { html: escAttr(aspect.name) }));
+      head.appendChild(el("div", {
         class: "detail-aspect-sub",
         html: members.length + " metric(s) declared · reference: " + (aspect.reference_metric || "none"),
       }));
+      var tile = el("div", { class: "detail-atile" });
+      tile.appendChild(el("span", { class: "detail-aspect-score", html: aScore === null ? "--" : Number(aScore).toFixed(3) }));
+      tile.appendChild(document.createTextNode(" · "));
+      tile.appendChild(el("span", { class: "detail-atile-pts", html: Number(aspect.points).toFixed(1) + " pts declared" }));
+      head.appendChild(tile);
+      section.appendChild(head);
+
       members.forEach(function (m) {
         var row = rows[m.signal];
         if (row) section.appendChild(renderSignalCard(row));

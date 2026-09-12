@@ -145,10 +145,29 @@
     .detail-statst th:first-child, .detail-statst td:first-child { text-align: left; color: #7ecfff; }
     .detail-statst thead th { background: #0f3460; color: #888; }
     .detail-aspect-section { border-top: 1px solid #0f3460; padding-top: 12px; margin-top: 12px; }
-    .detail-aspect-section h2 { color: #7ecfff; font-size: 1.1em; margin: 0 0 4px; }
+    .detail-aspect-section h2 { color: #7ecfff; font-size: 1.1em; margin: 0; }
     .detail-aspect-score { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8em; color: #00d4ff; }
-    .detail-aspect-sub { color: #888; font-size: 0.78em; margin-bottom: 8px; }
+    .detail-aspect-sub { color: #888; font-size: 0.78em; margin-bottom: 0; }
     .detail-refctl { margin-top: 6px; font-size: 11px; color: #7a8aa0; }
+    /* Three-panel grid fork (engram-alpha#2868) -- CSS *shapes* ported from
+       health_workbench.html's .signal/.strip/.aspect-head/.atile rules,
+       translated to this page's own hardcoded palette (never the
+       workbench's --panel/--rule/... custom properties -- this page has no
+       :root theme of its own, and the fork discipline is "copy the shape,
+       not the syntax"). Per the #2868 fork ruling, this file's classes are
+       independent of health_workbench.html's -- they are free to drift.
+       Same 1000px collapse breakpoint the workbench uses for both grids. */
+    .detail-signal-grid { display: grid; grid-template-columns: 1.05fr 1.1fr 1.25fr; gap: 16px; }
+    .detail-strip-top { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: stretch; margin-bottom: 12px; }
+    .detail-meaning-panel { font-size: 0.82em; color: #aaa; line-height: 1.5; }
+    .detail-meaning-panel code { color: #7ecfff; }
+    .detail-aspect-head { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; margin: 0 0 8px; }
+    .detail-atile { display: flex; align-items: baseline; gap: 6px; background: #0f3460; border: 1px solid #1a4a8a; border-radius: 6px; padding: 6px 12px; }
+    .detail-atile-pts { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78em; color: #888; }
+    @media (max-width: 1000px) {
+      .detail-signal-grid { grid-template-columns: 1fr; }
+      .detail-strip-top { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
