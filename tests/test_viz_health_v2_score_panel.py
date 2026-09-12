@@ -140,6 +140,19 @@ class TestRenderFailHonestBranch(_LiveServerBase):
         self.assertIn("v2.composed", fn_body)
         self.assertIn("scoreColor(v2Score)", fn_body)
 
+    def test_score_value_rounded_to_two_decimals_at_render(self):
+        """engram-alpha#2867: the displayed score must be rounded to 2 decimal
+        places at render time -- the stored composed.value keeps full
+        precision, only the text shown in the score panel is formatted.
+        scoreColor()'s own threshold comparison must keep using the raw
+        (unrounded) v2Score, not the display string."""
+        body = self._get("/health")
+        script = _extract_inline_script(body)
+        fn_body = _extract_function(script, "render")
+        self.assertIn("v2Score).toFixed(2)", fn_body)
+        # scoreColor still receives the raw value, not the rounded string
+        self.assertIn("scoreColor(v2Score)", fn_body)
+
     def test_provenance_written_at_rendered(self):
         body = self._get("/health")
         script = _extract_inline_script(body)

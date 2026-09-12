@@ -306,7 +306,10 @@
     let scoreValueHtml, scoreFootHtml;
     if (v2Score !== null) {
       const writtenAt = (v2.provenance && v2.provenance.written_at) || 'unknown';
-      scoreValueHtml = `<div class="score" style="color:${scoreColor(v2Score)}">${esc(v2Score)}</div>`;
+      // Round at render time only (#2867) -- the stored composed.value keeps
+      // its full precision; scoreColor()'s threshold comparison below still
+      // uses the raw v2Score, only the displayed text is rounded.
+      scoreValueHtml = `<div class="score" style="color:${scoreColor(v2Score)}">${esc(Number(v2Score).toFixed(2))}</div>`;
       // Coverage caveat (#2757 round 2, per Ariadne's contract): composed.value
       // is only ever computed over the SCORED aspects -- when composed_coverage
       // is < 1.0 the score is silently partial, and rendering the number alone
