@@ -517,18 +517,22 @@ class TestFrontmatterParsing:
 
 
 # ===========================================================================
-# CATEGORY 5: Single-agent guard (config-based)
+# CATEGORY 5: No-forum-configured guard (config-based)
 #
-# Changed from directory-existence check to config mode check.
-# Read commands → silent exit 0 in single-agent mode.
-# Write commands → EXIT_STATE with "single-agent mode" message.
+# Changed from mode check to forum-configured check (#2857 step 1) —
+# baton/letter/forum are symmetric for any agent once a forum is configured,
+# so the gate that actually matters is "is a forum configured", not
+# "mode == multi". A mode=single config WITH forum.url/agent_name set now
+# succeeds identically to a multi-mode config.
+# Read commands → silent exit 0 with no forum configured.
+# Write commands → EXIT_STATE with "no forum configured" message.
 # ===========================================================================
 
 class TestSingleAgentGuard:
-    """Config mode gate: single-agent → silent exit (reads) or error (writes)."""
+    """Forum-configured gate: no forum → silent exit (reads) or error (writes)."""
 
-    def test_status_single_agent_exits_0_silently(self, capsys):
-        """cmd_status with single-agent config exits 0 silently, no API calls."""
+    def test_status_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_status with no forum configured exits 0 silently, no API calls."""
         client = _make_client()
         args = argparse.Namespace()
         with pytest.raises(SystemExit) as exc_info:
@@ -538,16 +542,28 @@ class TestSingleAgentGuard:
         assert captured.out.strip() == ""
         client.get.assert_not_called()
 
-    def test_mine_single_agent_exits_0_silently(self, capsys):
-        """cmd_mine with single-agent config exits 0 silently."""
+    def test_status_single_mode_with_forum_url_succeeds(self, capsys):
+        """cmd_status with mode=single but forum.url set proceeds past the gate."""
+        client = _make_client(get_return={"projects": []})
+        args = argparse.Namespace()
+        _baton.cmd_status(
+            args,
+            {"mode": "single", "forum": {"url": "http://testforum:5002"}},
+            "borges",
+            client,
+        )
+        client.get.assert_called()
+
+    def test_mine_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_mine with no forum configured exits 0 silently."""
         client = _make_client()
         args = argparse.Namespace()
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_mine(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_OK
 
-    def test_show_single_agent_exits_0_silently(self, capsys):
-        """cmd_show with single-agent config exits 0 silently, no API call."""
+    def test_show_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_show with no forum configured exits 0 silently, no API call."""
         client = _make_client()
         args = argparse.Namespace(project_id="PR-999")
         with pytest.raises(SystemExit) as exc_info:
@@ -555,8 +571,8 @@ class TestSingleAgentGuard:
         assert exc_info.value.code == EXIT_OK
         client.get.assert_not_called()
 
-    def test_init_single_agent_exits_state(self, capsys):
-        """cmd_init with single-agent config exits EXIT_STATE with message."""
+    def test_init_no_forum_configured_exits_state(self, capsys):
+        """cmd_init with no forum configured exits EXIT_STATE with message."""
         client = _make_client()
         args = argparse.Namespace(
             project_id="PR-999", title="test", participants="borges,ariadne",
@@ -566,10 +582,25 @@ class TestSingleAgentGuard:
             _baton.cmd_init(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
 
-    def test_flip_single_agent_exits_state(self, capsys):
-        """cmd_flip with single-agent config exits EXIT_STATE with message."""
+    def test_init_single_mode_with_agent_name_succeeds(self, capsys, monkeypatch):
+        """cmd_init with mode=single but agent_name set proceeds past the gate."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-999", title="test", participants="borges,ariadne",
+            status="planning", turn=None, github=None, colleague=None,
+        )
+        _baton.cmd_init(
+            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+        )
+        client.post.assert_called()
+
+    def test_flip_no_forum_configured_exits_state(self, capsys):
+        """cmd_flip with no forum configured exits EXIT_STATE with message."""
         client = _make_client()
         args = argparse.Namespace(
             project_id="PR-1", to="ariadne", reason="done", force=False,
@@ -578,7 +609,7 @@ class TestSingleAgentGuard:
             _baton.cmd_flip(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
 
     def test_flip_missing_project_exits_1(self, capsys):
         """flip referencing non-existent project ID → EXIT_VALIDATION."""
@@ -1939,12 +1970,12 @@ class TestPoolSentinel:
         client.post.assert_not_called()
 
     def test_missing_config_fails_loud(self, capsys):
-        """cmd_claim with empty config (no mode) exits EXIT_STATE (single-agent mode).
+        """cmd_claim with empty config (no forum configured) exits EXIT_STATE.
 
         Replaces the old subprocess test that verified missing config.json +
-        no BATON_POOL_SENTINEL caused a loud failure. With the config-based gate,
-        missing/empty config → mode defaults to 'single' → EXIT_STATE immediately,
-        before any sentinel resolution is attempted.
+        no BATON_POOL_SENTINEL caused a loud failure. With the forum-configured
+        gate, missing/empty config → no forum.url, no agent_name → EXIT_STATE
+        immediately, before any sentinel resolution is attempted.
         """
         client = _make_client()
         args = argparse.Namespace(project_id="pool-no-config")
@@ -1953,7 +1984,23 @@ class TestPoolSentinel:
             _baton.cmd_claim(args, {}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
+
+    def test_missing_mode_with_forum_configured_succeeds_past_gate(self, capsys):
+        """cmd_claim with mode absent but agent_name set proceeds past the gate.
+
+        Control case for the above: an otherwise-empty config with just
+        agent_name set is NOT held at the forum-configured gate — it reaches
+        the project-ID validation instead (EXIT_VALIDATION, not EXIT_STATE).
+        """
+        client = _make_client()
+        args = argparse.Namespace(project_id="badid")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, {"agent_name": "borges"}, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "invalid project ID" in captured.err
 
 
 # ===========================================================================
@@ -2148,13 +2195,28 @@ class TestAddParticipant:
         captured = capsys.readouterr()
         assert "already a participant" in captured.out.lower()
 
-    def test_add_participant_single_agent_mode_exits_state(self):
-        """add-participant in single-agent mode refuses (write command)."""
+    def test_add_participant_no_forum_configured_exits_state(self):
+        """add-participant with no forum configured refuses (write command)."""
         client = _make_client()
         args = argparse.Namespace(project_id="PR-604", participant="alex")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
+
+    def test_add_participant_single_mode_with_forum_configured_succeeds(self, capsys):
+        """add-participant with mode=single but forum.url set proceeds past the gate."""
+        client = _make_client(
+            post_return={"seq": 4, "added": True},
+            get_return={"raw": _make_raw_baton("PR-604")},
+        )
+        args = argparse.Namespace(project_id="PR-604", participant="alex")
+        _baton.cmd_add_participant(
+            args,
+            {"mode": "single", "forum": {"url": "http://testforum:5002"}},
+            "borges",
+            client,
+        )
+        client.post.assert_called()
 
     def test_add_participant_then_flip_to_new_participant_succeeds(self, monkeypatch):
         """End-to-end regression guard: the whole point of the verb (#1609).
@@ -2300,13 +2362,25 @@ class TestSetColleague:
         captured = capsys.readouterr()
         assert "added as participant" not in captured.out.lower()
 
-    def test_set_colleague_single_agent_mode_exits_state(self):
-        """set-colleague in single-agent mode refuses (write command)."""
+    def test_set_colleague_no_forum_configured_exits_state(self):
+        """set-colleague with no forum configured refuses (write command)."""
         client = _make_client()
         args = argparse.Namespace(project_id="PR-707", colleague="alex")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_set_colleague(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
+
+    def test_set_colleague_single_mode_with_agent_name_succeeds(self, capsys):
+        """set-colleague with mode=single but agent_name set proceeds past the gate."""
+        client = _make_client(
+            post_return={"seq": 6, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-707")},
+        )
+        args = argparse.Namespace(project_id="PR-707", colleague="alex")
+        _baton.cmd_set_colleague(
+            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+        )
+        client.post.assert_called()
 
     def test_init_sends_colleague_to_server(self, monkeypatch):
         """#2764: --colleague at init is now actually POSTed, not dropped

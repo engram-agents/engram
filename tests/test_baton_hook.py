@@ -23,7 +23,9 @@ Behaviors covered:
     8.  turn_since is parsed to a datetime object.
 
   Integration -- main() rendering:
-    9.  Single-agent guard (mode='single') -> silent exit 0, no output.
+    9.  No-forum-configured guard (no forum.url, no agent_name) -> silent
+        exit 0, no output. (mode='single' WITH forum.url/agent_name set
+        succeeds identically to mode='multi' — #2857 step 1.)
     10. forum_api gate (_FORUM_API_OK=False) -> silent exit 0, no output.
     11. Empty project list -> no output.
     12. No batons in court -> no output.
@@ -120,11 +122,20 @@ def _ts(offset_minutes: int) -> datetime:
 
 def _write_config(
     engram_home: Path,
-    agent_name: str = "borges",
+    agent_name="borges",
     mode: str = "multi",
+    forum_url=None,
 ) -> None:
-    """Write a minimal config.json into engram_home."""
-    cfg = {"mode": mode, "agent_name": agent_name}
+    """Write a minimal config.json into engram_home.
+
+    agent_name=None omits the agent_name field entirely (for the
+    no-forum-configured gate tests); forum_url, if given, sets forum.url.
+    """
+    cfg = {"mode": mode}
+    if agent_name is not None:
+        cfg["agent_name"] = agent_name
+    if forum_url is not None:
+        cfg["forum"] = {"url": forum_url}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -310,16 +321,27 @@ class TestMyBatons:
 class TestMainRendering:
     """Integration tests for main(): in-court baton surfacing."""
 
-    # 9. Single-agent gate
-    def test_single_agent_gate_silent_exit(self, engram_home):
-        """mode='single' in config -> hook exits 0 with no output."""
-        _write_config(engram_home, mode="single")
+    # 9. No-forum-configured gate
+    def test_no_forum_configured_gate_silent_exit(self, engram_home):
+        """No forum.url, no agent_name in config -> hook exits 0 with no output."""
+        _write_config(engram_home, mode="single", agent_name=None)
         mod = _load_hook_module(engram_home)
         stdout, stderr, rc = _call_main(mod, projects=[
             _make_project_dict("PR-10", turn="borges"),
         ])
         assert rc == 0
-        assert stdout.strip() == "", "single-agent mode must produce no output"
+        assert stdout.strip() == "", "no forum configured must produce no output"
+
+    # 9b. Control: mode='single' WITH a forum configured succeeds
+    def test_single_mode_with_forum_configured_succeeds(self, engram_home):
+        """mode='single' but agent_name set -> hook proceeds (not held at the gate)."""
+        _write_config(engram_home, mode="single", agent_name="borges")
+        mod = _load_hook_module(engram_home)
+        stdout, stderr, rc = _call_main(mod, projects=[
+            _make_project_dict("PR-10", turn="borges"),
+        ])
+        assert rc == 0
+        assert "PR-10" in stdout
 
     # 10. forum_api import failure gate
     def test_forum_api_gate_silent_exit(self, engram_home):

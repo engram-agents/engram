@@ -15,7 +15,7 @@
     "dynamic_dispatch_exclusions": [
       {
         "file": "engram_client.py",
-        "line": 453,
+        "line": 467,
         "reason": "Test/SDK harness (ClientHarness.call) invokes already-terminal @mcp.tool dispatch targets by name via a dict built from getattr(server, name); walk correctness is unaffected because dispatch targets are the walk's own stopping point, not an intermediate hop toward one."
       },
       {
@@ -527,18 +527,15 @@
     },
     {
       "path": "tools/forum-mention-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/forum-updates-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/_proc_identity.py",
       "tier": "convenience",
-      "multi_agent": true,
       "reason": "shared process-identity verification (#2321), extracted from forum-mention-monitor.sh/forum-updates-monitor.sh -- ships alongside both, same tier"
     },
     {
@@ -547,8 +544,7 @@
     },
     {
       "path": "tools/ia.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/dump_mcp_schema.py",
@@ -556,8 +552,7 @@
     },
     {
       "path": "tools/baton.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/_channel.py",
@@ -574,8 +569,7 @@
     },
     {
       "path": "tools/forum_api.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/_status_derive.py",
@@ -802,14 +796,12 @@
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
       "dest": "hooks/engram-inter-agent-prompt-hook.py",
-      "multi_agent": true,
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-baton-prompt-hook.py",
       "tier": "convenience",
       "dest": "hooks/engram-baton-prompt-hook.py",
-      "multi_agent": true,
       "identity_coupled": true
     },
     {
@@ -968,14 +960,12 @@
     {
       "path": "skills/claude/engram-letter",
       "tier": "convenience",
-      "dest": "skills/engram-letter",
-      "multi_agent": true
+      "dest": "skills/engram-letter"
     },
     {
       "path": "skills/claude/engram-baton",
       "tier": "convenience",
-      "dest": "skills/engram-baton",
-      "multi_agent": true
+      "dest": "skills/engram-baton"
     },
     {
       "path": "skills/claude/engram-forum",
@@ -990,8 +980,7 @@
     {
       "path": "skills/claude/engram-collaborating-loop",
       "tier": "convenience",
-      "dest": "skills/engram-collaborating-loop",
-      "multi_agent": true
+      "dest": "skills/engram-collaborating-loop"
     },
     {
       "path": "skills/claude/engram-self-improve",
@@ -1079,8 +1068,7 @@
     },
     {
       "path": "templates/template.CLAUDE.multi-agent.md",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "templates/agents.json.example",

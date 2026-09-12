@@ -90,10 +90,19 @@ def _run_ia(
 def _write_config(
     engram_home: Path,
     mode: str = "multi",
-    agent_name: str = "ariadne",
+    agent_name="ariadne",
+    forum_url=None,
 ) -> None:
-    """Write a minimal config.json into engram_home."""
-    cfg = {"mode": mode, "agent_name": agent_name}
+    """Write a minimal config.json into engram_home.
+
+    agent_name=None omits the agent_name field entirely (for the
+    no-forum-configured gate tests); forum_url, if given, sets forum.url.
+    """
+    cfg = {"mode": mode}
+    if agent_name is not None:
+        cfg["agent_name"] = agent_name
+    if forum_url is not None:
+        cfg["forum"] = {"url": forum_url}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -220,51 +229,66 @@ class TestSmoke:
 
 
 class TestModeGate:
-    """Single-agent mode returns a clean error (exit 3) for all DM commands."""
+    """No forum configured returns a clean error (exit 3) for all DM commands.
 
-    def test_list_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    mode=single WITH forum.url/agent_name set now succeeds identically to
+    mode=multi (#2857 step 1) — the gate that actually matters is "is a
+    forum configured", not the mode field.
+    """
+
+    def test_list_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
-        assert "mode='multi'" in stderr
+        assert "no forum configured" in stderr
         assert "inter-agent/README.md" in stderr
 
-    def test_read_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    def test_list_single_mode_with_forum_configured_proceeds_past_gate(self, engram_home):
+        """mode=single but agent_name set → list proceeds past the gate."""
+        _write_config(engram_home, "single", agent_name="ariadne")
+        rc, stdout, stderr = _run_ia(
+            engram_home, "list",
+            env_overrides={"FORUM_URL": "http://localhost:1"},
+        )
+        # Gate no longer fires -- command proceeds and fails loud on the
+        # unreachable forum instead (EXIT_IO), never EXIT_STATE.
+        assert rc != EXIT_STATE
+
+    def test_read_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "read", "borges")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
-    def test_write_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    def test_write_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(
             engram_home, "write", "--to", "borges", "--from-stdin",
             stdin_text="hello",
         )
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
-    def test_mark_read_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    def test_mark_read_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "mark-read")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
-    def test_cursor_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    def test_cursor_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "cursor", "--show")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
-    def test_peers_single_mode_exits_3(self, engram_home):
-        _write_config(engram_home, "single")
+    def test_peers_no_forum_configured_exits_3(self, engram_home):
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(
             engram_home, "peers",
             env_overrides={"FORUM_URL": "http://localhost:1"},
         )
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
     def test_status_single_mode_exits_0(self, engram_home):
         """ia status is exempt from the mode gate (diagnostic utility)."""
@@ -277,12 +301,12 @@ class TestModeGate:
         assert "single" in stdout
 
     def test_missing_config_treated_as_single(self, engram_home):
-        """No config.json → mode defaults to 'single' → exit 3 for DM commands."""
+        """No config.json → no forum configured → exit 3 for DM commands."""
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
 
     def test_corrupt_config_treated_as_single(self, engram_home):
-        """Corrupt config.json → mode defaults to 'single' → exit 3."""
+        """Corrupt config.json → no forum configured → exit 3."""
         (engram_home / "config.json").write_text("{not valid json")
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
@@ -290,11 +314,10 @@ class TestModeGate:
 
     def test_mode_gate_error_has_all_three_lines(self, engram_home):
         """Mode gate error emits all three required lines (DESIGN §9.4)."""
-        _write_config(engram_home, "single")
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "list")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
-        assert "mode='multi'" in stderr
+        assert "no forum configured" in stderr
         assert "inter-agent/README.md" in stderr
 
 
@@ -735,12 +758,12 @@ class TestMarkRead:
         # since should be the cursor value (5)
         assert call_params["since"] == "5"
 
-    def test_mark_read_subprocess_multi_mode(self, engram_home):
-        """ia mark-read in single mode → exit 3 (mode gate fires)."""
-        _write_config(engram_home, "single")
+    def test_mark_read_subprocess_no_forum_configured(self, engram_home):
+        """ia mark-read with no forum configured → exit 3 (gate fires)."""
+        _write_config(engram_home, "single", agent_name=None)
         rc, stdout, stderr = _run_ia(engram_home, "mark-read")
         assert rc == EXIT_STATE
-        assert "single-agent mode" in stderr
+        assert "no forum configured" in stderr
 
 
 # ===========================================================================

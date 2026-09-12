@@ -58,6 +58,20 @@ def is_multi_agent_mode() -> bool:
     return config.get("mode", "single") == "multi"
 
 
+def is_forum_configured() -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Baton/letter/forum are symmetric for any agent, alone on its host or not,
+    once a forum is configured — this is the check that actually gates them,
+    independent of the (separate, topology-only) mode field above.
+    """
+    config = _load_engram_config()
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
+
+
 def get_counterparts() -> list[str]:
     """List of peer agent names on this host. Empty in single mode."""
     config = _load_engram_config()

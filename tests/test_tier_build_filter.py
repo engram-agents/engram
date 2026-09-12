@@ -98,11 +98,20 @@ class TestPredicate:
     # A dev tool — ships only at dev tier
     DEV_TOOL = "tools/scan-leaks.py"
 
-    # A multi-agent hook (convenience+MA) — needs --multi-agent
-    MA_HOOK = "hooks/claude/engram-baton-prompt-hook.py"
+    # An MA-gated entry (convenience+MA) — needs --multi-agent.
+    # NOTE (#2857 step 1): no hook or skill is MA-gated any longer — every
+    # forum-backed hook/skill (baton/inter-agent hooks, engram-letter/
+    # engram-baton/engram-collaborating-loop skills) was un-gated, since
+    # baton/letter/forum are symmetric for any agent once a forum is
+    # configured. The two remaining MA-gated fixtures below are plain
+    # tools/scripts, not a hook or skill — see tiers.json's 6-item "leave
+    # gated" list (session.py / _channel.py / _session_context.py /
+    # agents.json.example / the two collab-*-monitor.sh scripts), none of
+    # which are forum-backed.
+    MA_GATED_ENTRY_1 = "tools/session.py"
 
-    # A multi-agent skill (convenience+MA) — needs --multi-agent
-    MA_SKILL = "skills/claude/engram-letter"
+    # A second MA-gated entry (convenience+MA) — needs --multi-agent.
+    MA_GATED_ENTRY_2 = "tools/collab-baton-monitor.sh"
 
     # A convenience tool with no MA flag (forum.py) — ships at convenience, no MA needed
     FORUM_TOOL = "tools/forum.py"
@@ -149,33 +158,33 @@ class TestPredicate:
     def test_dev_tool_ships_at_dev_ma(self):
         assert ships(self.manifest, self.DEV_TOOL, "dev", multi_agent=True)
 
-    # --- multi-agent hook: needs right tier AND --multi-agent ---
+    # --- MA-gated entry 1: needs right tier AND --multi-agent ---
 
-    def test_ma_hook_blocked_without_ma_flag(self):
-        assert not ships(self.manifest, self.MA_HOOK, "convenience", multi_agent=False)
+    def test_ma_gated_entry_1_blocked_without_ma_flag(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "convenience", multi_agent=False)
 
-    def test_ma_hook_blocked_without_ma_flag_dev(self):
-        assert not ships(self.manifest, self.MA_HOOK, "dev", multi_agent=False)
+    def test_ma_gated_entry_1_blocked_without_ma_flag_dev(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "dev", multi_agent=False)
 
-    def test_ma_hook_blocked_with_ma_but_too_low_tier(self):
-        assert not ships(self.manifest, self.MA_HOOK, "essential", multi_agent=True)
+    def test_ma_gated_entry_1_blocked_with_ma_but_too_low_tier(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "essential", multi_agent=True)
 
-    def test_ma_hook_ships_at_convenience_with_ma(self):
-        assert ships(self.manifest, self.MA_HOOK, "convenience", multi_agent=True)
+    def test_ma_gated_entry_1_ships_at_convenience_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY_1, "convenience", multi_agent=True)
 
-    def test_ma_hook_ships_at_dev_with_ma(self):
-        assert ships(self.manifest, self.MA_HOOK, "dev", multi_agent=True)
+    def test_ma_gated_entry_1_ships_at_dev_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY_1, "dev", multi_agent=True)
 
-    # --- multi-agent skill: same pattern ---
+    # --- MA-gated entry 2: same pattern ---
 
-    def test_ma_skill_blocked_without_ma_flag(self):
-        assert not ships(self.manifest, self.MA_SKILL, "convenience", multi_agent=False)
+    def test_ma_gated_entry_2_blocked_without_ma_flag(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY_2, "convenience", multi_agent=False)
 
-    def test_ma_skill_ships_at_convenience_with_ma(self):
-        assert ships(self.manifest, self.MA_SKILL, "convenience", multi_agent=True)
+    def test_ma_gated_entry_2_ships_at_convenience_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY_2, "convenience", multi_agent=True)
 
-    def test_ma_skill_ships_at_dev_with_ma(self):
-        assert ships(self.manifest, self.MA_SKILL, "dev", multi_agent=True)
+    def test_ma_gated_entry_2_ships_at_dev_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY_2, "dev", multi_agent=True)
 
     # --- forum.py: convenience, no MA flag → ships at convenience without --multi-agent ---
 
@@ -262,17 +271,32 @@ class TestGapClosure:
             "even when multi-agent infra was present."
         )
 
-    def test_gap_closure_items_absent_at_convenience_without_ma(self):
-        """MA surfaces are correctly absent from the default (convenience, no MA) build."""
+    def test_gap_closure_items_present_at_convenience_without_ma(self):
+        """Forum-backed gap-closure surfaces now ship in the DEFAULT build too.
+
+        #2857 step 1 dropped the multi_agent gate from every genuinely
+        forum-backed mechanism, including the baton hook and the letter
+        skill this class exists to guard — baton/letter/forum are symmetric
+        for any agent once a forum is configured, so `--multi-agent` is no
+        longer required for them. This inverts the pre-#2857 assertion below
+        (baton hook / letter skill used to be absent from the convenience,
+        no-MA build; they are now present, matching forum.py's un-gated
+        shape all along).
+        """
         default_set = shipping_set(self.manifest, tier="convenience", multi_agent=False)
-        # baton hook and letter skill are MA-gated → must NOT ship without --multi-agent
-        assert self.BATON_HOOK not in default_set, (
-            f"{self.BATON_HOOK!r} must NOT ship at --tier convenience without --multi-agent"
+        assert self.BATON_HOOK in default_set, (
+            f"{self.BATON_HOOK!r} should ship at --tier convenience without --multi-agent "
+            "now that it is forum-backed and un-gated (#2857 step 1)"
         )
-        assert self.LETTER_SKILL not in default_set, (
-            f"{self.LETTER_SKILL!r} must NOT ship at --tier convenience without --multi-agent"
+        assert self.INTER_AGENT_HOOK in default_set, (
+            f"{self.INTER_AGENT_HOOK!r} should ship at --tier convenience without --multi-agent "
+            "now that it is forum-backed and un-gated (#2857 step 1)"
         )
-        # forum.py has no MA flag → DOES ship at convenience without --multi-agent
+        assert self.LETTER_SKILL in default_set, (
+            f"{self.LETTER_SKILL!r} should ship at --tier convenience without --multi-agent "
+            "now that it is forum-backed and un-gated (#2857 step 1)"
+        )
+        # forum.py never had an MA flag → DOES ship at convenience without --multi-agent
         assert self.FORUM_TOOL in default_set, (
             f"{self.FORUM_TOOL!r} should ship at --tier convenience (no MA flag on this entry)"
         )

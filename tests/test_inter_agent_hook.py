@@ -27,7 +27,9 @@ Behaviors covered:
     11. Duplicate senders deduplicated.
 
   Integration -- main() rendering:
-    12. Single-agent guard (mode='single') -> silent exit 0, no output.
+    12. No-forum-configured guard (no forum.url, no agent_name) -> silent
+        exit 0, no output. (mode='single' WITH forum.url/agent_name set
+        succeeds identically to mode='multi' — #2857 step 1.)
     13. forum_api gate (_FORUM_API_OK=False) -> silent exit 0, no output.
     14. No DMs -> no output; surfaced cursor advances.
     15. 1 new DM -> new-message block emitted.
@@ -106,11 +108,20 @@ def _make_updates_response(
 
 def _write_config(
     engram_home: Path,
-    agent_name: str = "borges",
+    agent_name="borges",
     mode: str = "multi",
+    forum_url=None,
 ) -> None:
-    """Write a minimal config.json into engram_home."""
-    cfg = {"mode": mode, "agent_name": agent_name, "counterparts": []}
+    """Write a minimal config.json into engram_home.
+
+    agent_name=None omits the agent_name field entirely (for the
+    no-forum-configured gate tests); forum_url, if given, sets forum.url.
+    """
+    cfg = {"mode": mode, "counterparts": []}
+    if agent_name is not None:
+        cfg["agent_name"] = agent_name
+    if forum_url is not None:
+        cfg["forum"] = {"url": forum_url}
     (engram_home / "config.json").write_text(json.dumps(cfg))
 
 
@@ -321,18 +332,30 @@ class TestFormatSenders:
 class TestMainRendering:
     """Integration tests for main(): DM surfacing behavior."""
 
-    # 12. Single-agent gate
-    def test_single_agent_gate_silent_exit(self, engram_home):
-        """mode='single' in config -> hook exits 0 with no output."""
-        _write_config(engram_home, mode="single")
+    # 12. No-forum-configured gate
+    def test_no_forum_configured_gate_silent_exit(self, engram_home):
+        """No forum.url, no agent_name in config -> hook exits 0 with no output."""
+        _write_config(engram_home, mode="single", agent_name=None)
         mod = _load_hook_module(engram_home)
         stdout, stderr, rc = _call_main(mod, updates=[
             _make_dm_update(1, "ariadne", "Hello"),
         ])
         assert rc == 0
-        assert stdout.strip() == "", "single-agent mode must produce no output"
-        # Surfaced cursor must NOT be written in single mode
+        assert stdout.strip() == "", "no forum configured must produce no output"
+        # Surfaced cursor must NOT be written when no forum is configured
         assert _read_surfaced_cursor(engram_home) == -1
+
+    # 12b. Control: mode='single' WITH a forum configured succeeds
+    def test_single_mode_with_forum_configured_succeeds(self, engram_home):
+        """mode='single' but agent_name set -> hook proceeds (not held at the gate)."""
+        _write_config(engram_home, mode="single", agent_name="borges")
+        mod = _load_hook_module(engram_home)
+        stdout, stderr, rc = _call_main(mod, updates=[
+            _make_dm_update(1, "ariadne", "Hello"),
+        ])
+        assert rc == 0
+        assert stdout.strip() != ""
+        assert _read_surfaced_cursor(engram_home) != -1
 
     # 13. forum_api gate (_FORUM_API_OK=False)
     def test_forum_api_gate_silent_exit(self, engram_home):
@@ -647,9 +670,9 @@ class TestMainRendering:
         assert rc == 0
         assert stdout.strip() == "", "No DMs -> no stdout; footer must not appear"
 
-    # 29. Missing config -> mode defaults to single -> silent exit
+    # 29. Missing config -> no forum configured -> silent exit
     def test_missing_config_treated_as_single(self, engram_home):
-        """No config.json -> mode defaults to 'single', hook exits silently."""
+        """No config.json -> no forum.url/agent_name, hook exits silently."""
         mod = _load_hook_module(engram_home)  # no config written
         stdout, stderr, rc = _call_main(mod, updates=[
             _make_dm_update(1, "ariadne", "Hello"),

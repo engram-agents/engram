@@ -476,7 +476,7 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 ## Step 7 — Tell the user what's next
 
-What you tell the user here depends on whether this install is single-agent or multi-agent. Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
+What you tell the user here depends on whether this install is single-agent or multi-agent — a *topology* question (is this a newly-spawned co-resident agent that still needs its Linux-uid substrate rename?), separate from whether a forum is configured (which gates baton/letter/forum use, per #2857 step 1, but says nothing about uid finalization — a genuinely single-host agent can have a forum configured for cross-host LAN coordination without ever needing `finalize-name`). Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
 
 ### Multi-agent mode
 

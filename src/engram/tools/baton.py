@@ -110,16 +110,17 @@ def _api_get_raw(client, project_id):
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
 
-def _require_multi_agent(config=None) -> None:
-    """Exit with EXIT_STATE if not in multi-agent mode.
+def _require_forum(config=None) -> None:
+    """Exit with EXIT_STATE if no forum is configured.
 
-    Write commands call this guard at entry. Single-agent installs that
-    run a write command get a clear actionable message rather than an
-    obscure API error.
+    Write commands call this guard at entry. Installs with no forum
+    configured that run a write command get a clear actionable message
+    rather than an obscure API error.
     """
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         print(
-            "baton: this host is in single-agent mode; baton is multi-agent-only.",
+            "baton: no forum configured (set forum.url or agent_name in "
+            "config.json); baton requires a configured forum.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -176,11 +177,19 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
-    """True if config.json mode == 'multi' (mirrors ia.py / the engram hook helper)."""
+def _is_forum_configured(config: Optional[dict] = None) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Gates write commands: if neither forum.url nor agent_name is in config,
+    baton refuses with an actionable message. Mirrors ia.py / the engram hook
+    helper.
+    """
     if config is None:
         config = _load_config()
-    return config.get("mode", "single") == "multi"
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +638,7 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     err = _validate_project_id(project_id)
@@ -866,7 +875,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     to_agent = args.to.strip().lower()
@@ -1156,7 +1165,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     turn == pool sentinel (the install's primary_user); refuses to steal from
     another agent.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
 
@@ -1244,7 +1253,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
     restricted to the current holder (only you can release what you hold).
     With --done, also appends '(done)' to the project title (idempotent).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     mark_done = args.done
@@ -1320,7 +1329,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
 # ---------------------------------------------------------------------------
 
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1379,7 +1388,7 @@ def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1399,7 +1408,7 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1467,7 +1476,7 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: 
     Inverse of cmd_close. Only operates on batons with status: merged or
     cancelled. Refuses if the baton is already in a non-closed status.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1543,7 +1552,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     loop-start to drain the backlog of merged/closed PR-batons that the
     hook cannot reach (uncached anchors).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     if not shutil.which("gh"):
         print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
@@ -1659,7 +1668,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
 # ---------------------------------------------------------------------------
 
 def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_title = args.title
@@ -1737,7 +1746,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
     exists, parseable frontmatter), then delegates the write to the forum
     API via client.post.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     github_anchor = args.github.strip().lower()
@@ -1798,7 +1807,7 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
     server-side (add_participant() in coordination.projects) — this CLI's
     own already-present check is a UX nicety only, never the source of truth.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_participant = args.participant.strip().lower()
@@ -1873,7 +1882,7 @@ def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, c
     (set_colleague() in coordination.projects), same split as
     cmd_add_participant.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     colleague = args.colleague.strip().lower()
@@ -1946,7 +1955,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     --force skips gates 3-4 only; never skips 1-2.
     --dry-run prints the ladder verdict without merging.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     # Resolve project_id and pr_number from the argument (PR-N or bare N)
     raw_arg = args.pr.strip()
