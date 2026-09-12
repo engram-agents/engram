@@ -31,7 +31,21 @@ from engram_confidence import (
     REASONING_TYPES,
 )
 
-from engram_log_emitter import emit_if_initialized
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -280,18 +294,55 @@ def _derive_impl(
         )
         if block is not None:
             # --- engram.tool.engram_call event — blocked path (DESIGN.md §4.2) ---
-            emit_if_initialized(
-                event_type="engram.tool.engram_call",
-                level=1,
-                data={
-                    "tool_name": "engram_derive",
-                    "supporting_ids_count": len(ids),
-                    "reasoning_type": reasoning_type,
-                    "premise_validation_warnings": [],
-                    "result_status": block.get("status", "blocked"),
-                    "result_node_id": None,
-                },
-            )
+            # alpha #2574 WS5: site attestation + outcome recording +
+            # protection (docs/2574-telemetry-design.md §1/§4/§5). A new,
+            # narrowly-scoped try/except around this new code only --
+            # emit_if_initialized() never raises (its own contract) and
+            # write_telemetry_record() never raises (WS1's contract), so
+            # this is defense-in-depth against a future change to either
+            # contract, not a live risk today -- rather than adding an
+            # except clause to the wider pre-existing try/finally around
+            # this whole function (which would swallow unrelated business
+            # errors it was never meant to catch). §11.1: catch-and-drop is
+            # mandatory here since this function's own try/finally has no
+            # handler, so an uncaught raise would propagate straight out of
+            # this MCP tool call.
+            _site = "server.engram_derive.blocked"
+            try:
+                _had_emitter = Emitter.get() is not None
+                _uid = emit_if_initialized(
+                    event_type="engram.tool.engram_call",
+                    level=1,
+                    data={
+                        "tool_name": "engram_derive",
+                        "supporting_ids_count": len(ids),
+                        "reasoning_type": reasoning_type,
+                        "premise_validation_warnings": [],
+                        "result_status": block.get("status", "blocked"),
+                        "result_node_id": None,
+                    },
+                    site="server.engram_derive.blocked",
+                )
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={
+                        "outcome": (
+                            "delivered" if _uid is not None
+                            else "dropped" if _had_emitter
+                            else "no_emitter"
+                        )
+                    },
+                )
+            except Exception:
+                try:
+                    write_telemetry_record(
+                        manifest_id=_site,
+                        event_type="engram.tool.engram_call",
+                        fields={"outcome": "init_failed"},
+                    )
+                except Exception:
+                    pass
             if independence_advisory:
                 block["independence_advisory"] = independence_advisory
             return json.dumps(block)
@@ -362,18 +413,44 @@ def _derive_impl(
             result["independence_advisory"] = independence_advisory
 
         # --- engram.tool.engram_call event — success path (DESIGN.md §4.2) ---
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_derive",
-                "supporting_ids_count": len(ids),
-                "reasoning_type": success["reasoning_type"],
-                "premise_validation_warnings": success.get("structure_warnings") or [],
-                "result_status": "created",
-                "result_node_id": success["node_id"],
-            },
-        )
+        # alpha #2574 WS5: see the blocked-path site above for the full
+        # protection/outcome-recording rationale (identical shape here).
+        _site = "server.engram_derive.created"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_derive",
+                    "supporting_ids_count": len(ids),
+                    "reasoning_type": success["reasoning_type"],
+                    "premise_validation_warnings": success.get("structure_warnings") or [],
+                    "result_status": "created",
+                    "result_node_id": success["node_id"],
+                },
+                site="server.engram_derive.created",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         return json.dumps(result)
     finally:
@@ -527,18 +604,44 @@ def _contradict_impl(
         # target_id captures both conflicting nodes; the new contradiction node
         # id is emitted as result_node_id. Includes both node IDs since
         # contradictions link two targets (not a single "target").
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_contradict",
-                "target_id": node_id_a,
-                "target_id_b": node_id_b,
-                "action_type": "contradict",
-                "result_status": "created",
-                "result_node_id": node_id,
-            },
-        )
+        # alpha #2574 WS5: see _derive_impl's blocked-path site (above, this
+        # file) for the full protection/outcome-recording rationale.
+        _site = "server.engram_contradict"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_contradict",
+                    "target_id": node_id_a,
+                    "target_id_b": node_id_b,
+                    "action_type": "contradict",
+                    "result_status": "created",
+                    "result_node_id": node_id,
+                },
+                site="server.engram_contradict",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         return json.dumps(
             {

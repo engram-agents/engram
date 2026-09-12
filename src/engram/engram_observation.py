@@ -82,7 +82,21 @@ from urllib.parse import urlparse
 import engram_core as core
 from engram_anchoring import anchor as _anchor_claim
 from engram_anchoring import quote_claim_similarity as _quote_claim_similarity
-from engram_log_emitter import emit_if_initialized
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 # VALID_QUOTE_TYPES and VALID_SOURCE_CLASSES come from engram_confidence via
 # server.py imports.  Family A receives them as arguments or via the function
@@ -1894,21 +1908,52 @@ def _add_observation_impl(
             if sims:
                 _highest_sim = max(sims)
             _first_hint = similar_matches[0].get("action_hint")
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_add_observation",
-                "similar_existing_returned_count": _similar_count,
-                "highest_similarity": _highest_sim,
-                "dedup_action_hint": _first_hint,
-                "result_status": result.get("status"),
-                "result_node_id": result.get("observation_id"),
-                "validation_warnings": (
-                    [result["yellow_card_warning"]] if result.get("yellow_card_warning") else []
-                ),
-            },
-        )
+        # alpha #2574 WS5: site attestation + outcome recording +
+        # protection (docs/2574-telemetry-design.md §1/§4/§5). New,
+        # narrowly-scoped try/except around this new code only -- see
+        # engram_derive.py's _derive_impl blocked-path site for the full
+        # rationale (identical shape: this function's own try/finally has
+        # no except, so an uncaught raise here would propagate straight
+        # out of this MCP tool call, breaching §8).
+        _site = "server.engram_add_observation"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_add_observation",
+                    "similar_existing_returned_count": _similar_count,
+                    "highest_similarity": _highest_sim,
+                    "dedup_action_hint": _first_hint,
+                    "result_status": result.get("status"),
+                    "result_node_id": result.get("observation_id"),
+                    "validation_warnings": (
+                        [result["yellow_card_warning"]] if result.get("yellow_card_warning") else []
+                    ),
+                },
+                site="server.engram_add_observation",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
         return json.dumps(core._strip_agent_facing(result))
     finally:
         conn.close()
@@ -2050,22 +2095,50 @@ def _add_observation_batch_impl(
     # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
     # Batch-level summary event — one event for the entire batch MCP call.
     # Per-observation events are already emitted by _add_observation_impl above.
-    emit_if_initialized(
-        event_type="engram.tool.engram_call",
-        level=1,
-        data={
-            "tool_name": "engram_add_observation_batch",
-            "result_status": "batch_complete",
-            "result_node_id": None,
-            "batch_total": len(observations),
-            "batch_created": len(created),
-            "batch_error_count": len(observations) - len(created),
-            "validation_warnings": (
-                [batch_result["yellow_card_warning"]]
-                if batch_result.get("yellow_card_warning")
-                else []
-            ),
-        },
-    )
+    # alpha #2574 WS5: this site sits with NO surrounding try at all (§0.1) --
+    # a NEW try wraps it (§10: "a new try wrapping each of the two
+    # no-try-at-all consumer sites"), same protective purpose and shape as
+    # the try/finally sites above.
+    _site = "server.engram_add_observation_batch"
+    try:
+        _had_emitter = Emitter.get() is not None
+        _uid = emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_add_observation_batch",
+                "result_status": "batch_complete",
+                "result_node_id": None,
+                "batch_total": len(observations),
+                "batch_created": len(created),
+                "batch_error_count": len(observations) - len(created),
+                "validation_warnings": (
+                    [batch_result["yellow_card_warning"]]
+                    if batch_result.get("yellow_card_warning")
+                    else []
+                ),
+            },
+            site="server.engram_add_observation_batch",
+        )
+        write_telemetry_record(
+            manifest_id=_site,
+            event_type="engram.tool.engram_call",
+            fields={
+                "outcome": (
+                    "delivered" if _uid is not None
+                    else "dropped" if _had_emitter
+                    else "no_emitter"
+                )
+            },
+        )
+    except Exception:
+        try:
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={"outcome": "init_failed"},
+            )
+        except Exception:
+            pass
 
     return json.dumps(core._strip_agent_facing(batch_result))

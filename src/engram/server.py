@@ -35,9 +35,27 @@ from fastmcp import FastMCP
 # silent no-op when the singleton has not been initialized, which is the
 # normal state for server.py: it runs as a long-lived MCP process serving
 # multiple Claude sessions and has no single session_id to bind to.
-# Phase 4 will add a separate init path for server-side events.
+# alpha #2574 WS5 is Phase 4 -- see the Emitter.init() call in
+# `if __name__ == "__main__":` below.
 # See alpha #175 (two-level logging architecture) for the spec.
-from engram_log_emitter import emit_if_initialized  # noqa: E402
+from engram_log_emitter import Emitter, emit_if_initialized  # noqa: E402
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience
+# (WS1's own tiering judgment call -- src/build/packaging/tiers.json), while
+# server.py ships at tier=essential. A plain top-level import here would
+# make an essential-tier module hard-depend on a convenience-tier one,
+# breaking an Essential-only build
+# (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces
+# exactly this). Guarded import + no-op stub keeps every MCP tool call
+# gating-nothing-T1 (docs/2574-telemetry-design.md §8) even if the store
+# ships without it -- same pattern as the four engram_*.py impl modules
+# this workstream also touches (engram_derive.py, engram_observation.py,
+# engram_query.py, engram_revision.py).
+try:
+    from engram_telemetry_store import write_telemetry_record  # noqa: E402
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 # sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
 # O(N) pure-Python cosine loop in _semantic_search. If the extension fails to
@@ -1870,6 +1888,11 @@ def engram_add_observation(payload_json: str) -> str:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
+    # alpha #2574 WS5: `reached` -- unconditional, before any argument
+    # validation/guard/early-return, per docs/2574-telemetry-design.md §1's
+    # TRIGGER ENTRY / NEGATIVE EVIDENCE. write_telemetry_record() never
+    # raises (WS1's contract) so this needs no protective try.
+    write_telemetry_record(manifest_id="server.py:engram_add_observation", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -1997,6 +2020,10 @@ def engram_add_observation_batch(payload_json: str) -> str:
     See _add_observation_batch_impl for full per-observation semantics + the
     evidence-resolution logic.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale (identical shape at every one of this workstream's 9
+    # dispatch targets).
+    write_telemetry_record(manifest_id="server.py:engram_add_observation_batch", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2361,6 +2388,9 @@ def engram_query(payload_json: str) -> str:
     See _query_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2780,6 +2810,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
 
     See _cascade_resolve_impl (engram_revision.py) for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is one of the 3 FAN-IN targets: it is
+    # itself reached from TWO sites (engram_revision.py:2543 via
+    # _supersede_impl, and :3281 via _retract_impl) -- both land on this
+    # SAME manifest_id, which is exactly the union-over-targets semantics
+    # this workstream's spec calls for; no special-casing needed here.
+    write_telemetry_record(manifest_id="server.py:engram_cascade_resolve", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -5998,6 +6035,12 @@ def engram_derive(payload_json: str) -> str:
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is reached from BOTH of engram_derive.py's
+    # _derive_impl sites (:283 blocked-path, :365 success-path -- see
+    # docs/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
+    # this single `reached` write covers both.
+    write_telemetry_record(manifest_id="server.py:engram_derive", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6079,6 +6122,9 @@ def engram_contradict(payload_json: str) -> str:
 
     See _contradict_impl for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_contradict", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6360,6 +6406,9 @@ def engram_supersede(payload_json: str) -> str:
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_supersede", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6483,6 +6532,9 @@ def engram_retract(payload_json: str) -> str:
 
     See _retract_impl for full semantics + error-type catalog.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_retract", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -7254,6 +7306,9 @@ def engram_query_pattern(payload_json: str) -> str:
     See _query_pattern_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query_pattern", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -7780,6 +7835,35 @@ if __name__ == "__main__":
         print(
             f"[engram] snapshot worker startup failed "
             f"(checkpoints will use the sync commit path): {_sw_e}",
+            file=_sys.stderr,
+        )
+
+    # alpha #2574 WS5 (Phase 4 the engram_log_emitter.py header comment
+    # deferred to): initialize the server-side telemetry emitter singleton,
+    # so the 9 engram.tool.engram_call emit_if_initialized() sites in
+    # engram_derive.py/engram_observation.py/engram_query.py/engram_revision.py
+    # stop being permanently NO_EMITTER (docs/2574-telemetry-design.md §0.1).
+    # Best-effort, same shape as the snapshot worker start above and the
+    # embedding gate below: a failure here must never block server boot
+    # (§8 "telemetry gates nothing T1" -- server.py is the literal T1 MCP
+    # server every engram_* tool call goes through).
+    #
+    # session_id/transcript_path judgment call (flagged for review, per this
+    # workstream's spec): there is no real per-session identity for this
+    # long-lived, multi-session server process -- exactly why the design
+    # doc's §1 WINDOW/SCOPE explicitly does NOT require session_id at the
+    # record level, and §11.1 rules session_id out of scope for a "real
+    # per-request" fix. "server"/"" are literal sentinels that read
+    # unambiguously as "this is the server process, not a session" rather
+    # than a real session id; the design doc does not specify the exact
+    # sentinel string.
+    try:
+        Emitter.init(session_id="server", transcript_path="")
+    except Exception as _em_e:
+        import sys as _sys
+        print(
+            f"[engram] telemetry emitter init failed (server-side telemetry "
+            f"stays NO_EMITTER for this process): {_em_e}",
             file=_sys.stderr,
         )
 

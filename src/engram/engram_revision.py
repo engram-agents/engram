@@ -40,7 +40,21 @@ import uuid
 
 import engram_core as core
 
-from engram_log_emitter import emit_if_initialized
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 
 # #2252 Stage 1.0b: the cascade walk's walked-relation set, DERIVED from
@@ -2540,17 +2554,47 @@ def _supersede_impl(
         conn.commit()
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_supersede",
-                "target_id": old_node_id,
-                "action_type": "supersede",
-                "result_status": "superseded",
-                "result_node_id": new_node_id,
-            },
-        )
+        # alpha #2574 WS5: site attestation + outcome recording +
+        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # narrowly-scoped try/except; see engram_derive.py's _derive_impl
+        # blocked-path site for the full rationale. This function's own
+        # try/finally has no except, so an uncaught raise here would
+        # propagate straight out of this MCP tool call, breaching §8.
+        _site = "server.engram_supersede"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_supersede",
+                    "target_id": old_node_id,
+                    "action_type": "supersede",
+                    "result_status": "superseded",
+                    "result_node_id": new_node_id,
+                },
+                site="server.engram_supersede",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         result = {
             "status": "superseded",
@@ -3278,17 +3322,44 @@ def _retract_impl(
             )
 
         # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_retract",
-                "target_id": node_id,
-                "action_type": "retract",
-                "result_status": "retracted",
-                "result_node_id": replacement_id or None,
-            },
-        )
+        # alpha #2574 WS5: see engram_revision.py's _supersede_impl site
+        # (above, this file) for the full protection/outcome-recording
+        # rationale (identical shape here).
+        _site = "server.engram_retract"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_retract",
+                    "target_id": node_id,
+                    "action_type": "retract",
+                    "result_status": "retracted",
+                    "result_node_id": replacement_id or None,
+                },
+                site="server.engram_retract",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         return json.dumps(result)
     finally:

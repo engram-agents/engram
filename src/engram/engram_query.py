@@ -33,7 +33,21 @@ from pathlib import Path
 from typing import Optional
 
 import engram_core as core
-from engram_log_emitter import emit_if_initialized
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -2918,17 +2932,47 @@ def _query_impl(
         # Decision context: query length + result count + type filter used.
         # source_class_filter is not a parameter of engram_query (only type
         # filter exists); emitted as None. Noted in phase-3 F1 handoff.
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_query",
-                "query_text_len": len(query),
-                "result_count": len(output),
-                "type_filter": types or None,
-                "source_class_filter": None,
-            },
-        )
+        # alpha #2574 WS5: site attestation + outcome recording +
+        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # narrowly-scoped try/except; see engram_derive.py's _derive_impl
+        # blocked-path site for the full rationale. This function's own
+        # try/finally has no except, so an uncaught raise here would
+        # propagate straight out of this MCP tool call, breaching §8.
+        _site = "server.engram_query"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_query",
+                    "query_text_len": len(query),
+                    "result_count": len(output),
+                    "type_filter": types or None,
+                    "source_class_filter": None,
+                },
+                site="server.engram_query",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         # return_debug=True: preserve full legacy shape verbatim (eval/harness contract).
         if return_debug:
@@ -3480,19 +3524,46 @@ def _query_pattern_impl(
     # pattern_name length as a proxy. source_class_filter and type_filter
     # are not parameters of this tool — emitted as None. See phase-3 F1
     # handoff ambiguous-decisions log.
-    emit_if_initialized(
-        event_type="engram.tool.engram_call",
-        level=1,
-        data={
-            "tool_name": "engram_query_pattern",
-            "query_text_len": len(pattern_name),
-            "result_count": len(candidates),
-            "type_filter": None,
-            "source_class_filter": None,
-            "pattern_name": pattern_name,
-            "preset": preset,
-        },
-    )
+    # alpha #2574 WS5: this site sits with NO surrounding try at all (§0.1)
+    # -- a NEW try wraps it (§10), same shape as the batch-summary site in
+    # engram_observation.py.
+    _site = "server.engram_query_pattern"
+    try:
+        _had_emitter = Emitter.get() is not None
+        _uid = emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_query_pattern",
+                "query_text_len": len(pattern_name),
+                "result_count": len(candidates),
+                "type_filter": None,
+                "source_class_filter": None,
+                "pattern_name": pattern_name,
+                "preset": preset,
+            },
+            site="server.engram_query_pattern",
+        )
+        write_telemetry_record(
+            manifest_id=_site,
+            event_type="engram.tool.engram_call",
+            fields={
+                "outcome": (
+                    "delivered" if _uid is not None
+                    else "dropped" if _had_emitter
+                    else "no_emitter"
+                )
+            },
+        )
+    except Exception:
+        try:
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={"outcome": "init_failed"},
+            )
+        except Exception:
+            pass
 
     # Apply tiered render after pattern-internal ranking is complete.
     # Clamp summary_top_k to [0, len(candidates)].

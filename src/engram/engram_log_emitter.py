@@ -274,8 +274,14 @@ def emit_if_initialized(
     data: dict[str, Any],
     tool_use_id: Optional[str] = None,
     parent_uuid: Optional[str] = None,
+    site: Optional[str] = None,
 ) -> Optional[str]:
+    # alpha #2574 WS5: `site` is purely additive (default None, same shape as
+    # WS3's addition to Emitter.emit()/_emit_inner() -- see that method's own
+    # docstring) so tools/telemetry_manifest_gate.py's AST scan can find a
+    # `site="..."` keyword literal directly at THIS call, not only at
+    # Emitter.emit() itself. No other behavior change.
     emitter = Emitter.get()
     if emitter is None:
         return None
-    return emitter.emit(event_type, level, data, tool_use_id=tool_use_id, parent_uuid=parent_uuid)
+    return emitter.emit(event_type, level, data, tool_use_id=tool_use_id, parent_uuid=parent_uuid, site=site)

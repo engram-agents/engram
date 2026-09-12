@@ -677,6 +677,7 @@
   ],
   "server_import_allowlist": [
     "test_engram_core_seam.py",
-    "test_inductive_enumeration_and_timing.py"
+    "test_inductive_enumeration_and_timing.py",
+    "test_ws5_telemetry_protection.py"
   ]
 }

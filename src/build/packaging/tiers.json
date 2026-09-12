@@ -98,7 +98,11 @@
     {
       "path": "engram_derive.py",
       "tier": "essential",
-      "telemetry": []
+      "telemetry": [
+        {"site": "server.engram_derive.blocked", "trigger": "MCP tool body"},
+        {"site": "server.engram_derive.created", "trigger": "MCP tool body"},
+        {"site": "server.engram_contradict", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_tasks.py",
@@ -107,7 +111,10 @@
     {
       "path": "engram_revision.py",
       "tier": "essential",
-      "telemetry": []
+      "telemetry": [
+        {"site": "server.engram_supersede", "trigger": "MCP tool body"},
+        {"site": "server.engram_retract", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_stats.py",
@@ -160,12 +167,18 @@
     {
       "path": "engram_query.py",
       "tier": "essential",
-      "telemetry": []
+      "telemetry": [
+        {"site": "server.engram_query", "trigger": "MCP tool body"},
+        {"site": "server.engram_query_pattern", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_observation.py",
       "tier": "essential",
-      "telemetry": []
+      "telemetry": [
+        {"site": "server.engram_add_observation", "trigger": "MCP tool body"},
+        {"site": "server.engram_add_observation_batch", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_anchoring.py",
@@ -204,7 +217,7 @@
     {
       "path": "engram_telemetry_store.py",
       "tier": "convenience",
-      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path -- and as of this PR nothing in the T1 surface calls into it at all (WS1 ships the store mechanism only; WS3, a later workstream, is what wires call sites). Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier."
+      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path. Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier. UPDATED by WS5 (server-side wiring): five T1/essential files (server.py, engram_derive.py, engram_observation.py, engram_query.py, engram_revision.py) now import this module -- but each does so via a guarded `try/except ImportError`-style import with a no-op stub fallback (`write_telemetry_record(...) -> False`), never a plain top-level import, specifically so this file's own T2 tier is preserved without those five files silently breaking on an Essential-only build that excludes it (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces the absence of a HARD dependency; the guarded-import shape is what keeps the dependency soft). This is the concrete mechanism behind docs/2574-telemetry-design.md §8's 'telemetry gates nothing T1.'"
     },
     {
       "path": "engram_log_indexer.py",
