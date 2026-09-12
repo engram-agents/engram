@@ -35,6 +35,15 @@
     seriesByAgentSignal: {}, // "agent|signal" -> /api/health/v2/series payload
     curves: {}, // signal -> {knots: [[x,y],...], importance: number} (LIVE, editable)
     edited: {}, // signal -> true, once touched by the user
+    // signal -> {knots, importance} -- the RAW localStorage-persisted blob
+    // for a signal that has NOT (yet) been loaded into the live edit state
+    // above (engram-alpha#2870 fix 2). Always re-seeded from loadEdits()
+    // in seedCurveState(); the page opens on the SHIPPED curve for every
+    // signal regardless of what's in here -- a draft banner
+    // (renderSignalRow, RIGHT column) is the only UI surface that shows
+    // it, and only "load draft" ever copies it into
+    // state.curves/state.edited.
+    drafts: {},
     histView: {}, // signal -> 'raw'|'rawhist'|'score'|'hist'
     // signal -> reason string, set when an edit-enter-time value check
     // refuses a knot/importance edit (engram-alpha#2738 round 2); cleared
@@ -118,6 +127,26 @@
     return m ? decodeURIComponent(m[1]) : null;
   }
 
+  // switchAgent: engram-alpha#2870 fix 1 -- the single path for switching
+  // the whole page to a different seat's view, shared by the #wb-agent
+  // <select>'s own change handler and a click on a seat's row in a
+  // signal's per-seat comparison table (LEFT column). No-op when the
+  // seat is already selected, so clicking the current seat's own row
+  // doesn't trigger a redundant refetch. Keeps the <select>'s displayed
+  // value in sync -- necessary for the click path (the browser doesn't
+  // update the <select> on its own for a click elsewhere on the page);
+  // harmless for the change-handler path, where the browser has already
+  // updated the <select> itself.
+  function switchAgent(name) {
+    if (name === state.agent) return;
+    state.agent = name;
+    var url = new URL(window.location.href);
+    url.searchParams.set("agent", state.agent);
+    window.history.replaceState(null, "", url.toString());
+    qs("#wb-agent").value = state.agent;
+    loadForAgent().then(render);
+  }
+
   function fetchJSON(url) {
     return fetch(url).then(function (r) { return r.json(); });
   }
@@ -134,11 +163,32 @@
       return {};
     }
   }
-  function saveEdits() {
+  // mergeDraftsForPersist: pure data transform (no DOM/localStorage
+  // access) -- given the current edited/curves/drafts state, produce the
+  // object that should be WRITTEN to localStorage (engram-alpha#2870 fix
+  // 2 item 3). Two properties this exists to guarantee: (1) a signal with
+  // an unloaded draft that the user never touched this session SURVIVES a
+  // save triggered by editing some OTHER signal (a full-overwrite keyed
+  // only off `edited` would otherwise silently erase it); (2) a signal
+  // that is both an unloaded draft AND a live edit (loaded, then further
+  // edited) is written from the LIVE `curves` value, never the stale
+  // `drafts` copy -- the `edited` pass below runs second so it overwrites
+  // the `drafts` pass for the same key. Extracted as a standalone function
+  // (rather than inlined in saveEdits()) so it's directly testable under
+  // plain `node`, no DOM shim needed -- see
+  // tests/test_health_workbench_draft_persist.py.
+  function mergeDraftsForPersist(edited, curves, drafts) {
     var out = {};
-    Object.keys(state.edited).forEach(function (sig) {
-      if (state.edited[sig] && state.curves[sig]) out[sig] = state.curves[sig];
+    Object.keys(drafts || {}).forEach(function (sig) {
+      if (!edited || !edited[sig]) out[sig] = drafts[sig];
     });
+    Object.keys(edited || {}).forEach(function (sig) {
+      if (edited[sig] && curves && curves[sig]) out[sig] = curves[sig];
+    });
+    return out;
+  }
+  function saveEdits() {
+    var out = mergeDraftsForPersist(state.edited, state.curves, state.drafts);
     try {
       window.localStorage.setItem(LS_KEY, JSON.stringify(out));
     } catch (e) { /* ignore quota errors -- best-effort persistence only */ }
@@ -162,17 +212,22 @@
   }
   function seedCurveState() {
     var persisted = loadEdits();
+    // engram-alpha#2870 fix 2: the page must open on the CURRENT shipped
+    // curve for every signal -- state.curves/state.edited below are ALWAYS
+    // seeded from the shipped model, never from localStorage. A persisted
+    // blob is instead stashed in state.drafts (unloaded, session-scoped
+    // visibility only), so a stale edit from an earlier session is never
+    // silently presented as the curve.
+    state.drafts = {};
     (state.model.model_defs.metrics || []).forEach(function (m) {
       var cd = curveDefFor(m);
       var shippedKnots = cd ? cd.knots.map(function (p) { return p.slice(); }) : [[0, 0], [1, 1]];
+      state.curves[m.signal] = { knots: shippedKnots, importance: m.importance };
       if (persisted[m.signal]) {
-        state.curves[m.signal] = {
+        state.drafts[m.signal] = {
           knots: persisted[m.signal].knots.map(function (p) { return p.slice(); }),
           importance: persisted[m.signal].importance,
         };
-        state.edited[m.signal] = true;
-      } else {
-        state.curves[m.signal] = { knots: shippedKnots, importance: m.importance };
       }
       if (!state.histView[m.signal]) state.histView[m.signal] = "raw";
     });
@@ -204,6 +259,11 @@
       state.curves[m.signal] = { knots: shippedKnots, importance: m.importance };
       delete state.edited[m.signal];
       delete state.editWarnings[m.signal];
+      // engram-alpha#2870 fix 2 item 4: also forget any still-unloaded
+      // draft for this signal -- otherwise the merged saveEdits() below
+      // would see it absent from `edited` and re-persist it right back,
+      // resurrecting exactly what this reset just discarded.
+      delete state.drafts[m.signal];
     });
     saveEdits();
     render();
@@ -226,6 +286,15 @@
     rescaled.forEach(function (r) {
       state.curves[r.signal].importance = r.importance;
       markEdited(r.signal);
+      // engram-alpha#2870 fix 2 follow-up (reviewer-fairy suggestion,
+      // PR #2875 round 1): symmetric with the two reset paths -- a member
+      // that had a still-unloaded draft is now genuinely edited, so forget
+      // the stale draft copy rather than leaving it to linger inertly in
+      // state.drafts (mergeDraftsForPersist already prefers state.curves
+      // for an edited signal, so this was never a live bug, but leaving a
+      // dead draft behind is the same asymmetry the two reset paths were
+      // fixed to avoid).
+      delete state.drafts[r.signal];
     });
     state.references[aspectName] = signal;
     render();
@@ -1007,13 +1076,23 @@
       var noSnapTitle = (!s || !s.has_snapshot)
         ? ' title="' + escAttr((s && s.reason) || "no snapshot for this seat") + '"'
         : "";
-      seatRows += '<tr class="' + (a.name === state.agent ? "sel" : "") + '"><td>' + escAttr(a.name) +
+      seatRows += '<tr class="seat-row' + (a.name === state.agent ? " sel" : "") +
+        '" data-agent="' + escAttr(a.name) + '"><td>' + escAttr(a.name) +
         '</td><td class="num"' + noSnapTitle + '>' +
         (raw === null || raw === undefined || raw === "UNAVAILABLE" ? "--" : fmtPct(raw)) +
         '</td><td class="num">' + fmtScore(sc) + "</td></tr>";
     });
     var table = el("table", {
       html: "<thead><tr><th>seat</th><th style='text-align:right'>raw</th><th style='text-align:right'>score</th></tr></thead><tbody>" + seatRows + "</tbody>",
+    });
+    // engram-alpha#2870 fix 1: one delegated click listener per render
+    // (not per-row) -- clicking any seat's row switches the whole page to
+    // that seat, same as picking it in the #wb-agent <select>. Re-created
+    // fresh on every render() call, consistent with every other
+    // button/control in this file.
+    table.addEventListener("click", function (e) {
+      var tr = e.target.closest("tr[data-agent]");
+      if (tr) switchAgent(tr.getAttribute("data-agent"));
     });
     left.appendChild(table);
 
@@ -1082,6 +1161,42 @@
 
     var right = el("div", {});
     right.appendChild(el("div", { class: "lbl", html: "Curve &middot; raw &rarr; score, editable knots" }));
+
+    // engram-alpha#2870 fix 2 item 2: an UNLOADED draft (present in
+    // state.drafts, not yet copied into state.curves/state.edited) is
+    // surfaced here instead of silently applied -- once loaded it becomes
+    // an ordinary edit and this banner's job is done (the existing
+    // `.changed` highlighting + "reset this curve" button already cover
+    // it from there).
+    if (state.drafts[signal] && !state.edited[signal]) {
+      var draftBanner = el("div", { class: "draft-banner" });
+      draftBanner.appendChild(document.createTextNode(
+        "local draft from an earlier session (not shown) "
+      ));
+      var loadDraftBtn = el("button", { type: "button", class: "kbtn" });
+      loadDraftBtn.textContent = "load draft";
+      loadDraftBtn.addEventListener("click", function () {
+        state.curves[signal] = {
+          knots: state.drafts[signal].knots.map(function (p) { return p.slice(); }),
+          importance: state.drafts[signal].importance,
+        };
+        state.edited[signal] = true;
+        saveEdits();
+        render();
+      });
+      draftBanner.appendChild(loadDraftBtn);
+      draftBanner.appendChild(document.createTextNode(" "));
+      var discardDraftBtn = el("button", { type: "button", class: "kbtn" });
+      discardDraftBtn.textContent = "discard";
+      discardDraftBtn.addEventListener("click", function () {
+        delete state.drafts[signal];
+        saveEdits();
+        render();
+      });
+      draftBanner.appendChild(discardDraftBtn);
+      right.appendChild(draftBanner);
+    }
+
     var curveHost = el("div", { class: "plot-container" });
     right.appendChild(curveHost);
     var curveEl = curveSVG(curveHost, signal, storedKnots, cd ? cd.input_domain : null, cd ? cd.output_range : null);
@@ -1224,6 +1339,10 @@
       };
       delete state.edited[signal];
       delete state.editWarnings[signal];
+      // engram-alpha#2870 fix 2 item 4: see resetAspect's own comment --
+      // without this, the merged saveEdits() below would re-persist a
+      // still-unloaded draft for this signal right back into localStorage.
+      delete state.drafts[signal];
       saveEdits();
       render();
     });
@@ -1363,11 +1482,7 @@
     });
 
     qs("#wb-agent").addEventListener("change", function (e) {
-      state.agent = e.target.value;
-      var url = new URL(window.location.href);
-      url.searchParams.set("agent", state.agent);
-      window.history.replaceState(null, "", url.toString());
-      loadForAgent().then(render);
+      switchAgent(e.target.value);
     });
 
     init();

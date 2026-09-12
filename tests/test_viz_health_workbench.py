@@ -493,6 +493,62 @@ class TestWorkbenchStandaloneServer(_LiveServerBase):
         self.assertIn("boom-from-test", body.get("reason", ""))
 
 
+class TestWorkbenchClickableSeatRowsAndDraftBanner(_LiveServerBase):
+    """engram-alpha#2870: fix 1 (clickable seat rows in the per-signal
+    comparison table) and fix 2's DOM-visible parts (the localStorage-draft
+    banner) are DOM-shape/wiring concerns, not pure math -- per this
+    module's own docstring ("the page's client-side JS render logic" is
+    "out of scope for THIS file"), covered here only by static
+    string/structure assertions on the SERVED ``health-workbench.js`` /
+    ``health_workbench.html``, never by simulating an actual click event
+    without a DOM (that narrow exception is
+    ``tests/test_viz_health_v2_detail_view.py``'s own
+    ``TestDetailViewRealDOMStructure``, scoped to a different bug class --
+    see that class's docstring for why). The pure-data-transform half of
+    fix 2 (``mergeDraftsForPersist``) is covered separately, directly under
+    node, by ``tests/test_health_workbench_draft_persist.py``."""
+
+    HANDLER_CLASS = viz_workbench.Handler
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_2870_static_test_")
+        cls.engram_home = Path(cls.tmpdir) / "agent_dir"
+        cls.engram_home.mkdir()
+        cls.db_path = cls.engram_home / "knowledge.db"
+        cls.db_path.write_bytes(b"")
+
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
+            "test_agent": {"name": "test_agent", "label": "Test", "db": str(cls.db_path)}
+        }
+        viz_agents.DEFAULT_AGENT = "test_agent"
+
+    @classmethod
+    def tearDownClass(cls):
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_js_seat_row_construction_carries_data_agent(self):
+        status, _headers, body = self._get("/static/health-workbench.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"data-agent=", body)
+        self.assertIn(b"seat-row", body)
+
+    def test_js_defines_switch_agent_function(self):
+        status, _headers, body = self._get("/static/health-workbench.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"function switchAgent(", body)
+
+    def test_html_carries_seat_row_and_draft_banner_css(self):
+        status, _headers, body = self._get("/?agent=test_agent")
+        self.assertEqual(status, 200)
+        self.assertIn(b".seat-row", body)
+        self.assertIn(b".draft-banner", body)
+
+
 class TestWorkbenchAccessLog(_LiveServerBase):
     """engram-alpha#2767: viz.workbench.Handler.log_message mirrors
     viz.server's own opt-in R5.5 access log -- off by default

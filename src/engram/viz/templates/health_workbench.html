@@ -86,6 +86,10 @@
   td{padding:3px 6px 3px 0;border-bottom:1px solid #16233f}
   td.num{text-align:right}
   tr.sel td{color:var(--accent2)}
+  /* engram-alpha#2870 fix 1: seat rows in the per-signal comparison table
+     are clickable -- switches the whole page to that seat. */
+  .seat-row{cursor:pointer}
+  .seat-row:hover td{background:var(--panel2)}
   .lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
   svg{display:block;width:100%;height:auto}
   .legend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin-top:4px;flex-wrap:wrap}
@@ -125,6 +129,11 @@
   .imp input:disabled{opacity:.55;cursor:not-allowed}
   .hold-lock{color:var(--held);font-size:11px;margin-left:6px}
   .warn-msg{color:var(--bad);font-size:11px;margin-top:6px}
+  /* engram-alpha#2870 fix 2: an unloaded localStorage draft is surfaced
+     here rather than silently applied -- same warning/attention token
+     (--warn) as the .changed highlighting above, so a stale draft reads
+     visually consistent with the rest of this page's warning language. */
+  .draft-banner{margin:6px 0;padding:6px 8px;border-radius:4px;border:1px solid var(--warn);background:rgba(255,183,77,.14);color:var(--warn);font-size:11px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
   .resetcurve{margin-top:8px}
   /* R5.1: the "how stale is this checkpoint" suffix on the latest-checkpoint
      label (#wb-status and each signal row's focus "who" line). */
