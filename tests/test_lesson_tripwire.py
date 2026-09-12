@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -910,3 +911,223 @@ class TestMainDemotionIntegration(unittest.TestCase):
         lines = [json.loads(l) for l in self.ledger_path.read_text().strip().splitlines()]
         modes = [l.get("mode") for l in lines]
         self.assertIn("auto_demoted_lease", modes)
+
+
+# ---------------------------------------------------------------------------
+# #2858 -- tripwire-block preview cap: specificity ordering, character-
+# ceiling cap on the fully-rendered block, overflow file, and the
+# always-emitted "N shown · M cut" trailer (rendered FIRST — round 2).
+# ---------------------------------------------------------------------------
+
+select_and_cap_hits = _hook.select_and_cap_hits
+write_tripwire_overflow = _hook.write_tripwire_overflow
+TRIPWIRE_BLOCK_CHAR_CEILING = _hook.TRIPWIRE_BLOCK_CHAR_CEILING
+
+_TRAILER_RE = re.compile(r"▸ (\d+) shown · (\d+) cut(?: — see (\S+)|\s*\(overflow file unavailable\))?")
+
+
+class TestTripwirePreviewCap(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_tripwire_cap_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_20_match_seeded_case_caps_orders_and_writes_overflow(self):
+        """#2858 test 1: 20 distinct patterns all match one command. The
+        rendered block must show fewer than 20 (a real cap fired), the
+        shown+cut count must reconcile exactly to 20, the shown hits must be
+        the 20 patterns' longest-K by len(pattern) (specificity ordering,
+        not just "capping happened"), and the overflow file must exist and
+        contain every cut hit's full nudge text."""
+        db = _make_db(Path(self.tmp))
+        n = 20
+        patterns = []
+        nudges = []
+        node_ids = []
+        for i in range(n):
+            # Strictly increasing pattern length (10, 11, ..., 29 chars) so
+            # specificity order is unambiguous — no ties to worry about.
+            pattern = "uniqmark" + str(i).zfill(2) + ("Z" * i)
+            # Deliberately long nudge text (well past what 20 of them could
+            # ever fit under TRIPWIRE_BLOCK_CHAR_CEILING) so the cap actually
+            # fires in this test rather than everything fitting trivially.
+            nudge = f"NUDGE_{i:02d} " + ("x" * 100)
+            node_id = f"ls_p{i:02d}"
+            patterns.append(pattern)
+            nudges.append(nudge)
+            node_ids.append(node_id)
+            _insert_lesson(db, pattern=pattern, nudge=nudge, node_id=node_id)
+
+        tripwires = load_tripwires(db_path=db)
+        command = " ".join(patterns)
+
+        # Sanity check outside main(): all 20 patterns really do match.
+        hits = check_command(command, tripwires)
+        self.assertEqual(len(hits), n, "sanity: all 20 seeded patterns must match the command")
+
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[(patterns[i], nudges[i], node_ids[i]) for i in range(n)],
+            )
+        self.assertTrue(out.strip(), "expected JSON output")
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+
+        # #2858 round 2 (Fix 1): the trailer must be the FIRST line of the
+        # tripwire block / of additionalContext -- not merely present
+        # somewhere in the string. A trailer anywhere-in-string check would
+        # pass even if it were still emitted last (and therefore vulnerable
+        # to the harness's own tail-truncation on exactly this kind of
+        # large capture), so this must be a line-0 check, not a substring
+        # search.
+        first_line = additional_context.split("\n", 1)[0]
+        trailer_match = _TRAILER_RE.match(first_line)
+        self.assertIsNotNone(
+            trailer_match,
+            f"trailer line must be the FIRST line of additionalContext, got: {first_line!r}",
+        )
+        shown_count = int(trailer_match.group(1))
+        cut_count = int(trailer_match.group(2))
+        overflow_path = trailer_match.group(3)
+
+        self.assertGreaterEqual(shown_count, 1, "at least one hit must always be shown")
+        self.assertEqual(
+            shown_count + cut_count, n,
+            "shown + cut must reconcile exactly to the 20 seeded matches",
+        )
+        self.assertGreater(
+            cut_count, 0,
+            "test fixture must actually force some cuts — if this fails, the "
+            "nudge/ceiling sizing in this test needs to be made more extreme",
+        )
+
+        self.assertIsNotNone(overflow_path, "cut_count > 0 must always name an overflow path")
+        self.assertTrue(
+            os.path.exists(overflow_path),
+            f"overflow file named in the trailer must actually exist: {overflow_path}",
+        )
+        overflow_content = Path(overflow_path).read_text(encoding="utf-8")
+
+        # #2858 round 2 (Fix 2): the tripwire block this hook itself
+        # rendered (trailer + header + shown bullets — NOT the whole
+        # additionalContext, which may also carry an unrelated
+        # "[triggered principles]" section appended after it) must respect
+        # its OWN character ceiling. This tests the hook's own contract,
+        # not any assumed harness number.
+        tripwire_block_lines = additional_context.split("\n")[: 2 + shown_count]
+        tripwire_block = "\n".join(tripwire_block_lines)
+        self.assertLessEqual(
+            len(tripwire_block), TRIPWIRE_BLOCK_CHAR_CEILING,
+            "the hook's own rendered tripwire block must respect its own character ceiling",
+        )
+
+        # Specificity ordering: shown hits are the longest-K patterns (i.e.
+        # the highest-index seeds, since pattern length increases with i).
+        # This is the check that verifies ORDERING, not merely that SOME
+        # cap happened.
+        expected_shown_indices = set(range(n - shown_count, n))
+        expected_cut_indices = set(range(0, n - shown_count))
+
+        for i in expected_shown_indices:
+            self.assertIn(
+                nudges[i], additional_context,
+                f"pattern index {i} (longer/more-specific) should be SHOWN",
+            )
+        for i in expected_cut_indices:
+            self.assertNotIn(
+                nudges[i], additional_context,
+                f"pattern index {i} (shorter/less-specific) should be CUT, not shown",
+            )
+            # Every cut hit's full node_id + nudge text must appear verbatim
+            # in the overflow file (not truncated, not summarized).
+            self.assertIn(node_ids[i], overflow_content)
+            self.assertIn(nudges[i], overflow_content)
+
+    def test_2_match_control_trailer_always_present_even_with_zero_cuts(self):
+        """#2858 test 2: exactly 2 short matches, comfortably under the real
+        TRIPWIRE_BLOCK_CHAR_CEILING together — nothing should be cut. Per
+        Kepler's ruling (overturning his own earlier "only emit when cut"
+        position), the trailer line is ALWAYS emitted whenever the tripwire
+        block fires, including the zero-cut case. This test asserts
+        PRESENCE with the exact "0 cut" text, AND that it is the FIRST line
+        — asserting absence here would pass on a dead/regressed emitter and
+        catch nothing, which is the exact failure mode Kepler's ruling
+        exists to rule out; asserting only presence (not position) would
+        pass even if the trailer regressed back to being emitted LAST,
+        which is the round-2 defect this fix addresses."""
+        db = _make_db(Path(self.tmp))
+        pattern_a = "controlpatternalpha"
+        pattern_b = "controlpatternbeta"
+        nudge_a = "Short nudge A."
+        nudge_b = "Short nudge B."
+        _insert_lesson(db, pattern=pattern_a, nudge=nudge_a, node_id="ls_ctrl_a")
+        _insert_lesson(db, pattern=pattern_b, nudge=nudge_b, node_id="ls_ctrl_b")
+
+        tripwires = load_tripwires(db_path=db)
+        command = f"{pattern_a} {pattern_b}"
+        hits = check_command(command, tripwires)
+        self.assertEqual(len(hits), 2, "sanity: both seeded patterns must match")
+
+        # Both nudges together are far under the real ceiling (no override —
+        # this test deliberately uses the module's actual
+        # TRIPWIRE_BLOCK_CHAR_CEILING, not a test-only ceiling, since neither
+        # nudge is anywhere near large enough to force a cut).
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[(pattern_a, nudge_a, "ls_ctrl_a"), (pattern_b, nudge_b, "ls_ctrl_b")],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+
+        self.assertIn(
+            "▸ 2 shown · 0 cut", additional_context,
+            "trailer must be present and read exactly '2 shown · 0 cut' "
+            "even when nothing was cut",
+        )
+        self.assertEqual(
+            additional_context.split("\n", 1)[0], "▸ 2 shown · 0 cut",
+            "trailer must be the FIRST line of additionalContext",
+        )
+
+    def test_at_least_one_hit_always_shown_even_if_it_alone_exceeds_ceiling(self):
+        """#2858 optional test: a single oversized nudge (bigger than the
+        whole ceiling on its own) must still be shown — never cut down to
+        zero shown hits when there is at least one match. A second,
+        unambiguously smaller hit that would push the total over the
+        ceiling must be the one cut."""
+        huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
+        small_nudge = "small nudge text"
+        # Hits passed in already specificity-ordered (as select_and_cap_hits
+        # expects — main() does the ordering before calling it; this test
+        # exercises select_and_cap_hits directly).
+        hits = [
+            {"nudge": huge_nudge, "node_id": "ls_huge", "pattern": "z" * 40},
+            {"nudge": small_nudge, "node_id": "ls_small", "pattern": "a"},
+        ]
+        shown, cut = select_and_cap_hits(hits, TRIPWIRE_BLOCK_CHAR_CEILING)
+        self.assertEqual(len(shown), 1, "the oversized first hit alone must still be shown")
+        self.assertEqual(shown[0]["node_id"], "ls_huge")
+        self.assertEqual(len(cut), 1)
+        self.assertEqual(cut[0]["node_id"], "ls_small")
+
+    def test_write_tripwire_overflow_failure_degrades_to_empty_string(self):
+        """#2858 reviewer-fairy round 1 suggestion (PR #2860): the
+        write-failure path (e.g. an unwritable ENGRAM_HOME) was verified by
+        hand during review but had no test in the shipped suite. Mocks
+        Path.mkdir to raise OSError (the same failure shape a permissions
+        or disk-full error would produce) and confirms write_tripwire_overflow
+        never raises -- it returns "" per its documented never-raises
+        contract, so the caller's trailer falls back to the honest
+        "(overflow file unavailable)" form instead of claiming a file exists
+        that doesn't."""
+        cut_hits = [{"nudge": "a cut nudge", "node_id": "ls_0001"}]
+        with unittest.mock.patch.object(
+            Path, "mkdir", side_effect=OSError("simulated permission failure")
+        ):
+            result = write_tripwire_overflow(cut_hits, now=1700000000.0)
+        self.assertEqual(result, "", "a write failure must degrade to empty string, never raise")
+
+        trailer = _hook._build_trailer(3, len(cut_hits), result)
+        self.assertEqual(trailer, "▸ 3 shown · 1 cut (overflow file unavailable)")
