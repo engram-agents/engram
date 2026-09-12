@@ -788,6 +788,11 @@
       "dest": "hooks/_hooklib.py"
     },
     {
+      "path": "hooks/claude/_harness.py",
+      "tier": "essential",
+      "dest": "hooks/_harness.py"
+    },
+    {
       "path": "hooks/claude/_prompthooklib.py",
       "tier": "convenience",
       "dest": "hooks/_prompthooklib.py"

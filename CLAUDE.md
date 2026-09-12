@@ -191,6 +191,20 @@ verify-the-live-artifact method — lives in
 on-demand; not loaded every session). This behavior is **undocumented upstream** —
 re-verify after any Claude Code version bump.*
 
+## Hook injection budget — every `additionalContext` block must be bounded
+
+Lei's ruling (2026-09-12, engram-alpha#2863): every hook's `additionalContext`
+must be (1) **bounded** under a named per-harness budget, (2) **never load
+content of unpredictable size**, and (3) **carry its highest-value summary in
+the first ~2,000 characters** — the harness silently truncates the TAIL of an
+oversized injection, and different harnesses (Codex, DeepSeek) have different
+ceilings. Mechanism: `_hooklib.emit_context()` (the one shared bounded
+renderer — trailer leads, never exceeds the hard per-harness `budget`) plus
+`_harness.py` (`get_harness_budgets()`, the per-harness numbers table —
+unmeasured harnesses get an explicitly-named conservative floor, never
+claude-code's numbers). New hooks route `additionalContext` through
+`emit_context()` rather than hand-rolling a bare join/f-string block.
+
 ## PR merge authority — the substrate-feature gate
 
 Once a PR is merge-ready (next section), **who merges it** depends on what it

@@ -23,6 +23,15 @@
       "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete."
     },
     {
+      "path_prefix_or_glob": "hooks/claude/_harness.py",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py"
+      ],
+      "note": "engram-alpha#2863 WS1 -- per-harness budget/floor table for the bounded hook-injection helper (_hooklib.emit_context()). Loaded by tests via importlib.util.spec_from_file_location (same dynamic-load convention as _hooklib.py above, mirrored here since this is the same pattern of a module a hook would import via a runtime sys.path insert, not a static top-level `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py precedent above."
+    },
+    {
       "path_prefix_or_glob": "hooks/claude/_prompthooklib.py",
       "test_globs": [
         "tests/test_prompthooklib.py",
