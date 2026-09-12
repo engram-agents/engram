@@ -158,9 +158,25 @@
        independent of health_workbench.html's -- they are free to drift.
        Same 1000px collapse breakpoint the workbench uses for both grids. */
     .detail-signal-grid { display: grid; grid-template-columns: 1.05fr 1.1fr 1.25fr; gap: 16px; }
-    .detail-strip-top { display: grid; grid-template-columns: 220px 1fr; gap: 16px; align-items: stretch; margin-bottom: 12px; }
-    .detail-meaning-panel { font-size: 0.82em; color: #aaa; line-height: 1.5; }
-    .detail-meaning-panel code { color: #7ecfff; }
+    /* #2881 restructuring: this was 220px 1fr for a score-card | disclaimer-
+       text pairing -- the right slot now holds a readable history/histogram
+       plot instead (see health-detail.js's renderComposedBlock()), so the
+       ratio widened from a narrow text column to something closer to the
+       per-signal grid's own score:plot proportions above. JUDGMENT CALL
+       (flagged in the dispatching report): exact ratio unspecified by the
+       issue -- verified visually via Playwright screenshot, not just read
+       off this number. */
+    .detail-strip-top { display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: stretch; margin-bottom: 12px; }
+    /* Disclaimer bar (#2881): a slim, full-width bar above the score/plot
+       row -- was `.detail-meaning-panel`, a side-panel column beside the
+       score card; renamed since it's no longer a grid column. Text content
+       unchanged, only the container. */
+    .detail-disclaimer-bar { font-size: 0.82em; color: #aaa; line-height: 1.5;
+                              padding: 10px 16px; margin-bottom: 12px;
+                              background: #16213e; border: 1px solid #0f3460;
+                              border-radius: 8px; }
+    .detail-disclaimer-bar p { margin: 0; }
+    .detail-disclaimer-bar code { color: #7ecfff; }
     .detail-aspect-head { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; margin: 0 0 8px; }
     .detail-atile { display: flex; align-items: baseline; gap: 6px; background: #0f3460; border: 1px solid #1a4a8a; border-radius: 6px; padding: 6px 12px; }
     .detail-atile-pts { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78em; color: #888; }

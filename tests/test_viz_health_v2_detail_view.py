@@ -215,6 +215,18 @@ _DOM_HARNESS_JS = r"""
   }
   function findTag(root, tag) { return findFirst(root, function (n) { return n.tagName === tag; }); }
   function findClassToken(root, token) { return findFirst(root, function (n) { return hasClassToken(n, token); }); }
+  // findAspectSectionByName: locate the `.detail-aspect-section` whose <h2>
+  // textContent matches `name` -- used by the #2881 regression test below to
+  // pull the SPECIFIC `zero_eligible_aspect` tile's rendered score text
+  // (rather than just "the first one", which test_detail_aspect_head_is_
+  // three_cell_grid already covers structurally).
+  function findAspectSectionByName(root, name) {
+    return findFirst(root, function (n) {
+      if (!hasClassToken(n, "detail-aspect-section")) return false;
+      var h2 = findTag(n, "H2");
+      return !!(h2 && String(h2.textContent) === name);
+    });
+  }
 
   // ---- Editing-control probe --------------------------------------------
   var EXPORT_IDS = ["wb-export-section", "wb-export-json", "wb-export-refresh", "wb-export-download", "wb-export-copy", "wb-export-reset"];
@@ -235,24 +247,42 @@ _DOM_HARNESS_JS = r"""
   }
 
   // ---- Fixture data -------------------------------------------------
-  // Four metrics across two aspects -- deliberately includes ALL FOUR
+  // Five metrics across three aspects -- deliberately includes ALL FOUR
   // per-row branches health-detail.js/health-workbench.js distinguish:
   // (a) the aspect's current reference (quote_verification_rate),
   // (b) a non-held, non-reference metric -- the ONLY case that renders the
   //     workbench's "set as reference" BUTTON (git_versioning_rate),
   // (c) a held-out metric (url_resolvability_rate),
   // (d) a single-member aspect where the lone metric is its own reference
-  //     (claim_bearing_rate).
+  //     (claim_bearing_rate),
+  // plus (e) `zero_eligible_aspect` (#2881 regression fixture, ADDED by
+  // this PR): a THIRD aspect whose only member is held-out (importance 0),
+  // matching the real `provenance_integrity` bug's shape on a live seat --
+  // zero ADMITTED (importance>0) members with data, so
+  // aspectScoreForToday()'s model-recompute path finds `members.length ===
+  // 0` and falls through to the raw aspect_tile fallback. This is a
+  // DIFFERENT shape from (c)/`provenance_integrity` above, which has TWO
+  // admitted, scored siblings alongside its held-out member and never
+  // reaches the fallback branch at all -- that's precisely why 34 pre-
+  // #2881 tests (including #2872's own held-out-aspect-member regression)
+  // never caught this bug: none of them left an aspect with ZERO eligible
+  // members. `zero_eligible_aspect`'s aspect_tile entry carries the same
+  // string sentinel `"UNAVAILABLE"` the real server payload does (verified
+  // via `curl /api/health/v2?agent=kepler` at spec-writing time) -- not
+  // `null` -- which is exactly the value `typeof tile.score === "number"`
+  // must reject.
   var CURVE_DEFS = { curve_pass_rate: { knots: [[0, 0], [0.5, 0.5], [1, 1]], input_domain: [0, 1], output_range: [0, 1] } };
   var METRICS = [
     { signal: "quote_verification_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 1 },
     { signal: "git_versioning_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 1 },
     { signal: "url_resolvability_rate", aspect: "provenance_integrity", curve: "curve_pass_rate", importance: 0 },
     { signal: "claim_bearing_rate", aspect: "claim_bearing_current", curve: "curve_pass_rate", importance: 2 },
+    { signal: "zero_eligible_signal", aspect: "zero_eligible_aspect", curve: "curve_pass_rate", importance: 0 },
   ];
   var ASPECTS = [
     { name: "provenance_integrity", points: 40, reference_metric: "quote_verification_rate" },
     { name: "claim_bearing_current", points: 60, reference_metric: "claim_bearing_rate" },
+    { name: "zero_eligible_aspect", points: 20, reference_metric: null },
   ];
   var MODEL_FIXTURE = { available: true, model_defs: { metrics: METRICS, aspects: ASPECTS }, curve_defs: CURVE_DEFS };
   var AGENTS_FIXTURE = { agents: [{ name: "sol", label: "Sol" }], default: "sol" };
@@ -280,10 +310,16 @@ _DOM_HARNESS_JS = r"""
       signalRow("git_versioning_rate", 0.7, 0.7, "scored"),
       signalRow("url_resolvability_rate", 0.6, null, "held_out"),
       signalRow("claim_bearing_rate", 0.9, 0.9, "scored"),
+      signalRow("zero_eligible_signal", 0.5, null, "held_out"),
     ],
     aspect_tile: [
       { name: "provenance_integrity", score: 0.8, unscored: false },
       { name: "claim_bearing_current", score: 0.9, unscored: false },
+      // #2881 regression fixture -- the real server shape for an aspect
+      // with zero eligible (importance>0, has-data) members: `score` is
+      // the STRING sentinel "UNAVAILABLE", not `null`, with `unscored:
+      // true`. See this file's own comment on `zero_eligible_aspect` above.
+      { name: "zero_eligible_aspect", score: "UNAVAILABLE", unscored: true },
     ],
     composed: { value: 86.0, composed_coverage: 1.0, unscored_aspects: [] },
   };
@@ -298,6 +334,7 @@ _DOM_HARNESS_JS = r"""
     git_versioning_rate: seriesPoints(0.7),
     url_resolvability_rate: seriesPoints(0.6),
     claim_bearing_rate: seriesPoints(0.9),
+    zero_eligible_signal: seriesPoints(0.5),
   };
   var COMPOSED_SERIES = [
     { t: "2026-09-10T00:00:00Z", value: 82.0 },
@@ -376,6 +413,22 @@ _DOM_HARNESS_JS = r"""
       } : null,
       composedStripTop: stripTopEl ? { childCount: stripTopEl.children.length } : null,
       composedHasDistStrip: !!findClassToken(detailComposedBlock, "detail-strip-dist-container"),
+      // #2881: the disclaimer bar must be a DIRECT child of
+      // #detail-composed-block, appended before `.detail-strip-top` --
+      // verified by index position among detailComposedBlock's own
+      // immediate children (not a deep search, which couldn't tell
+      // "sibling before" from "nested inside").
+      composedHasDisclaimerBar: (function () {
+        return detailComposedBlock.children.some(function (c) { return hasClassToken(c, "detail-disclaimer-bar"); });
+      })(),
+      disclaimerBarBeforeStripTop: (function () {
+        var disclaimerIdx = -1, stripTopIdx = -1;
+        detailComposedBlock.children.forEach(function (c, i) {
+          if (hasClassToken(c, "detail-disclaimer-bar")) disclaimerIdx = i;
+          if (hasClassToken(c, "detail-strip-top")) stripTopIdx = i;
+        });
+        return disclaimerIdx >= 0 && stripTopIdx >= 0 && disclaimerIdx < stripTopIdx;
+      })(),
       // Borges's #2872 post-merge finding: the fixture already carries a
       // held-out (importance:0) metric inside provenance_integrity, and
       // the code guards it twice (aspectScoreForToday's `importance <= 0`
@@ -388,6 +441,18 @@ _DOM_HARNESS_JS = r"""
         return el ? String(el.textContent) : null;
       })(),
       firstAspectHead: aspectHeadEl ? { childCount: aspectHeadEl.children.length } : null,
+      // #2881 regression: the SPECIFIC zero-eligible-members aspect's own
+      // rendered `.detail-aspect-score` text (renderAspectGrouped's
+      // `aScore === null ? "--" : Number(aScore).toFixed(3)`) -- pre-fix,
+      // aspectScoreForToday() returns the raw string "UNAVAILABLE" for this
+      // aspect, and `Number("UNAVAILABLE").toFixed(3)` renders the literal
+      // text "NaN"; post-fix it renders "--".
+      zeroEligibleAspectScoreText: (function () {
+        var section = findAspectSectionByName(detailAspectSections, "zero_eligible_aspect");
+        if (!section) return null;
+        var scoreEl = findClassToken(section, "detail-aspect-score");
+        return scoreEl ? String(scoreEl.textContent) : null;
+      })(),
     };
 
     // ---- Workbench side (control) ---------------------------------------
@@ -772,11 +837,25 @@ class TestDetailViewRealDOMStructure(unittest.TestCase):
         self.assertTrue(row["rightHasCurveOrImportance"], "right column should contain the curve plot or importance readout")
 
     def test_detail_composed_block_is_two_column_strip(self):
+        """#2881 restructuring: the right-hand column now holds the history/
+        histogram strip (was the disclaimer/meaning text pre-#2881) -- the
+        disclaimer moved to its own full-width bar above this row (see
+        composedHasDisclaimerBar below). Still 2 columns; the CONTENT of
+        the second column changed, not the column count."""
         d = self.report["detail"]
         top = d["composedStripTop"]
         self.assertIsNotNone(top, "no .detail-strip-top element found under #detail-composed-block")
-        self.assertEqual(top["childCount"], 2, f"expected 2 columns (score, meaning), got {top['childCount']}")
+        self.assertEqual(top["childCount"], 2, f"expected 2 columns (score, strip), got {top['childCount']}")
         self.assertTrue(d["composedHasDistStrip"], "a history/distribution strip should follow the top strip")
+
+    def test_detail_composed_block_has_full_width_disclaimer_bar_above(self):
+        """#2881: the disclaimer text is now a standalone full-width bar
+        (`.detail-disclaimer-bar`) that is a DIRECT child of
+        #detail-composed-block, appended BEFORE the `.detail-strip-top`
+        two-column row -- not nested inside either column."""
+        d = self.report["detail"]
+        self.assertTrue(d["composedHasDisclaimerBar"], "no .detail-disclaimer-bar element found under #detail-composed-block")
+        self.assertTrue(d["disclaimerBarBeforeStripTop"], "disclaimer bar must precede the score/strip row, not follow or nest inside it")
 
     def test_detail_aspect_head_is_three_cell_grid(self):
         d = self.report["detail"]
@@ -792,6 +871,17 @@ class TestDetailViewRealDOMStructure(unittest.TestCase):
         text is a finite number rather than "NaN" or "--" -- 34 tests
         passed without a single one naming this outcome.
 
+        Post-#2881 note: MODEL_FIXTURE now ALSO carries `zero_eligible_
+        aspect` (added for test_composed_score_finite_with_zero_eligible_
+        aspect below), which shares this same render and this same
+        `composedValueText` field -- so this test is no longer isolated to
+        JUST the held-out-member case described below; without the #2881
+        fix it would also fail via the zero-eligible-members path. That
+        doesn't invalidate what follows -- provenance_integrity's own
+        arithmetic still doesn't discriminate the guard, which is exactly
+        why the dedicated test below was added rather than relying on this
+        one to cover both shapes.
+
         Round-1 reviewer-fairy correction on this PR (verified, kept):
         this test pins TODAY's render as finite on THIS fixture; it does
         NOT exercise or discriminate the weighting-guard logic
@@ -806,8 +896,10 @@ class TestDetailViewRealDOMStructure(unittest.TestCase):
         conditions (null raw, zero total importance) actually occur on
         this fixture. A genuine guard-discriminating test would need a
         fixture where an aspect's ADMITTED importance total is itself
-        driven to zero (e.g. a fully-held-out aspect) -- not built here,
-        left as a documented gap rather than a false claim of coverage.
+        driven to zero (e.g. a fully-held-out aspect) -- NOT built here at
+        the time of the original comment; #2881 below closes exactly that
+        gap (see test_composed_score_finite_with_zero_eligible_aspect and
+        the `zero_eligible_aspect` fixture entry).
 
         The fixture's `available: true` model makes composedScoreForToday()
         take the live compose-from-aspects path (not the flat snapshot.
@@ -822,6 +914,43 @@ class TestDetailViewRealDOMStructure(unittest.TestCase):
         except ValueError:
             self.fail(f"composed score text {text!r} is not parseable as a finite number")
         self.assertTrue(math.isfinite(value), f"composed score {value} is not finite")
+
+    def test_composed_score_finite_with_zero_eligible_aspect(self):
+        """#2881 regression -- the genuinely guard-discriminating case the
+        previous test's docstring named as a documented gap: `MODEL_FIXTURE`
+        now includes `zero_eligible_aspect`, a THIRD aspect whose only
+        member (`zero_eligible_signal`) is held-out (importance 0), so
+        aspectScoreForToday()'s model-recompute path finds `members.length
+        === 0` and falls through to the raw `aspect_tile` fallback, whose
+        `score` field is the STRING sentinel "UNAVAILABLE" -- matching the
+        real `provenance_integrity` bug's shape on a live seat (verified via
+        `curl /api/health/v2?agent=kepler` at spec-writing time), which
+        `provenance_integrity`'s own fixture entry (two admitted, scored
+        siblings alongside its held-out member) never reaches.
+
+        Pre-fix (`return tile ? tile.score : null;`), this string survives
+        composeScore()'s `!== null && !== undefined` filter, `"UNAVAILABLE"
+        * 100.0` evaluates to NaN, and the poisoned accumulator renders
+        both `.detail-composed-value` AND this aspect's own
+        `.detail-aspect-score` as the literal text "NaN". Post-fix
+        (`typeof tile.score === "number" ? tile.score : null`), the aspect
+        is correctly excluded from the compose-from-aspects weighted sum
+        (rendering "--" for the excluded aspect's own score) while the
+        composed value stays finite from the two remaining aspects."""
+        d = self.report["detail"]
+        composed_text = d["composedValueText"]
+        self.assertIsNotNone(composed_text, "no .detail-composed-value element found")
+        self.assertNotIn("NaN", composed_text, "composed score rendered NaN with a zero-eligible-members aspect present")
+        try:
+            value = float(composed_text)
+        except ValueError:
+            self.fail(f"composed score text {composed_text!r} is not parseable as a finite number")
+        self.assertTrue(math.isfinite(value), f"composed score {value} is not finite")
+
+        aspect_text = d["zeroEligibleAspectScoreText"]
+        self.assertIsNotNone(aspect_text, "no .detail-aspect-score element found for zero_eligible_aspect")
+        self.assertNotIn("NaN", aspect_text, "zero_eligible_aspect's own tile rendered NaN instead of the null placeholder")
+        self.assertEqual(aspect_text, "--", "zero_eligible_aspect (zero eligible members) should render the null placeholder")
 
     def test_workbench_signal_row_is_three_column_grid_control(self):
         """Control for the grid-structure checks above: the workbench's own

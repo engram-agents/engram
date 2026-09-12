@@ -344,7 +344,15 @@
       if (members.length) return aspectScore(members);
     }
     var tile = (state.snapshot.aspect_tile || []).filter(function (a) { return a.name === aspectName; })[0];
-    return tile ? tile.score : null;
+    // #2881: tile.score can be the string sentinel "UNAVAILABLE" (a zero-
+    // eligible-members aspect -- every member held-out or without data),
+    // never null, for this fallback path -- only a real number is safe to
+    // feed into composeScore()'s weighted-sum math below; the string
+    // otherwise survives composeScore's `!== null && !== undefined` filter
+    // and poisons the reduce accumulator to NaN. The visual status badges
+    // (statusClass(), the aspect tile's own "(unscored)" text) read
+    // tile/row fields directly elsewhere and are untouched by this guard.
+    return tile ? (typeof tile.score === "number" ? tile.score : null) : null;
   }
   function composedScoreForToday() {
     if (modelAvailable()) {
@@ -823,22 +831,37 @@
   }
 
   // -----------------------------------------------------------------------
-  // Composed-score block -- the workbench's top `.strip` two-column shape
-  // (score panel | explanatory-text panel, ported to this page's own
-  // `.detail-strip-top` class -- see health.html's own comment on that
-  // rule), plus its own history/distribution strip below (score-only:
-  // there is no single "raw" value for a composed score). The workbench's
-  // own `.strip` has no history/distribution content at all (it never
-  // displays composed-score history -- see this file's own module
-  // docstring) -- JUDGMENT CALL, flagged in the dispatching report: with
-  // no workbench placement to port, the strip is placed full-width below
-  // the two-column score/meaning row rather than inside either column.
+  // Composed-score block -- restructured per #2881 (Lei's explicit ruling):
+  // the disclaimer text that used to sit in the workbench-ported `.meaning`
+  // side panel is now a slim, full-width bar ABOVE everything else; the
+  // right-hand slot beside the Composed Score card (where the disclaimer
+  // used to sit) now holds the history/histogram strip instead. Text
+  // content of the disclaimer is unchanged -- only its container/position
+  // and CSS class (detail-meaning-panel -> detail-disclaimer-bar).
+  //
+  // JUDGMENT CALL (flagged in the dispatching report): the exact two-column
+  // width ratio for `.detail-strip-top` (score card | plot) is not
+  // specified by the issue -- verify visually (see health.html's own
+  // comment on that rule) rather than treating this as settled.
   // -----------------------------------------------------------------------
   function renderComposedBlock() {
     var prov = state.snapshot.provenance || {};
     var el1 = qs("#detail-composed-block");
     var composedValue = composedScoreForToday();
     el1.innerHTML = "";
+
+    // JUDGMENT CALL (flagged in the dispatching report): the workbench's
+    // `.meaning` panel disclaims EDITING ("Nothing on this page writes the
+    // substrate, the model, or any file on disk") -- reworded here since
+    // this read-only fork has no editing to disclaim in the first place,
+    // but the underlying fact (this page never writes anything) still
+    // holds and is worth keeping, per health-detail.js's own module
+    // docstring ("This page NEVER writes the substrate...").
+    var disclaimerBar = el("div", { class: "detail-disclaimer-bar" });
+    disclaimerBar.appendChild(el("p", {
+      html: "This is the same importance-weighted-mean / points-weighted composition the shipped scoring model uses, recomputed here in JS from the model&rsquo;s shipped curves and importance (see <code>/static/health-workbench-curve.js</code>) for read-only display. This page never writes the substrate, the model, or any file on disk.",
+    }));
+    el1.appendChild(disclaimerBar);
 
     var top = el("div", { class: "detail-strip-top" });
 
@@ -852,23 +875,16 @@
     scoreCard.appendChild(el("div", { class: "metric", html: '<span class="label">health_version</span><span class="value">' + escAttr(prov.health_version) + "</span>" }));
     top.appendChild(scoreCard);
 
-    // JUDGMENT CALL (flagged in the dispatching report): the workbench's
-    // `.meaning` panel disclaims EDITING ("Nothing on this page writes the
-    // substrate, the model, or any file on disk") -- reworded here since
-    // this read-only fork has no editing to disclaim in the first place,
-    // but the underlying fact (this page never writes anything) still
-    // holds and is worth keeping, per health-detail.js's own module
-    // docstring ("This page NEVER writes the substrate...").
-    var meaningCard = el("div", { class: "card detail-meaning-panel" });
-    meaningCard.appendChild(el("p", {
-      html: "This is the same importance-weighted-mean / points-weighted composition the shipped scoring model uses, recomputed here in JS from the model&rsquo;s shipped curves and importance (see <code>/static/health-workbench-curve.js</code>) for read-only display. This page never writes the substrate, the model, or any file on disk.",
-    }));
-    top.appendChild(meaningCard);
+    // JUDGMENT CALL (flagged in the dispatching report): the strip now
+    // lives in its own `.card` for visual parity with scoreCard, rather
+    // than a bare, unstyled container -- the issue names the SLOT
+    // (beside Composed Score) but not the wrapper styling.
+    var stripCard = el("div", { class: "card" });
+    var stripHost = el("div", { class: "detail-strip-dist-container" });
+    stripCard.appendChild(stripHost);
+    top.appendChild(stripCard);
 
     el1.appendChild(top);
-
-    var stripHost = el("div", { class: "detail-strip-dist-container" });
-    el1.appendChild(stripHost);
 
     var points = ((state.series && state.series.composed) || []).map(function (p) {
       return { t: p.t, score: p.value, raw: null, unreplayable: null };
