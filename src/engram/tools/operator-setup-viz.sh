@@ -144,10 +144,41 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Curve Workbench (:5021, engram-alpha#2894) — a SEPARATE, non-fatal gate.
+#
+# Unlike viz.server above, the Curve Workbench ships at DEV tier only
+# (viz/workbench.py + viz/data/health_workbench.py are both "dev" in
+# src/build/packaging/tiers.json) — a convenience/essential-tier install
+# legitimately does NOT ship it. Failing this gate means "skip the
+# workbench unit below", never "abort this script": the viz.server (:5001)
+# unit above must still install on a convenience-tier build.
+#
+# Reuses PYTHON_BIN found above (no need to re-loop over candidates — a
+# python that failed the viz.server gate already exited the script via the
+# check above). `import viz.workbench` itself IS the gate: that module's own
+# module-import-time check (engram-alpha#2754) already fails loud (SystemExit)
+# when the dev-tier files it needs are not shipped, so this reuses the same
+# self-gating mechanism the module carries rather than re-declaring the list
+# of dev-tier files here.
+# ---------------------------------------------------------------------------
+WORKBENCH_MODULE_INVOCATION="-m viz.workbench"
+WORKBENCH_SERVICE_NAME="engram-workbench-user.service"
+WORKBENCH_SERVICE_DEST="$HOME/.config/systemd/user/$WORKBENCH_SERVICE_NAME"
+WORKBENCH_GATE_OK=0
+if ENGRAM_DIR="$PLUGIN_ENGRAM_DIR" "$PYTHON_BIN" -c "import sys, os; sys.path.insert(0, os.environ['ENGRAM_DIR']); import viz.workbench" 2>/dev/null; then
+  WORKBENCH_GATE_OK=1
+fi
+
 echo "=== ENGRAM viz operator setup ==="
 echo "  plugin engram dir: $PLUGIN_ENGRAM_DIR"
 echo "  viz server:        $VIZ_PY"
 echo "  python:            $PYTHON_BIN"
+if [[ "$WORKBENCH_GATE_OK" -eq 1 ]]; then
+  echo "  workbench (:5021):  dev tier shipped -- would install $WORKBENCH_SERVICE_DEST (Linux only)"
+else
+  echo "  workbench (:5021):  dev-tier files NOT shipped -- workbench unit will be skipped"
+fi
 echo
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -221,6 +252,41 @@ if [[ "$OS" == "Linux" ]]; then
   echo "  systemd user service: enabled + started"
   echo "  Status: $(systemctl --user is-active "$SERVICE_NAME")"
 
+  # Step 3.5: Curve Workbench unit (engram-alpha#2894, dev tier only — see
+  # the WORKBENCH_GATE_OK gate computed above, before OS detection).
+  echo
+  echo "Step 3.5: Installing Curve Workbench systemd user unit (dev tier)"
+
+  if [[ "$WORKBENCH_GATE_OK" -eq 1 ]]; then
+    WORKBENCH_TEMPLATE="$PLUGIN_ENGRAM_DIR/templates/engram-workbench-user.service.template"
+
+    if [[ ! -f "$WORKBENCH_TEMPLATE" ]]; then
+      echo "  WARNING: workbench unit template not found: $WORKBENCH_TEMPLATE" >&2
+      echo "  Skipping the Curve Workbench unit (bundle may predate engram-alpha#2894)." >&2
+    else
+      mkdir -p "$(dirname "$WORKBENCH_SERVICE_DEST")"
+
+      sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+          -e "s|{{PLUGIN_ENGRAM_DIR}}|$PLUGIN_ENGRAM_DIR|g" \
+          "$WORKBENCH_TEMPLATE" > "$WORKBENCH_SERVICE_DEST"
+
+      echo "  unit → $WORKBENCH_SERVICE_DEST"
+
+      systemctl --user daemon-reload
+      systemctl --user enable "$WORKBENCH_SERVICE_NAME"
+      # restart (not start): idempotent, same convention as the viz-server
+      # unit above.
+      systemctl --user restart "$WORKBENCH_SERVICE_NAME"
+
+      echo "  Curve Workbench service: enabled + started"
+      echo "  Status: $(systemctl --user is-active "$WORKBENCH_SERVICE_NAME")"
+    fi
+  else
+    echo "  This install does not ship the Curve Workbench's dev-tier files"
+    echo "  (viz/data/health_workbench.py and friends) -- skipping the"
+    echo "  workbench unit. Build/install with the 'dev' tier to enable it."
+  fi
+
   # Step 4: Create ~/.local/bin/engram-viz-setup convenience symlink
   echo
   echo "Step 4: Creating convenience symlink"
@@ -235,6 +301,12 @@ if [[ "$OS" == "Linux" ]]; then
   echo "  Viz server running at: http://127.0.0.1:5001"
   echo "  Service:               systemctl --user status $SERVICE_NAME"
   echo "  Logs:                  journalctl --user -u $SERVICE_NAME -f"
+  if [[ "$WORKBENCH_GATE_OK" -eq 1 && -f "$PLUGIN_ENGRAM_DIR/templates/engram-workbench-user.service.template" ]]; then
+    echo
+    echo "  Curve Workbench at:    http://127.0.0.1:5021"
+    echo "  Service:               systemctl --user status $WORKBENCH_SERVICE_NAME"
+    echo "  Logs:                  journalctl --user -u $WORKBENCH_SERVICE_NAME -f"
+  fi
   echo
   echo "  Note: For service persistence across user logout, run:"
   echo "        sudo loginctl enable-linger $USER"

@@ -1,0 +1,28 @@
+[Unit]
+Description=ENGRAM Curve Workbench (developer tier, user session)
+
+[Service]
+Type=simple
+# Runs as the operator (no User=/Group=/SupplementaryGroups= — user-session
+# unit inherits the login user automatically). Dev-tier only: viz/workbench.py
+# fails loud (SystemExit) at import time if this install did not ship the
+# Curve Workbench's dev-tier files (engram-alpha#2754/#2894) -- visible via
+# `systemctl --user status` / `journalctl --user -u engram-workbench-user`
+# rather than a half-started server.
+WorkingDirectory={{PLUGIN_ENGRAM_DIR}}
+# -m viz.workbench (not a direct viz/workbench.py script path): viz/workbench.py
+# uses relative imports to reach its sibling modules, which only resolve when
+# run as part of the viz package -- WorkingDirectory above puts
+# PLUGIN_ENGRAM_DIR on sys.path so `viz` resolves (mirrors the viz.server
+# precedent, engram-alpha#2555). Same operator config as viz.server
+# (/etc/engram-viz/agents.json) -- viz/workbench.py's own docstring: "all
+# against the SAME operator config viz.server would use".
+ExecStart={{PYTHON}} -m viz.workbench --bind 127.0.0.1 --port 5021 --config /etc/engram-viz/agents.json
+
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

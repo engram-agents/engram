@@ -109,6 +109,28 @@ def _python_stub_exit1(stub_dir: Path) -> Path:
     return _write_stub(stub_dir, "python3", "#!/usr/bin/env bash\nexit 1\n")
 
 
+def _python_stub_workbench_gate(stub_dir: Path, *, workbench_ok: bool) -> Path:
+    """Write a python3 stub that always passes the viz.server gate (the
+    `engram_stats`/`tools.config_schema` import), but for the Curve
+    Workbench-specific gate (`import viz.workbench`, engram-alpha#2894)
+    exits 0 only when workbench_ok=True, else 1 — simulating a
+    convenience/essential-tier install that legitimately doesn't ship the
+    dev-tier files. Distinguishes the two gate calls by grepping the -c
+    script text (the stub's own last positional argument) for the
+    substring 'viz.workbench'.
+    """
+    exit_code = "0" if workbench_ok else "1"
+    content = textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        script="${{@: -1}}"
+        if [[ "$script" == *"viz.workbench"* ]]; then
+          exit {exit_code}
+        fi
+        exit 0
+        """)
+    return _write_stub(stub_dir, "python3", content)
+
+
 # Coreutils the setup script needs at runtime. The missing-service-manager
 # tests run with PATH scrubbed down to symlinks of these — deliberately WITHOUT
 # launchctl/systemctl — so "the tool is absent" can be simulated portably. (A
@@ -778,6 +800,334 @@ class TestPlistTemplateRendering(unittest.TestCase):
             self.assertIn("/fake/engram", content)
             # VIZ_CONFIG path appears in the rendered args
             self.assertIn("/fake/.engram/viz-agents.json", content)
+
+
+# ---------------------------------------------------------------------------
+# Curve Workbench (:5021) systemd unit — engram-alpha#2894.
+# ---------------------------------------------------------------------------
+WORKBENCH_TEMPLATE_FILE = TEMPLATE_DIR / "engram-workbench-user.service.template"
+
+
+class TestWorkbenchTemplateRendering(unittest.TestCase):
+    """Direct sed rendering of the workbench template (no script invocation).
+
+    Mirrors TestPlistTemplateRendering's shape for engram-viz-server.plist.template.
+    """
+
+    def test_workbench_template_exists(self):
+        self.assertTrue(
+            WORKBENCH_TEMPLATE_FILE.exists(),
+            f"Template must exist: {WORKBENCH_TEMPLATE_FILE}",
+        )
+
+    def test_workbench_template_renders_no_residual_placeholders(self):
+        """sed rendering of engram-workbench-user.service.template must leave no {{...}}."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "engram-workbench-user.service"
+            fake_python = "/usr/local/bin/python3"
+            fake_plugin_dir = "/usr/local/lib/engram"
+
+            subprocess.run(
+                [
+                    "sed",
+                    "-e", f"s|{{{{PYTHON}}}}|{fake_python}|g",
+                    "-e", f"s|{{{{PLUGIN_ENGRAM_DIR}}}}|{fake_plugin_dir}|g",
+                    str(WORKBENCH_TEMPLATE_FILE),
+                ],
+                stdout=out.open("w"),
+                check=True,
+            )
+
+            content = out.read_text()
+            self.assertNotIn(
+                "{{",
+                content,
+                f"Rendered unit must have no {{{{...}}}} placeholders;\ngot:\n{content}",
+            )
+
+    def test_workbench_template_execstart_names_module_and_port(self):
+        """Rendered ExecStart must name viz.workbench and port 5021, with the
+        substituted python/plugin-dir values, and use the same operator
+        config path as the viz.server unit."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "engram-workbench-user.service"
+            fake_python = "/usr/local/bin/python3"
+            fake_plugin_dir = "/usr/local/lib/engram"
+
+            subprocess.run(
+                [
+                    "sed",
+                    "-e", f"s|{{{{PYTHON}}}}|{fake_python}|g",
+                    "-e", f"s|{{{{PLUGIN_ENGRAM_DIR}}}}|{fake_plugin_dir}|g",
+                    str(WORKBENCH_TEMPLATE_FILE),
+                ],
+                stdout=out.open("w"),
+                check=True,
+            )
+
+            content = out.read_text()
+            execstart_lines = [
+                line for line in content.splitlines() if line.startswith("ExecStart=")
+            ]
+            self.assertEqual(
+                len(execstart_lines), 1,
+                f"Expected exactly one ExecStart line;\ngot:\n{content}",
+            )
+            execstart = execstart_lines[0]
+            self.assertIn(fake_python, execstart)
+            self.assertIn("-m viz.workbench", execstart)
+            self.assertIn("--port 5021", execstart)
+            self.assertIn("--bind 127.0.0.1", execstart)
+            self.assertIn("/etc/engram-viz/agents.json", execstart)
+            self.assertIn(fake_plugin_dir, content)  # WorkingDirectory
+
+    def test_workbench_template_has_unit_sections(self):
+        """Rendered unit must be well-formed INI-like systemd syntax:
+        [Unit]/[Service]/[Install] sections, Restart=on-failure, WantedBy=default.target."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "engram-workbench-user.service"
+            subprocess.run(
+                [
+                    "sed",
+                    "-e", "s|{{PYTHON}}|/usr/bin/python3|g",
+                    "-e", "s|{{PLUGIN_ENGRAM_DIR}}|/fake/engram|g",
+                    str(WORKBENCH_TEMPLATE_FILE),
+                ],
+                stdout=out.open("w"),
+                check=True,
+            )
+            content = out.read_text()
+            self.assertIn("[Unit]", content)
+            self.assertIn("[Service]", content)
+            self.assertIn("[Install]", content)
+            self.assertIn("Restart=on-failure", content)
+            self.assertIn("WantedBy=default.target", content)
+
+
+class TestWorkbenchLinuxBranch(unittest.TestCase):
+    """Extending operator-setup-viz.sh's Linux branch installs a SECOND
+    systemd unit (engram-workbench-user.service) alongside the existing
+    engram-viz-user.service, gated on the Curve Workbench's dev-tier files
+    being importable (see WORKBENCH_GATE_OK in the script)."""
+
+    def _run_linux(
+        self, fake_home: str, stub_dir: str, plugin_engram_dir: Path,
+        *, workbench_ok: bool = True,
+    ) -> subprocess.CompletedProcess:
+        fake_engram_home = Path(fake_home) / ".engram"
+        fake_engram_home.mkdir(parents=True, exist_ok=True)
+
+        stub_path = Path(stub_dir)
+        _python_stub_workbench_gate(stub_path, workbench_ok=workbench_ok)
+        _write_stub(stub_path, "uname", '#!/usr/bin/env bash\necho "Linux"\n')
+        log = stub_path / "systemctl-calls.log"
+        _write_stub(
+            stub_path,
+            "systemctl",
+            textwrap.dedent(f"""\
+                #!/usr/bin/env bash
+                echo "$@" >> "{log}"
+                exit 0
+                """),
+        )
+
+        patched = Path(fake_home) / "setup_patched.sh"
+        _make_patched_script(str(plugin_engram_dir), patched)
+
+        env = _make_env(stub_dir, fake_home, engram_home=str(fake_engram_home))
+        return subprocess.run(
+            ["bash", str(patched)],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def test_workbench_unit_lands_in_systemd_user_dir(self):
+        """Linux branch must ALSO write engram-workbench-user.service, alongside
+        the existing engram-viz-user.service, when the dev-tier gate passes."""
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            result = self._run_linux(fake_home, stub_dir, plugin_engram_dir, workbench_ok=True)
+
+            viz_unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-viz-user.service"
+            )
+            workbench_unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-workbench-user.service"
+            )
+            self.assertTrue(
+                viz_unit.exists(),
+                f"viz.server unit must still be written;\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertTrue(
+                workbench_unit.exists(),
+                f"workbench unit must be written when the dev-tier gate passes;\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+    def test_workbench_unit_no_residual_placeholders(self):
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            self._run_linux(fake_home, stub_dir, plugin_engram_dir, workbench_ok=True)
+
+            unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-workbench-user.service"
+            )
+            content = unit.read_text()
+            self.assertNotIn(
+                "{{",
+                content,
+                f"Rendered unit must have no {{{{...}}}} placeholders;\ngot:\n{content}",
+            )
+
+    def test_workbench_unit_execstart_names_module_and_port(self):
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            self._run_linux(fake_home, stub_dir, plugin_engram_dir, workbench_ok=True)
+
+            unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-workbench-user.service"
+            )
+            content = unit.read_text()
+            self.assertIn("-m viz.workbench", content)
+            self.assertIn("--port 5021", content)
+
+    def test_workbench_invokes_systemctl_for_workbench_service(self):
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            self._run_linux(fake_home, stub_dir, plugin_engram_dir, workbench_ok=True)
+
+            log = Path(stub_dir) / "systemctl-calls.log"
+            self.assertTrue(log.exists() and log.read_text().strip(), "systemctl must be invoked")
+            calls = log.read_text()
+            self.assertIn("engram-workbench-user.service", calls)
+            self.assertIn("engram-viz-user.service", calls)
+
+    def test_workbench_skipped_when_dev_tier_gate_fails(self):
+        """A convenience/essential-tier install (workbench gate fails) must
+        NOT get a workbench unit written or enabled, but the viz.server unit
+        must still install normally — the workbench gate failing is
+        non-fatal to the rest of the script."""
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir)
+
+            result = self._run_linux(fake_home, stub_dir, plugin_engram_dir, workbench_ok=False)
+
+            self.assertEqual(
+                result.returncode, 0,
+                f"Script must still succeed when only the workbench gate fails;\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+
+            viz_unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-viz-user.service"
+            )
+            workbench_unit = (
+                Path(fake_home) / ".config" / "systemd" / "user" / "engram-workbench-user.service"
+            )
+            self.assertTrue(
+                viz_unit.exists(),
+                "viz.server unit must still install when only the workbench gate fails",
+            )
+            self.assertFalse(
+                workbench_unit.exists(),
+                "workbench unit must NOT be written when the dev-tier gate fails",
+            )
+
+            log = Path(stub_dir) / "systemctl-calls.log"
+            calls = log.read_text() if log.exists() else ""
+            self.assertNotIn(
+                "engram-workbench-user.service", calls,
+                "systemctl must not be invoked for the workbench unit when the gate fails",
+            )
+
+
+class TestWorkbenchDryRun(unittest.TestCase):
+    """--dry-run must report the workbench unit's resolved install path
+    without installing anything (engram-alpha#2894 acceptance criterion)."""
+
+    def test_dry_run_reports_workbench_resolved_path_when_gate_passes(self):
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            stub_path = Path(stub_dir)
+            fake_engram_home = Path(fake_home) / ".engram"
+            fake_engram_home.mkdir(parents=True, exist_ok=True)
+
+            _python_stub_workbench_gate(stub_path, workbench_ok=True)
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir, with_templates=False)
+
+            patched = Path(fake_home) / "setup_patched.sh"
+            _make_patched_script(str(plugin_engram_dir), patched)
+
+            env = _make_env(stub_dir, fake_home, engram_home=str(fake_engram_home))
+            result = subprocess.run(
+                ["bash", str(patched), "--dry-run"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            self.assertIn("engram-workbench-user.service", combined)
+            self.assertIn(
+                str(Path(fake_home) / ".config" / "systemd" / "user"), combined,
+            )
+            # dry-run must not actually create anything
+            self.assertFalse(
+                (Path(fake_home) / ".config" / "systemd").exists(),
+                "--dry-run must not create ~/.config/systemd",
+            )
+
+    def test_dry_run_reports_workbench_skip_when_gate_fails(self):
+        with tempfile.TemporaryDirectory() as stub_dir, \
+             tempfile.TemporaryDirectory() as fake_home:
+
+            stub_path = Path(stub_dir)
+            fake_engram_home = Path(fake_home) / ".engram"
+            fake_engram_home.mkdir(parents=True, exist_ok=True)
+
+            _python_stub_workbench_gate(stub_path, workbench_ok=False)
+
+            plugin_engram_dir = Path(fake_home) / "plugin" / "engram"
+            _make_fake_plugin(plugin_engram_dir, with_templates=False)
+
+            patched = Path(fake_home) / "setup_patched.sh"
+            _make_patched_script(str(plugin_engram_dir), patched)
+
+            env = _make_env(stub_dir, fake_home, engram_home=str(fake_engram_home))
+            result = subprocess.run(
+                ["bash", str(patched), "--dry-run"],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            combined = result.stdout + result.stderr
+            self.assertIn("NOT shipped", combined)
 
 
 if __name__ == "__main__":
