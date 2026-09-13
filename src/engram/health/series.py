@@ -3404,6 +3404,17 @@ def export(
     - ``version_absent`` -- no ``derived_points`` rows for ``health_version``
       (default ``health_version_module.CURRENT``); ``has_declarations``
       says whether a ``declarations`` row exists for it regardless.
+      Returned when there is no ``l0_points`` data for the version's MAJOR,
+      OR when ``health_version`` is non-CURRENT and has no stored
+      ``declarations`` row -- signal formulas (numerator/denominator/form/
+      gate) are MINOR-scoped (``health/version.py``'s own MAJOR/MINOR
+      split; ``health/measurements.py``'s ``canonical_derived_hash``), so
+      serving a non-current, undeclared version's raw values under today's
+      live formulas could silently mislabel a different formula's output
+      with that version's string. Only when L0 data exists AND the
+      requested version genuinely IS ``health_version_module.CURRENT``
+      (declared or not) does ``export`` instead return the raw L0 series
+      with ``scores_available: False``; see below.
     - ``signal_unknown`` -- ``signal`` is not a key of that version's
       ``signal_defs``.
     - ``unreadable`` -- a ``sqlite3.Error`` occurred (corrupt file, etc.);
@@ -3428,7 +3439,19 @@ def export(
     denominator``; ``unreplayable`` is the L0 row's own ``unreplayable``
     entries restricted to those two keys (``None`` if neither is present).
     This function does NOT compute distribution statistics (#2518 §4: the
-    page does that client-side over ``history``)."""
+    page does that client-side over ``history``).
+
+    ``signals[name][i]["raw"]``/``["score"]`` can be populated even when
+    ``scores_available`` is ``False``: when the requested ``health_version``
+    genuinely IS ``health_version_module.CURRENT`` and was never
+    ``derive``d, but L0 data for its MAJOR exists, ``raw`` is computed live
+    via ``derive_point`` while ``score`` stays ``None`` -- mirrors
+    ``derive()``'s own live-seeding guard exactly (``seed_from_live and
+    effective_health_version == health_version_module.CURRENT``). A
+    non-current version with no stored declaration returns
+    ``version_absent`` instead (see above), never a live-formula fallback.
+    ``"UNAVAILABLE"`` (string) is a normal value for ``raw`` in that case,
+    exactly as it already is in the normal derived path."""
     db_path = Path(db_path)
     if not db_path.exists():
         return {
@@ -3449,6 +3472,13 @@ def export(
 
     try:
         try:
+            major, _minor = health_version_module.parse_version(effective_health_version)
+        except ValueError as e:
+            return {"error": str(e), "reason": "unreadable"}
+
+        current_hash = health_measurements.replay_decl_hash()
+
+        try:
             derived_count = conn.execute(
                 "SELECT COUNT(*) AS c FROM derived_points WHERE health_version = ?",
                 (effective_health_version,),
@@ -3457,39 +3487,10 @@ def export(
                 "SELECT * FROM declarations WHERE health_version = ?",
                 (effective_health_version,),
             ).fetchone()
-        except sqlite3.Error as e:
-            return {"error": str(e), "reason": "unreadable"}
-
-        if derived_count == 0:
-            return {
-                "error": f"no derived_points rows for {effective_health_version!r}",
-                "reason": "version_absent",
-                "has_declarations": decl_row is not None,
-            }
-
-        signal_defs = json.loads(decl_row["signal_defs"]) if decl_row is not None else {}
-        if signal is not None and signal not in (signal_defs or {}):
-            return {
-                "error": f"unknown signal {signal!r} for {effective_health_version!r}",
-                "reason": "signal_unknown",
-            }
-
-        try:
-            major, _minor = health_version_module.parse_version(effective_health_version)
-        except ValueError as e:
-            return {"error": str(e), "reason": "unreadable"}
-
-        current_hash = health_measurements.replay_decl_hash()
-
-        try:
             l0_rows = conn.execute(
                 "SELECT * FROM l0_points WHERE health_major = ? "
                 "AND (source = 'stored' OR (source = 'git_replay' AND replay_decl_hash = ?))",
                 (major, current_hash),
-            ).fetchall()
-            derived_rows = conn.execute(
-                "SELECT * FROM derived_points WHERE health_version = ?",
-                (effective_health_version,),
             ).fetchall()
         except sqlite3.Error as e:
             return {"error": str(e), "reason": "unreadable"}
@@ -3501,16 +3502,69 @@ def export(
             if existing_l0 is None or (existing_l0["source"] != "stored" and r["source"] == "stored"):
                 l0_by_commit[c] = r
 
+        if derived_count == 0 and not l0_by_commit:
+            return {
+                "error": f"no derived_points rows for {effective_health_version!r}",
+                "reason": "version_absent",
+                "has_declarations": decl_row is not None,
+            }
+
+        if decl_row is not None and decl_row["signal_defs"]:
+            signal_defs = json.loads(decl_row["signal_defs"])
+        elif effective_health_version == health_version_module.CURRENT:
+            # No declaration was ever ingested for CURRENT (e.g. the MINOR
+            # was bumped in code but no snapshot at the new version has
+            # been ingested yet) -- fall back to the LIVE code's current
+            # signal definitions. This is safe ONLY because the requested
+            # version genuinely IS the code's live version by definition --
+            # there is no formula mismatch to mislabel. Mirrors derive()'s
+            # own guard (`seed_from_live and effective_health_version ==
+            # health_version_module.CURRENT`) exactly.
+            health_signals = _import_health_module("signals")
+            signal_defs = health_signals.signal_defs_jsonable()
+        else:
+            # A non-current version with no stored declaration -- signal
+            # formulas (numerator/denominator/form/gate) are MINOR-scoped
+            # (health/version.py, health/measurements.py's
+            # canonical_derived_hash), so borrowing HEAD's live definitions
+            # here would silently compute values under a possibly
+            # different formula and mislabel them with this (different,
+            # non-current) requested version string -- exactly what
+            # derive_point()'s own docstring says never to do. Treat this
+            # the same as version_absent: there is nothing this function
+            # can safely serve for this version.
+            return {
+                "error": (
+                    f"{effective_health_version!r} is not CURRENT and has no "
+                    "stored declaration -- refusing to derive signal_defs "
+                    "from HEAD for a non-current version"
+                ),
+                "reason": "version_absent",
+                "has_declarations": decl_row is not None,
+            }
+
+        if signal is not None and signal not in (signal_defs or {}):
+            return {
+                "error": f"unknown signal {signal!r} for {effective_health_version!r}",
+                "reason": "signal_unknown",
+            }
+
+        try:
+            derived_rows = conn.execute(
+                "SELECT * FROM derived_points WHERE health_version = ?",
+                (effective_health_version,),
+            ).fetchall()
+        except sqlite3.Error as e:
+            return {"error": str(e), "reason": "unreadable"}
+
         derived_by_key = {
             (r["commit_sha"], r["l0_source"], r["replay_decl_hash"]): r for r in derived_rows
         }
 
-        triples: "list[tuple[str, sqlite3.Row, sqlite3.Row]]" = []
+        triples: "list[tuple[str, sqlite3.Row, sqlite3.Row | None]]" = []
         for commit_sha, l0_row in l0_by_commit.items():
             key = (commit_sha, l0_row["source"], l0_row["replay_decl_hash"])
             derived_row = derived_by_key.get(key)
-            if derived_row is None:
-                continue
             triples.append((commit_sha, l0_row, derived_row))
         triples.sort(key=lambda t: (t[1]["commit_time"], t[0]))
 
@@ -3518,13 +3572,31 @@ def export(
         signals_out: "dict[str, list]" = {name: [] for name in names}
         aspects_out: "dict[str, list]" = {}
         composed_out: "list[dict]" = []
-        scores_available = decl_row is not None and decl_row["model_defs"] is not None
+        scores_available = (
+            derived_count > 0
+            and decl_row is not None
+            and decl_row["model_defs"] is not None
+        )
 
         for commit_sha, l0_row, derived_row in triples:
             measurements = json.loads(l0_row["measurements"])
             unreplayable_all = json.loads(l0_row["unreplayable"])
-            signals_json = json.loads(derived_row["signals"])
-            scores_json = json.loads(derived_row["scores"])
+            if derived_row is not None:
+                signals_json = json.loads(derived_row["signals"])
+                scores_json = json.loads(derived_row["scores"])
+            else:
+                # No stored derived_points row for this exact commit+version --
+                # compute the raw signal values live via the SAME pure deriver
+                # `derive()` itself uses, rather than leaving `raw`/`score` as
+                # None. `derive_point` degrades scores to
+                # {"unavailable_reason": "model_defs_absent"} on its own when
+                # `model_defs` is absent -- we don't need to pass curve_defs/
+                # model_defs at all here, since `scores_available` (computed
+                # above) already forces every point's `score` to None and skips
+                # the aspects/composed block below regardless of what
+                # `derive_point` returns for scores.
+                signals_json, _ = derive_point(measurements, {"signal_defs": signal_defs})
+                scores_json = {}
             source = l0_row["source"]
             t = l0_row["commit_time"]
             turn = l0_row["turn"]
@@ -3555,7 +3627,7 @@ def export(
                 }
                 signals_out[name].append(point)
 
-            if scores_available and isinstance(scores_json, dict):
+            if derived_row is not None and scores_available and isinstance(scores_json, dict):
                 for aspect_name, aspect_score in (scores_json.get("aspects") or {}).items():
                     aspects_out.setdefault(aspect_name, []).append(
                         {"t": t, "commit": commit_sha, "source": source, "score": aspect_score}

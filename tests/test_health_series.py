@@ -3311,6 +3311,164 @@ def test_export_fail_honest_reasons(tmp_path):
     assert r4["reason"] == "unreadable"
 
 
+def test_export_raw_l0_fallback_when_never_derived(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    # deliberately do NOT call series.derive() -- derived_points stays empty
+
+    ex = series.export(db_path)
+    assert "error" not in ex
+    assert ex["scores_available"] is False
+    assert set(ex["signals"].keys()) == set(snap["signal_defs"].keys())
+    point = ex["signals"]["taint_rate"][0]
+    assert point["commit"] == commit_sha
+    assert point["num"] == snap["measurements"]["claim_bearing_pending_retract_marker"]
+    assert point["den"] == snap["measurements"]["claim_bearing_current"]
+    assert isinstance(point["raw"], float)  # live-derived via derive_point, not None
+    assert point["score"] is None
+    assert ex["aspects"] == {}
+    assert ex["composed"] == []
+
+
+def test_export_raw_l0_fallback_for_bumped_minor_version(tmp_path):
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    series.derive(db_path, snapshots_dir=snapshots_dir)
+    stored_version = snap["health_version"]
+    assert stored_version == series.health_version_module.CURRENT
+    major, minor = series.health_version_module.parse_version(stored_version)
+    bumped_version = series.health_version_module.format_version(major, minor + 1)
+
+    # A version NEWER than CURRENT with no stored declaration is NOT safe
+    # to raw-fallback for -- signal formulas are MINOR-scoped, so serving
+    # this via live HEAD definitions could silently mislabel a different
+    # formula's output. version_absent is the correct, conservative answer
+    # here (same as the pre-existing health-v9.9 MAJOR-absent case below).
+    ex = series.export(db_path, health_version=bumped_version)
+    assert ex["reason"] == "version_absent"
+
+    # control: the ORIGINAL, fully-derived version is completely unaffected.
+    ex_full = series.export(db_path, health_version=stored_version)
+    assert ex_full["scores_available"] is True
+    assert ex_full["signals"]["taint_rate"][0]["score"] is not None
+
+    # control: a MAJOR with zero L0 data at all still errors (unchanged
+    # behavior, matches test_export_fail_honest_reasons's health-v9.9 case).
+    r = series.export(db_path, health_version="health-v9.9")
+    assert r["reason"] == "version_absent"
+
+
+def test_export_raw_l0_fallback_uses_live_signal_defs_for_current_version(tmp_path):
+    """The genuinely-safe live-fallback case: no declarations row exists
+    for CURRENT (e.g. ingest() never ran for a snapshot at this exact
+    version string), but L0 data does. This is DIFFERENT from
+    test_export_raw_l0_fallback_when_never_derived, whose decl_row IS
+    populated (by ingest()) -- that test exercises the decl_row-present
+    branch, not the live-signal_defs fallback. Constructed by deleting the
+    declarations row ingest() wrote, via raw SQL (same pattern as round 2's
+    partial-coverage test), rather than trying to prevent it from being
+    written in the first place."""
+    repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
+    stored_version = snap["health_version"]
+    assert stored_version == series.health_version_module.CURRENT
+
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute("DELETE FROM declarations WHERE health_version = ?", (stored_version,))
+    raw_conn.commit()
+    raw_conn.close()
+
+    ex = series.export(db_path)  # defaults to CURRENT
+    assert "error" not in ex
+    assert ex["version"] == stored_version
+    assert ex["scores_available"] is False
+    point = ex["signals"]["taint_rate"][0]
+    assert point["commit"] == commit_sha
+    assert isinstance(point["raw"], float)
+    assert point["score"] is None
+
+
+def test_export_no_spurious_composed_point_for_partial_derive_coverage(tmp_path):
+    """Round-2 regression: PARTIAL derive coverage (derived_count > 0 for
+    the version, but ONE commit's own derived_points row is missing) must
+    NOT synthesize a spurious all-None composed_out/aspects_out entry for
+    that commit. The two raw-L0-fallback tests above both have
+    derived_count == 0 for the target version (the whole-version-absent
+    case); this exercises the narrower partial-coverage case the original
+    ``scores_available and isinstance(scores_json, dict)`` gate missed --
+    ``scores_available`` is a VERSION-level flag, so it stayed True while
+    ``scores_json`` fell back to ``{}`` for the one commit lacking a row,
+    and ``isinstance({}, dict)`` slipped past the gate."""
+    repo_dir = tmp_path / "repo"
+    _init_repo(repo_dir)
+    t0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+    commit1 = _commit_knowledge(repo_dir, "-- k1", _committer_iso(t0))
+    commit2 = _commit_knowledge(repo_dir, "-- k2", _committer_iso(t0 + timedelta(minutes=1)))
+
+    snapshots_dir = tmp_path / "health-snapshots"
+    snapshots_dir.mkdir()
+    snap1 = _build_populated_v2_snapshot(anchor=None, turn=1)
+    ts1 = t0.strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 1, "nap", ts1, snap1)
+
+    snap2 = _build_populated_v2_snapshot(anchor=None, turn=2)
+    ts2 = (t0 + timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ")
+    _write_snapshot_file(snapshots_dir, 2, "nap", ts2, snap2)
+
+    db_path = tmp_path / "series.db"
+    series.ingest(snapshots_dir, repo_dir, db_path)
+    result = series.derive(db_path, snapshots_dir=snapshots_dir)
+    assert result["status"] == "ok"
+
+    # Sanity: both commits got a derived row -- fully-derived version,
+    # derived_count == 2, BEFORE we simulate partial coverage below.
+    conn = series.open_store(db_path)
+    derived_before = {
+        r["commit_sha"]
+        for r in conn.execute(
+            "SELECT commit_sha FROM derived_points WHERE health_version = ?",
+            (snap1["health_version"],),
+        ).fetchall()
+    }
+    conn.close()
+    assert derived_before == {commit1, commit2}
+
+    # Simulate partial coverage: delete commit2's derived_points row via a
+    # raw sqlite3 connection (not open_store, to avoid unrelated
+    # migration/write side effects).
+    raw_conn = sqlite3.connect(str(db_path))
+    raw_conn.execute("DELETE FROM derived_points WHERE commit_sha = ?", (commit2,))
+    raw_conn.commit()
+    raw_conn.close()
+
+    ex = series.export(db_path)
+    assert "error" not in ex
+    # Version-level flag confirms this is genuinely the partial-coverage
+    # case (derived_count > 0), not the whole-version-absent case the two
+    # tests above already cover.
+    assert ex["scores_available"] is True
+
+    # The commit WITH a derived row appears normally, with a real value.
+    composed_commit1 = [c for c in ex["composed"] if c["commit"] == commit1]
+    assert len(composed_commit1) == 1
+    assert composed_commit1[0]["value"] is not None
+
+    # THE KEY ASSERTION: the commit whose derived row was deleted must not
+    # produce a spurious all-None composed_out entry. Before the fix this
+    # list held one entry with value/points_in_play/composed_coverage all
+    # None; after the fix it's empty, matching pre-round-1 behavior for the
+    # aspects/composed block on individual points lacking a derived row.
+    composed_commit2 = [c for c in ex["composed"] if c["commit"] == commit2]
+    assert composed_commit2 == []
+    for aspect_points in ex["aspects"].values():
+        assert all(p["commit"] != commit2 for p in aspect_points)
+
+    # Round-1's own intended fix (raw-signal-always-available) is untouched
+    # by this narrower fix: commit2 still appears in signals_out with a
+    # real raw value (computed live via derive_point) and score None.
+    point2 = [p for p in ex["signals"]["taint_rate"] if p["commit"] == commit2]
+    assert len(point2) == 1
+    assert isinstance(point2[0]["raw"], float)
+    assert point2[0]["score"] is None
+
+
 # --- 8.10: migrations ---------------------------------------------------------
 
 _PRE_C1_DERIVED_POINTS_DDL = """
