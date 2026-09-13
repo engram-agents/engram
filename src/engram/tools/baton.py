@@ -937,7 +937,16 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     _flip_force = args.force
     _parsed_anchor = _parse_github_anchor(github_anchor)
     _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
-    if _pr_anchor_match and _is_pool_sentinel(to_agent) and _parsed_anchor[1] is None:
+    # #2912: hoisted here (was previously computed only later, inside the
+    # no_approval branch) so both call sites below -- the unqualified-anchor
+    # refusal and the main CI/approval/colleague gate -- can call
+    # _is_maintainer_flip, which needs to know who currently holds the baton
+    # and who the registered colleague is. Same fields.get("turn", ...) read
+    # _current_holder used at its old, later site (now reusing this value
+    # instead of recomputing); nothing mutates `fields` in between.
+    _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+    _colleague_name = fields.get("colleague", "").strip().lower()
+    if _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name) and _parsed_anchor[1] is None:
         # #1918/#2511: unqualified pr/<N> anchor -- there is no default repo
         # to guess against. A flip-to-the-pool-sentinel IS the merge-readiness
         # signal the maintainer trusts (CLAUDE.md's baton-tracked
@@ -960,7 +969,7 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
-    elif _pr_anchor_match and _is_pool_sentinel(to_agent):
+    elif _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name):
         _pr_num = _parsed_anchor[2]
         _pr_repo = _parsed_anchor[1]
         _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
@@ -1023,8 +1032,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             # the participants list (single-agent mode / no counterpart), warn
             # and proceed — per CLAUDE.md the colleague layer collapses when no
             # counterpart exists ("don't block on a colleague review that has
-            # no one to perform it").
-            _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+            # no one to perform it").  _current_holder was hoisted above
+            # (#2912) so _is_maintainer_flip could use it too; reused here
+            # rather than recomputed.
             _sentinel = _pool_sentinel()
             _colleague_participants = [
                 p for p in participants
@@ -1155,6 +1165,37 @@ def _is_pool_sentinel(name: str) -> bool:
     # Also accept the first whitespace-token of the sentinel ("lei" from "lei shi").
     first_token = sentinel.split()[0] if sentinel else ""
     return bool(first_token) and name == first_token
+
+
+def _is_maintainer_flip(to_agent: str, current_holder: str, colleague_name: str) -> bool:
+    """True when flipping the baton to `to_agent` represents presenting
+    the PR for MERGE (to the maintainer) — the point where CI-green,
+    approval-freshness, and colleague-approval-existence must all hold —
+    as opposed to a review-stage flip (to the registered colleague, who
+    has not reviewed yet) or a self-flip (still working on it, no
+    merge-readiness claim being made).
+
+    Fires on:
+      - the literal pool sentinel (the single-human-owner convention
+        `_is_pool_sentinel` already recognizes), OR
+      - any OTHER agent — this repo's actual convention is to flip to a
+        NAMED maintainer agent (e.g. "ariadne", "borges"), not the literal
+        sentinel — PROVIDED it is not a self-flip and not the flip TO the
+        registered colleague (that flip is the "please review" signal,
+        not "ready to merge", and firing CI/approval checks on it would
+        be premature — the colleague hasn't reviewed yet).
+
+    Caller guarantees `to_agent` is already either the pool sentinel or a
+    genuine registered participant (validated earlier in cmd_flip) — this
+    function does not re-validate participant membership.
+    """
+    if _is_pool_sentinel(to_agent):
+        return True
+    if to_agent == current_holder:
+        return False
+    if colleague_name and to_agent == colleague_name:
+        return False
+    return True
 
 
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:

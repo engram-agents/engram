@@ -2869,6 +2869,454 @@ class TestFlipRepoQualifiedGuard:
 
 
 # ===========================================================================
+# CATEGORY 16: cmd_flip's maintainer-role gate broadening (#2912)
+# ===========================================================================
+
+
+class TestFlipMaintainerRoleGate:
+    """#2912: cmd_flip's entire CI-green/approval-freshness/colleague-
+    approval-exists gate block was guarded by a bare `_is_pool_sentinel(to_agent)`
+    check -- true only when to_agent matches config.json's primary_user (the
+    literal pool sentinel, e.g. "lei shi"). But this repo's actual, documented
+    convention (CLAUDE.md, "Every PR carries a baton") is to flip a PR-baton
+    to a NAMED maintainer agent ("baton flip PR-N borges", "baton flip PR-N
+    ariadne") -- never to the literal sentinel. So on every flip that matches
+    real practice, the ENTIRE gate -- CI check, approval-freshness check, and
+    the colleague-approval-EXISTS check -- silently never ran. A fully
+    CI-red, zero-approval PR could be flipped to a named maintainer with
+    total silence.
+
+    _is_maintainer_flip broadens the trigger: fires on the literal sentinel
+    OR any other agent, PROVIDED it is not a self-flip and not the flip to
+    the registered colleague (that flip is "please review", not "ready to
+    merge" -- the colleague hasn't reviewed yet, so firing CI/approval
+    checks on it would be premature).
+
+    All tests here pin the sentinel EXPLICITLY via
+    `monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")` --
+    matching this file's existing convention in TestFlipRepoQualifiedGuard
+    above. This matters because _pool_sentinel() resolves from the INVOKING
+    SEAT's own $ENGRAM_HOME/config.json primary_user, not a fleet-wide
+    constant -- two different seats running the identical command can see
+    _is_pool_sentinel(to_agent) resolve differently depending on whose
+    machine ran it. Relying on the ambient real config.json on whatever
+    machine runs these tests would make them non-deterministic across
+    seats/installs; pinning removes that dependency entirely. Tests below
+    cover BOTH shapes of "presenting for merge" under the SAME pinned
+    sentinel: a flip to a named maintainer agent that is NOT the sentinel
+    (the shape the bug actually missed), and a flip to the literal sentinel
+    value itself (the shape that already worked, kept as a side-by-side
+    control under the same fixture)."""
+
+    def test_flip_to_named_maintainer_ci_red_refuses(self, monkeypatch, capsys):
+        """Sol's exact #2912 repro: fully repo-qualified anchor, CI mocked
+        red, approval mocked no_approval, flip to a NAMED maintainer
+        ("borges") that is NOT the pool sentinel and NOT the registered
+        colleague -- must REFUSE, not silently succeed. Asserting on the CI
+        mock's call count (not just the exit code) is what makes this a real
+        regression test for "the gate never even ran": on the old bare
+        _is_pool_sentinel(to_agent) predicate, this exact flip would never
+        even call _pr_ci_state, let alone see its red verdict.
+
+        Only _pr_ci_state is asserted called (not _pr_approval_state): the
+        CI-red branch exits before the approval check is ever reached --
+        same short-circuit shape as the pre-existing
+        test_flip_repo_qualified_ci_red_refuses above. The approval fake is
+        still wired up (matching Sol's literal repro setup) so a future
+        change to the short-circuit order doesn't silently stop testing it.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9200", github="pr/engram-agents/engram-paper/9200",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9200", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        # The guard actually RAN -- this is exactly what the old bare
+        # _is_pool_sentinel(to_agent) predicate never did for a
+        # named-maintainer flip.
+        assert ("ci", "9200", "engram-agents/engram-paper") in calls
+        assert ("approval", "9200", "engram-agents/engram-paper") not in calls
+        captured = capsys.readouterr()
+        assert captured.err.strip() != ""
+        assert "CI is red" in captured.err
+
+    def test_flip_to_literal_sentinel_ci_red_refuses(self, monkeypatch, capsys):
+        """Companion control to the named-maintainer case above: a flip to
+        the LITERAL pinned sentinel value itself must ALSO refuse under
+        CI-red -- this is the pre-existing, already-correct behavior (same
+        shape as TestFlipRepoQualifiedGuard.test_flip_repo_qualified_ci_red_refuses),
+        reproduced here under the identical pinned-sentinel fixture as the
+        test above it, so both shapes of "presenting for merge" are verified
+        side by side under one sentinel value."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9201", github="pr/engram-agents/engram-paper/9201",
+                turn="ariadne", participants="[ariadne, borges, sol, casey]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9201", to="casey", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert ("ci", "9201", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_flip_to_registered_colleague_does_not_trigger_gate(self, monkeypatch, capsys):
+        """Control: flip to the registered COLLEAGUE ("sol", the baton's
+        colleague: field) is the review-stage "please review" signal, not a
+        merge-readiness claim -- this must NOT trigger CI/approval checks,
+        even with CI red and no approval mocked. A regression here would
+        break the exact pattern this team uses on every PR, all day
+        ("baton flip PR-N <colleague>" as the first review-request flip)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called for a flip to the registered colleague")
+
+        def _fake_approval_state(pr_num, repo=None):
+            raise AssertionError("_pr_approval_state must not be called for a flip to the registered colleague")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9202", github="pr/engram-agents/engram-paper/9202",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9202", to="sol", reason="please review", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+
+    def test_self_flip_does_not_trigger_gate(self, monkeypatch, capsys):
+        """Control: flipping back to yourself (e.g. after a colleague
+        requests changes) is not a merge-readiness claim and must NOT
+        trigger CI/approval checks, even with CI red and no approval
+        mocked."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called for a self-flip")
+
+        def _fake_approval_state(pr_num, repo=None):
+            raise AssertionError("_pr_approval_state must not be called for a self-flip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9203", github="pr/engram-agents/engram-paper/9203",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9203", to="ariadne", reason="more work needed", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+
+    def test_flip_to_named_maintainer_ci_green_approved_succeeds(self, monkeypatch):
+        """Positive case: a flip to a named maintainer ("borges") with CI
+        green and a real (fresh) approval SUCCEEDS -- same shape as the
+        pre-existing sentinel-flip success path
+        (test_flip_repo_qualified_ci_green_proceeds), just with a named
+        agent as to_agent instead of the literal sentinel."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9204", github="pr/engram-agents/engram-paper/9204",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9204", to="borges", reason="ready", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        assert ("ci", "9204", "engram-agents/engram-paper") in calls
+        assert ("approval", "9204", "engram-agents/engram-paper") in calls
+
+    def test_flip_single_agent_mode_no_colleague_field_ci_red_refuses(self, monkeypatch, capsys):
+        """Single-agent-mode shape: no colleague: field registered on the
+        baton at all (fields.get("colleague", "") reads empty), flip to a
+        named participant that is not self, with CI red -- must still
+        REFUSE. Confirms the broadened gate still fires when there's no
+        colleague to distinguish against (matches CLAUDE.md's "colleague
+        layer collapses when no counterpart exists" for the
+        APPROVAL-existence check specifically, but CI-green must still gate
+        regardless of single/multi-agent mode)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        # No colleague= kwarg passed -- _make_raw_baton's frontmatter has no
+        # "colleague" key, so fields.get("colleague", "") reads "".
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9205", github="pr/engram-agents/engram-paper/9205",
+                turn="ariadne", participants="[ariadne, borges]",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9205", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert ("ci", "9205", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_cmd_flip_gate_fires_identically_across_different_pinned_sentinels(
+        self, monkeypatch, capsys,
+    ):
+        """#2912 seat-independence, exercised end-to-end through cmd_flip
+        (companion to TestIsMaintainerFlip's direct-call invariance test
+        below): _pool_sentinel() resolves per-INSTALL from that seat's own
+        $ENGRAM_HOME/config.json primary_user, not a fleet-wide constant --
+        the identical command can see a different resolved sentinel
+        depending on who runs it (e.g. "lei shi" on one seat, "lin" on
+        another). The SAME named-maintainer flip (CI red, to a named
+        maintainer that is neither the current holder nor the registered
+        colleague) must refuse identically no matter which sentinel value
+        is resolved -- proving the gate's firing does not depend on the
+        sentinel's literal value, only on the (to_agent, current_holder,
+        colleague_name) triple."""
+        for sentinel_value in ("casey", "lei shi", "lin"):
+            monkeypatch.setattr(_baton, "_pool_sentinel", lambda v=sentinel_value: v)
+            calls = []
+
+            def _fake_ci_state(pr_num, repo=None, _calls=calls):
+                _calls.append(("ci", pr_num, repo))
+                return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+            def _fake_approval_state(pr_num, repo=None, _calls=calls):
+                _calls.append(("approval", pr_num, repo))
+                return ("no_approval", "no APPROVED review")
+
+            monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+            monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+            client = _make_client(
+                get_return={"raw": _make_raw_baton(
+                    "PR-9206", github="pr/engram-agents/engram-paper/9206",
+                    turn="ariadne", participants="[ariadne, borges, sol]",
+                    colleague="sol",
+                )},
+            )
+            args = argparse.Namespace(
+                project_id="PR-9206", to="borges", reason="ready", force=False,
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+            assert exc_info.value.code == EXIT_VALIDATION, (
+                f"expected refusal under sentinel={sentinel_value!r}"
+            )
+            client.post.assert_not_called()
+            assert ("ci", "9206", "engram-agents/engram-paper") in calls, (
+                f"expected the CI gate to have fired under sentinel={sentinel_value!r}"
+            )
+            captured = capsys.readouterr()
+            assert "CI is red" in captured.err
+
+    def test_flip_to_named_maintainer_bare_anchor_refuses_never_guesses(self, monkeypatch, capsys):
+        """Reviewer-fairy-suggested companion to TestFlipRepoQualifiedGuard's
+        test_flip_bare_anchor_refuses_never_guesses: that pre-existing test
+        only exercises the unqualified-anchor refusal call site
+        (`_pr_anchor_match and _is_maintainer_flip(...) and
+        _parsed_anchor[1] is None`) with a flip TO the literal pool sentinel
+        -- the one shape that already triggered _is_maintainer_flip under
+        the OLD bare _is_pool_sentinel(to_agent) predicate. This test
+        confirms the SAME unqualified-anchor refusal fires when the flip
+        target is a NAMED maintainer ("borges") instead -- the shape #2912's
+        broadening exists for, and a shape the unqualified-anchor branch had
+        never been exercised under before this test."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9207", github="pr/9207",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9207", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # the flip never happens
+        assert calls == []  # no gh call at all -- never guessed a repo
+        captured = capsys.readouterr()
+        assert "has no repo-qualified github anchor" in captured.err
+
+
+class TestIsMaintainerFlip:
+    """Direct-call unit tests for _is_maintainer_flip (#2912) -- the
+    broadened trigger predicate cmd_flip now uses in place of the bare
+    _is_pool_sentinel(to_agent) check. Pins the sentinel via
+    monkeypatch.setattr(_baton, "_pool_sentinel", ...) rather than reading
+    the ambient real config.json, for the same reason documented on
+    TestFlipMaintainerRoleGate above."""
+
+    def test_sentinel_is_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("casey", "borges", "sol") is True
+
+    def test_self_flip_is_not_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("borges", "borges", "sol") is False
+
+    def test_registered_colleague_is_not_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
+
+    def test_other_participant_is_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("ariadne", "borges", "sol") is True
+
+    def test_empty_colleague_name_other_participant_is_maintainer_flip(self, monkeypatch):
+        """Single-agent-mode shape: colleague_name == "" (no colleague
+        registered) -- a flip to any non-self participant still fires."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("ariadne", "borges", "") is True
+
+    def test_result_invariant_across_different_pinned_sentinel_values(self, monkeypatch):
+        """#2912 seat-independence: _is_maintainer_flip's boolean answer for
+        a given (to_agent, current_holder, colleague_name) triple must NOT
+        depend on which value _pool_sentinel() happens to resolve to.
+        _pool_sentinel() resolves per-INSTALL from that seat's own
+        $ENGRAM_HOME/config.json primary_user, not a fleet-wide constant --
+        the exact same call can see a different resolved sentinel depending
+        on who runs it (e.g. "lei shi" on one seat, "lin" on another). The
+        fix is sentinel-value-independent by construction: it only ever
+        compares against the RESOLVED sentinel value, current_holder, and
+        colleague_name -- never a literal hardcoded string -- so this must
+        hold across any sentinel value, not just one pinned choice. None of
+        the sentinel values exercised below ("casey", "lei shi", "lin",
+        "alex") collide with the to_agent/current_holder/colleague names
+        used in the assertions ("ariadne", "borges", "sol") -- a collision
+        would change which branch of _is_maintainer_flip fires and
+        invalidate the comparison."""
+        sentinel_values = ("casey", "lei shi", "lin", "alex")
+        exercised_names = ("ariadne", "borges", "sol")
+        assert not (set(sentinel_values) & set(exercised_names)), (
+            "sentinel/name collision would confound the invariance check"
+        )
+        for sentinel_value in sentinel_values:
+            monkeypatch.setattr(_baton, "_pool_sentinel", lambda v=sentinel_value: v)
+            # Flip TO the resolved sentinel itself: always True, whatever
+            # the sentinel's literal value happens to be this iteration.
+            assert _baton._is_maintainer_flip(sentinel_value, "borges", "sol") is True
+            # Named-maintainer flip (to_agent is never the sentinel, never
+            # the current holder, never the colleague, in any iteration):
+            # always True.
+            assert _baton._is_maintainer_flip("ariadne", "borges", "sol") is True
+            # Self-flip (to_agent == current_holder; neither ever equals
+            # the sentinel in this loop): always False.
+            assert _baton._is_maintainer_flip("borges", "borges", "sol") is False
+            # Flip to the registered colleague (to_agent == colleague_name;
+            # neither ever equals the sentinel in this loop): always False.
+            assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
+
+
+# ===========================================================================
 # CATEGORY 15: _pr_approval_state direct-call parsing coverage (#2320)
 # ===========================================================================
 
