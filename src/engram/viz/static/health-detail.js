@@ -971,14 +971,23 @@
 
     var noteEl = qs("#detail-scores-note");
     var seriesUnscored = state.series && state.series.scores_available === false;
+    // engram-alpha#2896 item 2: name the actual version + the "run derive"
+    // remedy, per #2869's own requested wording ("a one-line 'no derived
+    // rows for vX — run derive' notice") -- both seriesUnscored branches
+    // below carry it, not just an explanation of the condition.
+    // state.series is truthy whenever seriesUnscored is true (it's the
+    // left operand of the `&&` above), and health/series.py's export()
+    // always returns `version` alongside `scores_available` on its one
+    // success-path return statement -- so state.series.version is safe
+    // here with no separate undefined guard.
     if (!modelAvailable() && seriesUnscored) {
-      noteEl.textContent = "score history unavailable for this model version, and the developer-tier curve model isn't installed on this build — showing raw values and server-reported scores only.";
+      noteEl.textContent = "no derived rows for " + state.series.version + " — run derive. The developer-tier curve model isn't installed on this build either — showing raw values and server-reported scores only.";
       noteEl.style.display = "";
     } else if (!modelAvailable()) {
       noteEl.textContent = "the developer-tier curve model isn't installed on this build — signals are shown as a flat list without aspect grouping, curve plots, or reference markers.";
       noteEl.style.display = "";
     } else if (seriesUnscored) {
-      noteEl.textContent = "score history unavailable for this model version — showing raw values.";
+      noteEl.textContent = "no derived rows for " + state.series.version + " — run derive — showing raw values.";
       noteEl.style.display = "";
     } else {
       noteEl.style.display = "none";

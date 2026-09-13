@@ -634,6 +634,54 @@ class TestDetailJsFileContract(unittest.TestCase):
         self.assertIn("modelAvailable", self.src)
         self.assertIn("renderFlat", self.src)
 
+    def test_unscored_notice_names_version_and_remedy_in_both_branches(self):
+        """engram-alpha#2896 item 2: #detail-scores-note must state the
+        actual version + the "run derive" remedy, per #2869's own
+        requested wording ("a one-line 'no derived rows for vX — run
+        derive' notice") -- not just an explanation of the condition. Both
+        the standalone `seriesUnscored` branch and the combined
+        `!modelAvailable() && seriesUnscored` branch must carry it -- the
+        old single-string version only had one."""
+        # Old stale wording must not survive the fix.
+        self.assertNotIn("score history unavailable for this model version", self.src)
+
+        occurrences = self.src.count("no derived rows for")
+        self.assertEqual(
+            occurrences, 2,
+            "expected the phrase in both the standalone and the combined "
+            "seriesUnscored branches",
+        )
+        self.assertIn("run derive", self.src)
+        self.assertIn("state.series.version", self.src)
+
+        combined_idx = self.src.index("!modelAvailable() && seriesUnscored")
+        standalone_idx = self.src.index("} else if (seriesUnscored) {")
+        self.assertGreater(standalone_idx, combined_idx)
+
+        combined_notice_idx = self.src.index("no derived rows for", combined_idx)
+        standalone_notice_idx = self.src.index("no derived rows for", standalone_idx)
+
+        # Each branch's notice sits close to its own `state.series.version`
+        # interpolation -- genuinely inside that branch, not a stray
+        # occurrence elsewhere in the file.
+        combined_version_idx = self.src.index("state.series.version", combined_notice_idx)
+        self.assertLess(combined_version_idx - combined_notice_idx, 100)
+
+        standalone_version_idx = self.src.index("state.series.version", standalone_notice_idx)
+        self.assertLess(standalone_version_idx - standalone_notice_idx, 100)
+
+        # The combined branch must still carry the developer-tier-model
+        # clause alongside the new version/remedy text -- not dropped.
+        combined_end = self.src.index(";", combined_notice_idx)
+        combined_text = self.src[combined_idx:combined_end]
+        self.assertIn("developer-tier curve model isn't installed", combined_text)
+        self.assertIn("showing raw values and server-reported scores only", combined_text)
+
+        # The standalone branch still conveys "showing raw values".
+        standalone_end = self.src.index(";", standalone_notice_idx)
+        standalone_text = self.src[standalone_idx:standalone_end]
+        self.assertIn("showing raw values", standalone_text)
+
 
 class TestDetailViewMarkup(_LiveServerBase):
     def test_detail_content_containers_present(self):

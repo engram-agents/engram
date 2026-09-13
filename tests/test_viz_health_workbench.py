@@ -549,6 +549,94 @@ class TestWorkbenchClickableSeatRowsAndDraftBanner(_LiveServerBase):
         self.assertIn(b".draft-banner", body)
 
 
+class TestWorkbenchUnscoredNotice(_LiveServerBase):
+    """engram-alpha#2896 item 1: the per-signal focus panel's history/
+    distribution section must surface `series.scores_available === false`
+    -- previously it was read NOWHERE in this file except inside
+    buildExportPayload's own doc comment (about the export JSON's SHAPE,
+    not a display consumer), so a version with raw points but no derived
+    rows plotted a scoreless curve with no explanation. Static
+    string/proximity assertions on the served static file, matching this
+    file's own established convention (see
+    TestWorkbenchClickableSeatRowsAndDraftBanner above and this module's
+    docstring: JS render logic is out of scope for node-extraction here,
+    covered only by static assertions on the SERVED health-workbench.js)."""
+
+    HANDLER_CLASS = viz_workbench.Handler
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = tempfile.mkdtemp(prefix="engram_workbench_2896_static_test_")
+        cls.engram_home = Path(cls.tmpdir) / "agent_dir"
+        cls.engram_home.mkdir()
+        cls.db_path = cls.engram_home / "knowledge.db"
+        cls.db_path.write_bytes(b"")
+
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
+            "test_agent": {"name": "test_agent", "label": "Test", "db": str(cls.db_path)}
+        }
+        viz_agents.DEFAULT_AGENT = "test_agent"
+
+    @classmethod
+    def tearDownClass(cls):
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_scores_available_false_genuinely_read_in_render_path(self):
+        """The literal condition `series.scores_available === false` must
+        appear in the served file, and it must appear BEFORE
+        buildExportPayload's own (unrelated) mention of the bare word
+        "scores_available" in its doc comment -- confirming the gate is in
+        the render function, not merely a coincidental second occurrence of
+        the word elsewhere in the file."""
+        status, _headers, body = self._get("/static/health-workbench.js")
+        self.assertEqual(status, 200)
+        text = body.decode("utf-8")
+        self.assertIn("series.scores_available === false", text)
+        gate_idx = text.index("series.scores_available === false")
+        export_idx = text.index("function buildExportPayload")
+        self.assertLess(
+            gate_idx, export_idx,
+            "the display-read gate must sit in the render function, before "
+            "buildExportPayload's own unrelated mention of the flag",
+        )
+
+    def test_unscored_notice_text_emitted_near_the_gate(self):
+        """The new notice string must appear close to the gate that reads
+        the flag -- i.e. genuinely inside the same conditional branch, not
+        just coincidentally present somewhere else in the file."""
+        status, _headers, body = self._get("/static/health-workbench.js")
+        text = body.decode("utf-8")
+        self.assertIn("no derived rows for", text)
+        self.assertIn("run derive", text)
+        gate_idx = text.index("series.scores_available === false")
+        notice_idx = text.index("no derived rows for")
+        self.assertLess(
+            abs(notice_idx - gate_idx), 400,
+            "the notice text should sit right next to the flag check, not "
+            "somewhere unrelated in the file",
+        )
+
+    def test_unscored_notice_not_gated_on_empty_points(self):
+        """The new notice must be reachable when points.length is
+        TRUTHY (the raw-L0-fallback case #2869/#2891 shipped) -- i.e. it
+        must sit inside the trailing `else` branch of the
+        series.error / !points.length / else chain, not inside the
+        `!points.length` branch above it."""
+        status, _headers, body = self._get("/static/health-workbench.js")
+        text = body.decode("utf-8")
+        empty_branch_idx = text.index("No recorded history points for this signal yet.")
+        gate_idx = text.index("series.scores_available === false")
+        self.assertGreater(
+            gate_idx, empty_branch_idx,
+            "the scores_available gate must sit in the else branch, after "
+            "the !points.length branch, so it fires when points DO exist",
+        )
+
+
 class TestWorkbenchAccessLog(_LiveServerBase):
     """engram-alpha#2767: viz.workbench.Handler.log_message mirrors
     viz.server's own opt-in R5.5 access log -- off by default

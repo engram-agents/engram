@@ -1139,6 +1139,20 @@
     } else if (!points.length) {
       mid.appendChild(el("div", { class: "sub", html: "No recorded history points for this signal yet." }));
     } else {
+      // engram-alpha#2896 item 1: raw points can exist alongside
+      // scores_available === false (the raw-L0-fallback case #2869/#2891
+      // shipped, for a CURRENT version that has never been through
+      // `derive`) -- surface that explicitly instead of silently plotting
+      // a scoreless curve with no explanation. Not gated on !points.length
+      // above -- this is exactly the case where points DO exist. Same
+      // phrasing pattern as health-detail.js's #detail-scores-note (#2896
+      // item 2) so a reader sees consistent language on both surfaces.
+      if (series.scores_available === false) {
+        mid.appendChild(el("div", {
+          class: "sub",
+          html: "no derived rows for " + series.version + " -- run derive -- showing raw values.",
+        }));
+      }
       var histEl = historySVG(histHost, signal, state.agent, points, state.histView[signal],
         cd ? cd.input_domain : null, cd ? cd.output_range : null);
       fitViewBox(histEl, 4);
