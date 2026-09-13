@@ -26,6 +26,7 @@ _build_trailer / write_tripwire_overflow are the proven mechanism
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -414,3 +415,384 @@ class TestUnknownHarnessFloor:
 
         assert len(out) <= budgets["budget"]
         assert "(unmeasured harness floor)" in out
+
+
+# ---------------------------------------------------------------------------
+# engram-alpha#2892 -- a head dropped by Stage 1 must be visible in the
+# trailer (previously reported "0 cut" even when the entire head vanished).
+# ---------------------------------------------------------------------------
+class TestHeadCutSignal:
+    """Borges's explicit ask (forum #411): a test that only shows a head
+    being dropped proves less than a PAIR -- forced body-item cuts
+    reporting real cut counts BESIDE a head cut reporting real head-cut
+    status is what makes the trailer's counter the thing under test rather
+    than something merely relabelled. See test_head_drop_and_forced_body_cuts_
+    signal_independently below for the discriminating pair; the two single-
+    axis tests bracket it as controls."""
+
+    def test_head_dropped_whole_signals_head_cut_in_trailer(self, hooklib):
+        """A single-line `head` (no newline at all) long enough that
+        Stage 1's own line-boundary trim drops it WHOLE (`_trim_to_line_
+        boundary` returns "" when no newline fits within the room
+        available) -- constructed precisely against the ACTUAL worst-case
+        trailer `emit_context()` itself sizes against (n=0, so `cut_count`
+        is 0 and the worst-case trailer already reserves room for the
+        `head_cut=True` clause per Correction 3), not a guessed number."""
+        target = 200
+        budget = 5000
+        trailer_len = len(hooklib._build_context_trailer(0, 0, head_cut=True))
+        head_room = target - trailer_len - 1  # sep=1 for a nonempty head
+        head = "x" * (head_room + 50)  # no "\n" anywhere -- forces a full drop
+
+        out = hooklib.emit_context(head, [], budget=budget, target=target)
+
+        assert "head trimmed" in out, (
+            "a head dropped whole by Stage 1 must be signalled in the "
+            f"trailer -- got: {out!r}"
+        )
+        assert len(out) <= target
+        # The head text itself must genuinely be gone, not merely flagged
+        # while still present -- the bug this closes was silence, not a
+        # false positive, but a real fix must actually drop the content.
+        assert "x" * 20 not in out
+
+    def test_short_head_survives_untouched_no_head_cut_signal(self, hooklib):
+        """Control: a `head` comfortably within budget must NOT trigger the
+        head-cut signal -- proves the signal is sensitive to an actual cut,
+        not merely present on every call."""
+        target = 200
+        budget = 5000
+        head = "short tldr, well within budget"
+
+        out = hooklib.emit_context(head, [], budget=budget, target=target)
+
+        assert "head trimmed" not in out
+        assert head in out
+
+    def test_head_drop_and_forced_body_cuts_signal_independently(self, hooklib):
+        """The discriminating pair (Borges, forum #411): a head dropped
+        WHOLE, forced ALONGSIDE genuine body-item cuts, in the SAME call --
+        proving the trailer's body `cut` count stays numerically correct
+        and INDEPENDENT of the head-cut signal, rather than the two being
+        conflated into one number. A mutant that folded head_cut into the
+        `M` count (or vice versa) would fail this pairing even though
+        test_head_dropped_whole_signals_head_cut_in_trailer alone would
+        not catch it."""
+        target = 200
+        budget = 5000
+        body = _make_body(50, item_len=100)  # forces genuine body-item cuts
+        trailer_len = len(hooklib._build_context_trailer(0, len(body), head_cut=True))
+        head_room = target - trailer_len - 1
+        head = "y" * (head_room + 50)  # no "\n" -- forces a full head drop
+
+        out = hooklib.emit_context(head, body, budget=budget, target=target)
+
+        assert "head trimmed" in out
+        match = re.search(r"▸ (\d+) shown · (\d+) cut", out)
+        assert match is not None, f"trailer format not found in: {out!r}"
+        shown_n, cut_n = int(match.group(1)), int(match.group(2))
+        assert cut_n > 0, "expected genuine body-item cuts alongside the head drop"
+        assert shown_n + cut_n == len(body), (
+            "shown+cut must still account for every body item -- the "
+            "head-cut signal must not perturb body accounting"
+        )
+        # And the head is genuinely gone, same check as the single-axis test.
+        assert "y" * 20 not in out
+
+
+# ---------------------------------------------------------------------------
+# engram-alpha#2893 -- emit_context()'s sizing loop measures against a
+# generic placeholder overflow-path length; the render must be re-validated
+# against `target` once the REAL overflow path is known (Stage 3), not just
+# checked against the hard `budget`.
+# ---------------------------------------------------------------------------
+class TestRealOverflowPathRevalidation:
+    """Deliberate bound-hit resolution (stated explicitly in _hooklib.py's
+    own comment above the retry loop, per Kepler's Amendment/Borges's
+    review ask): when shrinking `shown_n` all the way to 1 still doesn't
+    fit `target` against the REAL path, emit_context() degrades to the
+    same truncated_first construction Stage 2's own placeholder-sized pass
+    already uses -- not a fallback nobody decided on."""
+
+    def test_real_path_longer_than_placeholder_shrinks_shown_n_to_respect_target(
+        self, hooklib, harness
+    ):
+        """Construct the exact boundary the spec asks for: the placeholder-
+        sized Stage-2 selection is pinned (via `target = len(baseline)`) to
+        land EXACTLY at the edge where a real overflow path longer than the
+        placeholder pushes the same shown_n over `target`. Assert the FINAL
+        rendered output still respects `target` (not just `budget`)."""
+        budgets = harness.get_harness_budgets("claude-code")
+        body = _make_body(60, item_len=20)
+
+        def passthrough_writer(items):
+            # Returns the EXACT placeholder path Stage 2 already sized
+            # against -- makes this call's own render exactly what Stage 2
+            # alone would have produced (see the paired-direction test
+            # below for why this establishes the baseline precisely).
+            return hooklib._placeholder_overflow_path()
+
+        baseline = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=1800, overflow_writer=passthrough_writer
+        )
+        target = len(baseline)  # pin the boundary with zero slack
+
+        delta = 4  # matches the spec's own "tripwire-overflow" (17) vs
+        # "hook-overflow" (13) real-world example
+
+        def longer_writer(items):
+            return hooklib._placeholder_overflow_path() + ("Z" * delta)
+
+        real_out = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=target, overflow_writer=longer_writer
+        )
+
+        assert len(real_out) <= target, (
+            f"real overflow path ({delta} chars longer than the placeholder "
+            f"Stage 2 sized against) pushed the render past `target`: "
+            f"{len(real_out)} > {target}"
+        )
+        baseline_shown = int(re.search(r"▸ (\d+) shown", baseline).group(1))
+        real_shown = int(re.search(r"▸ (\d+) shown", real_out).group(1))
+        assert real_shown < baseline_shown, (
+            "expected the retry loop to actually shrink shown_n -- if this "
+            "fails, the fixture no longer lands at the boundary this test "
+            "is meant to exercise"
+        )
+
+    def test_real_path_same_length_as_placeholder_leaves_output_byte_identical(
+        self, hooklib, harness
+    ):
+        """Paired control (Borges's explicit ask): when the real overflow
+        path is the SAME length as the placeholder, the retry loop's
+        `while` condition must never become true (it should exit
+        immediately on the first check), and the output must be
+        byte-identical to what Stage 2 alone would have produced. Using a
+        writer that returns the placeholder path VERBATIM makes this
+        exact, not merely same-length -- Stage 3's own real-path render is
+        then, by construction, the identical computation Stage 2's sizing
+        loop already performed for that same (shown_n, cut_n) pair."""
+        budgets = harness.get_harness_budgets("claude-code")
+        body = _make_body(60, item_len=20)
+
+        def passthrough_writer(items):
+            return hooklib._placeholder_overflow_path()
+
+        baseline = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=1800, overflow_writer=passthrough_writer
+        )
+        target = len(baseline)
+
+        same_out = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=target, overflow_writer=passthrough_writer
+        )
+
+        assert same_out == baseline, (
+            "a same-length (here: identical) real overflow path must never "
+            "perturb the render the placeholder-sized pass already chose"
+        )
+
+    def test_real_path_shorter_than_placeholder_leaves_shown_n_unaffected(
+        self, hooklib, harness
+    ):
+        """Paired control, the other direction: a real overflow path
+        SHORTER than the placeholder must also leave `shown_n` untouched --
+        the retry loop only ever fires when the real path makes things
+        WORSE, never when it makes them better. Text differs (a different,
+        shorter path string), so this checks shown/cut counts rather than
+        byte-for-byte equality -- the byte-identical case is covered by the
+        same-length test above."""
+        budgets = harness.get_harness_budgets("claude-code")
+        body = _make_body(60, item_len=20)
+
+        def passthrough_writer(items):
+            return hooklib._placeholder_overflow_path()
+
+        baseline = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=1800, overflow_writer=passthrough_writer
+        )
+        target = len(baseline)
+        baseline_shown = int(re.search(r"▸ (\d+) shown", baseline).group(1))
+
+        def shorter_writer(items):
+            return hooklib._placeholder_overflow_path()[:-2]  # 2 chars shorter
+
+        shorter_out = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=target, overflow_writer=shorter_writer
+        )
+        shorter_shown = int(re.search(r"▸ (\d+) shown", shorter_out).group(1))
+
+        assert shorter_shown == baseline_shown, (
+            "a real overflow path shorter than the placeholder must never "
+            "trigger the shrink-and-retry loop"
+        )
+        assert len(shorter_out) <= target
+
+    def test_shrink_loop_keeps_overflow_content_in_sync_with_final_cut_set(
+        self, hooklib, harness
+    ):
+        """Independent-review catch (engram-alpha#2892/#2893 follow-up,
+        found on this round's own build): the retry loop above
+        re-validates the RENDER against `target` on every shrink, but
+        before this fix it reused the `overflow_path` computed ONCE,
+        before the loop -- so the overflow FILE's own content could
+        silently go stale relative to the cut set the render actually
+        settled on. This test recovers the writer's calls (a stand-in for
+        "the file actually on disk when emit_context() returns") and
+        asserts the LAST call covers every item the FINAL render reports
+        as cut -- not just the items cut at the loop's first (pre-shrink)
+        iteration.
+
+        Constructed to fire the loop EXACTLY once (shown_n shrinks by 1)
+        without reaching the shown_n == 1 floor -- the floor-degrade path
+        is covered by the other tests in this class; this one is scoped
+        to the mid-loop staleness the floor-degrade branch was never
+        exposed to."""
+        budgets = harness.get_harness_budgets("claude-code")
+        body = _make_body(60, item_len=100)
+
+        def passthrough_writer(items):
+            return hooklib._placeholder_overflow_path()
+
+        baseline = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=1800, overflow_writer=passthrough_writer
+        )
+        target = len(baseline)
+        baseline_shown = int(re.search(r"▸ (\d+) shown", baseline).group(1))
+
+        delta = 4  # matches the sibling tests' own real-path-longer offset
+        calls = []  # every overflow_writer call's items, in call order
+
+        def recording_writer(items):
+            calls.append(list(items))
+            return hooklib._placeholder_overflow_path() + ("Z" * delta)
+
+        real_out = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=target, overflow_writer=recording_writer
+        )
+        real_shown = int(re.search(r"▸ (\d+) shown", real_out).group(1))
+
+        assert real_shown < baseline_shown, (
+            "expected the retry loop to actually shrink shown_n -- if "
+            "this fails, the fixture no longer lands at the boundary "
+            "this test is meant to exercise"
+        )
+        assert real_shown > 1, (
+            "expected the loop to settle above the shown_n == 1 floor -- "
+            "this test is scoped to the mid-loop case, not the "
+            "floor-degrade case the other tests in this class already "
+            "cover"
+        )
+        assert len(calls) >= 1, "overflow_writer was never called"
+
+        final_cut_items = body[real_shown:]
+        assert calls[-1] == final_cut_items, (
+            "the overflow file's LAST write must cover every item the "
+            "FINAL render reports as cut -- if this fails, the overflow "
+            "path written to disk is stale relative to the cut set the "
+            "render actually settled on (the file the trailer's "
+            "'-- see <path>' clause points at is missing content)"
+        )
+
+    def test_floor_degrade_respects_allow_single_overflow_with_real_path(
+        self, hooklib, harness
+    ):
+        """Reviewer-fairy's Suggestion 1 on PR #2898 (APPROVE, non-blocking):
+        the floor-degrade condition's own
+        `not (allow_single_overflow and len(rendered) <= budget)` clause --
+        verified correct by the reviewer via a real A/B (removing it
+        changed real output from 518 untruncated chars to 605
+        forcibly-truncated chars for an `allow_single_overflow=True` call
+        landing at this floor) -- was UNTESTED: no existing fixture in this
+        class drives the shrink-and-retry loop all the way down to
+        `shown_n == 1` AND still exceeds `target` there against the REAL
+        (writer-produced) overflow path. The sibling tests above stop once
+        the loop finds ANY fit above the floor; this one forces it all the
+        way down.
+
+        Fixture: 5 oversized (800-char) body items under `target=1800` --
+        only 2 fit even against the placeholder path, so Stage 2 lands
+        `shown_n=2`, `cut_n=3`. Pinning `target = len(baseline)` (zero
+        slack) and then supplying a real overflow path 1000 chars LONGER
+        than the placeholder -- empirically larger than the ~811 chars
+        saved by dropping one more 800-char item, so the shrink IS still
+        insufficient once it reaches the floor -- forces the while loop to
+        shrink `shown_n` from 2 to 1 and land there STILL over `target`
+        (~189 chars over, measured; `delta` was chosen larger than a
+        single item's own savings, not tuned to hit an exact number)."""
+        budgets = harness.get_harness_budgets("claude-code")
+        body = _make_body(5, item_len=800)
+
+        def passthrough_writer(items):
+            return hooklib._placeholder_overflow_path()
+
+        baseline = hooklib.emit_context(
+            "", body, budget=budgets["budget"], target=1800, overflow_writer=passthrough_writer
+        )
+        target = len(baseline)
+        baseline_shown = int(re.search(r"▸ (\d+) shown", baseline).group(1))
+        assert baseline_shown == 2, (
+            "fixture assumption: Stage 2 (against the placeholder path) "
+            "should land shown_n=2 out of 5 oversized items -- if this "
+            "fails, the fixture no longer sets up the floor-boundary case "
+            "this test targets"
+        )
+
+        delta = 1000  # empirically larger than the ~811 chars saved by
+        # dropping one more 800-char item -- see docstring above
+
+        def longer_writer(items):
+            return hooklib._placeholder_overflow_path() + ("Z" * delta)
+
+        rescued = hooklib.emit_context(
+            "",
+            body,
+            budget=budgets["budget"],
+            target=target,
+            overflow_writer=longer_writer,
+            allow_single_overflow=True,
+        )
+        rescued_shown = int(re.search(r"▸ (\d+) shown", rescued).group(1))
+        assert rescued_shown == 1, (
+            "expected the shrink-and-retry loop to reach the shown_n == 1 "
+            "floor -- if this fails, the fixture doesn't force the floor "
+            "case this test is meant to exercise"
+        )
+        assert len(rescued) > target, (
+            "expected the floor-degrade render to still exceed `target` "
+            "even at shown_n == 1 -- if this fails, the fixture's delta "
+            "isn't large enough to land at the actual floor-degrade "
+            "condition (it fits under target before ever reaching it)"
+        )
+        assert len(rescued) <= budgets["budget"], (
+            "allow_single_overflow=True never permits exceeding the hard "
+            "budget, only the soft target"
+        )
+        assert "…[truncated" not in rescued, (
+            "allow_single_overflow=True at the floor-degrade branch should "
+            "RESCUE the render (let it run past `target`, still within "
+            "`budget`) rather than forcibly truncate it -- this is the "
+            "clause the reviewer's A/B verified but no existing test "
+            "exercised"
+        )
+
+        # Paired control (mirroring this PR's own established pattern for
+        # paired controls throughout this class): the SAME fixture with
+        # allow_single_overflow=False (the default) must produce the
+        # truncated/marker output at the same floor -- confirming the flag
+        # genuinely discriminates the two outcomes, not just that the
+        # rescued case happens to look fine on its own.
+        truncated = hooklib.emit_context(
+            "",
+            body,
+            budget=budgets["budget"],
+            target=target,
+            overflow_writer=longer_writer,
+        )
+        truncated_shown = int(re.search(r"▸ (\d+) shown", truncated).group(1))
+        assert truncated_shown == 1
+        assert "…[truncated" in truncated, (
+            "without allow_single_overflow, the SAME floor-boundary "
+            "fixture must forcibly truncate -- if this fails, the paired "
+            "control doesn't actually discriminate the flag's effect"
+        )
