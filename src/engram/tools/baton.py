@@ -769,25 +769,31 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # merge, days or weeks after the person who could trivially have avoided
     # it has moved on.
     #
-    # WARN, deliberately, rather than refuse -- and the reason is worth
-    # recording because my first draft of this fix DID refuse:
+    # REFUSE, not warn. This shipped first as a WARN because a first-draft
+    # REFUSE broke 8 existing tests -- including
+    # test_init_auto_derives_bare_anchor_from_pr_project_id, which exists
+    # specifically to PIN bare auto-derivation as intended #1715 behavior.
+    # Flipping a pinned contract is a team decision, not a follow-up's to
+    # make unilaterally, so #1924 carried that governance question forward
+    # rather than deciding it here.
     #
-    #   * Refusing breaks the plainest invocation there is
-    #     (`baton init PR-1234 --title ... --participants ...`), which is what
-    #     every agent and script on this host actually types. Seven existing
-    #     tests failed on it.
-    #   * One of those, test_init_auto_derives_bare_anchor_from_pr_project_id,
-    #     exists specifically to PIN bare auto-derivation as intended #1715
-    #     behavior. Flipping a pinned contract is a team decision, not a
-    #     follow-up's to make unilaterally. #1924 carries that question.
+    # That question is now SETTLED (forum #411, 2026-09-13, Kepler ruling
+    # with Aleph as design owner): REFUSE, not warn -- flip the #1715-pinned
+    # contract deliberately as part of accepting this fix.
     #
-    # A creation-time warning is also better targeted than I first argued.
-    # I had reasoned by analogy to cmd_flip's stderr warning, which reaches
-    # the flipping agent while the consequence lands on the maintainer -- but
-    # that analogy is wrong here. At init the author IS the party who can fix
-    # it, holds the missing flag right now, and is the only one who knows
-    # which repo is meant. The displaced-consequence problem is precisely what
-    # warning HERE (rather than only refusing later, at merge) removes.
+    # The ruling is narrow: require an explicit --repo or refuse, with NO
+    # cwd-inference of any kind. An earlier draft of the ruling proposed
+    # resolving the repo from the checkout's git `origin` remote when
+    # unambiguous; that was proposed, examined, and explicitly withdrawn
+    # (#1918: there is NO default repo, deliberately -- do not revisit). A
+    # cwd-inferred anchor is confidently wrong and fully qualified rather
+    # than merely unresolvable: minting a UMWELT-PR-<N> baton from inside
+    # a checkout of THIS project's own public repo would silently produce
+    # pr/engram-agents/engram/<N>, a DIFFERENT repo's PR of the same
+    # number, which passes every downstream gate silently -- worse than the
+    # bare-anchor bug this section fixes, which at least gets refused loudly
+    # by gc/flip/merge. There is no cwd-inference anywhere in this function,
+    # deliberately.
     #
     # Scope note: fires only when an anchor RESOLVES TO A PR and is
     # unqualified. A baton with no github anchor at all (a DESIGN-* project,
@@ -800,17 +806,16 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         _n = _final_anchor[2]
         _derived = repo_arg is None and not getattr(args, "github", None)
         print(
-            f"baton init: warning: '{project_id}' is being created with the "
+            f"baton init: refusing to create '{project_id}' with the "
             f"unqualified PR anchor 'pr/{_n}'"
             + (" (auto-derived from the project id)" if _derived else "")
-            + " -- there is no default repo (#1918), so gc/flip/merge will all "
-            "REFUSE this baton later. Qualify it now:\n"
+            + " -- there is no default repo (#1918), so gc/flip/merge would "
+            "all refuse this baton later. Qualify it now:\n"
             f"    baton init {project_id} ... --repo <owner>/<repo>\n"
-            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}\n"
-            f"  or fix it after the fact:\n"
-            f"    baton anchor {project_id} --github pr/<owner>/<repo>/{_n}",
+            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}",
             file=sys.stderr,
         )
+        sys.exit(EXIT_VALIDATION)
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"

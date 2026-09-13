@@ -451,6 +451,7 @@ class TestCmdInit:
             participants="borges,ariadne",
             status="in-progress",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
@@ -480,12 +481,13 @@ class TestCmdInit:
             status="planning",
             turn="borges",
             github="pr/200",
+            repo="engram-agents/engram-paper",
         )
 
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
         _, body = client.post.call_args[0]
-        assert body["github"] == "pr/200"
+        assert body["github"] == "pr/engram-agents/engram-paper/200"
 
     def test_409_conflict_maps_to_exit_validation(self, monkeypatch):
         """ForumHttpError 409 (project already exists) → EXIT_VALIDATION."""
@@ -500,6 +502,7 @@ class TestCmdInit:
             participants="borges",
             status="planning",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -519,6 +522,7 @@ class TestCmdInit:
             participants="borges",
             status="planning",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         with pytest.raises(SystemExit) as exc_info:

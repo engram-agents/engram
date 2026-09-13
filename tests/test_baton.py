@@ -165,6 +165,7 @@ class TestSmoke:
             turn=None,
             github=None,
             colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -262,7 +263,15 @@ class TestValidation:
     """Bad inputs are rejected with expected exit codes and error messages."""
 
     def test_init_duplicate_fails(self, capsys, monkeypatch):
-        """init on existing project → EXIT_VALIDATION, already-exists error."""
+        """init on existing project → EXIT_VALIDATION, already-exists error.
+
+        #1924: this project_id is repo-qualified via --repo specifically so
+        the mint-site refuse-on-unqualified-anchor path never fires here --
+        without it, EXIT_VALIDATION and the project_id substring in stderr
+        both coincidentally match the refuse path too, and client.post is
+        never reached, silently testing nothing about duplicate-conflict
+        handling (the 409 side_effect below).
+        """
         # _pool_sentinel() reads the ambient $ENGRAM_HOME/config.json file, not the
         # passed config dict — mock it (as the sibling tests do) so the turn
         # validation resolves in a clean CI env instead of erroring on a missing
@@ -279,10 +288,12 @@ class TestValidation:
             turn=None,
             github=None,
             colleague=None,
+            repo="engram-agents/engram-paper",
         )
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_called_once()
         captured = capsys.readouterr()
         assert "already exists" in captured.err or "PR-101" in captured.err
 
@@ -593,6 +604,7 @@ class TestSingleAgentGuard:
         args = argparse.Namespace(
             project_id="PR-999", title="test", participants="borges,ariadne",
             status="planning", turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(
             args, {"mode": "single", "agent_name": "borges"}, "borges", client,
@@ -833,6 +845,7 @@ class TestIntegration:
             project_id="PR-801", title="default turn test",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -849,6 +862,7 @@ class TestIntegration:
             project_id="PR-802", title="explicit turn",
             participants="borges,ariadne", status="planning",
             turn="ariadne", github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -865,6 +879,7 @@ class TestIntegration:
             project_id="PR-803", title="with casey",
             participants="borges,ariadne,casey", status="planning",
             turn="casey", github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         client.post.assert_called_once()
@@ -905,6 +920,7 @@ class TestRename:
             project_id="PR-901", title="original title",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args_init, MULTI_CONFIG, "borges", client)
         client.post.assert_called_once()
@@ -1269,14 +1285,16 @@ class TestAnchor:
 
     # --- #1924: the mint path must not create what gc/flip/merge refuse -----
 
-    def test_init_warns_on_explicit_unqualified_pr_anchor(self, monkeypatch, capsys):
-        """#1924: --github pr/<N> with no repo WARNS at creation and still creates.
+    def test_init_refuses_on_explicit_unqualified_pr_anchor(self, monkeypatch, capsys):
+        """#1924: --github pr/<N> with no repo REFUSES at creation.
 
         #1918/#1920 made gc/flip/merge refuse-and-count an unqualified PR
-        anchor; cmd_init minted one silently, so the refusal surfaced weeks
-        later on whoever tried to merge. The warning moves that signal to the
-        one moment the author can act on it. It deliberately does NOT refuse --
-        see the comment at the call site for the blast-radius reasoning.
+        anchor; cmd_init used to mint one silently (then, for a stopgap
+        period, only warn about it), so the refusal surfaced weeks later on
+        whoever tried to merge. Refusing here moves that signal to the one
+        moment the author can act on it -- settled as REFUSE, not warn, by
+        forum #411 (2026-09-13, Kepler ruling): see the comment at the call
+        site for the full governance history and the cwd-inference exclusion.
         """
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -1286,14 +1304,17 @@ class TestAnchor:
             participants="borges,ariadne", status="planning",
             turn=None, github="pr/777", colleague=None, repo=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body["github"] == "pr/777"          # still created
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
         err = capsys.readouterr().err
-        assert "REFUSE this baton later" in err     # names the real consequence
-        assert "baton anchor PR-777" in err         # and the after-the-fact fix
+        assert "refusing to create" in err          # names the real consequence
+        assert "--repo <owner>/<repo>" in err        # first fix path
+        assert "--github pr/<owner>/<repo>/777" in err  # second fix path
+        assert "fix it after the fact" not in err    # no anchor exists to fix
 
-    def test_init_warns_on_auto_derived_bare_anchor(self, monkeypatch, capsys):
+    def test_init_refuses_on_auto_derived_bare_anchor(self, monkeypatch, capsys):
         """#1924: the SILENT path -- no --github at all, anchor auto-derived
         from a PR-<N> project_id. This is the plainest possible invocation and
         was the one that produced most unqualified anchors in practice."""
@@ -1305,12 +1326,13 @@ class TestAnchor:
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None, repo=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body["github"] == "pr/1234"
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
         err = capsys.readouterr().err
         # the message must name WHY the anchor exists at all, or the caller
-        # cannot tell why they are being warned about a flag they never passed
+        # cannot tell why they are being refused over a flag they never passed
         assert "auto-derived" in err
         assert "--repo" in err
 
@@ -2389,7 +2411,8 @@ class TestSetColleague:
         client = _make_client(post_return={"seq": 1})
         args = argparse.Namespace(
             project_id="PR-708", title="t", participants="borges",
-            turn=None, status="in-progress", github=None, repo=None,
+            turn=None, status="in-progress", github=None,
+            repo="engram-agents/engram-paper",
             colleague="ariadne",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
@@ -2402,7 +2425,8 @@ class TestSetColleague:
         client = _make_client(post_return={"seq": 1})
         args = argparse.Namespace(
             project_id="PR-709", title="t", participants="borges",
-            turn=None, status="in-progress", github=None, repo=None,
+            turn=None, status="in-progress", github=None,
+            repo="engram-agents/engram-paper",
             colleague=None,
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
@@ -2435,10 +2459,15 @@ class TestParseGithubAnchor:
 
 
 class TestInitRepoQualification:
-    def test_init_auto_derives_bare_anchor_from_pr_project_id(self, monkeypatch):
-        """A PR-<N> project_id with no --github auto-derives pr/<N> (#1715) --
-        every PR-baton should carry SOME anchor from creation, not rely on
-        downstream code re-deriving the number from project_id ad hoc."""
+    def test_init_refuses_bare_anchor_auto_derived_from_pr_project_id(self, monkeypatch, capsys):
+        """A PR-<N> project_id with no --github still auto-derives pr/<N>
+        internally (#1715 -- every PR-baton should carry SOME anchor from
+        creation, not rely on downstream code re-deriving the number from
+        project_id ad hoc), but that bare, unqualified derivation is no
+        longer sufficient to create the baton on its own (#1924, forum #411,
+        2026-09-13 ruling): without --repo (or an already-qualified
+        --github), init now REFUSES rather than minting an anchor that
+        gc/flip/merge would refuse later anyway."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         client = _make_client({"seq": 1})
@@ -2446,9 +2475,52 @@ class TestInitRepoQualification:
             project_id="PR-9001", title="auto anchor", participants="borges,ariadne",
             status="planning", turn=None, github=None, repo=None, colleague=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body.get("github") == "pr/9001"
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "PR-9001" in err
+        assert "--repo <owner>/<repo>" in err
+        assert "--github pr/<owner>/<repo>/9001" in err
+
+    def test_init_never_infers_repo_from_cwd_or_git_remote(self, monkeypatch, capsys):
+        """#1924's ruling (forum #411, 2026-09-13) is explicit: NO cwd or
+        git-remote-based repo inference of any kind, anywhere in cmd_init's
+        anchor-handling path -- an earlier draft of the ruling proposed
+        resolving the repo from the checkout's git `origin` remote when
+        unambiguous, and that was proposed, examined, and explicitly
+        withdrawn (see the #1918/#1924 comment at the anchor-handling call
+        site). A cwd-inferred anchor would be confidently wrong and fully
+        qualified rather than merely unresolvable, which is worse than the
+        loud refusal this function raises without --repo.
+
+        This is a control, not a vigilance check: fail the test hard the
+        moment cmd_init ever shells out to `subprocess` (a git-remote lookup
+        being the obvious shape such an inference would take) while minting
+        a bare PR-<N> baton with no --repo."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                f"cmd_init must never invoke subprocess (got args={args!r}, "
+                f"kwargs={kwargs!r}) -- there is no cwd/git-remote repo "
+                "inference anywhere in this function, deliberately (#1918/#1924)."
+            )
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fail_if_called)
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-4242", title="no cwd inference",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, repo=None, colleague=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
 
     def test_init_with_repo_qualifies_anchor(self, monkeypatch):
         """--repo combines with the (auto-derived or explicit) pr/<N> anchor
