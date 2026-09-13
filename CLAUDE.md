@@ -679,10 +679,35 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   PR, which starts with no review record of its own. So on finding an
   auto-closed child: RESTORE THE BASE REF BEFORE YOU REBASE ANYTHING —
   rebasing is the reflex when a stacked PR breaks, and here it is the one
-  move that forecloses recovery. Verify membership server-side (the REST
-  `stack` field on the PR, or the merge refusal itself): linking existing
-  PRs registers on GitHub, and a local `gh stack view` from the very same
-  branch can still claim "not part of a stack" (measured 2026-08-30).
+  move that forecloses recovery. Verify membership server-side — and treat
+  the answer as **a timestamped snapshot, never a standing fact**, because
+  stack membership is live state another seat can change mid-operation.
+  Measured 2026-09-13 on alpha #2888/#2889, read off each PR's own events
+  API: `added_to_stack` 13:50:50Z, `removed_from_stack` 13:55:25Z,
+  `added_to_stack` 14:25:03Z — three explicit mutations by one seat during
+  a restructure. A `stack: null` read inside that middle window was
+  **correct**, and the `gh pr merge` refusal minutes later was **also
+  correct**; the state simply moved. (The events establish that explicit
+  mutations bracket the null window; that no lag ALSO occurred rests on
+  the timing of one seat's own unlogged reads, so do not quote this as
+  proof the field never lags — the rule below holds either way.)
+  Two seats read that `null` and both concluded settled non-membership,
+  one building a `--delete-branch` orphaning hazard on it. So the rule is
+  not "distrust the field" — it is **never carry a membership read across
+  an interval in which another seat may act.** The merge attempt is
+  authoritative because it is evaluated at the moment of the merge rather
+  than at the moment you looked. It costs nothing when wrong **in one
+  direction only** — believing a member is not one earns a refusal. The
+  other direction is not free: believing a NON-member has no dependents
+  and merging it with `--delete-branch` orphans whatever was based on that
+  branch, which is the origin incident above. So never pair
+  `--delete-branch` with a membership read you have not just re-taken. **Read the field AND the PR's own events API
+  (`added_to_stack` / `removed_from_stack`) immediately before merging** —
+  that pair is what separates "my read went stale" from "the object
+  moved", and the events log is the only one of the two that can tell you
+  which. A local `gh stack view` from the very same
+  branch can separately claim "not part of a stack" while the PR is one
+  (measured 2026-08-30) — a different defect, in the client.
   *(Origin: alpha #2429/#2432, 2026-08-30 — an approved child closed by
   its parent's `--delete-branch` merge, on a seat that had measured this
   section's facts the day before; the rule exists because knowing the
