@@ -10,8 +10,8 @@ Borges S4 + Kepler's amendments):
   1. Bound            -- TestBound
   2. Head survives     -- TestHeadSurvives
   3. No writer outside the helper (structural) -- TestNoBareJoinOutsideHelper
-     (currently xfail-tracked pending WS2's hook migration -- see that
-     class's own docstring for why)
+     (currently xfail-tracked pending #2859's session-start migration -- see
+     that class's own docstring for why)
   4. Trailing-summary decoy MUST FAIL -- TestTrailingSummaryDecoy
   5. Straddling-line decoy MUST FAIL  -- TestStraddlingLineDecoy
   6. Unknown-harness fixture -- TestUnknownHarnessFloor
@@ -197,15 +197,18 @@ class TestHeadSurvives:
 # ---------------------------------------------------------------------------
 # Item 3 -- No writer outside the helper (structural).
 # ---------------------------------------------------------------------------
-# NOT enforced today (xfail-tracked): 10+ of the 14 real hook emitters do
-# not yet route their additionalContext content through emit_context() --
-# that migration is WS2 (engram-alpha#2863), explicitly out of scope for
-# this PR (WS1: helper + _harness.py + gate only). Hard-failing this check
-# today would make THIS PR's own merge red on someone else's future work,
-# which is clearly wrong -- so the check exists (real, working structural
-# logic below) but is skipped until WS2 activates it by removing the skip
-# decorator. This is a deliberate choice named in the WS1 spec itself
-# ("Choose (b)"), not an oversight.
+# NOT enforced today (xfail-tracked): 5 hook emitters still don't route
+# their additionalContext content through emit_context() -- WS2 (the bulk
+# migration, engram-alpha#2863) has landed; what remains is
+# engram-session-start-hook.py (pending its own restructure, #2859, owned
+# by Clio) plus 4 files deliberately escape-valved as atomic fixed-format
+# emitters that were never meant to migrate onto emit_context() by design.
+# Hard-failing this check today would make merges red on #2859's still-open
+# work, which is clearly wrong -- so the check exists (real, working
+# structural logic below) but is skipped until #2859 lands and this xfail
+# is removed. This is a deliberate choice named in the WS1 spec itself
+# ("Choose (b)"), not an oversight. See the xfail's own reason= just below
+# the class for the exact per-file breakdown.
 class TestNoBareJoinOutsideHelper:
     """Any hook file that assembles a string destined for
     hookSpecificOutput.additionalContext must route that content through
@@ -224,12 +227,44 @@ class TestNoBareJoinOutsideHelper:
     bounded. Per-file "does this emitter call emit_context() at all" is the
     check that actually targets the structural rule (Part C item 3's own
     intent) without that false-positive surface.
+
+    Refinement (engram-alpha#2863 WS3): the ORIGINAL bare-substring form
+    ("additionalContext" appears anywhere in the file's text) over-fired on
+    two files that never construct an additionalContext dict-key/value at
+    all -- engram-loop-arm-stop-hook.py and engram-postcompact-hook.py --
+    where every occurrence of the literal string is inside a docstring or a
+    `#`-comment discussing the concept in prose (both explicitly document
+    that they emit a DIFFERENT hookSpecificOutput shape, or none at all).
+    `_ADDITIONAL_CONTEXT_KEY_RE` narrows the trigger to the actual
+    dict-key/subscript CONSTRUCTION shape -- a quoted `additionalContext`
+    immediately followed by a colon, e.g. `"additionalContext":` or
+    `'additionalContext':` -- which is how every genuine emitter in this
+    codebase builds the key (verified against all 5 currently-flagged
+    violators plus a spot-check of already-migrated hooks, e.g.
+    engram-surface-hook.py / engram-forum-prompt-hook.py, which also match
+    this pattern but are correctly exempted by the emit_context() check
+    below, same as before). Prose mentions of the bare word never satisfy
+    this pattern, since a docstring/comment discussing the field by name
+    doesn't happen to place a colon immediately after the quoted word.
     """
 
     _EXCLUDED = {
         "_hooklib.py",  # emit_context()'s own implementation lives here
         "_harness.py",  # no additionalContext content of its own
     }
+
+    # A quoted `additionalContext` immediately followed by a colon -- the
+    # dict-key/subscript CONSTRUCTION shape, not a bare prose mention.
+    #
+    # Trade-off, named explicitly (reviewer-fairy round 1, PR #2910): this
+    # narrows detection surface relative to the old bare-substring check.
+    # A future hook that builds the key indirectly -- through a named
+    # constant, an f-string, or a dict-update call, rather than the direct
+    # literal-colon form -- would silently evade this gate even though it
+    # never calls emit_context(). Verified against all 25 hook files as of
+    # this PR: none use indirection. If one ever does, this regex is the
+    # first place to widen.
+    _ADDITIONAL_CONTEXT_KEY_RE = re.compile(r"""["']additionalContext["']\s*:""")
 
     @staticmethod
     def _find_violators() -> list:
@@ -241,7 +276,7 @@ class TestNoBareJoinOutsideHelper:
                 text = path.read_text(encoding="utf-8")
             except OSError:
                 continue
-            if "additionalContext" not in text:
+            if not TestNoBareJoinOutsideHelper._ADDITIONAL_CONTEXT_KEY_RE.search(text):
                 continue
             if "emit_context(" in text:
                 continue
@@ -250,11 +285,18 @@ class TestNoBareJoinOutsideHelper:
 
     @pytest.mark.xfail(
         reason=(
-            "engram-alpha#2863 WS2: 10+ of the 14 hook emitters (all but the "
-            "handful that already local-cap) are not yet migrated onto "
-            "emit_context() -- this is EXPECTED to report violators today. "
-            "Remove this xfail once WS2's migration lands and re-run to "
-            "confirm the violator list is empty."
+            "engram-alpha#2863 WS3: 5 hook emitters still don't route their "
+            "additionalContext content through emit_context() -- this is "
+            "EXPECTED to report violators today. engram-session-start-hook.py "
+            "is pending its own restructure, #2859 (owned by Clio, not a "
+            "drop-in migration -- explicitly out of scope here). The other 4 "
+            "-- engram-bash-pipe-exit-warn.py, engram-end-of-day-hook.py, "
+            "engram-stale-tree-warn-hook.py, engram-time-bar-hook.py -- are "
+            "deliberately escape-valved as atomic fixed-format emitters (no "
+            "head/body split, per the epic's own reasoning) and were never "
+            "meant to migrate onto emit_context() by design. Remove this "
+            "xfail once #2859 lands and re-run to confirm the violator list "
+            "is empty."
         ),
         strict=True,
     )
@@ -272,10 +314,179 @@ class TestNoBareJoinOutsideHelper:
         gate)."""
         violators = self._find_violators()
         assert violators, (
-            "expected at least one un-migrated hook emitter today (WS2 "
-            "hasn't run yet) -- if this is empty, WS2 has landed and the "
-            "xfail above should be removed/activated instead."
+            "expected at least one un-migrated hook emitter today "
+            "(engram-session-start-hook.py, pending #2859) -- if this is "
+            "empty, either #2859 landed or one of the 4 deliberately "
+            "escape-valved emitters was migrated, and the xfail above "
+            "should be removed/activated instead."
         )
+
+
+# ---------------------------------------------------------------------------
+# WS3 (engram-alpha#2863) -- divergence check between the narrowed
+# colon-construction predicate above and the ORIGINAL bare-substring one it
+# replaced. Ariadne's colleague-review finding on this PR (0d67656a): the
+# narrowing's own trade-off comment names a real blind spot -- "a future
+# hook that builds the key indirectly ... would silently evade this gate"
+# -- but names no watcher for it. The gate would go silently blind exactly
+# when it matters (a new indirect-construction hook appears) and nothing
+# in the suite would notice, because the condition that should trigger a
+# widening is by construction invisible to the narrowed predicate itself.
+#
+# The fix Ariadne proposed and Borges raised per Lei's 2026-09-07 same-PR
+# ruling (a root cause plus a better design that makes the bad state
+# structurally impossible gets fixed alongside the root cause, not
+# deferred to a follow-up issue): keep the OLD bare-substring predicate
+# running as a SEPARATE, permanent assertion, and require that its result
+# only ever differs from the new predicate's result by the two currently-
+# named, currently-justified exemptions. Same-answer is silence;
+# disagreement on any OTHER file is the signal that the narrowed predicate
+# has gone blind to something the old one would have caught -- which is
+# exactly the "first place to widen" moment the code comment names, now
+# enforced rather than remembered.
+# ---------------------------------------------------------------------------
+class TestNoDivergenceFromOldPredicateBeyondNamedExemptions:
+    """Ariadne's colleague-review suggestion on PR #2910, folded in per
+    Lei's 2026-09-07 same-PR ruling rather than deferred as a follow-up.
+
+    `_find_violators_old()` below is a frozen copy of the ORIGINAL (pre-WS3)
+    bare-substring predicate -- deliberately NOT the live one from
+    TestNoBareJoinOutsideHelper, so that a future edit to the narrowed
+    regex can't accidentally also change what this check compares against.
+    The two predicates are independent instruments FOR DETECTION -- neither
+    calls the other, so a bug in the narrowed regex can't silently coincide
+    with the old check and hide behind that coupling. They are NOT
+    independent in SCOPE: both share `_EXCLUDED` and `_HOOKS_DIR`, so a file
+    excluded from one is excluded from both, and this divergence check
+    inherits whatever blind spot that exclusion set already has (Ariadne's
+    colleague-review finding, same tip). Two instruments are two checks
+    only when the scope differs, per this repo's own conclusion-warrant
+    discipline -- here the scope is deliberately shared, so this check's
+    guarantee is "no NEW divergence beyond the named exemptions," not "no
+    divergence anywhere `_EXCLUDED`/`_HOOKS_DIR` could hide."
+    """
+
+    # Named, currently-justified exemptions -- see
+    # TestNoBareJoinOutsideHelper's own docstring "Refinement" note for why
+    # each is a genuine non-emitter, not merely narrower-regex-shy.
+    _KNOWN_EXEMPTIONS = frozenset(
+        {"engram-loop-arm-stop-hook.py", "engram-postcompact-hook.py"}
+    )
+
+    @staticmethod
+    def _find_violators_old() -> set:
+        """The pre-WS3 predicate: bare substring "additionalContext"
+        present, no "emit_context(" present. Frozen here, not imported --
+        see class docstring."""
+        violators = set()
+        for path in sorted(_HOOKS_DIR.glob("*.py")):
+            if path.name in TestNoBareJoinOutsideHelper._EXCLUDED:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if "additionalContext" not in text:
+                continue
+            if "emit_context(" in text:
+                continue
+            violators.add(path.name)
+        return violators
+
+    def test_new_predicate_only_diverges_on_named_exemptions(self):
+        old_violators = self._find_violators_old()
+        new_violators = set(TestNoBareJoinOutsideHelper._find_violators())
+        dropped = old_violators - new_violators
+        assert dropped == self._KNOWN_EXEMPTIONS, (
+            "the narrowed colon-construction predicate now disagrees with "
+            "the original bare-substring predicate on a file OTHER than "
+            "the two named, justified exemptions -- this is the exact "
+            "silent-blind-spot scenario the narrowing's own trade-off "
+            "comment warns about. A file it dropped: "
+            f"{sorted(dropped - self._KNOWN_EXEMPTIONS)} (if empty, a "
+            "named exemption stopped being dropped instead -- also worth "
+            f"investigating: {sorted(self._KNOWN_EXEMPTIONS - dropped)})"
+        )
+
+    def test_new_predicate_never_flags_something_old_did_not(self):
+        """Structural sanity check, not expected to ever fail by
+        construction (the colon-construction shape is strictly narrower
+        than bare-substring presence) -- but "by construction" is exactly
+        the kind of claim this suite doesn't take on faith elsewhere, so it
+        doesn't here either."""
+        old_violators = self._find_violators_old()
+        new_violators = set(TestNoBareJoinOutsideHelper._find_violators())
+        added = new_violators - old_violators
+        assert not added, (
+            "the narrowed predicate flagged a file the original "
+            f"bare-substring predicate did not: {sorted(added)} -- this "
+            "should be structurally impossible; if it happens, the two "
+            "predicates' relationship has changed and this comment is "
+            "wrong"
+        )
+
+
+# ---------------------------------------------------------------------------
+# WS3 (engram-alpha#2863) -- regression coverage for the colon-construction
+# discriminator in TestNoBareJoinOutsideHelper._find_violators() above.
+# Recreates each false-positive class the pre-fix gate caught (a
+# docstring-only mention, a comment-only mention) in isolation, plus a
+# control proving the refinement didn't make the gate blind to a genuine
+# violation -- using tiny synthetic hook-shaped files rather than depending
+# on the real hooks directory's current contents (which could change
+# independently of this gate's own correctness).
+# ---------------------------------------------------------------------------
+class TestViolatorGateDiscriminator:
+    @staticmethod
+    def _violators_in(tmp_path, monkeypatch) -> list:
+        """Point the module-level _HOOKS_DIR at an isolated tmp_path so
+        _find_violators() scans only the fixture file(s) written there,
+        never the real hooks directory."""
+        monkeypatch.setattr(sys.modules[__name__], "_HOOKS_DIR", tmp_path)
+        return TestNoBareJoinOutsideHelper._find_violators()
+
+    def test_docstring_only_mention_is_not_flagged(self, tmp_path, monkeypatch):
+        """False-positive class 1 (engram-loop-arm-stop-hook.py's shape):
+        the literal string "additionalContext" appears only inside a
+        docstring, never as an actual dict-key construction."""
+        (tmp_path / "engram-fake-docstring-hook.py").write_text(
+            '"""This hook discusses additionalContext in prose only -- it\n'
+            'never actually builds the additionalContext key; it emits a\n'
+            'different hookSpecificOutput shape entirely.\n"""\n'
+            'print("hello")\n',
+            encoding="utf-8",
+        )
+        assert self._violators_in(tmp_path, monkeypatch) == []
+
+    def test_comment_only_mention_is_not_flagged(self, tmp_path, monkeypatch):
+        """False-positive class 2 (engram-postcompact-hook.py's shape): the
+        literal string appears only inside a `#`-comment."""
+        (tmp_path / "engram-fake-comment-hook.py").write_text(
+            "# additionalContext is Claude Code's injection field -- this\n"
+            "# hook cannot emit it at all, mentioned here only in a comment.\n"
+            'print("hello")\n',
+            encoding="utf-8",
+        )
+        assert self._violators_in(tmp_path, monkeypatch) == []
+
+    def test_genuine_dict_key_construction_without_emit_context_is_still_flagged(
+        self, tmp_path, monkeypatch
+    ):
+        """Control: a file that genuinely constructs
+        `"additionalContext": ...` as a real dict key, without ever calling
+        emit_context(), must still be flagged -- proving the refinement
+        narrowed the trigger pattern without blinding the gate to a real
+        violation. A check that has only ever been observed to pass is not
+        yet a real gate."""
+        (tmp_path / "engram-fake-real-violator-hook.py").write_text(
+            "import json\n"
+            'print(json.dumps({"hookSpecificOutput": '
+            '{"additionalContext": "unbounded content"}}))\n',
+            encoding="utf-8",
+        )
+        assert self._violators_in(tmp_path, monkeypatch) == [
+            "engram-fake-real-violator-hook.py"
+        ]
 
 
 # ---------------------------------------------------------------------------
