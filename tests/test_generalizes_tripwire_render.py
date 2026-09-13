@@ -150,7 +150,12 @@ class TestTripwireShapeCarriesNodeId(unittest.TestCase):
         ls1 = _seed_lesson(server, pattern=r"rm -rf", nudge="careful")
         tripwires = load_tripwires(db_path=_db_path())
         hits = check_command("rm -rf /tmp/x", tripwires)
-        self.assertEqual(hits, [{"nudge": "careful", "node_id": ls1}])
+        # #2858 added a 3rd "pattern" key to each hit (the firing
+        # situation_pattern itself, used by main() to order hits by
+        # specificity before rendering) -- assert the full dict shape
+        # check_command's own docstring documents, not just the two keys
+        # this test predates that change.
+        self.assertEqual(hits, [{"nudge": "careful", "node_id": ls1, "pattern": r"rm -rf"}])
 
 
 # ---------------------------------------------------------------------------

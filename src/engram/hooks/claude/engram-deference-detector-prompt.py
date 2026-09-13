@@ -43,7 +43,8 @@ DEFERENCE_COOLDOWN_PATH = os.path.join(ENGRAM_HOME, "deference-cooldown-at.txt")
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import resolve_runtime_dir
+from _hooklib import resolve_runtime_dir, emit_context
+from _harness import detect_harness, get_harness_budgets
 
 _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
 if _RUNTIME_DIR not in sys.path:
@@ -281,7 +282,13 @@ def main() -> None:
         _emit_hook_fire(session_id, transcript_path, int((time.perf_counter() - _t0) * 1000), 0)
         sys.exit(0)
 
-    lines = [
+    # engram-alpha#2863 WS2: `head` carries the single must-not-miss fact
+    # (a deference reflex fired, and how many matches) -- `body_blocks`
+    # carries the per-hit snippets, ordered as detected. Snippet content
+    # comes from the agent's own prior response and is of genuinely
+    # unpredictable size/count (unlike engram-toolcall-repair.py's bounded
+    # sibling), so this is a real, not merely defensive, migration target.
+    head = (
         "[Deference detector — self-loop mode] Your previous response contained "
         f"{marker.get('hit_count', len(hits))} deference-phrase match(es) "
         f"({marker.get('unique_labels', len(hits))} unique pattern(s)). "
@@ -292,13 +299,24 @@ def main() -> None:
         "correctable. If you're in self-loop / autonomous mode and waiting on "
         "a human response that isn't coming: you can safely proceed without "
         "further input. The deference is informational, not actionable."
-    ]
+    )
+    body_blocks = []
     for h in hits:
         snippet = h.get("snippet", "").strip()
         if snippet:
-            lines.append(f"  - [{h.get('label', '?')}] \"{snippet}\"")
+            body_blocks.append(f"  - [{h.get('label', '?')}] \"{snippet}\"")
 
-    additional_context = "\n".join(lines)
+    # No local economy target exists for this hook -- `target` uses the
+    # same hard `budget` ceiling as `budget` itself (mirrors
+    # engram-surface-hook.py's own default choice for a hook with no
+    # pre-existing local cap).
+    budgets = get_harness_budgets(detect_harness())
+    additional_context = emit_context(
+        head,
+        body_blocks,
+        budget=budgets["budget"],
+        target=budgets["budget"],
+    )
 
     response = {
         "hookSpecificOutput": {

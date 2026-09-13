@@ -919,7 +919,6 @@ class TestMainDemotionIntegration(unittest.TestCase):
 # always-emitted "N shown · M cut" trailer (rendered FIRST — round 2).
 # ---------------------------------------------------------------------------
 
-select_and_cap_hits = _hook.select_and_cap_hits
 write_tripwire_overflow = _hook.write_tripwire_overflow
 TRIPWIRE_BLOCK_CHAR_CEILING = _hook.TRIPWIRE_BLOCK_CHAR_CEILING
 
@@ -1096,21 +1095,46 @@ class TestTripwirePreviewCap(unittest.TestCase):
         whole ceiling on its own) must still be shown — never cut down to
         zero shown hits when there is at least one match. A second,
         unambiguously smaller hit that would push the total over the
-        ceiling must be the one cut."""
+        ceiling must be the one cut.
+
+        #2863 WS2: select_and_cap_hits (which this test used to exercise
+        directly) was removed -- main() now renders via the shared
+        _hooklib.emit_context() (allow_single_overflow=True reproduces this
+        exact "always show at least one hit" guarantee). Updated to assert
+        through the new call path (main()'s actual output) rather than a
+        removed internal function -- observable behavior, not internals."""
         huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
         small_nudge = "small nudge text"
-        # Hits passed in already specificity-ordered (as select_and_cap_hits
-        # expects — main() does the ordering before calling it; this test
-        # exercises select_and_cap_hits directly).
-        hits = [
-            {"nudge": huge_nudge, "node_id": "ls_huge", "pattern": "z" * 40},
-            {"nudge": small_nudge, "node_id": "ls_small", "pattern": "a"},
-        ]
-        shown, cut = select_and_cap_hits(hits, TRIPWIRE_BLOCK_CHAR_CEILING)
-        self.assertEqual(len(shown), 1, "the oversized first hit alone must still be shown")
-        self.assertEqual(shown[0]["node_id"], "ls_huge")
-        self.assertEqual(len(cut), 1)
-        self.assertEqual(cut[0]["node_id"], "ls_small")
+        # Longer pattern == more specific == sorted first (descending
+        # pattern length) -- so the huge hit is the "most specific" one
+        # that must survive the cap.
+        pattern_huge = "hugepattern" + ("z" * 30)
+        pattern_small = "q"
+        command = f"{pattern_huge} {pattern_small}"
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_huge, huge_nudge, "ls_huge"),
+                    (pattern_small, small_nudge, "ls_small"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            huge_nudge, additional_context,
+            "the oversized first (most-specific) hit alone must still be shown, in full",
+        )
+        self.assertNotIn(
+            small_nudge, additional_context,
+            "the smaller, less-specific hit must be the one cut",
+        )
+        first_line = additional_context.split("\n", 1)[0]
+        self.assertTrue(
+            first_line.startswith("▸ 1 shown · 1 cut"),
+            f"expected a '1 shown · 1 cut' trailer (overflow write succeeds "
+            f"here, so a '— see <path>' clause is expected too); got: {first_line!r}",
+        )
 
     def test_write_tripwire_overflow_failure_degrades_to_empty_string(self):
         """#2858 reviewer-fairy round 1 suggestion (PR #2860): the
@@ -1119,9 +1143,18 @@ class TestTripwirePreviewCap(unittest.TestCase):
         Path.mkdir to raise OSError (the same failure shape a permissions
         or disk-full error would produce) and confirms write_tripwire_overflow
         never raises -- it returns "" per its documented never-raises
-        contract, so the caller's trailer falls back to the honest
-        "(overflow file unavailable)" form instead of claiming a file exists
-        that doesn't."""
+        contract.
+
+        #2863 WS2: the caller-side trailer wording on a write failure
+        changed with the migration onto the shared _hooklib.emit_context()/
+        _build_context_trailer() -- the removed _build_trailer's
+        "(overflow file unavailable)" clause is gone; the shared trailer
+        renders plain "N shown · M cut" (no clause) on an empty overflow
+        path, whether the writer was never supplied or genuinely failed at
+        runtime (Kepler's WS1 spec, Part B item 7: only the REASON differs,
+        never the rendered text). Updated to assert this end-to-end through
+        main() (observable behavior) rather than the removed internal
+        _build_trailer function directly."""
         cut_hits = [{"nudge": "a cut nudge", "node_id": "ls_0001"}]
         with unittest.mock.patch.object(
             Path, "mkdir", side_effect=OSError("simulated permission failure")
@@ -1129,5 +1162,31 @@ class TestTripwirePreviewCap(unittest.TestCase):
             result = write_tripwire_overflow(cut_hits, now=1700000000.0)
         self.assertEqual(result, "", "a write failure must degrade to empty string, never raise")
 
-        trailer = _hook._build_trailer(3, len(cut_hits), result)
-        self.assertEqual(trailer, "▸ 3 shown · 1 cut (overflow file unavailable)")
+        huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
+        small_nudge = "small nudge text"
+        pattern_huge = "overflowfailpattern" + ("z" * 20)
+        pattern_small = "q"
+        command = f"{pattern_huge} {pattern_small}"
+        with (
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+            unittest.mock.patch.object(
+                Path, "mkdir", side_effect=OSError("simulated permission failure")
+            ),
+        ):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_huge, huge_nudge, "ls_huge2"),
+                    (pattern_small, small_nudge, "ls_small2"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        first_line = additional_context.split("\n", 1)[0]
+        self.assertEqual(
+            first_line, "▸ 1 shown · 1 cut",
+            "write failure must degrade the trailer to the new shared "
+            "'N shown · M cut' form (no clause) rather than the old "
+            "'(overflow file unavailable)' wording or crashing",
+        )
+        self.assertNotIn("overflow file unavailable", additional_context)

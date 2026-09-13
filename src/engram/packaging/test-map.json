@@ -22,9 +22,12 @@
         "tests/test_hook_injection_bounds.py",
         "tests/test_surface_hook_injection_bounds.py",
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
-        "tests/test_user_identity_hook_injection_bounds.py"
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_toolcall_repair_injection_bounds.py",
+        "tests/test_deference_detector_injection_bounds.py"
       ],
-      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it drives engram-surface-hook.py's emit_context() call end-to-end (same dynamic-load invisibility as the other consumers here). engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- it drives engram-stale-tree-pull-hook.py's emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- it drives engram-user-identity-hook.py's own emit_context() call end-to-end, same dynamic-load invisibility."
+      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it drives engram-surface-hook.py's emit_context() call end-to-end (same dynamic-load invisibility as the other consumers here). engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- it drives engram-stale-tree-pull-hook.py's emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- it drives engram-user-identity-hook.py's own emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own emit_context() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they drive engram-toolcall-repair.py's and engram-deference-detector-prompt.py's own emit_context() calls end-to-end (same dynamic-load invisibility as the other consumers here)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/_harness.py",
@@ -34,9 +37,12 @@
         "tests/test_run_touched_tests.py",
         "tests/test_surface_hook_injection_bounds.py",
         "tests/test_stale_tree_pull_hook_injection_bounds.py",
-        "tests/test_user_identity_hook_injection_bounds.py"
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_toolcall_repair_injection_bounds.py",
+        "tests/test_deference_detector_injection_bounds.py"
       ],
-      "note": "engram-alpha#2863 WS1 -- per-harness budget/floor table for the bounded hook-injection helper (_hooklib.emit_context()). Loaded by tests via importlib.util.spec_from_file_location (same dynamic-load convention as _hooklib.py above, mirrored here since this is the same pattern of a module a hook would import via a runtime sys.path insert, not a static top-level `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py precedent above. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it exercises get_harness_budgets()/detect_harness() via engram-surface-hook.py's own call site. engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- same reasoning, via engram-stale-tree-pull-hook.py's call site. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- exercises get_harness_budgets()/detect_harness() via engram-user-identity-hook.py's own call site."
+      "note": "engram-alpha#2863 WS1 -- per-harness budget/floor table for the bounded hook-injection helper (_hooklib.emit_context()). Loaded by tests via importlib.util.spec_from_file_location (same dynamic-load convention as _hooklib.py above, mirrored here since this is the same pattern of a module a hook would import via a runtime sys.path insert, not a static top-level `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py precedent above. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it exercises get_harness_budgets()/detect_harness() via engram-surface-hook.py's own call site. engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- same reasoning, via engram-stale-tree-pull-hook.py's call site. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- exercises get_harness_budgets()/detect_harness() via engram-user-identity-hook.py's own call site. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own detect_harness()/get_harness_budgets() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they exercise get_harness_budgets()/detect_harness() via those two hooks' own call sites."
     },
     {
       "path_prefix_or_glob": "hooks/claude/_prompthooklib.py",
@@ -100,8 +106,10 @@
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-prompt.py",
       "test_globs": [
         "tests/test_deference_detector_scope_gate.py",
-        "tests/test_engine_unit.py"
-      ]
+        "tests/test_engine_unit.py",
+        "tests/test_deference_detector_injection_bounds.py"
+      ],
+      "note": "engram-alpha#2863 WS2 batch C: test_deference_detector_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end via importlib.util.spec_from_file_location (hyphenated filename, invisible to the layer-1 AST import graph, same reasoning as test_deference_detector_prompt.py's own existing pattern for this hook)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-stop.py",
@@ -141,9 +149,11 @@
       "test_globs": [
         "tests/test_lesson_tripwire.py",
         "tests/test_in_turn_recall.py",
-        "tests/test_principle_triggers_registry.py"
+        "tests/test_principle_triggers_registry.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_resolve_runtime_dir_plugin.py"
       ],
-      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
+      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 (lesson-tripwire fold onto _hooklib.emit_context()): test_lesson_tripwire_injection_bounds.py added (bound/head/ordering coverage for the new emit_context() call site). test_resolve_runtime_dir_plugin.py added too -- it dynamically loads this hook file's own no-argument _resolve_runtime_dir (a different helper from the shared _hooklib one) via importlib against a synthetic worktree-nested copy, and this migration added a second module-scope dependency (`_harness`) that fixture now has to satisfy alongside the pre-existing `_hooklib` one."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
@@ -232,9 +242,10 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
       "test_globs": [
-        "tests/test_add_observation_payload.py"
+        "tests/test_add_observation_payload.py",
+        "tests/test_toolcall_repair_injection_bounds.py"
       ],
-      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path)"
+      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path). engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end (same dynamic-load invisibility as this file's existing entry)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",

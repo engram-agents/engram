@@ -104,6 +104,14 @@ from unittest.mock import patch
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _HOOKLIB_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "_hooklib.py"
 _HOOKLIB_SRC = _HOOKLIB_PATH.read_text()
+# engram-alpha#2863 WS2: engram-lesson-tripwire-hook.py now ALSO carries a
+# module-scope `from _harness import detect_harness, get_harness_budgets`
+# (folded onto the shared emit_context() renderer) -- a second real
+# dependency the fake worktree tree below must satisfy, same reasoning as
+# the pre-existing _hooklib.py sibling-write this mirrors (see
+# TestResolveRuntimeDirWalkParents._build_worktree_tree's own docstring).
+_HARNESS_PATH = _REPO_ROOT / "src" / "engram" / "hooks" / "claude" / "_harness.py"
+_HARNESS_SRC = _HARNESS_PATH.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +659,13 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         unconditionally (redundant-but-harmless for "hooklib" subjects,
         whose own file IS _hooklib.py) makes every subject's worktree tree
         self-contained regardless of what else ran earlier in the process.
+
+        Also writes a sibling _harness.py, same reasoning (engram-alpha#2863
+        WS2): folding engram-lesson-tripwire-hook.py onto the shared
+        emit_context() renderer added a second module-scope dependency,
+        `from _harness import detect_harness, get_harness_budgets`, which
+        this fake worktree tree must satisfy for the same
+        order-dependent-pass reason the _hooklib.py sibling exists for.
         """
         main_repo = tmp_path / "main-repo"
         worktree = main_repo / ".claude" / "worktrees" / "fake-agent"
@@ -661,6 +676,9 @@ class TestResolveRuntimeDirWalkParents(unittest.TestCase):
         hooklib_sibling = worktree_hook_dir / "_hooklib.py"
         if hooklib_sibling != worktree_file:
             hooklib_sibling.write_text(_HOOKLIB_SRC)
+        harness_sibling = worktree_hook_dir / "_harness.py"
+        if harness_sibling != worktree_file:
+            harness_sibling.write_text(_HARNESS_SRC)
         return main_repo, worktree, worktree_file
 
     @staticmethod

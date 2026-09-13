@@ -44,9 +44,21 @@ specificity, rendering the trailer FIRST (so it survives the tail-cut even
 when everything after it doesn't), capping the fully-rendered block
 (trailer + header + bullets) to a character ceiling below the harness's own
 cut, persisting the overflow to a file, and always emitting a
-"N shown · M cut" trailer on the tripwire block (see
-TRIPWIRE_BLOCK_CHAR_CEILING, select_and_cap_hits, write_tripwire_overflow
-below).
+"N shown · M cut" trailer on the tripwire block.
+
+#2863 WS2 — this hook's own bespoke render mechanism (formerly
+select_and_cap_hits / _render_tripwire_block / _build_trailer / its own
+_placeholder_overflow_path) was the REFERENCE IMPLEMENTATION
+`_hooklib.emit_context()` was generalized FROM (see that function's own
+docstring). This hook has now been folded onto the shared helper: the
+actual rendering (trailer + header + bullets, capped to
+TRIPWIRE_BLOCK_CHAR_CEILING as `target`, never exceeding the harness's hard
+`budget`) is emit_context()'s job now, called from main() below.
+write_tripwire_overflow() is unchanged and still owns the on-disk overflow
+format (node_id-keyed, one block per cut hit) — it is invoked from a small
+overflow_writer adapter that reconstructs the cut hit dicts BY POSITION
+from emit_context()'s own selection (see main()'s own comments at the
+call site for why position, not string value).
 """
 import json
 import math
@@ -59,7 +71,8 @@ from pathlib import Path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json, resolve_runtime_dir
+from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context
+from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
@@ -89,7 +102,19 @@ DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
 # precede this one on the same tool call -- not a value to treat as exact;
 # if the envelope/other-blocks overhead is measured precisely later, retune
 # this constant rather than treating it as derived science.
+#
+# #2863 WS2: this is now passed as `target` to `_hooklib.emit_context()`
+# (see main()), which owns the actual capping/trailer-rendering mechanism
+# this hook's own bespoke select_and_cap_hits/_render_tripwire_block/
+# _build_trailer used to implement directly. The ceiling VALUE and its
+# margin reasoning above are unchanged.
 TRIPWIRE_BLOCK_CHAR_CEILING = 1800
+
+# #2863 WS2: the fixed header line emit_context()'s `head` argument renders
+# right after the trailer -- extracted as a module constant (was previously
+# inlined inside _render_tripwire_block) so main() and this module's own
+# tests share exactly one copy of the literal text.
+TRIPWIRE_HEADER = "[lesson-tripwire] Action-moment pattern matched — remember:"
 
 _QUERY = """
 SELECT
@@ -155,128 +180,34 @@ def check_command(match_target: str, tripwires) -> list:
     return hits
 
 
-def _placeholder_overflow_path() -> str:
-    """A representative-length dummy overflow path, used ONLY during
-    select_and_cap_hits's sizing loop -- never written to disk, never
-    returned to a caller as a real path.
-
-    #2858 round 2: the trailer's "— see {path}" text depends on the real
-    overflow path, which write_tripwire_overflow() only produces once the
-    final cut_hits split is known -- but that split is exactly what the
-    sizing loop below is computing (chicken-and-egg). Resolved by sizing
-    against a placeholder of the SAME shape/length as the real path
-    (ENGRAM_HOME/tripwire-overflow/<10-digit-ts>-<pid>.txt) instead of
-    writing throwaway files during the loop. A few characters' difference
-    between this placeholder and the eventual real path is immaterial at
-    1800 chars vs. the ~200-byte measured headroom (see
-    TRIPWIRE_BLOCK_CHAR_CEILING above) -- not worth the complexity of an
-    exact reservation.
-    """
-    return str(
-        Path(ENGRAM_HOME) / "tripwire-overflow" / f"9999999999-{os.getpid()}.txt"
-    )
+def _tripwire_bullet(hit: dict) -> str:
+    """Render one hit's bullet line -- the exact per-item body string
+    emit_context() renders, one per shown hit (was previously inlined
+    inside the now-removed _render_tripwire_block). Extracted as its own
+    function so main() and this module's tests share one copy of the
+    format."""
+    return f"  • {hit['nudge']}"
 
 
-def _build_trailer(shown_count: int, cut_count: int, overflow_path: str = "") -> str:
-    """Build the "N shown · M cut" trailer line.
-
-    cut_count == 0            -> "▸ {shown} shown · 0 cut" (no path).
-    cut_count > 0, path given -> "▸ {shown} shown · {cut} cut — see {path}".
-    cut_count > 0, no path    -> "▸ {shown} shown · {cut} cut (overflow file
-                                  unavailable)" -- either because
-                                  write_tripwire_overflow() genuinely failed
-                                  (final render), or because this is the
-                                  sizing loop's placeholder call for a
-                                  cut_count of 0 (never reached — see caller).
-
-    Shared by select_and_cap_hits's sizing loop (fed a placeholder path via
-    _placeholder_overflow_path()) and main()'s final render (fed the real
-    path, or "" on a genuine write failure) -- one trailer-format string,
-    not two copies that could drift.
-    """
-    if cut_count == 0:
-        return f"▸ {shown_count} shown · 0 cut"
-    if overflow_path:
-        return f"▸ {shown_count} shown · {cut_count} cut — see {overflow_path}"
-    return f"▸ {shown_count} shown · {cut_count} cut (overflow file unavailable)"
-
-
-def _render_tripwire_block(shown_hits: list, trailer: str) -> str:
-    """Build the EXACT tripwire-block string main() emits: trailer line
-    FIRST, then the header line, then one bullet per shown hit.
-
-    #2858 round 2 (Fix 1): the trailer must be the FIRST line, not the
-    last -- the harness truncates the TAIL of the whole additionalContext
-    string, so a trailer at the end is cut right along with the nudges on
-    exactly the large, heavily-capped captures this issue is about,
-    silently defeating the always-emit-trailer guarantee. Putting it first
-    means it survives the cut even when everything after it doesn't.
-
-    Shared between select_and_cap_hits's sizing loop (which needs the exact
-    rendered length before the final cut_hits/overflow-path are known) and
-    main()'s actual emission -- one render path, so the two call sites
-    cannot drift apart in format.
-    """
-    nudge_lines = "\n".join(f"  • {h['nudge']}" for h in shown_hits)
-    return (
-        f"{trailer}\n"
-        "[lesson-tripwire] Action-moment pattern matched — remember:\n"
-        f"{nudge_lines}"
-    )
-
-
-def select_and_cap_hits(hits: list, ceiling: int) -> tuple[list, list]:
-    """Greedily select from an already specificity-ordered `hits` list into
-    (shown_hits, cut_hits): shown_hits is the longest PREFIX of `hits` whose
-    FULLY RENDERED block (trailer + header + bullets, exactly as
-    _render_tripwire_block will produce it) is <= `ceiling` CHARACTERS, and
-    cut_hits is everything past that point, in the same order.
-
-    #2858 round 2: this replaces the round-1 approach of summing bullet-line
-    BYTES in isolation (which never accounted for the header, the trailer,
-    or measuring in the right unit) with measuring len() of the ACTUAL
-    string that will be emitted, in characters -- see
-    TRIPWIRE_BLOCK_CHAR_CEILING above for why 1800 chars is the ceiling.
-    The trailer used during sizing is built with a representative-length
-    PLACEHOLDER overflow path (_placeholder_overflow_path()) since the real
-    path isn't known until write_tripwire_overflow() runs on the final
-    cut_hits -- see that function's docstring for the chicken-and-egg this
-    resolves.
-
-    This is the mechanism that turns "harness silently truncates the tail
-    of a large additionalContext blob" into "this hook itself decides
-    what's shown vs. cut, and says so out loud" -- the ceiling here is
-    deliberately BELOW the harness's own observed preview boundary so this
-    hook's own decision is the one that actually takes effect, not the
-    harness's blind tail-cut.
-
-    Always includes at least the FIRST (most specific) hit, even if its own
-    rendered block alone exceeds `ceiling` -- never cuts down to zero shown
-    hits when there is at least one match. An empty visible block with
-    every hit cut would defeat the whole point of the tripwire having fired
-    at all; a single oversized nudge is still strictly better than none.
-    """
-    if not hits:
-        return [], []
-    shown = list(hits)
-    while len(shown) > 1:
-        cut_count = len(hits) - len(shown)
-        if cut_count == 0:
-            trailer = _build_trailer(len(shown), 0)
-        else:
-            trailer = _build_trailer(len(shown), cut_count, _placeholder_overflow_path())
-        rendered = _render_tripwire_block(shown, trailer)
-        if len(rendered) <= ceiling:
-            break
-        shown = shown[:-1]  # drop the LEAST-specific currently-shown hit
-    cut = hits[len(shown):]
-    return shown, cut
+# #2863 WS2: select_and_cap_hits / _render_tripwire_block / _build_trailer /
+# this module's own _placeholder_overflow_path (the bespoke mechanism
+# `_hooklib.emit_context()` was generalized FROM -- see that function's
+# docstring) are REMOVED. main() below calls emit_context() directly for
+# both the selection (shown vs. cut) AND the rendering (trailer + header +
+# bullets) -- one call, one source of truth, replacing four separate
+# hand-written functions that had to be kept in lockstep by hand. The
+# empirical equivalence (byte-identical selection + rendering on every
+# fixture this file's own test suite exercises, including the
+# always-show-at-least-one-hit edge case) was verified before this removal
+# landed -- see the PR description for the comparison.
 
 
 def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
-    """Persist the full node_id + nudge text of every hit that select_and_cap_hits
-    cut, so the trailer line in the visible tripwire block can point somewhere
-    real instead of leaving the reader with no way to recover what was dropped.
+    """Persist the full node_id + nudge text of every hit emit_context()
+    cut (or, for the rare item-alone-exceeds-the-hard-budget case, marked
+    truncated-in-band -- see main()'s own overflow_writer adapter), so the
+    trailer/marker in the visible tripwire block can point somewhere real
+    instead of leaving the reader with no way to recover what was dropped.
 
     #2858 Piece 2: written to ENGRAM_HOME/tripwire-overflow/<ts>-<pid>.txt (a
     NEW directory, created on demand). File name is deterministic enough for a
@@ -1377,34 +1308,68 @@ def main() -> None:
         shown_hits = []
         if hits:
             hits = sorted(hits, key=lambda h: -len(h.get("pattern") or ""))
-            # #2858 Piece 2 (round 2) — cap the FULLY RENDERED block
-            # (trailer + header + bullets) to a character ceiling so this
-            # hook's own truncation decision (visible, trailer-announced)
-            # pre-empts the harness's blind tail-cut of the whole
-            # additionalContext string. shown_hits feeds both the bullet
-            # list below AND (per Piece 3) render_triggered_principles —
-            # never the full, uncapped `hits`, so a "[triggered principles]"
-            # line never cites a lesson whose own nudge text was cut from
-            # the visible block.
-            shown_hits, cut_hits = select_and_cap_hits(hits, TRIPWIRE_BLOCK_CHAR_CEILING)
-            if cut_hits:
-                overflow_path = write_tripwire_overflow(cut_hits)
-                # write_tripwire_overflow() returns "" on any failure (e.g.
-                # unwritable ENGRAM_HOME) — _build_trailer reports the
-                # honest cut count without claiming a file exists that
-                # doesn't.
-                trailer = _build_trailer(len(shown_hits), len(cut_hits), overflow_path)
-            else:
-                trailer = _build_trailer(len(shown_hits), 0)
-            # #2858 round 2 (Fix 1) — trailer is the FIRST line of this
-            # block, not the last: the harness truncates the TAIL of the
-            # whole additionalContext string, so a trailing trailer gets cut
-            # along with the nudges on exactly the large, heavily-capped
-            # captures this issue is about. _render_tripwire_block is the
-            # SAME function select_and_cap_hits's sizing loop used, so the
-            # format here cannot drift from what was actually measured
-            # against the ceiling.
-            parts.append(_render_tripwire_block(shown_hits, trailer))
+            # #2863 WS2 — render via the shared _hooklib.emit_context()
+            # helper instead of this hook's own former select_and_cap_hits/
+            # _render_tripwire_block/_build_trailer (removed above).
+            # `bullets` is the SAME ordered (most-specific-first) list of
+            # per-hit strings the old _render_tripwire_block used to build
+            # inline; emit_context() now owns the capping (which prefix
+            # fits under `target`) AND the trailer/header rendering in one
+            # call -- verified (see PR description) to select and render
+            # byte-identically to the old mechanism on this file's own test
+            # fixtures, including the always-show-at-least-one-hit case
+            # (allow_single_overflow=True reproduces that guarantee: the
+            # single most-important hit is still shown in full as long as
+            # it fits the harness's hard `budget`, only truncated in-band
+            # in the pathological case where even one hit alone exceeds
+            # that hard ceiling -- something the old mechanism had no
+            # protection against at all).
+            bullets = [_tripwire_bullet(h) for h in hits]
+
+            # emit_context() calls this ONLY with the item strings it
+            # itself decided to cut/truncate -- always either a trailing
+            # SUFFIX of `bullets` (the ordinary cut case), or, in the rare
+            # case where even the single most-important hit's own block
+            # exceeds the harness's hard budget, the ENTIRE list (that
+            # hit's own FULL untruncated text is included alongside the
+            # genuinely-cut rest, so nothing is unrecoverable -- see
+            # emit_context()'s own docstring, "Stage 3"). Reconstructed
+            # back to hit dicts BY POSITION (never by nudge-text VALUE,
+            # which could collide if two different hits happen to share
+            # identical nudge text) so write_tripwire_overflow()'s existing
+            # node_id-keyed on-disk format is preserved byte-for-byte.
+            cut_hits_holder: dict = {"cut": []}
+
+            def _tripwire_overflow_writer(items: list) -> str:
+                cut_n = len(items)
+                cut = hits[-cut_n:] if 0 < cut_n <= len(hits) else []
+                cut_hits_holder["cut"] = cut
+                return write_tripwire_overflow(cut) if cut else ""
+
+            budgets = get_harness_budgets(detect_harness())
+            parts.append(emit_context(
+                TRIPWIRE_HEADER,
+                bullets,
+                budget=budgets["budget"],
+                target=TRIPWIRE_BLOCK_CHAR_CEILING,
+                allow_single_overflow=True,
+                overflow_writer=_tripwire_overflow_writer,
+            ))
+
+            # shown_hits feeds render_triggered_principles below (Piece 3)
+            # — never the full, uncapped `hits`, so a "[triggered
+            # principles]" line never cites a lesson whose own nudge text
+            # was cut from the visible block. Derived from cut_hits_holder
+            # (set as a side effect of the emit_context() call above, via
+            # the overflow_writer): everything NOT cut is shown, except the
+            # pathological case above where the writer receives ALL hits
+            # (item 0's full text for recovery + the genuinely-cut rest) —
+            # there, item 0 is still "shown" (marker-truncated in-band, not
+            # dropped), so it is never left out of the principles section.
+            cut_hits = cut_hits_holder["cut"]
+            shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
+            if not shown_hits and hits:
+                shown_hits = hits[:1]
 
         # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
         # after the nudge block above and independently guarded: a failure
