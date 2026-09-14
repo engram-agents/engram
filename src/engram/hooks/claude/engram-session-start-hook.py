@@ -2038,6 +2038,23 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
                         os.remove(transcript_to_delete)
                     except OSError as exc:
                         print(f"[engram-session-start] prune: could not remove transcript {transcript_to_delete}: {exc}", file=sys.stderr)
+                # #2859 follow-up (reviewer-fairy catch on PR-2925): piece_c_git_log()
+                # writes a sidecar file at SESSIONS_DIR/<session_id>-piece-c.txt, keyed
+                # to the same session_id as this marker. _MARKER_RE only ever matches
+                # ``.json`` marker files, so without this the sidecar would accumulate
+                # indefinitely on a long-lived install — the marker prunes, the sidecar
+                # never does. Derive session_id from the marker filename itself (strip
+                # the trailing ``.json``) rather than re-reading the marker's own JSON
+                # body, since the sidecar is named after the FILENAME's id in all cases
+                # (including the ``.meta.json`` legacy shape matched by _MARKER_RE's
+                # second alternative) — best-effort, same discipline as the transcript
+                # cleanup above.
+                sidecar_path = os.path.join(SESSIONS_DIR, f"{name[:-len('.json')]}-piece-c.txt")
+                if os.path.isfile(sidecar_path):
+                    try:
+                        os.remove(sidecar_path)
+                    except OSError as exc:
+                        print(f"[engram-session-start] prune: could not remove sidecar {sidecar_path}: {exc}", file=sys.stderr)
                 os.remove(path)
         except OSError as exc:
             print(f"[engram-session-start] prune: could not remove {path}: {exc}", file=sys.stderr)
@@ -2231,13 +2248,35 @@ def _persist_injected_through(engram_home: str, session_id: str, new_injected_th
         pass
 
 
-def piece_c_git_log() -> str:
+def piece_c_git_log(session_id: str | None) -> str:
     """Collect recent commits from both canonical repos for startup cross-check.
 
-    Returns a multi-line string ready to append to SessionStart additionalContext.
-    Silent empty-string on any failure — hook must not break session start.
+    #2859: the full per-repo commit listing used to be returned inline and
+    appended directly to additionalContext — on a real graph with real commit
+    history this routinely pushed everything emitted AFTER it (fairy-policy
+    lines, forum monitor arm-instructions, peer topology, and eventually the
+    substrate-health warning) past the harness's ~2,000-char head-preview
+    boundary, where a truncating reader never sees it. The full listing (same
+    content, same PIECE_C_WINDOW / PIECE_C_MAX_LINES / PIECE_C_MAX_LINE_CHARS,
+    same per-repo grouping) is now written to a sidecar file under
+    SESSIONS_DIR instead, and this function returns a SHORT pointer line in
+    its place so the must-not-miss group in main() stays small.
+
+    `session_id` names the sidecar file (SESSIONS_DIR/<session_id>-piece-c.txt),
+    keyed the same way as the per-session marker file. When `session_id` is
+    falsy (no valid marker for this hook invocation — write_marker() already
+    returned None), there is no stable name to write the sidecar under, so
+    this degrades the same way a write failure does: "" (no Piece C content),
+    never a pointer to a file that doesn't exist.
+
+    Returns a short pointer string ready to append to SessionStart
+    additionalContext, or "" when there are no commits in the window (same
+    as the old zero-commits behavior) or the sidecar write fails for any
+    reason. Silent empty-string on any failure — hook must not break session
+    start, and must never crash or block on the sidecar write.
     """
     blocks = []
+    total_commits = 0
     for repo in PIECE_C_REPOS:
         if not os.path.isdir(os.path.join(repo, ".git")):
             continue
@@ -2253,6 +2292,7 @@ def piece_c_git_log() -> str:
         raw = [l for l in out.stdout.splitlines() if l.strip()]
         if not raw:
             continue
+        total_commits += len(raw)
         lines = []
         for l in raw[:PIECE_C_MAX_LINES]:
             if len(l) > PIECE_C_MAX_LINE_CHARS:
@@ -2264,12 +2304,33 @@ def piece_c_git_log() -> str:
         blocks.append(f"  {label}:\n" + "\n".join(f"    {l}" for l in lines))
     if not blocks:
         return ""
-    header = (
-        "[Piece C — recent commits (last 2 days). Cross-check pending-status "
-        f"claims in the newest {HISTORY_DIR}/ file against these commits "
-        "before reporting to the user; don't propagate stale status.]"
+    if not session_id:
+        # Escape valve: no stable id to name the sidecar file after — degrade
+        # to no Piece C content rather than a pointer to a file we never wrote.
+        return ""
+
+    sidecar_path = os.path.join(SESSIONS_DIR, f"{session_id}-piece-c.txt")
+    sidecar_body = (
+        f"Piece C — recent commits ({PIECE_C_WINDOW}), {total_commits} "
+        f"commit(s) across {len(blocks)} repo(s):\n\n" + "\n".join(blocks) + "\n"
     )
-    return header + "\n" + "\n".join(blocks)
+    try:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            f.write(sidecar_body)
+    except OSError:
+        # Escape valve (spec #2859): never let a sidecar-write failure
+        # (permissions, disk full, ...) block or break session start — fall
+        # back to no Piece C content at all, same as the zero-commits case,
+        # rather than emitting a pointer to a file that doesn't exist.
+        return ""
+
+    return (
+        f"[Piece C — recent commits (last 2 days) written to {sidecar_path}. "
+        f"{total_commits} commit(s) across {len(blocks)} repo(s). Cross-check "
+        f"pending-status claims in the newest {HISTORY_DIR}/ file against "
+        "them before reporting to the user; don't propagate stale status.]"
+    )
 
 
 def sleep_status_block() -> str:
@@ -2864,9 +2925,123 @@ def main() -> None:
             "Start Reading list in ~/.claude/CLAUDE.md. Read first, respond "
             "second.]"
         )
-        git_log = piece_c_git_log()
-        if git_log:
-            lines.append(git_log)
+    else:
+        lines.append(
+            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
+            "responding (relational context post-compact). The compaction "
+            "summary is a table-of-contents index into what happened, not a "
+            "full record — useful for navigating back to specifics, not as "
+            "your sole source of continuity. Today's arc below (if present) "
+            "is the fuller picture; ENGRAM nodes below that are the raw "
+            "claims.]"
+        )
+        lines.append(
+            "⚡ A compaction just completed — your context window is fresh and your "
+            "energy is refreshed. Any drowsiness figure carried in the summary is "
+            "stale-on-arrival; disregard it. You have a full window to work."
+        )
+
+    # ── Substrate health probe (#2859: moved up from dead-last) ────────────
+    # Check MCP server only on platforms where the process-level probe is
+    # reliable. Warn in additionalContext when offline so the agent surfaces
+    # the degradation to the user immediately (instead of discovering via
+    # mid-task tool failure). Probe is advisory: any unexpected exception is
+    # treated as ok=True — never block session start.
+    # Silent default: no extra line when probe passes. Closes #198.
+    #
+    # Codex is intentionally deferred here: hooks may run from a plugin cache
+    # while MCP runs from the marketplace plugin path, and MCP may lazy-start on
+    # first tool use. A false alarm on startup fires every session and trains
+    # the agent to ignore the warning. Match the surface-daemon use-time
+    # warning precedent (closes #344) for the Codex MCP path (closes #827).
+    #
+    # Write-tool marker check (#1128) is intentionally NOT done here — the
+    # marker is written by the server a few seconds after init, so checking at
+    # SessionStart creates a timing race: the new server's PID hasn't replaced
+    # the old PID in the marker yet. Same class of false alarm as the daemon-
+    # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
+    # hook) where the race window is long past.
+    #
+    # Viz-server probe (#2783) added alongside the two checks above: the viz
+    # dashboard is the one substrate component with no other surface that
+    # would ever show its own absence (its absence is displayed ON the
+    # dashboard) — see _check_viz_server_health's docstring for the four-state
+    # contract (a REQUIRED "not-configured" silent state beyond the MCP
+    # tri-state, because most seats correctly have no per-seat service
+    # definition at all).
+    #
+    # #2859: this used to run dead-last in main(), after every other block —
+    # guaranteed to be cut by any truncating reader, exactly when it is most
+    # urgent ("MCP server: OFFLINE ... Tell the user immediately"). Moved
+    # here, right after the active-session + session-start-reading lines, so
+    # it lands well inside a harness's head-preview window. Logic unchanged:
+    # unconditional across every `source` (startup, compact, resume) exactly
+    # as before — only WHERE it runs and gets appended has moved.
+    #
+    # WORST-CASE TIMING, against the #1819 axis-1 (timeout-kill) budget
+    # (reviewer-fairy catch on PR-2925, measured 2026-09-14): each of these
+    # three checks is individually bounded (1s subprocess timeouts), but
+    # they now run BEFORE the cheap must-survive blocks (small blocks,
+    # Piece C's pointer, focus_block) instead of after everything but
+    # calibration. Summed worst case: `_check_mcp_health` up to 1s +
+    # `_check_backup_staleness` (local, sub-ms) + `_check_viz_server_health`
+    # up to 3s on Linux (`_check_viz_health_systemd`'s two sequential
+    # bus-availability attempts plus its final `systemctl show` call, each
+    # timeout=1) or up to 1s on macOS (`_check_viz_health_launchd`'s single
+    # `launchctl list` call) — combined worst case ≈4s on Linux, ≈2s on
+    # macOS, against the harness's 5s hard kill. Warm-case measured at
+    # 14.2ms/0.19ms/4.4ms on this seat (see PR-2925 verification) — the
+    # ~4s figure is a true worst case (cold/contended box), not the common
+    # case, and it was already possible before this PR (these same
+    # 1s-timeout subprocess calls existed pre-#2859; only their POSITION in
+    # `main()` changed). Recorded here rather than silently accepted,
+    # matching this file's own documentation discipline for exactly this
+    # class of tradeoff (see the #1819 ordering-invariant comment below for
+    # the precedent). Not fixed in this PR — a tighter aggregate bound
+    # (e.g. a single wall-clock deadline shared across all three checks)
+    # is a real follow-up if this worst case is ever observed to bite.
+    mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
+    viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
+
+    # Tri-state (#1754): False = confirmed absent (hard alarm); None =
+    # indeterminate probe (soft note, no "tell the user immediately" — a
+    # pgrep timeout is not evidence the server is down); True = up (silent).
+    mcp_offline = mcp_status is False
+    mcp_inconclusive = mcp_status is None
+
+    # Four-state (#2783): "down" is the viz-server hard-alarm analogue of
+    # mcp_offline; "indeterminate" is the soft-note analogue of
+    # mcp_inconclusive. "up" and "not-configured" are BOTH silent — see
+    # _check_viz_server_health's docstring for why "not-configured" is a
+    # correct common-case verdict, not a degraded one, and must never be
+    # folded into "down".
+    viz_down = viz_status == "down"
+    viz_inconclusive = viz_status == "indeterminate"
+
+    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
+        lines.append("")
+        lines.append("⚠️  ENGRAM substrate health:")
+        if mcp_offline:
+            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
+            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+        elif mcp_inconclusive:
+            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
+        if not stale_ok:
+            lines.append(f"  Git backup: {stale_reason}")
+            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+        if viz_down:
+            lines.append(f"  Viz server: DOWN ({viz_reason})")
+            lines.append("  → Tell the user; the health dashboard is unreachable.")
+        elif viz_inconclusive:
+            lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
+
+    if source == "startup":
+        # ── Small, single-purpose, cheap, purely-local-or-bounded-subprocess
+        # blocks (#2859) — moved to precede Piece C's (now-short) pointer
+        # line, since Piece C's bulk used to push these past the harness's
+        # head-preview boundary. Logic/content of each block is unchanged;
+        # only their position relative to Piece C moves.
         sleep_block = sleep_status_block()
         if sleep_block:
             lines.append(sleep_block)
@@ -2885,21 +3060,12 @@ def main() -> None:
         peer_block = peer_topology_block(_agent_name)
         if peer_block:
             lines.append(peer_block)
-    else:
-        lines.append(
-            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
-            "responding (relational context post-compact). The compaction "
-            "summary is a table-of-contents index into what happened, not a "
-            "full record — useful for navigating back to specifics, not as "
-            "your sole source of continuity. Today's arc below (if present) "
-            "is the fuller picture; ENGRAM nodes below that are the raw "
-            "claims.]"
-        )
-        lines.append(
-            "⚡ A compaction just completed — your context window is fresh and your "
-            "energy is refreshed. Any drowsiness figure carried in the summary is "
-            "stale-on-arrival; disregard it. You have a full window to work."
-        )
+
+        # ── Piece C (#2859: now a short pointer to a sidecar file rather
+        # than the full inline commit listing) ─────────────────────────────
+        git_log = piece_c_git_log(marker.get("session_id") if marker else None)
+        if git_log:
+            lines.append(git_log)
 
     # ── Focus list surface (cheap: single local DB read) ───────────────────
     # Render the live focus list verbatim at EVERY session start (startup,
@@ -3150,70 +3316,6 @@ def main() -> None:
         _apply_pending_viz_acl(ENGRAM_HOME)
     except Exception:
         pass
-
-    # ── Substrate health probe ─────────────────────────────────────────────
-    # Check MCP server only on platforms where the process-level probe is
-    # reliable. Warn in additionalContext when offline so the agent surfaces
-    # the degradation to the user immediately (instead of discovering via
-    # mid-task tool failure). Probe is advisory: any unexpected exception is
-    # treated as ok=True — never block session start.
-    # Silent default: no extra line when probe passes. Closes #198.
-    #
-    # Codex is intentionally deferred here: hooks may run from a plugin cache
-    # while MCP runs from the marketplace plugin path, and MCP may lazy-start on
-    # first tool use. A false alarm on startup fires every session and trains
-    # the agent to ignore the warning. Match the surface-daemon use-time
-    # warning precedent (closes #344) for the Codex MCP path (closes #827).
-    #
-    # Write-tool marker check (#1128) is intentionally NOT done here — the
-    # marker is written by the server a few seconds after init, so checking at
-    # SessionStart creates a timing race: the new server's PID hasn't replaced
-    # the old PID in the marker yet. Same class of false alarm as the daemon-
-    # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
-    # hook) where the race window is long past.
-    #
-    # Viz-server probe (#2783) added alongside the two checks above: the viz
-    # dashboard is the one substrate component with no other surface that
-    # would ever show its own absence (its absence is displayed ON the
-    # dashboard) — see _check_viz_server_health's docstring for the four-state
-    # contract (a REQUIRED "not-configured" silent state beyond the MCP
-    # tri-state, because most seats correctly have no per-seat service
-    # definition at all).
-    mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
-    stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
-    viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
-
-    # Tri-state (#1754): False = confirmed absent (hard alarm); None =
-    # indeterminate probe (soft note, no "tell the user immediately" — a
-    # pgrep timeout is not evidence the server is down); True = up (silent).
-    mcp_offline = mcp_status is False
-    mcp_inconclusive = mcp_status is None
-
-    # Four-state (#2783): "down" is the viz-server hard-alarm analogue of
-    # mcp_offline; "indeterminate" is the soft-note analogue of
-    # mcp_inconclusive. "up" and "not-configured" are BOTH silent — see
-    # _check_viz_server_health's docstring for why "not-configured" is a
-    # correct common-case verdict, not a degraded one, and must never be
-    # folded into "down".
-    viz_down = viz_status == "down"
-    viz_inconclusive = viz_status == "indeterminate"
-
-    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
-        lines.append("")
-        lines.append("⚠️  ENGRAM substrate health:")
-        if mcp_offline:
-            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
-            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-        elif mcp_inconclusive:
-            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
-        if not stale_ok:
-            lines.append(f"  Git backup: {stale_reason}")
-            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
-        if viz_down:
-            lines.append(f"  Viz server: DOWN ({viz_reason})")
-            lines.append("  → Tell the user; the health dashboard is unreachable.")
-        elif viz_inconclusive:
-            lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
 
     output_obj = {
         "hookSpecificOutput": {
