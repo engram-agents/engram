@@ -1644,7 +1644,7 @@ def create_app(
     def api_project_init():
         """Create a new project baton.
 
-        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?}
+        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?, colleague?}
         ``participants`` may be a list of strings OR a comma-separated string.
         Response: {seq, project_id}, 201.
         Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
@@ -1670,6 +1670,7 @@ def create_app(
         turn = (data.get("turn") or "").strip().lower()
         turn_reason = (data.get("turn_reason") or "").strip()
         github = (data.get("github") or "").strip() or None
+        colleague = (data.get("colleague") or "").strip() or None
 
         raw_parts = data.get("participants") or []
         if isinstance(raw_parts, str):
@@ -1685,7 +1686,7 @@ def create_app(
                 store, allocator, project_id,
                 title=title, status=status, turn=turn,
                 participants=participants, turn_reason=turn_reason,
-                by_agent=agent, github=github,
+                by_agent=agent, github=github, colleague=colleague,
             )
         except ProjectAlreadyExists:
             return jsonify({"error": f"project already exists: {project_id}"}), 409
@@ -1955,6 +1956,58 @@ def create_app(
             return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
 
         return jsonify({"seq": seq, "added": added}), 201
+
+    @app.route("/api/projects/<pid>/colleague", methods=["POST"])
+    def api_project_set_colleague(pid: str):
+        """Set or change the colleague: field on a project baton (#2764).
+
+        JSON body: {agent, colleague}
+        ``agent`` is the agent performing the set — server-side authorization
+        requires ``agent`` to already be a current participant OR the
+        baton's current turn holder (LOAD-BEARING: lives in the coordination
+        write-fn, not here, so it can't be bypassed by a direct API call).
+        ``colleague`` is the agent being named; also added to ``participants``
+        (dedup) in the same atomic write.
+        Response: {seq, participant_added}, 201.
+        Errors: 400 (missing/invalid fields), 403 (agent not authorized),
+                404 (project not found), 503 (store not configured).
+        """
+        from forum.coordination import (
+            set_colleague as _set_colleague,
+            NotAParticipant,
+            ProjectNotFound,
+        )
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        colleague = (data.get("colleague") or "").strip().lower()
+        if not colleague or not db.is_valid_agent_name(colleague):
+            return jsonify({"error": f"invalid colleague name {colleague!r}"}), 400
+
+        try:
+            seq, participant_added = _set_colleague(
+                store, allocator, pid, agent=agent, colleague=colleague,
+            )
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({
+                "error": f"agent {agent!r} must be a participant or the "
+                         f"current turn holder of {pid} to set colleague",
+            }), 403
+
+        return jsonify({"seq": seq, "participant_added": participant_added}), 201
 
     @app.route("/api/projects/<pid>/gc", methods=["POST"])
     def api_project_gc(pid: str):

@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KG Memory Visualizer</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <link rel="stylesheet" href="/static/base.css">
+  <link rel="stylesheet" href="/static/graph.css">
+</head>
+<body>
+
+<!-- ── Top nav ──────────────────────────────────────────────────────── -->
+<!--NAV_PLACEHOLDER-->
+
+<!-- ── Content row ──────────────────────────────────────────────────── -->
+<div id="content-row">
+
+<!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+<div id="sidebar">
+  <header>
+    ENGRAM Visualizer
+    <small id="db-path-label"></small>
+  </header>
+
+  <div class="section">
+    <div id="status-line"><span id="stat-nodes">—</span></div>
+    <div id="new-nodes-indicator"></div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <div class="btn" id="refresh-btn">↻ Refresh</div>
+      <label class="toggle" style="margin:0">
+        <input type="checkbox" id="auto-refresh-cb" checked />
+        Auto (10s)
+      </label>
+    </div>
+    <div id="last-refresh" style="font-size:10px;color:#556;margin-top:6px;"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Find node</div>
+    <div id="search-box">
+      <input type="text" id="search-input" placeholder="e.g. dv_NNNN" spellcheck="false" />
+      <div class="btn" id="search-btn">Go</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Semantic search</div>
+    <div id="semantic-search-box">
+      <input type="text" id="semantic-search-input" placeholder="e.g. calibration uncertainty" spellcheck="false" />
+      <div class="btn" id="semantic-search-btn">Search</div>
+    </div>
+    <div id="semantic-search-results" style="display:none;margin-top:8px;"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Options</div>
+    <label class="toggle">
+      <input type="checkbox" id="show-superseded-cb" />
+      Show superseded / retracted
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="show-labels-cb" checked />
+      Show labels
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="show-tier-opacity-cb" checked />
+      Tier opacity
+    </label>
+    <label class="toggle">
+      <input type="checkbox" id="show-full-graph-cb" />
+      Show full graph
+    </label>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Node types</div>
+    <div id="type-filters"></div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Edge relations</div>
+    <div id="edge-legend"></div>
+  </div>
+
+  <div class="section" id="stats-section">
+    <div class="section-title">Graph stats</div>
+    <div id="stats-detail"></div>
+  </div>
+</div>
+
+<!-- ── Graph ────────────────────────────────────────────────────────── -->
+<div id="main">
+  <div id="empty-msg">No data yet — start the MCP server and add some nodes.</div>
+  <svg id="graph-svg"></svg>
+</div>
+
+<!-- ── Detail panel ──────────────────────────────────────────────────── -->
+<div id="detail-panel">
+  <div id="detail-header">
+    <div>
+      <div class="node-id" id="detail-id"></div>
+      <span class="node-type-badge" id="detail-type-badge"></span>
+    </div>
+    <div id="close-detail">✕</div>
+  </div>
+  <div id="detail-body"></div>
+</div>
+
+</div><!-- /#content-row -->
+
+<!-- ── Tooltip ───────────────────────────────────────────────────────── -->
+<div id="tooltip"></div>
+
+<script src="/static/graph.js"></script>
+<script src="/static/graph-agent-select.js"></script>
+<!--FOOTER_PLACEHOLDER-->
+</body>
+</html>

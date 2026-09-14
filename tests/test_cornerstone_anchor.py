@@ -39,7 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
-sys.path.insert(0, str(SRC_ENGRAM))
+sys.path.append(str(SRC_ENGRAM))  # #2565: append, not insert(0)
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_cornerstone_anchor_")
 atexit.register(lambda: shutil.rmtree(TEST_DIR, ignore_errors=True))

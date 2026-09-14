@@ -31,7 +31,7 @@ the layered-sidecar design Lei + Borges agreed on 2026-05-04:
 
 ```
 engram-alpha/
-├── server.py, engram_*.py, viz_server.py    # engine — agent-agnostic
+├── server.py, engram_*.py, viz/             # engine — agent-agnostic
 ├── tools/                                   # shared utilities + build-plugin.sh
 ├── hooks/
 │   └── claude/  ← Claude Code hooks (transcript paths + event JSON)
@@ -184,7 +184,7 @@ Three test surfaces, in order of preference:
 >
 > **Two cases this helper is deliberately WRONG for.** Both exist in this repo, both are correct as they stand, and unifying them would reintroduce a real incident:
 >
-> - **A writer that does not own the file.** `os.replace()` swaps in the temp file's inode, carrying the *writer's* UID and mkstemp's `0600`. `viz_server.py` writes an agent's `config.json` while possibly running as a different UID; renaming there strips the agent's ownership of its own config and locks it out (#372). It copies into the existing inode instead and covers the lost crash-atomicity with backup + read-after-write + rollback.
+> - **A writer that does not own the file.** `os.replace()` swaps in the temp file's inode, carrying the *writer's* UID and mkstemp's `0600`. `viz/data/config.py`'s `write_config_key` writes an agent's `config.json` while possibly running as a different UID; renaming there strips the agent's ownership of its own config and locks it out (#372). It copies into the existing inode instead and covers the lost crash-atomicity with backup + read-after-write + rollback.
 > - **A file that must be readable by others.** `mkstemp` creates `0600`. `forum/coordination/store_file.py` chmods `0644` before the rename because the store is read by other agents.
 >
 > If your write matches either shape, do not use this helper — and say why at the call site, as those two do.
@@ -372,34 +372,64 @@ Substitution shape:
 | `ob_NNNN captured this` (provenance breadcrumb) | drop, OR "an earlier capture of this" if context demands |
 | Cross-references inside narrative docs | replace with the concept, not a graph pointer |
 
-### Enforcement (reviewer-discipline; CI temporarily disabled)
+### Enforcement (CI-backed)
 
-This rule is currently enforced by **reviewer discipline + local testing**,
-not CI. (The repo's GitHub Actions billing is paused 2026-05-30; full tests
-run locally before each PR push instead.) When CI is re-enabled, a
-diff-grep workflow on PRs to `dev`/`main` is the intended structural
-backstop; until then, the reviewer-fairy and counterpart-colleague layers
-catch new additions. The 2026-05-30 scrub wave (issue #51, ten incremental
-PRs) cleared the alpha-released-scope corpus; new PRs should not introduce
-new concrete IDs in shipped files.
+This rule is enforced by CI: the **`no-new-shipped-node-ids`** step (step 2)
+of `.github/workflows/pr-checks.yml`, which runs on every `pull_request`
+event (opened/reopened/synchronize/edited, with no base-branch filter — it
+fires on PRs targeting `dev`, `main`, or any stacked intermediate branch).
+The step diffs the PR against its base branch, excludes the allowlisted
+non-citation surfaces (test fixtures, scratch/drafting dirs, and the process
+docs where node IDs are load-bearing author-graph provenance — see the
+allowlist-rationale comment in the workflow for the per-path reasoning), and
+hard-fails the job if any added line introduces a new concrete node ID
+outside that allowlist. Reviewer discipline and local testing remain useful
+as a pre-push check, but the mechanical gate is what actually blocks a PR
+from merging — it is live, not merely intended. The 2026-05-30 scrub wave
+(issue #51, ten incremental PRs) cleared the alpha-released-scope corpus
+before the gate shipped; new PRs should not introduce new concrete IDs in
+shipped files.
 
-To check your own PR locally before pushing:
+To check your own PR locally before pushing — this snippet must match the
+workflow's own `EXCLUDES` array exactly (checked 2026-09-06, engram-alpha
+#2626: it had drifted, missing 5 entries and one path was wrong in a way
+that made the local check *stricter* than CI, i.e. false alarms rather
+than missed leaks):
 
 ```bash
 git diff --no-color "origin/dev...HEAD" -- \
-  ':(exclude)tests/' ':(exclude)paper_draft/' ':(exclude)active-work/' \
-  ':(exclude)README.md' ':(exclude)CHANGELOG.md' \
+  ':(exclude)tests/' ':(exclude)src/forum/tests/' ':(exclude)paper_draft/' \
+  ':(exclude)active-work/' ':(exclude)docs/cycle/' ':(exclude)docs/handbook/' \
+  ':(exclude)README.md' ':(exclude)docs/CHANGELOG.md' \
+  ':(exclude).github/workflows/pr-checks.yml' ':(exclude)src/engram/engram_ids.py' \
   | grep -E '^\+[^+].*\b[a-z]{2}_[0-9]{4,}\b' && echo "FAIL: new node-ID references introduced" || echo "PASS: no new node-IDs"
 ```
 
-**Allowlisted paths** (intentional exceptions):
+**Allowlisted paths** (intentional exceptions — kept in sync with the
+workflow's own `EXCLUDES` comment block; if you change one, change both):
 
-- `tests/` — fixture IDs are part of test scenarios, not citations.
-- `paper_draft/`, `active-work/` — non-shipped surfaces.
+- `tests/`, `src/forum/tests/` — fixture IDs are part of test scenarios,
+  not citations.
+- `paper_draft/`, `active-work/` — non-shipped surfaces. (`paper_draft/`
+  has no git history and no `.gitignore` entry as of 2026-09-06 — possibly
+  a named-but-unused convention; harmless to the gate either way, since an
+  exclude pathspec for a nonexistent directory is a no-op.)
+- `docs/cycle/` — self-improvement-cycle process docs (charter, chronicle,
+  review packages, dream-pass protocol); node IDs are load-bearing
+  provenance there by design, and `build-plugin.sh` does not bundle it.
+- `docs/handbook/` — dev-internal developer handbook (accuracy-pass
+  reference docs); same rationale as `docs/cycle/` — node IDs are
+  load-bearing provenance and the build engine doesn't bundle `docs/`.
 - `README.md` — documents the seed-graph IDs (the ones present in
   **every** install, listed there as the install-state mapping); these
   are install state, not developer citations.
-- `CHANGELOG.md` — historical record; scrub deferred (low-priority).
+- `docs/CHANGELOG.md` — historical record; scrub deferred (low-priority).
+  (There is no top-level `CHANGELOG.md` — the real file lives at
+  `docs/CHANGELOG.md`; a bare `CHANGELOG.md` exclude entry excludes
+  nothing.)
+- `.github/workflows/pr-checks.yml` — the workflow file itself contains
+  the pattern literally.
+- `src/engram/engram_ids.py` — see "Schema-illustration exception" below.
 
 **Schema-illustration exception** (the small carve-out the scrub wave
 surfaced):

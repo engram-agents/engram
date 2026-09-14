@@ -110,16 +110,17 @@ def _api_get_raw(client, project_id):
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
 
-def _require_multi_agent(config=None) -> None:
-    """Exit with EXIT_STATE if not in multi-agent mode.
+def _require_forum(config=None) -> None:
+    """Exit with EXIT_STATE if no forum is configured.
 
-    Write commands call this guard at entry. Single-agent installs that
-    run a write command get a clear actionable message rather than an
-    obscure API error.
+    Write commands call this guard at entry. Installs with no forum
+    configured that run a write command get a clear actionable message
+    rather than an obscure API error.
     """
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         print(
-            "baton: this host is in single-agent mode; baton is multi-agent-only.",
+            "baton: no forum configured (set forum.url or agent_name in "
+            "config.json); baton requires a configured forum.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -176,11 +177,19 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
-    """True if config.json mode == 'multi' (mirrors ia.py / the engram hook helper)."""
+def _is_forum_configured(config: Optional[dict] = None) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Gates write commands: if neither forum.url nor agent_name is in config,
+    baton refuses with an actionable message. Mirrors ia.py / the engram hook
+    helper.
+    """
     if config is None:
         config = _load_config()
-    return config.get("mode", "single") == "multi"
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 # ---------------------------------------------------------------------------
@@ -629,7 +638,7 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     err = _validate_project_id(project_id)
@@ -760,25 +769,31 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # merge, days or weeks after the person who could trivially have avoided
     # it has moved on.
     #
-    # WARN, deliberately, rather than refuse -- and the reason is worth
-    # recording because my first draft of this fix DID refuse:
+    # REFUSE, not warn. This shipped first as a WARN because a first-draft
+    # REFUSE broke 8 existing tests -- including
+    # test_init_auto_derives_bare_anchor_from_pr_project_id, which exists
+    # specifically to PIN bare auto-derivation as intended #1715 behavior.
+    # Flipping a pinned contract is a team decision, not a follow-up's to
+    # make unilaterally, so #1924 carried that governance question forward
+    # rather than deciding it here.
     #
-    #   * Refusing breaks the plainest invocation there is
-    #     (`baton init PR-1234 --title ... --participants ...`), which is what
-    #     every agent and script on this host actually types. Seven existing
-    #     tests failed on it.
-    #   * One of those, test_init_auto_derives_bare_anchor_from_pr_project_id,
-    #     exists specifically to PIN bare auto-derivation as intended #1715
-    #     behavior. Flipping a pinned contract is a team decision, not a
-    #     follow-up's to make unilaterally. #1924 carries that question.
+    # That question is now SETTLED (forum #411, 2026-09-13, Kepler ruling
+    # with Aleph as design owner): REFUSE, not warn -- flip the #1715-pinned
+    # contract deliberately as part of accepting this fix.
     #
-    # A creation-time warning is also better targeted than I first argued.
-    # I had reasoned by analogy to cmd_flip's stderr warning, which reaches
-    # the flipping agent while the consequence lands on the maintainer -- but
-    # that analogy is wrong here. At init the author IS the party who can fix
-    # it, holds the missing flag right now, and is the only one who knows
-    # which repo is meant. The displaced-consequence problem is precisely what
-    # warning HERE (rather than only refusing later, at merge) removes.
+    # The ruling is narrow: require an explicit --repo or refuse, with NO
+    # cwd-inference of any kind. An earlier draft of the ruling proposed
+    # resolving the repo from the checkout's git `origin` remote when
+    # unambiguous; that was proposed, examined, and explicitly withdrawn
+    # (#1918: there is NO default repo, deliberately -- do not revisit). A
+    # cwd-inferred anchor is confidently wrong and fully qualified rather
+    # than merely unresolvable: minting a UMWELT-PR-<N> baton from inside
+    # a checkout of THIS project's own public repo would silently produce
+    # pr/engram-agents/engram/<N>, a DIFFERENT repo's PR of the same
+    # number, which passes every downstream gate silently -- worse than the
+    # bare-anchor bug this section fixes, which at least gets refused loudly
+    # by gc/flip/merge. There is no cwd-inference anywhere in this function,
+    # deliberately.
     #
     # Scope note: fires only when an anchor RESOLVES TO A PR and is
     # unqualified. A baton with no github anchor at all (a DESIGN-* project,
@@ -791,17 +806,16 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         _n = _final_anchor[2]
         _derived = repo_arg is None and not getattr(args, "github", None)
         print(
-            f"baton init: warning: '{project_id}' is being created with the "
+            f"baton init: refusing to create '{project_id}' with the "
             f"unqualified PR anchor 'pr/{_n}'"
             + (" (auto-derived from the project id)" if _derived else "")
-            + " -- there is no default repo (#1918), so gc/flip/merge will all "
-            "REFUSE this baton later. Qualify it now:\n"
+            + " -- there is no default repo (#1918), so gc/flip/merge would "
+            "all refuse this baton later. Qualify it now:\n"
             f"    baton init {project_id} ... --repo <owner>/<repo>\n"
-            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}\n"
-            f"  or fix it after the fact:\n"
-            f"    baton anchor {project_id} --github pr/<owner>/<repo>/{_n}",
+            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}",
             file=sys.stderr,
         )
+        sys.exit(EXIT_VALIDATION)
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
@@ -816,6 +830,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             "turn_reason": init_reason,
             "github": github_anchor,
             "participants": participants,
+            "colleague": colleague_name,
         })
     except ForumNetworkError as e:
         print(f"baton init: {e}", file=sys.stderr)
@@ -865,7 +880,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     to_agent = args.to.strip().lower()
@@ -927,23 +942,39 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     _flip_force = args.force
     _parsed_anchor = _parse_github_anchor(github_anchor)
     _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
-    if _pr_anchor_match and _is_pool_sentinel(to_agent) and _parsed_anchor[1] is None:
-        # #1918: unqualified pr/<N> anchor -- there is no default repo to
-        # guess against. Skip CI/approval/colleague verification entirely
-        # rather than querying a possibly-wrong repo (the old
-        # DEFAULT_GITHUB_REPO fallback here could false-block a legitimate
-        # flip, or worse, false-pass one against an unrelated same-numbered
-        # PR). Same "cannot verify, proceed with a warning" shape already
-        # used below for a genuine gh-query failure, just triggered before
-        # any gh call is made at all.
+    # #2912: hoisted here (was previously computed only later, inside the
+    # no_approval branch) so both call sites below -- the unqualified-anchor
+    # refusal and the main CI/approval/colleague gate -- can call
+    # _is_maintainer_flip, which needs to know who currently holds the baton
+    # and who the registered colleague is. Same fields.get("turn", ...) read
+    # _current_holder used at its old, later site (now reusing this value
+    # instead of recomputing); nothing mutates `fields` in between.
+    _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+    _colleague_name = fields.get("colleague", "").strip().lower()
+    if _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name) and _parsed_anchor[1] is None:
+        # #1918/#2511: unqualified pr/<N> anchor -- there is no default repo
+        # to guess against. A flip-to-the-pool-sentinel IS the merge-readiness
+        # signal the maintainer trusts (CLAUDE.md's baton-tracked
+        # merge-readiness convention) -- skipping the CI/approval/colleague
+        # gates here and merely warning left the artifact indistinguishable
+        # from one whose gates actually ran and passed, which is worse than
+        # refusing outright. REFUSE, matching the same repo-qualification
+        # gate cmd_merge already enforces (see its "refusing to guess which
+        # repo" comment) -- and matching what the header comment, the #1918
+        # note, and the `baton init` warning text have promised all along.
+        # This is not skippable with --force -- --force skips CI/approval
+        # QUALITY gates, it has never meant "proceed without knowing which
+        # repo," and this gate does not change that contract.
         print(
-            f"warning: baton flip: PR anchor 'pr/{_parsed_anchor[2]}' is not "
-            "repo-qualified — skipping CI/approval/colleague verification "
-            "(no default repo to guess against). Anchor it first: "
-            f"baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}",
+            f"baton flip: '{project_id}' has no repo-qualified github anchor "
+            f"-- refusing to guess which repo's PR #{_parsed_anchor[2]} to "
+            "verify CI/approval/colleague state against. Run "
+            f"'baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}' "
+            "first. This is not skippable with --force.",
             file=sys.stderr,
         )
-    elif _pr_anchor_match and _is_pool_sentinel(to_agent):
+        sys.exit(EXIT_VALIDATION)
+    elif _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name):
         _pr_num = _parsed_anchor[2]
         _pr_repo = _parsed_anchor[1]
         _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
@@ -1006,8 +1037,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             # the participants list (single-agent mode / no counterpart), warn
             # and proceed — per CLAUDE.md the colleague layer collapses when no
             # counterpart exists ("don't block on a colleague review that has
-            # no one to perform it").
-            _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+            # no one to perform it").  _current_holder was hoisted above
+            # (#2912) so _is_maintainer_flip could use it too; reused here
+            # rather than recomputed.
             _sentinel = _pool_sentinel()
             _colleague_participants = [
                 p for p in participants
@@ -1140,6 +1172,37 @@ def _is_pool_sentinel(name: str) -> bool:
     return bool(first_token) and name == first_token
 
 
+def _is_maintainer_flip(to_agent: str, current_holder: str, colleague_name: str) -> bool:
+    """True when flipping the baton to `to_agent` represents presenting
+    the PR for MERGE (to the maintainer) — the point where CI-green,
+    approval-freshness, and colleague-approval-existence must all hold —
+    as opposed to a review-stage flip (to the registered colleague, who
+    has not reviewed yet) or a self-flip (still working on it, no
+    merge-readiness claim being made).
+
+    Fires on:
+      - the literal pool sentinel (the single-human-owner convention
+        `_is_pool_sentinel` already recognizes), OR
+      - any OTHER agent — this repo's actual convention is to flip to a
+        NAMED maintainer agent (e.g. "ariadne", "borges"), not the literal
+        sentinel — PROVIDED it is not a self-flip and not the flip TO the
+        registered colleague (that flip is the "please review" signal,
+        not "ready to merge", and firing CI/approval checks on it would
+        be premature — the colleague hasn't reviewed yet).
+
+    Caller guarantees `to_agent` is already either the pool sentinel or a
+    genuine registered participant (validated earlier in cmd_flip) — this
+    function does not re-validate participant membership.
+    """
+    if _is_pool_sentinel(to_agent):
+        return True
+    if to_agent == current_holder:
+        return False
+    if colleague_name and to_agent == colleague_name:
+        return False
+    return True
+
+
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Claim a Project-layer baton from the pool.
 
@@ -1148,7 +1211,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     turn == pool sentinel (the install's primary_user); refuses to steal from
     another agent.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
 
@@ -1236,7 +1299,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
     restricted to the current holder (only you can release what you hold).
     With --done, also appends '(done)' to the project title (idempotent).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     mark_done = args.done
@@ -1312,7 +1375,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
 # ---------------------------------------------------------------------------
 
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1371,7 +1434,7 @@ def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1391,7 +1454,7 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1459,7 +1522,7 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: 
     Inverse of cmd_close. Only operates on batons with status: merged or
     cancelled. Refuses if the baton is already in a non-closed status.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1535,7 +1598,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     loop-start to drain the backlog of merged/closed PR-batons that the
     hook cannot reach (uncached anchors).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     if not shutil.which("gh"):
         print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
@@ -1651,7 +1714,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
 # ---------------------------------------------------------------------------
 
 def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_title = args.title
@@ -1729,7 +1792,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
     exists, parseable frontmatter), then delegates the write to the forum
     API via client.post.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     github_anchor = args.github.strip().lower()
@@ -1790,7 +1853,7 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
     server-side (add_participant() in coordination.projects) — this CLI's
     own already-present check is a UX nicety only, never the source of truth.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_participant = args.participant.strip().lower()
@@ -1852,6 +1915,75 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: set-colleague  (#2764)
+# ---------------------------------------------------------------------------
+
+def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Set or change the colleague: field on an existing baton.
+
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter), then delegates the write to the forum
+    API via client.post — the AUTHORITATIVE authorization check (caller must
+    already be a participant OR the current turn holder) is server-side
+    (set_colleague() in coordination.projects), same split as
+    cmd_add_participant.
+    """
+    _require_forum(config)
+
+    project_id = args.project_id
+    colleague = args.colleague.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if not colleague:
+        print(
+            "baton set-colleague: <colleague> must be non-empty.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, _body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton set-colleague: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        resp = client.post(f"/api/projects/{project_id}/colleague", {
+            "agent": agent_name or "baton",
+            "colleague": colleague,
+        })
+    except ForumNetworkError as e:
+        print(f"baton set-colleague: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton set-colleague: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        if e.status == 403:
+            print(
+                f"baton set-colleague: '{agent_name or 'you'}' must already be a "
+                f"participant of '{project_id}', or its current turn holder, "
+                "to set colleague.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton set-colleague: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    participant_added = resp.get("participant_added", False)
+    suffix = " (added as participant)" if participant_added else ""
+    print(f"baton set-colleague: {project_id} colleague → {colleague}{suffix}")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
@@ -1869,7 +2001,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     --force skips gates 3-4 only; never skips 1-2.
     --dry-run prints the ladder verdict without merging.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     # Resolve project_id and pr_number from the argument (PR-N or bare N)
     raw_arg = args.pr.strip()
@@ -2445,6 +2577,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent name to add as a participant",
     )
 
+    # -- set-colleague --
+    p_set_colleague = subparsers.add_parser(
+        "set-colleague",
+        help="Set or change the colleague: field on an existing baton (#2764)",
+        description=(
+            "Set or replace the colleague: frontmatter field on an existing "
+            "baton, atomically, and add <colleague> to participants (dedup) "
+            "in the same write -- exactly the behavior 'baton init "
+            "--colleague' already has, now available after init too, and "
+            "now persisted (pre-#2764, --colleague at init never wrote "
+            "anything server-side, so 'baton show' could never render it). "
+            "The invoking agent must already be a participant of the baton, "
+            "OR its current turn holder (server-side authorization) -- this "
+            "is what lets the baton's holder name a colleague who then has "
+            "no need to add themselves. Does not change what the flip-time "
+            "colleague-gate enforces (still participants-derived); this is "
+            "about making the colleague identity settable and visible, not "
+            "about changing enforcement."
+        ),
+    )
+    p_set_colleague.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_set_colleague.add_argument(
+        "colleague",
+        metavar="COLLEAGUE",
+        help="Agent name to set as the expected colleague reviewer",
+    )
+
     # -- merge --
     p_merge = subparsers.add_parser(
         "merge",
@@ -2525,6 +2688,8 @@ def main() -> None:
         cmd_anchor(args, config, agent_name, client)
     elif args.subcommand == "add-participant":
         cmd_add_participant(args, config, agent_name, client)
+    elif args.subcommand == "set-colleague":
+        cmd_set_colleague(args, config, agent_name, client)
     elif args.subcommand == "merge":
         cmd_merge(args, config, agent_name, client)
     else:

@@ -232,3 +232,48 @@ def test_set_recall_summaries_non_str_payload_returns_error_envelope():
             f"engram_set_recall_summaries(payload_json={label}) did not return "
             f"an error envelope: {r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 7. alpha#1944 — override_lesson stripped centrally
+# ---------------------------------------------------------------------------
+#
+# override_lesson is a reserved field the PreToolUse lesson-tripwire hook
+# reads directly off the raw tool_input to let a single call through a
+# "blocking" lesson (see engram-lesson-tripwire-hook.py's check_blocking_deny
+# / _find_override). By the time _parse_payload runs, the hook has already
+# made its allow/deny decision on the RAW payload string — this field has
+# done its job and must not reach any tool's own unknown-field check.
+
+
+def test_override_lesson_stripped_from_params():
+    server = fresh_server()
+    payload = {"a": 1, "override_lesson": "ls_0018: verified safe"}
+    params, err = server._parse_payload(json.dumps(payload))
+    assert err is None, err
+    assert params == {"a": 1}, params
+
+
+def test_override_lesson_absent_is_a_no_op():
+    """The overwhelming majority of calls never carry override_lesson —
+    confirm the pop() doesn't touch anything when the key is absent."""
+    server = fresh_server()
+    payload = {"a": 1, "b": "two"}
+    params, err = server._parse_payload(json.dumps(payload))
+    assert err is None, err
+    assert params == {"a": 1, "b": "two"}, params
+
+
+def test_override_lesson_does_not_trip_unknown_field_check():
+    """End-to-end: a representative tool's own unknown-field check never
+    sees override_lesson, so a call carrying it is not rejected for that
+    reason (it may still be rejected for missing required fields — this
+    only proves the field itself isn't the cause)."""
+    server = fresh_server()
+    payload = {"node_id": "ob_0001", "override_lesson": "ls_0018: verified safe"}
+    result_str = server.engram_inspect(payload_json=json.dumps(payload))
+    r = json.loads(result_str)
+    # Whatever the real outcome (node not found, etc.), it must not be
+    # "Unknown fields" naming override_lesson.
+    if "error" in r:
+        assert "override_lesson" not in r["error"], r

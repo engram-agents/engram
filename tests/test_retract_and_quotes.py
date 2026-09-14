@@ -290,7 +290,9 @@ def test_retract_multi_level_cascade():
 
 
 def test_retract_with_replacement():
-    """Retract with replacement should create a new correct observation."""
+    """Retract with replacement_id — the caller creates the replacement first
+    via its own canonical creation tool, then names it (#2612: purely
+    relational, engram_retract does NOT create the replacement node)."""
     client = fresh_client()
     r = client.call("engram_add_observation", {
         "url": "https://example.com/article",
@@ -303,21 +305,23 @@ def test_retract_with_replacement():
     ob_id = r["observation_id"]
     ev_id = r["evidence_id"]
 
-    replacement = {
+    repl = client.call("engram_add_observation", {
+        "evidence_id": ev_id,
         "quoted_text": "Correct quote from the article.",
         "interpretation": "Proper interpretation.",
         "claim": "Correct claim",
         "quote_type": "hard_data",
-    }
+    })
+    repl_id = repl["observation_id"]
+
     ret = client.call("engram_retract", {
         "node_id": ob_id,
         "error_type": "fabricated_quote",
         "reason": "Original quote was fabricated.",
-        "replacement_json": json.dumps(replacement),
+        "replacement_id": repl_id,
     })
     assert ret["status"] == "retracted"
-    assert "replacement_id" in ret, f"Expected replacement_id, got {ret}"
-    repl_id = ret["replacement_id"]
+    assert ret.get("replacement_id") == repl_id, f"Expected replacement_id, got {ret}"
 
     # Verify replacement exists and cites same evidence.
     # include_superseded=True because the retracted node (is_current=0) is the

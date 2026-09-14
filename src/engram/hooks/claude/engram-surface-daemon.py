@@ -120,46 +120,54 @@ def _indexer_loop(interval_s: int, shutdown_event: threading.Event) -> None:
 
 
 def _resolve_engram_home() -> str:
-    """Per-install data dir: knowledge.db, sockets, briefing, history."""
-    return (
+    """Per-install data dir: knowledge.db, sockets, briefing, history.
+
+    Always returns an ABSOLUTE path (gh#2695): a relative ENGRAM_HOME would
+    make this process bind its AF_UNIX socket with a relative path string,
+    so /proc/net/unix records the bind exactly as passed to bind() --
+    relative text. start-engram-daemon.sh's unit-2 ownership guard
+    (#2652 phase-0) always compares against its own absolute $SOCKET_PATH
+    (built from whatever ENGRAM_HOME the HOOK resolved, which may differ in
+    absolute-vs-relative form and cwd from this process), so a relative
+    bind means the guard's path-text match finds zero rows, the guard
+    concludes "no live holder", and fails OPEN -- allowing exactly the
+    delete it exists to prevent. abspath() (not realpath()) is used
+    deliberately: it makes the path absolute relative to cwd without
+    resolving symlinks, which matches the existing expanduser-only
+    behavior for the already-absolute common case (an intermediate
+    symlinked ENGRAM_HOME component would keep resolving the same way it
+    always has -- realpath would be a second, unrelated behavior change
+    bundled into this fix).
+    """
+    return os.path.abspath(
         os.environ.get("ENGRAM_HOME")
         or os.path.expanduser("~/.engram")
     )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate where engram_client.py lives for import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
-
-
 ENGRAM_HOME = _resolve_engram_home()
-PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
+
+# _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir (gh#2570 --
+# the maintainer's own count correction: this hook's local copy was an
+# accidental omission from the original three-hook enumeration, identical
+# in signature/body to engram-session-start-hook.py's pre-migration copy,
+# not a fourth variant). This hook's own sentinel, engram_client.py, is
+# preserved unchanged. This file's own directory is NOT already on
+# sys.path (unlike hooks that self-insert it for other reasons), and
+# several tests load this module directly via
+# importlib.util.spec_from_file_location (test_surface_daemon_indexer.py,
+# test_surface_daemon_idle_timeout.py, test_surface_daemon_pid_reap.py,
+# test_pgrep_liveness_reap_patterns.py), which does not implicitly add the
+# hook's directory to sys.path the way a subprocess invocation does --
+# insert explicitly so both invocation styles resolve _hooklib the same
+# way (same fix applied to engram-deference-detector-prompt.py in this
+# same change).
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if _this_dir not in sys.path:
+    sys.path.insert(0, _this_dir)
+from _hooklib import resolve_runtime_dir
+
+PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 PID_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.pid")
 
@@ -168,6 +176,18 @@ os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 _last_activity = time.time()
 _shutdown = threading.Event()
+
+# Socket-ownership tracking (#2713 -- the daemon-side sibling of #2687's
+# hook-side socket-ownership guard). Set to True ONLY after this process's
+# own server.bind(SOCKET_PATH) succeeds in main(). cleanup()'s SOCKET_PATH
+# unlink is gated on THIS flag, independent of PID_PATH identity -- pidfile
+# identity answers "did I write the pidfile", not "did I bind the socket",
+# and on a two-daemon seat those two questions have different answers: the
+# hook-launched instance can write the pidfile while a DIFFERENT,
+# supervisor-launched instance holds the actual socket. Unlinking
+# SOCKET_PATH on pidfile identity alone deletes the live holder's socket
+# out from under it.
+_bound_socket = False
 
 
 def handle_client(conn, client):
@@ -252,16 +272,31 @@ def idle_watchdog(idle_timeout: int):
 
 
 def cleanup(*args):
-    """Remove socket and PID files on exit -- but only if PID_PATH still
-    names THIS process (#1874 colleague-review suggestion).
+    """Remove socket and PID files on exit -- two independent resources,
+    two independent predicates. Do not conflate them (#2713).
 
-    Without this guard, a delayed SIGTERM (this process was already
-    superseded -- e.g. start-engram-daemon.sh's reap loop killed it, but
-    it was slow to actually exit) could fire its cleanup AFTER a newer
-    instance already wrote its own fresh PID file and bound its socket,
-    deleting the NEW instance's files out from under it and reproducing
-    the exact "unreachable-but-alive" shape #1874 reported, via a
-    different mechanism than the one that PR actually fixes.
+    PID_PATH: removed only if PID_PATH still names THIS process (#1874
+    colleague-review suggestion). Without this guard, a delayed SIGTERM
+    (this process was already superseded -- e.g. start-engram-daemon.sh's
+    reap loop killed it, but it was slow to actually exit) could fire its
+    cleanup AFTER a newer instance already wrote its own fresh PID file
+    and bound its socket, deleting the NEW instance's files out from
+    under it and reproducing the exact "unreachable-but-alive" shape
+    #1874 reported, via a different mechanism than the one that PR
+    actually fixes.
+
+    SOCKET_PATH: removed only if THIS process actually bound it
+    (`_bound_socket`, set in main() immediately after a successful
+    server.bind()) -- independent of PID_PATH identity (#2713). Pidfile
+    identity is a proxy for "did I bind the socket", and on a two-daemon
+    seat the proxy is wrong: the hook-launched instance is the one that
+    wrote the pidfile, but a DIFFERENT, supervisor-launched instance may
+    be the one actually serving SOCKET_PATH. Gating the unlink on pidfile
+    identity (or its absence -- "nothing to protect, proceed") deletes
+    the live holder's socket out from under it even though this process
+    never bound it. `_bound_socket` answers the only question that
+    matters for this resource; PID_PATH's absence/unreadability is no
+    longer sufficient, on its own, to unlink the socket.
     """
     _shutdown.set()
     still_ours = False
@@ -269,17 +304,19 @@ def cleanup(*args):
         with open(PID_PATH) as f:
             still_ours = int(f.read().strip()) == os.getpid()
     except (OSError, ValueError):
-        # No pidfile, or unreadable/garbage content -- nothing to protect,
-        # proceed with cleanup (matches the prior unconditional behavior
-        # for this case).
+        # No pidfile, or unreadable/garbage content -- nothing to protect
+        # for the PIDFILE, proceed with removing IT (matches the prior
+        # unconditional behavior for this case). Says nothing about the
+        # socket -- see _bound_socket above.
         still_ours = True
     if still_ours:
         try:
-            os.unlink(SOCKET_PATH)
+            os.unlink(PID_PATH)
         except FileNotFoundError:
             pass
+    if _bound_socket:
         try:
-            os.unlink(PID_PATH)
+            os.unlink(SOCKET_PATH)
         except FileNotFoundError:
             pass
     sys.exit(0)
@@ -309,7 +346,7 @@ def _recorded_pid_is_alive() -> bool:
 
 
 def main():
-    global _client
+    global _client, _bound_socket
 
     # #1874: only remove the socket if the PID it was bound by is
     # confirmably dead. The prior unconditional unlink let a fresh daemon
@@ -379,6 +416,12 @@ def main():
     # Create Unix socket server
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
+    # Ownership flag flips ONLY after bind() returns successfully (#2713)
+    # -- cleanup()'s SOCKET_PATH unlink is gated on this, not on pidfile
+    # identity. Set immediately after the call that establishes ownership,
+    # never before it (a mutation that flips this earlier would falsely
+    # claim ownership for a bind() that actually failed/raised).
+    _bound_socket = True
     # Remove any idle-shutdown tombstone — daemon is healthy and running (#1260).
     tombstone_path = os.path.join(ENGRAM_HOME, "daemon-idle-shutdown")
     try:

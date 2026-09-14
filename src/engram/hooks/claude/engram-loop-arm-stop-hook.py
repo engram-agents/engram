@@ -125,13 +125,16 @@ unchanged; `_NUDGE_TEXT` carries a pointer to the batched shape so an
 agent nudged mid-conversation doesn't swallow its next reply. Measured
 on 2.1.235, not asserted universal.
 
-Fire condition -- emit the nudge iff ALL of:
+Fire condition -- for Claude, emit the normal nudge iff ALL of:
   (a) `~/.engram/loop-mode.json` exists (never nag a non-loop session), AND
   (b) its `pacer` field identifies a `scheduleWakeup`-paced loop (see
       2026-07-31 round-6 note below), AND
   (c) this turn's transcript delta contains NO `tool_use` block that BOTH
       (i) names the wake-arming tool (`ScheduleWakeup`), AND (ii) carries
       the `<loop-wake>` marker in its `input.prompt`.
+
+For managed Codex, a `scheduleWakeup` marker emits only the Codex repair
+nudge; the normal Claude confirmation scan never runs.
 
 2026-07-31 round-6 review finding (colleague review, asking what happens
 on a non-Claude install): the marker's `pacer` field distinguishes a
@@ -144,14 +147,13 @@ EXISTENCE, never `pacer` -- so on a cron-paced loop, which has no reason to
 call `ScheduleWakeup` on any given turn, the gate could never be satisfied
 and the nudge fired every single turn, telling the agent to `ScheduleWakeup`
 -- actively the wrong action, and a pacer-mixing bug in its own right. The
-same gate also makes the codex-target question harmless by construction:
-the plugin bundle ships `hooks.json` AND `skills/` to codex, so a codex
-install gets this hook too, while `ScheduleWakeup` is a Claude-harness tool
-name -- gating on `pacer` means a non-`scheduleWakeup`-paced (or
-unreadable/foreign) install silently does nothing, with no need to assert
-anything about what tools a codex install does or doesn't have. This
-reasoning is unchanged by the 2026-08-12 retarget -- `pacer` gating is
-orthogonal to which tool-shape the confirmation check inspects.
+Codex needs one extra guard beyond pacer gating: a stale or misfiled
+`pacer: "scheduleWakeup"` marker is exactly the cross-harness state that
+would otherwise make this hook demand a Claude-only action. Runtime platform
+evidence therefore wins before the normal confirmation scan. On managed Codex,
+that erroneous marker gets a Codex-specific bridge/timer repair nudge; all
+other Codex markers stay silent. This preserves the original pacer gate for
+Claude while refusing to reinforce a wrong Codex pacer.
 
 `_pacer_is_schedule_wakeup` compares case-insensitively and
 whitespace-tolerantly (`scheduleWakeup` is camelCase in the skills; a
@@ -319,6 +321,52 @@ _LOOP_ARM_STATE_FILE = os.path.join(ENGRAM_HOME, ".loop-arm-nudge-last-fire.json
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+# Guarded (unlike the sibling hooks' unguarded equivalent): this hook's own
+# design contract, defended by test_emits_via_fallback_when_stophooklib_import_fails
+# and the two _copy_hook_into_baked_bundle regression tests, is that it must
+# NEVER crash even when a sibling lib module is absent from an isolated
+# bundle -- its whole purpose is making a missed ScheduleWakeup arm loud,
+# so an unhandled ImportError here (which would abort the primary nudge
+# below, not just telemetry) is strictly worse than the emitter silently
+# not firing. Same fail-toward-emitting posture as the rest of this file.
+try:
+    from _hooklib import resolve_runtime_dir
+    _RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+    if _RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _RUNTIME_DIR)
+except Exception:
+    pass
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+# Guarded the same way as the emitter resolver above -- same fail-toward-
+# emitting posture this whole file uses (this new addition does not touch
+# the existing bootstrap above it).
+try:
+    from _hooklib import resolve_runtime_dir as _resolve_runtime_dir_for_telemetry
+    _TELEMETRY_RUNTIME_DIR = _resolve_runtime_dir_for_telemetry(ENGRAM_HOME, "engram_telemetry_store.py")
+    if _TELEMETRY_RUNTIME_DIR not in sys.path:
+        sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+except Exception:
+    pass
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-loop-arm-stop-hook.py:main"
+_HOOK_FIRE_SITE = "loop-arm-stop-hook.hook_fire"
+
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -351,9 +399,29 @@ if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
 for _lp_parent in Path(__file__).resolve().parents:
     _lp_candidates.append(_lp_parent / "tools")
-_LP_TOOLS_DIR = next(
-    (c for c in _lp_candidates if (c / "loop_prompt.py").exists()), None
-)
+# (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
+# unreadable candidate directory, and this whole block runs at bare
+# module-import time, so an unguarded raise here must never crash the
+# hook process. PER-CANDIDATE guard, not a single try/except around the
+# whole search: _lp_candidates puts $CLAUDE_PLUGIN_ROOT FIRST and the
+# __file__-relative walk-parents fallbacks after, so if the plugin-root
+# candidate is the unreadable one (exactly this issue's reported case),
+# a whole-search try/except aborts on that first raise and never tries
+# the later, normally-readable fallbacks -- discarding a candidate that
+# would have resolved. Skipping just the failing candidate and
+# continuing the search is what actually degrades gracefully
+# (engram-alpha#2671 review round: reproduced the whole-search variant
+# returning None on an unreadable-then-readable candidate order, where
+# the per-candidate variant correctly finds the readable one).
+_LP_TOOLS_DIR = None
+for _lp_candidate in _lp_candidates:
+    try:
+        _lp_found = (_lp_candidate / "loop_prompt.py").exists()
+    except OSError:
+        continue
+    if _lp_found:
+        _LP_TOOLS_DIR = _lp_candidate
+        break
 if _LP_TOOLS_DIR is not None and str(_LP_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_LP_TOOLS_DIR))
 try:
@@ -376,6 +444,45 @@ _WAKE_ARMING_TOOL_NAMES = frozenset({"ScheduleWakeup"})
 # lowercase form.
 _SCHEDULE_WAKEUP_PACER = "schedulewakeup"
 
+
+def _runtime_platform() -> str | None:
+    """Return a baked runtime platform when a plugin bundle provides one.
+
+    A baked profile is stronger evidence than an ambient environment variable:
+    a user shell can retain ``CODEX_PLUGIN_ROOT`` while a Claude bundle is the
+    hook's actual runtime. Source/dev hooks normally have no profile, so the
+    caller may use the Codex root variable as the documented fallback.
+    """
+    # The bundle containing this hook is the runtime actually executing this
+    # code. Its baked platform profile must win over every ambient root: a
+    # shell can retain either plugin-root variable after a harness switch.
+    # Environment roots are source/dev fallbacks only, when this colocated
+    # bundle has no profile.
+    candidates: list[Path] = [Path(__file__).resolve().parent.parent]
+    for env_name in ("ENGRAM_RUNTIME_DIR", "CODEX_PLUGIN_ROOT", "CLAUDE_PLUGIN_ROOT"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(Path(value))
+    for runtime_dir in candidates:
+        try:
+            with open(runtime_dir / "platform.json", encoding="utf-8") as f:
+                data = json.load(f)
+            platform = data.get("platform")
+            if isinstance(platform, str):
+                return platform.strip().lower()
+        except Exception:
+            continue
+    return None
+
+
+def _is_managed_codex_runtime() -> bool:
+    """Detect Codex from reliable bundle evidence, then its runtime root."""
+    platform = _runtime_platform()
+    if platform is not None:
+        return platform == "codex"
+    return bool(os.environ.get("CODEX_PLUGIN_ROOT", "").strip())
+
+
 _NUDGE_TEXT = (
     "[Loop Arm Check: a loop marker is active and this turn shows no "
     "ScheduleWakeup call. Arm now — ScheduleWakeup with this file's "
@@ -389,6 +496,13 @@ _NUDGE_TEXT = (
     "a solo arm ends the turn, a trailing arm swallows the reply (engram-"
     "loop Step 2 item 3, #2098). If a reply already rendered this turn, "
     "arm now and add nothing after.]"
+)
+
+_CODEX_PACER_NUDGE_TEXT = (
+    "[Loop Arm Check: managed Codex is active but this loop marker says "
+    "pacer scheduleWakeup. Do not use the Claude wake path. Verify the "
+    "managed codex-umwelt-wake.py bridge and this agent's systemd heartbeat "
+    "timer, then correct the marker to pacer systemd before continuing.]"
 )
 
 
@@ -521,6 +635,10 @@ def _delta_has_arm_confirmation(transcript_path: str) -> bool:
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     session_id = "unknown"
@@ -554,12 +672,24 @@ def main() -> None:
     if not os.path.exists(LOOP_MARKER_PATH):
         return
 
+    # A stale scheduleWakeup marker is harmful on Codex: the normal nudge
+    # would demand a Claude-only tool. Detect the runtime before the regular
+    # pacer gate and provide only a concrete managed-bridge/systemd repair.
+    pacer_is_schedule_wakeup = _pacer_is_schedule_wakeup(LOOP_MARKER_PATH)
+    if _is_managed_codex_runtime():
+        if not pacer_is_schedule_wakeup:
+            return
+        print(json.dumps({"decision": "block", "reason": _CODEX_PACER_NUDGE_TEXT}))
+        if _STOPHOOKLIB_OK:
+            _write_offset_state(_LOOP_ARM_STATE_FILE, transcript_path)
+        return
+
     # Round-6 fix: never nag a loop this hook can't positively identify as
     # scheduleWakeup-paced -- see _pacer_is_schedule_wakeup's docstring and
     # the module docstring's round-6 note for why silence, not emission,
     # is correct here. Also stateless, same reasoning as the marker-absent
     # check above.
-    if not _pacer_is_schedule_wakeup(LOOP_MARKER_PATH):
+    if not pacer_is_schedule_wakeup:
         return
 
     confirmed = False
@@ -589,14 +719,27 @@ def main() -> None:
 
     # Emit engram.hook.fire event, matching the sibling Stop hooks'
     # observability convention. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5).
+    _emitter = None
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id,
             transcript_path=transcript_path,
         )
-        _emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -605,9 +748,13 @@ def main() -> None:
                 "duration_ms": _duration_ms,
                 "exit_code": 0,
             },
+            site="loop-arm-stop-hook.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

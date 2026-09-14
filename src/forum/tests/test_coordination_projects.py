@@ -22,6 +22,7 @@ from forum.coordination import (
     release,
     rename,
     reopen,
+    set_colleague,
     set_status,
 )
 from forum.coordination import markdown as md
@@ -735,6 +736,126 @@ def test_add_participant_missing_project_raises(store, allocator):
         add_participant(store, allocator, "PR-nope", agent="ariadne", participant="luria")
 
 
+# ---------------------------------------------------------------------------
+# set_colleague() tests (#2764)
+# ---------------------------------------------------------------------------
+# Seed baton (_baton()) turn=ariadne, participants=[ariadne, borges].
+
+
+def test_set_colleague_first_set_persists_field_and_adds_participant(store, allocator):
+    seq, participant_added = set_colleague(
+        store, allocator, "PR-1",
+        agent="ariadne", colleague="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert seq == 1
+    assert participant_added is True
+
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["colleague"] == "luria"
+    assert _participants_list(fields["participants"]) == ["ariadne", "borges", "luria"]
+    assert "- 2026-06-26T12:00:00Z ariadne set colleague → luria" in raw
+
+
+def test_set_colleague_byte_exact_golden(store, allocator):
+    set_colleague(
+        store, allocator, "PR-1",
+        agent="ariadne", colleague="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    assert "- 2026-06-26T12:00:00Z ariadne set colleague → luria" in raw
+
+
+def test_set_colleague_already_participant_does_not_duplicate(store, allocator):
+    """colleague already in participants -> field is still set, but no dup entry."""
+    seq, participant_added = set_colleague(
+        store, allocator, "PR-1",
+        agent="ariadne", colleague="borges",  # already a seeded participant
+        ts="2026-06-26T12:00:00Z",
+    )
+    assert participant_added is False
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["colleague"] == "borges"
+    assert _participants_list(fields["participants"]) == ["ariadne", "borges"]
+
+
+def test_set_colleague_update_existing_value_logs_change(store, allocator):
+    set_colleague(store, allocator, "PR-1", agent="ariadne", colleague="luria", ts="2026-06-26T12:00:00Z")
+    set_colleague(store, allocator, "PR-1", agent="ariadne", colleague="borges", ts="2026-06-26T13:00:00Z")
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["colleague"] == "borges"
+    assert '- 2026-06-26T13:00:00Z ariadne changed colleague from "luria" to "borges"' in raw
+
+
+def test_set_colleague_normalizes_case(store, allocator):
+    set_colleague(store, allocator, "PR-1", agent="ARIADNE", colleague="  LURIA ")
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert fields["colleague"] == "luria"
+    assert "luria" in _participants_list(fields["participants"])
+
+
+def test_set_colleague_does_not_touch_turn_fields(store, allocator):
+    set_colleague(
+        store, allocator, "PR-1",
+        agent="ariadne", colleague="luria",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = store.read_project("PR-1")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["turn"] == "ariadne"
+    assert fields["turn_since"] == "2026-06-26T00:00:00Z"
+    assert fields["turn_reason"] == '"start"'
+
+
+def test_set_colleague_returns_monotonic_seq(store, allocator):
+    seq1, _ = set_colleague(store, allocator, "PR-1", agent="ariadne", colleague="luria")
+    seq2, _ = set_colleague(store, allocator, "PR-1", agent="ariadne", colleague="borges")
+    assert seq2 > seq1
+
+
+def test_set_colleague_missing_project_raises(store, allocator):
+    with pytest.raises(ProjectNotFound):
+        set_colleague(store, allocator, "PR-nope", agent="ariadne", colleague="luria")
+
+
+def test_set_colleague_by_existing_participant_succeeds(store, allocator):
+    """agent = a current participant who is NOT the turn holder -- allowed."""
+    seq, _ = set_colleague(store, allocator, "PR-1", agent="borges", colleague="luria")
+    assert seq == 1
+
+
+def test_set_colleague_agent_neither_participant_nor_holder_raises(store, allocator):
+    """The load-bearing server-side auth guard -- a bystander cannot set colleague."""
+    with pytest.raises(NotAParticipant):
+        set_colleague(store, allocator, "PR-1", agent="casey", colleague="luria")
+    raw = store.read_project("PR-1")
+    assert "set colleague" not in raw
+
+
+def test_set_colleague_by_turn_holder_not_in_participants_succeeds(store, allocator):
+    """The OR-holder half: a PR baton legitimately flipped to the pool sentinel
+    (not itself listed in participants -- flip's own to_agent validation
+    bypasses the participants check for the sentinel) must still let that
+    holder set the colleague -- exactly the "maintainer confirms the
+    colleague before merge" case #2764 exists for."""
+    raw = _baton(turn="kepler")  # kepler is the turn holder but NOT in [ariadne, borges]
+    store.write_project("PR-1", raw, seq=0)
+    seq, participant_added = set_colleague(
+        store, allocator, "PR-1", agent="kepler", colleague="luria",
+    )
+    assert seq == 1
+    assert participant_added is True
+    fields, _ = md.parse_frontmatter(store.read_project("PR-1"))
+    assert fields["colleague"] == "luria"
+    # kepler (the holder) is still not a listed participant -- set_colleague
+    # only adds the COLLEAGUE being named, never the caller.
+    assert "kepler" not in _participants_list(fields["participants"])
+
+
 def _participants_list(participants_field: str) -> list:
     """Parse the frontmatter participants field ('[a, b]') into a list, for assertions."""
     inner = participants_field.strip().lstrip("[").rstrip("]")
@@ -822,6 +943,46 @@ def test_init_without_github_anchor(tmp_path):
     raw = s.read_project("PR-42")
     fields, _ = md.parse_frontmatter(raw)
     assert "github" not in fields
+
+
+def test_init_with_colleague_persists_field(tmp_path):
+    """init() with colleague= includes the colleague: field in frontmatter
+    (#2764 -- pre-fix, --colleague at init only touched participants and a
+    client-side print; nothing was ever persisted, so baton show could never
+    render it)."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T",
+        status="in-progress",
+        turn="borges",
+        participants=["borges", "ariadne"],
+        turn_reason="init",
+        colleague="ariadne",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-42")
+    fields, _ = md.parse_frontmatter(raw)
+    assert fields["colleague"] == "ariadne"
+
+
+def test_init_without_colleague_omits_field(tmp_path):
+    """init() without colleague= omits the colleague: field entirely."""
+    s = FileStore(tmp_path)
+    alloc = SeqAllocator(recover=s.recover_max_seq)
+    init(
+        s, alloc, "PR-42",
+        title="T",
+        status="in-progress",
+        turn="borges",
+        participants=["borges"],
+        turn_reason="init",
+        ts="2026-06-26T12:00:00Z",
+    )
+    raw = s.read_project("PR-42")
+    fields, _ = md.parse_frontmatter(raw)
+    assert "colleague" not in fields
 
 
 def test_init_sets_turn_by_to_initor(tmp_path):

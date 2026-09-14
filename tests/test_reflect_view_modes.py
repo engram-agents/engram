@@ -354,8 +354,15 @@ def test_high_volume_claim_truncated_to_160_when_no_recall_summary():
     assert target is not None, f"{ob_id} not found in weakly_grounded"
     assert "claim" in target, "Tier-1 entry must have claim key"
     claim_val = target["claim"]
-    # Note: _slim_reflect_briefing truncates claim to 199 chars (_REFLECT_FIELD_MAX=200)
-    # matching RECALL_SUMMARY_HARD_CAP so RS content passes through without further cut.
+    # The operative bound is _REFLECT_FIELD_MAX (200, engram_lifecycle.py) —
+    # reflect's briefing DISPLAY cap. _slim_reflect_briefing leaves a field of
+    # <= 200 chars alone and rewrites a longer one to 199 content chars plus a
+    # one-char ellipsis, i.e. a 200-char field, not a 199-char one. Here it does
+    # not fire at all: _reflect_rs_or_claim already cut the claim to 160 + "..."
+    # = 163 chars, so 200 below is a ceiling this asserts against, not the
+    # length. RECALL_SUMMARY_HARD_CAP (200, tools/recall_summary_validator.py)
+    # is NOT this bound — it gates the batch recall_summary WRITE path. The two
+    # 200s are a numeric coincidence, not a dependency.
     assert len(claim_val) <= 200, f"claim should not exceed 200 chars; got {len(claim_val)}"
     assert "X" in claim_val, "Truncated claim should contain the original content"
 
@@ -373,7 +380,11 @@ def test_low_volume_claim_truncated_to_160_when_no_recall_summary():
     target = next((c for c in conjectures if c["id"] == cj_id), None)
     assert target is not None, f"{cj_id} not found in open_conjectures"
     claim_val = target["claim"]
-    # _slim_reflect_briefing truncates to 199 chars (_REFLECT_FIELD_MAX=200), so effective max is 199
+    # The operative bound is _REFLECT_FIELD_MAX (200, engram_lifecycle.py):
+    # <= 200 chars passes through untouched, longer is rewritten to 199 content
+    # chars plus a one-char ellipsis, i.e. a 200-char field. It does not fire
+    # here either — _reflect_rs_or_claim already cut the claim to 160 + "..." =
+    # 163 chars — so 200 below is a ceiling, not the effective length.
     assert len(claim_val) <= 200, f"claim should be truncated; got {len(claim_val)}: {claim_val!r}"
 
 

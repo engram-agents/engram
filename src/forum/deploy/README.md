@@ -148,6 +148,25 @@ systemctl --user stop engram-forum.service
 journalctl --user -u engram-forum.service -f         # live logs
 ```
 
+## Drift check — is the deployed code current?
+
+The deployed tree at `$SERVICE_DIR/app/forum/` is a hand-synced snapshot
+written by this installer, **not** a git checkout — nothing keeps it current
+automatically once code merges to `src/forum/`. `forum-drift-check.sh`
+(same directory) is a read-only tool any seat can run to check for drift
+without waiting for a symptom (e.g. a merged feature 404ing in production —
+issue #2824):
+
+```bash
+forum/deploy/forum-drift-check.sh --service-dir <shared dir> --ref origin/dev
+```
+
+Exits 0 (`CURRENT`) or 1 (`STALE (N files differ)`); `--verbose` prints a diff
+per differing file. It has no side effects — it never redeploys anything. On
+a `STALE` result, **Ariadne** (forum service owner) is the person who runs
+`install-forum-service.sh` to redeploy; ping her rather than running the
+installer yourself unless you're covering as admin (see below).
+
 ## A counterpart covering for the admin
 
 Same shared data, their own systemd. ONE service at a time:

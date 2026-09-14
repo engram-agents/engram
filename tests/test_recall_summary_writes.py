@@ -26,6 +26,24 @@ Batch tool tests (engram_set_recall_summaries):
   12. test_batch_apply_clears_summary_missing_flag — #1952 PR3: a summary_missing=1
                                              node clears to 0 on successful apply
 
+Batch tool tests, file-based input (summaries_file — file-path-inside-payload):
+  13. test_batch_inline_still_works_exact_shape — inline path unchanged: exact dict
+                                             equality vs. the pre-change response shape
+  14. test_file_based_summaries_applies_same_as_inline — summaries_file applies the
+                                             identical entries as the equivalent inline call
+  15. test_file_and_inline_both_present_is_error — both keys present -> error,
+                                             asserts nothing was written to the DB
+  16. test_file_relative_path_rejected      — relative path -> error naming the
+                                             absolute-path requirement
+  17. test_file_missing_file_error          — nonexistent path -> distinct "not found" error
+  18. test_file_malformed_json_error        — unparseable file contents -> distinct error
+  19. test_file_wrong_shape_error           — valid JSON, wrong shape -> distinct error
+  20. test_file_path_is_directory_not_regular_file — non-file path -> distinct error
+  21. test_file_empty_summaries_list_is_labeled_not_silent — summaries=[] via file is
+                                             not an error, but always distinguishable
+                                             from the bare inline no-op via the echoed
+                                             summaries_file field in the response
+
 Validator unit tests (tools.recall_summary_validator.validate_summary_entry):
   9.  test_validator_valid_entry           — all-good entry → None
   10. test_validator_missing_fields        — missing node_id/recall_summary/recall_keywords
@@ -490,6 +508,226 @@ def test_batch_apply_clears_summary_missing_flag():
         assert row["needs_tightening"] == 0
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 13 (batch): inline path unchanged — exact shape check
+# ---------------------------------------------------------------------------
+
+def test_batch_inline_still_works_exact_shape():
+    """Inline `summaries` path is byte-identical to the pre-file-support shape:
+    exact dict equality, no leaked `summaries_file` key or other new field."""
+    srv = fresh_server()
+    obs_id = _add_obs(srv, "inline unchanged claim")
+    entry = _valid_entry(obs_id, "Inline summary, unchanged path.")
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries": [entry]})
+    ))
+    assert r == {
+        "ok": [{"node_id": obs_id}],
+        "errors": [],
+        "applied": 1,
+        "failed": 0,
+        "pre_flight_failures": [],
+    }, r
+
+
+# ---------------------------------------------------------------------------
+# Test 14 (batch): summaries_file applies same entries as equivalent inline call
+# ---------------------------------------------------------------------------
+
+def test_file_based_summaries_applies_same_as_inline():
+    """summaries_file pointing at a real temp file applies exactly the same
+    summaries as the equivalent inline call (same node set, same ok/errors
+    shape modulo the summaries_file echo field)."""
+    srv = fresh_server()
+    ids = [_add_obs(srv, f"file-based claim {i}") for i in range(3)]
+    summaries = [_valid_entry(id_, f"File-based summary {i}.", ["a", "b", "c"])
+                 for i, id_ in enumerate(ids)]
+    inline_payload = {"summaries": summaries}
+
+    with tempfile.TemporaryDirectory() as scratch:
+        file_path = os.path.join(scratch, "final_payload.json")
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(inline_payload))
+        r_file = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries_file": file_path})
+        ))
+
+        assert "error" not in r_file, r_file
+        assert r_file["applied"] == 3, r_file
+        assert r_file["failed"] == 0, r_file
+        assert r_file["summaries_file"] == file_path, r_file
+        ok_ids = {e["node_id"] for e in r_file["ok"]}
+        assert ok_ids == set(ids), f"ok IDs mismatch: {ok_ids} vs {set(ids)}"
+
+        # Verify DB state directly — same as the inline happy-path test does.
+        conn = fresh_conn(srv)
+        try:
+            row = conn.execute(
+                "SELECT recall_summary, recall_keywords FROM nodes WHERE id = ?",
+                (ids[0],),
+            ).fetchone()
+            assert row["recall_summary"] == summaries[0]["recall_summary"]
+            assert json.loads(row["recall_keywords"]) == summaries[0]["recall_keywords"]
+        finally:
+            conn.close()
+
+        # Re-running the equivalent inline call (idempotent re-apply) produces
+        # the identical response shape, minus the file-echo field.
+        r_file_no_echo = dict(r_file)
+        del r_file_no_echo["summaries_file"]
+        r_inline = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps(inline_payload)))
+        assert r_inline == r_file_no_echo, (r_inline, r_file_no_echo)
+
+
+# ---------------------------------------------------------------------------
+# Test 15 (batch): both "summaries" and "summaries_file" present -> error
+# ---------------------------------------------------------------------------
+
+def test_file_and_inline_both_present_is_error():
+    """Both keys present -> loud ambiguous-input error, nothing applied,
+    nothing written to the DB."""
+    srv = fresh_server()
+    obs_id = _add_obs(srv, "both-keys-error claim")
+    entry = _valid_entry(obs_id, "Should not be applied.")
+
+    with tempfile.TemporaryDirectory() as scratch:
+        file_path = os.path.join(scratch, "final_payload.json")
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"summaries": [entry]}))
+        r = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries": [entry], "summaries_file": file_path})
+        ))
+
+    assert "error" in r, r
+    assert "summaries_file" in r["error"], r
+    assert "applied" not in r, r  # nothing-applied response shape, not the normal batch shape
+
+    conn = fresh_conn(srv)
+    try:
+        row = conn.execute(
+            "SELECT recall_summary FROM nodes WHERE id = ?", (obs_id,)
+        ).fetchone()
+        assert row["recall_summary"] is None, "nothing should have been written to the DB"
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 16 (batch): relative summaries_file path -> rejected
+# ---------------------------------------------------------------------------
+
+def test_file_relative_path_rejected():
+    """A relative summaries_file path is rejected with an error naming the
+    absolute-path requirement (the MCP server's cwd is not the calling
+    agent's cwd)."""
+    srv = fresh_server()
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries_file": "relative/final_payload.json"})
+    ))
+    assert "error" in r, r
+    assert "absolute" in r["error"].lower(), r
+
+
+# ---------------------------------------------------------------------------
+# Test 17 (batch): missing summaries_file -> distinct "not found" error
+# ---------------------------------------------------------------------------
+
+def test_file_missing_file_error():
+    srv = fresh_server()
+    missing_path = "/tmp/definitely_does_not_exist_engram_test_dir_xyz/final_payload.json"
+    assert not os.path.exists(missing_path)
+    r = json.loads(srv.engram_set_recall_summaries(
+        payload_json=json.dumps({"summaries_file": missing_path})
+    ))
+    assert "error" in r, r
+    assert "not found" in r["error"].lower(), r
+    assert missing_path in r["error"], r
+
+
+# ---------------------------------------------------------------------------
+# Test 18 (batch): malformed JSON in summaries_file -> distinct error
+# ---------------------------------------------------------------------------
+
+def test_file_malformed_json_error():
+    srv = fresh_server()
+    with tempfile.TemporaryDirectory() as scratch:
+        file_path = os.path.join(scratch, "final_payload.json")
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write("{not valid json")
+        r = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries_file": file_path})
+        ))
+    assert "error" in r, r
+    assert "not valid json" in r["error"].lower(), r
+    assert "not found" not in r["error"].lower(), r  # distinct from the missing-file error
+
+
+# ---------------------------------------------------------------------------
+# Test 19 (batch): valid JSON, wrong shape -> distinct error
+# ---------------------------------------------------------------------------
+
+def test_file_wrong_shape_error():
+    srv = fresh_server()
+    with tempfile.TemporaryDirectory() as scratch:
+        file_path = os.path.join(scratch, "final_payload.json")
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"nodes": []}))  # valid JSON, wrong shape
+        r = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries_file": file_path})
+        ))
+    assert "error" in r, r
+    assert "must be a json object with 'summaries' as a list" in r["error"].lower(), r
+
+
+# ---------------------------------------------------------------------------
+# Test 20 (batch): summaries_file pointing at a directory -> distinct error
+# ---------------------------------------------------------------------------
+
+def test_file_path_is_directory_not_regular_file():
+    srv = fresh_server()
+    with tempfile.TemporaryDirectory() as scratch:
+        r = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries_file": scratch})
+        ))
+    assert "error" in r, r
+    assert "not a regular file" in r["error"].lower(), r
+
+
+# ---------------------------------------------------------------------------
+# Test 21 (batch): summaries_file with summaries=[] — not silently indistinguishable
+# ---------------------------------------------------------------------------
+
+def test_file_empty_summaries_list_is_labeled_not_silent():
+    """DESIGN DECISION: a file whose `summaries` is `[]` is NOT an error — a
+    genuinely-empty final_payload.json ("nothing to summarize tonight") is a
+    legitimate zero-item batch, same applied=0/failed=0 semantics as the bare
+    inline `{"summaries": []}` call. What changes is that the file-based
+    response ALWAYS echoes back `summaries_file` (the resolved path it read),
+    even when applied=0 — so it can never be byte-identical to, or mistaken
+    for, the bare inline no-op response, which carries no such field. Any
+    caller that wants to confirm "this really is empty, not a misread" reads
+    the file itself via the echoed path; the response makes clear a file was
+    the source in the first place."""
+    srv = fresh_server()
+    with tempfile.TemporaryDirectory() as scratch:
+        file_path = os.path.join(scratch, "final_payload.json")
+        with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"summaries": [], "failures": []}))
+        r = json.loads(srv.engram_set_recall_summaries(
+            payload_json=json.dumps({"summaries_file": file_path})
+        ))
+    assert "error" not in r, r
+    assert r["applied"] == 0, r
+    assert r["failed"] == 0, r
+    assert r["summaries_file"] == file_path, r  # the distinguishing marker
+
+    # The bare inline empty-list call carries NO such field — this is what
+    # makes the two "applied=0" cases distinguishable in the response.
+    r_inline = json.loads(srv.engram_set_recall_summaries(payload_json=json.dumps({"summaries": []})))
+    assert "summaries_file" not in r_inline, r_inline
+    assert r != r_inline, "file-based and inline empty responses must differ"
 
 
 # ===========================================================================

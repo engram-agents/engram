@@ -201,6 +201,33 @@ class TestTurnFromConfig(EmitterTestBase):
         self.assertEqual(evt["turn"], 99)
 
 
+class TestSiteKwarg(EmitterTestBase):
+    """alpha #2574 WS3: emit()'s new trailing `site` kwarg is purely additive
+    and never threaded into the L1/L2 JSONL schema (see emit()'s own
+    docstring)."""
+
+    def setUp(self):
+        super().setUp()
+        self.emitter = Emitter.init("sess_SITE", "/tmp/t.jsonl", initial_turn=1, logs_dir=self.logs_dir)
+
+    def test_emit_accepts_site_kwarg(self):
+        uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"}, site="surface-hook.surface_fire")
+        self.assertIsNotNone(uuid)
+
+    def test_site_kwarg_not_in_written_record(self):
+        self.emitter.emit("engram.surface.fire", 1, {"k": "v"}, site="surface-hook.surface_fire")
+        line = (self.logs_dir / "sessions" / "sess_SITE.l1.jsonl").read_text().strip()
+        evt = json.loads(line)
+        self.assertNotIn("site", evt)
+        self.assertNotIn("site", evt["data"])
+
+    def test_omitting_site_kwarg_unchanged(self):
+        # Backward-compat: a caller that never passes site= behaves exactly
+        # as before.
+        uuid = self.emitter.emit("engram.surface.fire", 1, {"k": "v"})
+        self.assertIsNotNone(uuid)
+
+
 class TestEmitIfInitialized(EmitterTestBase):
     def test_no_op_when_not_initialized(self):
         # Module singleton was reset in setUp

@@ -185,9 +185,9 @@ engram_resolve(payload_json=json.dumps({
 }))
 ```
 
-**Sub-case B: a replacement observation was created (engram_retract with replacement_json).**
+**Sub-case B: a replacement observation was named (engram_retract with replacement_id).**
 
-The retract may have produced a corrected replacement. If the replacement STILL contradicts the other side, follow the post-supersede case 2 pattern: new-contradict + supersede-old-contradiction.
+The retract may have been paired with a corrected replacement — created first via its own creation tool, then named via replacement_id. If the replacement STILL contradicts the other side, follow the post-supersede case 2 pattern: new-contradict + supersede-old-contradiction.
 
 **Sub-case C: the contradiction is genuinely moot now (the topic no longer matters, or both sides have been retracted).**
 

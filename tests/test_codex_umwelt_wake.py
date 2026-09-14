@@ -1,8 +1,8 @@
 """Tests for tools/codex-umwelt-wake.py.
 
-Coverage required by issue #1802:
+Coverage required by issues #1802 and #2490:
 - relevance (addressed crossings + granted mentions);
-- forward-looking seed, including newly created places;
+- forward-looking agent-wide seed and compatibility fallback;
 - restart-safe dedupe;
 - stale-marker rejection in favor of the newest loaded live thread;
 - batched wake coalescing + bounded prompt summaries;
@@ -37,11 +37,13 @@ spec.loader.exec_module(wake)
 
 
 class FakeWorld:
-    def __init__(self, place_snapshots, responses, self_name="mira"):
+    def __init__(self, place_snapshots, responses, self_name="mira", agent_responses=None):
         self.place_snapshots = list(place_snapshots)
         self.responses = {k: list(v) for k, v in responses.items()}
+        self.agent_responses = None if agent_responses is None else list(agent_responses)
         self.place_calls = 0
         self.crossing_calls = []
+        self.agent_calls = []
         self.context = type("Ctx", (), {"self_name": self_name})()
 
     def places(self):
@@ -55,6 +57,16 @@ class FakeWorld:
         queue = self.responses.get(key)
         assert queue, f"no fake response queued for {key!r}"
         return queue.pop(0)
+
+    def crossings_for_agent(self, since=None):
+        self.agent_calls.append(since)
+        if self.agent_responses is None:
+            raise wake.AgentCrossingsUnavailable("agent endpoint unavailable")
+        assert self.agent_responses, "no fake agent response queued"
+        response = self.agent_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class ScriptedRpc:
@@ -693,47 +705,312 @@ def test_monitor_recovery_raises_when_terminal_scan_exceeds_cap(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# seed/new-place behavior
+# agent-wide Umwelt polling
 # ---------------------------------------------------------------------------
 
 
-def test_seed_is_forward_only_and_new_place_is_seeded_without_replay(tmp_path):
+def test_agent_stream_seeds_forward_then_polls_once_per_cycle(tmp_path):
     state = wake.default_state()
     logger = _logger(tmp_path)
     world = FakeWorld(
-        place_snapshots=[["place_square"], ["place_square", "place_new"]],
-        responses={
-            ("place_square", None): [
-                {
-                    "crossings": [{"seq": 10, "sender": "sol", "viewer_relation": "addressee", "wake_granted": True}],
-                    "to_position": 10,
-                }
-            ],
-            ("place_square", 10): [
-                {
-                    "crossings": [{"seq": 11, "sender": "sol", "viewer_relation": "addressee", "wake_granted": True}],
-                    "to_position": 11,
-                }
-            ],
-            ("place_new", None): [
-                {
-                    "crossings": [{"seq": 1, "sender": "kepler", "viewer_relation": "addressee", "wake_granted": True}],
-                    "to_position": 3,
-                }
-            ],
-        },
+        place_snapshots=[],
+        responses={},
+        agent_responses=[
+            {
+                "crossings": [{"seq": 10, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 10,
+            },
+            {
+                "crossings": [{"seq": 11, "sender": "sol", "destination": "place_new", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 11,
+            },
+        ],
     )
 
     assert wake.poll_umwelt(world, state, logger) == "seeded"
     assert state["seeded"] is True
     assert state["queue"] == []
-    assert state["cursors"]["place_square"] == 10
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 10
+    assert state["umwelt_coverage"] == "agent-wide"
 
     assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_new:11"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 11
+    assert world.agent_calls == [None, 10]
+    assert world.place_calls == 0
+    assert world.crossing_calls == []
+
+
+def test_agent_stream_empty_seed_persists_null_marker_then_delivers_first_crossing(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    world = FakeWorld(
+        place_snapshots=[],
+        responses={},
+        agent_responses=[
+            {"crossings": [], "to_position": None},
+            {
+                "crossings": [{"seq": 1, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 1,
+            },
+        ],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    # A present null is distinct from no seed: the endpoint legitimately has
+    # no sequence yet, but the forward-only seed completed successfully.
+    assert wake._AGENT_CURSOR_KEY in state["cursors"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] is None
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:1"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 1
+    assert world.agent_calls == [None, None]
+
+
+def test_legacy_per_place_state_migrates_without_agent_history_replay(tmp_path):
+    logger = _logger(tmp_path)
+    state = wake.normalize_state({
+        "state_version": 5,
+        "seeded": True,
+        "cursors": {"place_square": 7},
+    })
+    world = FakeWorld(
+        place_snapshots=[],
+        responses={},
+        agent_responses=[{
+            "crossings": [{"seq": 9, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+            "to_position": 9,
+        }],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    assert state["queue"] == []
+    assert state["cursors"] == {"place_square": 7, wake._AGENT_CURSOR_KEY: 9}
+    assert state["umwelt_coverage"] == "agent-wide"
+    assert world.agent_calls == [None]
+    assert world.place_calls == 0
+
+
+@pytest.mark.parametrize("code", [404, 405, 501])
+def test_only_route_unavailable_http_codes_select_per_place_fallback(monkeypatch, code):
+    world = wake.WorldClient(wake.UmweltContext(self_name="mira", world_url="http://world.test"))
+    payloads = []
+
+    def unavailable(path, payload):
+        payloads.append((path, payload))
+        raise wake.urllib.error.HTTPError("http://world.test/umwelt/crossings_for_agent", code, "unavailable", None, None)
+
+    monkeypatch.setattr(world, "_request", unavailable)
+    with pytest.raises(wake.AgentCrossingsUnavailable, match=f"HTTP {code}"):
+        world.crossings_for_agent(12)
+    assert payloads == [(
+        "/umwelt/crossings_for_agent",
+        {"viewer": "mira", "agent": "mira", "since": 12},
+    )]
+
+
+def test_agent_endpoint_fallback_is_one_cycle_and_recovers(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={("place_square", None): [{"crossings": [], "to_position": 5}]},
+        agent_responses=[
+            wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent"),
+            {"crossings": [], "to_position": 10},
+        ],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    assert state["umwelt_coverage"] == "per-place-fallback"
+    assert state["cursors"]["place_square"] == 5
+    assert wake._AGENT_CURSOR_KEY not in state["cursors"]
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert state["umwelt_coverage"] == "agent-wide"
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 10
+    assert world.agent_calls == [None, 5]
+    assert world.place_calls == 1
+
+
+def test_per_place_fallback_recovers_agent_stream_without_prior_agent_cursor(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={
+            ("place_square", None): [{"crossings": [], "to_position": 5}],
+        },
+        agent_responses=[
+            wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent"),
+            {
+                "crossings": [{"seq": 6, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 6,
+            },
+        ],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    assert wake._AGENT_CURSOR_KEY not in state["cursors"]
+    assert state["umwelt_coverage"] == "per-place-fallback"
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert world.agent_calls == [None, 5]
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:6"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 6
+    assert state["umwelt_coverage"] == "agent-wide"
+
+
+def test_per_place_fallback_null_recovery_marks_agent_stream_then_delivers_first_crossing(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={
+            ("place_square", None): [{"crossings": [], "to_position": None}],
+        },
+        agent_responses=[
+            wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent"),
+            {"crossings": [], "to_position": None},
+            {
+                "crossings": [{"seq": 1, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 1,
+            },
+        ],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    assert state["cursors"]["place_square"] is None
+    assert wake._AGENT_CURSOR_KEY not in state["cursors"]
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert wake._AGENT_CURSOR_KEY in state["cursors"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] is None
+    assert state["umwelt_coverage"] == "agent-wide"
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:1"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 1
+    assert world.agent_calls == [None, None, None]
+
+
+def test_agent_fallback_agent_reconciliation_keeps_gap_and_suppresses_overlap(tmp_path):
+    state = wake.default_state()
+    logger = _logger(tmp_path)
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={
+            ("place_square", 10): [{
+                "crossings": [{"seq": 11, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 11,
+            }],
+        },
+        agent_responses=[
+            {
+                "crossings": [{"seq": 10, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 10,
+            },
+            wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent"),
+            {
+                "crossings": [
+                    {"seq": 11, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True},
+                    {"seq": 12, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True},
+                ],
+                "to_position": 12,
+            },
+        ],
+    )
+
+    assert wake.poll_umwelt(world, state, logger) == "seeded"
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 10
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert world.crossing_calls == [("place_square", 10)]
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:11"]
+
+    # Model a later recovery after the bounded delivery-ID cache has expired.
+    # Reconciliation must suppress 11 by cursor, not only by ID dedupe.
+    state["queue"] = []
+    state["delivered_event_ids"] = []
+
+    assert wake.poll_umwelt(world, state, logger) == "polled"
+    assert world.agent_calls == [None, 10, 10]
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:12"]
+    assert state["cursors"][wake._AGENT_CURSOR_KEY] == 12
+    assert state["umwelt_coverage"] == "agent-wide"
+
+
+def test_agent_to_fallback_uses_agent_cursor_for_place_without_cursor(tmp_path):
+    state = wake.default_state()
+    state["seeded"] = True
+    state["cursors"] = {wake._AGENT_CURSOR_KEY: 10}
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={
+            ("place_square", 10): [{
+                "crossings": [{"seq": 11, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 11,
+            }],
+        },
+        agent_responses=[wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent")],
+    )
+
+    assert wake.poll_umwelt(world, state, _logger(tmp_path)) == "polled"
+    assert world.crossing_calls == [("place_square", 10)]
     assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:11"]
     assert state["cursors"]["place_square"] == 11
-    assert state["cursors"]["place_new"] == 3
-    assert ("place_new", None) in world.crossing_calls
+
+
+def test_agent_to_fallback_keeps_newer_per_place_cursor(tmp_path):
+    state = wake.default_state()
+    state["seeded"] = True
+    state["cursors"] = {wake._AGENT_CURSOR_KEY: 10, "place_square": 12}
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={
+            ("place_square", 12): [{
+                "crossings": [{"seq": 13, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                "to_position": 13,
+            }],
+        },
+        agent_responses=[wake.AgentCrossingsUnavailable("HTTP 404 from crossings_for_agent")],
+    )
+
+    assert wake.poll_umwelt(world, state, _logger(tmp_path)) == "polled"
+    assert world.crossing_calls == [("place_square", 12)]
+    assert [event["id"] for event in state["queue"]] == ["umwelt-crossing:place_square:13"]
+    assert state["cursors"]["place_square"] == 13
+
+
+def test_agent_endpoint_other_failure_does_not_fall_back_to_places(tmp_path):
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={},
+        agent_responses=[wake.urllib.error.HTTPError(
+            "http://world.test/umwelt/crossings_for_agent", 500, "server error", None, None
+        )],
+    )
+
+    with pytest.raises(wake.urllib.error.HTTPError):
+        wake.poll_umwelt(world, wake.default_state(), _logger(tmp_path))
+    assert world.place_calls == 0
+    assert world.crossing_calls == []
+
+
+def test_agent_endpoint_auth_failure_does_not_select_per_place_fallback(tmp_path):
+    world = FakeWorld(
+        place_snapshots=[["place_square"]],
+        responses={},
+        agent_responses=[wake.urllib.error.HTTPError(
+            "http://world.test/umwelt/crossings_for_agent", 401, "unauthorized", None, None
+        )],
+    )
+
+    with pytest.raises(wake.urllib.error.HTTPError):
+        wake.poll_umwelt(world, wake.default_state(), _logger(tmp_path))
+    assert world.place_calls == 0
+    assert world.crossing_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -745,28 +1022,25 @@ def test_restart_dedupe_avoids_duplicate_queue_and_requeue_after_delivery(tmp_pa
     logger = _logger(tmp_path)
     state = wake.default_state()
     state["seeded"] = True
-    state["cursors"] = {"place_square": 5}
+    state["cursors"] = {wake._AGENT_CURSOR_KEY: 5}
 
     world = FakeWorld(
-        place_snapshots=[["place_square"], ["place_square"], ["place_square"]],
-        responses={
-            ("place_square", 5): [
+        place_snapshots=[],
+        responses={},
+        agent_responses=[
                 {
-                    "crossings": [{"seq": 6, "sender": "sol", "viewer_relation": "addressee", "wake_granted": True}],
-                    "to_position": 6,
-                }
-            ],
-            ("place_square", 6): [
-                {
-                    "crossings": [{"seq": 6, "sender": "sol", "viewer_relation": "addressee", "wake_granted": True}],
+                    "crossings": [{"seq": 6, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
                     "to_position": 6,
                 },
                 {
-                    "crossings": [{"seq": 6, "sender": "sol", "viewer_relation": "addressee", "wake_granted": True}],
+                    "crossings": [{"seq": 6, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
                     "to_position": 6,
                 },
-            ],
-        },
+                {
+                    "crossings": [{"seq": 6, "sender": "sol", "destination": "place_square", "viewer_relation": "addressee", "wake_granted": True}],
+                    "to_position": 6,
+                },
+        ],
     )
 
     wake.poll_umwelt(world, state, logger)
@@ -1518,6 +1792,38 @@ def test_run_cycle_poll_failure_still_delivers_codex_queue_and_upgrades_legacy_s
     assert on_disk_status["mode"] == "delivered"
     assert on_disk_status["detail"] == "codex-legacy; umwelt degraded: poll failed: umwelt offline"
     assert "umwelt poll failed: umwelt offline" in (tmp_path / "watcher.log").read_text()
+
+
+def test_run_cycle_status_reports_agent_wide_coverage_not_cursor_count(tmp_path, monkeypatch):
+    paths = wake.build_paths(tmp_path / "codex-wake")
+    state = wake.default_state()
+    state["seeded"] = True
+    state["cursors"] = {"place_square": 7, wake._AGENT_CURSOR_KEY: 12}
+    state["umwelt_coverage"] = "agent-wide"
+    wake.atomic_write_json(paths.state_path, state)
+    umwelt_config = tmp_path / "umwelt.json"
+    umwelt_config.write_text(json.dumps({"agent": "mira", "world_url": "http://world.test"}))
+
+    monkeypatch.setattr(wake, "poll_umwelt", lambda *_args: "polled")
+    monkeypatch.setattr(
+        wake,
+        "attempt_delivery",
+        lambda *_args, **_kwargs: wake.DeliveryResult(status="idle"),
+    )
+
+    status = wake.run_cycle(
+        paths=paths,
+        umwelt_config=umwelt_config,
+        app_server="ws://127.0.0.1:4500",
+        sessions_dir=tmp_path / "sessions",
+        thread_override=None,
+        logger=_logger(tmp_path),
+        started_at="2026-07-22T12:00:00+00:00",
+    )
+
+    assert status["umwelt_coverage"] == "agent-wide"
+    assert "known_places" not in status
+    assert "known_places" not in wake.default_status(paths)
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,6 @@
-"""Tests for viz_server calibration endpoint and get_calibration_data helper.
+"""Tests for viz.server calibration endpoint and viz.data.calibration's
+get_calibration_data helper (engram-alpha#2555 PR A retarget -- was
+viz_server, now split across viz.server/viz.agents/viz.data.calibration).
 
 Covers:
 1. get_calibration_data returns dict with expected top-level keys when given
@@ -24,7 +26,9 @@ from urllib.request import urlopen
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz.data import calibration as viz_calibration_data
 
 
 # ---------------------------------------------------------------------------
@@ -100,24 +104,24 @@ class TestGetCalibrationDataPopulated(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_top_level_keys_present(self):
-        result = viz_server.get_calibration_data(self.db_path)
+        result = viz_calibration_data.get_calibration_data(self.db_path)
         self.assertNotIn("error", result, f"Unexpected error: {result.get('error')}")
         for key in ("corpus", "this_turn", "rolling_7", "drift_by_type"):
             self.assertIn(key, result, f"Missing top-level key: {key}")
 
     def test_corpus_sub_keys_present(self):
-        corpus = viz_server.get_calibration_data(self.db_path)["corpus"]
+        corpus = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]
         for sub in ("by_type", "by_quote_type", "by_reasoning_type", "by_source_class"):
             self.assertIn(sub, corpus, f"Missing corpus sub-key: {sub}")
 
     def test_by_type_includes_primary_types(self):
-        by_type = viz_server.get_calibration_data(self.db_path)["corpus"]["by_type"]
+        by_type = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]["by_type"]
         for ntype in ("observation_factual", "derivation", "conjecture", "lesson"):
             self.assertIn(ntype, by_type, f"Missing type in by_type: {ntype}")
 
     def test_retracted_and_noncurrent_excluded(self):
         """Confidence 0.99 (retracted) and 0.30 (old) must not skew p95."""
-        by_type = viz_server.get_calibration_data(self.db_path)["corpus"]["by_type"]
+        by_type = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]["by_type"]
         obs = by_type["observation_factual"]
         # Only 3 active, non-retracted obs: 0.80, 0.65, 0.90
         self.assertEqual(obs["n"], 3, f"Expected n=3 after excluding retracted+old, got {obs['n']}")
@@ -126,20 +130,20 @@ class TestGetCalibrationDataPopulated(unittest.TestCase):
                              f"p95 should be ≤ 0.90 (retracted excluded), got {obs['p95']}")
 
     def test_by_quote_type_groups_correctly(self):
-        bq = viz_server.get_calibration_data(self.db_path)["corpus"]["by_quote_type"]
+        bq = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]["by_quote_type"]
         # strong_evidence: ob_001 (0.80) + ob_003 (0.90) → mean 0.85
         self.assertIn("strong_evidence", bq)
         self.assertEqual(bq["strong_evidence"]["n"], 2)
         self.assertAlmostEqual(bq["strong_evidence"]["mean"], 0.85, places=2)
 
     def test_by_reasoning_type_groups_derivations(self):
-        brt = viz_server.get_calibration_data(self.db_path)["corpus"]["by_reasoning_type"]
+        brt = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]["by_reasoning_type"]
         self.assertIn("inductive", brt)
         self.assertIn("deductive", brt)
 
     def test_drift_by_type_shape_when_present(self):
         """When drift_by_type entries exist, they must have the required fields and correct delta math."""
-        drift = viz_server.get_calibration_data(self.db_path)["drift_by_type"]
+        drift = viz_calibration_data.get_calibration_data(self.db_path)["drift_by_type"]
         # ob_001/ob_002/ob_003 use ts_now (1h ago) so they fall inside the 24h this_turn
         # window and produce ≥3 samples for observation_factual — guaranteeing at least one
         # drift entry and exercising the arithmetic assertion below.
@@ -157,7 +161,7 @@ class TestGetCalibrationDataPopulated(unittest.TestCase):
 
     def test_rolling_7_window_sub_keys_present(self):
         """rolling_7 response must have the same shape as corpus."""
-        result = viz_server.get_calibration_data(self.db_path)
+        result = viz_calibration_data.get_calibration_data(self.db_path)
         rolling_7 = result["rolling_7"]
         for sub in ("by_type", "by_quote_type", "by_reasoning_type", "by_source_class"):
             self.assertIn(sub, rolling_7, f"rolling_7 missing sub-key: {sub}")
@@ -169,7 +173,7 @@ class TestGetCalibrationDataPopulated(unittest.TestCase):
 
     def test_this_turn_sub_keys_present(self):
         """this_turn response must have the same shape as corpus."""
-        result = viz_server.get_calibration_data(self.db_path)
+        result = viz_calibration_data.get_calibration_data(self.db_path)
         this_turn = result["this_turn"]
         for sub in ("by_type", "by_quote_type", "by_reasoning_type", "by_source_class"):
             self.assertIn(sub, this_turn, f"this_turn missing sub-key: {sub}")
@@ -190,14 +194,14 @@ class TestGetCalibrationDataEmpty(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_empty_db_returns_expected_keys_not_error(self):
-        result = viz_server.get_calibration_data(self.db_path)
+        result = viz_calibration_data.get_calibration_data(self.db_path)
         self.assertNotIn("error", result, f"Empty DB raised error: {result.get('error')}")
         for key in ("corpus", "this_turn", "rolling_7", "drift_by_type"):
             self.assertIn(key, result)
 
     def test_empty_by_type_returns_zero_n_placeholders(self):
         """Every confidence-bearing type must appear in by_type with n=0 (not absent)."""
-        by_type = viz_server.get_calibration_data(self.db_path)["corpus"]["by_type"]
+        by_type = viz_calibration_data.get_calibration_data(self.db_path)["corpus"]["by_type"]
         for ntype in ("observation_factual", "derivation", "conjecture", "lesson",
                       "axiom", "definition"):
             self.assertIn(ntype, by_type, f"{ntype} absent from empty by_type")
@@ -205,7 +209,7 @@ class TestGetCalibrationDataEmpty(unittest.TestCase):
                              f"Expected n=0 for {ntype} in empty DB, got {by_type[ntype]}")
 
     def test_empty_db_drift_is_empty(self):
-        result = viz_server.get_calibration_data(self.db_path)
+        result = viz_calibration_data.get_calibration_data(self.db_path)
         self.assertEqual(result["drift_by_type"], {},
                          "drift_by_type should be empty for an empty DB")
 
@@ -213,7 +217,7 @@ class TestGetCalibrationDataEmpty(unittest.TestCase):
 class TestGetCalibrationDataMissingDB(unittest.TestCase):
 
     def test_missing_db_returns_error_key(self):
-        result = viz_server.get_calibration_data("/nonexistent/path/knowledge.db")
+        result = viz_calibration_data.get_calibration_data("/nonexistent/path/knowledge.db")
         self.assertIn("error", result)
 
 
@@ -227,12 +231,12 @@ class TestCalibrationEndpointHTTP(unittest.TestCase):
         _make_populated_db(cls.db_path)
 
         # Wire AGENTS so the handler can resolve db_path
-        cls._saved_agents = viz_server.AGENTS
-        cls._saved_default = viz_server.DEFAULT_AGENT
-        viz_server.AGENTS = {
+        cls._saved_agents = viz_agents.AGENTS
+        cls._saved_default = viz_agents.DEFAULT_AGENT
+        viz_agents.AGENTS = {
             "test_agent": {"name": "test_agent", "label": "Test", "db": cls.db_path}
         }
-        viz_server.DEFAULT_AGENT = "test_agent"
+        viz_agents.DEFAULT_AGENT = "test_agent"
 
         cls.server = HTTPServer(("127.0.0.1", 0), viz_server.Handler)
         cls.port = cls.server.server_address[1]
@@ -243,8 +247,8 @@ class TestCalibrationEndpointHTTP(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
-        viz_server.AGENTS = cls._saved_agents
-        viz_server.DEFAULT_AGENT = cls._saved_default
+        viz_agents.AGENTS = cls._saved_agents
+        viz_agents.DEFAULT_AGENT = cls._saved_default
         import shutil
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 

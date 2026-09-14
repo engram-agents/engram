@@ -32,6 +32,33 @@ Complements (does not replace) the prompt-time recall hook.
 
 TIER: T2 (Convenience) — degrades gracefully on DB unavailability; never blocks.
 Issues: #1203 (Bash/locus-1) + #1297 (MCP/locus-2) — lesson-tripwire encoding-specificity gap.
+#2858 — the harness previews only the first ~1964-2016 bytes / ~1964-2000
+characters of a hook's additionalContext inline (composite rule measured
+across two seats: min(2000 chars, last complete line under ~2048 bytes)); a
+heavily-loaded seat with many matching patterns silently lost most nudges
+past that cut, with no signal anything was dropped — and since the harness
+truncates the TAIL of the whole additionalContext string, a trailer placed
+at the END of this hook's own block was cut right along with the nudges on
+exactly the large captures this issue is about. Fixed by ordering hits by
+specificity, rendering the trailer FIRST (so it survives the tail-cut even
+when everything after it doesn't), capping the fully-rendered block
+(trailer + header + bullets) to a character ceiling below the harness's own
+cut, persisting the overflow to a file, and always emitting a
+"N shown · M cut" trailer on the tripwire block.
+
+#2863 WS2 — this hook's own bespoke render mechanism (formerly
+select_and_cap_hits / _render_tripwire_block / _build_trailer / its own
+_placeholder_overflow_path) was the REFERENCE IMPLEMENTATION
+`_hooklib.emit_context()` was generalized FROM (see that function's own
+docstring). This hook has now been folded onto the shared helper: the
+actual rendering (trailer + header + bullets, capped to
+TRIPWIRE_BLOCK_CHAR_CEILING as `target`, never exceeding the harness's hard
+`budget`) is emit_context()'s job now, called from main() below.
+write_tripwire_overflow() is unchanged and still owns the on-disk overflow
+format (node_id-keyed, one block per cut hit) — it is invoked from a small
+overflow_writer adapter that reconstructs the cut hit dicts BY POSITION
+from emit_context()'s own selection (see main()'s own comments at the
+call site for why position, not string value).
 """
 import json
 import math
@@ -44,13 +71,54 @@ from pathlib import Path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir, emit_context
+from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = os.environ.get("ENGRAM_HOME") or str(Path.home() / ".engram")
 DB_PATH = Path(ENGRAM_HOME) / "knowledge.db"
 
+# ---------------------------------------------------------------------------
+# #2858 -- tripwire-block preview cap (harness-truncation defense)
+# ---------------------------------------------------------------------------
+# Claude Code's harness only shows a preview of a PreToolUse hook's
+# additionalContext INLINE; everything past that is spilled to a file the
+# agent must deliberately open, and usually doesn't. When many tripwire
+# patterns match one command (a heavily-loaded seat, or a broad pattern),
+# this hook used to emit ALL hits in DB-query order with no cap -- so most
+# nudges were silently truncated out of context, with no signal anything
+# was cut at all.
+#
+# Round 2 (this fix): two colleagues (Borges, Ariadne) independently
+# measured the ACTUAL harness truncation boundary on real captures from live
+# sessions: it lands around 1964-2016 bytes / 1964-2000 characters (two
+# measurement rounds, reconciled to a composite rule: min(2000 characters,
+# last complete line under ~2048 bytes)). 1800 characters on the FULLY
+# RENDERED block (trailer + header + bullets, exactly as emitted -- not just
+# the bullet lines in isolation) sits safely under that boundary with
+# measured margin: worst-case byte expansion ratio ~1.008 for this file's
+# actual nudge text gives ~1814 bytes at 1800 chars -- ~200 bytes of
+# headroom under the 2016-byte observed ceiling. That headroom is a reserved
+# margin for JSON-envelope overhead and whatever other hook blocks may
+# precede this one on the same tool call -- not a value to treat as exact;
+# if the envelope/other-blocks overhead is measured precisely later, retune
+# this constant rather than treating it as derived science.
+#
+# #2863 WS2: this is now passed as `target` to `_hooklib.emit_context()`
+# (see main()), which owns the actual capping/trailer-rendering mechanism
+# this hook's own bespoke select_and_cap_hits/_render_tripwire_block/
+# _build_trailer used to implement directly. The ceiling VALUE and its
+# margin reasoning above are unchanged.
+TRIPWIRE_BLOCK_CHAR_CEILING = 1800
+
+# #2863 WS2: the fixed header line emit_context()'s `head` argument renders
+# right after the trailer -- extracted as a module constant (was previously
+# inlined inside _render_tripwire_block) so main() and this module's own
+# tests share exactly one copy of the literal text.
+TRIPWIRE_HEADER = "[lesson-tripwire] Action-moment pattern matched — remember:"
+
 _QUERY = """
 SELECT
+    id,
     COALESCE(
         json_extract(metadata, '$.scaffolding_nudge'),
         json_extract(metadata, '$.anchor_line'),
@@ -68,28 +136,639 @@ WHERE type IN ('lesson', 'cornerstone', 'axiom', 'goal')
 
 
 def load_tripwires(db_path: Path = DB_PATH):
-    """Return list of (pattern_str, nudge_str) from active lessons with situation_pattern."""
+    """Return list of (pattern_str, nudge_str, node_id) from active lessons
+    with situation_pattern.
+
+    #2753 epic WS2: node_id was added (3rd tuple element, minimal extension
+    of the pre-existing (pattern, nudge) shape) so check_command's hits can
+    carry the firing node's id for generalization_chain() lookups, without
+    touching what the existing nudge block renders."""
     if not db_path.exists():
         return []
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
         rows = conn.execute(_QUERY).fetchall()
         conn.close()
-        return [(row[1], row[0]) for row in rows if row[0] and row[1]]
+        return [(row[2], row[1], row[0]) for row in rows if row[1] and row[2]]
     except Exception:
         return []
 
 
 def check_command(match_target: str, tripwires) -> list:
-    """Return list of scaffolding nudges whose situation_pattern matches match_target."""
+    """Return list of {"nudge": str, "node_id": str, "pattern": str} dicts
+    for every situation_pattern that matches match_target.
+
+    #2753 epic WS2: hits carry node_id (in addition to the pre-existing
+    nudge text) so the caller can compute generalization_chain() per hit for
+    the additive "[triggered principles]" section, without changing what
+    the existing nudge block renders (main() reads hit["nudge"] where it
+    used to read the hit string directly).
+
+    #2858: hits ALSO carry the firing pattern itself now (3rd-then-4th
+    field, minimal extension of the same shape) -- purely so main() can
+    order hits by specificity (len(pattern), descending) before rendering
+    and capping, per the preview-truncation fix above. This does NOT change
+    the matching logic or the circumstances under which a hit fires -- still
+    exactly one hit per matching pattern."""
     hits = []
-    for pattern, nudge in tripwires:
+    for pattern, nudge, node_id in tripwires:
         try:
             if re.search(pattern, match_target, re.IGNORECASE):
-                hits.append(nudge)
+                hits.append({"nudge": nudge, "node_id": node_id, "pattern": pattern})
         except re.error:
             pass  # malformed pattern — skip silently
     return hits
+
+
+def _tripwire_bullet(hit: dict) -> str:
+    """Render one hit's bullet line -- the exact per-item body string
+    emit_context() renders, one per shown hit (was previously inlined
+    inside the now-removed _render_tripwire_block). Extracted as its own
+    function so main() and this module's tests share one copy of the
+    format."""
+    return f"  • {hit['nudge']}"
+
+
+# #2863 WS2: select_and_cap_hits / _render_tripwire_block / _build_trailer /
+# this module's own _placeholder_overflow_path (the bespoke mechanism
+# `_hooklib.emit_context()` was generalized FROM -- see that function's
+# docstring) are REMOVED. main() below calls emit_context() directly for
+# both the selection (shown vs. cut) AND the rendering (trailer + header +
+# bullets) -- one call, one source of truth, replacing four separate
+# hand-written functions that had to be kept in lockstep by hand. The
+# empirical equivalence (byte-identical selection + rendering on every
+# fixture this file's own test suite exercises, including the
+# always-show-at-least-one-hit edge case) was verified before this removal
+# landed -- see the PR description for the comparison.
+
+
+def write_tripwire_overflow(cut_hits: list, now: float | None = None) -> str:
+    """Persist the full node_id + nudge text of every hit emit_context()
+    cut (or, for the rare item-alone-exceeds-the-hard-budget case, marked
+    truncated-in-band -- see main()'s own overflow_writer adapter), so the
+    trailer/marker in the visible tripwire block can point somewhere real
+    instead of leaving the reader with no way to recover what was dropped.
+
+    #2858 Piece 2: written to ENGRAM_HOME/tripwire-overflow/<ts>-<pid>.txt (a
+    NEW directory, created on demand). File name is deterministic enough for a
+    test to reconstruct the exact path given the same `now` + pid. `now`
+    defaults to time.time() but accepts an injected value so tests can assert
+    on an exact resulting path.
+
+    Never raises -- like every other helper in this file, a broken overflow-
+    file write must never suppress the nudges that DID make it into the
+    visible block, and must never crash the hook (this hook's whole contract,
+    per the module docstring, is "never blocks"). Returns "" on any failure,
+    including an empty cut_hits list (nothing to write).
+    """
+    if not cut_hits:
+        return ""
+    try:
+        if now is None:
+            import time as _time
+            now = _time.time()
+        overflow_dir = Path(ENGRAM_HOME) / "tripwire-overflow"
+        overflow_dir.mkdir(parents=True, exist_ok=True)
+        overflow_path = overflow_dir / f"{int(now)}-{os.getpid()}.txt"
+        blocks = [
+            f"[{hit.get('node_id', '?')}] {hit.get('nudge', '')}"
+            for hit in cut_hits
+        ]
+        overflow_path.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+        return str(overflow_path)
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# #2753 epic WS2 — generalization-chain render at the tripwire (D3 point 1)
+# ---------------------------------------------------------------------------
+# ADDITIVE to the existing nudge block above: for each hit this fire, walk
+# generalization_chain() on its node id and render one merged, deduped-by-
+# head "[triggered principles]" section. Dedupe is scoped to THIS ONE fire
+# (Case 1 in the issue's D3) -- no new cooldown/suppression across fires
+# (Case 2 is explicitly unchanged, per the issue). Never raises: the call
+# site in main() wraps this in its own try/except, matching
+# check_in_turn_recall's posture -- a failure here must never suppress the
+# existing nudge block, and vice versa.
+
+_GENERALIZATION_CHAIN_FN = None
+_GENERALIZATION_CHAIN_IMPORT_ATTEMPTED = False
+
+
+def _import_generalization_chain():
+    """Lazily import generalization_chain from engram_core (#2753 WS1) --
+    lazy, like engram_idf's import in check_in_turn_recall below, so this
+    hook never crashes at import time if engram_core isn't yet resolvable
+    (e.g. a partial/mid-upgrade install). Memoized (including a failed
+    lookup) so a missing module doesn't re-pay the resolve+import cost on
+    every hit within one process; each hook invocation is a fresh process
+    anyway, so the memo only helps within a single fire's multiple hits."""
+    global _GENERALIZATION_CHAIN_FN, _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED
+    if _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED:
+        return _GENERALIZATION_CHAIN_FN
+    _GENERALIZATION_CHAIN_IMPORT_ATTEMPTED = True
+    try:
+        runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_core.py")
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        from engram_core import generalization_chain
+        _GENERALIZATION_CHAIN_FN = generalization_chain
+    except Exception:
+        _GENERALIZATION_CHAIN_FN = None
+    return _GENERALIZATION_CHAIN_FN
+
+
+def _truncate_for_label(text: str, limit: int = 60) -> str:
+    """Short, single-line excerpt for the merged-head summary line -- never
+    raises on a non-string/None input (defensive: claim/recall_summary are
+    both nullable per generalization_chain's own docstring)."""
+    if not text:
+        return ""
+    text = str(text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def render_triggered_principles(hits: list, db_path: "Path | None" = None) -> str:
+    """#2753 epic WS2, D3 point 1: for this ONE tripwire fire, walk each
+    hit's generalization_chain() and render ONE additive "[triggered
+    principles]" section, deduped by HEAD across all of this fire's hits
+    (D3's Case 1 -- within one fire; Case 2, the existing per-node
+    recent-id/repeat-count cooldown machinery, is untouched and not this
+    function's concern).
+
+    Per head: every non-head node reached (from any hit sharing that head,
+    merged into one subgraph, ordered by depth) renders as a one-liner
+    (`recall_summary` only -- never `claim`, which is absent on non-head
+    entries by generalization_chain's own contract); the head itself
+    renders its `claim` IN FULL. When more than one of this fire's
+    chain-bearing hits share a head, one line names the convergence
+    ("N of these M matches sit under <head_id> (<short label>)") before the
+    merged rungs.
+
+    A hit whose own node has NO generalizes ancestor at all (already a head
+    with nothing above it -- chain contains only the node itself) renders
+    NOTHING for that hit; the section is emitted at all only when at least
+    one hit produced a real chain OR at least one hit's chain reported
+    `cycle_detected` (see below).
+
+    #2753 WS2 round 2 -- `cycle_detected` (WS1's cycle-guard fix, 5e14f83b):
+    a hit whose chain comes back with `cycle_detected: True` has NO valid
+    head to render (structurally impossible in a valid DAG -- the resolved
+    graph actually contains a cycle). Rendering the normal head/rung
+    structure is impossible (there is no head), and silently skipping it
+    like the no-ancestor case above would be the exact bug WS1 fixed one
+    layer down: an omitted section reads as "no chain exists", which is
+    false -- a chain WAS found, it's just corrupt. So a cycle-detected hit
+    renders its own one-line malformed-data notice instead, visibly
+    distinct from both a normal rendered chain and from omission.
+
+    #2753 WS2 round 3 -- `truncated` (present since WS1's original commit,
+    read by this function for the first time): a hit whose chain reports
+    `heads: []` and `cycle_detected: False` and `truncated: True` has real
+    partial ancestry -- `max_depth` was hit while nodes were still pending
+    expansion, so a head genuinely exists above what was walked, it just
+    wasn't reached. Falling into the same silent skip as the no-ancestor
+    case would misreport "no chain exists" exactly as the cycle_detected
+    case would -- a milder instance of the same problem, since the data
+    here is incomplete rather than corrupt. So a truncated-with-no-head hit
+    renders its own one-line "chain truncated" notice (no rungs shown --
+    the walk never reached far enough to have any to show) -- worded and
+    marked (`…`, not `⚠`) to read as incomplete-but-honest data rather than
+    malformed data, and never both: `cycle_detected` and
+    `truncated` are mutually exclusive by generalization_chain's own
+    contract (`cycle_detected` requires `truncated: False`), so the two
+    checks below never fire on the same hit.
+
+    Returns "" on: no hits, no importable generalization_chain, any DB/walk
+    failure, or no hit producing a real chain and no hit reporting
+    cycle_detected or a truncated-with-no-head walk. Never raises -- this
+    hook's T2 "never blocks" contract (see module docstring) applies to
+    this additive section exactly as it does to the pre-existing nudge
+    block.
+
+    db_path defaults to None (resolved to the module-level DB_PATH INSIDE
+    the function body, not as a mutable default-argument value) so a test
+    that monkeypatches DB_PATH after this module is imported is honored on
+    the no-arg call path main() uses -- a `db_path: Path = DB_PATH` default
+    would instead freeze at the value DB_PATH held at function-definition
+    time (import time), same footgun load_tripwires's own default already
+    carries (harmless there since every caller passes db_path explicitly).
+    """
+    if not hits:
+        return ""
+    if db_path is None:
+        db_path = DB_PATH
+    generalization_chain = _import_generalization_chain()
+    if generalization_chain is None:
+        return ""
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        # head_id -> {"nodes": {resolved_id: entry, ...}, "hit_ids": [node_id, ...]}
+        heads_seen: dict = {}
+        head_order: list = []
+        relevant_hit_count = 0
+        # #2753 WS2 round 2 -- node ids whose own chain() call reported
+        # cycle_detected: True (WS1 5e14f83b). Kept separate from
+        # heads_seen: a cycle-detected chain has NO head to merge into, by
+        # definition (cycle_detected implies heads == []), so it is never a
+        # candidate for the head-dedupe machinery above -- it renders its
+        # own standalone malformed-data line instead. Dedup by node_id in
+        # first-seen order (a hit list should not repeat a node_id in
+        # practice, but this stays cheap insurance).
+        cycle_detected_ids: list = []
+        # #2753 WS2 round 3 -- node ids whose own chain() call reported
+        # heads == [] with truncated: True (real ancestry exists, the walk
+        # was just cut off by max_depth before reaching a head). Kept
+        # separate from heads_seen for the same reason cycle_detected_ids
+        # is: there is no head to merge into. Kept separate from
+        # cycle_detected_ids too, even though both are "heads == [] and
+        # nothing to merge into" -- the two states are mutually exclusive
+        # (see docstring) and read differently to a human, so each gets its
+        # own notice line and its own dedup list.
+        truncated_ids: list = []
+        for hit in hits:
+            node_id = hit.get("node_id") if isinstance(hit, dict) else None
+            if not node_id:
+                continue
+            chain = generalization_chain(conn, node_id)
+            nodes = chain.get("nodes") or {}
+            start_resolved = chain.get("start_resolved_id")
+            heads = chain.get("heads") or []
+            if chain.get("cycle_detected"):
+                if node_id not in cycle_detected_ids:
+                    cycle_detected_ids.append(node_id)
+                continue
+            if not heads and chain.get("truncated"):
+                if node_id not in truncated_ids:
+                    truncated_ids.append(node_id)
+                continue
+            # No generalizes ancestor at all -- already a head with nothing
+            # above it. Nothing to render for this hit (D3: "render nothing
+            # extra for it; only render the section when there is an
+            # actual chain to show").
+            if not heads or (len(nodes) <= 1 and start_resolved in nodes):
+                continue
+            relevant_hit_count += 1
+            for head_id in heads:
+                if head_id not in heads_seen:
+                    heads_seen[head_id] = {"nodes": {}, "hit_ids": []}
+                    head_order.append(head_id)
+                heads_seen[head_id]["hit_ids"].append(node_id)
+                heads_seen[head_id]["nodes"].update(nodes)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not heads_seen and not cycle_detected_ids and not truncated_ids:
+        return ""
+
+    lines = ["[triggered principles]"]
+    for node_id in cycle_detected_ids:
+        lines.append(
+            f"  ⚠ {node_id} — principle-chain data is malformed (a cycle "
+            "was detected in the resolved generalizes graph); chain not shown"
+        )
+    for node_id in truncated_ids:
+        lines.append(
+            f"  … {node_id} — principle chain truncated (max depth reached "
+            "before a head was found); further ancestry likely exists but "
+            "is not shown"
+        )
+    for head_id in head_order:
+        entry = heads_seen[head_id]
+        merged_nodes = entry["nodes"]
+        contributing = entry["hit_ids"]
+        head_entry = merged_nodes.get(head_id, {})
+        if len(contributing) > 1:
+            label = _truncate_for_label(head_entry.get("claim") or head_entry.get("recall_summary"))
+            lines.append(
+                f"  {len(contributing)} of these {relevant_hit_count} matches sit under "
+                f"{head_id} ({label})" if label else
+                f"  {len(contributing)} of these {relevant_hit_count} matches sit under {head_id}"
+            )
+        non_head_ids = sorted(
+            (nid for nid in merged_nodes if nid != head_id),
+            key=lambda nid: merged_nodes[nid].get("depth", 0),
+        )
+        for nid in non_head_ids:
+            summary = merged_nodes[nid].get("recall_summary") or ""
+            lines.append(f"  ↑ {nid} — {summary}")
+        head_claim = head_entry.get("claim") or ""
+        lines.append(f"  ↑ {head_id} — {head_claim}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# alpha#1944 step 2 — shadow-block logging
+# ---------------------------------------------------------------------------
+# A SEPARATE query + check path from load_tripwires/check_command above,
+# deliberately not folded into them: those two feed the advisory-nudge
+# injection every lesson/cornerstone/axiom/goal has always had, and this
+# repo's tests construct bare (pattern, nudge) 2-tuples as fixtures for that
+# path. Widening that tuple shape to carry prevention_type would silently
+# break every such fixture. prevention_type only exists on lesson nodes
+# (engram_epistemic.PREVENTION_TYPES), so this path queries just lessons,
+# runs independently, and — like check_in_turn_recall — must never suppress
+# or be suppressed by the advisory-nudge path.
+
+PREVENTION_LEDGER_PATH = Path(ENGRAM_HOME) / "lesson-prevention-ledger.jsonl"
+
+_PREVENTION_QUERY = """
+SELECT
+    id,
+    json_extract(metadata, '$.situation_pattern')  AS pattern,
+    json_extract(metadata, '$.prevention_type')    AS prevention_type,
+    COALESCE(json_extract(metadata, '$.scaffolding_nudge'), claim) AS nudge
+FROM nodes
+WHERE type = 'lesson'
+  AND is_current = 1
+  AND memory_status = 'active'
+  AND json_extract(metadata, '$.situation_pattern') IS NOT NULL
+  AND json_extract(metadata, '$.situation_pattern') != ''
+  AND json_extract(metadata, '$.prevention_type') IN ('shadow', 'blocking')
+"""
+
+
+def load_prevention_lessons(db_path: Path = DB_PATH):
+    """Return list of {id, pattern, prevention_type, nudge} for lessons
+    whose prevention_type is 'shadow' or 'blocking' (advisory/absent
+    lessons are excluded — they have nothing to log or deny here)."""
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+        rows = conn.execute(_PREVENTION_QUERY).fetchall()
+        conn.close()
+        return [
+            {"id": row[0], "pattern": row[1], "prevention_type": row[2], "nudge": row[3] or ""}
+            for row in rows if row[1] and row[2]
+        ]
+    except Exception:
+        return []
+
+
+# alpha#1944 step 3 — override token detection. Kepler's verified design
+# (Lei-authorized throwaway test, PreToolUse deny confirmed reachable on
+# this plugin): the override is STATELESS and single-call-scoped — nothing
+# persists, nothing to re-arm. The retry IS the override. Bash embeds it as
+# a harmless leading env-var assignment (ENGRAM_OVERRIDE="ls_NNNN: <reason>"
+# <same command> — the shell sets the var and runs the command unchanged;
+# the hook only reads the literal command STRING, never executes it). MCP
+# tools carry it as an "override_lesson" field in payload_json, which lands
+# inside build_match_target's compact-JSON args string the same way any
+# other field would. One regex covers both shapes since both end up
+# somewhere inside match_target.
+#
+# The hook itself can only ALLOW or DENY — it cannot strip override_lesson
+# before the call reaches the tool. That gap is closed centrally instead:
+# server.py's _parse_payload() pops override_lesson before any tool's own
+# unknown-field check runs, so every MCP tool is covered without touching
+# each one's individual allowlist (see _parse_payload's own docstring).
+_OVERRIDE_TOKEN_RE = r'(?:ENGRAM_OVERRIDE\s*=\s*"|"override_lesson"\s*:\s*")%s\s*:\s*([^"]*)"'
+
+
+def _find_override(match_target: str, lesson_id: str) -> str | None:
+    """Return the override reason for lesson_id if a matching
+    ENGRAM_OVERRIDE / override_lesson token is present in match_target,
+    else None. Never raises."""
+    try:
+        m = re.search(_OVERRIDE_TOKEN_RE % re.escape(lesson_id), match_target)
+    except re.error:
+        return None
+    return m.group(1).strip() if m else None
+
+
+def check_shadow_block(match_target: str, prevention_lessons, hook_input: dict | None = None) -> list:
+    """Return a list of would-have-blocked fire records — one per matching
+    shadow/blocking lesson, including whether an override token for that
+    lesson was present (#1944 step 3 — the override token IS the label
+    step 4's auto-demotion counter reads). Never raises: a malformed
+    pattern is skipped silently, matching check_command's posture."""
+    hits = []
+    for lesson in prevention_lessons:
+        pattern = lesson["pattern"]
+        try:
+            match = re.search(pattern, match_target, re.IGNORECASE)
+        except re.error:
+            continue  # malformed pattern — skip silently, same as check_command
+        if not match:
+            continue
+        override_reason = _find_override(match_target, lesson["id"])
+        hits.append({
+            "lesson_id": lesson["id"],
+            "prevention_type": lesson["prevention_type"],
+            "matched_span": match.group(0),
+            "tool_name": (hook_input or {}).get("tool_name"),
+            "session_id": (hook_input or {}).get("session_id"),
+            "override_present": override_reason is not None,
+            "override_reason": override_reason,
+        })
+    return hits
+
+
+# alpha#1944 step 4 — auto-demotion, Kepler's read-time-lease design
+# (forum #387, 2026-09-04): the hook NEVER writes the graph directly — that
+# is the no-raw-DB-edits rule, and the audit trail (field_traces,
+# edit_history, turn stamp) belongs to engram_update_lesson, the module
+# that owns it. "Mechanically demoted" stays true anyway because the hook
+# computes the EFFECTIVE prevention_type at read time from the ledger, not
+# only from the lesson's stored metadata: once a blocking lesson has N
+# overrides inside the window, THIS call (and every call after it, until
+# the durable write lands) is treated as advisory. A lease, not a latch —
+# it decays to safe immediately from the signal already on disk; the
+# durable write is a follow-up (a person, or a dream-cycle reconcile pass
+# reading the "threshold crossed" ledger entries this emits) tracked
+# separately, not built in this hook.
+_DEMOTION_DEFAULTS = {"overrides": 2, "window_days": 7}
+
+
+def _demotion_config() -> dict:
+    """Read lessons.blocking_demotion from config.json; safe defaults.
+
+    Default (overrides=2, window_days=7) is Kepler's pick made 2026-09-04,
+    not a considered policy from Lei — retune via config.json:
+      {"lessons": {"blocking_demotion": {"overrides": 2, "window_days": 7}}}
+    Reasoning stated on the issue: a lesson only reaches "blocking" after a
+    zero-false-positive shadow window, so one override is plausibly an
+    accepted-risk case; two legitimate overrides in a week is evidence the
+    pattern matches legitimate calls and should stop blocking.
+    """
+    try:
+        with open(Path(ENGRAM_HOME) / "config.json", "r", encoding="utf-8") as f:
+            config = json.load(f)
+        section = (config.get("lessons", {}) or {}).get("blocking_demotion", {}) or {}
+        return {
+            "overrides": int(section.get("overrides", _DEMOTION_DEFAULTS["overrides"])),
+            "window_days": float(section.get("window_days", _DEMOTION_DEFAULTS["window_days"])),
+        }
+    except Exception:
+        return dict(_DEMOTION_DEFAULTS)
+
+
+def _count_recent_overrides(lesson_id: str, window_days: float, now: float) -> int:
+    """Count override_present=True ledger entries for lesson_id within the
+    last window_days. Best-effort: any read failure counts as 0, never
+    raises. Only called on an actual blocking-lesson match (rare by
+    design — the whole point of blocking is deterrence), so scanning the
+    full ledger stays cheap in practice."""
+    if not PREVENTION_LEDGER_PATH.exists():
+        return 0
+    cutoff = now - (window_days * 86400)
+    count = 0
+    try:
+        with open(PREVENTION_LEDGER_PATH) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if (
+                    entry.get("lesson_id") == lesson_id
+                    and entry.get("override_present")
+                    and entry.get("ts", 0) >= cutoff
+                ):
+                    count += 1
+    except Exception:
+        return count
+    return count
+
+
+def check_blocking_deny(match_target: str, prevention_lessons, now: float | None = None) -> dict | None:
+    """Return a decision for the FIRST 'blocking' lesson matched without a
+    valid override this call, or None if nothing to report.
+
+    Only prevention_type == 'blocking' is ever consulted — 'shadow' never
+    denies or demotes (that is the entire distinction; shadow only logs,
+    via check_shadow_block above). A lesson-id-matching override token
+    lets THIS call through outright (still recorded as a hit by
+    check_shadow_block); it is checked before the demotion count so an
+    overridden call is never ALSO reported as a demotion.
+
+    Otherwise checks the read-time lease: if this lesson already has
+    demotion_config()["overrides"] overrides inside the window, the
+    returned dict carries demoted=True and override_count/threshold —
+    main() must NOT deny on that, only log + warn. A genuine denial (no
+    override this call, threshold not yet crossed) carries demoted=False.
+    """
+    if now is None:
+        import time as _time
+        now = _time.time()
+    cfg = _demotion_config()
+    for lesson in prevention_lessons:
+        if lesson["prevention_type"] != "blocking":
+            continue
+        pattern = lesson["pattern"]
+        try:
+            match = re.search(pattern, match_target, re.IGNORECASE)
+        except re.error:
+            continue
+        if not match:
+            continue
+        if _find_override(match_target, lesson["id"]) is not None:
+            continue  # overridden this call — do not deny or demote-report
+        override_count = _count_recent_overrides(lesson["id"], cfg["window_days"], now)
+        base = {
+            "lesson_id": lesson["id"],
+            "matched_span": match.group(0),
+            "nudge": lesson.get("nudge", ""),
+        }
+        if override_count >= cfg["overrides"]:
+            base.update({
+                "demoted": True,
+                "override_count": override_count,
+                "threshold": cfg["overrides"],
+                "window_days": cfg["window_days"],
+            })
+        else:
+            base["demoted"] = False
+        return base
+    return None
+
+
+def build_deny_reason(deny: dict) -> str:
+    """Build the permissionDecisionReason text for a blocking denial —
+    lesson id, matched span, the nudge, and the exact override recipe
+    (Kepler's verified design: JSON permissionDecision form, its reason
+    rendering cleanly as the tool error rather than a hook-crash-shaped
+    exit-2 message)."""
+    lesson_id = deny["lesson_id"]
+    return (
+        f"[lesson-tripwire BLOCKING] {lesson_id} matched {deny['matched_span']!r} "
+        f"— this call is blocked, not merely advised.\n"
+        f"{deny['nudge']}\n\n"
+        f"If you've reviewed this and the call is correct, retry with the exact "
+        f"same call plus a single-use override naming this lesson and your reason:\n"
+        f"  Bash:  ENGRAM_OVERRIDE=\"{lesson_id}: <your reason>\" <same command>\n"
+        f"  MCP:   add \"override_lesson\": \"{lesson_id}: <your reason>\" to payload_json\n"
+        f"The override is single-call-scoped — nothing persists, nothing to re-arm."
+    )
+
+
+def _log_threshold_crossed(now: float, deny: dict) -> None:
+    """alpha#1944 step 4 — the read-time-lease signal: a loud stderr line
+    (hook stdout is reserved for the additionalContext/deny JSON contract;
+    stderr is safe to use freely) plus a distinct ledger entry, emitted
+    the FIRST time a call would have denied but the override threshold was
+    already crossed. Best-effort, never raises."""
+    lesson_id = deny["lesson_id"]
+    try:
+        print(
+            f"[lesson-tripwire] AUTO-DEMOTED (lease) {lesson_id}: "
+            f"{deny['override_count']} overrides in the last {deny['window_days']} "
+            f"day(s) (threshold {deny['threshold']}) — treating as advisory on this "
+            f"call; durable prevention_type write still pending (engram_update_lesson).",
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+    try:
+        with open(PREVENTION_LEDGER_PATH, "a") as f:
+            f.write(json.dumps({
+                "ts": now,
+                "lesson_id": lesson_id,
+                "mode": "auto_demoted_lease",
+                "override_count": deny["override_count"],
+                "threshold": deny["threshold"],
+                "window_days": deny["window_days"],
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _append_prevention_ledger(now: float, hits: list) -> None:
+    """Best-effort append of one JSONL entry per would-have-blocked fire
+    (alpha#1944 step 2, extended step 3 with override fields — the log a
+    future promotion/demotion gate reads). Mirrors _append_ledger's
+    never-raises contract: a ledger failure must never suppress or delay
+    the tripwire path it rides alongside."""
+    if not hits:
+        return
+    try:
+        with open(PREVENTION_LEDGER_PATH, "a") as f:
+            for hit in hits:
+                f.write(json.dumps({
+                    "ts": now,
+                    "lesson_id": hit["lesson_id"],
+                    "mode": hit["prevention_type"],
+                    "tool_name": hit["tool_name"],
+                    "session_id": hit["session_id"],
+                    "matched_span": hit["matched_span"],
+                    "override_present": hit.get("override_present", False),
+                    "override_reason": hit.get("override_reason"),
+                    # step 4 field (independent-predicate verdict) lands
+                    # when the auto-demotion counter is wired.
+                }) + "\n")
+    except Exception:
+        pass
 
 
 def build_match_target(hook_input: dict) -> str:
@@ -561,16 +1240,171 @@ def main() -> None:
         if not match_target or not match_target.strip():
             sys.exit(0)
 
+        # alpha#1944 step 3 — the deny gate, checked FIRST and computed
+        # inside its own fail-open try/except. This is the one place this
+        # hook can refuse a tool call at all; every other check in this
+        # function only ever ADDS advisory context. A failure loading
+        # prevention lessons, or any other exception while computing the
+        # deny decision, MUST resolve to "do not deny" — infra failure is
+        # never a reason to block a call (Kepler's design point 5: the only
+        # reachable failure mode is loud-advisory, never silent no-op and
+        # never deadlock). prevention_lessons is computed once and reused
+        # by the shadow-block logging below.
+        prevention_lessons = []
+        deny = None
+        try:
+            prevention_lessons = load_prevention_lessons()
+            if prevention_lessons:
+                deny = check_blocking_deny(match_target, prevention_lessons)
+        except Exception:
+            deny = None
+
+        if deny is not None and deny.get("demoted"):
+            # Read-time lease (step 4): do NOT deny — this lesson's
+            # override count already crossed the auto-demotion threshold,
+            # so the effective state is advisory for this call even though
+            # the durable prevention_type write hasn't landed. Log loudly
+            # and fall through to the normal advisory path below.
+            try:
+                import time as _time
+                _log_threshold_crossed(_time.time(), deny)
+            except Exception:
+                pass
+            deny = None
+
+        if deny is not None:
+            response = {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": build_deny_reason(deny),
+                }
+            }
+            print(json.dumps(response))
+            sys.exit(0)
+
         parts = []
 
         tripwires = load_tripwires()
         hits = check_command(match_target, tripwires) if tripwires else []
+        # #2858 Piece 1 — order by specificity (pattern length, descending)
+        # before rendering/capping. Ties preserve check_command's original
+        # (DB-query) order — sorted() is stable, so this is just the sort
+        # key, no explicit tiebreak needed. This does NOT change which hits
+        # fire, only the order they're considered for the character-ceiling
+        # selection below (a longer, more specific pattern is judged more
+        # likely to be the useful nudge when not everything can fit).
+        #
+        # Reviewer-fairy round 1 (PR #2860): this resort also changes the
+        # order `shown_hits` carries into render_triggered_principles below
+        # (Piece 3) -- including in the ZERO-CUT case, where shown_hits ==
+        # hits by MEMBERSHIP but not by the pre-sort DB-query ORDER. That
+        # section only uses order to decide which "generalizes" head prints
+        # first when several hits share one, so this is a presentation-only
+        # effect (which head-group appears first), never a correctness one
+        # (which heads appear, or what they say) -- not worth threading a
+        # second, unsorted hits list through main() just to preserve an
+        # ordering nothing downstream depends on.
+        shown_hits = []
         if hits:
-            nudge_lines = "\n".join(f"  • {h}" for h in hits)
-            parts.append(
-                "[lesson-tripwire] Action-moment pattern matched — remember:\n"
-                f"{nudge_lines}"
+            hits = sorted(hits, key=lambda h: -len(h.get("pattern") or ""))
+            # #2863 WS2 — render via the shared _hooklib.emit_context()
+            # helper instead of this hook's own former select_and_cap_hits/
+            # _render_tripwire_block/_build_trailer (removed above).
+            # `bullets` is the SAME ordered (most-specific-first) list of
+            # per-hit strings the old _render_tripwire_block used to build
+            # inline; emit_context() now owns the capping (which prefix
+            # fits under `target`) AND the trailer/header rendering in one
+            # call -- verified (see PR description) to select and render
+            # byte-identically to the old mechanism on this file's own test
+            # fixtures, including the always-show-at-least-one-hit case
+            # (allow_single_overflow=True reproduces that guarantee: the
+            # single most-important hit is still shown in full as long as
+            # it fits the harness's hard `budget`, only truncated in-band
+            # in the pathological case where even one hit alone exceeds
+            # that hard ceiling -- something the old mechanism had no
+            # protection against at all).
+            bullets = [_tripwire_bullet(h) for h in hits]
+
+            # emit_context() calls this ONLY with the item strings it
+            # itself decided to cut/truncate -- always either a trailing
+            # SUFFIX of `bullets` (the ordinary cut case), or, in the rare
+            # case where even the single most-important hit's own block
+            # exceeds the harness's hard budget, the ENTIRE list (that
+            # hit's own FULL untruncated text is included alongside the
+            # genuinely-cut rest, so nothing is unrecoverable -- see
+            # emit_context()'s own docstring, "Stage 3"). Reconstructed
+            # back to hit dicts BY POSITION (never by nudge-text VALUE,
+            # which could collide if two different hits happen to share
+            # identical nudge text) so write_tripwire_overflow()'s existing
+            # node_id-keyed on-disk format is preserved byte-for-byte.
+            cut_hits_holder: dict = {"cut": []}
+
+            def _tripwire_overflow_writer(items: list) -> str:
+                cut_n = len(items)
+                cut = hits[-cut_n:] if 0 < cut_n <= len(hits) else []
+                cut_hits_holder["cut"] = cut
+                return write_tripwire_overflow(cut) if cut else ""
+
+            budgets = get_harness_budgets(detect_harness())
+            parts.append(emit_context(
+                TRIPWIRE_HEADER,
+                bullets,
+                budget=budgets["budget"],
+                target=TRIPWIRE_BLOCK_CHAR_CEILING,
+                allow_single_overflow=True,
+                overflow_writer=_tripwire_overflow_writer,
+            ))
+
+            # shown_hits feeds render_triggered_principles below (Piece 3)
+            # — never the full, uncapped `hits`, so a "[triggered
+            # principles]" line never cites a lesson whose own nudge text
+            # was cut from the visible block. Derived from cut_hits_holder
+            # (set as a side effect of the emit_context() call above, via
+            # the overflow_writer): everything NOT cut is shown, except the
+            # pathological case above where the writer receives ALL hits
+            # (item 0's full text for recovery + the genuinely-cut rest) —
+            # there, item 0 is still "shown" (marker-truncated in-band, not
+            # dropped), so it is never left out of the principles section.
+            cut_hits = cut_hits_holder["cut"]
+            shown_hits = hits[: len(hits) - len(cut_hits)] if cut_hits else hits
+            if not shown_hits and hits:
+                shown_hits = hits[:1]
+
+        # #2753 epic WS2 (D3 point 1) — generalization-chain render, ADDITIVE
+        # after the nudge block above and independently guarded: a failure
+        # computing the principles section must NEVER suppress the existing
+        # nudge (already appended above), and vice versa (the existing nudge
+        # append above already ran and is untouched by anything below).
+        #
+        # #2858 Piece 3 — only SHOWN hits feed this, never the full/uncapped
+        # `hits` list: a principle-chain citation for a hit whose own nudge
+        # text was cut from the visible block above would reference
+        # something the reader can't see the reason for.
+        if hits:
+            try:
+                principles_block = render_triggered_principles(shown_hits)
+            except Exception:
+                principles_block = ""
+            if principles_block:
+                parts.append(principles_block)
+
+        # alpha#1944 step 2 — shadow-block logging. Independently guarded,
+        # same posture as in-turn recall below: a logging failure must never
+        # suppress a tripwire hit, and a tripwire failure must never suppress
+        # this. Nothing here changes what the agent sees — shadow lessons
+        # (and any blocking lesson that WAS overridden, since deny already
+        # returned above otherwise) still only ever inject the advisory
+        # nudge above; this purely appends to the promotion-gate ledger.
+        try:
+            import time as _time
+            shadow_hits = (
+                check_shadow_block(match_target, prevention_lessons, hook_input)
+                if prevention_lessons else []
             )
+            _append_prevention_ledger(_time.time(), shadow_hits)
+        except Exception:
+            pass
 
         # In-turn ambient recall (#1690) — independently guarded; a recall
         # failure must never suppress a tripwire hit (and vice versa).

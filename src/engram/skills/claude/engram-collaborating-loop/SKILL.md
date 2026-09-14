@@ -178,14 +178,20 @@ update it when you transition between states.
 > are now forum DMs); it remains documented for historical reference only —
 > do not arm it.
 
+> **The script itself, `tools/collab-letter-monitor.sh`, was deleted in
+> #2857 step 2** (dead code — the channel it watched was retired by the
+> 2026-06-28 UCS cutover to forum DMs, per the notice above). The rest of
+> this section documents the retired v0 workflow for historical reference
+> only; the command below no longer exists in the repo and will not run.
+
 Arm a **persistent** Monitor that emits only *new letters addressed to you*.
 `inotifywait` is typically not installed, so this polls at ~2s (the measured
-arrival→wake latency). The script ships as `tools/collab-letter-monitor.sh`
+arrival→wake latency). The script shipped as `tools/collab-letter-monitor.sh`
 (also symlinked at `/home/agents-shared/bin/collab-letter-monitor.sh` via the
 same convention as `ia`/`baton`/`forum`):
 
 ```bash
-# Arm via the Monitor tool with persistent: true:
+# Historical only — script no longer exists (#2857 step 2):
 bash <repo>/tools/collab-letter-monitor.sh
 ```
 
@@ -220,12 +226,12 @@ stop with `TaskStop` when the loop ends). **Load-bearing discipline notes:**
   `forum-mention-monitor.sh`) WARN — a suspected duplicate is left alive and
   reported by pid on stdout — so after arming one, check the Monitor's output
   for a duplicate-instance warning and hand-`kill <pid>` it if it's genuinely
-  stale (#1933). `collab-letter-monitor.sh` still kills its prior instance
-  outright, but do **not** read that as the safer guarantee: it is the
-  retired local-FS monitor (above), and its kill uses the same unanchored
-  cmdline substring match that #1933 was filed for — it can SIGTERM an
-  unrelated process whose command line merely contains the script's name
-  (#1935). (Origin: a compaction left two letter
+  stale (#1933). `collab-letter-monitor.sh` (deleted in #2857 step 2, alongside
+  the retired local-FS letter channel it watched — see above) used to kill its
+  prior instance outright; that was never the safer guarantee, since its kill
+  used the same unanchored cmdline substring match that #1933 was filed for —
+  it could SIGTERM an unrelated process whose command line merely contained
+  the script's name (#1935). (Origin: a compaction left two letter
   + two forum-mention monitors polling, double-delivering every event, 2026-06-13.)
 
 > **Why filename-poll, not mtime?** New letters are new *files*, so the

@@ -65,47 +65,49 @@ ENGRAM_HOME = (
 )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate the directory that contains engram_ids.py and engram_log_emitter.py.
+_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
+if _HOOK_DIR not in sys.path:
+    sys.path.insert(0, _HOOK_DIR)
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
-    Probe order mirrors engram-surface-hook.py's resolver; the sentinel file
-    differs (engram_ids.py here vs engram_client.py there) because each hook
-    probes for the module it actually imports.
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_ids.py lives at <plugin_root>/. This
-         resolves clean plugin installs where ENGRAM_HOME is data-only
-         (issue #782 class: stale scatter copy at ENGRAM_HOME must not shadow
-         the plugin's live copy).
-      3. $ENGRAM_HOME if it bundles a snapshot (alpha-install pattern). Reached
-         only when no plugin bundle is present — scatter-install fallback.
-      4. ~/engram-alpha (live-source fallback for dev installs that
-         haven't bundled a snapshot into $ENGRAM_HOME).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if os.path.exists(os.path.join(plugin_root, "engram_ids.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_ids.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
-
-
-_RUNTIME_DIR = _resolve_runtime_dir(ENGRAM_HOME)
+# Resolves the directory containing engram_ids.py -- hoisted to
+# _hooklib.resolve_runtime_dir (gh#2570); this hook's own sentinel
+# (engram_ids.py, distinct from engram_client.py/engram_log_emitter.py used
+# by other hooks) is preserved unchanged.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_ids.py")
 
 # Ensure runtime modules are importable. Uses the plugin-aware resolution
 # above instead of the retired scatter-layout sys.path.insert(0, ENGRAM_HOME).
 if _RUNTIME_DIR not in sys.path:
     sys.path.insert(0, _RUNTIME_DIR)
 
-_HOOK_DIR = os.path.dirname(os.path.abspath(__file__))
-if _HOOK_DIR not in sys.path:
-    sys.path.insert(0, _HOOK_DIR)
-from _hooklib import atomic_write_json
+# Separate resolve call for the emitter (gh#2570 §1): an import of
+# engram_log_emitter must probe for engram_log_emitter, not piggyback on
+# whatever directory engram_ids.py happened to resolve to above -- one call
+# per module actually imported, even when both currently resolve to the
+# same plugin root in practice.
+_EMITTER_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _EMITTER_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _EMITTER_RUNTIME_DIR)
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-utility-credit-mention-stop.py:main"
+_ENACTMENT_SITE = "utility-credit-mention-stop.enactment"
+_HOOK_FIRE_SITE = "utility-credit-mention-stop.hook_fire"
 
 KNOWLEDGE_DB = os.path.join(ENGRAM_HOME, "knowledge.db")
 LOG_PATH = os.path.join(ENGRAM_HOME, "utility-credit-mention.log")
@@ -303,17 +305,37 @@ def _emit_enactment(
     """Emit engram.trigger.enactment telemetry (#1698 slice 3 §4) — same
     Emitter pattern/failure-mode contract as engram-surface-hook.py's
     engram.trigger.fire (§1.3): best-effort, drop silently on any failure.
+
+    alpha #2574 WS3: construction (import + Emitter.init) is narrowed to its
+    own try/except so an INIT_FAILED outcome is recordable and distinct
+    from an ordinary DROPPED emit (docs/2574-telemetry-design.md §1/§5) --
+    this is the design doc's own decisive/measured site for the TIME axis
+    (§1's NEGATIVE EVIDENCE discussion): this function's entire body is the
+    emit, so `reached` cannot be counted here at all -- it belongs to the
+    TRIGGER ENTRY frame (`main`), not this per-site wrapper.
     """
     try:
         from engram_log_emitter import Emitter
         emitter = Emitter.init(session_id=session_id, transcript_path=transcript_path)
-        emitter.emit(
-            event_type="engram.trigger.enactment",
-            level=1,
-            data={"principle_id": principle_id, "prompt_seq": prompt_count},
-        )
     except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_ENACTMENT_SITE,
+            event_type="engram.trigger.enactment",
+            fields={"outcome": "init_failed"},
+        )
+        return
+
+    _uid = emitter.emit(
+        event_type="engram.trigger.enactment",
+        level=1,
+        data={"principle_id": principle_id, "prompt_seq": prompt_count},
+        site="utility-credit-mention-stop.enactment",
+    )
+    write_telemetry_record(
+        manifest_id=_ENACTMENT_SITE,
+        event_type="engram.trigger.enactment",
+        fields={"outcome": "delivered" if _uid is not None else "dropped"},
+    )
 
 
 def _check_enactments(
@@ -433,6 +455,10 @@ def credit_mentions(
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     last_message = ""
@@ -472,13 +498,26 @@ def main() -> None:
             f"duration_ms={_duration_ms}"
         )
 
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5).
+    emitter = None
     try:
         from engram_log_emitter import Emitter
         emitter = Emitter.init(
             session_id=session_id,
             transcript_path=transcript_path,
         )
-        emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if emitter is not None:
+        _uid = emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -490,9 +529,13 @@ def main() -> None:
                 "updated_count": stats["updated_count"],
                 "alpha_mention": ALPHA_MENTION,
             },
+            site="utility-credit-mention-stop.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

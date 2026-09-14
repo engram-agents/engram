@@ -165,6 +165,7 @@ class TestSmoke:
             turn=None,
             github=None,
             colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -262,7 +263,15 @@ class TestValidation:
     """Bad inputs are rejected with expected exit codes and error messages."""
 
     def test_init_duplicate_fails(self, capsys, monkeypatch):
-        """init on existing project → EXIT_VALIDATION, already-exists error."""
+        """init on existing project → EXIT_VALIDATION, already-exists error.
+
+        #1924: this project_id is repo-qualified via --repo specifically so
+        the mint-site refuse-on-unqualified-anchor path never fires here --
+        without it, EXIT_VALIDATION and the project_id substring in stderr
+        both coincidentally match the refuse path too, and client.post is
+        never reached, silently testing nothing about duplicate-conflict
+        handling (the 409 side_effect below).
+        """
         # _pool_sentinel() reads the ambient $ENGRAM_HOME/config.json file, not the
         # passed config dict — mock it (as the sibling tests do) so the turn
         # validation resolves in a clean CI env instead of erroring on a missing
@@ -279,10 +288,12 @@ class TestValidation:
             turn=None,
             github=None,
             colleague=None,
+            repo="engram-agents/engram-paper",
         )
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_called_once()
         captured = capsys.readouterr()
         assert "already exists" in captured.err or "PR-101" in captured.err
 
@@ -517,18 +528,22 @@ class TestFrontmatterParsing:
 
 
 # ===========================================================================
-# CATEGORY 5: Single-agent guard (config-based)
+# CATEGORY 5: No-forum-configured guard (config-based)
 #
-# Changed from directory-existence check to config mode check.
-# Read commands → silent exit 0 in single-agent mode.
-# Write commands → EXIT_STATE with "single-agent mode" message.
+# Changed from mode check to forum-configured check (#2857 step 1) —
+# baton/letter/forum are symmetric for any agent once a forum is configured,
+# so the gate that actually matters is "is a forum configured", not
+# "mode == multi". A mode=single config WITH forum.url/agent_name set now
+# succeeds identically to a multi-mode config.
+# Read commands → silent exit 0 with no forum configured.
+# Write commands → EXIT_STATE with "no forum configured" message.
 # ===========================================================================
 
 class TestSingleAgentGuard:
-    """Config mode gate: single-agent → silent exit (reads) or error (writes)."""
+    """Forum-configured gate: no forum → silent exit (reads) or error (writes)."""
 
-    def test_status_single_agent_exits_0_silently(self, capsys):
-        """cmd_status with single-agent config exits 0 silently, no API calls."""
+    def test_status_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_status with no forum configured exits 0 silently, no API calls."""
         client = _make_client()
         args = argparse.Namespace()
         with pytest.raises(SystemExit) as exc_info:
@@ -538,16 +553,28 @@ class TestSingleAgentGuard:
         assert captured.out.strip() == ""
         client.get.assert_not_called()
 
-    def test_mine_single_agent_exits_0_silently(self, capsys):
-        """cmd_mine with single-agent config exits 0 silently."""
+    def test_status_single_mode_with_forum_url_succeeds(self, capsys):
+        """cmd_status with mode=single but forum.url set proceeds past the gate."""
+        client = _make_client(get_return={"projects": []})
+        args = argparse.Namespace()
+        _baton.cmd_status(
+            args,
+            {"mode": "single", "forum": {"url": "http://testforum:5002"}},
+            "borges",
+            client,
+        )
+        client.get.assert_called()
+
+    def test_mine_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_mine with no forum configured exits 0 silently."""
         client = _make_client()
         args = argparse.Namespace()
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_mine(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_OK
 
-    def test_show_single_agent_exits_0_silently(self, capsys):
-        """cmd_show with single-agent config exits 0 silently, no API call."""
+    def test_show_no_forum_configured_exits_0_silently(self, capsys):
+        """cmd_show with no forum configured exits 0 silently, no API call."""
         client = _make_client()
         args = argparse.Namespace(project_id="PR-999")
         with pytest.raises(SystemExit) as exc_info:
@@ -555,8 +582,8 @@ class TestSingleAgentGuard:
         assert exc_info.value.code == EXIT_OK
         client.get.assert_not_called()
 
-    def test_init_single_agent_exits_state(self, capsys):
-        """cmd_init with single-agent config exits EXIT_STATE with message."""
+    def test_init_no_forum_configured_exits_state(self, capsys):
+        """cmd_init with no forum configured exits EXIT_STATE with message."""
         client = _make_client()
         args = argparse.Namespace(
             project_id="PR-999", title="test", participants="borges,ariadne",
@@ -566,10 +593,26 @@ class TestSingleAgentGuard:
             _baton.cmd_init(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
 
-    def test_flip_single_agent_exits_state(self, capsys):
-        """cmd_flip with single-agent config exits EXIT_STATE with message."""
+    def test_init_single_mode_with_agent_name_succeeds(self, capsys, monkeypatch):
+        """cmd_init with mode=single but agent_name set proceeds past the gate."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-999", title="test", participants="borges,ariadne",
+            status="planning", turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
+        )
+        _baton.cmd_init(
+            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+        )
+        client.post.assert_called()
+
+    def test_flip_no_forum_configured_exits_state(self, capsys):
+        """cmd_flip with no forum configured exits EXIT_STATE with message."""
         client = _make_client()
         args = argparse.Namespace(
             project_id="PR-1", to="ariadne", reason="done", force=False,
@@ -578,7 +621,7 @@ class TestSingleAgentGuard:
             _baton.cmd_flip(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
 
     def test_flip_missing_project_exits_1(self, capsys):
         """flip referencing non-existent project ID → EXIT_VALIDATION."""
@@ -802,6 +845,7 @@ class TestIntegration:
             project_id="PR-801", title="default turn test",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -818,6 +862,7 @@ class TestIntegration:
             project_id="PR-802", title="explicit turn",
             participants="borges,ariadne", status="planning",
             turn="ariadne", github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
@@ -834,6 +879,7 @@ class TestIntegration:
             project_id="PR-803", title="with casey",
             participants="borges,ariadne,casey", status="planning",
             turn="casey", github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         client.post.assert_called_once()
@@ -874,6 +920,7 @@ class TestRename:
             project_id="PR-901", title="original title",
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None,
+            repo="engram-agents/engram-paper",
         )
         _baton.cmd_init(args_init, MULTI_CONFIG, "borges", client)
         client.post.assert_called_once()
@@ -1238,14 +1285,16 @@ class TestAnchor:
 
     # --- #1924: the mint path must not create what gc/flip/merge refuse -----
 
-    def test_init_warns_on_explicit_unqualified_pr_anchor(self, monkeypatch, capsys):
-        """#1924: --github pr/<N> with no repo WARNS at creation and still creates.
+    def test_init_refuses_on_explicit_unqualified_pr_anchor(self, monkeypatch, capsys):
+        """#1924: --github pr/<N> with no repo REFUSES at creation.
 
         #1918/#1920 made gc/flip/merge refuse-and-count an unqualified PR
-        anchor; cmd_init minted one silently, so the refusal surfaced weeks
-        later on whoever tried to merge. The warning moves that signal to the
-        one moment the author can act on it. It deliberately does NOT refuse --
-        see the comment at the call site for the blast-radius reasoning.
+        anchor; cmd_init used to mint one silently (then, for a stopgap
+        period, only warn about it), so the refusal surfaced weeks later on
+        whoever tried to merge. Refusing here moves that signal to the one
+        moment the author can act on it -- settled as REFUSE, not warn, by
+        forum #411 (2026-09-13, Kepler ruling): see the comment at the call
+        site for the full governance history and the cwd-inference exclusion.
         """
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
@@ -1255,14 +1304,17 @@ class TestAnchor:
             participants="borges,ariadne", status="planning",
             turn=None, github="pr/777", colleague=None, repo=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body["github"] == "pr/777"          # still created
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
         err = capsys.readouterr().err
-        assert "REFUSE this baton later" in err     # names the real consequence
-        assert "baton anchor PR-777" in err         # and the after-the-fact fix
+        assert "refusing to create" in err          # names the real consequence
+        assert "--repo <owner>/<repo>" in err        # first fix path
+        assert "--github pr/<owner>/<repo>/777" in err  # second fix path
+        assert "fix it after the fact" not in err    # no anchor exists to fix
 
-    def test_init_warns_on_auto_derived_bare_anchor(self, monkeypatch, capsys):
+    def test_init_refuses_on_auto_derived_bare_anchor(self, monkeypatch, capsys):
         """#1924: the SILENT path -- no --github at all, anchor auto-derived
         from a PR-<N> project_id. This is the plainest possible invocation and
         was the one that produced most unqualified anchors in practice."""
@@ -1274,12 +1326,13 @@ class TestAnchor:
             participants="borges,ariadne", status="planning",
             turn=None, github=None, colleague=None, repo=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body["github"] == "pr/1234"
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
         err = capsys.readouterr().err
         # the message must name WHY the anchor exists at all, or the caller
-        # cannot tell why they are being warned about a flag they never passed
+        # cannot tell why they are being refused over a flag they never passed
         assert "auto-derived" in err
         assert "--repo" in err
 
@@ -1939,12 +1992,12 @@ class TestPoolSentinel:
         client.post.assert_not_called()
 
     def test_missing_config_fails_loud(self, capsys):
-        """cmd_claim with empty config (no mode) exits EXIT_STATE (single-agent mode).
+        """cmd_claim with empty config (no forum configured) exits EXIT_STATE.
 
         Replaces the old subprocess test that verified missing config.json +
-        no BATON_POOL_SENTINEL caused a loud failure. With the config-based gate,
-        missing/empty config → mode defaults to 'single' → EXIT_STATE immediately,
-        before any sentinel resolution is attempted.
+        no BATON_POOL_SENTINEL caused a loud failure. With the forum-configured
+        gate, missing/empty config → no forum.url, no agent_name → EXIT_STATE
+        immediately, before any sentinel resolution is attempted.
         """
         client = _make_client()
         args = argparse.Namespace(project_id="pool-no-config")
@@ -1953,7 +2006,23 @@ class TestPoolSentinel:
             _baton.cmd_claim(args, {}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent" in captured.err
+        assert "no forum configured" in captured.err
+
+    def test_missing_mode_with_forum_configured_succeeds_past_gate(self, capsys):
+        """cmd_claim with mode absent but agent_name set proceeds past the gate.
+
+        Control case for the above: an otherwise-empty config with just
+        agent_name set is NOT held at the forum-configured gate — it reaches
+        the project-ID validation instead (EXIT_VALIDATION, not EXIT_STATE).
+        """
+        client = _make_client()
+        args = argparse.Namespace(project_id="badid")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, {"agent_name": "borges"}, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "invalid project ID" in captured.err
 
 
 # ===========================================================================
@@ -2148,13 +2217,28 @@ class TestAddParticipant:
         captured = capsys.readouterr()
         assert "already a participant" in captured.out.lower()
 
-    def test_add_participant_single_agent_mode_exits_state(self):
-        """add-participant in single-agent mode refuses (write command)."""
+    def test_add_participant_no_forum_configured_exits_state(self):
+        """add-participant with no forum configured refuses (write command)."""
         client = _make_client()
         args = argparse.Namespace(project_id="PR-604", participant="alex")
         with pytest.raises(SystemExit) as exc_info:
             _baton.cmd_add_participant(args, {"mode": "single"}, "borges", client)
         assert exc_info.value.code == EXIT_STATE
+
+    def test_add_participant_single_mode_with_forum_configured_succeeds(self, capsys):
+        """add-participant with mode=single but forum.url set proceeds past the gate."""
+        client = _make_client(
+            post_return={"seq": 4, "added": True},
+            get_return={"raw": _make_raw_baton("PR-604")},
+        )
+        args = argparse.Namespace(project_id="PR-604", participant="alex")
+        _baton.cmd_add_participant(
+            args,
+            {"mode": "single", "forum": {"url": "http://testforum:5002"}},
+            "borges",
+            client,
+        )
+        client.post.assert_called()
 
     def test_add_participant_then_flip_to_new_participant_succeeds(self, monkeypatch):
         """End-to-end regression guard: the whole point of the verb (#1609).
@@ -2199,6 +2283,158 @@ class TestAddParticipant:
         assert body["to_agent"] == "dana"
 
 
+# ===========================================================================
+# CATEGORY 15: set-colleague subcommand (#2764)
+# ===========================================================================
+
+class TestSetColleague:
+    """baton set-colleague: arg wiring, error mapping, and the init-time
+    --colleague payload fix (colleague is now actually sent to the server,
+    not just used to shape participants + a client-side print)."""
+
+    def test_set_colleague_posts_agent_and_colleague(self):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-700")},
+        )
+        args = argparse.Namespace(project_id="PR-700", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+
+        url, body = client.post.call_args[0]
+        assert url == "/api/projects/PR-700/colleague"
+        assert body["agent"] == "borges"
+        assert body["colleague"] == "alex"
+
+    def test_set_colleague_normalizes_case(self):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-701")},
+        )
+        args = argparse.Namespace(project_id="PR-701", colleague="  ALEX ")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] == "alex"
+
+    def test_set_colleague_missing_project_exits_nonzero(self, capsys):
+        client = _make_client()
+        client.get.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        args = argparse.Namespace(project_id="PR-NONE", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower() or "PR-NONE" in captured.err
+
+    def test_set_colleague_bad_project_id_exits_nonzero(self, engram_home):
+        _write_config(engram_home, "borges")
+        rc, stdout, stderr = _run_baton(
+            engram_home, "set-colleague", "not a valid id!", "alex",
+        )
+        assert rc != 0
+
+    def test_set_colleague_empty_colleague_exits_nonzero(self, capsys):
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-702")})
+        args = argparse.Namespace(project_id="PR-702", colleague="   ")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_set_colleague_server_403_maps_to_exit_validation(self, capsys):
+        """Server-side auth guard (agent not a participant/holder) → EXIT_VALIDATION."""
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-703")})
+        client.post.side_effect = ForumHttpError(403, '{"error": "not authorized"}')
+        args = argparse.Namespace(project_id="PR-703", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "participant" in captured.err.lower() or "holder" in captured.err.lower()
+
+    def test_set_colleague_404_maps_to_exit_state(self, capsys):
+        client = _make_client(get_return={"raw": _make_raw_baton("PR-704")})
+        client.post.side_effect = ForumHttpError(404, '{"error": "not found"}')
+        args = argparse.Namespace(project_id="PR-704", colleague="alex")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+
+    def test_set_colleague_prints_participant_added_suffix(self, capsys):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-705")},
+        )
+        args = argparse.Namespace(project_id="PR-705", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        captured = capsys.readouterr()
+        assert "added as participant" in captured.out.lower()
+
+    def test_set_colleague_no_suffix_when_already_participant(self, capsys):
+        client = _make_client(
+            post_return={"seq": 5, "participant_added": False},
+            get_return={"raw": _make_raw_baton("PR-706", participants="[borges, alex]")},
+        )
+        args = argparse.Namespace(project_id="PR-706", colleague="alex")
+        _baton.cmd_set_colleague(args, MULTI_CONFIG, "borges", client)
+        captured = capsys.readouterr()
+        assert "added as participant" not in captured.out.lower()
+
+    def test_set_colleague_no_forum_configured_exits_state(self):
+        """set-colleague with no forum configured refuses (write command)."""
+        client = _make_client()
+        args = argparse.Namespace(project_id="PR-707", colleague="alex")
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_set_colleague(args, {"mode": "single"}, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+
+    def test_set_colleague_single_mode_with_agent_name_succeeds(self, capsys):
+        """set-colleague with mode=single but agent_name set proceeds past the gate."""
+        client = _make_client(
+            post_return={"seq": 6, "participant_added": True},
+            get_return={"raw": _make_raw_baton("PR-707")},
+        )
+        args = argparse.Namespace(project_id="PR-707", colleague="alex")
+        _baton.cmd_set_colleague(
+            args, {"mode": "single", "agent_name": "borges"}, "borges", client,
+        )
+        client.post.assert_called()
+
+    def test_init_sends_colleague_to_server(self, monkeypatch):
+        """#2764: --colleague at init is now actually POSTed, not dropped
+        after being used client-side to shape participants + a print."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-708", title="t", participants="borges",
+            turn=None, status="in-progress", github=None,
+            repo="engram-agents/engram-paper",
+            colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] == "ariadne"
+
+    def test_init_without_colleague_sends_none(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        client = _make_client(post_return={"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-709", title="t", participants="borges",
+            turn=None, status="in-progress", github=None,
+            repo="engram-agents/engram-paper",
+            colleague=None,
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body["colleague"] is None
+
+
 # ---------------------------------------------------------------------------
 # #1715: repo-qualified PR anchors (fixes PR-baton IDs colliding across repos)
 # ---------------------------------------------------------------------------
@@ -2223,10 +2459,15 @@ class TestParseGithubAnchor:
 
 
 class TestInitRepoQualification:
-    def test_init_auto_derives_bare_anchor_from_pr_project_id(self, monkeypatch):
-        """A PR-<N> project_id with no --github auto-derives pr/<N> (#1715) --
-        every PR-baton should carry SOME anchor from creation, not rely on
-        downstream code re-deriving the number from project_id ad hoc."""
+    def test_init_refuses_bare_anchor_auto_derived_from_pr_project_id(self, monkeypatch, capsys):
+        """A PR-<N> project_id with no --github still auto-derives pr/<N>
+        internally (#1715 -- every PR-baton should carry SOME anchor from
+        creation, not rely on downstream code re-deriving the number from
+        project_id ad hoc), but that bare, unqualified derivation is no
+        longer sufficient to create the baton on its own (#1924, forum #411,
+        2026-09-13 ruling): without --repo (or an already-qualified
+        --github), init now REFUSES rather than minting an anchor that
+        gc/flip/merge would refuse later anyway."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
         client = _make_client({"seq": 1})
@@ -2234,9 +2475,52 @@ class TestInitRepoQualification:
             project_id="PR-9001", title="auto anchor", participants="borges,ariadne",
             status="planning", turn=None, github=None, repo=None, colleague=None,
         )
-        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
-        _, body = client.post.call_args[0]
-        assert body.get("github") == "pr/9001"
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        err = capsys.readouterr().err
+        assert "PR-9001" in err
+        assert "--repo <owner>/<repo>" in err
+        assert "--github pr/<owner>/<repo>/9001" in err
+
+    def test_init_never_infers_repo_from_cwd_or_git_remote(self, monkeypatch, capsys):
+        """#1924's ruling (forum #411, 2026-09-13) is explicit: NO cwd or
+        git-remote-based repo inference of any kind, anywhere in cmd_init's
+        anchor-handling path -- an earlier draft of the ruling proposed
+        resolving the repo from the checkout's git `origin` remote when
+        unambiguous, and that was proposed, examined, and explicitly
+        withdrawn (see the #1918/#1924 comment at the anchor-handling call
+        site). A cwd-inferred anchor would be confidently wrong and fully
+        qualified rather than merely unresolvable, which is worse than the
+        loud refusal this function raises without --repo.
+
+        This is a control, not a vigilance check: fail the test hard the
+        moment cmd_init ever shells out to `subprocess` (a git-remote lookup
+        being the obvious shape such an inference would take) while minting
+        a bare PR-<N> baton with no --repo."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                f"cmd_init must never invoke subprocess (got args={args!r}, "
+                f"kwargs={kwargs!r}) -- there is no cwd/git-remote repo "
+                "inference anywhere in this function, deliberately (#1918/#1924)."
+            )
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fail_if_called)
+
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-4242", title="no cwd inference",
+            participants="borges,ariadne", status="planning",
+            turn=None, github=None, repo=None, colleague=None,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
 
     def test_init_with_repo_qualifies_anchor(self, monkeypatch):
         """--repo combines with the (auto-derived or explicit) pr/<N> anchor
@@ -2594,13 +2878,17 @@ class TestFlipRepoQualifiedGuard:
         assert ("ci", "9101", "engram-agents/engram-paper") in calls
         assert ("approval", "9101", "engram-agents/engram-paper") in calls
 
-    def test_flip_bare_anchor_skips_guard_never_guesses(self, monkeypatch, capsys):
-        """#1918: an unqualified bare pr/<N> anchor skips the CI/approval/
-        colleague guard entirely (no gh call, no guessed repo) rather than
-        resolving against a default -- the flip still succeeds, just
-        unverified, with a warning. Supersedes the old
-        test_flip_bare_anchor_still_resolves_default_repo, which asserted
-        the exact silent-guess behavior this issue fixes."""
+    def test_flip_bare_anchor_refuses_never_guesses(self, monkeypatch, capsys):
+        """#1918/#2511: an unqualified bare pr/<N> anchor REFUSES the flip
+        entirely (no gh call, no guessed repo, no CI/approval/colleague
+        verification, and the flip itself never happens) rather than
+        resolving against a default OR silently proceeding unverified.
+        Supersedes the old test_flip_bare_anchor_skips_guard_never_guesses,
+        which asserted the exact warn-and-proceed behavior #2511 fixes --
+        that assertion in turn superseded test_flip_bare_anchor_still_
+        resolves_default_repo, which asserted the original silent-guess
+        behavior #1918 fixed. The 'never guesses' half of the name still
+        holds; only the disposition of the ungaugeable flip changed."""
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         calls = []
 
@@ -2622,12 +2910,482 @@ class TestFlipRepoQualifiedGuard:
         args = argparse.Namespace(
             project_id="PR-9102", to="casey", reason="ready", force=False,
         )
-        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
 
-        client.post.assert_called_once()
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # the flip never happens
         assert calls == []  # no gh call at all -- never guessed a repo
         captured = capsys.readouterr()
-        assert "not repo-qualified" in captured.err
+        assert "has no repo-qualified github anchor" in captured.err
+
+    def test_flip_bare_anchor_refuses_even_with_force(self, monkeypatch, capsys):
+        """#2511: --force does not bypass the unqualified-anchor refusal --
+        force's contract is 'skip CI/approval quality gates', never 'proceed
+        without knowing which repo'. Companion to the no-force case above."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton("PR-9102", github="pr/9102")},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9102", to="casey", reason="ready", force=True,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "This is not skippable with --force" in captured.err
+
+
+# ===========================================================================
+# CATEGORY 16: cmd_flip's maintainer-role gate broadening (#2912)
+# ===========================================================================
+
+
+class TestFlipMaintainerRoleGate:
+    """#2912: cmd_flip's entire CI-green/approval-freshness/colleague-
+    approval-exists gate block was guarded by a bare `_is_pool_sentinel(to_agent)`
+    check -- true only when to_agent matches config.json's primary_user (the
+    literal pool sentinel, e.g. "lei shi"). But this repo's actual, documented
+    convention (CLAUDE.md, "Every PR carries a baton") is to flip a PR-baton
+    to a NAMED maintainer agent ("baton flip PR-N borges", "baton flip PR-N
+    ariadne") -- never to the literal sentinel. So on every flip that matches
+    real practice, the ENTIRE gate -- CI check, approval-freshness check, and
+    the colleague-approval-EXISTS check -- silently never ran. A fully
+    CI-red, zero-approval PR could be flipped to a named maintainer with
+    total silence.
+
+    _is_maintainer_flip broadens the trigger: fires on the literal sentinel
+    OR any other agent, PROVIDED it is not a self-flip and not the flip to
+    the registered colleague (that flip is "please review", not "ready to
+    merge" -- the colleague hasn't reviewed yet, so firing CI/approval
+    checks on it would be premature).
+
+    All tests here pin the sentinel EXPLICITLY via
+    `monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")` --
+    matching this file's existing convention in TestFlipRepoQualifiedGuard
+    above. This matters because _pool_sentinel() resolves from the INVOKING
+    SEAT's own $ENGRAM_HOME/config.json primary_user, not a fleet-wide
+    constant -- two different seats running the identical command can see
+    _is_pool_sentinel(to_agent) resolve differently depending on whose
+    machine ran it. Relying on the ambient real config.json on whatever
+    machine runs these tests would make them non-deterministic across
+    seats/installs; pinning removes that dependency entirely. Tests below
+    cover BOTH shapes of "presenting for merge" under the SAME pinned
+    sentinel: a flip to a named maintainer agent that is NOT the sentinel
+    (the shape the bug actually missed), and a flip to the literal sentinel
+    value itself (the shape that already worked, kept as a side-by-side
+    control under the same fixture)."""
+
+    def test_flip_to_named_maintainer_ci_red_refuses(self, monkeypatch, capsys):
+        """Sol's exact #2912 repro: fully repo-qualified anchor, CI mocked
+        red, approval mocked no_approval, flip to a NAMED maintainer
+        ("borges") that is NOT the pool sentinel and NOT the registered
+        colleague -- must REFUSE, not silently succeed. Asserting on the CI
+        mock's call count (not just the exit code) is what makes this a real
+        regression test for "the gate never even ran": on the old bare
+        _is_pool_sentinel(to_agent) predicate, this exact flip would never
+        even call _pr_ci_state, let alone see its red verdict.
+
+        Only _pr_ci_state is asserted called (not _pr_approval_state): the
+        CI-red branch exits before the approval check is ever reached --
+        same short-circuit shape as the pre-existing
+        test_flip_repo_qualified_ci_red_refuses above. The approval fake is
+        still wired up (matching Sol's literal repro setup) so a future
+        change to the short-circuit order doesn't silently stop testing it.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9200", github="pr/engram-agents/engram-paper/9200",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9200", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        # The guard actually RAN -- this is exactly what the old bare
+        # _is_pool_sentinel(to_agent) predicate never did for a
+        # named-maintainer flip.
+        assert ("ci", "9200", "engram-agents/engram-paper") in calls
+        assert ("approval", "9200", "engram-agents/engram-paper") not in calls
+        captured = capsys.readouterr()
+        assert captured.err.strip() != ""
+        assert "CI is red" in captured.err
+
+    def test_flip_to_literal_sentinel_ci_red_refuses(self, monkeypatch, capsys):
+        """Companion control to the named-maintainer case above: a flip to
+        the LITERAL pinned sentinel value itself must ALSO refuse under
+        CI-red -- this is the pre-existing, already-correct behavior (same
+        shape as TestFlipRepoQualifiedGuard.test_flip_repo_qualified_ci_red_refuses),
+        reproduced here under the identical pinned-sentinel fixture as the
+        test above it, so both shapes of "presenting for merge" are verified
+        side by side under one sentinel value."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9201", github="pr/engram-agents/engram-paper/9201",
+                turn="ariadne", participants="[ariadne, borges, sol, casey]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9201", to="casey", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert ("ci", "9201", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_flip_to_registered_colleague_does_not_trigger_gate(self, monkeypatch, capsys):
+        """Control: flip to the registered COLLEAGUE ("sol", the baton's
+        colleague: field) is the review-stage "please review" signal, not a
+        merge-readiness claim -- this must NOT trigger CI/approval checks,
+        even with CI red and no approval mocked. A regression here would
+        break the exact pattern this team uses on every PR, all day
+        ("baton flip PR-N <colleague>" as the first review-request flip)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called for a flip to the registered colleague")
+
+        def _fake_approval_state(pr_num, repo=None):
+            raise AssertionError("_pr_approval_state must not be called for a flip to the registered colleague")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9202", github="pr/engram-agents/engram-paper/9202",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9202", to="sol", reason="please review", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+
+    def test_self_flip_does_not_trigger_gate(self, monkeypatch, capsys):
+        """Control: flipping back to yourself (e.g. after a colleague
+        requests changes) is not a merge-readiness claim and must NOT
+        trigger CI/approval checks, even with CI red and no approval
+        mocked."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called for a self-flip")
+
+        def _fake_approval_state(pr_num, repo=None):
+            raise AssertionError("_pr_approval_state must not be called for a self-flip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9203", github="pr/engram-agents/engram-paper/9203",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9203", to="ariadne", reason="more work needed", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+
+    def test_flip_to_named_maintainer_ci_green_approved_succeeds(self, monkeypatch):
+        """Positive case: a flip to a named maintainer ("borges") with CI
+        green and a real (fresh) approval SUCCEEDS -- same shape as the
+        pre-existing sentinel-flip success path
+        (test_flip_repo_qualified_ci_green_proceeds), just with a named
+        agent as to_agent instead of the literal sentinel."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9204", github="pr/engram-agents/engram-paper/9204",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9204", to="borges", reason="ready", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        assert ("ci", "9204", "engram-agents/engram-paper") in calls
+        assert ("approval", "9204", "engram-agents/engram-paper") in calls
+
+    def test_flip_single_agent_mode_no_colleague_field_ci_red_refuses(self, monkeypatch, capsys):
+        """Single-agent-mode shape: no colleague: field registered on the
+        baton at all (fields.get("colleague", "") reads empty), flip to a
+        named participant that is not self, with CI red -- must still
+        REFUSE. Confirms the broadened gate still fires when there's no
+        colleague to distinguish against (matches CLAUDE.md's "colleague
+        layer collapses when no counterpart exists" for the
+        APPROVAL-existence check specifically, but CI-green must still gate
+        regardless of single/multi-agent mode)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("no_approval", "no APPROVED review")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        # No colleague= kwarg passed -- _make_raw_baton's frontmatter has no
+        # "colleague" key, so fields.get("colleague", "") reads "".
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9205", github="pr/engram-agents/engram-paper/9205",
+                turn="ariadne", participants="[ariadne, borges]",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9205", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        assert ("ci", "9205", "engram-agents/engram-paper") in calls
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+    def test_cmd_flip_gate_fires_identically_across_different_pinned_sentinels(
+        self, monkeypatch, capsys,
+    ):
+        """#2912 seat-independence, exercised end-to-end through cmd_flip
+        (companion to TestIsMaintainerFlip's direct-call invariance test
+        below): _pool_sentinel() resolves per-INSTALL from that seat's own
+        $ENGRAM_HOME/config.json primary_user, not a fleet-wide constant --
+        the identical command can see a different resolved sentinel
+        depending on who runs it (e.g. "lei shi" on one seat, "lin" on
+        another). The SAME named-maintainer flip (CI red, to a named
+        maintainer that is neither the current holder nor the registered
+        colleague) must refuse identically no matter which sentinel value
+        is resolved -- proving the gate's firing does not depend on the
+        sentinel's literal value, only on the (to_agent, current_holder,
+        colleague_name) triple."""
+        for sentinel_value in ("casey", "lei shi", "lin"):
+            monkeypatch.setattr(_baton, "_pool_sentinel", lambda v=sentinel_value: v)
+            calls = []
+
+            def _fake_ci_state(pr_num, repo=None, _calls=calls):
+                _calls.append(("ci", pr_num, repo))
+                return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+            def _fake_approval_state(pr_num, repo=None, _calls=calls):
+                _calls.append(("approval", pr_num, repo))
+                return ("no_approval", "no APPROVED review")
+
+            monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+            monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+            client = _make_client(
+                get_return={"raw": _make_raw_baton(
+                    "PR-9206", github="pr/engram-agents/engram-paper/9206",
+                    turn="ariadne", participants="[ariadne, borges, sol]",
+                    colleague="sol",
+                )},
+            )
+            args = argparse.Namespace(
+                project_id="PR-9206", to="borges", reason="ready", force=False,
+            )
+            with pytest.raises(SystemExit) as exc_info:
+                _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+            assert exc_info.value.code == EXIT_VALIDATION, (
+                f"expected refusal under sentinel={sentinel_value!r}"
+            )
+            client.post.assert_not_called()
+            assert ("ci", "9206", "engram-agents/engram-paper") in calls, (
+                f"expected the CI gate to have fired under sentinel={sentinel_value!r}"
+            )
+            captured = capsys.readouterr()
+            assert "CI is red" in captured.err
+
+    def test_flip_to_named_maintainer_bare_anchor_refuses_never_guesses(self, monkeypatch, capsys):
+        """Reviewer-fairy-suggested companion to TestFlipRepoQualifiedGuard's
+        test_flip_bare_anchor_refuses_never_guesses: that pre-existing test
+        only exercises the unqualified-anchor refusal call site
+        (`_pr_anchor_match and _is_maintainer_flip(...) and
+        _parsed_anchor[1] is None`) with a flip TO the literal pool sentinel
+        -- the one shape that already triggered _is_maintainer_flip under
+        the OLD bare _is_pool_sentinel(to_agent) predicate. This test
+        confirms the SAME unqualified-anchor refusal fires when the flip
+        target is a NAMED maintainer ("borges") instead -- the shape #2912's
+        broadening exists for, and a shape the unqualified-anchor branch had
+        never been exercised under before this test."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        calls = []
+
+        def _fake_ci_state(pr_num, repo=None):
+            calls.append(("ci", pr_num, repo))
+            return ("green", "mergeStateStatus=CLEAN")
+
+        def _fake_approval_state(pr_num, repo=None):
+            calls.append(("approval", pr_num, repo))
+            return ("fresh", "approved at current tip")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _fake_approval_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9207", github="pr/9207",
+                turn="ariadne", participants="[ariadne, borges, sol]",
+                colleague="sol",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9207", to="borges", reason="ready", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()  # the flip never happens
+        assert calls == []  # no gh call at all -- never guessed a repo
+        captured = capsys.readouterr()
+        assert "has no repo-qualified github anchor" in captured.err
+
+
+class TestIsMaintainerFlip:
+    """Direct-call unit tests for _is_maintainer_flip (#2912) -- the
+    broadened trigger predicate cmd_flip now uses in place of the bare
+    _is_pool_sentinel(to_agent) check. Pins the sentinel via
+    monkeypatch.setattr(_baton, "_pool_sentinel", ...) rather than reading
+    the ambient real config.json, for the same reason documented on
+    TestFlipMaintainerRoleGate above."""
+
+    def test_sentinel_is_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("casey", "borges", "sol") is True
+
+    def test_self_flip_is_not_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("borges", "borges", "sol") is False
+
+    def test_registered_colleague_is_not_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
+
+    def test_other_participant_is_maintainer_flip(self, monkeypatch):
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("ariadne", "borges", "sol") is True
+
+    def test_empty_colleague_name_other_participant_is_maintainer_flip(self, monkeypatch):
+        """Single-agent-mode shape: colleague_name == "" (no colleague
+        registered) -- a flip to any non-self participant still fires."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("ariadne", "borges", "") is True
+
+    def test_result_invariant_across_different_pinned_sentinel_values(self, monkeypatch):
+        """#2912 seat-independence: _is_maintainer_flip's boolean answer for
+        a given (to_agent, current_holder, colleague_name) triple must NOT
+        depend on which value _pool_sentinel() happens to resolve to.
+        _pool_sentinel() resolves per-INSTALL from that seat's own
+        $ENGRAM_HOME/config.json primary_user, not a fleet-wide constant --
+        the exact same call can see a different resolved sentinel depending
+        on who runs it (e.g. "lei shi" on one seat, "lin" on another). The
+        fix is sentinel-value-independent by construction: it only ever
+        compares against the RESOLVED sentinel value, current_holder, and
+        colleague_name -- never a literal hardcoded string -- so this must
+        hold across any sentinel value, not just one pinned choice. None of
+        the sentinel values exercised below ("casey", "lei shi", "lin",
+        "alex") collide with the to_agent/current_holder/colleague names
+        used in the assertions ("ariadne", "borges", "sol") -- a collision
+        would change which branch of _is_maintainer_flip fires and
+        invalidate the comparison."""
+        sentinel_values = ("casey", "lei shi", "lin", "alex")
+        exercised_names = ("ariadne", "borges", "sol")
+        assert not (set(sentinel_values) & set(exercised_names)), (
+            "sentinel/name collision would confound the invariance check"
+        )
+        for sentinel_value in sentinel_values:
+            monkeypatch.setattr(_baton, "_pool_sentinel", lambda v=sentinel_value: v)
+            # Flip TO the resolved sentinel itself: always True, whatever
+            # the sentinel's literal value happens to be this iteration.
+            assert _baton._is_maintainer_flip(sentinel_value, "borges", "sol") is True
+            # Named-maintainer flip (to_agent is never the sentinel, never
+            # the current holder, never the colleague, in any iteration):
+            # always True.
+            assert _baton._is_maintainer_flip("ariadne", "borges", "sol") is True
+            # Self-flip (to_agent == current_holder; neither ever equals
+            # the sentinel in this loop): always False.
+            assert _baton._is_maintainer_flip("borges", "borges", "sol") is False
+            # Flip to the registered colleague (to_agent == colleague_name;
+            # neither ever equals the sentinel in this loop): always False.
+            assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
 
 
 # ===========================================================================

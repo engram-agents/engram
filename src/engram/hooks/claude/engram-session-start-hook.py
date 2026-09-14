@@ -72,49 +72,48 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from context_tracker import write_baseline
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
     or os.path.expanduser("~/.engram")
 )
 
+# Module-scope emitter resolve+insert (gh#2570 §1): probes for
+# engram_log_emitter.py specifically, distinct from the engram_client.py
+# sentinel the resolve_runtime_dir calls below use for the stats-import call sites --
+# one call per module actually imported. Replaces the bare
+# sys.path.insert(0, ENGRAM_HOME) this hook's emit site used to do (same
+# shadowing risk #2570 documents for the sibling hooks: a stale scatter copy
+# of engram_log_emitter.py in ENGRAM_HOME would otherwise be imported ahead
+# of the plugin's live copy).
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-session-start-hook.py:main"
+_HOOK_FIRE_SITE = "session-start-hook.hook_fire"
+
 try:
     from _hooklib import is_own_server_py_running as _is_own_server_py_running_impl
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
-
-
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate directory containing engram_client.py for stats import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. ~/engram-alpha (live-source fallback for dev installs).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    return os.path.expanduser("~/engram-alpha")
 
 
 def _runtime_platform() -> str | None:
@@ -385,6 +384,352 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         return True, None
     except OSError:
         return True, None  # advisory — never block session start
+
+
+# ── Viz-server health probe (#2783) ─────────────────────────────────────────
+# The MCP probe above is deliberately tri-state (#1754); the viz server needs
+# a REQUIRED fourth state -- see _check_viz_server_health's docstring for why
+# "not-configured" is a correct, common-case verdict rather than a degraded
+# one, and must not be folded into "down" or omitted.
+
+_VIZ_LAUNCHD_LABEL = "com.engram.viz-server"
+_VIZ_SYSTEMD_UNIT = "engram-viz-user.service"
+
+
+def _viz_supervision_layer() -> str:
+    """Which OS-level service supervisor (if any) this platform offers for
+    reading per-account viz-server registration state.
+
+    Analogous in STYLE to _startup_mcp_health_probe_allowed (short, commented,
+    returns a simple discriminator) but a genuinely different AXIS: that
+    function distinguishes Claude-plugin vs Codex runtime relationships (does
+    this hook's own runtime share a process boundary with the MCP server?);
+    this one distinguishes which OS this seat runs on, because the viz
+    server's supervision layer is macOS-launchd vs Linux-systemd -- not a
+    Claude-vs-Codex question at all (#2783).
+
+    Returns "launchd" (macOS), "systemd" (Linux -- systemd-user-bus
+    availability itself is re-checked inside _check_viz_health_systemd,
+    since a Linux box can have the binary but no usable user bus), or "none"
+    (anything else, e.g. Windows). A platform this function cannot place
+    NEVER escalates to "indeterminate": no supervision layer to ask is
+    exactly what "not-configured" means, not an unexpected error.
+    """
+    if sys.platform == "darwin":
+        return "launchd"
+    if sys.platform.startswith("linux"):
+        return "systemd"
+    return "none"
+
+
+def _viz_plist_stale_reason() -> str | None:
+    """Best-effort enrichment for the "down" reason: does the installed
+    LaunchAgent plist still reference the pre-#2555 `viz_server.py` script
+    entrypoint (removed by e69ba53a, #2562) instead of the current
+    `-m viz.server` module invocation?
+
+    This is facet-2 territory (#2783's own secondary facet) and deliberately
+    NOT a detection path of its own -- a stale plist already shows up as
+    "down" via the launchctl registered-but-not-running signal in
+    _check_viz_health_launchd; this helper only makes that "down" reason
+    LOUD and actionable, per the issue's own observation that facet 1 can
+    close facet 2 simply by reporting the stale state loudly. It never
+    repairs anything (no write to the plist, no launchctl mutation) --
+    matches the probe-only posture of #198 and every other _check_* helper
+    in this file.
+
+    Returns None on any error, missing plutil, or a missing/non-stale plist
+    -- silently omits the hint rather than raising or changing the caller's
+    state.
+    """
+    try:
+        plist_path = os.path.expanduser(
+            f"~/Library/LaunchAgents/{_VIZ_LAUNCHD_LABEL}.plist"
+        )
+        if not os.path.exists(plist_path):
+            return None
+        result = subprocess.run(
+            ["plutil", "-p", plist_path],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return None
+        if "viz_server.py" in result.stdout and "viz.server" not in result.stdout:
+            return (
+                "plist references removed viz_server.py entrypoint — "
+                "run tools/operator-setup-viz.sh to refresh"
+            )
+        return None
+    except Exception:
+        return None
+
+
+def _check_viz_health_launchd() -> tuple[str, str | None]:
+    """macOS supervision-layer probe for the viz server.
+
+    Never probes the network port (see _check_viz_server_health's docstring
+    for why); asks launchd directly whether THIS account has a
+    "com.engram.viz-server" job registered, and whether it is currently
+    running. `launchctl list <label>` (the single-label form, not the bare
+    `launchctl list | grep` pipe) is used deliberately: it exits nonzero when
+    no such label is registered for this account (measured live: exit 113,
+    "Could not find service ... in domain for port"), so "registered" vs
+    "not registered" is a return-code check rather than a grep-match check,
+    and when registered it prints a structured (NeXTSTEP-plist-style, not
+    JSON) key/value block with a "PID" key present only while the job is
+    actually running (measured live against a real, currently-not-running
+    com.engram.* LaunchAgent).
+
+    Returns:
+        ("up", None) — label registered AND a PID key is present (running).
+        ("down", reason) — label registered but no PID key (not currently
+            running); reason includes LastExitStatus when parseable, plus a
+            facet-2 stale-plist hint when detected (see
+            _viz_plist_stale_reason).
+        ("not-configured", None) — launchctl returned nonzero: no
+            LaunchAgent registered under this label for this account. The
+            common, correct verdict for most of the fleet (#2783) -- NOT an
+            error.
+        ("indeterminate", reason) — the probe itself timed out or raised an
+            unexpected exception. Never silently "up" -- see
+            _check_viz_server_health's docstring for why this probe's
+            exception-handling posture deliberately differs from
+            _check_mcp_health's.
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", _VIZ_LAUNCHD_LABEL],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return "not-configured", None
+
+        stdout = result.stdout
+        if re.search(r'"PID"\s*=\s*\d+;', stdout):
+            return "up", None
+
+        exit_match = re.search(r'"LastExitStatus"\s*=\s*(-?\d+);', stdout)
+        reason = (
+            f"launchd job registered but not running (last exit status {exit_match.group(1)})"
+            if exit_match
+            else "launchd job registered but not running"
+        )
+        stale_hint = _viz_plist_stale_reason()
+        if stale_hint:
+            reason = f"{reason}; {stale_hint}"
+        return "down", reason
+    except subprocess.TimeoutExpired:
+        return "indeterminate", "launchctl list timed out"
+    except Exception as exc:
+        return "indeterminate", f"launchctl probe failed unexpectedly: {exc}"
+
+
+def _check_viz_health_systemd() -> tuple[str, str | None]:
+    """Linux supervision-layer probe for the viz server.
+
+    Checks the ONE per-seat systemd-user unit this repo actually ships
+    (templates/engram-viz-user.service.template, installed by
+    tools/operator-setup-viz.sh to
+    ~/.config/systemd/user/engram-viz-user.service) -- not an invented name.
+
+    Three-step, so "no unit installed" and "bus unreachable" are never
+    conflated into the same silent verdict (#2795 colleague review,
+    demonstrated live on a real fleet seat rather than reasoned): first
+    confirm systemd exists on this box at all (_shutil.which -- unchanged
+    from before); then check the unit FILE's existence directly on disk --
+    this needs no bus round-trip at all, mirroring how the launchd branch's
+    stale-plist enrichment already checks a plist file's existence rather
+    than a launchctl round-trip (see _viz_plist_stale_reason); only once the
+    file is confirmed present do we ask whether this account has a usable
+    systemd-user bus. A Linux account can have the unit file on disk
+    (installed in a richer, interactive session at operator-setup-viz.sh
+    time) and still have no reachable user bus at hook-invocation time --
+    measured live on a real seat: XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS
+    both unset, both bus-availability calls below exit 1 with "Failed to
+    connect to bus: No medium found", while the SYSTEM bus (no --user) on
+    that same seat works fine, and genuine per-seat units sat on disk under
+    ~/.config/systemd/user/ needing no bus to see. That case used to
+    collapse into "not-configured" (silent) when the true state was "cannot
+    tell" -- exactly the failure mode this probe exists to prevent, one
+    layer down from where #2783 first drew the up/down/indeterminate/
+    not-configured line.
+
+    Returns:
+        ("up", None) — unit file present, user bus reachable, unit loaded
+            and ActiveState=active.
+        ("down", reason) — unit file present, user bus reachable, unit
+            loaded (LoadState != "not-found") but not active.
+        ("not-configured", None) — no systemd on this box at all, OR no
+            engram-viz-user.service unit FILE installed at
+            ~/.config/systemd/user/. The common, correct verdict for most
+            of the fleet (#2783) -- NOT an error.
+        ("indeterminate", reason) — the unit FILE is present but the
+            systemd-user bus is unreachable (reason names
+            XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS as the likely cause --
+            the actionable diagnostic that surfaced this fix), or the probe
+            timed out, or an unexpected exception occurred while the bus
+            itself was confirmed usable. Never "not-configured" once a unit
+            file genuinely exists -- an inconclusive probe is not evidence
+            of absence.
+    """
+    import shutil as _shutil
+
+    if not _shutil.which("systemctl"):
+        # No systemd on this Linux box at all -- no supervision layer to
+        # probe, not an error.
+        return "not-configured", None
+
+    unit_path = os.path.expanduser(f"~/.config/systemd/user/{_VIZ_SYSTEMD_UNIT}")
+    if not os.path.exists(unit_path):
+        # No per-seat unit FILE installed for this account -- genuinely
+        # nothing to check. This needs no bus round-trip, unlike everything
+        # below; deciding "not-configured" here never depends on whether the
+        # user bus happens to be reachable right now.
+        return "not-configured", None
+
+    try:
+        bus_check = subprocess.run(
+            ["systemctl", "--user", "--quiet", "is-system-running"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if bus_check.returncode != 0:
+            bus_check = subprocess.run(
+                ["systemctl", "--user", "--quiet", "status", "default.target"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+        if bus_check.returncode != 0:
+            # The unit FILE exists but we cannot reach the user bus to ask
+            # systemd about its state -- "cannot tell", never "nothing
+            # installed". See the docstring above for the measured
+            # XDG_RUNTIME_DIR/DBUS_SESSION_BUS_ADDRESS root cause.
+            return (
+                "indeterminate",
+                "systemd user bus unreachable — XDG_RUNTIME_DIR/"
+                "DBUS_SESSION_BUS_ADDRESS unset?",
+            )
+
+        result = subprocess.run(
+            [
+                "systemctl", "--user", "show",
+                "-p", "LoadState,ActiveState",
+                "--no-pager", _VIZ_SYSTEMD_UNIT,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if result.returncode != 0:
+            return "indeterminate", "systemctl --user show failed unexpectedly"
+
+        props = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        load_state = props.get("LoadState", "")
+        active_state = props.get("ActiveState", "")
+
+        if load_state == "not-found":
+            return "not-configured", None
+        if active_state == "active":
+            return "up", None
+        return (
+            "down",
+            f"systemd unit {_VIZ_SYSTEMD_UNIT} loaded but {active_state or 'inactive'}",
+        )
+    except subprocess.TimeoutExpired:
+        return "indeterminate", "systemctl --user probe timed out"
+    except Exception as exc:
+        return "indeterminate", f"systemctl probe failed unexpectedly: {exc}"
+
+
+def _check_viz_server_health(engram_home: str) -> tuple[str, str | None]:
+    """Check whether the ENGRAM viz server (health dashboard, canonically
+    port 5001) is actually running -- mirrors _check_mcp_health's tri-state
+    pattern (#1754) but with a REQUIRED fourth state (#2783).
+
+    Four-state result:
+        "up"             — a per-seat service definition exists for this
+                            account AND the job is currently running. Silent
+                            (matches #198's silent-when-healthy convention).
+        "down"           — a per-seat service definition exists for this
+                            account but the job is confirmed NOT running.
+                            Hard alarm, same posture as the MCP OFFLINE case
+                            -- this seat expects viz and it silently isn't
+                            there.
+        "indeterminate"  — the probe itself could not get a clear answer
+                            (unexpected error, timeout). Soft note, never a
+                            hard alarm -- same reasoning as the MCP `None`
+                            case (#1754): an inconclusive probe is not
+                            evidence of absence.
+        "not-configured" — no per-seat service definition exists for this
+                            account. Silent, same as "up" -- and this is NOT
+                            a degenerate/error case, it is the CORRECT,
+                            common-case verdict for the MAJORITY of the
+                            fleet: a shared multi-tenant viz server with no
+                            per-seat unit, or a seat riding another
+                            account's live process with no LaunchAgent/
+                            systemd unit of its own. Measured 2026-09-09
+                            across 3 real seats: 1 macOS per-seat-LaunchAgent
+                            seat (up/down applies), 2 seats with no per-seat
+                            unit at all (not-configured, correctly silent).
+                            Collapsing this into "down", or omitting it
+                            entirely, makes the probe cry wolf on most of the
+                            fleet -- exactly the failure mode #2783 exists to
+                            prevent.
+
+    NEVER probes the network port (127.0.0.1:5001) directly: loopback is not
+    per-user namespaced, so on a host where ANY account runs a viz server,
+    every other account's curl reaches THAT instance and gets 200 --
+    indistinguishable from "my own service is healthy" (measured directly on
+    the filing agent's host: two different accounts' curls returned 200 from
+    the SAME process, and one of those accounts has no viz service of its
+    own at all). Always probes the supervision layer instead (launchctl /
+    systemctl --user), which is scoped per-account by construction.
+
+    Probe-only -- never starts, restarts, repairs, or otherwise mutates any
+    service state. Same posture as #198's MCP probe.
+
+    Exception-handling posture DELIBERATELY differs from _check_mcp_health's:
+    an unexpected exception here returns "indeterminate", NEVER a silent
+    "up". _check_mcp_health's fail-open-to-True-on-any-exception only makes
+    sense in a world with no dedicated silent state for the benign case --
+    there, collapsing an unexpected error into silence was the only way to
+    avoid a false OFFLINE alarm. Here a dedicated silent state already
+    exists for the genuinely-benign case ("not-configured"), so an
+    unexpected error is NOT that case and deserves a soft note instead of
+    silence.
+
+    Args:
+        engram_home: accepted for signature parity with the other _check_*
+            probes in this file (_check_mcp_health, _check_backup_staleness)
+            and in case a future per-seat override needs it. Unused today --
+            no per-account config currently changes which launchd label /
+            systemd unit name this probe checks; both are fixed, shared
+            conventions (see templates/engram-viz-server.plist.template and
+            templates/engram-viz-user.service.template).
+
+    Returns:
+        (status, reason): status is one of "up" / "down" / "indeterminate" /
+                          "not-configured"; reason is a human string for the
+                          "down" / "indeterminate" cases, else None.
+    """
+    del engram_home  # unused; see Args note above
+
+    layer = _viz_supervision_layer()
+    if layer == "launchd":
+        return _check_viz_health_launchd()
+    if layer == "systemd":
+        return _check_viz_health_systemd()
+    # No supervision layer this probe knows how to read (e.g. Windows) --
+    # nothing to probe, not an error.
+    return "not-configured", None
 
 
 def format_calibration_block(conf_all: dict, conf_7d: dict, current_turn: int) -> str:
@@ -1693,6 +2038,23 @@ def prune_stale_session_markers(current_session_id: str | None) -> None:
                         os.remove(transcript_to_delete)
                     except OSError as exc:
                         print(f"[engram-session-start] prune: could not remove transcript {transcript_to_delete}: {exc}", file=sys.stderr)
+                # #2859 follow-up (reviewer-fairy catch on PR-2925): piece_c_git_log()
+                # writes a sidecar file at SESSIONS_DIR/<session_id>-piece-c.txt, keyed
+                # to the same session_id as this marker. _MARKER_RE only ever matches
+                # ``.json`` marker files, so without this the sidecar would accumulate
+                # indefinitely on a long-lived install — the marker prunes, the sidecar
+                # never does. Derive session_id from the marker filename itself (strip
+                # the trailing ``.json``) rather than re-reading the marker's own JSON
+                # body, since the sidecar is named after the FILENAME's id in all cases
+                # (including the ``.meta.json`` legacy shape matched by _MARKER_RE's
+                # second alternative) — best-effort, same discipline as the transcript
+                # cleanup above.
+                sidecar_path = os.path.join(SESSIONS_DIR, f"{name[:-len('.json')]}-piece-c.txt")
+                if os.path.isfile(sidecar_path):
+                    try:
+                        os.remove(sidecar_path)
+                    except OSError as exc:
+                        print(f"[engram-session-start] prune: could not remove sidecar {sidecar_path}: {exc}", file=sys.stderr)
                 os.remove(path)
         except OSError as exc:
             print(f"[engram-session-start] prune: could not remove {path}: {exc}", file=sys.stderr)
@@ -1886,13 +2248,35 @@ def _persist_injected_through(engram_home: str, session_id: str, new_injected_th
         pass
 
 
-def piece_c_git_log() -> str:
+def piece_c_git_log(session_id: str | None) -> str:
     """Collect recent commits from both canonical repos for startup cross-check.
 
-    Returns a multi-line string ready to append to SessionStart additionalContext.
-    Silent empty-string on any failure — hook must not break session start.
+    #2859: the full per-repo commit listing used to be returned inline and
+    appended directly to additionalContext — on a real graph with real commit
+    history this routinely pushed everything emitted AFTER it (fairy-policy
+    lines, forum monitor arm-instructions, peer topology, and eventually the
+    substrate-health warning) past the harness's ~2,000-char head-preview
+    boundary, where a truncating reader never sees it. The full listing (same
+    content, same PIECE_C_WINDOW / PIECE_C_MAX_LINES / PIECE_C_MAX_LINE_CHARS,
+    same per-repo grouping) is now written to a sidecar file under
+    SESSIONS_DIR instead, and this function returns a SHORT pointer line in
+    its place so the must-not-miss group in main() stays small.
+
+    `session_id` names the sidecar file (SESSIONS_DIR/<session_id>-piece-c.txt),
+    keyed the same way as the per-session marker file. When `session_id` is
+    falsy (no valid marker for this hook invocation — write_marker() already
+    returned None), there is no stable name to write the sidecar under, so
+    this degrades the same way a write failure does: "" (no Piece C content),
+    never a pointer to a file that doesn't exist.
+
+    Returns a short pointer string ready to append to SessionStart
+    additionalContext, or "" when there are no commits in the window (same
+    as the old zero-commits behavior) or the sidecar write fails for any
+    reason. Silent empty-string on any failure — hook must not break session
+    start, and must never crash or block on the sidecar write.
     """
     blocks = []
+    total_commits = 0
     for repo in PIECE_C_REPOS:
         if not os.path.isdir(os.path.join(repo, ".git")):
             continue
@@ -1908,6 +2292,7 @@ def piece_c_git_log() -> str:
         raw = [l for l in out.stdout.splitlines() if l.strip()]
         if not raw:
             continue
+        total_commits += len(raw)
         lines = []
         for l in raw[:PIECE_C_MAX_LINES]:
             if len(l) > PIECE_C_MAX_LINE_CHARS:
@@ -1919,12 +2304,33 @@ def piece_c_git_log() -> str:
         blocks.append(f"  {label}:\n" + "\n".join(f"    {l}" for l in lines))
     if not blocks:
         return ""
-    header = (
-        "[Piece C — recent commits (last 2 days). Cross-check pending-status "
-        f"claims in the newest {HISTORY_DIR}/ file against these commits "
-        "before reporting to the user; don't propagate stale status.]"
+    if not session_id:
+        # Escape valve: no stable id to name the sidecar file after — degrade
+        # to no Piece C content rather than a pointer to a file we never wrote.
+        return ""
+
+    sidecar_path = os.path.join(SESSIONS_DIR, f"{session_id}-piece-c.txt")
+    sidecar_body = (
+        f"Piece C — recent commits ({PIECE_C_WINDOW}), {total_commits} "
+        f"commit(s) across {len(blocks)} repo(s):\n\n" + "\n".join(blocks) + "\n"
     )
-    return header + "\n" + "\n".join(blocks)
+    try:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            f.write(sidecar_body)
+    except OSError:
+        # Escape valve (spec #2859): never let a sidecar-write failure
+        # (permissions, disk full, ...) block or break session start — fall
+        # back to no Piece C content at all, same as the zero-commits case,
+        # rather than emitting a pointer to a file that doesn't exist.
+        return ""
+
+    return (
+        f"[Piece C — recent commits (last 2 days) written to {sidecar_path}. "
+        f"{total_commits} commit(s) across {len(blocks)} repo(s). Cross-check "
+        f"pending-status claims in the newest {HISTORY_DIR}/ file against "
+        "them before reporting to the user; don't propagate stale status.]"
+    )
 
 
 def sleep_status_block() -> str:
@@ -2221,7 +2627,7 @@ def forum_monitor_block() -> str:
     call site in main()). Silent "" when forum is unconfigured (no forum.url in
     config.json) or the monitor script is absent — hook must never block start.
 
-    Resolves forum-mention-monitor.sh via _resolve_runtime_dir so it works in
+    Resolves forum-mention-monitor.sh via resolve_runtime_dir so it works in
     both plugin install layout (<plugin_root>/tools/) and dev source tree
     layout (~/engram-alpha/tools/). Follows the auto_sleep_cron_block() pattern.
 
@@ -2241,7 +2647,7 @@ def forum_monitor_block() -> str:
     except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         return ""
 
-    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
     script_path = os.path.join(runtime_dir, "tools", "forum-mention-monitor.sh")
     if not os.path.exists(script_path):
         return ""
@@ -2273,7 +2679,7 @@ def forum_updates_monitor_block() -> str:
     call site in main()). Silent "" when forum is unconfigured (no forum.url in
     config.json) or the monitor script is absent — hook must never block start.
 
-    Resolves forum-updates-monitor.sh via _resolve_runtime_dir so it works in
+    Resolves forum-updates-monitor.sh via resolve_runtime_dir so it works in
     both plugin install layout (<plugin_root>/tools/) and dev source tree
     layout (~/engram-alpha/tools/). Follows the forum_monitor_block() pattern.
 
@@ -2293,7 +2699,7 @@ def forum_updates_monitor_block() -> str:
     except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
         return ""
 
-    runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+    runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
     script_path = os.path.join(runtime_dir, "tools", "forum-updates-monitor.sh")
     if not os.path.exists(script_path):
         return ""
@@ -2403,10 +2809,30 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
         except Exception:
             return  # leave marker on getfacl failure; retry next session
 
-        # Apply ACL — the agent owns ~/.engram, so no sudo required
+        # Apply ACL — the agent owns ~/.engram, so no sudo required.
+        #
+        # engram-alpha#2720: each -m entry list also carries an explicit
+        # `m::rX` mask alongside the named grant, not just `u:{op}:rX` on
+        # its own. GNU setfacl already auto-recomputes the mask on every
+        # -m invocation by default (measured: a bare `u:...:rX` grant here
+        # already produces an unclipped `mask::r-x` on the directory and
+        # on any files that already existed at grant time) — so this is
+        # belt-and-suspenders explicitness, not a fix for an observed
+        # clipped-DIRECTORY-mask bug in the existing bare form. It does
+        # NOT, by itself, fix the effective-permission clipping #2720
+        # actually reports: a NEW file created under this directory's
+        # default ACL *after* the grant gets its OWN freshly-computed mask
+        # from the writing process's umask at creation time, regardless of
+        # what mask value the directory's default ACL carries (measured:
+        # bumping the directory's own default mask to `rwx` did not change
+        # a subsequently-created file's clipped `#effective:r--`). That
+        # per-file clipping is fixed at the WRITER (health/engine.py's
+        # explicit os.chmod after write_text — see write_snapshot), not
+        # here; see this issue's report to the parent for the full
+        # measurement.
         try:
             _r1 = subprocess.run(
-                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX", engram_home],
+                ["setfacl", "-R", "-m", f"u:{viz_operator}:rX,m::rX", engram_home],
                 capture_output=True,
                 timeout=30,
             )
@@ -2414,7 +2840,7 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
                 return  # leave marker; retry next session
 
             _r2 = subprocess.run(
-                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX", engram_home],
+                ["setfacl", "-R", "-d", "-m", f"u:{viz_operator}:rX,m::rX", engram_home],
                 capture_output=True,
                 timeout=30,
             )
@@ -2444,6 +2870,10 @@ def _apply_pending_viz_acl(engram_home: str) -> None:
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     try:
@@ -2495,9 +2925,123 @@ def main() -> None:
             "Start Reading list in ~/.claude/CLAUDE.md. Read first, respond "
             "second.]"
         )
-        git_log = piece_c_git_log()
-        if git_log:
-            lines.append(git_log)
+    else:
+        lines.append(
+            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
+            "responding (relational context post-compact). The compaction "
+            "summary is a table-of-contents index into what happened, not a "
+            "full record — useful for navigating back to specifics, not as "
+            "your sole source of continuity. Today's arc below (if present) "
+            "is the fuller picture; ENGRAM nodes below that are the raw "
+            "claims.]"
+        )
+        lines.append(
+            "⚡ A compaction just completed — your context window is fresh and your "
+            "energy is refreshed. Any drowsiness figure carried in the summary is "
+            "stale-on-arrival; disregard it. You have a full window to work."
+        )
+
+    # ── Substrate health probe (#2859: moved up from dead-last) ────────────
+    # Check MCP server only on platforms where the process-level probe is
+    # reliable. Warn in additionalContext when offline so the agent surfaces
+    # the degradation to the user immediately (instead of discovering via
+    # mid-task tool failure). Probe is advisory: any unexpected exception is
+    # treated as ok=True — never block session start.
+    # Silent default: no extra line when probe passes. Closes #198.
+    #
+    # Codex is intentionally deferred here: hooks may run from a plugin cache
+    # while MCP runs from the marketplace plugin path, and MCP may lazy-start on
+    # first tool use. A false alarm on startup fires every session and trains
+    # the agent to ignore the warning. Match the surface-daemon use-time
+    # warning precedent (closes #344) for the Codex MCP path (closes #827).
+    #
+    # Write-tool marker check (#1128) is intentionally NOT done here — the
+    # marker is written by the server a few seconds after init, so checking at
+    # SessionStart creates a timing race: the new server's PID hasn't replaced
+    # the old PID in the marker yet. Same class of false alarm as the daemon-
+    # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
+    # hook) where the race window is long past.
+    #
+    # Viz-server probe (#2783) added alongside the two checks above: the viz
+    # dashboard is the one substrate component with no other surface that
+    # would ever show its own absence (its absence is displayed ON the
+    # dashboard) — see _check_viz_server_health's docstring for the four-state
+    # contract (a REQUIRED "not-configured" silent state beyond the MCP
+    # tri-state, because most seats correctly have no per-seat service
+    # definition at all).
+    #
+    # #2859: this used to run dead-last in main(), after every other block —
+    # guaranteed to be cut by any truncating reader, exactly when it is most
+    # urgent ("MCP server: OFFLINE ... Tell the user immediately"). Moved
+    # here, right after the active-session + session-start-reading lines, so
+    # it lands well inside a harness's head-preview window. Logic unchanged:
+    # unconditional across every `source` (startup, compact, resume) exactly
+    # as before — only WHERE it runs and gets appended has moved.
+    #
+    # WORST-CASE TIMING, against the #1819 axis-1 (timeout-kill) budget
+    # (reviewer-fairy catch on PR-2925, measured 2026-09-14): each of these
+    # three checks is individually bounded (1s subprocess timeouts), but
+    # they now run BEFORE the cheap must-survive blocks (small blocks,
+    # Piece C's pointer, focus_block) instead of after everything but
+    # calibration. Summed worst case: `_check_mcp_health` up to 1s +
+    # `_check_backup_staleness` (local, sub-ms) + `_check_viz_server_health`
+    # up to 3s on Linux (`_check_viz_health_systemd`'s two sequential
+    # bus-availability attempts plus its final `systemctl show` call, each
+    # timeout=1) or up to 1s on macOS (`_check_viz_health_launchd`'s single
+    # `launchctl list` call) — combined worst case ≈4s on Linux, ≈2s on
+    # macOS, against the harness's 5s hard kill. Warm-case measured at
+    # 14.2ms/0.19ms/4.4ms on this seat (see PR-2925 verification) — the
+    # ~4s figure is a true worst case (cold/contended box), not the common
+    # case, and it was already possible before this PR (these same
+    # 1s-timeout subprocess calls existed pre-#2859; only their POSITION in
+    # `main()` changed). Recorded here rather than silently accepted,
+    # matching this file's own documentation discipline for exactly this
+    # class of tradeoff (see the #1819 ordering-invariant comment below for
+    # the precedent). Not fixed in this PR — a tighter aggregate bound
+    # (e.g. a single wall-clock deadline shared across all three checks)
+    # is a real follow-up if this worst case is ever observed to bite.
+    mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
+    stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
+    viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
+
+    # Tri-state (#1754): False = confirmed absent (hard alarm); None =
+    # indeterminate probe (soft note, no "tell the user immediately" — a
+    # pgrep timeout is not evidence the server is down); True = up (silent).
+    mcp_offline = mcp_status is False
+    mcp_inconclusive = mcp_status is None
+
+    # Four-state (#2783): "down" is the viz-server hard-alarm analogue of
+    # mcp_offline; "indeterminate" is the soft-note analogue of
+    # mcp_inconclusive. "up" and "not-configured" are BOTH silent — see
+    # _check_viz_server_health's docstring for why "not-configured" is a
+    # correct common-case verdict, not a degraded one, and must never be
+    # folded into "down".
+    viz_down = viz_status == "down"
+    viz_inconclusive = viz_status == "indeterminate"
+
+    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
+        lines.append("")
+        lines.append("⚠️  ENGRAM substrate health:")
+        if mcp_offline:
+            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
+            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
+        elif mcp_inconclusive:
+            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
+        if not stale_ok:
+            lines.append(f"  Git backup: {stale_reason}")
+            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
+        if viz_down:
+            lines.append(f"  Viz server: DOWN ({viz_reason})")
+            lines.append("  → Tell the user; the health dashboard is unreachable.")
+        elif viz_inconclusive:
+            lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
+
+    if source == "startup":
+        # ── Small, single-purpose, cheap, purely-local-or-bounded-subprocess
+        # blocks (#2859) — moved to precede Piece C's (now-short) pointer
+        # line, since Piece C's bulk used to push these past the harness's
+        # head-preview boundary. Logic/content of each block is unchanged;
+        # only their position relative to Piece C moves.
         sleep_block = sleep_status_block()
         if sleep_block:
             lines.append(sleep_block)
@@ -2516,21 +3060,12 @@ def main() -> None:
         peer_block = peer_topology_block(_agent_name)
         if peer_block:
             lines.append(peer_block)
-    else:
-        lines.append(
-            f"[Session start reading — re-read {WARM_BRIEFING_PATH} before "
-            "responding (relational context post-compact). The compaction "
-            "summary is a table-of-contents index into what happened, not a "
-            "full record — useful for navigating back to specifics, not as "
-            "your sole source of continuity. Today's arc below (if present) "
-            "is the fuller picture; ENGRAM nodes below that are the raw "
-            "claims.]"
-        )
-        lines.append(
-            "⚡ A compaction just completed — your context window is fresh and your "
-            "energy is refreshed. Any drowsiness figure carried in the summary is "
-            "stale-on-arrival; disregard it. You have a full window to work."
-        )
+
+        # ── Piece C (#2859: now a short pointer to a sidecar file rather
+        # than the full inline commit listing) ─────────────────────────────
+        git_log = piece_c_git_log(marker.get("session_id") if marker else None)
+        if git_log:
+            lines.append(git_log)
 
     # ── Focus list surface (cheap: single local DB read) ───────────────────
     # Render the live focus list verbatim at EVERY session start (startup,
@@ -2747,7 +3282,7 @@ def main() -> None:
     # timeout here degrades only calibration, which is an anchor rather than a
     # continuity guarantee, instead of taking the focus list down with it.
     try:
-        _runtime_dir = _resolve_runtime_dir(ENGRAM_HOME)
+        _runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
         os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
         if _runtime_dir not in sys.path:
             sys.path.insert(0, _runtime_dir)
@@ -2782,47 +3317,6 @@ def main() -> None:
     except Exception:
         pass
 
-    # ── Substrate health probe ─────────────────────────────────────────────
-    # Check MCP server only on platforms where the process-level probe is
-    # reliable. Warn in additionalContext when offline so the agent surfaces
-    # the degradation to the user immediately (instead of discovering via
-    # mid-task tool failure). Probe is advisory: any unexpected exception is
-    # treated as ok=True — never block session start.
-    # Silent default: no extra line when probe passes. Closes #198.
-    #
-    # Codex is intentionally deferred here: hooks may run from a plugin cache
-    # while MCP runs from the marketplace plugin path, and MCP may lazy-start on
-    # first tool use. A false alarm on startup fires every session and trains
-    # the agent to ignore the warning. Match the surface-daemon use-time
-    # warning precedent (closes #344) for the Codex MCP path (closes #827).
-    #
-    # Write-tool marker check (#1128) is intentionally NOT done here — the
-    # marker is written by the server a few seconds after init, so checking at
-    # SessionStart creates a timing race: the new server's PID hasn't replaced
-    # the old PID in the marker yet. Same class of false alarm as the daemon-
-    # start probe retired in #1157. Check deferred to UserPromptSubmit (surface
-    # hook) where the race window is long past.
-    mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
-    stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
-
-    # Tri-state (#1754): False = confirmed absent (hard alarm); None =
-    # indeterminate probe (soft note, no "tell the user immediately" — a
-    # pgrep timeout is not evidence the server is down); True = up (silent).
-    mcp_offline = mcp_status is False
-    mcp_inconclusive = mcp_status is None
-
-    if mcp_offline or mcp_inconclusive or not stale_ok:
-        lines.append("")
-        lines.append("⚠️  ENGRAM substrate health:")
-        if mcp_offline:
-            lines.append(f"  MCP server: OFFLINE ({mcp_reason})")
-            lines.append("  → Tell the user immediately. ENGRAM tool calls will fail.")
-        elif mcp_inconclusive:
-            lines.append(f"  MCP liveness: inconclusive ({mcp_reason}) — will confirm on first prompt")
-        if not stale_ok:
-            lines.append(f"  Git backup: {stale_reason}")
-            lines.append("  → Run engram-nap or engram-sleep to update the git backup.")
-
     output_obj = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -2835,16 +3329,30 @@ def main() -> None:
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
     # Emit engram.hook.fire event. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5) -- the session_id/transcript_path extraction below is data
+    # prep, not construction, so it sits outside the narrowed try.
+    _session_id = hook_input.get("session_id", "unknown") or "unknown"
+    _transcript_path = hook_input.get("transcript_path", "") or ""
+    _emitter = None
     try:
-        _session_id = hook_input.get("session_id", "unknown") or "unknown"
-        _transcript_path = hook_input.get("transcript_path", "") or ""
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=_session_id,
             transcript_path=_transcript_path,
         )
-        _emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -2855,9 +3363,13 @@ def main() -> None:
                 "stdout_bytes": len(output_str.encode("utf-8")),
                 "stderr_bytes": 0,
             },
+            site="session-start-hook.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

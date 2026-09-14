@@ -1,4 +1,4 @@
-"""Tests for viz_server live agent re-discovery (TTL-cached rescan, issue #1526).
+"""Tests for viz.agents live agent re-discovery (TTL-cached rescan, issue #1526).
 
 Uses fake clock injection (unittest.mock.patch on time.monotonic) and
 discover_agents mocking so no filesystem I/O happens and timing is deterministic.
@@ -25,10 +25,10 @@ import unittest.mock
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "engram"))
+sys.path.append(str(Path(__file__).resolve().parent.parent / "src" / "engram"))  # #2565: append, not insert(0)
 
-import viz_server
-from viz_server import _refresh_agents_if_stale
+from viz import agents as viz_agents
+from viz.agents import _refresh_agents_if_stale
 
 
 # ---------------------------------------------------------------------------
@@ -47,18 +47,18 @@ class _RefreshBase(unittest.TestCase):
     """Save/restore all module-level cache state around each test."""
 
     def setUp(self):
-        self._saved_agents = dict(viz_server.AGENTS)
-        self._saved_default = viz_server.DEFAULT_AGENT
-        self._saved_mode = viz_server._AGENT_STARTUP_MODE
-        self._saved_config = viz_server._AGENT_STARTUP_CONFIG
-        self._saved_ts = viz_server._AGENT_CACHE_TS
+        self._saved_agents = dict(viz_agents.AGENTS)
+        self._saved_default = viz_agents.DEFAULT_AGENT
+        self._saved_mode = viz_agents._AGENT_STARTUP_MODE
+        self._saved_config = viz_agents._AGENT_STARTUP_CONFIG
+        self._saved_ts = viz_agents._AGENT_CACHE_TS
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server.DEFAULT_AGENT = self._saved_default
-        viz_server._AGENT_STARTUP_MODE = self._saved_mode
-        viz_server._AGENT_STARTUP_CONFIG = self._saved_config
-        viz_server._AGENT_CACHE_TS = self._saved_ts
+        viz_agents.AGENTS = self._saved_agents
+        viz_agents.DEFAULT_AGENT = self._saved_default
+        viz_agents._AGENT_STARTUP_MODE = self._saved_mode
+        viz_agents._AGENT_STARTUP_CONFIG = self._saved_config
+        viz_agents._AGENT_CACHE_TS = self._saved_ts
 
 
 # ---------------------------------------------------------------------------
@@ -69,28 +69,28 @@ class TestCacheHitWithinTTL(_RefreshBase):
     """discover_agents is never called when the cache is still fresh."""
 
     def test_no_rescan_within_ttl(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
         # Fake clock: now=1000.0; last scan was at 990.0 → 10s ago → within 45s TTL.
-        viz_server._AGENT_CACHE_TS = 990.0
-        viz_server.AGENTS = _agents("existing-agent")
-        viz_server.DEFAULT_AGENT = "existing-agent"
+        viz_agents._AGENT_CACHE_TS = 990.0
+        viz_agents.AGENTS = _agents("existing-agent")
+        viz_agents.DEFAULT_AGENT = "existing-agent"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents") as mock_discover:
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents") as mock_discover:
                 _refresh_agents_if_stale(ttl_seconds=45.0)
 
         mock_discover.assert_not_called()
-        self.assertIn("existing-agent", viz_server.AGENTS)
+        self.assertIn("existing-agent", viz_agents.AGENTS)
 
     def test_exactly_at_ttl_boundary_is_cache_hit(self):
         """now - ts == ttl exactly is within TTL (≤, not <)."""
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
-        viz_server._AGENT_CACHE_TS = 955.0  # exactly 45s before now=1000
-        viz_server.AGENTS = _agents("boundary-agent")
-        viz_server.DEFAULT_AGENT = "boundary-agent"
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_CACHE_TS = 955.0  # exactly 45s before now=1000
+        viz_agents.AGENTS = _agents("boundary-agent")
+        viz_agents.DEFAULT_AGENT = "boundary-agent"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents") as mock_discover:
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents") as mock_discover:
                 _refresh_agents_if_stale(ttl_seconds=45.0)
 
         mock_discover.assert_not_called()
@@ -104,49 +104,49 @@ class TestCacheMissPastTTL(_RefreshBase):
     """Past the TTL, discover_agents is called and the new agent is picked up."""
 
     def test_new_agent_appears_after_ttl(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
         # now=1000.0; last scan at 900.0 → 100s ago → past 45s TTL.
-        viz_server._AGENT_CACHE_TS = 900.0
-        viz_server.AGENTS = _agents("old-agent")
-        viz_server.DEFAULT_AGENT = "old-agent"
+        viz_agents._AGENT_CACHE_TS = 900.0
+        viz_agents.AGENTS = _agents("old-agent")
+        viz_agents.DEFAULT_AGENT = "old-agent"
 
         new_registry = _agents("old-agent", "new-agent")
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value=new_registry):
-                with patch.object(viz_server, "_pick_default", return_value="old-agent"):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value=new_registry):
+                with patch.object(viz_agents, "_pick_default", return_value="old-agent"):
                     _refresh_agents_if_stale(ttl_seconds=45.0)
 
-        self.assertIn("new-agent", viz_server.AGENTS)
-        self.assertIn("old-agent", viz_server.AGENTS)
+        self.assertIn("new-agent", viz_agents.AGENTS)
+        self.assertIn("old-agent", viz_agents.AGENTS)
 
     def test_rescan_called_exactly_once_past_ttl(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("alpha")
-        viz_server.DEFAULT_AGENT = "alpha"
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("alpha")
+        viz_agents.DEFAULT_AGENT = "alpha"
 
         discovered = _agents("alpha", "beta")
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value=discovered) as mock_d:
-                with patch.object(viz_server, "_pick_default", return_value="alpha"):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value=discovered) as mock_d:
+                with patch.object(viz_agents, "_pick_default", return_value="alpha"):
                     _refresh_agents_if_stale(ttl_seconds=45.0)
 
         mock_d.assert_called_once()
 
     def test_cache_timestamp_updated_after_rescan(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("alpha")
-        viz_server.DEFAULT_AGENT = "alpha"
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("alpha")
+        viz_agents.DEFAULT_AGENT = "alpha"
 
         now_val = 12345.0
         discovered = _agents("alpha")
-        with patch.object(viz_server.time, "monotonic", return_value=now_val):
-            with patch.object(viz_server, "discover_agents", return_value=discovered):
-                with patch.object(viz_server, "_pick_default", return_value="alpha"):
+        with patch.object(viz_agents.time, "monotonic", return_value=now_val):
+            with patch.object(viz_agents, "discover_agents", return_value=discovered):
+                with patch.object(viz_agents, "_pick_default", return_value="alpha"):
                     _refresh_agents_if_stale(ttl_seconds=45.0)
 
-        self.assertEqual(viz_server._AGENT_CACHE_TS, now_val)
+        self.assertEqual(viz_agents._AGENT_CACHE_TS, now_val)
 
 
 # ---------------------------------------------------------------------------
@@ -157,33 +157,33 @@ class TestSingleDbModeNeverRescans(_RefreshBase):
     """In single_db mode, _refresh_agents_if_stale never calls discover_agents."""
 
     def test_single_db_no_rescan_even_stale(self):
-        viz_server._AGENT_STARTUP_MODE = "single_db"
+        viz_agents._AGENT_STARTUP_MODE = "single_db"
         # Timestamp is zero — maximally stale; TTL=0 forces expiry on any other mode.
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = {"default": _agent_entry("default", "/explicit/knowledge.db")}
-        viz_server.DEFAULT_AGENT = "default"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = {"default": _agent_entry("default", "/explicit/knowledge.db")}
+        viz_agents.DEFAULT_AGENT = "default"
 
-        with patch.object(viz_server.time, "monotonic", return_value=9999.0):
-            with patch.object(viz_server, "discover_agents") as mock_discover:
+        with patch.object(viz_agents.time, "monotonic", return_value=9999.0):
+            with patch.object(viz_agents, "discover_agents") as mock_discover:
                 _refresh_agents_if_stale(ttl_seconds=0.0)
 
         mock_discover.assert_not_called()
         # Registry unchanged.
         self.assertEqual(
-            viz_server.AGENTS["default"]["db"], "/explicit/knowledge.db"
+            viz_agents.AGENTS["default"]["db"], "/explicit/knowledge.db"
         )
 
     def test_single_db_registry_unchanged(self):
         original = {"default": _agent_entry("default", "/my/db.db")}
-        viz_server._AGENT_STARTUP_MODE = "single_db"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = original
-        viz_server.DEFAULT_AGENT = "default"
+        viz_agents._AGENT_STARTUP_MODE = "single_db"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = original
+        viz_agents.DEFAULT_AGENT = "default"
 
-        with patch.object(viz_server.time, "monotonic", return_value=99999.0):
+        with patch.object(viz_agents.time, "monotonic", return_value=99999.0):
             _refresh_agents_if_stale(ttl_seconds=0.0)
 
-        self.assertEqual(viz_server.AGENTS, original)
+        self.assertEqual(viz_agents.AGENTS, original)
 
 
 # ---------------------------------------------------------------------------
@@ -194,41 +194,41 @@ class TestRefreshFailureSafe(_RefreshBase):
     """When the refresh throws, the last-good registry is preserved."""
 
     def test_exception_keeps_last_good_no_raise(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_only"
-        viz_server._AGENT_CACHE_TS = 0.0
+        viz_agents._AGENT_STARTUP_MODE = "discover_only"
+        viz_agents._AGENT_CACHE_TS = 0.0
         last_good = _agents("last-good-agent")
-        viz_server.AGENTS = last_good
-        viz_server.DEFAULT_AGENT = "last-good-agent"
+        viz_agents.AGENTS = last_good
+        viz_agents.DEFAULT_AGENT = "last-good-agent"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
             with patch.object(
-                viz_server, "discover_agents", side_effect=RuntimeError("disk error")
+                viz_agents, "discover_agents", side_effect=RuntimeError("disk error")
             ):
                 try:
                     _refresh_agents_if_stale(ttl_seconds=0.0)
                 except Exception as exc:
                     self.fail(f"_refresh_agents_if_stale raised unexpectedly: {exc}")
 
-        self.assertIn("last-good-agent", viz_server.AGENTS)
-        self.assertNotIn("new-agent", viz_server.AGENTS)
+        self.assertIn("last-good-agent", viz_agents.AGENTS)
+        self.assertNotIn("new-agent", viz_agents.AGENTS)
         # Anti-hammering: the except block bumps the cache TS so the next retry
         # waits a full TTL. Without this assertion, deleting that bump would
         # leave the test green (the gap the reviewer flagged).
-        self.assertEqual(viz_server._AGENT_CACHE_TS, 1000.0)
+        self.assertEqual(viz_agents._AGENT_CACHE_TS, 1000.0)
 
     def test_exception_in_merge_keeps_last_good(self):
         """Failure in _merge_config_over_discovered also keeps the last-good registry."""
-        viz_server._AGENT_STARTUP_MODE = "discover_merge"
-        viz_server._AGENT_STARTUP_CONFIG = "/fake/agents.json"
-        viz_server._AGENT_CACHE_TS = 0.0
+        viz_agents._AGENT_STARTUP_MODE = "discover_merge"
+        viz_agents._AGENT_STARTUP_CONFIG = "/fake/agents.json"
+        viz_agents._AGENT_CACHE_TS = 0.0
         last_good = _agents("stable-agent")
-        viz_server.AGENTS = last_good
-        viz_server.DEFAULT_AGENT = "stable-agent"
+        viz_agents.AGENTS = last_good
+        viz_agents.DEFAULT_AGENT = "stable-agent"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value=_agents("found")):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value=_agents("found")):
                 with patch.object(
-                    viz_server,
+                    viz_agents,
                     "_merge_config_over_discovered",
                     side_effect=ValueError("bad config"),
                 ):
@@ -237,29 +237,29 @@ class TestRefreshFailureSafe(_RefreshBase):
                     except Exception as exc:
                         self.fail(f"_refresh_agents_if_stale raised unexpectedly: {exc}")
 
-        self.assertIn("stable-agent", viz_server.AGENTS)
-        self.assertEqual(viz_server._AGENT_CACHE_TS, 1000.0)
+        self.assertIn("stable-agent", viz_agents.AGENTS)
+        self.assertEqual(viz_agents._AGENT_CACHE_TS, 1000.0)
 
     def test_empty_discover_in_merge_keeps_last_good_no_merge(self):
         """discover_merge: an empty discover() is a transient scan failure — keep
         last-good, bump TS, and do NOT call _merge_config_over_discovered (which
         would narrow the registry to config-only agents and drop discovered ones)."""
-        viz_server._AGENT_STARTUP_MODE = "discover_merge"
-        viz_server._AGENT_STARTUP_CONFIG = "/fake/agents.json"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("discovered-only-agent")
-        viz_server.DEFAULT_AGENT = "discovered-only-agent"
+        viz_agents._AGENT_STARTUP_MODE = "discover_merge"
+        viz_agents._AGENT_STARTUP_CONFIG = "/fake/agents.json"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("discovered-only-agent")
+        viz_agents.DEFAULT_AGENT = "discovered-only-agent"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value={}):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value={}):
                 with patch.object(
-                    viz_server, "_merge_config_over_discovered"
+                    viz_agents, "_merge_config_over_discovered"
                 ) as mock_merge:
                     _refresh_agents_if_stale(ttl_seconds=0.0)
 
         mock_merge.assert_not_called()
-        self.assertIn("discovered-only-agent", viz_server.AGENTS)
-        self.assertEqual(viz_server._AGENT_CACHE_TS, 1000.0)
+        self.assertIn("discovered-only-agent", viz_agents.AGENTS)
+        self.assertEqual(viz_agents._AGENT_CACHE_TS, 1000.0)
 
 
 # ---------------------------------------------------------------------------
@@ -270,35 +270,35 @@ class TestDiscoverFallbackMode(_RefreshBase):
     """In discover_fallback mode, discovery is retried on TTL expiry."""
 
     def test_fallback_picks_up_new_agent(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_fallback"
-        viz_server._AGENT_CACHE_TS = 0.0
+        viz_agents._AGENT_STARTUP_MODE = "discover_fallback"
+        viz_agents._AGENT_CACHE_TS = 0.0
         # Simulates the initial fallback: a "default" sentinel agent.
-        viz_server.AGENTS = {"default": _agent_entry("default")}
-        viz_server.DEFAULT_AGENT = "default"
+        viz_agents.AGENTS = {"default": _agent_entry("default")}
+        viz_agents.DEFAULT_AGENT = "default"
 
         newly_found = _agents("ariadne-calvino")
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value=newly_found):
-                with patch.object(viz_server, "_pick_default", return_value="ariadne-calvino"):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value=newly_found):
+                with patch.object(viz_agents, "_pick_default", return_value="ariadne-calvino"):
                     _refresh_agents_if_stale(ttl_seconds=0.0)
 
-        self.assertIn("ariadne-calvino", viz_server.AGENTS)
-        self.assertEqual(viz_server.DEFAULT_AGENT, "ariadne-calvino")
+        self.assertIn("ariadne-calvino", viz_agents.AGENTS)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "ariadne-calvino")
 
     def test_fallback_keeps_registry_when_still_nothing_found(self):
         """If discovery still returns empty, the fallback sentinel is preserved."""
-        viz_server._AGENT_STARTUP_MODE = "discover_fallback"
-        viz_server._AGENT_CACHE_TS = 0.0
+        viz_agents._AGENT_STARTUP_MODE = "discover_fallback"
+        viz_agents._AGENT_CACHE_TS = 0.0
         sentinel = {"default": _agent_entry("default")}
-        viz_server.AGENTS = sentinel
-        viz_server.DEFAULT_AGENT = "default"
+        viz_agents.AGENTS = sentinel
+        viz_agents.DEFAULT_AGENT = "default"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value={}):
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value={}):
                 _refresh_agents_if_stale(ttl_seconds=0.0)
 
-        self.assertEqual(viz_server.AGENTS, sentinel)
-        self.assertEqual(viz_server.DEFAULT_AGENT, "default")
+        self.assertEqual(viz_agents.AGENTS, sentinel)
+        self.assertEqual(viz_agents.DEFAULT_AGENT, "default")
 
 
 # ---------------------------------------------------------------------------
@@ -308,34 +308,34 @@ class TestDiscoverFallbackMode(_RefreshBase):
 class TestDiscoverMergeMode(_RefreshBase):
 
     def test_discover_and_merge_called_past_ttl(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_merge"
-        viz_server._AGENT_STARTUP_CONFIG = "/fake/agents.json"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("old")
-        viz_server.DEFAULT_AGENT = "old"
+        viz_agents._AGENT_STARTUP_MODE = "discover_merge"
+        viz_agents._AGENT_STARTUP_CONFIG = "/fake/agents.json"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("old")
+        viz_agents.DEFAULT_AGENT = "old"
 
         merged = _agents("old", "new-merged")
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents", return_value=_agents("old")) as mock_d:
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents", return_value=_agents("old")) as mock_d:
                 with patch.object(
-                    viz_server, "_merge_config_over_discovered", return_value=(merged, "old")
+                    viz_agents, "_merge_config_over_discovered", return_value=(merged, "old")
                 ) as mock_m:
                     _refresh_agents_if_stale(ttl_seconds=0.0)
 
         mock_d.assert_called_once()
         mock_m.assert_called_once_with(_agents("old"), "/fake/agents.json")
-        self.assertIn("new-merged", viz_server.AGENTS)
+        self.assertIn("new-merged", viz_agents.AGENTS)
 
     def test_discover_not_called_within_ttl_in_merge_mode(self):
-        viz_server._AGENT_STARTUP_MODE = "discover_merge"
-        viz_server._AGENT_STARTUP_CONFIG = "/fake/agents.json"
+        viz_agents._AGENT_STARTUP_MODE = "discover_merge"
+        viz_agents._AGENT_STARTUP_CONFIG = "/fake/agents.json"
         # Cache fresh: 10s ago, TTL=45s.
-        viz_server._AGENT_CACHE_TS = 990.0
-        viz_server.AGENTS = _agents("old")
-        viz_server.DEFAULT_AGENT = "old"
+        viz_agents._AGENT_CACHE_TS = 990.0
+        viz_agents.AGENTS = _agents("old")
+        viz_agents.DEFAULT_AGENT = "old"
 
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents") as mock_d:
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents") as mock_d:
                 _refresh_agents_if_stale(ttl_seconds=45.0)
 
         mock_d.assert_not_called()
@@ -348,23 +348,23 @@ class TestDiscoverMergeMode(_RefreshBase):
 class TestConfigOnlyMode(_RefreshBase):
 
     def test_config_only_calls_load_config_not_discover(self):
-        viz_server._AGENT_STARTUP_MODE = "config_only"
-        viz_server._AGENT_STARTUP_CONFIG = "/my/agents.json"
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("old")
-        viz_server.DEFAULT_AGENT = "old"
+        viz_agents._AGENT_STARTUP_MODE = "config_only"
+        viz_agents._AGENT_STARTUP_CONFIG = "/my/agents.json"
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("old")
+        viz_agents.DEFAULT_AGENT = "old"
 
         new_reg = _agents("config-reloaded")
-        with patch.object(viz_server.time, "monotonic", return_value=1000.0):
-            with patch.object(viz_server, "discover_agents") as mock_d:
+        with patch.object(viz_agents.time, "monotonic", return_value=1000.0):
+            with patch.object(viz_agents, "discover_agents") as mock_d:
                 with patch.object(
-                    viz_server, "_load_config", return_value=(new_reg, "config-reloaded")
+                    viz_agents, "_load_config", return_value=(new_reg, "config-reloaded")
                 ) as mock_lc:
                     _refresh_agents_if_stale(ttl_seconds=0.0)
 
         mock_d.assert_not_called()
         mock_lc.assert_called_once_with("/my/agents.json")
-        self.assertIn("config-reloaded", viz_server.AGENTS)
+        self.assertIn("config-reloaded", viz_agents.AGENTS)
 
 
 # ---------------------------------------------------------------------------
@@ -374,17 +374,17 @@ class TestConfigOnlyMode(_RefreshBase):
 class TestUninitializedMode(_RefreshBase):
 
     def test_empty_mode_is_noop(self):
-        viz_server._AGENT_STARTUP_MODE = ""
-        viz_server._AGENT_CACHE_TS = 0.0
-        viz_server.AGENTS = _agents("existing")
-        viz_server.DEFAULT_AGENT = "existing"
+        viz_agents._AGENT_STARTUP_MODE = ""
+        viz_agents._AGENT_CACHE_TS = 0.0
+        viz_agents.AGENTS = _agents("existing")
+        viz_agents.DEFAULT_AGENT = "existing"
 
-        with patch.object(viz_server.time, "monotonic", return_value=9999.0):
-            with patch.object(viz_server, "discover_agents") as mock_d:
+        with patch.object(viz_agents.time, "monotonic", return_value=9999.0):
+            with patch.object(viz_agents, "discover_agents") as mock_d:
                 _refresh_agents_if_stale(ttl_seconds=0.0)
 
         mock_d.assert_not_called()
-        self.assertIn("existing", viz_server.AGENTS)
+        self.assertIn("existing", viz_agents.AGENTS)
 
 
 if __name__ == "__main__":

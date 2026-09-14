@@ -40,3 +40,6 @@ deploy/
 #     from the snapshot, so these are dev-internal and stay in the private repo). ---
 docs/RELEASING.md
 docs/DEVELOPMENT.md
+
+# v0.5.0 cut (2026-09-02): internal fleet runbook naming a superseded rc tag; no public reader (Ariadne, roster scan)
+docs/rc-upgrade-runbook.md

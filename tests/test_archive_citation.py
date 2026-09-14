@@ -275,6 +275,44 @@ def test_verify_quote_absolute_existing_file_verifies(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# #2765 — PDF quotes can never verify against raw bytes; the error must say
+# so rather than sending the agent hunting for a typo in a correct quote.
+# ---------------------------------------------------------------------------
+
+def test_verify_quote_pdf_names_the_format_gap(tmp_path):
+    """A .pdf archive's raw bytes never contain a quote copied from the
+    document's extracted text -- the error must name the PDF/extraction
+    gap and say the quote may be exactly correct, not the generic
+    verbatim-substring message."""
+    fp = tmp_path / "paper.pdf"
+    fp.write_bytes(b"%PDF-1.4\n%\xc2\xa5\xc2\xb1\xc2\xab\n...binary garbage...")
+    result = eo._verify_quote_in_source(f"file://{fp}", "a quote from the extracted text")
+    assert result is not None
+    assert "This source is a PDF" in result
+    assert "extracted text" in result
+    assert "Your quote may be exactly correct" in result
+    # The generic message's own wording must NOT appear -- this is a
+    # replacement, not an addition, per the issue's resolution.
+    assert "must be a verbatim substring" not in result
+
+
+def test_verify_quote_pdf_omits_near_match_noise(tmp_path):
+    """Near-matches are computed against the PDF's raw bytes decoded as
+    UTF-8 -- garbage, not text. Suggesting 'copy from a match above' on
+    garbage would contradict the PDF message's own 'your quote may be
+    exactly correct' -- the suggestion block must not appear."""
+    fp = tmp_path / "paper.pdf"
+    # A byte sequence chosen to decode (with errors="replace") into text
+    # that shares words with the quote, so _find_near_matches has
+    # something to find if the PDF branch didn't suppress it.
+    fp.write_bytes(b"%PDF-1.4\nquote from the extracted\xff\xfetext garbage\n")
+    result = eo._verify_quote_in_source(f"file://{fp}", "a quote from the extracted text")
+    assert result is not None
+    assert "Nearest matches" not in result
+    assert "Copy the exact text from a match above" not in result
+
+
+# ---------------------------------------------------------------------------
 # #1256 round-2 — _capture_file_version rejects relative file:// paths
 # ---------------------------------------------------------------------------
 

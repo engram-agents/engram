@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ENGRAM Health Dashboard</title>
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    /* font-family/background/color moved to static/base.css's shared body{}
+       rule (engram-alpha#2555 PR C, forum #389) -- only this page's own
+       padding remains local, since base.css's copy is linked BEFORE this
+       <style> block and a page-local body{} declared here still wins the
+       cascade on any property it sets. */
+    body { padding: 24px; }
+    h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
+    h2 { color: #7ecfff; font-size: 1.1em; margin: 16px 0 8px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+    .card { background: #16213e; border-radius: 8px; padding: 16px; border: 1px solid #0f3460; }
+    .card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 10px; }
+    .metric { display: flex; justify-content: space-between; padding: 4px 0;
+              border-bottom: 1px solid #0f3460; font-size: 0.85em; }
+    .metric:last-child { border-bottom: none; }
+    .metric .label { color: #aaa; }
+    .metric .value { color: #fff; font-weight: 600; }
+    .metric .value.warn { color: #ff9800; }
+    .metric .value.danger { color: #f44336; }
+    .metric .value.good { color: #4caf50; }
+    .gauge { width: 120px; height: 120px; margin: 0 auto 12px; position: relative; }
+    .gauge canvas { width: 120px; height: 120px; }
+    .gauge .score { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+                    font-size: 1.8em; font-weight: 700; }
+    .bar-chart { display: flex; align-items: flex-end; gap: 4px; height: 80px; margin-top: 8px; }
+    .bar-chart .bar { flex: 1; background: #00d4ff; border-radius: 3px 3px 0 0;
+                      min-width: 20px; position: relative; transition: height 0.3s; }
+    .bar-chart .bar .bar-label { position: absolute; bottom: -18px; left: 50%;
+                                  transform: translateX(-50%); font-size: 0.65em; color: #888; white-space: nowrap; }
+    .bar-chart .bar .bar-value { position: absolute; top: -16px; left: 50%;
+                                  transform: translateX(-50%); font-size: 0.7em; color: #ccc; }
+    .trend { margin-top: 8px; }
+    .trend svg { width: 100%; height: 60px; }
+    .trend path { fill: none; stroke: #00d4ff; stroke-width: 2; }
+    .trend circle { fill: #00d4ff; }
+    .timeline { margin-top: 8px; }
+    .timeline .day { display: flex; align-items: center; gap: 8px; padding: 3px 0;
+                     font-size: 0.8em; border-bottom: 1px solid #0f3460; }
+    .timeline .day .date { color: #888; min-width: 80px; }
+    .timeline .day .counts { display: flex; gap: 6px; flex-wrap: wrap; }
+    .timeline .day .counts span { padding: 1px 6px; border-radius: 3px; font-size: 0.75em; }
+    .tag-created { background: #1b5e20; color: #a5d6a7; }
+    .tag-superseded { background: #4a148c; color: #ce93d8; }
+    .tag-retracted { background: #b71c1c; color: #ef9a9a; }
+    .tag-resolved { background: #0d47a1; color: #90caf9; }
+    .tag-other { background: #37474f; color: #b0bec5; }
+    #loading { text-align: center; padding: 40px; color: #888; }
+    /* Calibration card — namespaced to avoid collision with existing .bar-chart */
+    .calibration-bar-chart { display: flex; align-items: flex-end; gap: 3px; height: 60px; margin: 6px 0 20px; }
+    .calibration-bar-chart .cal-bar { flex: 1; border-radius: 3px 3px 0 0; min-width: 16px;
+                                      position: relative; transition: height 0.3s; }
+    .calibration-bar-chart .cal-bar .cal-bar-label { position: absolute; bottom: -18px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.6em;
+                                                      color: #888; white-space: nowrap; }
+    .calibration-bar-chart .cal-bar .cal-bar-value { position: absolute; top: -14px; left: 50%;
+                                                      transform: translateX(-50%); font-size: 0.65em; color: #ccc; }
+    .cal-type-label { color: #7ecfff; font-size: 0.8em; margin: 10px 0 2px; font-weight: 600; }
+    .cal-caption { font-size: 0.72em; color: #888; font-style: italic; margin: 8px 0 4px; }
+    .cal-col-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+    .cal-col-header { color: #7ecfff; font-size: 0.78em; font-weight: 600; text-align: center;
+                      border-bottom: 1px solid #0f3460; padding-bottom: 4px; margin-bottom: 4px; }
+    .cal-col-row { font-size: 0.75em; text-align: center; padding: 2px 0; color: #d0d0d0; }
+    .cal-col-type { font-size: 0.72em; color: #aaa; text-align: left; padding: 2px 0; }
+    /* .nav-agent-label/.nav-agent-select/#nav-agent-wrapper consolidated
+       into static/base.css's sole copy (engram-alpha#2555 PR C sweep --
+       this page's copy was byte-identical dead weight left behind by PR
+       B's nav-CSS consolidation, which covered .nav/.nav a/.nav a:hover
+       but missed this trio). */
+    /* View toggle (Normal/Detail) + Snapshot-now button shell -- #2518 slice 1.
+       Page-scoped (not base.css): this control only exists on health.html. */
+    .health-header { display: flex; align-items: center; justify-content: space-between;
+                      flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+    .health-header h1 { margin-bottom: 0; }
+    .health-header-controls { display: flex; align-items: center; gap: 12px; }
+    .view-toggle { display: inline-flex; border: 1px solid #1a4a8a; border-radius: 4px;
+                   overflow: hidden; }
+    .view-toggle-btn { background: #0d1b36; color: #888; border: none; padding: 6px 14px;
+                        font-size: 0.85em; font-family: inherit; cursor: pointer; }
+    .view-toggle-btn:hover { background: #16213e; color: #ccc; }
+    .view-toggle-btn.active { background: #00d4ff; color: #0d1b36; font-weight: 600; }
+    .view-toggle-btn + .view-toggle-btn { border-left: 1px solid #1a4a8a; }
+    .snapshot-now-btn { background: #0d1b36; color: #888; border: 1px solid #1a4a8a;
+                         border-radius: 4px; padding: 6px 12px; font-size: 0.85em;
+                         font-family: inherit; cursor: not-allowed; opacity: 0.6; }
+    /* Detail-view empty state -- matches #loading's visual treatment
+       (text-align/padding/color), per the existing dark theme. */
+    .detail-empty-state { text-align: center; padding: 40px; color: #888; }
+    /* Detail-view real content (engram-alpha#2754 PR A) -- a read-only fork
+       of the Curve Workbench (health-workbench.js/health-workbench-curve.js),
+       restyled to sit inside this dashboard rather than the Workbench's own
+       dark :root theme. "detail-" prefix per the pre-existing convention;
+       scoped to #detail-view's own elements so nothing here leaks into
+       #normal-view's cards. See health-detail.js's own module docstring for
+       the full fork rationale. */
+    .detail-scores-note { background: #2a1f00; color: #ffb74d; border: 1px solid #5c4500;
+                           border-radius: 4px; padding: 8px 12px; margin-bottom: 12px;
+                           font-size: 0.85em; }
+    .detail-composed-value { font-size: 2em; font-weight: 700; color: #00d4ff;
+                              text-align: center; margin: 4px 0; }
+    .detail-provenance { text-align: center; color: #888; font-size: 0.8em; margin-bottom: 8px; }
+    .detail-chkpt-age { color: #888; }
+    .detail-status-badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
+                            font-size: 0.7em; font-weight: 600; margin-left: 6px; vertical-align: middle; }
+    .detail-status-badge.good { background: #1b5e20; color: #a5d6a7; }
+    .detail-status-badge.warn { background: #4a3200; color: #ffcc80; }
+    .detail-status-badge.danger { background: #b71c1c; color: #ef9a9a; }
+    .detail-aspect-tag { color: #7ecfff; font-size: 0.75em; }
+    .detail-signal-row { margin-bottom: 12px; }
+    .detail-held { opacity: 0.85; }
+    .detail-plot-label { font-size: 0.7em; letter-spacing: 0.06em; text-transform: uppercase;
+                          color: #888; margin: 10px 0 4px; }
+    .detail-strip-dist-container { margin-top: 8px; }
+    /* Scaled-down modifier on the existing .view-toggle/.view-toggle-btn
+       pattern (never a copy-paste) -- one strip-mode toggle per
+       strip+distribution block. */
+    .detail-mini-toggle { margin: 6px 0; }
+    .detail-mini-toggle-btn { padding: 3px 8px; font-size: 0.72em; }
+    .detail-series-note { color: #888; font-size: 0.78em; font-style: italic; padding: 6px 0; }
+    /* Ported from health-workbench.js's plot/focus-marker machinery
+       (engram-alpha#2738 round 2-4), restyled to this page's own color
+       literals instead of the Workbench's --muted/--accent/--rule CSS
+       vars -- no dashboard equivalent exists for these SVG-plot-specific
+       rules, so they're ported directly rather than reusing .trend. */
+    .detail-axis-label { fill: #888; font-size: 9px; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .detail-focus-guide { stroke: #7ecfff; stroke-width: 1; stroke-dasharray: 2 2; }
+    .detail-focus-dot { fill: #00d4ff; stroke: #16213e; stroke-width: 1; }
+    .detail-unavailable-band { opacity: 0.85; }
+    .detail-plot-container { position: relative; }
+    .detail-plot-container svg { display: block; width: 100%; height: auto; cursor: crosshair; }
+    .detail-focus-readout { position: absolute; pointer-events: none; background: rgba(15,52,96,.92);
+                             border: 1px solid #0f3460; border-radius: 4px; padding: 3px 6px;
+                             color: #e0e0e0; font-size: 10px; line-height: 1.35;
+                             font-family: ui-monospace, Menlo, Consolas, monospace;
+                             white-space: normal; z-index: 2; }
+    .detail-statst { margin-top: 4px; border: 1px solid #0f3460; border-collapse: collapse; width: 100%; }
+    .detail-statst th, .detail-statst td { font-size: 11px; padding: 3px 6px; border: 1px solid #0f3460; text-align: right; }
+    .detail-statst th:first-child, .detail-statst td:first-child { text-align: left; color: #7ecfff; }
+    .detail-statst thead th { background: #0f3460; color: #888; }
+    .detail-aspect-section { border-top: 1px solid #0f3460; padding-top: 12px; margin-top: 12px; }
+    .detail-aspect-section h2 { color: #7ecfff; font-size: 1.1em; margin: 0; }
+    .detail-aspect-score { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8em; color: #00d4ff; }
+    .detail-aspect-sub { color: #888; font-size: 0.78em; margin-bottom: 0; }
+    .detail-refctl { margin-top: 6px; font-size: 11px; color: #7a8aa0; }
+    /* Three-panel grid fork (engram-alpha#2868) -- CSS *shapes* ported from
+       health_workbench.html's .signal/.strip/.aspect-head/.atile rules,
+       translated to this page's own hardcoded palette (never the
+       workbench's --panel/--rule/... custom properties -- this page has no
+       :root theme of its own, and the fork discipline is "copy the shape,
+       not the syntax"). Per the #2868 fork ruling, this file's classes are
+       independent of health_workbench.html's -- they are free to drift.
+       Same 1000px collapse breakpoint the workbench uses for both grids. */
+    .detail-signal-grid { display: grid; grid-template-columns: 1.05fr 1.1fr 1.25fr; gap: 16px; }
+    /* #2881 restructuring: this was 220px 1fr for a score-card | disclaimer-
+       text pairing -- the right slot now holds a readable history/histogram
+       plot instead (see health-detail.js's renderComposedBlock()), so the
+       ratio widened from a narrow text column to something closer to the
+       per-signal grid's own score:plot proportions above. JUDGMENT CALL
+       (flagged in the dispatching report): exact ratio unspecified by the
+       issue -- verified visually via Playwright screenshot, not just read
+       off this number. */
+    .detail-strip-top { display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: stretch; margin-bottom: 12px; }
+    /* Disclaimer bar (#2881): a slim, full-width bar above the score/plot
+       row -- was `.detail-meaning-panel`, a side-panel column beside the
+       score card; renamed since it's no longer a grid column. Text content
+       unchanged, only the container. */
+    .detail-disclaimer-bar { font-size: 0.82em; color: #aaa; line-height: 1.5;
+                              padding: 10px 16px; margin-bottom: 12px;
+                              background: #16213e; border: 1px solid #0f3460;
+                              border-radius: 8px; }
+    .detail-disclaimer-bar p { margin: 0; }
+    .detail-disclaimer-bar code { color: #7ecfff; }
+    .detail-aspect-head { display: grid; grid-template-columns: auto 1fr auto; gap: 16px; align-items: center; margin: 0 0 8px; }
+    .detail-atile { display: flex; align-items: baseline; gap: 6px; background: #0f3460; border: 1px solid #1a4a8a; border-radius: 6px; padding: 6px 12px; }
+    .detail-atile-pts { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78em; color: #888; }
+    @media (max-width: 1000px) {
+      .detail-signal-grid { grid-template-columns: 1fr; }
+      .detail-strip-top { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<!--NAV_PLACEHOLDER-->
+  <div class="health-header">
+    <h1>ENGRAM Health Dashboard</h1>
+    <div class="health-header-controls">
+      <div class="view-toggle" id="view-toggle" role="group" aria-label="View mode">
+        <button type="button" class="view-toggle-btn" id="view-toggle-normal" data-view="normal">Normal</button>
+        <button type="button" class="view-toggle-btn" id="view-toggle-detail" data-view="detail">Detail</button>
+      </div>
+      <button type="button" class="snapshot-now-btn" id="snapshot-now-btn" disabled
+              title="Recompute endpoint not yet available">Snapshot now</button>
+    </div>
+  </div>
+  <div id="normal-view">
+    <div id="loading">Loading health data...</div>
+    <div id="dashboard" style="display:none;">
+      <div class="grid" id="cards"></div>
+    </div>
+  </div>
+  <div id="detail-view" style="display:none;">
+    <div class="detail-empty-state" id="detail-empty-state">No detail-view snapshot data yet — this view is under construction.</div>
+    <div id="detail-content" style="display:none;">
+      <div class="detail-scores-note" id="detail-scores-note" style="display:none;"></div>
+      <div id="detail-composed-block"></div>
+      <div id="detail-aspect-sections"></div>
+    </div>
+  </div>
+
+  <script src="/static/health-detail-math.js"></script>
+  <script src="/static/health-workbench-curve.js"></script>
+  <script src="/static/health-detail.js"></script>
+  <script>
+  function _currentAgent() {
+    return new URL(window.location.href).searchParams.get('agent');
+  }
+  function _withAgent(path) {
+    const a = _currentAgent();
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+
+  function loadHealth() {
+    document.getElementById('loading').style.display = '';
+    document.getElementById('dashboard').style.display = 'none';
+    document.getElementById('cards').innerHTML = '';
+    Promise.all([
+      fetch(_withAgent('/api/health')).then(r => r.json()),
+      fetch(_withAgent('/api/calibration')).then(r => r.json()).catch(() => null),
+      fetch(_withAgent('/api/health/v2')).then(r => r.json()).catch(() => null),
+    ]).then(([data, calData, v2]) => {
+        document.getElementById('loading').style.display = 'none';
+        document.getElementById('dashboard').style.display = 'block';
+        if (data.error) {
+          document.getElementById('cards').innerHTML = '<div class="card"><p>' + data.error + '</p></div>';
+          return;
+        }
+        render(data, v2);
+        if (calData && !calData.error) {
+          renderCalibration(calData);
+        }
+      })
+      .catch(e => {
+        document.getElementById('loading').textContent = 'Error: ' + e.message;
+      });
+  }
+
+  // ── View toggle (Normal/Detail) -- #2518 slice 1 ─────────────────────────
+  // State-resolution order: URL ?view= param wins if present, else the
+  // localStorage preference, else "normal". Detail view has no real data
+  // source yet (see #detail-view's empty-state placeholder above) -- this
+  // is shell-only, no fetch, no new endpoint.
+  var VIEW_STORAGE_KEY = 'healthViewPreference';
+
+  function getInitialView() {
+    var urlView = new URL(window.location.href).searchParams.get('view');
+    if (urlView === 'detail' || urlView === 'normal') return urlView;
+    // localStorage access throws SecurityError in a browser that denies
+    // site data (e.g. Chrome "Block all cookies", Firefox
+    // dom.storage.enabled=false) -- guarded so that throw can never abort
+    // this top-level inline script before loadHealth() below runs.
+    // Ariadne's colleague-review finding on #2579: unguarded, this took
+    // down the whole dashboard, not just the toggle's persistence.
+    try {
+      var stored = localStorage.getItem(VIEW_STORAGE_KEY);
+      if (stored === 'detail' || stored === 'normal') return stored;
+    } catch (e) { /* storage blocked -- fall through to the default */ }
+    return 'normal';
+  }
+
+  function applyView(view, persist) {
+    var isDetail = view === 'detail';
+    // Lazy-load the detail-view data, once, the first time Detail activates
+    // -- on the initial applyView(getInitialView(), false) call below (when
+    // ?view=detail or the stored preference already resolves to 'detail' at
+    // page load) AND on a later Normal->Detail toggle click. loadDetailView()
+    // itself is the single-fetch guard (a `_detailLoaded` flag), so this one
+    // call site covers both triggers without fetching on every toggle click.
+    if (isDetail) { loadDetailView(); }
+    document.getElementById('normal-view').style.display = isDetail ? 'none' : '';
+    document.getElementById('detail-view').style.display = isDetail ? '' : 'none';
+    document.getElementById('view-toggle-normal').classList.toggle('active', !isDetail);
+    document.getElementById('view-toggle-detail').classList.toggle('active', isDetail);
+    document.getElementById('view-toggle-normal').setAttribute('aria-pressed', String(!isDetail));
+    document.getElementById('view-toggle-detail').setAttribute('aria-pressed', String(isDetail));
+    if (persist) {
+      // See getInitialView()'s comment -- same guard, same reason.
+      try {
+        localStorage.setItem(VIEW_STORAGE_KEY, view);
+      } catch (e) { /* storage blocked -- persistence is lost, not fatal */ }
+      var url = new URL(window.location.href);
+      if (isDetail) {
+        url.searchParams.set('view', 'detail');
+      } else {
+        url.searchParams.delete('view');
+      }
+      history.replaceState(null, '', url.toString());
+    }
+  }
+
+  applyView(getInitialView(), false);
+  document.getElementById('view-toggle-normal').addEventListener('click', function () {
+    applyView('normal', true);
+  });
+  document.getElementById('view-toggle-detail').addEventListener('click', function () {
+    applyView('detail', true);
+  });
+
+  // Agent switching is handled by the shared top-nav selector (see
+  // _NAV_SCRIPT); loadHealth() reads _currentAgent() from the URL on each
+  // page load, so no per-tab wiring is needed here.
+  loadHealth();
+
+  function render(d, v2) {
+    const cards = document.getElementById('cards');
+    let html = '';
+
+    // Health score gauge -- health-v2 composed score (#2757), NOT v1's
+    // d.health_score. d.health_score's OTHER uses (the separate "Health
+    // Score Trend" card further down) are untouched -- out of scope here.
+    // REBASE NOTE (#2757 onto #2524/#2763): #2524 added a `scoreKnown`
+    // fail-honest guard to this same card for v1's d.health_score (never
+    // fabricate 0 on ImportError) -- moot here, not lost: this card no
+    // longer displays d.health_score at all, v2's own independent
+    // fail-honest branch below (composed.value null/UNAVAILABLE) is the
+    // one now guarding what actually renders in this card. #2524's OTHER
+    // change (drawGauge()'s own null/undefined guard, a separate
+    // non-overlapping location in this file) is untouched by this rebase.
+    const v2Score = (v2 && v2.has_snapshot === true && v2.composed &&
+                     v2.composed.value !== null && v2.composed.value !== undefined &&
+                     v2.composed.value !== 'UNAVAILABLE')
+      ? v2.composed.value : null;
+
+    let scoreValueHtml, scoreFootHtml;
+    if (v2Score !== null) {
+      const writtenAt = (v2.provenance && v2.provenance.written_at) || 'unknown';
+      // Round at render time only (#2867) -- the stored composed.value keeps
+      // its full precision; scoreColor()'s threshold comparison below still
+      // uses the raw v2Score, only the displayed text is rounded.
+      scoreValueHtml = `<div class="score" style="color:${scoreColor(v2Score)}">${esc(Number(v2Score).toFixed(2))}</div>`;
+      // Coverage caveat (#2757 round 2, per Ariadne's contract): composed.value
+      // is only ever computed over the SCORED aspects -- when composed_coverage
+      // is < 1.0 the score is silently partial, and rendering the number alone
+      // (e.g. 94.7) reads as a full-coverage figure it never was. Additive
+      // only -- a fully-scored snapshot (coverage === 1.0, or the field is
+      // absent/null) shows nothing extra here.
+      const coverage = v2.composed && v2.composed.composed_coverage;
+      let coverageHtml = '';
+      if (coverage !== null && coverage !== undefined && coverage < 1) {
+        const coveragePct = Math.round(coverage * 100);
+        const unscoredAspects = (v2.composed.unscored_aspects || []).join(', ');
+        const unscoredNote = unscoredAspects ? ` (${esc(unscoredAspects)} unavailable)` : '';
+        coverageHtml = `<div class="detail-provenance">${esc(coveragePct)}% coverage${unscoredNote}</div>`;
+      }
+      scoreFootHtml = `<div class="detail-provenance">as of ${esc(writtenAt)}</div>${coverageHtml}`;
+    } else {
+      // FAIL-HONEST (#2757, mirrors #2524's own fix): never fabricate a 0
+      // or fall back to the v1 score here, and never draw a gauge arc for
+      // a number that doesn't exist (see the drawGauge() call below).
+      const reasonText = (v2 && v2.reason) ? esc(v2.reason) : '';
+      scoreValueHtml = `<div style="font-size:0.85em; color:#888; padding-top:44px;">health-v2 score unavailable</div>`;
+      scoreFootHtml = reasonText ? `<div class="detail-provenance">${reasonText}</div>` : '';
+    }
+
+    html += `<div class="card" style="text-align:center">
+      <h3>Health Score</h3>
+      <div class="gauge"><canvas id="gauge" width="120" height="120"></canvas>
+        ${scoreValueHtml}
+      </div>
+      ${scoreFootHtml}
+      <div style="font-size:0.8em; color:#888">Turn ${d.current_turn}</div>
+      <div style="margin-top:6px;">
+        <a href="/health?view=detail" id="score-panel-details-link" onclick="applyView('detail', true); return false;">View details &rarr;</a>
+      </div>
+    </div>`;
+
+    // Overview
+    html += `<div class="card"><h3>Overview</h3>
+      ${metric('Current nodes', d.total_current)}
+      ${metric('Total (incl. superseded)', d.total_nodes)}
+      ${metric('Edges', d.total_edges)}
+      ${metric('Embedding coverage', d.embedding_pct + '%', d.embedding_pct < 80 ? 'warn' : 'good')}
+      ${metric('Feeling reports', d.feeling_reports)}
+    </div>`;
+
+    // Issues
+    const issues = d.tainted + d.stale + d.retracted + d.orphans;
+    html += `<div class="card"><h3>Issues</h3>
+      ${metric('Tainted nodes', d.tainted, d.tainted > 0 ? 'danger' : 'good')}
+      ${metric('Stale nodes', d.stale, d.stale > 0 ? 'warn' : 'good')}
+      ${metric('Retracted nodes', d.retracted, d.retracted > 10 ? 'warn' : '')}
+      ${metric('Orphan nodes', d.orphans, d.orphans > 5 ? 'warn' : '')}
+      ${metric('Total issues', issues, issues > 10 ? 'warn' : 'good')}
+    </div>`;
+
+    // Resolution
+    html += `<div class="card"><h3>Resolution Rates</h3>
+      ${metric('Questions', d.questions_resolved + '/' + d.questions_total + ' (' + pct(d.questions_resolved, d.questions_total) + ')')}
+      ${metric('Conjectures', d.conjectures_resolved + '/' + d.conjectures_total + ' (' + pct(d.conjectures_resolved, d.conjectures_total) + ')')}
+    </div>`;
+
+    // Confidence distribution
+    const confDist = d.confidence_distribution || {};
+    const confMax = Math.max(...Object.values(confDist), 1);
+    html += `<div class="card"><h3>Confidence Distribution</h3>
+      <div class="bar-chart">
+        ${Object.entries(confDist).map(([k,v]) =>
+          `<div class="bar" style="height:${Math.max(v/confMax*80,2)}px; background:${confBarColor(k)}">
+            <span class="bar-value">${v}</span><span class="bar-label">${k}</span></div>`
+        ).join('')}
+      </div>
+    </div>`;
+
+    // Node types
+    const nc = d.node_counts || {};
+    html += `<div class="card"><h3>Node Types</h3>
+      ${Object.entries(nc).sort((a,b) => b[1].current - a[1].current).map(([t,c]) =>
+        metric(t, c.current + (c.total > c.current ? ' (+' + (c.total - c.current) + ' old)' : ''))
+      ).join('')}
+    </div>`;
+
+    // Edge types
+    const ec = d.edge_counts || {};
+    html += `<div class="card"><h3>Edge Types</h3>
+      ${Object.entries(ec).sort((a,b) => b[1] - a[1]).map(([r,c]) => metric(r, c)).join('')}
+    </div>`;
+
+    // Edit timeline (last 7 days)
+    const ebd = d.edit_by_day || {};
+    const days = Object.keys(ebd).sort();
+    if (days.length > 0) {
+      html += `<div class="card" style="grid-column: span 2"><h3>Edit Activity (Last 7 Days)</h3>
+        <div class="timeline">
+          ${days.map(day => {
+            const acts = ebd[day];
+            return `<div class="day"><span class="date">${day}</span><div class="counts">
+              ${Object.entries(acts).map(([a,c]) =>
+                `<span class="tag-${tagClass(a)}">${a}: ${c}</span>`).join('')}
+            </div></div>`;
+          }).join('')}
+        </div>
+      </div>`;
+    }
+
+    // Health trend
+    const trend = d.health_trend || [];
+    if (trend.length > 1) {
+      html += `<div class="card" style="grid-column: span 2"><h3>Health Score Trend</h3>
+        <div class="trend"><svg id="trend-svg" viewBox="0 0 600 60"></svg></div>
+      </div>`;
+    }
+
+    cards.innerHTML = html;
+
+    // Draw gauge -- only when a real v2 composed score exists; never draw a
+    // placeholder arc for the unavailable case (#2757 fail-honest).
+    if (v2Score !== null) drawGauge(v2Score);
+
+    // Draw trend line
+    if (trend.length > 1) drawTrend(trend);
+  }
+
+  function metric(label, value, cls) {
+    return `<div class="metric"><span class="label">${label}</span><span class="value ${cls||''}">${value}</span></div>`;
+  }
+  function pct(a, b) { return b > 0 ? Math.round(a/b*100) + '%' : '0%'; }
+  function scoreColor(s) { return s >= 80 ? '#4caf50' : s >= 60 ? '#ff9800' : '#f44336'; }
+  function confBarColor(k) {
+    const m = {'0.0-0.2':'#f44336','0.2-0.4':'#ff9800','0.4-0.6':'#ffeb3b','0.6-0.8':'#8bc34a','0.8-1.0':'#4caf50'};
+    return m[k] || '#00d4ff';
+  }
+  function tagClass(a) {
+    if (a === 'created') return 'created';
+    if (a === 'superseded' || a === 'stale_flagged') return 'superseded';
+    if (a === 'retracted' || a === 'tainted') return 'retracted';
+    if (a === 'resolved' || a === 'reopened') return 'resolved';
+    return 'other';
+  }
+
+  function drawGauge(score) {
+    const c = document.getElementById('gauge');
+    if (!c) return;
+    const ctx = c.getContext('2d');
+    const cx = 60, cy = 60, r = 50;
+    // Background arc
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0.75 * Math.PI, 2.25 * Math.PI);
+    ctx.strokeStyle = '#0f3460';
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    // engram-alpha#2524: score === null/undefined means "unavailable", not
+    // "zero" -- (null / 100) coerces to 0 in JS arithmetic, which would
+    // silently draw the exact same empty arc a real score=0 draws. Skip the
+    // score arc entirely rather than let the two states look identical.
+    if (score === null || score === undefined) return;
+    // Score arc
+    const angle = 0.75 * Math.PI + (score / 100) * 1.5 * Math.PI;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0.75 * Math.PI, angle);
+    ctx.strokeStyle = scoreColor(score);
+    ctx.lineWidth = 10;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  }
+
+  function drawTrend(trend) {
+    const svg = document.getElementById('trend-svg');
+    if (!svg || trend.length < 2) return;
+    const w = 600, h = 60, pad = 10;
+    const scores = trend.map(t => t.health_score);
+    const mn = Math.min(...scores) - 5, mx = Math.max(...scores) + 5;
+    const xScale = i => pad + i / (trend.length - 1) * (w - 2 * pad);
+    const yScale = v => h - pad - (v - mn) / (mx - mn) * (h - 2 * pad);
+    const pts = trend.map((t, i) => `${xScale(i)},${yScale(t.health_score)}`);
+    svg.innerHTML = `<path d="M${pts.join(' L')}"/>` +
+      trend.map((t, i) =>
+        `<circle cx="${xScale(i)}" cy="${yScale(t.health_score)}" r="3"><title>Turn ${t.turn}: ${t.health_score}</title></circle>`
+      ).join('');
+  }
+
+  // HTML-escape for DB-sourced strings used in innerHTML.
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Bucket boundaries for per-type histograms (5-6 buckets).
+  // Reserved for future histogram rendering — V1 uses quantile display.
+  const CAL_BUCKETS = [
+    {lo: 0,    hi: 0.30, label: '<0.30', color: '#f44336'},
+    {lo: 0.30, hi: 0.50, label: '0.30–0.50', color: '#ff9800'},
+    {lo: 0.50, hi: 0.70, label: '0.50–0.70', color: '#ffeb3b'},
+    {lo: 0.70, hi: 0.85, label: '0.70–0.85', color: '#8bc34a'},
+    {lo: 0.85, hi: 0.95, label: '0.85–0.95', color: '#4caf50'},
+    {lo: 0.95, hi: 1.01, label: '≥0.95',    color: '#00e676'},
+  ];
+
+  function calDeltaClass(delta) {
+    const abs = Math.abs(delta);
+    if (abs >= 0.15) return 'danger';
+    if (abs >= 0.10) return 'warn';
+    return 'good';
+  }
+
+  function renderCalibration(cal) {
+    const cards = document.getElementById('cards');
+    if (!cards) return;
+
+    const corpus = cal.corpus || {};
+    const byType = corpus.by_type || {};
+    const byQt   = corpus.by_quote_type || {};
+    const byRt   = corpus.by_reasoning_type || {};
+    const drift  = cal.drift_by_type || {};
+
+    const PRIMARY_TYPES = ['observation_factual', 'derivation', 'conjecture', 'lesson'];
+
+    // ── Per-type histograms ───────────────────────────────────────────────
+    let histHtml = '';
+    for (const ntype of PRIMARY_TYPES) {
+      const stats = byType[ntype] || {n: 0};
+      const n = stats.n || 0;
+      // We don't have raw distribution, so approximate from p-quantiles:
+      // use n + p25/p50/p75/p90/p95 to assign fractional counts to buckets.
+      // Simpler approach for V1: render a compact stats row instead of a
+      // histogram (true bucket data requires a separate query not in the
+      // current API shape). Display p25/p50/p75 summary row + N.
+      if (n === 0) {
+        histHtml += `<div class="cal-type-label">${esc(ntype)}</div>
+          <div style="color:#888;font-size:0.78em;font-style:italic;">No data</div>`;
+      } else {
+        const p50 = stats.p50 !== null ? stats.p50.toFixed(2) : '—';
+        const p25 = stats.p25 !== null ? stats.p25.toFixed(2) : '—';
+        const p75 = stats.p75 !== null ? stats.p75.toFixed(2) : '—';
+        const mean = stats.mean !== null ? stats.mean.toFixed(3) : '—';
+        histHtml += `<div class="cal-type-label">${esc(ntype)} <span style="color:#888;font-weight:normal;">(n=${n})</span></div>
+          ${metric('p25 / p50 / p75', p25 + ' / ' + p50 + ' / ' + p75)}
+          ${metric('mean', mean)}`;
+      }
+    }
+
+    // ── Per-quote_type table ──────────────────────────────────────────────
+    const qtEntries = Object.entries(byQt).sort((a, b) => b[1].n - a[1].n);
+    let qtHtml = '';
+    if (qtEntries.length === 0) {
+      qtHtml = '<p class="empty" style="padding:8px 0;">No quote_type data yet.</p>';
+    } else {
+      qtHtml = '<table><thead><tr><th>quote_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [qt, s] of qtEntries) {
+        qtHtml += `<tr><td>${esc(qt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      qtHtml += '</tbody></table>';
+      qtHtml += '<p class="cal-caption">the structural-confidence-determination axiom — structural anchoring — see ob_NNNN for the 2D matrix design.</p>';
+    }
+
+    // ── Per-reasoning_type table ──────────────────────────────────────────
+    const rtEntries = Object.entries(byRt).sort((a, b) => b[1].n - a[1].n);
+    let rtHtml = '';
+    if (rtEntries.length === 0) {
+      rtHtml = '<p class="empty" style="padding:8px 0;">No reasoning_type data yet.</p>';
+    } else {
+      rtHtml = '<table><thead><tr><th>reasoning_type</th><th style="text-align:right">n</th><th style="text-align:right">mean</th></tr></thead><tbody>';
+      for (const [rt, s] of rtEntries) {
+        rtHtml += `<tr><td>${esc(rt)}</td><td style="text-align:right">${s.n}</td><td style="text-align:right">${s.mean.toFixed(3)}</td></tr>`;
+      }
+      rtHtml += '</tbody></table>';
+    }
+
+    // ── Drift indicator ───────────────────────────────────────────────────
+    let driftHtml = '';
+    const driftEntries = Object.entries(drift);
+    if (driftEntries.length === 0) {
+      driftHtml = '<p style="color:#888;font-size:0.8em;font-style:italic;">No this-turn data yet — drift available after first filing.</p>';
+    } else {
+      for (const [ntype, d] of driftEntries) {
+        const cls = calDeltaClass(d.delta);
+        const sign = d.delta >= 0 ? '+' : '';
+        driftHtml += `<div class="metric">
+          <span class="label">${esc(ntype)}</span>
+          <span class="value ${cls}" title="this_turn p50=${d.this_turn_p50} corpus p50=${d.corpus_p50} n_this_turn=${d.n_this_turn}">
+            ${d.this_turn_p50.toFixed(2)} vs ${d.corpus_p50.toFixed(2)} · delta ${sign}${d.delta.toFixed(3)}
+          </span>
+        </div>`;
+      }
+    }
+
+    // ── Assemble card ─────────────────────────────────────────────────────
+    const cardHtml = `<div class="card" style="grid-column: span 2">
+      <h3>Confidence Calibration</h3>
+      <h2 style="margin-top:0;margin-bottom:6px;">Per-Type Summary (corpus)</h2>
+      ${histHtml}
+      <h2>Per-Quote-Type (observation_factual)</h2>
+      ${qtHtml}
+      <h2>Per-Reasoning-Type (derivation)</h2>
+      ${rtHtml}
+      <h2>Drift: This Turn vs Corpus (p50 delta)</h2>
+      ${driftHtml}
+    </div>`;
+
+    cards.innerHTML += cardHtml;
+  }
+
+  </script>
+<script src="/static/nav.js"></script>
+<!--FOOTER_PLACEHOLDER-->
+</body>
+</html>

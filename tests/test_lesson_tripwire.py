@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -34,7 +35,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_ENGRAM = PROJECT_ROOT / "src" / "engram"
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(SRC_ENGRAM))
+sys.path.append(str(SRC_ENGRAM))  # #2565: append, not insert(0)
 
 # ---------------------------------------------------------------------------
 # Load the hook module (hyphenated filename, not importable via normal import)
@@ -53,11 +54,17 @@ check_command = _hook.check_command
 build_match_target = _hook.build_match_target
 
 
-def _run_hook_main(hook_input: dict, *, tripwires=None, recall: str = "") -> str:
-    """Run the hook main() with controlled tripwires/recall; return stdout."""
+def _run_hook_main(
+    hook_input: dict, *, tripwires=None, recall: str = "", prevention_lessons=None,
+) -> str:
+    """Run the hook main() with controlled tripwires/recall/prevention_lessons;
+    return stdout. prevention_lessons defaults to [] — the shadow-block path
+    (alpha#1944 step 2) is a no-op unless a test explicitly supplies lessons,
+    same posture as tripwires/recall defaulting empty."""
     output_buf = io.StringIO()
     with (
         unittest.mock.patch.object(_hook, "load_tripwires", return_value=tripwires or []),
+        unittest.mock.patch.object(_hook, "load_prevention_lessons", return_value=prevention_lessons or []),
         unittest.mock.patch.object(_hook, "check_in_turn_recall", return_value=recall),
         unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(hook_input))),
         unittest.mock.patch("sys.stdout", output_buf),
@@ -98,16 +105,22 @@ def _make_db(tmp_path: Path) -> Path:
     return db
 
 
-def _insert_lesson(db: Path, *, pattern: str = "", nudge: str = "do the right thing"):
-    """Insert a lesson row with optional situation_pattern in metadata."""
+def _insert_lesson(
+    db: Path, *, pattern: str = "", nudge: str = "do the right thing",
+    prevention_type: str = "", node_id: str = "",
+):
+    """Insert a lesson row with optional situation_pattern (+ #1944
+    prevention_type) in metadata."""
     meta: dict = {"scaffolding_nudge": nudge, "reasoning_type": "inductive_generalization"}
     if pattern:
         meta["situation_pattern"] = pattern
+    if prevention_type:
+        meta["prevention_type"] = prevention_type
     conn = sqlite3.connect(str(db))
     conn.execute(
         "INSERT INTO nodes (id, type, is_current, memory_status, metadata, claim) "
         "VALUES (?, 'lesson', 1, 'active', ?, ?)",
-        (f"ls_{len(nudge):04d}", json.dumps(meta), "test lesson"),
+        (node_id or f"ls_{len(nudge):04d}", json.dumps(meta), "test lesson"),
     )
     conn.commit()
     conn.close()
@@ -132,7 +145,7 @@ class TestLoadTripwires(unittest.TestCase):
         tripwires = load_tripwires(db_path=db)
         hits = check_command("forum reply 42", tripwires)
         self.assertEqual(len(hits), 1)
-        self.assertIn("stdin", hits[0])
+        self.assertIn("stdin", hits[0]["nudge"])
 
     def test_non_matching_command_returns_empty(self):
         """A command that doesn't match any pattern → empty list."""
@@ -188,7 +201,7 @@ class TestMcpToolMatching(unittest.TestCase):
         match_target = 'mcp__plugin_engram_engram__engram_add_observation {"payload_json":"{}"}'
         hits = check_command(match_target, tripwires)
         self.assertEqual(len(hits), 1)
-        self.assertIn("verify_quote", hits[0])
+        self.assertIn("verify_quote", hits[0]["nudge"])
 
     def test_mcp_tool_no_match(self):
         """A forum-reply pattern does not fire on an unrelated MCP tool call."""
@@ -241,7 +254,7 @@ class TestPreToolUseEnvelope(unittest.TestCase):
         """Lesson-tripwire context-only output must omit permissionDecision."""
         out = _run_hook_main(
             {"tool_name": "Bash", "tool_input": {"command": "forum reply 42"}},
-            tripwires=[(r"forum reply", "Read body from stdin.")],
+            tripwires=[(r"forum reply", "Read body from stdin.", "ls_forumreply")],
         )
         self.assertTrue(out.strip(), "Expected JSON output")
         response = json.loads(out.strip())
@@ -326,9 +339,854 @@ class TestSituationPatternStoredViaMcp(unittest.TestCase):
 
         # Also verify that load_tripwires returns this lesson
         tripwires = load_tripwires(db_path=db_path)
-        patterns_in_tripwires = [p for p, _ in tripwires]
+        patterns_in_tripwires = [p for p, _nudge, _node_id in tripwires]
         self.assertIn(pattern, patterns_in_tripwires, "Pattern must appear in load_tripwires output")
+        # #2753 epic WS2: the 3rd tuple element is the firing node's own id
+        # (the lesson_id minted above), so a caller can call
+        # generalization_chain() on the actual hit.
+        node_ids_in_tripwires = [nid for _p, _nudge, nid in tripwires]
+        self.assertIn(lesson_id, node_ids_in_tripwires, "load_tripwires must carry the lesson's own node id")
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# alpha#1944 step 2 — shadow-block logging
+# ---------------------------------------------------------------------------
+
+load_prevention_lessons = _hook.load_prevention_lessons
+check_shadow_block = _hook.check_shadow_block
+
+
+class TestLoadPreventionLessons(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_prevention_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.db = _make_db(Path(self.tmp))
+
+    def test_advisory_lesson_excluded(self):
+        _insert_lesson(self.db, pattern="rm -rf", prevention_type="advisory", node_id="ls_a")
+        lessons = load_prevention_lessons(db_path=self.db)
+        self.assertEqual(lessons, [])
+
+    def test_absent_prevention_type_excluded(self):
+        """A lesson predating #1944 (no prevention_type in metadata at all)
+        must not be treated as a candidate — absence is advisory, not shadow."""
+        _insert_lesson(self.db, pattern="rm -rf", node_id="ls_legacy")
+        lessons = load_prevention_lessons(db_path=self.db)
+        self.assertEqual(lessons, [])
+
+    def test_shadow_lesson_included(self):
+        _insert_lesson(self.db, pattern="rm -rf", prevention_type="shadow", node_id="ls_s")
+        lessons = load_prevention_lessons(db_path=self.db)
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["id"], "ls_s")
+        self.assertEqual(lessons[0]["prevention_type"], "shadow")
+        self.assertEqual(lessons[0]["pattern"], "rm -rf")
+
+    def test_blocking_lesson_included(self):
+        _insert_lesson(self.db, pattern="git push --force", prevention_type="blocking", node_id="ls_b")
+        lessons = load_prevention_lessons(db_path=self.db)
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["prevention_type"], "blocking")
+
+    def test_shadow_lesson_without_pattern_excluded(self):
+        _insert_lesson(self.db, prevention_type="shadow", node_id="ls_nopattern")
+        lessons = load_prevention_lessons(db_path=self.db)
+        self.assertEqual(lessons, [])
+
+    def test_missing_db_returns_empty(self):
+        lessons = load_prevention_lessons(db_path=Path(self.tmp) / "nonexistent.db")
+        self.assertEqual(lessons, [])
+
+
+class TestCheckShadowBlock(unittest.TestCase):
+
+    def test_matching_shadow_lesson_produces_hit(self):
+        lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
+        hits = check_shadow_block(
+            "rm -rf /tmp/whatever", lessons,
+            {"tool_name": "Bash", "session_id": "sess-1"},
+        )
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["lesson_id"], "ls_s")
+        self.assertEqual(hits[0]["prevention_type"], "shadow")
+        self.assertEqual(hits[0]["matched_span"], "rm -rf")
+        self.assertEqual(hits[0]["tool_name"], "Bash")
+        self.assertEqual(hits[0]["session_id"], "sess-1")
+
+    def test_non_matching_command_produces_no_hits(self):
+        lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
+        hits = check_shadow_block("ls -la", lessons, {"tool_name": "Bash"})
+        self.assertEqual(hits, [])
+
+    def test_multiple_matching_lessons_each_produce_a_hit(self):
+        lessons = [
+            {"id": "ls_s1", "pattern": "rm -rf", "prevention_type": "shadow"},
+            {"id": "ls_b1", "pattern": "force", "prevention_type": "blocking"},
+        ]
+        hits = check_shadow_block("rm -rf --force", lessons, {"tool_name": "Bash"})
+        self.assertEqual({h["lesson_id"] for h in hits}, {"ls_s1", "ls_b1"})
+
+    def test_malformed_regex_skipped_without_raising(self):
+        lessons = [{"id": "ls_bad", "pattern": "(unclosed", "prevention_type": "shadow"}]
+        hits = check_shadow_block("(unclosed anything", lessons, {"tool_name": "Bash"})
+        self.assertEqual(hits, [])
+
+    def test_hook_input_none_does_not_raise(self):
+        lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
+        hits = check_shadow_block("rm -rf /tmp", lessons, None)
+        self.assertEqual(len(hits), 1)
+        self.assertIsNone(hits[0]["tool_name"])
+
+
+class TestAppendPreventionLedger(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_ledger_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def test_empty_hits_writes_nothing(self):
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            _hook._append_prevention_ledger(1234.0, [])
+        self.assertFalse(self.ledger_path.exists())
+
+    def test_hits_appended_as_jsonl(self):
+        hits = [{
+            "lesson_id": "ls_s", "prevention_type": "shadow",
+            "matched_span": "rm -rf", "tool_name": "Bash", "session_id": "sess-1",
+        }]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            _hook._append_prevention_ledger(1234.0, hits)
+        lines = self.ledger_path.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["lesson_id"], "ls_s")
+        self.assertEqual(entry["mode"], "shadow")
+        self.assertEqual(entry["ts"], 1234.0)
+        self.assertEqual(entry["matched_span"], "rm -rf")
+
+    def test_multiple_hits_appended_as_separate_lines(self):
+        hits = [
+            {"lesson_id": "ls_a", "prevention_type": "shadow", "matched_span": "x",
+             "tool_name": "Bash", "session_id": None},
+            {"lesson_id": "ls_b", "prevention_type": "blocking", "matched_span": "y",
+             "tool_name": "Bash", "session_id": None},
+        ]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            _hook._append_prevention_ledger(1234.0, hits)
+        lines = self.ledger_path.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 2)
+
+    def test_write_failure_does_not_raise(self):
+        """Points PREVENTION_LEDGER_PATH at a directory (open() will fail) —
+        the append must swallow the error, matching _append_ledger's
+        never-raises contract."""
+        bad_path = Path(self.tmp)  # a directory, not a file
+        hits = [{"lesson_id": "ls_a", "prevention_type": "shadow", "matched_span": "x",
+                  "tool_name": "Bash", "session_id": None}]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", bad_path):
+            _hook._append_prevention_ledger(1234.0, hits)  # must not raise
+
+
+class TestMainShadowBlockIntegration(unittest.TestCase):
+    """main() end-to-end: shadow-block logging never changes the agent-visible
+    additionalContext (that's step 3's job), and never breaks on a logging
+    failure."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_ledger_main_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def test_shadow_match_logs_but_output_unchanged_vs_no_shadow(self):
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        prevention_lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
+
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            out_without_shadow = _run_hook_main(hook_input, tripwires=tripwires)
+            out_with_shadow = _run_hook_main(
+                hook_input, tripwires=tripwires, prevention_lessons=prevention_lessons,
+            )
+        self.assertEqual(out_without_shadow, out_with_shadow)
+        self.assertIn("Think twice before rm -rf.", out_with_shadow)
+
+        # And the shadow fire WAS logged to the ledger.
+        lines = self.ledger_path.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["lesson_id"], "ls_s")
+        self.assertEqual(entry["mode"], "shadow")
+
+    def test_ledger_write_failure_does_not_break_tripwire_output(self):
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        prevention_lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow"}]
+        bad_path = Path(self.tmp)  # a directory — forces the ledger write to fail
+
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", bad_path):
+            out = _run_hook_main(
+                hook_input, tripwires=tripwires, prevention_lessons=prevention_lessons,
+            )
+        self.assertIn("Think twice before rm -rf.", out)
+
+
+# ---------------------------------------------------------------------------
+# alpha#1944 step 3 — deny path + override recipe
+# ---------------------------------------------------------------------------
+
+find_override = _hook._find_override
+check_blocking_deny = _hook.check_blocking_deny
+build_deny_reason = _hook.build_deny_reason
+
+
+class TestFindOverride(unittest.TestCase):
+
+    def test_bash_style_override_found(self):
+        cmd = 'ENGRAM_OVERRIDE="ls_0018: verified this is safe" rm -rf /tmp/x'
+        reason = find_override(cmd, "ls_0018")
+        self.assertEqual(reason, "verified this is safe")
+
+    def test_mcp_style_override_found(self):
+        target = 'mcp__x__y {"override_lesson":"ls_0018: verified safe","claim":"z"}'
+        reason = find_override(target, "ls_0018")
+        self.assertEqual(reason, "verified safe")
+
+    def test_no_override_present_returns_none(self):
+        reason = find_override("rm -rf /tmp/x", "ls_0018")
+        self.assertIsNone(reason)
+
+    def test_override_for_a_different_lesson_id_not_matched(self):
+        """An override naming a DIFFERENT lesson must not satisfy this one —
+        an override is a deliberate, specific act, not a blanket bypass."""
+        cmd = 'ENGRAM_OVERRIDE="ls_9999: wrong lesson" rm -rf /tmp/x'
+        reason = find_override(cmd, "ls_0018")
+        self.assertIsNone(reason)
+
+    def test_malformed_lesson_id_does_not_raise(self):
+        # lesson_id containing regex-special characters must be escaped
+        # safely, not crash the search.
+        reason = find_override("nothing here", "ls_(0018)")
+        self.assertIsNone(reason)
+
+
+class TestCheckBlockingDeny(unittest.TestCase):
+
+    def test_shadow_lesson_never_denies(self):
+        lessons = [{"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow", "nudge": "careful"}]
+        deny = check_blocking_deny("rm -rf /tmp/x", lessons)
+        self.assertIsNone(deny)
+
+    def test_blocking_lesson_without_override_denies(self):
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        deny = check_blocking_deny("rm -rf /tmp/x", lessons)
+        self.assertIsNotNone(deny)
+        self.assertEqual(deny["lesson_id"], "ls_b")
+        self.assertEqual(deny["matched_span"], "rm -rf")
+        self.assertEqual(deny["nudge"], "careful")
+
+    def test_blocking_lesson_with_matching_override_does_not_deny(self):
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        cmd = 'ENGRAM_OVERRIDE="ls_b: verified safe" rm -rf /tmp/x'
+        deny = check_blocking_deny(cmd, lessons)
+        self.assertIsNone(deny)
+
+    def test_blocking_lesson_with_wrong_lesson_override_still_denies(self):
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        cmd = 'ENGRAM_OVERRIDE="ls_other: wrong" rm -rf /tmp/x'
+        deny = check_blocking_deny(cmd, lessons)
+        self.assertIsNotNone(deny)
+
+    def test_non_matching_command_no_deny(self):
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        deny = check_blocking_deny("ls -la", lessons)
+        self.assertIsNone(deny)
+
+    def test_malformed_regex_skipped_no_deny(self):
+        lessons = [{"id": "ls_bad", "pattern": "(unclosed", "prevention_type": "blocking", "nudge": "x"}]
+        deny = check_blocking_deny("(unclosed anything", lessons)
+        self.assertIsNone(deny)
+
+    def test_advisory_and_shadow_and_blocking_mixed_denies_only_on_blocking(self):
+        lessons = [
+            {"id": "ls_shadow", "pattern": "rm -rf", "prevention_type": "shadow", "nudge": "x"},
+            {"id": "ls_block", "pattern": "force", "prevention_type": "blocking", "nudge": "y"},
+        ]
+        deny = check_blocking_deny("rm -rf --force", lessons)
+        self.assertEqual(deny["lesson_id"], "ls_block")
+
+
+class TestBuildDenyReason(unittest.TestCase):
+
+    def test_reason_contains_lesson_id_nudge_and_recipe(self):
+        deny = {"lesson_id": "ls_0018", "matched_span": "rm -rf", "nudge": "Think twice."}
+        reason = build_deny_reason(deny)
+        self.assertIn("ls_0018", reason)
+        self.assertIn("Think twice.", reason)
+        self.assertIn("ENGRAM_OVERRIDE=\"ls_0018:", reason)
+        self.assertIn("override_lesson", reason)
+        self.assertIn("single-call-scoped", reason)
+
+
+class TestMainDenyIntegration(unittest.TestCase):
+    """main() end-to-end: a blocking match without override produces a
+    permissionDecision:deny response and nothing else; with a valid
+    override it produces the normal advisory response instead."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_deny_main_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def test_blocking_match_without_override_denies(self):
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        prevention_lessons = [
+            {"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "Think twice."}
+        ]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            out = _run_hook_main(hook_input, prevention_lessons=prevention_lessons)
+        response = json.loads(out)
+        hso = response["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("ls_b", hso["permissionDecisionReason"])
+        self.assertIn("Think twice.", hso["permissionDecisionReason"])
+        self.assertNotIn("additionalContext", hso)
+
+    def test_blocking_match_with_override_allows_and_advisory_still_shows(self):
+        hook_input = {
+            "tool_name": "Bash",
+            "tool_input": {"command": 'ENGRAM_OVERRIDE="ls_b: verified safe" rm -rf /tmp/x'},
+        }
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        prevention_lessons = [
+            {"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "Think twice."}
+        ]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            out = _run_hook_main(
+                hook_input, tripwires=tripwires, prevention_lessons=prevention_lessons,
+            )
+        response = json.loads(out)
+        hso = response["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", hso)
+        self.assertIn("Think twice before rm -rf.", hso["additionalContext"])
+
+        # The override fire is still logged, with override_present=True.
+        lines = self.ledger_path.read_text().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["lesson_id"], "ls_b")
+        self.assertTrue(entry["override_present"])
+        self.assertEqual(entry["override_reason"], "verified safe")
+
+    def test_deny_computation_failure_fails_open(self):
+        """If load_prevention_lessons itself raises, the call must NOT be
+        denied — infra failure is never a reason to block (Kepler's design
+        point 5: the only reachable failure mode is loud-advisory)."""
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        output_buf = io.StringIO()
+        with (
+            unittest.mock.patch.object(_hook, "load_tripwires", return_value=tripwires),
+            unittest.mock.patch.object(_hook, "load_prevention_lessons", side_effect=RuntimeError("db down")),
+            unittest.mock.patch.object(_hook, "check_in_turn_recall", return_value=""),
+            unittest.mock.patch("sys.stdin", io.StringIO(json.dumps(hook_input))),
+            unittest.mock.patch("sys.stdout", output_buf),
+        ):
+            try:
+                _hook.main()
+            except SystemExit:
+                pass
+        out = output_buf.getvalue()
+        response = json.loads(out)
+        hso = response["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", hso)
+        self.assertIn("Think twice before rm -rf.", hso["additionalContext"])
+
+    def test_shadow_match_never_denies_end_to_end(self):
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        prevention_lessons = [
+            {"id": "ls_s", "pattern": "rm -rf", "prevention_type": "shadow", "nudge": "Think twice."}
+        ]
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            out = _run_hook_main(
+                hook_input, tripwires=tripwires, prevention_lessons=prevention_lessons,
+            )
+        response = json.loads(out)
+        hso = response["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", hso)
+        self.assertIn("Think twice before rm -rf.", hso["additionalContext"])
+
+
+# ---------------------------------------------------------------------------
+# alpha#1944 step 4 — auto-demotion (read-time lease, Kepler's design)
+# ---------------------------------------------------------------------------
+
+demotion_config = _hook._demotion_config
+count_recent_overrides = _hook._count_recent_overrides
+
+
+class TestDemotionConfig(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_democonfig_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write_config(self, config: dict) -> Path:
+        p = Path(self.tmp) / "config.json"
+        p.write_text(json.dumps(config))
+        return p
+
+    def test_default_when_no_config_file(self):
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", str(Path(self.tmp) / "nonexistent")):
+            cfg = demotion_config()
+        self.assertEqual(cfg, {"overrides": 2, "window_days": 7})
+
+    def test_default_when_key_absent(self):
+        self._write_config({"some_other_key": True})
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            cfg = demotion_config()
+        self.assertEqual(cfg, {"overrides": 2, "window_days": 7})
+
+    def test_explicit_config_overrides_default(self):
+        self._write_config({"lessons": {"blocking_demotion": {"overrides": 5, "window_days": 14}}})
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            cfg = demotion_config()
+        self.assertEqual(cfg, {"overrides": 5, "window_days": 14})
+
+    def test_malformed_config_falls_back_to_default(self):
+        p = Path(self.tmp) / "config.json"
+        p.write_text("{not-json")
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            cfg = demotion_config()
+        self.assertEqual(cfg, {"overrides": 2, "window_days": 7})
+
+
+class TestCountRecentOverrides(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_countoverrides_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def _write_ledger(self, entries: list) -> None:
+        with open(self.ledger_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def test_missing_ledger_returns_zero(self):
+        count = count_recent_overrides("ls_b", 7, 1_000_000.0)
+        self.assertEqual(count, 0)
+
+    def test_counts_only_matching_lesson_with_override(self):
+        self._write_ledger([
+            {"lesson_id": "ls_b", "override_present": True, "ts": 999_000.0},
+            {"lesson_id": "ls_b", "override_present": False, "ts": 999_000.0},
+            {"lesson_id": "ls_other", "override_present": True, "ts": 999_000.0},
+        ])
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            count = count_recent_overrides("ls_b", 7, 1_000_000.0)
+        self.assertEqual(count, 1)
+
+    def test_excludes_entries_outside_window(self):
+        now = 1_000_000.0
+        seven_days = 7 * 86400
+        self._write_ledger([
+            {"lesson_id": "ls_b", "override_present": True, "ts": now - seven_days + 10},  # inside
+            {"lesson_id": "ls_b", "override_present": True, "ts": now - seven_days - 10},  # outside
+        ])
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            count = count_recent_overrides("ls_b", 7, now)
+        self.assertEqual(count, 1)
+
+    def test_corrupt_line_skipped_without_raising(self):
+        with open(self.ledger_path, "w") as f:
+            f.write("not json at all\n")
+            f.write(json.dumps({"lesson_id": "ls_b", "override_present": True, "ts": 999_000.0}) + "\n")
+        with unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path):
+            count = count_recent_overrides("ls_b", 7, 1_000_000.0)
+        self.assertEqual(count, 1)
+
+
+class TestCheckBlockingDenyWithDemotion(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_denydemote_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def _write_ledger(self, entries: list) -> None:
+        with open(self.ledger_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def test_below_threshold_denies_normally(self):
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        with (
+            unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path),
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+        ):
+            deny = check_blocking_deny("rm -rf /tmp/x", lessons, now=1_000_000.0)
+        self.assertIsNotNone(deny)
+        self.assertFalse(deny["demoted"])
+
+    def test_at_threshold_reports_demoted_not_a_real_deny(self):
+        self._write_ledger([
+            {"lesson_id": "ls_b", "override_present": True, "ts": 999_000.0},
+            {"lesson_id": "ls_b", "override_present": True, "ts": 999_100.0},
+        ])
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        with (
+            unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path),
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+        ):
+            deny = check_blocking_deny("rm -rf /tmp/x", lessons, now=1_000_000.0)
+        self.assertIsNotNone(deny)
+        self.assertTrue(deny["demoted"])
+        self.assertEqual(deny["override_count"], 2)
+        self.assertEqual(deny["threshold"], 2)
+
+    def test_override_this_call_skips_demotion_reporting_too(self):
+        """An override present on THIS call takes priority — never reported
+        as either a real deny or a demotion, just allowed."""
+        self._write_ledger([
+            {"lesson_id": "ls_b", "override_present": True, "ts": 999_000.0},
+            {"lesson_id": "ls_b", "override_present": True, "ts": 999_100.0},
+        ])
+        lessons = [{"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "careful"}]
+        cmd = 'ENGRAM_OVERRIDE="ls_b: verified safe" rm -rf /tmp/x'
+        with (
+            unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path),
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+        ):
+            deny = check_blocking_deny(cmd, lessons, now=1_000_000.0)
+        self.assertIsNone(deny)
+
+
+class TestMainDemotionIntegration(unittest.TestCase):
+    """main() end-to-end: once a blocking lesson has crossed its demotion
+    threshold, further matching calls are NOT denied — they fall through
+    to the normal advisory path, with a loud ledger entry recording it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_test_demote_main_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ledger_path = Path(self.tmp) / "lesson-prevention-ledger.jsonl"
+
+    def _write_ledger(self, entries: list) -> None:
+        with open(self.ledger_path, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def test_demoted_lesson_no_longer_denies(self):
+        import time
+        now = time.time()
+        self._write_ledger([
+            {"lesson_id": "ls_b", "override_present": True, "ts": now - 10},
+            {"lesson_id": "ls_b", "override_present": True, "ts": now - 5},
+        ])
+        hook_input = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp/x"}}
+        tripwires = [("rm -rf", "Think twice before rm -rf.", "ls_rmrf")]
+        prevention_lessons = [
+            {"id": "ls_b", "pattern": "rm -rf", "prevention_type": "blocking", "nudge": "Think twice."}
+        ]
+        with (
+            unittest.mock.patch.object(_hook, "PREVENTION_LEDGER_PATH", self.ledger_path),
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+        ):
+            out = _run_hook_main(
+                hook_input, tripwires=tripwires, prevention_lessons=prevention_lessons,
+            )
+        response = json.loads(out)
+        hso = response["hookSpecificOutput"]
+        self.assertNotIn("permissionDecision", hso)
+        self.assertIn("Think twice before rm -rf.", hso["additionalContext"])
+
+        # A distinct auto_demoted_lease entry was appended.
+        lines = [json.loads(l) for l in self.ledger_path.read_text().strip().splitlines()]
+        modes = [l.get("mode") for l in lines]
+        self.assertIn("auto_demoted_lease", modes)
+
+
+# ---------------------------------------------------------------------------
+# #2858 -- tripwire-block preview cap: specificity ordering, character-
+# ceiling cap on the fully-rendered block, overflow file, and the
+# always-emitted "N shown · M cut" trailer (rendered FIRST — round 2).
+# ---------------------------------------------------------------------------
+
+write_tripwire_overflow = _hook.write_tripwire_overflow
+TRIPWIRE_BLOCK_CHAR_CEILING = _hook.TRIPWIRE_BLOCK_CHAR_CEILING
+
+_TRAILER_RE = re.compile(r"▸ (\d+) shown · (\d+) cut(?: — see (\S+)|\s*\(overflow file unavailable\))?")
+
+
+class TestTripwirePreviewCap(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="engram_tripwire_cap_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_20_match_seeded_case_caps_orders_and_writes_overflow(self):
+        """#2858 test 1: 20 distinct patterns all match one command. The
+        rendered block must show fewer than 20 (a real cap fired), the
+        shown+cut count must reconcile exactly to 20, the shown hits must be
+        the 20 patterns' longest-K by len(pattern) (specificity ordering,
+        not just "capping happened"), and the overflow file must exist and
+        contain every cut hit's full nudge text."""
+        db = _make_db(Path(self.tmp))
+        n = 20
+        patterns = []
+        nudges = []
+        node_ids = []
+        for i in range(n):
+            # Strictly increasing pattern length (10, 11, ..., 29 chars) so
+            # specificity order is unambiguous — no ties to worry about.
+            pattern = "uniqmark" + str(i).zfill(2) + ("Z" * i)
+            # Deliberately long nudge text (well past what 20 of them could
+            # ever fit under TRIPWIRE_BLOCK_CHAR_CEILING) so the cap actually
+            # fires in this test rather than everything fitting trivially.
+            nudge = f"NUDGE_{i:02d} " + ("x" * 100)
+            node_id = f"ls_p{i:02d}"
+            patterns.append(pattern)
+            nudges.append(nudge)
+            node_ids.append(node_id)
+            _insert_lesson(db, pattern=pattern, nudge=nudge, node_id=node_id)
+
+        tripwires = load_tripwires(db_path=db)
+        command = " ".join(patterns)
+
+        # Sanity check outside main(): all 20 patterns really do match.
+        hits = check_command(command, tripwires)
+        self.assertEqual(len(hits), n, "sanity: all 20 seeded patterns must match the command")
+
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[(patterns[i], nudges[i], node_ids[i]) for i in range(n)],
+            )
+        self.assertTrue(out.strip(), "expected JSON output")
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+
+        # #2858 round 2 (Fix 1): the trailer must be the FIRST line of the
+        # tripwire block / of additionalContext -- not merely present
+        # somewhere in the string. A trailer anywhere-in-string check would
+        # pass even if it were still emitted last (and therefore vulnerable
+        # to the harness's own tail-truncation on exactly this kind of
+        # large capture), so this must be a line-0 check, not a substring
+        # search.
+        first_line = additional_context.split("\n", 1)[0]
+        trailer_match = _TRAILER_RE.match(first_line)
+        self.assertIsNotNone(
+            trailer_match,
+            f"trailer line must be the FIRST line of additionalContext, got: {first_line!r}",
+        )
+        shown_count = int(trailer_match.group(1))
+        cut_count = int(trailer_match.group(2))
+        overflow_path = trailer_match.group(3)
+
+        self.assertGreaterEqual(shown_count, 1, "at least one hit must always be shown")
+        self.assertEqual(
+            shown_count + cut_count, n,
+            "shown + cut must reconcile exactly to the 20 seeded matches",
+        )
+        self.assertGreater(
+            cut_count, 0,
+            "test fixture must actually force some cuts — if this fails, the "
+            "nudge/ceiling sizing in this test needs to be made more extreme",
+        )
+
+        self.assertIsNotNone(overflow_path, "cut_count > 0 must always name an overflow path")
+        self.assertTrue(
+            os.path.exists(overflow_path),
+            f"overflow file named in the trailer must actually exist: {overflow_path}",
+        )
+        overflow_content = Path(overflow_path).read_text(encoding="utf-8")
+
+        # #2858 round 2 (Fix 2): the tripwire block this hook itself
+        # rendered (trailer + header + shown bullets — NOT the whole
+        # additionalContext, which may also carry an unrelated
+        # "[triggered principles]" section appended after it) must respect
+        # its OWN character ceiling. This tests the hook's own contract,
+        # not any assumed harness number.
+        tripwire_block_lines = additional_context.split("\n")[: 2 + shown_count]
+        tripwire_block = "\n".join(tripwire_block_lines)
+        self.assertLessEqual(
+            len(tripwire_block), TRIPWIRE_BLOCK_CHAR_CEILING,
+            "the hook's own rendered tripwire block must respect its own character ceiling",
+        )
+
+        # Specificity ordering: shown hits are the longest-K patterns (i.e.
+        # the highest-index seeds, since pattern length increases with i).
+        # This is the check that verifies ORDERING, not merely that SOME
+        # cap happened.
+        expected_shown_indices = set(range(n - shown_count, n))
+        expected_cut_indices = set(range(0, n - shown_count))
+
+        for i in expected_shown_indices:
+            self.assertIn(
+                nudges[i], additional_context,
+                f"pattern index {i} (longer/more-specific) should be SHOWN",
+            )
+        for i in expected_cut_indices:
+            self.assertNotIn(
+                nudges[i], additional_context,
+                f"pattern index {i} (shorter/less-specific) should be CUT, not shown",
+            )
+            # Every cut hit's full node_id + nudge text must appear verbatim
+            # in the overflow file (not truncated, not summarized).
+            self.assertIn(node_ids[i], overflow_content)
+            self.assertIn(nudges[i], overflow_content)
+
+    def test_2_match_control_trailer_always_present_even_with_zero_cuts(self):
+        """#2858 test 2: exactly 2 short matches, comfortably under the real
+        TRIPWIRE_BLOCK_CHAR_CEILING together — nothing should be cut. Per
+        Kepler's ruling (overturning his own earlier "only emit when cut"
+        position), the trailer line is ALWAYS emitted whenever the tripwire
+        block fires, including the zero-cut case. This test asserts
+        PRESENCE with the exact "0 cut" text, AND that it is the FIRST line
+        — asserting absence here would pass on a dead/regressed emitter and
+        catch nothing, which is the exact failure mode Kepler's ruling
+        exists to rule out; asserting only presence (not position) would
+        pass even if the trailer regressed back to being emitted LAST,
+        which is the round-2 defect this fix addresses."""
+        db = _make_db(Path(self.tmp))
+        pattern_a = "controlpatternalpha"
+        pattern_b = "controlpatternbeta"
+        nudge_a = "Short nudge A."
+        nudge_b = "Short nudge B."
+        _insert_lesson(db, pattern=pattern_a, nudge=nudge_a, node_id="ls_ctrl_a")
+        _insert_lesson(db, pattern=pattern_b, nudge=nudge_b, node_id="ls_ctrl_b")
+
+        tripwires = load_tripwires(db_path=db)
+        command = f"{pattern_a} {pattern_b}"
+        hits = check_command(command, tripwires)
+        self.assertEqual(len(hits), 2, "sanity: both seeded patterns must match")
+
+        # Both nudges together are far under the real ceiling (no override —
+        # this test deliberately uses the module's actual
+        # TRIPWIRE_BLOCK_CHAR_CEILING, not a test-only ceiling, since neither
+        # nudge is anywhere near large enough to force a cut).
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[(pattern_a, nudge_a, "ls_ctrl_a"), (pattern_b, nudge_b, "ls_ctrl_b")],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+
+        self.assertIn(
+            "▸ 2 shown · 0 cut", additional_context,
+            "trailer must be present and read exactly '2 shown · 0 cut' "
+            "even when nothing was cut",
+        )
+        self.assertEqual(
+            additional_context.split("\n", 1)[0], "▸ 2 shown · 0 cut",
+            "trailer must be the FIRST line of additionalContext",
+        )
+
+    def test_at_least_one_hit_always_shown_even_if_it_alone_exceeds_ceiling(self):
+        """#2858 optional test: a single oversized nudge (bigger than the
+        whole ceiling on its own) must still be shown — never cut down to
+        zero shown hits when there is at least one match. A second,
+        unambiguously smaller hit that would push the total over the
+        ceiling must be the one cut.
+
+        #2863 WS2: select_and_cap_hits (which this test used to exercise
+        directly) was removed -- main() now renders via the shared
+        _hooklib.emit_context() (allow_single_overflow=True reproduces this
+        exact "always show at least one hit" guarantee). Updated to assert
+        through the new call path (main()'s actual output) rather than a
+        removed internal function -- observable behavior, not internals."""
+        huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
+        small_nudge = "small nudge text"
+        # Longer pattern == more specific == sorted first (descending
+        # pattern length) -- so the huge hit is the "most specific" one
+        # that must survive the cap.
+        pattern_huge = "hugepattern" + ("z" * 30)
+        pattern_small = "q"
+        command = f"{pattern_huge} {pattern_small}"
+        with unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_huge, huge_nudge, "ls_huge"),
+                    (pattern_small, small_nudge, "ls_small"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(
+            huge_nudge, additional_context,
+            "the oversized first (most-specific) hit alone must still be shown, in full",
+        )
+        self.assertNotIn(
+            small_nudge, additional_context,
+            "the smaller, less-specific hit must be the one cut",
+        )
+        first_line = additional_context.split("\n", 1)[0]
+        self.assertTrue(
+            first_line.startswith("▸ 1 shown · 1 cut"),
+            f"expected a '1 shown · 1 cut' trailer (overflow write succeeds "
+            f"here, so a '— see <path>' clause is expected too); got: {first_line!r}",
+        )
+
+    def test_write_tripwire_overflow_failure_degrades_to_empty_string(self):
+        """#2858 reviewer-fairy round 1 suggestion (PR #2860): the
+        write-failure path (e.g. an unwritable ENGRAM_HOME) was verified by
+        hand during review but had no test in the shipped suite. Mocks
+        Path.mkdir to raise OSError (the same failure shape a permissions
+        or disk-full error would produce) and confirms write_tripwire_overflow
+        never raises -- it returns "" per its documented never-raises
+        contract.
+
+        #2863 WS2: the caller-side trailer wording on a write failure
+        changed with the migration onto the shared _hooklib.emit_context()/
+        _build_context_trailer() -- the removed _build_trailer's
+        "(overflow file unavailable)" clause is gone; the shared trailer
+        renders plain "N shown · M cut" (no clause) on an empty overflow
+        path, whether the writer was never supplied or genuinely failed at
+        runtime (Kepler's WS1 spec, Part B item 7: only the REASON differs,
+        never the rendered text). Updated to assert this end-to-end through
+        main() (observable behavior) rather than the removed internal
+        _build_trailer function directly."""
+        cut_hits = [{"nudge": "a cut nudge", "node_id": "ls_0001"}]
+        with unittest.mock.patch.object(
+            Path, "mkdir", side_effect=OSError("simulated permission failure")
+        ):
+            result = write_tripwire_overflow(cut_hits, now=1700000000.0)
+        self.assertEqual(result, "", "a write failure must degrade to empty string, never raise")
+
+        huge_nudge = "H" * (TRIPWIRE_BLOCK_CHAR_CEILING + 500)
+        small_nudge = "small nudge text"
+        pattern_huge = "overflowfailpattern" + ("z" * 20)
+        pattern_small = "q"
+        command = f"{pattern_huge} {pattern_small}"
+        with (
+            unittest.mock.patch.object(_hook, "ENGRAM_HOME", self.tmp),
+            unittest.mock.patch.object(
+                Path, "mkdir", side_effect=OSError("simulated permission failure")
+            ),
+        ):
+            out = _run_hook_main(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                tripwires=[
+                    (pattern_huge, huge_nudge, "ls_huge2"),
+                    (pattern_small, small_nudge, "ls_small2"),
+                ],
+            )
+        response = json.loads(out.strip())
+        additional_context = response["hookSpecificOutput"]["additionalContext"]
+        first_line = additional_context.split("\n", 1)[0]
+        self.assertEqual(
+            first_line, "▸ 1 shown · 1 cut",
+            "write failure must degrade the trailer to the new shared "
+            "'N shown · M cut' form (no clause) rather than the old "
+            "'(overflow file unavailable)' wording or crashing",
+        )
+        self.assertNotIn("overflow file unavailable", additional_context)

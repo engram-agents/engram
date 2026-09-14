@@ -1640,3 +1640,177 @@ def test_prepare_ids_file_refuses_foreign_owned_file(tmp_path, monkeypatch, caps
     assert "owned by uid" in captured.err.lower() or "refus" in captured.err.lower(), (
         f"Expected an explicit ownership-refusal message on stderr, got: {captured.err!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: prepare --expect-total (mechanical truncation gate)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_expect_total_matching_succeeds():
+    """--expect-total equal to the real (post-dedup) id count -> succeeds,
+    chunks written as normal."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 31)]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+        out_dir = tmp_dir / "out"
+
+        exit_code = _run([
+            "prepare",
+            "--ids", ",".join(node_ids),
+            "--out", str(out_dir),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+            "--expect-total", "30",
+        ])
+        assert exit_code == 0, f"prepare exited {exit_code}"
+
+        manifest_path = out_dir / "manifest.json"
+        assert manifest_path.exists(), "manifest.json not created"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["total_nodes"] == 30
+        assert manifest["total_chunks"] == 2
+        for chunk_idx in range(2):
+            assert (out_dir / f"chunk-{chunk_idx}" / "payload.json").exists()
+
+
+def test_prepare_expect_total_mismatch_fails_and_writes_nothing(capsys):
+    """--expect-total mismatching the real id count -> non-zero exit, error
+    names both numbers, and NO chunk directory or payload/manifest file is
+    created (no-partial-state property)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 31)]  # 30 ids
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+        out_dir = tmp_dir / "out"
+
+        exit_code = _run([
+            "prepare",
+            "--ids", ",".join(node_ids),
+            "--out", str(out_dir),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+            "--expect-total", "45",
+        ])
+        assert exit_code != 0, "expect-total mismatch must exit non-zero"
+
+        # No-partial-state: nothing at all should be written to out_dir.
+        assert not out_dir.exists() or not any(out_dir.iterdir()), (
+            f"out_dir must be empty/absent on expect-total mismatch, found: "
+            f"{list(out_dir.iterdir()) if out_dir.exists() else None}"
+        )
+        assert not (out_dir / "manifest.json").exists()
+        assert not (out_dir / "chunk-0").exists()
+
+        captured = capsys.readouterr()
+        result = json.loads(captured.out)
+        assert result["passed"] is False
+        assert result["errors"][0]["check"] == "expect_total"
+        assert result["errors"][0]["received"] == 30
+        assert result["errors"][0]["expected"] == 45
+        error_text = result["errors"][0]["error"]
+        assert "30" in error_text and "45" in error_text, (
+            f"error message must name both numbers: {error_text!r}"
+        )
+
+
+def test_prepare_expect_total_omitted_byte_identical_to_current_behavior():
+    """--expect-total omitted entirely -> byte-identical stdout/exit-code/
+    manifest behavior to a run with no --expect-total flag at all (i.e. the
+    pre-existing code path is untouched)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        node_ids = [f"ob_{str(i).zfill(4)}" for i in range(1, 31)]
+        db_path = _make_sqlite_db(node_ids, tmp_dir)
+
+        out_dir_a = tmp_dir / "out_a"
+        out_dir_b = tmp_dir / "out_b"
+
+        base_argv = [
+            "--ids", ",".join(node_ids),
+            "--chunk-size", "15",
+            "--db", str(db_path),
+        ]
+
+        exit_a = _run(["prepare", "--out", str(out_dir_a)] + base_argv)
+        exit_b = _run(["prepare", "--out", str(out_dir_b)] + base_argv)
+
+        assert exit_a == exit_b == 0
+
+        manifest_a = json.loads((out_dir_a / "manifest.json").read_text())
+        manifest_b = json.loads((out_dir_b / "manifest.json").read_text())
+        # out_dir differs (needed to avoid collision) — normalize it out
+        # before comparing, since everything else must be identical.
+        manifest_a["out_dir"] = ""
+        manifest_b["out_dir"] = ""
+        for chunk in manifest_a["chunks"]:
+            chunk["chunk_dir"] = ""
+            chunk["payload_path"] = ""
+        for chunk in manifest_b["chunks"]:
+            chunk["chunk_dir"] = ""
+            chunk["payload_path"] = ""
+        assert manifest_a == manifest_b
+
+        payload_a0 = (out_dir_a / "chunk-0" / "payload.json").read_text()
+        payload_b0 = (out_dir_b / "chunk-0" / "payload.json").read_text()
+        assert payload_a0 == payload_b0
+
+
+def test_prepare_expect_total_hint_appears_only_when_received_is_exactly_100():
+    """The 100-specific engram_list hint appears when received==100 and
+    expected>100, and does NOT appear for any other mismatch shape."""
+    import io
+    import contextlib
+
+    def _capture_prepare(node_ids, db_path, out_dir, expect_total):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = dispatch_main([
+                "prepare",
+                "--ids", ",".join(node_ids),
+                "--out", str(out_dir),
+                "--db", str(db_path),
+                "--expect-total", str(expect_total),
+            ])
+        return code, buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+
+        # Each DB fixture writes a fixed "knowledge.db" filename into the dir
+        # it's given, so each case needs its own subdirectory to avoid a
+        # "table nodes already exists" collision across cases.
+        dir_100 = tmp_dir / "db_100"
+        dir_100.mkdir()
+        dir_30 = tmp_dir / "db_30"
+        dir_30.mkdir()
+
+        # Case A: received exactly 100, expected higher -> hint present.
+        node_ids_100 = [f"ob_{str(i).zfill(4)}" for i in range(1, 101)]
+        db_path_100 = _make_sqlite_db(node_ids_100, dir_100)
+        code_a, out_a = _capture_prepare(
+            node_ids_100, db_path_100, tmp_dir / "out_a", 203
+        )
+        assert code_a != 0
+        assert "engram_list" in out_a, "hint must appear when received==100 < expected"
+
+        # Case B: received 30 (not 100), expected 45 -> no hint.
+        node_ids_30 = [f"ob_{str(i).zfill(4)}" for i in range(1, 31)]
+        db_path_30 = _make_sqlite_db(node_ids_30, dir_30)
+        code_b, out_b = _capture_prepare(
+            node_ids_30, db_path_30, tmp_dir / "out_b", 45
+        )
+        assert code_b != 0
+        assert "engram_list" not in out_b, "hint must NOT appear when received != 100"
+
+        # Case C: received exactly 100, but expected is LOWER (e.g. 50) ->
+        # no hint (100 isn't evidence of engram_list truncation if fewer
+        # were expected than received).
+        code_c, out_c = _capture_prepare(
+            node_ids_100, db_path_100, tmp_dir / "out_c", 50
+        )
+        assert code_c != 0
+        assert "engram_list" not in out_c, (
+            "hint must NOT appear when expected < received, even at 100"
+        )

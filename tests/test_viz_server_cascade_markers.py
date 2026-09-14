@@ -44,7 +44,8 @@ import engram_core
 import engram_derive
 import engram_observation
 import engram_revision
-import viz_server  # noqa: E402
+from viz.data import graph as viz_graph_data  # noqa: E402
+from viz.data import health as viz_health_data  # noqa: E402
 
 
 TEST_DIR = tempfile.mkdtemp(prefix="engram_test_viz_cascade_markers_")
@@ -130,7 +131,7 @@ def test_get_graph_attaches_tainted_by_and_stale_by():
     del ob_dep_tainted  # not directly used; dv_id is the tainted node
 
     db_path = str(core.DB_PATH)
-    graph = viz_server.get_graph(db_path)
+    graph = viz_graph_data.get_graph(db_path)
     assert "error" not in graph, graph
     by_id = {n["id"]: n for n in graph["nodes"]}
 
@@ -170,7 +171,7 @@ def test_get_graph_stale_replacement_reads_roots_own_superseded_by():
     assert sup.get("status") == "superseded", sup
 
     db_path = str(core.DB_PATH)
-    graph = viz_server.get_graph(db_path)
+    graph = viz_graph_data.get_graph(db_path)
     by_id = {n["id"]: n for n in graph["nodes"]}
 
     assert by_id[dv_id]["stale_by"] == [ob_old]
@@ -201,7 +202,63 @@ def test_get_health_data_tainted_stale_counts_match_pending_markers():
         assert ret.get("status") == "retracted", ret
 
     db_path = str(core.DB_PATH)
-    health = viz_server.get_health_data(db_path)
+    health = viz_health_data.get_health_data(db_path)
     assert "error" not in health, health
     assert health["tainted"] == 2, f"expected 2 tainted nodes, got {health['tainted']}"
     assert health["stale"] == 0, f"expected 0 stale nodes, got {health['stale']}"
+
+
+def test_get_health_data_health_score_available_reports_a_number_and_no_error():
+    """When _compute_health_score imports cleanly, health_score is a real
+    number and health_score_error is None -- the companion field to the
+    #2524 fallback test below, confirming the happy path wasn't disturbed
+    by adding the error field alongside it."""
+    rev, obs, derive, core = _make_fresh_mods()
+    _seed_ob(obs)  # the DB file/schema is created on first write, not at _ensure_data_dir()
+    db_path = str(core.DB_PATH)
+    health = viz_health_data.get_health_data(db_path)
+    assert "error" not in health, health
+    assert health["health_score"] is not None
+    assert isinstance(health["health_score"], (int, float))
+    assert health["health_score_error"] is None
+
+
+def test_format_import_error_uses_message_when_present():
+    """_format_import_error() (engram-alpha#2524, factored out on
+    reviewer-fairy round 1 of PR #2763 so this expression is independently
+    testable): a real message wins over the class name."""
+    exc = ImportError("No module named 'engram_stats'")
+    assert viz_health_data._format_import_error(exc) == "No module named 'engram_stats'"
+
+
+def test_format_import_error_falls_back_to_class_name_on_empty_message():
+    """The empty-message branch: some ImportError constructions carry no
+    str() text at all -- e.g. a bare ImportError() with no args."""
+    exc = ImportError()
+    assert viz_health_data._format_import_error(exc) == "ImportError"
+
+
+def test_get_health_data_health_score_import_failure_reports_null_not_zero(monkeypatch):
+    """engram-alpha#2524: an ImportError must not fabricate a 0.0
+    'maximally unhealthy' reading indistinguishable from a real one.
+    Monkeypatches the module's own availability flags (set once at import
+    time from a real try/except ImportError) rather than trying to force
+    an actual import failure -- the flags are exactly what the runtime
+    code branches on, so this exercises the same code path a genuine
+    ImportError would."""
+    rev, obs, derive, core = _make_fresh_mods()
+    _seed_ob(obs)  # the DB file/schema is created on first write, not at _ensure_data_dir()
+    db_path = str(core.DB_PATH)
+
+    monkeypatch.setattr(viz_health_data, "_HEALTH_SCORE_AVAILABLE", False)
+    monkeypatch.setattr(
+        viz_health_data, "_HEALTH_SCORE_IMPORT_ERROR", "No module named 'engram_stats'"
+    )
+
+    health = viz_health_data.get_health_data(db_path)
+    assert "error" not in health, health
+    assert health["health_score"] is None, (
+        f"expected None on import failure, got a fabricated number: {health['health_score']!r}"
+    )
+    assert health["health_score_error"] is not None
+    assert "engram_stats" in health["health_score_error"]

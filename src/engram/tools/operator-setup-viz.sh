@@ -16,11 +16,18 @@
 # privilege delegation.
 #
 # Run-in-place design (no copying):
-#   viz_server.py, engram_stats.py, engram_core.py, and tools/config_schema.py
-#   all ship TOGETHER in the plugin bundle. The service runs viz_server.py
-#   directly from the plugin dir — no ~/.engram-viz/ copy, no stale-binary risk.
-#   The plugin dir is resolved from this script's own real path (readlink -f
-#   follows the ~/.local/bin/engram-viz-setup symlink back to the real location).
+#   viz/ (the viz package, engram-alpha#2555), engram_stats.py, engram_core.py,
+#   and tools/config_schema.py all ship TOGETHER in the plugin bundle. The
+#   service runs viz.server (`python3 -m viz.server`, WorkingDirectory =
+#   the plugin dir) directly from the plugin dir — no ~/.engram-viz/ copy, no
+#   stale-binary risk. `-m viz.server` (not a direct `python3 viz/server.py`
+#   script path) is required because viz/server.py uses relative imports to
+#   reach its sibling modules (viz/agents.py, viz/shell.py, etc.) — those only
+#   resolve when the file is imported as part of the `viz` package, which
+#   needs the plugin dir on sys.path (what running `-m` from that cwd gives
+#   you), not a bare script execution. The plugin dir is resolved from this
+#   script's own real path (readlink -f follows the
+#   ~/.local/bin/engram-viz-setup symlink back to the real location).
 #
 # Usage:
 #   engram-viz-setup            # via symlink (created by this script)
@@ -73,7 +80,11 @@ _self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}"
 #   dirname($_self)        = <plugin>/engram/tools/
 #   dirname(dirname(...))  = <plugin>/engram/
 PLUGIN_ENGRAM_DIR="$(dirname "$(dirname "$_self")")"
-VIZ_PY="$PLUGIN_ENGRAM_DIR/viz_server.py"
+VIZ_PY="$PLUGIN_ENGRAM_DIR/viz/server.py"
+# Module-invocation form for actually launching the server (see the
+# Run-in-place design note above for why this must be `-m viz.server`, run
+# with PLUGIN_ENGRAM_DIR as cwd, rather than a direct `python3 $VIZ_PY`).
+VIZ_MODULE_INVOCATION="-m viz.server"
 
 # ---------------------------------------------------------------------------
 # --dry-run / --check flag
@@ -84,11 +95,11 @@ if [[ "${1:-}" == "--dry-run" || "${1:-}" == "--check" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Verify viz_server.py is present (plugin bundle integrity check)
+# Verify viz/server.py is present (plugin bundle integrity check)
 # ---------------------------------------------------------------------------
 if [[ ! -f "$VIZ_PY" ]]; then
-  echo "ERROR: viz_server.py not found in plugin bundle at: $VIZ_PY" >&2
-  echo "       Expected location: $PLUGIN_ENGRAM_DIR/viz_server.py" >&2
+  echo "ERROR: viz/server.py not found in plugin bundle at: $VIZ_PY" >&2
+  echo "       Expected location: $PLUGIN_ENGRAM_DIR/viz/server.py" >&2
   echo "       The plugin bundle appears malformed — reinstall ENGRAM." >&2
   exit 1
 fi
@@ -133,10 +144,41 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Curve Workbench (:5021, engram-alpha#2894) — a SEPARATE, non-fatal gate.
+#
+# Unlike viz.server above, the Curve Workbench ships at DEV tier only
+# (viz/workbench.py + viz/data/health_workbench.py are both "dev" in
+# src/build/packaging/tiers.json) — a convenience/essential-tier install
+# legitimately does NOT ship it. Failing this gate means "skip the
+# workbench unit below", never "abort this script": the viz.server (:5001)
+# unit above must still install on a convenience-tier build.
+#
+# Reuses PYTHON_BIN found above (no need to re-loop over candidates — a
+# python that failed the viz.server gate already exited the script via the
+# check above). `import viz.workbench` itself IS the gate: that module's own
+# module-import-time check (engram-alpha#2754) already fails loud (SystemExit)
+# when the dev-tier files it needs are not shipped, so this reuses the same
+# self-gating mechanism the module carries rather than re-declaring the list
+# of dev-tier files here.
+# ---------------------------------------------------------------------------
+WORKBENCH_MODULE_INVOCATION="-m viz.workbench"
+WORKBENCH_SERVICE_NAME="engram-workbench-user.service"
+WORKBENCH_SERVICE_DEST="$HOME/.config/systemd/user/$WORKBENCH_SERVICE_NAME"
+WORKBENCH_GATE_OK=0
+if ENGRAM_DIR="$PLUGIN_ENGRAM_DIR" "$PYTHON_BIN" -c "import sys, os; sys.path.insert(0, os.environ['ENGRAM_DIR']); import viz.workbench" 2>/dev/null; then
+  WORKBENCH_GATE_OK=1
+fi
+
 echo "=== ENGRAM viz operator setup ==="
 echo "  plugin engram dir: $PLUGIN_ENGRAM_DIR"
 echo "  viz server:        $VIZ_PY"
 echo "  python:            $PYTHON_BIN"
+if [[ "$WORKBENCH_GATE_OK" -eq 1 ]]; then
+  echo "  workbench (:5021):  dev tier shipped -- would install $WORKBENCH_SERVICE_DEST (Linux only)"
+else
+  echo "  workbench (:5021):  dev-tier files NOT shipped -- workbench unit will be skipped"
+fi
 echo
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -160,8 +202,8 @@ if [[ "$OS" == "Linux" ]]; then
 
   if ! command -v systemctl &>/dev/null; then
     echo "ERROR: systemctl not found. This script requires systemd on Linux." >&2
-    echo "       For non-systemd environments, manage viz_server.py manually:" >&2
-    echo "         $PYTHON_BIN $VIZ_PY" >&2
+    echo "       For non-systemd environments, manage viz.server manually:" >&2
+    echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
     exit 1
   fi
 
@@ -210,6 +252,41 @@ if [[ "$OS" == "Linux" ]]; then
   echo "  systemd user service: enabled + started"
   echo "  Status: $(systemctl --user is-active "$SERVICE_NAME")"
 
+  # Step 3.5: Curve Workbench unit (engram-alpha#2894, dev tier only — see
+  # the WORKBENCH_GATE_OK gate computed above, before OS detection).
+  echo
+  echo "Step 3.5: Installing Curve Workbench systemd user unit (dev tier)"
+
+  if [[ "$WORKBENCH_GATE_OK" -eq 1 ]]; then
+    WORKBENCH_TEMPLATE="$PLUGIN_ENGRAM_DIR/templates/engram-workbench-user.service.template"
+
+    if [[ ! -f "$WORKBENCH_TEMPLATE" ]]; then
+      echo "  WARNING: workbench unit template not found: $WORKBENCH_TEMPLATE" >&2
+      echo "  Skipping the Curve Workbench unit (bundle may predate engram-alpha#2894)." >&2
+    else
+      mkdir -p "$(dirname "$WORKBENCH_SERVICE_DEST")"
+
+      sed -e "s|{{PYTHON}}|$PYTHON_BIN|g" \
+          -e "s|{{PLUGIN_ENGRAM_DIR}}|$PLUGIN_ENGRAM_DIR|g" \
+          "$WORKBENCH_TEMPLATE" > "$WORKBENCH_SERVICE_DEST"
+
+      echo "  unit → $WORKBENCH_SERVICE_DEST"
+
+      systemctl --user daemon-reload
+      systemctl --user enable "$WORKBENCH_SERVICE_NAME"
+      # restart (not start): idempotent, same convention as the viz-server
+      # unit above.
+      systemctl --user restart "$WORKBENCH_SERVICE_NAME"
+
+      echo "  Curve Workbench service: enabled + started"
+      echo "  Status: $(systemctl --user is-active "$WORKBENCH_SERVICE_NAME")"
+    fi
+  else
+    echo "  This install does not ship the Curve Workbench's dev-tier files"
+    echo "  (viz/data/health_workbench.py and friends) -- skipping the"
+    echo "  workbench unit. Build/install with the 'dev' tier to enable it."
+  fi
+
   # Step 4: Create ~/.local/bin/engram-viz-setup convenience symlink
   echo
   echo "Step 4: Creating convenience symlink"
@@ -224,6 +301,12 @@ if [[ "$OS" == "Linux" ]]; then
   echo "  Viz server running at: http://127.0.0.1:5001"
   echo "  Service:               systemctl --user status $SERVICE_NAME"
   echo "  Logs:                  journalctl --user -u $SERVICE_NAME -f"
+  if [[ "$WORKBENCH_GATE_OK" -eq 1 && -f "$PLUGIN_ENGRAM_DIR/templates/engram-workbench-user.service.template" ]]; then
+    echo
+    echo "  Curve Workbench at:    http://127.0.0.1:5021"
+    echo "  Service:               systemctl --user status $WORKBENCH_SERVICE_NAME"
+    echo "  Logs:                  journalctl --user -u $WORKBENCH_SERVICE_NAME -f"
+  fi
   echo
   echo "  Note: For service persistence across user logout, run:"
   echo "        sudo loginctl enable-linger $USER"
@@ -239,8 +322,8 @@ elif [[ "$OS" == "Darwin" ]]; then
   if ! command -v launchctl &>/dev/null; then
     echo "ERROR: launchctl not found." >&2
     echo "       This script requires launchctl on macOS." >&2
-    echo "       Manage the viz server manually:" >&2
-    echo "         $PYTHON_BIN $VIZ_PY" >&2
+    echo "       Manage viz.server manually:" >&2
+    echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
     exit 1
   fi
 
@@ -314,7 +397,7 @@ elif [[ "$OS" == "Darwin" ]]; then
 else
   echo "ERROR: Unsupported OS: $OS" >&2
   echo "       This script supports Linux (systemd) and macOS (launchd)." >&2
-  echo "       On other platforms, manage the viz server manually:" >&2
-  echo "         $PYTHON_BIN $VIZ_PY" >&2
+  echo "       On other platforms, manage viz.server manually:" >&2
+  echo "         (cd $PLUGIN_ENGRAM_DIR && $PYTHON_BIN $VIZ_MODULE_INVOCATION)" >&2
   exit 1
 fi

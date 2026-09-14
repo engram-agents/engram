@@ -10,13 +10,21 @@ hooks/hooks.json (completeness sweep found it was silently dropped during
 scatter→plugin migration).  Tests updated to assert baton appears in the
 built hooks.json for MA+dev builds and is absent for non-MA builds.
 
+Round-4 update (#2857 step 1): engram-inter-agent-prompt-hook.py and
+engram-baton-prompt-hook.py are no longer multi_agent-gated in tiers.json —
+they are genuinely forum-backed (HTTP to the LAN forum) and symmetric for
+any agent, alone on its host or not, once a forum is configured. They now
+ship in the DEFAULT (non-MA) build too, not only at --tier dev --multi-agent.
+Test (a) below is inverted accordingly.
+
 Two test classes:
 
 1. TestHooksConsistencyGate
    - Runs build-plugin.sh (default + --multi-agent --tier dev) and asserts:
-       (a) Default (convenience, no MA) build: hooks.json has NO
+       (a) Default (convenience, no MA) build: hooks.json DOES reference
            engram-inter-agent-prompt-hook.py / engram-baton-prompt-hook.py
-           entries, AND every referenced file is present.
+           (un-gated as of #2857 step 1), AND every referenced file is
+           present.
        (b) --tier dev --multi-agent build: hooks.json references inter-agent +
            baton AND both files are present.
        (c) All-or-nothing gate: removing a referenced hook file after a dev+MA
@@ -125,24 +133,30 @@ class TestHooksConsistencyGate:
     """Verify the hooks.json ↔ shipped-files consistency gate in build-plugin.sh.
 
     Round-2: hooks.json is filtered at build time, so:
-      (a) default build must have NO inter-agent/baton entries in hooks.json
+      (a) default build must have inter-agent/baton entries in hooks.json too,
+          as of #2857 step 1 (they are forum-backed and un-gated)
       (b) dev+MA build must have inter-agent+baton entries AND their files present
       (c) all-or-nothing gate fires when a referenced file is absent
     """
 
-    # MA-only hooks that must be absent from non-MA builds.
+    # Forum-backed hooks — un-gated as of #2857 step 1 (were MA-only before).
     INTER_AGENT_HOOK = "engram-inter-agent-prompt-hook.py"
     BATON_HOOK = "engram-baton-prompt-hook.py"
 
-    def test_default_build_no_ma_entries_in_hooks_json(self):
-        """Default build (convenience, no --multi-agent): hooks.json has no MA entries.
+    def test_default_build_has_forum_backed_hooks_in_hooks_json(self):
+        """Default build (convenience, no --multi-agent): hooks.json has the
+        forum-backed hooks too, and every referenced file is present.
 
-        Acceptance criterion (a): the built hooks.json must NOT reference
-        engram-inter-agent-prompt-hook.py or engram-baton-prompt-hook.py, and
-        every file that IS referenced must be present on disk.
-        This is the root-cause regression test for #713: the round-1 gate
-        produced a false pass because hooks.json was copied wholesale while
-        the inter-agent hook file was tier-filtered out.
+        Acceptance criterion (a), inverted by #2857 step 1: the built
+        hooks.json now DOES reference engram-inter-agent-prompt-hook.py and
+        engram-baton-prompt-hook.py in the DEFAULT build, since neither is
+        multi_agent-gated any longer (both are genuinely forum-backed and
+        symmetric for any agent once a forum is configured). Pre-#2857 this
+        test asserted the opposite (their ABSENCE) as the root-cause
+        regression test for #713: the round-1 gate produced a false pass
+        because hooks.json was copied wholesale while the inter-agent hook
+        file was tier-filtered out. The all-or-nothing check (a2) below is
+        the part of #713's regression coverage that still applies unchanged.
         """
         result = _run_build([])
         assert result.returncode == 0, (
@@ -151,18 +165,20 @@ class TestHooksConsistencyGate:
 
         referenced = _hooks_referenced_in_built_json(PLUGIN_ROOT)
 
-        # (a1) MA-only hooks must NOT appear in the built hooks.json.
-        assert self.INTER_AGENT_HOOK not in referenced, (
-            f"Default build: hooks.json still references '{self.INTER_AGENT_HOOK}' "
-            "even though it is a multi-agent-only hook.  The hooks.json filter step "
-            "did not drop this entry.  (#713 regression)"
+        # (a1) Forum-backed hooks now DO appear in the default build's hooks.json.
+        assert self.INTER_AGENT_HOOK in referenced, (
+            f"Default build: hooks.json does not reference '{self.INTER_AGENT_HOOK}'. "
+            "It should now ship un-gated (#2857 step 1) — it is genuinely forum-backed."
         )
-        assert self.BATON_HOOK not in referenced, (
-            f"Default build: hooks.json still references '{self.BATON_HOOK}' "
-            "even though it is a multi-agent-only hook.  (#713 regression)"
+        assert self.BATON_HOOK in referenced, (
+            f"Default build: hooks.json does not reference '{self.BATON_HOOK}'. "
+            "It should now ship un-gated (#2857 step 1) — it is genuinely forum-backed."
         )
 
         # (a2) Every hook that IS referenced must be present (all-or-nothing).
+        # This is the surviving #713 regression coverage: the round-1 gate
+        # produced a false pass because hooks.json was copied wholesale while
+        # a referenced hook file was tier-filtered out from disk.
         missing = _check_hooks_consistency_all_or_nothing(PLUGIN_ROOT)
         assert not missing, (
             "Default build: hooks.json references hook file(s) not present in "

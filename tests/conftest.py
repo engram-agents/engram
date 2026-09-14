@@ -27,6 +27,145 @@ if REPO_ROOT in sys.path:
     sys.path.remove(REPO_ROOT)
 sys.path.insert(0, REPO_ROOT)
 
+# #2565 — sys.path-collision guard for the `tools/` package-name clash.
+#
+# Two genuinely different `tools` packages share the same import name:
+# repo-root's own tools/ (containing tools/engine, needed by e.g.
+# test_engine_phase3.py's leak-scan/manifest tests) and src/engram/tools/
+# (the plugin-bundled tools, a different package). Whenever something puts
+# src/engram ahead of the repo root on sys.path, `import tools` resolves to
+# the wrong one and gets CACHED in sys.modules for the rest of the process
+# -- silently poisoning any LATER test file in the same pytest invocation
+# that needs the real tools.engine. Third recurrence (#2063, PR#2564,
+# this one) -- the rule-of-three threshold for building the durable check
+# rather than fixing the instance again.
+#
+# tools/__init__.py at the repo root is ITSELF a symlink into
+# src/engram/tools/__init__.py, so Path.resolve() collapses both import
+# paths to the identical real file and would defeat this check -- the
+# discriminator is which sys.path ENTRY Python actually used to find the
+# module, which os.path.abspath (NOT realpath/resolve) preserves.
+_EXPECTED_TOOLS_DIR = os.path.join(REPO_ROOT, "tools")
+
+
+def _assert_tools_package_is_repo_root() -> None:
+    """Proactive, filesystem-based check -- does NOT require `tools` to
+    already be imported. If `tools` is already cached, trust that (an
+    import already committed to a resolution; re-deriving from sys.path
+    here could disagree with what Python actually did). Otherwise, scan
+    sys.path in order for the first entry that contains a same-named
+    tools/__init__.py -- that is what the NEXT `import tools` would
+    resolve to, whether or not it has happened yet. Checking this
+    proactively (not only "is the wrong one already cached") is what lets
+    the `pytest_collectstart` hook below fire BEFORE a later file's own
+    `import tools...` line raises a raw, less-attributable
+    ModuleNotFoundError (the actual shape of the #2564 incident: the
+    victim file's own top-level import is what failed, not a fixture
+    running after successful collection)."""
+    mod = sys.modules.get("tools")
+    if mod is not None and getattr(mod, "__file__", None) is not None:
+        actual_dir = os.path.dirname(os.path.abspath(mod.__file__))
+    else:
+        actual_dir = None
+        for entry in sys.path:
+            candidate = os.path.join(entry, "tools", "__init__.py")
+            if os.path.isfile(candidate):
+                actual_dir = os.path.dirname(os.path.abspath(candidate))
+                break
+        if actual_dir is None:
+            return  # no `tools` package resolvable at all -- not this guard's concern
+    if actual_dir != _EXPECTED_TOOLS_DIR:
+        raise RuntimeError(
+            "sys.path collision (#2565): `import tools` would resolve to "
+            f"{actual_dir!r}, not the repo-root package at "
+            f"{_EXPECTED_TOOLS_DIR!r}. Some test file (or an env var like "
+            "PYTHONPATH) put another directory ahead of the repo root on "
+            "sys.path -- tools.engine and other repo-root-tools-only "
+            "imports will fail or misbehave for every test module "
+            f"collected after the one that caused this. Current sys.path: "
+            f"{sys.path!r}"
+        )
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _sys_path_collision_guard():
+    """Runs once per test MODULE, after that module's own top-level code
+    (including any sys.path manipulation it does at import time) has
+    already executed.
+
+    Attribution correction (Borges's colleague-review finding on PR #2661):
+    under pytest's default collect-then-run order (no xdist / pytest-randomly
+    / pytest-order / --forked on this repo), EVERY module is collected --
+    and therefore imported -- before ANY module-scoped fixture runs. So for
+    an IMPORT-TIME collision (a module's own top-level
+    `sys.path.insert(0, ...)`, the actual shape of the #2564/#2565
+    incident), `pytest_collectstart` below has ALREADY caught it before
+    this fixture ever gets a turn on that same module -- this fixture is
+    NOT the first line of defense there, whatever an earlier version of
+    this docstring implied. What this fixture actually, uniquely catches
+    is a RUN-PHASE collision: one a test body introduces during test
+    EXECUTION rather than at import time, which `pytest_collectstart`
+    structurally cannot see (it only fires before collection, never during
+    a test's own run). Keep both -- they cover genuinely different
+    phases -- but don't read this fixture as redundant belt-and-braces on
+    the import-time case; collectstart alone already covers that one.
+
+    Together with `pytest_collectstart`, turns "a new test file quietly
+    breaks a later, unrelated test file" into an immediate, attributable
+    failure naming the actual cause, instead of a confusing
+    ModuleNotFoundError surfacing three files later -- but for the
+    import-time case that credit belongs to `pytest_collectstart`, per
+    the attribution above; this fixture's own share of that credit is
+    the run-phase case only.
+
+    Checked in, not just asserted: the run-phase claim above is a
+    falsifiable property, and
+    tests/test_sys_path_collision_guard_2565.py::test_run_phase_collision_is_caught_by_the_fixture_not_collectstart
+    is the regression test that verifies it (Borges's colleague-review
+    finding on PR #2665: he confirmed it live before approving, but the
+    docstring stated it as fact with nothing in the suite checking it --
+    a hedge that did not survive compression into code).
+
+    Unlike `pytest_collectstart` below, this fixture lets
+    `_assert_tools_package_is_repo_root`'s RuntimeError propagate raw
+    rather than converting it to `pytest.exit()` -- deliberately, not an
+    oversight: a fixture failure is scoped and attributable per-module
+    (pytest reports it as a clean "ERROR at setup of <test>", not a
+    crash), unlike `pytest_collectstart`, which pytest calls with no
+    surrounding try/except and would turn a bare raise into an
+    INTERNALERROR (see that hook's own docstring for the confirmed
+    incident). Same underlying error, two different call-sites, two
+    different safe handling strategies -- not an inconsistency."""
+    _assert_tools_package_is_repo_root()
+    yield
+
+
+def pytest_collectstart(collector) -> None:
+    """Runs BEFORE a module is imported/collected -- catches a collision
+    left over from an earlier file's own top-level sys.path mistake
+    before THIS file's own `import tools...` line gets a chance to raise
+    a raw ModuleNotFoundError instead (the fixture above alone is too
+    late for that specific failure shape, since fixtures only run for
+    modules that already collected successfully).
+
+    Uses pytest.exit(), never a bare raise: pytest_collectstart is called
+    directly by _pytest.runner.collect_one_node with no surrounding
+    try/except (unlike the collection call that follows it), so any other
+    exception raised here propagates all the way out as an INTERNALERROR
+    crash trace -- confirmed empirically, not assumed, when an earlier
+    draft of this hook used a bare `raise RuntimeError(...)` and a full
+    suite run crashed with exactly that INTERNALERROR instead of the
+    intended attributable message. pytest.exit() is pytest's own sanctioned
+    mechanism for stopping the session immediately with a clear reason,
+    which is also the proportionate response here: once the collision has
+    happened, every module collected after it is unreliable, so continuing
+    to collect would just accumulate more confusing failures."""
+    try:
+        _assert_tools_package_is_repo_root()
+    except RuntimeError as exc:
+        pytest.exit(str(exc), returncode=1)
+
+
 # Test-mode bypass for the _get_db() fail-loud guards added with the plugin
 # bootstrap contract. Test fixtures monkey-patch DATA_DIR/DB_PATH to a tempdir
 # and let the first tool handler's _get_db() open-and-create the DB — the

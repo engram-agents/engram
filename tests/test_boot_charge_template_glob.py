@@ -11,9 +11,9 @@ charge-booted session's argv.
 
 That fix was applied to the DEPLOYED copies under
 `/usr/local/lib/agentctl/autostart/` only — never to this repo's SOURCE
-templates in `deploy/autostart/`. Every redeploy from source therefore
+Claude components in `deploy/autostart/`. Every redeploy from source therefore
 silently reverted the protection (measured live 2026-08-07: both deployed
-templates' mtimes matched to the second, from a scripted rewrite one day
+components' mtimes matched to the second, from a scripted rewrite one day
 after the fix was verified).
 
 This test is the guard: it fails loudly if either SOURCE template ever again
@@ -36,8 +36,8 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATES = [
-    _REPO_ROOT / "deploy" / "autostart" / "boot-charge-default.md",
-    _REPO_ROOT / "deploy" / "autostart" / "boot-charge-quiet.md",
+    _REPO_ROOT / "deploy" / "autostart" / "boot-charge-default-claude.md",
+    _REPO_ROOT / "deploy" / "autostart" / "boot-charge-quiet-claude.md",
 ]
 
 # The exact regression pattern: either monitor's script name written as a
@@ -103,7 +103,7 @@ def test_boot_charge_forum_branch_carries_verbatim_arming_text():
     repo = Path(__file__).resolve().parent.parent
     start = "Then arm your UCS forum monitors"
     end = "reports a live monitor as dead."
-    for name in ("boot-charge-default.md", "boot-charge-quiet.md"):
+    for name in ("boot-charge-default-claude.md", "boot-charge-quiet-claude.md"):
         text = (repo / "deploy" / "autostart" / name).read_text()
         m = re.search(re.escape(start) + r".*?" + re.escape(end), text, re.DOTALL)
         assert m, f"{name}: arming segment not found — forum branch drifted or wrapper broke it"

@@ -33,7 +33,21 @@ from pathlib import Path
 from typing import Optional
 
 import engram_core as core
-from engram_log_emitter import emit_if_initialized
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +92,27 @@ _CONTEXTUAL_RELATIONS = frozenset({
 # For recall view: cap per-group size to avoid response bloat when a popular
 # node has hundreds of dependents. Applied to each group independently.
 _INSPECT_RECALL_GROUP_CAP = 10
+
+
+# ---------------------------------------------------------------------------
+# engram_list — compact-triage display caps
+# ---------------------------------------------------------------------------
+# Both are DISPLAY-ONLY bounds applied by _list_impl's default compact-triage
+# branch; neither validates or rejects anything on write. Public (no leading
+# underscore) so tests can import them instead of re-hardcoding the numbers.
+
+# Display truncation for a populated recall_summary in the compact triage
+# shape. Independent of the write-path validators — RECALL_SUMMARY_HARD_CAP
+# (200, tools/recall_summary_validator.py, batch path only) and
+# RECALL_SUMMARY_HARD_REJECT_AT (280, engram_core._validate_recall_fields, node
+# creation); its equality with the former is a numeric coincidence, not a
+# dependency. So a 201-279-char summary is ordinary and the truncation below is
+# a real branch, not defense-in-depth against a hypothetical bypass.
+LIST_CLAIM_SUMMARY_DISPLAY_CAP = 200
+
+# Display truncation for the raw `claim` fallback, used only for legacy nodes
+# that have no recall_summary yet.
+LIST_CLAIM_FALLBACK_DISPLAY_CAP = 130
 
 
 # ---------------------------------------------------------------------------
@@ -2897,17 +2932,47 @@ def _query_impl(
         # Decision context: query length + result count + type filter used.
         # source_class_filter is not a parameter of engram_query (only type
         # filter exists); emitted as None. Noted in phase-3 F1 handoff.
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_query",
-                "query_text_len": len(query),
-                "result_count": len(output),
-                "type_filter": types or None,
-                "source_class_filter": None,
-            },
-        )
+        # alpha #2574 WS5: site attestation + outcome recording +
+        # protection (docs/2574-telemetry-design.md §1/§4/§5) -- new,
+        # narrowly-scoped try/except; see engram_derive.py's _derive_impl
+        # blocked-path site for the full rationale. This function's own
+        # try/finally has no except, so an uncaught raise here would
+        # propagate straight out of this MCP tool call, breaching §8.
+        _site = "server.engram_query"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_query",
+                    "query_text_len": len(query),
+                    "result_count": len(output),
+                    "type_filter": types or None,
+                    "source_class_filter": None,
+                },
+                site="server.engram_query",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
 
         # return_debug=True: preserve full legacy shape verbatim (eval/harness contract).
         if return_debug:
@@ -3358,24 +3423,29 @@ def _list_impl(
     else:
         # Default compact triage shape (matches legacy output).
         # The `claim` output key sources from recall_summary when populated
-        # (curated dense recognition string, up to 200 chars) or falls back
-        # to the original claim truncated to 130 chars for legacy nodes that
-        # haven't been backfilled yet. Key name unchanged for downstream compat.
+        # (curated dense recognition string; write path accepts up to 279
+        # chars, display truncates at LIST_CLAIM_SUMMARY_DISPLAY_CAP with an
+        # ellipsis) or falls back to the original claim truncated to
+        # LIST_CLAIM_FALLBACK_DISPLAY_CAP chars for legacy nodes that haven't
+        # been backfilled yet. Key name unchanged for downstream compat.
         for row in rows:
             nid, ntype, claim, st, conf, recalls, imp, created, mem_st, rs = row
-            if rs and len(rs) <= 200:
-                # recall_summary present and within safety bound — use as-is
-                # (validator hard cap is 200 chars (see RECALL_SUMMARY_HARD_CAP);
-                # the 200 bound here matches that cap exactly, defense-in-depth
-                # for hypothetical direct-SQL bypasses).
+            if rs and len(rs) <= LIST_CLAIM_SUMMARY_DISPLAY_CAP:
+                # Display-only bound, independent of the write-path validators
+                # (see LIST_CLAIM_SUMMARY_DISPLAY_CAP) — use as-is.
                 claim_display = rs
             elif rs:
-                # recall_summary present but unusually long (data integrity issue
-                # upstream, defense-in-depth) — truncate to cap with ellipsis
-                claim_display = rs[:200] + "..."
+                # recall_summary longer than the display bound (write path
+                # legitimately accepts up to 279 chars) — truncate for
+                # display only
+                claim_display = rs[:LIST_CLAIM_SUMMARY_DISPLAY_CAP] + "..."
             else:
                 # No recall_summary — fall back to truncated claim (legacy behavior)
-                claim_display = (claim[:130] + "...") if claim and len(claim) > 130 else (claim or "")
+                claim_display = (
+                    (claim[:LIST_CLAIM_FALLBACK_DISPLAY_CAP] + "...")
+                    if claim and len(claim) > LIST_CLAIM_FALLBACK_DISPLAY_CAP
+                    else (claim or "")
+                )
             entry = {
                 "id": nid,
                 "type": ntype,
@@ -3454,19 +3524,46 @@ def _query_pattern_impl(
     # pattern_name length as a proxy. source_class_filter and type_filter
     # are not parameters of this tool — emitted as None. See phase-3 F1
     # handoff ambiguous-decisions log.
-    emit_if_initialized(
-        event_type="engram.tool.engram_call",
-        level=1,
-        data={
-            "tool_name": "engram_query_pattern",
-            "query_text_len": len(pattern_name),
-            "result_count": len(candidates),
-            "type_filter": None,
-            "source_class_filter": None,
-            "pattern_name": pattern_name,
-            "preset": preset,
-        },
-    )
+    # alpha #2574 WS5: this site sits with NO surrounding try at all (§0.1)
+    # -- a NEW try wraps it (§10), same shape as the batch-summary site in
+    # engram_observation.py.
+    _site = "server.engram_query_pattern"
+    try:
+        _had_emitter = Emitter.get() is not None
+        _uid = emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_query_pattern",
+                "query_text_len": len(pattern_name),
+                "result_count": len(candidates),
+                "type_filter": None,
+                "source_class_filter": None,
+                "pattern_name": pattern_name,
+                "preset": preset,
+            },
+            site="server.engram_query_pattern",
+        )
+        write_telemetry_record(
+            manifest_id=_site,
+            event_type="engram.tool.engram_call",
+            fields={
+                "outcome": (
+                    "delivered" if _uid is not None
+                    else "dropped" if _had_emitter
+                    else "no_emitter"
+                )
+            },
+        )
+    except Exception:
+        try:
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={"outcome": "init_failed"},
+            )
+        except Exception:
+            pass
 
     # Apply tiered render after pattern-internal ranking is complete.
     # Clamp summary_top_k to [0, len(candidates)].

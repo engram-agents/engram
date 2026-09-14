@@ -41,7 +41,10 @@ def test_render_claude_code_claude_md_is_byte_identical_to_template():
     included_ids = [c["id"] for c in receipt["components"]]
     assert len(included_ids) == len(set(included_ids)), "duplicate component id in receipt"
     for c in receipt["components"]:
-        assert c["version"] == 1
+        # Every component carries an integer version >= 1; a component's
+        # version increments on content revision (first real bump: the
+        # model-identity-gate self-recognition paragraph, version 2).
+        assert isinstance(c["version"], int) and c["version"] >= 1
 
 
 def test_render_unknown_manifest_raises():

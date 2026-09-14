@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ENGRAM Config</title>
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    /* font-family/background/color moved to static/base.css's shared body{}
+       rule (engram-alpha#2555 PR C, forum #389) -- only this page's own
+       padding remains local, since base.css's copy is linked BEFORE this
+       <style> block and a page-local body{} declared here still wins the
+       cascade on any property it sets. */
+    body { padding: 24px; }
+    h1 { color: #00d4ff; font-size: 1.5em; margin-bottom: 16px; }
+    /* .nav-agent-label/.nav-agent-select/#nav-agent-wrapper consolidated
+       into static/base.css's sole copy (engram-alpha#2555 PR C sweep --
+       this page's copy was byte-identical dead weight left behind by PR
+       B's nav-CSS consolidation, which covered .nav/.nav a/.nav a:hover
+       but missed this trio). */
+
+    /* Section cards */
+    .section-card { background: #16213e; border-radius: 8px; padding: 16px;
+                    border: 1px solid #0f3460; margin-bottom: 14px; }
+    .section-card h3 { color: #00d4ff; font-size: 0.95em; margin-bottom: 12px; }
+    .section-gated { opacity: 0.5; pointer-events: none; }
+    .section-gated .gate-row { opacity: 1; pointer-events: auto; }
+
+    /* Rows */
+    .config-row { display: flex; align-items: flex-start; gap: 10px;
+                  padding: 6px 0; border-bottom: 1px solid #0f3460; font-size: 0.85em; }
+    .config-row:last-child { border-bottom: none; }
+    .row-label { color: #aaa; min-width: 200px; flex-shrink: 0; display: flex;
+                 align-items: center; gap: 4px; }
+    .row-control { flex: 1; }
+    .row-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+
+    /* Badges */
+    .badge { font-size: 0.72em; padding: 1px 5px; border-radius: 3px;
+             white-space: nowrap; }
+    .badge-restart { background: #1a3a5c; color: #7ecfff; border: 1px solid #1a4a8a; }
+    .badge-legacy  { background: #3a2a0a; color: #ffb74d; border: 1px solid #7a4500; cursor: help; }
+    .badge-readonly { background: #2a2a32; color: #999; border: 1px solid #44444c; cursor: help; }
+
+    /* Controls */
+    input[type="text"], input[type="number"] {
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; padding: 3px 7px; font-size: 0.85em; width: 100%;
+      outline: none; }
+    input:disabled { opacity: 0.7; cursor: not-allowed; }
+    input:not(:disabled):focus { border-color: #00d4ff; }
+    input[type="checkbox"] { accent-color: #00d4ff; width: 15px; height: 15px; }
+    input[type="checkbox"]:disabled { cursor: not-allowed; opacity: 0.7; }
+
+    /* Editable field wrapper */
+    .field-edit-wrap { display: flex; align-items: center; gap: 6px; }
+    .field-edit-wrap input[type="text"],
+    .field-edit-wrap input[type="number"] { flex: 1; }
+
+    /* Save button */
+    .btn-save { background: #0d3a6e; border: 1px solid #1a6aaa; border-radius: 4px;
+                color: #7ecfff; cursor: pointer; font-size: 0.78em; padding: 3px 10px;
+                white-space: nowrap; flex-shrink: 0; }
+    .btn-save:hover { background: #1a4a8a; }
+    .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Inline field status */
+    .field-status { font-size: 0.78em; margin-top: 3px; }
+    .field-status.ok  { color: #66bb6a; }
+    .field-status.err { color: #ef5350; }
+
+    /* Restart-required banner */
+    #restart-banner { display: none; margin-bottom: 14px; padding: 10px 14px;
+                      background: #1a2a4a; border: 1px solid #1a6aaa;
+                      border-radius: 6px; color: #7ecfff; font-size: 0.85em; }
+    #restart-banner strong { color: #00d4ff; }
+
+    /* System-critical soft warning (tier B + restart_required) */
+    .warn-critical { font-size: 0.75em; color: #ffb74d; margin-top: 3px; }
+
+    /* Select control (enum fields like coder_fairy_policy / reviewer_fairy_policy) */
+    select.cfg-select {
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; padding: 3px 7px; font-size: 0.85em; outline: none;
+      cursor: pointer; }
+    select.cfg-select:disabled { opacity: 0.7; cursor: not-allowed; }
+
+    /* List display (read-only) */
+    .list-display { list-style: none; padding: 0; }
+    .list-display li { background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 3px;
+                        padding: 2px 7px; margin-bottom: 3px; font-size: 0.82em; color: #ccc; }
+    .list-display li:empty { display: none; }
+    .list-empty { color: #555; font-style: italic; font-size: 0.82em; }
+
+    /* Null value */
+    .null-value { color: #555; font-style: italic; }
+
+    /* Tooltip */
+    .tooltip-icon { color: #7ecfff; cursor: help; font-size: 0.75em;
+                    border: 1px solid #7ecfff; border-radius: 50%; width: 14px; height: 14px;
+                    display: inline-flex; align-items: center; justify-content: center;
+                    flex-shrink: 0; position: relative; }
+    .tooltip-icon:hover::after {
+      content: attr(data-tip);
+      position: absolute;
+      background: #0d1b36; border: 1px solid #1a4a8a; border-radius: 4px;
+      color: #e0e0e0; font-size: 0.9em; padding: 6px 10px; max-width: 280px;
+      white-space: pre-wrap; z-index: 100; pointer-events: none;
+    }
+
+    /* Pulse animation for embedding.enabled == false */
+    @keyframes alertPulse {
+      0%   { border-color: #1a4a8a; }
+      50%  { border-color: #c62828; }
+      100% { border-color: #1a4a8a; }
+    }
+    .alert-pulse { animation: alertPulse 1.5s ease-in-out infinite; }
+
+    /* Advanced expander */
+    .advanced-expander { margin-top: 8px; }
+    .advanced-toggle { background: none; border: 1px solid #1a4a8a; border-radius: 4px;
+                        color: #7ecfff; cursor: pointer; font-size: 0.85em; padding: 6px 12px;
+                        display: flex; align-items: center; gap: 6px; width: 100%; text-align: left; }
+    .advanced-toggle:hover { background: #0d1b36; }
+    .advanced-toggle .arrow { transition: transform 0.2s; display: inline-block; }
+    .advanced-toggle.open .arrow { transform: rotate(90deg); }
+    .advanced-body { display: none; margin-top: 10px; }
+    .advanced-body.open { display: block; }
+
+    /* Footer */
+    .config-footer { margin-top: 24px; padding: 14px 16px; background: #16213e;
+                      border: 1px solid #0f3460; border-radius: 6px; color: #888;
+                      font-size: 0.8em; line-height: 1.6; }
+    .config-footer a { color: #7ecfff; text-decoration: none; }
+    .config-footer a:hover { text-decoration: underline; }
+
+    /* Loading / error */
+    #cfg-loading { color: #888; }
+    #cfg-error   { color: #f44336; }
+  </style>
+</head>
+<body>
+<!--NAV_PLACEHOLDER-->
+  <h1>ENGRAM Config</h1>
+
+  <div id="cfg-loading">Loading config…</div>
+  <div id="cfg-error" style="display:none;"></div>
+  <div id="restart-banner">
+    <strong>&#x27F3; Restart needed</strong> — one or more changes take effect after you restart Claude Code / next session.
+  </div>
+  <div id="cfg-body" style="display:none;"></div>
+
+  <div class="config-footer">
+    ENGRAM has additional configuration parameters for protocol-level
+    tuning that aren&#39;t surfaced here. They live in ~/.engram/config.json
+    and are documented in the project <a href="https://github.com/engram-agents/engram/blob/main/README.md" target="_blank">README</a>. Edit them only after
+    reading the calibration documentation.
+  </div>
+
+  <script>
+  function _currentAgent() {
+    return new URL(window.location.href).searchParams.get('agent');
+  }
+  function _withAgent(path) {
+    const a = _currentAgent();
+    if (!a) return path;
+    return path + (path.includes('?') ? '&' : '?') + 'agent=' + encodeURIComponent(a);
+  }
+  function esc(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  // Agent switching is handled by the shared top-nav selector (_NAV_SCRIPT);
+  // no per-tab selector wiring needed here.
+
+  // ── Config write (saveField) ─────────────────────────────────────────────
+  async function saveField(key, value) {
+    try {
+      const res = await fetch(_withAgent('/api/config/' + encodeURIComponent(key)), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: value }),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        console.error('saveField error:', data.error);
+        alert('Save failed: ' + (data.error || 'unknown error'));
+      }
+    } catch (e) {
+      console.error('saveField fetch error:', e);
+      alert('Save failed: ' + e.message);
+    }
+  }
+
+  // ── Rendering helpers ────────────────────────────────────────────────────
+
+  // Returns the input element HTML for a field. When editable=true the
+  // control is interactive; when editable=false it is disabled/read-only.
+  function renderControl(row) {
+    const v = row.value;
+    const ctrl = row.control;
+    const editable = row.editable !== false;  // undefined → treat as true (belt-and-suspenders)
+    const alertPulse = (row.alert_when_false === true && v === false) ? ' alert-pulse' : '';
+    const key = row.key;
+
+    if (ctrl === 'checkbox') {
+      const checked = v ? 'checked' : '';
+      if (!editable) {
+        return `<input type="checkbox" ${checked} disabled class="${alertPulse.trim()}">`;
+      }
+      // Editable checkbox: inline save-on-change (no explicit save button needed).
+      // updateDependsOn() fires unconditionally on every change so gated rows
+      // (e.g. auto_sleep_time under auto_sleep_enabled) show/hide immediately,
+      // even if the PUT fails.
+      return `<input type="checkbox" id="field-${esc(key)}" ${checked} class="${alertPulse.trim()}"
+                onchange="updateSectionGates(); updateDependsOn(); saveField('${esc(key)}', this.checked)">`;
+    }
+    if (ctrl === 'text') {
+      if (!editable) {
+        if (v === null || v === undefined) {
+          return `<span class="null-value">(not set)</span>`;
+        }
+        return `<input type="text" value="${esc(String(v))}" disabled class="${alertPulse.trim()}">`;
+      }
+      const val = (v === null || v === undefined) ? '' : esc(String(v));
+      return `<div class="field-edit-wrap">
+        <input type="text" id="field-${esc(key)}" value="${val}"
+               class="${alertPulse.trim()}"
+               onkeydown="if(event.key==='Enter')saveField('${esc(key)}',this.value)">
+        <button class="btn-save" onclick="saveFieldFromInput('${esc(key)}')">Save</button>
+      </div>`;
+    }
+    if (ctrl === 'int' || ctrl === 'float') {
+      if (!editable) {
+        if (v === null || v === undefined) {
+          return `<span class="null-value">(not set — using code default)</span>`;
+        }
+        return `<input type="number" value="${esc(String(v))}" disabled class="${alertPulse.trim()}">`;
+      }
+      const val = (v === null || v === undefined) ? '' : esc(String(v));
+      // When unset, surface the effective code default as a placeholder so the
+      // box isn't a blank with no hint of what's active (config_schema `default`).
+      // Scope: this lives in the int/float branch only — the sole schema field
+      // with a `default` today is numeric. A future text field with a `default`
+      // would need the same line added to the text branch above.
+      const ph = (val === '' && row.default !== null && row.default !== undefined)
+        ? ` placeholder="${esc(String(row.default))} (default)"` : '';
+      const step = (ctrl === 'float') ? 'any' : '1';
+      return `<div class="field-edit-wrap">
+        <input type="number" id="field-${esc(key)}" value="${val}"${ph} step="${step}"
+               class="${alertPulse.trim()}"
+               onkeydown="if(event.key==='Enter')saveFieldFromInput('${esc(key)}')">
+        <button class="btn-save" onclick="saveFieldFromInput('${esc(key)}')">Save</button>
+      </div>`;
+    }
+    if (ctrl === 'time_hm') {
+      // Parse current HH:MM value; default to 03:00 if missing.
+      const raw = (v === null || v === undefined || v === '') ? '03:00' : String(v);
+      const parts = raw.split(':');
+      const curHH = (parts[0] || '03').padStart(2, '0');
+      const curMM = (parts[1] || '00').padStart(2, '0');
+
+      // Build hour options 00–23
+      let hourOpts = '';
+      for (let h = 0; h < 24; h++) {
+        const hh = String(h).padStart(2, '0');
+        hourOpts += `<option value="${hh}"${hh === curHH ? ' selected' : ''}>${hh}</option>`;
+      }
+      // Build minute options 00–59
+      let minOpts = '';
+      for (let m = 0; m < 60; m++) {
+        const mm = String(m).padStart(2, '0');
+        minOpts += `<option value="${mm}"${mm === curMM ? ' selected' : ''}>${mm}</option>`;
+      }
+
+      const disabledAttr = editable ? '' : ' disabled';
+      const onChange = editable
+        ? `onchange="(function(){var hSel=this.closest('.field-edit-wrap').querySelector('.time-hm-hour');var mSel=this.closest('.field-edit-wrap').querySelector('.time-hm-min');saveField('${esc(key)}',hSel.value+':'+mSel.value);}).call(this)"`
+        : '';
+      return `<div class="field-edit-wrap">
+        <select class="time-hm-hour"${disabledAttr} ${onChange}>${hourOpts}</select>
+        <span style="margin:0 2px;">:</span>
+        <select class="time-hm-min"${disabledAttr} ${onChange}>${minOpts}</select>
+      </div>`;
+    }
+    // list_display (read-only list) and list_edit (editable in v0 as read-only list — full
+    // list editor is deferred; v0 shows the current values and a note)
+    if (ctrl === 'list_display' || ctrl === 'list_edit') {
+      if (v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
+        return `<span class="list-empty">(empty)</span>`;
+      }
+      const items = Array.isArray(v) ? v : [v];
+      return '<ul class="list-display">' + items.map(item => `<li>${esc(String(item))}</li>`).join('') + '</ul>';
+    }
+    if (ctrl === 'yellow_domains_edit') {
+      if (v === null || v === undefined || (Array.isArray(v) && v.length === 0)) {
+        return `<span class="list-empty">(empty)</span>`;
+      }
+      const items = Array.isArray(v) ? v : [v];
+      return '<ul class="list-display">' + items.map(item => {
+        const domain = esc(item.domain || item);
+        const reason = item.reason ? ` — ${esc(item.reason)}` : '';
+        const node = item.engram_node ? ` [${esc(item.engram_node)}]` : '';
+        return `<li>${domain}${reason}${node}</li>`;
+      }).join('') + '</ul>';
+    }
+    if (ctrl === 'select') {
+      const editable = row.editable !== false;
+      const opts = (row.allowed_values || []).map(opt =>
+        `<option value="${esc(opt)}" ${opt === v ? 'selected' : ''}>${esc(opt)}</option>`
+      ).join('');
+      if (!editable) {
+        return `<select disabled class="cfg-select${alertPulse}">${opts}</select>`;
+      }
+      const key = row.key;
+      return `<select id="field-${esc(key)}" class="cfg-select${alertPulse}"
+                onchange="saveField('${esc(key)}', this.value)">${opts}</select>`;
+    }
+    // fallback (read-only)
+    if (v === null || v === undefined) return `<span class="null-value">(not set)</span>`;
+    return `<input type="text" value="${esc(String(v))}" disabled>`;
+  }
+
+  function renderRow(row, isGated) {
+    const editable = row.editable !== false;
+    const badges = [];
+    if (!editable) {
+      badges.push(`<span class="badge badge-readonly" title="Managed elsewhere (set at install time / by agentctl, or read-only by design) — not editable here">&#128274; read-only</span>`);
+    }
+    if (row.restart_required) {
+      badges.push(`<span class="badge badge-restart" title="Restart needed after this change">&#x27F3; restart needed</span>`);
+    }
+    if (row.uses_legacy_path) {
+      const legPath = esc(row.value_source || '');
+      badges.push(`<span class="badge badge-legacy" title="Currently stored at ${legPath}; will canonicalize on next migration.">&#9888; legacy key</span>`);
+    }
+    const badgeHtml = badges.length ? `<div class="row-badges">${badges.join('')}</div>` : '';
+    const tipHtml = row.tooltip ? `<span class="tooltip-icon" data-tip="${esc(row.tooltip)}">?</span>` : '';
+    const gateRowClass = row.gates_section ? ' gate-row' : '';
+
+    // Soft warning for system-critical fields (tier B + restart_required + editable)
+    const critWarnHtml = (row.tier === 'advanced' && row.restart_required && editable)
+      ? `<div class="warn-critical">&#9888; Calibration-level setting — change with care.</div>`
+      : '';
+
+    // depends_on: hide row if the gate field is currently false
+    // We tag the row with data-depends-on so JS can toggle visibility.
+    const dependsAttr = row.depends_on ? ` data-depends-on="${esc(row.depends_on)}"` : '';
+
+    // Status placeholder for save feedback
+    const statusHtml = editable && row.control !== 'list_display' && row.control !== 'list_edit'
+      && row.control !== 'yellow_domains_edit'
+      ? `<div class="field-status" id="status-${esc(row.key)}"></div>`
+      : '';
+
+    return `<div class="config-row${gateRowClass}" id="row-${esc(row.key)}"${dependsAttr}>
+      <div class="row-label">${esc(row.label)}${tipHtml}</div>
+      <div class="row-control">${renderControl(row)}${badgeHtml}${critWarnHtml}${statusHtml}</div>
+    </div>`;
+  }
+
+  function renderSection(sec) {
+    const gated = sec.section_gate && !sec.gate_open;
+    const bodyClass = gated ? ' section-gated' : '';
+    const gateAttr = sec.section_gate ? ` data-section-gate="${esc(sec.section_gate)}"` : '';
+    const rowsHtml = sec.rows.map(r => renderRow(r, gated)).join('');
+    return `<div class="section-card${bodyClass}" id="sec-${esc(sec.id)}"${gateAttr}>
+      <h3>${esc(sec.label)}</h3>
+      ${rowsHtml}
+    </div>`;
+  }
+
+  // ── Main load ────────────────────────────────────────────────────────────
+  async function loadConfig() {
+    document.getElementById('cfg-loading').style.display = '';
+    document.getElementById('cfg-body').style.display = 'none';
+    document.getElementById('cfg-error').style.display = 'none';
+    try {
+      const res = await fetch(_withAgent('/api/config'));
+      const data = await res.json();
+      document.getElementById('cfg-loading').style.display = 'none';
+
+      if (data.error && !data.annotated) {
+        document.getElementById('cfg-error').textContent = 'Error: ' + data.error;
+        document.getElementById('cfg-error').style.display = '';
+        return;
+      }
+
+      const body = document.getElementById('cfg-body');
+      body.style.display = '';
+
+      if (!data.annotated || !data.annotated.sections) {
+        body.innerHTML = '<p style="color:#888;">No config data available.</p>';
+        return;
+      }
+
+      const sections = data.annotated.sections;
+      const tierA = sections.filter(s => s.tier === 'daily');
+      const tierB = sections.filter(s => s.tier === 'advanced');
+
+      let html = '';
+
+      // Tier A sections
+      tierA.forEach(sec => { html += renderSection(sec); });
+
+      // Tier B — wrapped in advanced expander
+      if (tierB.length > 0) {
+        const advBody = tierB.map(sec => renderSection(sec)).join('');
+        html += `<div class="advanced-expander">
+          <button class="advanced-toggle" id="adv-toggle" onclick="toggleAdvanced()">
+            <span class="arrow">&#9658;</span>
+            Advanced (calibration-aware tuning)
+          </button>
+          <div class="advanced-body" id="adv-body">${advBody}</div>
+        </div>`;
+      }
+
+      body.innerHTML = html;
+
+      // Apply depends_on visibility rules and section-gate greying immediately after render
+      updateGates();
+
+      // Restore advanced expander state from localStorage
+      const advExpanded = localStorage.getItem('engram_config_advanced_expanded') === 'true';
+      if (advExpanded) {
+        const toggle = document.getElementById('adv-toggle');
+        const advBody = document.getElementById('adv-body');
+        if (toggle && advBody) {
+          toggle.classList.add('open');
+          advBody.classList.add('open');
+        }
+      }
+    } catch (e) {
+      document.getElementById('cfg-loading').style.display = 'none';
+      document.getElementById('cfg-error').textContent = 'Failed to load config: ' + e.message;
+      document.getElementById('cfg-error').style.display = '';
+    }
+  }
+
+  function toggleAdvanced() {
+    const toggle = document.getElementById('adv-toggle');
+    const body = document.getElementById('adv-body');
+    if (!toggle || !body) return;
+    const isOpen = toggle.classList.toggle('open');
+    body.classList.toggle('open', isOpen);
+    localStorage.setItem('engram_config_advanced_expanded', isOpen ? 'true' : 'false');
+  }
+
+  // ── depends_on: show/hide rows gated on a boolean field ─────────────────
+  // Called after initial render and whenever a checkbox that gates_section
+  // or is referenced as depends_on changes.
+  function updateDependsOn() {
+    document.querySelectorAll('[data-depends-on]').forEach(rowEl => {
+      const gateKey = rowEl.getAttribute('data-depends-on');
+      const gateInput = document.getElementById('field-' + gateKey);
+      if (!gateInput) return;  // gate field not rendered — leave row as-is
+      const gateValue = gateInput.checked;
+      rowEl.style.display = gateValue ? '' : 'none';
+    });
+  }
+
+  // ── section-gate: grey/ungrey section cards whose gate checkbox toggled ──
+  // Reads the current checked state of each section's gate checkbox and
+  // adds/removes .section-gated on the card live, matching the initial
+  // server-side render (gated when unchecked, normal when checked).
+  function updateSectionGates() {
+    document.querySelectorAll('[data-section-gate]').forEach(cardEl => {
+      const gateKey = cardEl.getAttribute('data-section-gate');
+      const gateInput = document.getElementById('field-' + gateKey);
+      if (!gateInput) return;  // gate field not rendered — leave card as-is
+      if (gateInput.checked) {
+        cardEl.classList.remove('section-gated');
+      } else {
+        cardEl.classList.add('section-gated');
+      }
+    });
+  }
+
+  // Convenience wrapper: call both gate-update passes together.
+  function updateGates() {
+    updateDependsOn();
+    updateSectionGates();
+  }
+
+  // ── Field save ───────────────────────────────────────────────────────────
+  // saveField(key, value) — called directly from checkbox onchange and from
+  // saveFieldFromInput (text/number Save button or Enter press).
+  async function saveField(key, value) {
+    const statusEl = document.getElementById('status-' + key);
+    const btn = document.querySelector(`[onclick="saveFieldFromInput('${key}')"]`);
+    if (statusEl) { statusEl.textContent = 'Saving…'; statusEl.className = 'field-status'; }
+    if (btn) btn.disabled = true;
+
+    try {
+      const res = await fetch(_withAgent('/api/config/' + encodeURIComponent(key)), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value }),
+      });
+      const data = await res.json();
+
+      if (data.ok) {
+        // Update displayed value to validated_value (server may coerce types)
+        const inputEl = document.getElementById('field-' + key);
+        if (inputEl && inputEl.type !== 'checkbox' && data.validated_value !== undefined) {
+          inputEl.value = data.validated_value;
+        }
+        if (statusEl) {
+          statusEl.textContent = 'Saved';
+          statusEl.className = 'field-status ok';
+          setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 3000);
+        }
+        // Show restart banner if required
+        if (data.restart_required) {
+          document.getElementById('restart-banner').style.display = '';
+        }
+        // Update depends_on visibility and section-gate greying in case the saved key is a gate
+        updateGates();
+      } else {
+        const msg = data.error || 'Save failed';
+        if (statusEl) {
+          statusEl.textContent = msg;
+          statusEl.className = 'field-status err';
+        }
+      }
+    } catch (e) {
+      if (statusEl) {
+        statusEl.textContent = 'Network error: ' + e.message;
+        statusEl.className = 'field-status err';
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // Called by text/number Save button (or Enter press) — reads the input value,
+  // coerces numeric fields to Number, then delegates to saveField.
+  function saveFieldFromInput(key) {
+    const inputEl = document.getElementById('field-' + key);
+    if (!inputEl) return;
+    if (inputEl.type === 'number') {
+      const n = Number(inputEl.value);
+      if (Number.isNaN(n)) {
+        const statusEl = document.getElementById('status-' + key);
+        if (statusEl) {
+          statusEl.textContent = 'Invalid number — please enter a numeric value.';
+          statusEl.className = 'field-status err';
+        }
+        return;
+      }
+      saveField(key, n);
+    } else {
+      saveField(key, inputEl.value);
+    }
+  }
+
+  loadConfig();
+  </script>
+<script src="/static/nav.js"></script>
+<!--FOOTER_PLACEHOLDER-->
+</body>
+</html>

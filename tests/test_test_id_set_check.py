@@ -52,6 +52,9 @@ _spec.loader.exec_module(_mod)
 collect_ids = _mod.collect_ids
 parse_removed_test_markers = _mod.parse_removed_test_markers
 find_unparsed_removed_test_lines = _mod.find_unparsed_removed_test_lines
+parse_removed_test_markers_from_diff = _mod.parse_removed_test_markers_from_diff
+find_unparsed_removed_test_lines_from_diff = _mod.find_unparsed_removed_test_lines_from_diff
+read_diff_added_text_by_file = _mod.read_diff_added_text_by_file
 evaluate = _mod.evaluate
 ParseError = _mod.ParseError
 Marker = _mod.Marker
@@ -923,3 +926,513 @@ def test_2381_is_ancestor_returns_none_on_an_invalid_revision(tmp_path: Path) ->
     mode for an advisory-only check than silently returning None."""
     fx = _make_ancestry_fixture(tmp_path)
     assert _is_ancestor(Path(fx["repo"]), "deadbeef" * 5, fx["feature_tip"]) is None
+
+
+# ---------------------------------------------------------------------------
+# #2539 / #2540 -- a legitimate triple-backtick fence around Removed-test
+# markers was silently swallowed by the single-backtick-span strip (the
+# fence's three backticks read as one-and-a-half spans: the first two pair
+# off empty, the third dangles and pairs with the *closing* fence's first
+# backtick, taking everything between the two fences with it). Fixed by
+# `_split_out_fenced_code_blocks` / `_strip_inline_code_preserving_fences`,
+# which leave fenced content untouched before the inline-code strip runs.
+#
+# The fixture below is a reconstruction, not the literal PR #2538 body the
+# issues cite: PR #2538's body was edited (unfenced) by its author shortly
+# after the incident, and the GitHub REST API does not expose prior PR-body
+# revisions, so the exact original text is not recoverable. It reproduces
+# the same SHAPE both issues describe -- a fenced block wrapping several
+# `Removed-test:` lines -- with the same 7-marker COUNT as the real
+# incident (PR #2538's live body still carries exactly 7 unfenced
+# `Removed-test:` lines today, independently re-confirmed), not just a
+# same-shape-smaller-count stand-in. Independently verified against the
+# unpatched (pre-fix) code to reproduce a 7-parsed-as-0 failure with this
+# exact fixture before checking it here on the fix.
+# ---------------------------------------------------------------------------
+
+
+_FENCED_MARKERS_BODY = (
+    "## What\n\n"
+    "Removed 7 stale tests during the cleanup.\n\n"
+    "```\n"
+    "Removed-test: tests/test_mod.py::test_a — superseded by test_b\n"
+    "Removed-test: tests/test_mod.py::test_c — duplicate of test_d\n"
+    "Removed-test: tests/test_mod.py::TestX::test_e — merged into test_f\n"
+    "Removed-test: tests/test_mod.py::TestX::test_g — obsolete fixture\n"
+    "Removed-test: tests/test_other.py::test_h — flaky, replaced\n"
+    "Removed-test: tests/test_other.py::test_i — flaky, replaced\n"
+    "Removed-test: tests/test_other.py::test_j — no longer applicable\n"
+    "```\n\n"
+    "See the PR diff for details.\n"
+)
+
+
+def test_2539_fenced_markers_all_parse():
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    assert [m.id for m in markers] == [
+        "tests/test_mod.py::test_a",
+        "tests/test_mod.py::test_c",
+        "tests/test_mod.py::TestX::test_e",
+        "tests/test_mod.py::TestX::test_g",
+        "tests/test_other.py::test_h",
+        "tests/test_other.py::test_i",
+        "tests/test_other.py::test_j",
+    ]
+
+
+def test_2539_fenced_markers_account_for_real_disappearances():
+    base_ids = {
+        "tests/test_mod.py::test_a",
+        "tests/test_mod.py::test_c",
+        "tests/test_mod.py::TestX::test_e",
+        "tests/test_mod.py::TestX::test_g",
+        "tests/test_other.py::test_h",
+        "tests/test_other.py::test_i",
+        "tests/test_other.py::test_j",
+        "tests/test_mod.py::test_kept",
+    }
+    head_ids = {"tests/test_mod.py::test_kept"}
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    report = evaluate(base_ids, head_ids, markers)
+    assert report.passed, report.unaccounted
+
+
+def test_2539_fenced_markers_leave_no_unparsed_warning():
+    # The #2393 fail-loud warning path must not fire for markers that
+    # parse cleanly from inside a proper fence. Asserting markers are
+    # non-empty in THIS test (not just in the sibling
+    # test_2539_fenced_markers_all_parse) matters: without it, a
+    # regression that re-introduces the fence-swallow bug would ALSO
+    # pass this assertion vacuously -- a fully-swallowed fenced region
+    # removes the "removed-test:" substring along with everything else,
+    # so the per-line scan finds nothing to flag either, for the wrong
+    # reason (reviewer-fairy catch on PR #2628 round 1, confirmed by
+    # mutation-testing against the pre-fix regex).
+    markers = parse_removed_test_markers(_FENCED_MARKERS_BODY)
+    assert len(markers) == 7
+    assert find_unparsed_removed_test_lines(_FENCED_MARKERS_BODY) == []
+
+
+def test_2539_tilde_fence_also_preserved():
+    # A body with NO backtick anywhere (the original shape of this test)
+    # passes under every configuration -- the pre-fix code, the fix, and
+    # the fix with tilde support removed entirely -- because the naive
+    # strip has nothing to swallow regardless of whether the fence is
+    # even recognized (Ariadne's colleague-review catch on PR #2628,
+    # same class as the unterminated-fence fixture's own fix above: a
+    # test needs an UNPAIRED backtick straddling the fence to actually
+    # discriminate). An even count of backticks outside the fence would
+    # also fail to discriminate -- they pair off normally either way --
+    # so this needs an ODD one specifically: `x` (one backtick, unclosed)
+    # supplies it, and the closing `y` afterward is deliberately a
+    # SEPARATE, already-closed span, not part of counting toward that
+    # oddness.
+    body = (
+        "Note `x\n"
+        "~~~\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "~~~\n"
+        "and `y` after.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_language_tagged_fence_also_preserved():
+    body = (
+        "```text\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "```\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_unterminated_fence_extends_to_end_of_body():
+    # CommonMark's own rule: an unclosed fence implicitly closes at the end
+    # of the document. The marker inside must still parse, not be treated
+    # as "outside any fence" (which would re-expose it to the single-
+    # backtick swallow LIMIT below via whatever comes after it, in a real
+    # body that continues past this point).
+    #
+    # The trailing paragraph with a real inline-code span is load-bearing
+    # for this test, not decoration (reviewer-fairy catch on PR #2628
+    # round 1): with nothing after the marker, the dangling opening
+    # backtick has no OTHER backtick anywhere in the document to pair
+    # with, so even the PRE-FIX naive regex leaves the marker alone by
+    # accident -- this test would pass unchanged under the very bug it
+    # claims to guard against. Confirmed by mutation-testing: reverting to
+    # the pre-fix regex, a body ending right after the marker still
+    # parses correctly (false negative), while THIS body (marker,
+    # unterminated fence, then a real single-backtick span afterward)
+    # correctly fails under the pre-fix regex and passes only with the
+    # fix -- proving the EOF-closing rule is what's actually being tested.
+    body = (
+        "```\n"
+        "Removed-test: tests/test_mod.py::test_a — cleanup\n"
+        "\n"
+        "See `option_foo` for details.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2539_stray_backtick_typo_outside_a_fence_still_swallows_by_design():
+    """The fix narrows the LIMIT to non-fenced text; it does not remove it.
+    Identical shape to test_stray_unterminated_backtick_swallows_a_later_
+    marker_by_design above, confirming the fence carve-out did not
+    accidentally make every single backtick fence-like."""
+    base_ids = {"tests/test_mod.py::test_a", "tests/test_mod.py::test_b"}
+    head_ids = {"tests/test_mod.py::test_a"}
+    body = (
+        "See the config option `enable_foo (typo, unclosed)\n"
+        "\n"
+        "Removed-test: tests/test_mod.py::test_b — obsolete after refactor"
+        "\n"
+        "Also see `this real inline code`.\n"
+    )
+    markers = parse_removed_test_markers(body)
+    assert markers == []
+    report = evaluate(base_ids, head_ids, markers)
+    assert not report.passed
+    assert report.unaccounted == ("tests/test_mod.py::test_b",)
+
+
+# ---------------------------------------------------------------------------
+# #2568 -- accept Removed-test markers from the diff (added lines), not only
+# the PR body. Hit live on #2564: three well-formed markers written as
+# comments beside the actual removal, in the diff, were invisible to a
+# body-only parser -- CI failed with no real defect.
+# ---------------------------------------------------------------------------
+
+
+def _make_diff_marker_fixture(tmp_path: Path, *, marker_comment: str, marker_file: str = "tests/test_mod.py") -> dict[str, str]:
+    """A real repo: base has test_a and test_b in tests/test_mod.py; head
+    deletes both and adds `marker_comment` (a caller-supplied line, so
+    different tests can exercise different comment-prefix shapes) into
+    `marker_file` -- by default the SAME file the tests were deleted from,
+    matching the issue's own motivating shape ("next to the removal")."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_mod.py").write_text(
+        "def test_a():\n    assert True\n\n\ndef test_b():\n    assert True\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (tests_dir / "test_mod.py").write_text("")
+    target = repo / marker_file
+    target.parent.mkdir(parents=True, exist_ok=True)
+    existing = target.read_text() if target.exists() else ""
+    target.write_text(existing + marker_comment)
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return {"repo": str(repo), "base": base, "head": head}
+
+
+def test_2568_hash_comment_marker_in_diff_accounts_for_disappearance(tmp_path: Path):
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="# Removed-test: tests/test_mod.py::test_a — superseded by test_c\n",
+    )
+    markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2568_slash_comment_marker_in_diff_accounts_for_disappearance(tmp_path: Path):
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="// Removed-test: tests/test_mod.py::test_b — duplicate of test_d\n",
+    )
+    markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_b"]
+
+
+def test_2568_html_comment_marker_in_diff_accounts_for_disappearance(tmp_path: Path):
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="<!-- Removed-test: tests/test_mod.py::test_a — cleanup -->\n",
+    )
+    markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2568_diff_marker_documented_in_a_different_file_still_counts(tmp_path: Path):
+    # The issue's own case: the marker sits next to the removal, but nothing
+    # requires it be in the SAME file as the deleted test -- no path
+    # restriction, matching the PR-body path's own lack of restriction.
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="# Removed-test: tests/test_mod.py::test_a — superseded\n",
+        marker_file="CHANGELOG.md",
+    )
+    markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"]
+
+
+def test_2568_end_to_end_via_main_diff_marker_alone_accounts_for_both_disappearances(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment=(
+            "# Removed-test: tests/test_mod.py::test_a — superseded by test_c\n"
+            "# Removed-test: tests/test_mod.py::test_b — duplicate of test_d\n"
+        ),
+    )
+    exit_code = main(["--base", fx["base"], "--head", fx["head"], "--repo-root", fx["repo"]])
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.out
+    assert "PASS" in captured.out
+
+
+def test_2568_body_and_diff_markers_are_unioned_end_to_end(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    # test_a accounted for in the PR body; test_b accounted for in the diff.
+    # Neither surface alone covers both disappearances.
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="# Removed-test: tests/test_mod.py::test_b — duplicate of test_d\n",
+    )
+    pr_body_file = tmp_path / "pr_body.txt"
+    pr_body_file.write_text("Removed-test: tests/test_mod.py::test_a — superseded by test_c\n")
+    exit_code = main([
+        "--base", fx["base"], "--head", fx["head"], "--repo-root", fx["repo"],
+        "--pr-body-file", str(pr_body_file),
+    ])
+    captured = capsys.readouterr()
+    assert exit_code == 0, captured.out
+    assert "PASS" in captured.out
+
+
+def test_2568_diff_only_marker_without_pr_body_leaves_the_other_id_unaccounted(tmp_path: Path):
+    # Sanity control for the union test above: the diff marker alone does
+    # NOT also account for test_a -- proves the PASS above genuinely needs
+    # both surfaces, not just one of them plus some other leniency.
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="# Removed-test: tests/test_mod.py::test_b — duplicate of test_d\n",
+    )
+    exit_code = main(["--base", fx["base"], "--head", fx["head"], "--repo-root", fx["repo"]])
+    assert exit_code == 1
+
+
+def test_2568_stale_diff_marker_warns_not_fails(tmp_path: Path):
+    # A marker in the diff naming an id that did NOT disappear -- same
+    # stale-marker warning treatment as a PR-body marker, per the issue's
+    # explicit "identically" requirement.
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment="# Removed-test: tests/test_mod.py::test_never_existed — n/a\n",
+    )
+    base_ids = {"tests/test_mod.py::test_a", "tests/test_mod.py::test_b"}
+    head_ids: set[str] = set()
+    markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    report = evaluate(base_ids, head_ids, markers)
+    assert not report.passed  # test_a and test_b are genuinely unaccounted
+    assert any("test_never_existed" in w and "stale marker" in w for w in report.warnings)
+
+
+def test_2568_malformed_diff_marker_line_is_flagged_not_silently_dropped(tmp_path: Path):
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        # missing the em-dash/hyphen separator + reason -- malformed
+        marker_comment="# Removed-test: tests/test_mod.py::test_a\n",
+    )
+    unparsed = find_unparsed_removed_test_lines_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert len(unparsed) == 1
+    assert "test_a" in unparsed[0]
+
+
+def test_2568_diff_and_body_backtick_swallow_failures_are_isolated(tmp_path: Path):
+    """The architectural invariant the docstrings describe: the PR body and
+    the diff are parsed as SEPARATE text blobs, never concatenated -- an
+    unmatched backtick in one must never be able to swallow a marker that
+    lives in the other. Constructs the failure this test guards against by
+    literally concatenating the two blobs and running them through the SAME
+    parser used elsewhere, confirming THAT (wrong) way loses the diff's
+    marker, then confirms the actual (independent-parse) implementation
+    does not.
+
+    Colleague catch (@ariadne-calvino, #2632): the original version of this
+    test asserted `body_markers == []` on a PR body whose stray backtick
+    had nothing to pair with in the body alone -- true, but it meant the
+    fixture never constructed a backtick pair that actually STRADDLES the
+    body/diff boundary, so the test could not fail regardless of whether
+    the isolation held. Verified with a decoy: mutating main() to
+    concatenate body+diff before parsing left this test's assertions
+    unchanged (still green) -- proof the old fixture never touched the
+    danger zone it claimed to guard. Fixed per her exact prescription: the
+    diff's added text now carries a SECOND backtick after the marker, so
+    the body's unmatched backtick has something to pair with once
+    concatenated, and the resulting swallow is asserted directly against
+    the real parser rather than assumed."""
+    fx = _make_diff_marker_fixture(
+        tmp_path,
+        marker_comment=(
+            "# Removed-test: tests/test_mod.py::test_b — duplicate of test_d\n"
+            "second tick here `\n"
+        ),
+    )
+    pr_body_file = tmp_path / "pr_body.txt"
+    # An unmatched backtick in the PR body, of the kind the existing
+    # single-backtick LIMIT already documents.
+    pr_body_file.write_text("See the config option `enable_foo (typo, unclosed)\n")
+    pr_body = pr_body_file.read_text()
+
+    # The ACTUAL (independent-parse) implementation: each surface parses on
+    # its own, so the body's stray backtick has nothing in the diff to pair
+    # with, and vice versa -- the marker survives.
+    diff_markers = parse_removed_test_markers_from_diff(Path(fx["repo"]), fx["base"], fx["head"])
+    assert [m.id for m in diff_markers] == ["tests/test_mod.py::test_b"]
+
+    body_markers = parse_removed_test_markers(pr_body)
+    assert body_markers == []  # the body's own stray backtick has no marker to swallow here
+
+    # End to end via main(): PASS requires ONLY the diff marker (test_a is
+    # NOT deleted in this fixture variant -- reuse the union-control shape
+    # by checking test_b alone is fully accounted for despite the body's
+    # unrelated backtick typo).
+    base_ids = {"tests/test_mod.py::test_b"}
+    head_ids: set[str] = set()
+    report = evaluate(base_ids, head_ids, diff_markers + body_markers)
+    assert report.passed, report.unaccounted
+
+    # The WRONG way, constructed directly rather than merely described:
+    # concatenate the PR body and the diff's own added text into one blob
+    # and run THAT through the real PR-body parser. The body's unmatched
+    # backtick now has a second backtick to pair with -- the diff's own
+    # "second tick here `" line -- and the naive strip swallows everything
+    # between the two, including the marker.
+    diff_added_text = "\n".join(
+        read_diff_added_text_by_file(Path(fx["repo"]), fx["base"], fx["head"])
+    )
+    concatenated_markers = parse_removed_test_markers(pr_body + "\n" + diff_added_text)
+    assert concatenated_markers == [], (
+        "the WRONG (concatenated) path was expected to lose the marker -- "
+        "if it didn't, this fixture no longer straddles the boundary it "
+        "claims to guard, and the isolation this test names as load-bearing "
+        "is untested again"
+    )
+
+
+def test_2568_cross_file_backtick_swallow_failures_are_isolated_within_diff(tmp_path: Path):
+    """#2632 review catch: the isolation test above guards the body-vs-diff
+    boundary; this guards the boundary WITHIN the diff itself, across
+    files. A stray backtick added in one file must not swallow a marker
+    added in an unrelated file elsewhere in the SAME diff. Constructed so
+    an unmatched backtick opens in a_file.txt and (in file-path order)
+    closes in c_file.txt, with b_file.md's well-formed marker sitting
+    between them -- under a flat whole-diff-blob implementation this
+    swallows b_file.md's marker entirely; scoping the backtick-strip pass
+    per file (this fix) keeps it out of reach."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_mod.py").write_text("def test_a():\n    assert True\n")
+    (repo / "a_file.txt").write_text("")
+    (repo / "b_file.md").write_text("")
+    (repo / "c_file.txt").write_text("")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (repo / "tests" / "test_mod.py").write_text("")
+    (repo / "a_file.txt").write_text("See `enable_foo (typo, unclosed)\n")
+    (repo / "b_file.md").write_text(
+        "# Removed-test: tests/test_mod.py::test_a — superseded\n"
+    )
+    (repo / "c_file.txt").write_text("closing tick here `\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    markers = parse_removed_test_markers_from_diff(Path(repo), base, head)
+    assert [m.id for m in markers] == ["tests/test_mod.py::test_a"], (
+        "a stray backtick in one file swallowed a marker in another file "
+        "of the same diff -- backtick pairing must be scoped per file, "
+        "not to the whole diff blob"
+    )
+
+
+def test_2568_added_line_shaped_like_diff_header_is_not_dropped(tmp_path: Path):
+    """#2632 review catch: git prefixes every added line with its own `+`,
+    so a genuine added line whose own content starts with `++` (e.g. a
+    C-style pre-increment statement) becomes `+++...` in the raw diff --
+    shape-identical to a `+++ b/path` file header. The header skip must
+    be POSITIONAL (only immediately after a `--- ` line, the only place
+    git ever emits one), not shape-based, or such a line is silently
+    dropped with no warning at all. Demonstrated live on #2632's own
+    review via this exact repro."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "counter.c").write_text("int x = 0;\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (repo / "counter.c").write_text(
+        "int x = 0;\n++x; // Removed-test: tests/test_mod.py::test_a — bogus\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    file_blobs = read_diff_added_text_by_file(Path(repo), base, head)
+    assert any("++x;" in blob for blob in file_blobs), (
+        "an added line shaped like '+++...' (git's own '+' prefix plus a "
+        "genuine '++x' content prefix) was mistaken for a diff header "
+        "and silently dropped"
+    )
+
+
+def test_2568_removed_line_shaped_like_dashes_header_is_not_dropped(tmp_path: Path):
+    """#2632 round-2 review catch: a narrower positional check (skip '+++'
+    only when it immediately follows a '--- ' line) still collides, one
+    level down. A REMOVED line whose own content starts with '-- ' (e.g. a
+    Lua/SQL-style comment) becomes, after git's own single '-' prefix, a
+    line that ALSO starts with '--- ' -- shape-identical to a real
+    '--- a/path' header. If the very next line in the same one-line-replace
+    hunk is a genuine '++'-prefixed addition, a positional check keyed off
+    'did the previous line look like a header' misreads the pair as the
+    file's real header pair and drops the addition. Anchoring on 'has this
+    file's first hunk marker been seen yet' has no such collision."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+    (repo / "counter.sql").write_text("-- comment to remove\nint x = 0;\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (repo / "counter.sql").write_text(
+        "++x; // Removed-test: tests/test_mod.py::test_a — bogus\nint x = 0;\n"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    file_blobs = read_diff_added_text_by_file(Path(repo), base, head)
+    assert any("++x;" in blob for blob in file_blobs), (
+        "a removed line shaped like '--- ...' (git's own '-' prefix plus a "
+        "genuine '-- ' content prefix) made the following added '++'-shaped "
+        "line be mistaken for a diff header pair and silently dropped"
+    )

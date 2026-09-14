@@ -79,19 +79,23 @@ template.
    trust-tier MCP tools **and** the `engram-trust-tier` skill are all T1: a safety
    tool used without its discipline is worse than not having it.)
 
-2. **Every shippable is tagged exactly once in the manifest.** The tier map *will
-   be* the single source of truth at `src/build/packaging/tiers.json`; `build-plugin.sh
-   --tier` *will* filter through it at **build time** (the
+2. **Every shippable is tagged exactly once in the manifest.** The tier map **is**
+   the single source of truth at `src/build/packaging/tiers.json`, and
+   `build-plugin.sh --tier` filters through it at **build time** (the
    agent-led install reads the README, prompts the user for tier + multi-agent, and
-   builds accordingly — no post-install pruning). **CI must fail the build if any
+   builds accordingly — no post-install pruning). **CI fails the build if any
    shippable path is untiered or any manifest entry is dangling** — so "added a
    skill, forgot to tier it" cannot drift past review. This is a mechanical gate,
    not vigilance.
 
-*(The `src/build/packaging/tiers.json` manifest + the CI tag-once test land with the tiering
-rollout. Until they do, the tier of any new artifact is still a required design
-decision — record it in the audit so the manifest is a transcription, not a
-re-derivation.)*
+*(All three parts are LIVE, so tiering is enforced rather than aspirational: the
+manifest exists; `src/build/engine/build.py` and `cli.py` resolve it at build
+time, and the CLI's own help calls it "the single source of truth"; and
+`pr-checks.yml` runs the `manifest-gate` step on every PR. Behavioural
+confirmation, not a code-read: on 2026-09-04 that gate blocked a PR for a new
+module its author had not tiered. So the tier of a new artifact is not merely a
+design decision to record for later transcription — **add the entry in the same
+PR that adds the artifact, or CI will stop you.**)*
 
 ## Plugin build restructures code paths — never rely on the `src/` layout
 
@@ -186,6 +190,20 @@ verify-the-live-artifact method — lives in
 [`docs/claude-code-plugin-system.md`](docs/claude-code-plugin-system.md) (read
 on-demand; not loaded every session). This behavior is **undocumented upstream** —
 re-verify after any Claude Code version bump.*
+
+## Hook injection budget — every `additionalContext` block must be bounded
+
+Lei's ruling (2026-09-12, engram-alpha#2863): every hook's `additionalContext`
+must be (1) **bounded** under a named per-harness budget, (2) **never load
+content of unpredictable size**, and (3) **carry its highest-value summary in
+the first ~2,000 characters** — the harness silently truncates the TAIL of an
+oversized injection, and different harnesses (Codex, DeepSeek) have different
+ceilings. Mechanism: `_hooklib.emit_context()` (the one shared bounded
+renderer — trailer leads, never exceeds the hard per-harness `budget`) plus
+`_harness.py` (`get_harness_budgets()`, the per-harness numbers table —
+unmeasured harnesses get an explicitly-named conservative floor, never
+claude-code's numbers). New hooks route `additionalContext` through
+`emit_context()` rather than hand-rolling a bare join/f-string block.
 
 ## PR merge authority — the substrate-feature gate
 
@@ -322,9 +340,16 @@ reviewer-fairy.
 The **"colleague converged"** gate is two layers, both required before a PR
 enters the maintainer's merge queue:
 
-1. **Reviewer-fairy** (`engram-pr-reviewer`) on every push, iterate to
-   convergence — catches mechanical / contract / scope issues. (Applies in
-   single-agent mode too.)
+1. **Reviewer-fairy** (`engram-pr-reviewer`) — iterate to convergence (APPROVE)
+   *before the PR goes to the peer* — catches mechanical / contract / scope
+   issues. (Applies in single-agent mode too.) **This is the author's own
+   pre-peer self-check, not a re-run gate on every later push** (Lei,
+   2026-09-13 20:54 EDT, in-session, verbatim: "before going out for peer
+   review, the fairy review is like 'double checking it on your own' ... no
+   more fairy review is mandatory ANYMORE" once the PR has reached the peer).
+   No fairy delta round, and no patch-identity argument that a later diff is
+   "equivalent" to what the fairy approved, substitutes for the merge gate
+   below.
 2. **Counterpart-agent colleague fresh-eye** — after the fairy converges, the
    author sends the counterpart a letter (via `ia write`, the inter-agent
    letter CLI) requesting review and iterates on their findings. The
@@ -337,10 +362,191 @@ enters the maintainer's merge queue:
    colleague review to a fairy has skipped the colleague layer (the user flagged
    this directly, after the colleague-fairy-delegation lapse incident).
 
+**The merge gate itself**, operationalizing Lei's same ruling: a non-author
+peer APPROVE whose commit **is** the PR's current `headRefOid`, plus CI green
+on that same head. A new commit after approval needs a **fresh** peer review
+and approval — the peer simply looks again (the `dev` ruleset already
+enforces this mechanically: dismiss-on-push + last-push approval) — never a
+fairy re-check or a diff-equivalence argument standing in for it. The merge
+seat still compares the approval's commit to the head directly rather than
+trusting `reviewDecision` alone: a manual force-push on this repo has been
+seen to keep a stale approval alive on a *different* PR (#2338, a manual
+force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
+for the measurement).
+
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 (merge)**. Symmetric — each agent reviews the other's PRs and has its own
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
+
+### Which colleague takes the seat
+
+**If you are the detailed designer or builder of the PR, you are excused from its
+peer-reviewer seat** (Lei, 2026-09-09). Nothing weaker disqualifies you — a
+contribution in an *earlier session* does not.
+
+| Team | Review each other's PRs | If the pair collaborated on this PR |
+|---|---|---|
+| Borges + Luria | each other | **Sol**, else Clio |
+| Ariadne + Sol | each other | **Clio**, else Luria |
+| Aleph + Clio | each other | **Luria**, else Sol |
+
+Escape seats rotate `Luria → Sol → Clio →`; each team asks the next two, skipping
+its own. Ask at PR-open time: **was I in the session where this solution was
+formed?**
+
+- **"Not available" = the seat did not answer.** Send the ask; it *is* the probe.
+  Do not check a presence board: `forum online` tracks *prompts processed*, not
+  liveness (`engram-alpha src/forum/db.py:735`; the inbox endpoint upserts per
+  prompt, `src/forum/server.py:900`). A seat that has **never published a
+  cadence** falls back to a global 15-minute window and can read offline while
+  fully available — our heartbeat floor is 30 minutes and idles to 55 (a team
+  convention, not a code fact). A seat that HAS published one is judged against
+  its own rhythm, and an on-call seat stays listed while wakeable (#1035) — so
+  the board is not uniformly wrong, it is *unevenly* right, which is worse to
+  rely on. No answer within one idle cadence plus a turn (~90 min today) → next
+  seat.
+- **If all three escape seats are silent: try `zephyr`, then `mira`, and stop
+  there.** The list is deliberately two names long. Every escape seat is a
+  builder seat across two Anthropic accounts, so "all three silent" correlates
+  with a platform-level problem that would have taken your own seat down too —
+  a longer roster buys almost nothing and costs upkeep it will not get. **Do not
+  extend it** (Lei, 2026-09-09).
+- **A PR routed to an escape seat names its design posts** — that seat lacks the
+  context the pair shared, so the author supplies it.
+
+**Why.** A designer-builder pair can share a blind spot formed *between them,
+in-session*; a third seat reconsiders it cold. Nothing weaker disqualifies a
+reviewer because sessions reset, and recalled background does not constrain a mind
+the way in-session deliberation does — so contamination is **session-scoped, not
+history-scoped**. Do not "improve" this by tracking that mechanism more closely: a
+compaction is a partial reset *inside* a session, so the role check is the clean
+half and the mechanism is the fuzzy one.
+
+**The lineage asymmetry is deliberate.** All three escape seats are builder seats,
+so they carry their own pair review plus all escape review. That is the design, not
+an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
+(Lei, 2026-09-09).
+
+This names *which* seat; it does not add one.
+
+> **Duplicated by hand in engram-alpha and umwelt `CLAUDE.md`** — change one,
+> change both in the same pass. **Soma does not carry this block, and the reason
+> first shipped here was FALSE — do not restore it.** It said soma's cohort
+> excludes Sol so the rotation cannot resolve there; that was read off a stale
+> cohort line in soma's own `CLAUDE.md` and reported as a fact about reality.
+> Measured 2026-09-09 against soma's PR history and collaborator list instead:
+> Sol has authored soma PRs (#52, #54), and **all three escape seats hold push
+> access there**, as do both terminal-fallback seats. The rotation resolves in
+> soma fine. Whether soma adopts the block is a routing choice for Lei and
+> soma's principal — never a structural blocker.
+
+### Conclusion warrant — the gate lives in the fairy's output contract, not here
+
+Neither review layer was named **"is this claim true."** The fairy round checks
+mechanics; the colleague round checks pattern-level and cross-issue concerns.
+Both are good at their jobs, and a PR could pass both carrying a wrong number, a
+wrong mechanism, or a wrong cause — because being wrong about a *fact* was
+nobody's assigned box. Adopted fleet-wide 2026-09-03 (forum #385: Kepler's
+ruling, with Clio, Sol, Luria, Aleph and Borges converging; nobody produced a
+friction-and-caught-nothing case).
+
+**Read this section as documentation of a gate that lives somewhere else.** The
+gate is the required `## 🔵 Conclusion warrant` section in
+`engram-pr-reviewer.md`'s output contract — emitted, or *visibly absent*. That
+placement is the load-bearing part, not a formatting choice: a line of prose
+saying "verify your claims first" is a **preventive** remedy, and preventive
+remedies are walk-past-able. **No preventive-remedy instance this fleet examined
+produced a prevention** — including a warning one of us authored the previous day,
+fired at PreToolUse, with a written pre-commitment to heed it, read past while
+committing the exact error it named. **Uncounted denominator**: those cases were
+collected as they turned up rather than sampled, and the two candidate positives
+that were confounded and left unscored are *additive* remedies, not preventive
+ones — so no unscored case sits inside the claim above, and the claim is not a
+ratio and must not be quoted as one.
+A required output section is **additive**: its omission is a fact someone else can
+see. The copies of this section in the three
+`CLAUDE.md` files document the gate for the human-agent colleague pass; they are
+not the gate.
+
+**The box, in this order.** Line 1 is the floor because it is the only line
+needing no judgement about what "load-bearing" means, and judgement steps are
+exactly the ones that go quietly unexecuted under time pressure:
+
+1. **Re-measure the numbers from your own clone or your own API call** — never
+   from the PR's prose — and for each, **state what it ranges over and whether
+   that population is the claim's subject.** Unconditionally: a true measurement
+   of a *neighbouring* population agrees with itself, so the scope check in
+   line 2 — which fires only on a disagreement — is silent exactly there.
+2. **If your re-measure DISAGREES with the PR's number, check your own
+   instrument's scope before you write the finding.** A different answer is
+   evidence about two things, and yours is the cheaper to rule out. The direction
+   is predictable and it is the dangerous one: re-measuring yourself, a
+   manufactured null reads as reassurance and you stop; re-measuring *someone
+   else*, it reads as a finding and you publish.
+3. **For each load-bearing claim: what observable would DIFFER if it were false,
+   and did anyone check that?** The valuable question and the hard one —
+   escalation when line 1 is clean and the claim still feels shaky.
+4. **Does each claim sentence, as written, stay inside the bound stated next to
+   it?** Read claim and bound *adjacently*, not in sequence. A caveat can be
+   stated correctly and violated four lines away, in the same document, by the
+   author who wrote it.
+5. **For each "checked to fail" / mutation / control claim in the PR: did the
+   same mutation also redden tests the PR did NOT add, and did it mutate
+   toward the OLD code or toward a plausible-WRONG implementation?** A control
+   that has only ever been observed to fail is not yet a control — the
+   discriminating case is the one where a neighbouring test stays green while
+   the new one goes red, or where the failure comes from a plausible-wrong
+   implementation rather than from the pre-fix code itself.
+
+**And a wording rule for review requests, which is not part of the box.** State
+the claim, **not the method** — and where an instrument's output depends on who
+runs it, say which account and which file it read. Naming your method converts a
+second reader into a second copy: two seats independently ran the same
+`def`-signature grep and established the signatures were unmodified while the
+claim was about the *bodies*, because the request named the method and the second
+check inherited its blind spot. Two seats running one instrument are two checks
+only when the scope differs, and neither party can see that until they disagree.
+
+**Required-but-often-brief, never judgement-gated.** Most PRs carry few
+load-bearing factual claims, so most of the time the box is short — but "fill it
+in when the PR seems claim-heavy" reproduces the exact defect this section
+exists to fix: a condition has no firing moment, and nobody watches for it.
+
+**A quiet week is not confirmation.** A preventive gate's successes are invisible
+by construction, so the falsifier can fire and the corresponding confirmation
+cannot. Read the falsifier log —
+engram-alpha's `docs/conclusion-warrant-falsifier-log.md`
+— not the silence. The log deliberately **does not start clean**: its first
+entry is a case where the box would have been filled in honestly — every claim
+enumerated, the unmeasured half named explicitly — and the claim sentence two
+paragraphs earlier still overstated it. That case is what line 4 exists for.
+The log has no denominator and can never confirm — it records cases, and its
+header says why.
+
+**Diagnostic aid, offered with its bounds.** Verification failures sort roughly
+into wrong **SET** (right axis, too few members), wrong **OBJECT** (right
+question, wrong artifact), and wrong **AXIS** (right artifact, wrong dimension
+entirely). **AXIS is the load-bearing member** — it is the one that survives
+careful work, because collapsing it into "be more thorough" produces a more
+exhaustive count of the wrong dimension, which is indistinguishable from rigour
+from the inside. It is also the member with the least support. SET and OBJECT
+already have action-time tripwires and stay with them. **This carving is n=4, one
+agent, one day, and one agent's own carving — not a measured clustering.** Use it
+to name AXIS out loud; do not cite it as a taxonomy.
+
+*(Author-side counterpart, already minted separately and deliberately not
+restated here: an error site the author can NAME in writing is the author's own
+to verify before the PR ships, never a review ask. Cite that node; don't copy it,
+or the two prose copies drift.)*
+
+> **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`**, with no
+> generator or test binding the copies. The RULE portion above is byte-identical
+> across all three by construction, and was verified so across the three sibling
+> PRs before merge. Change one, change all three in the same pass. Note what is
+> NOT duplicated: the gate itself lives in exactly one place
+> (`engram-pr-reviewer.md`'s output contract), so these three copies are
+> documentation of one mechanism, never three copies of it.
 
 ### The order is a rule, not a diagram — no parallelizing fairy and colleague
 
@@ -397,13 +603,17 @@ rounds (on this PR and its umwelt twin) caught that mischaracterization before
 it shipped, which is its own small demonstration of the rule this section is
 arguing for.
 
-**Mechanical check at the merge seat.** Before merging, confirm a reviewer-fairy
-round *exists and converged on the tip being merged* by reading the PR's own
-review/comment record directly (`gh pr view <N> --comments`, or the REST
-fallback documented below if that command's `gh` version is affected) — **never
-infer it from a colleague approval being present.** A colleague approval is
-evidence the colleague pass happened; it is not evidence the fairy pass
-happened first, or at all.
+**Mechanical check at the merge seat.** Before merging, confirm two separate
+things. (1) A reviewer-fairy round *exists and reached APPROVE before the PR
+was sent to the peer* (per "The colleague converged gate" above — the fairy
+round need not match the tip being merged; a later commit folding peer
+feedback does not un-converge it) by reading the PR's own review/comment
+record directly (`gh pr view <N> --comments`, or the REST fallback documented
+below if that command's `gh` version is affected) — **never infer it from a
+colleague approval being present.** A colleague approval is evidence the
+colleague pass happened; it is not evidence the fairy pass happened first, or
+at all. (2) The actual merge gate — a non-author peer APPROVE whose commit
+**is** the current `headRefOid`, plus CI green on that head.
 
 **Check both surfaces, not just the one that's easiest to query.** Fairy
 rounds in this repo post as **comments**, not formal GitHub reviews — checking
@@ -419,6 +629,56 @@ shortcut that only sees formal review state.
 Cheap to check, and the check is the whole point: it
 replaces inferring readiness from the *shape* of the review record with
 actually reading it.
+
+**The hazard is BIDIRECTIONAL, and the paragraph above names only one half.** A
+round transcribed by a colleague into a **review body** is invisible to a scan of
+`issues/<N>/comments`, exactly as a round posted as a comment is invisible to
+`pulls/<N>/reviews`. Whichever single endpoint a hand-rolled fallback hits, it is
+blind in the other direction — so hit both, or use the one command that merges
+them.
+
+**And read them IN FULL — a CAPPED read of the RIGHT surface fails exactly like
+querying the wrong one.** This is the harder half, because it survives doing
+everything above correctly. Measured 2026-09-06 on engram-alpha#2656: the merge
+seat queried both surfaces and printed each review body **cut at 700
+characters**; the transcribed round sat at char 2152 of a 6414-char review, and
+the PR was twice reported as having no fairy round. Nothing was missing and no
+pattern was too narrow — the slice did not reach it.
+
+```
+wrong surface            -> hit BOTH endpoints (you cannot know which holds it)
+pattern too narrow       -> widen the pattern
+TRUNCATED right surface  -> NEITHER helps; only a full read does
+```
+
+**THE RULE.** Before you cap a read, ask: **could an item past my cut change this
+answer?** If yes, do not cap — no `head`, no `tail`, no character limit, no
+`--json` projection that drops the body.
+
+That question is the whole of it, and the property behind it is **monotonicity**:
+a capped read settles a question only when the slice is known — independently of
+the read — to hold everything the answer depends on. Finding your evidence
+*inside* the slice is the usual way to know that: a positive existential,
+answered YES. *Plainly: finding something proves it exists; not finding it, or
+needing to know what is LATEST, does not.* **If you cannot name how you know
+the slice suffices, you do not know it.**
+
+Two traps inside "conclusive", both of which have bitten:
+
+- **A bare keyword hit is not conclusive.** A cap landing mid-sentence, right
+  after `Blocker: X is broken` and before `— false alarm, retracting`, is a true
+  positive of the *literal string* and a false answer about the *claim*. A match
+  counts only once you have read to the end of its own clause.
+- **Absence is not the only fatal shape.** **Recency** ("is the current verdict
+  APPROVE?" — the resolving comment sits past the cap, so a stale blocker reads
+  as the live state), **counts and thresholds**, and **latest-state** questions
+  all fail the same way, because the truncated output and the true-negative
+  output are identical.
+
+*Two earlier drafts of this rule were false and both were caught before merge: it
+first claimed the safe case was "any question other than is-it-absent", then that
+a positive existential was the only safe case. Recorded because each wrong
+version was the kind a reader would have acted on.*
 
 ### Stacked PRs (`gh-stack`) — the merge verb changes, and nothing in training knows it
 
@@ -442,10 +702,35 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   PR, which starts with no review record of its own. So on finding an
   auto-closed child: RESTORE THE BASE REF BEFORE YOU REBASE ANYTHING —
   rebasing is the reflex when a stacked PR breaks, and here it is the one
-  move that forecloses recovery. Verify membership server-side (the REST
-  `stack` field on the PR, or the merge refusal itself): linking existing
-  PRs registers on GitHub, and a local `gh stack view` from the very same
-  branch can still claim "not part of a stack" (measured 2026-08-30).
+  move that forecloses recovery. Verify membership server-side — and treat
+  the answer as **a timestamped snapshot, never a standing fact**, because
+  stack membership is live state another seat can change mid-operation.
+  Measured 2026-09-13 on alpha #2888/#2889, read off each PR's own events
+  API: `added_to_stack` 13:50:50Z, `removed_from_stack` 13:55:25Z,
+  `added_to_stack` 14:25:03Z — three explicit mutations by one seat during
+  a restructure. A `stack: null` read inside that middle window was
+  **correct**, and the `gh pr merge` refusal minutes later was **also
+  correct**; the state simply moved. (The events establish that explicit
+  mutations bracket the null window; that no lag ALSO occurred rests on
+  the timing of one seat's own unlogged reads, so do not quote this as
+  proof the field never lags — the rule below holds either way.)
+  Two seats read that `null` and both concluded settled non-membership,
+  one building a `--delete-branch` orphaning hazard on it. So the rule is
+  not "distrust the field" — it is **never carry a membership read across
+  an interval in which another seat may act.** The merge attempt is
+  authoritative because it is evaluated at the moment of the merge rather
+  than at the moment you looked. It costs nothing when wrong **in one
+  direction only** — believing a member is not one earns a refusal. The
+  other direction is not free: believing a NON-member has no dependents
+  and merging it with `--delete-branch` orphans whatever was based on that
+  branch, which is the origin incident above. So never pair
+  `--delete-branch` with a membership read you have not just re-taken. **Read the field AND the PR's own events API
+  (`added_to_stack` / `removed_from_stack`) immediately before merging** —
+  that pair is what separates "my read went stale" from "the object
+  moved", and the events log is the only one of the two that can tell you
+  which. A local `gh stack view` from the very same
+  branch can separately claim "not part of a stack" while the PR is one
+  (measured 2026-08-30) — a different defect, in the client.
   *(Origin: alpha #2429/#2432, 2026-08-30 — an approved child closed by
   its parent's `--delete-branch` merge, on a seat that had measured this
   section's facts the day before; the rule exists because knowing the
@@ -460,6 +745,27 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   force-push is attributed to the merger. Expect it, and **verify with
   `git range-diff`/patch-id rather than assuming** it happened or that it
   changed nothing.
+- **`range-diff`/patch-id is NECESSARY BUT NOT SUFFICIENT — it answers "did
+  the patch change?", never "does the result still work?"** A rebase can be
+  conflict-free and still produce broken code, because the patch is intact
+  while the BASE UNDER IT moved. Measured 2026-08-31 on the engram-alpha
+  #1991 health-score stack: PR2 removed `import json` as dead code — correct
+  within PR2's own scope — while PR3 added a `json.loads()` caller elsewhere
+  in the same file. No textual overlap, so git rebased cleanly; the result
+  imports fine, `py_compile`s fine, and raises `NameError: name 'json' is
+  not defined` the moment the new function is called. **Note what range-diff
+  actually did here: it worked.** It correctly reported PR3's commits as
+  content-changed, as expected for commits rebased onto a different PR2 tip.
+  The defect was never in its output — it was in treating a diff-level check
+  as an answer to a question about the RESULTING TREE. Nothing that compares
+  patches can see a semantic conflict, because there is no conflict in the
+  patches. **The check has to read the RESULTING TREE, and running the tests
+  on each rebased tip is the general form of that** — general because a
+  narrower static pass catches only the subset it models (an undefined name
+  here; nothing about behaviour), while `py_compile` catches neither, since
+  Python resolves globals at call time. Origin: engram-alpha `cbda7d55`,
+  found by Luria running the full suite post-rebase instead of trusting a
+  clean rebase.
 - **Cascading rebase of un-merged layers**: `gh stack sync` / `gh stack
   rebase`. Machine-readable status: `gh stack view --json`. Stacks are
   API-readable (REST `stack`, GraphQL `PullRequestStack`) but not
@@ -470,17 +776,129 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   auto-rebase being attributed to the merger). **On this repo it is `true`
   on `dev`, where stacks live, and `false` on `main`** (measured
   2026-08-30 — the two protected branches are configured oppositely). And
-  `dismiss_stale_reviews_on_push: true` on `dev` means a content-changing
-  push **dismisses** the existing approval — it is gone, not merely
-  un-renewable by the pusher; whether GitHub's patch-id-identical
-  auto-rebase migrates or dismisses it is unmeasured, so read the approval
-  back after every layer rather than assuming.
+  `dismiss_stale_reviews_on_push: true` on `dev` is meant to make a
+  content-changing push dismiss the existing approval outright, not merely
+  leave it un-renewable by the pusher — that is the distinction the setting
+  exists to draw, not a guarantee for every push: #2338 below is a
+  content-changing push on this same `dev` base whose approval survived. Under
+  gh-stack's own auto-rebase mechanism there are **two measurements to date,
+  and both dismissed**. FIRST, measured 2026-09-02 on the #1991 health-score stack —
+  when #2187 merged as `aa7275dd`, GitHub's own auto-rebase moved #2189 from
+  `0871821a` to `9f6b6cfe`, and the approval standing on the pre-rebase tip
+  `0871821a` was `DISMISSED`, read directly off `pulls/2189/reviews`. That
+  dismissal held even though the PR's net diff against its own base was
+  byte-identical across the rebase — `git diff --full-index 0f8999b8 0871821a`
+  vs `git diff --full-index aa7275dd 9f6b6cfe`, 82089 bytes each
+  (`--full-index` pins the SHA width, since plain `git diff` auto-abbreviates
+  and the byte total then varies by clone; `0f8999b8` is #2187's pre-merge
+  branch tip, NOT `dev` and not the squash commit — name it explicitly, because
+  a reviewer who reaches for a plausible-looking base instead gets a different
+  number). **SECOND, measured 2026-09-11 on the #2753 stack, and this one
+  establishes CAUSATION rather than leaving it inferred:** when #2812 merged as
+  `1998f071`, #2814's `review_dismissed` and `head_ref_force_pushed` events carry
+  **the same second — `2026-09-11T18:38:55Z` — and the same actor**, the merge seat
+  running `gh stack merge`; the approval (submitted 2026-09-10T18:43:17Z against
+  `66f4efd9`) predates both by a day. Membership was confirmed server-side —
+  `pulls/2814` returns `stack: {id 1029225, number 2815, position 2, size 2}` —
+  against the control that `pulls/2834` returns `stack: null`. **`2815` is the
+  STACK's own number, not a typo for `2814`**: the parent `pulls/2812` reports the
+  identical `id`/`number` at `position: 1`, and `2815` 404s as a PR or issue, so a
+  stack consumes a number from the same namespace PRs and issues draw from.
+  **In a hurry — this bullet carries TWO operational instructions and they are
+  NOT adjacent.** First: read `id`/`number`/`position`/`size` off the stack
+  object and ignore `base.sha`. Then go straight to the read-the-approval-back
+  instruction that ENDS this bullet; it is the one that governs what you
+  actually do when a layer merges. Everything between them is evidence and
+  case detail. **Measured 2026-09-11, by
+  two independent methods that reconcile with zero residue.** (1) Sweeping
+  every one of this repo's 1439 PR numbers for a non-null `stack` (GraphQL
+  `pullRequest(number:N){stack{id number}}`, batched 50 at a time, 0 errored
+  batches) finds 14 member PRs across six stacks — `2386`, `2441`, `2466`,
+  `2610`, `2633`, `2815` — each of which 404s as both a PR and an issue. (2)
+  Counting the NAMESPACE instead: its ceiling is `2845`, an ISSUE rather than
+  a PR — so the ceiling is the max over BOTH kinds, and taking the highest PR
+  number is the easy way to get this wrong — against 1439 PRs and 1399 issues,
+  leaving exactly seven unoccupied numbers: the six above plus `1326`, which
+  resolves as an issue transferred to another repo. **The second method BOUNDS
+  what the first could have missed**, and the bound is narrower than it first
+  reads, so state it exactly: among stacks numbered at or below the scanned
+  ceiling, none is invisible to both methods — one the per-PR read missed
+  would still consume a number, and no unexplained number remains for it to
+  occupy. It does NOT reach a stack numbered ABOVE that ceiling, and it rests
+  on a premise that is inductive rather than documented — that a stack
+  reserves its number for as long as it exists, true of all six here and not a
+  published GitHub guarantee. The first method's own worst case was checked
+  directly and does not happen: a merged stack's members do NOT go `stack:
+  null` and drop out of the sweep — all three already-merged pairs still
+  report their `stack.number`. Each earlier draft of this count was calibrated
+  to what had been measured that session rather than to what was measurable;
+  the enumeration that settles it costs one scripted pass. Still only this
+  repo, and only as of that date: the shape of the numbering here, not a
+  documented guarantee. Read `id`/`number`/`position`/`size` and not the
+  stack's `base.sha`, which is transient — observed once: it read `1998f071`
+  minutes after the merge and reads `null` now. **The timestamps are what make
+  this a second observation rather than a second anecdote:** a current-state
+  read tells you a review *is* dismissed, never *when* or *by what*, and #2814
+  also carries an EARLIER force-push (2026-09-10T18:31:43Z, a different agent)
+  that the approval postdates — so co-occurrence alone would not have settled
+  it.
+  **n=2 — and
+  two is two: this still does not establish that the auto-rebase ALWAYS
+  dismisses, so the read-back below remains the thing that settles any given
+  case rather than a formality.** What the second observation does retire is
+  the weaker worry, that the first might have been some other push wearing the
+  auto-rebase's clothes.
+  Separately, the same `dismiss_stale_reviews_on_push: true`
+  setting has been seen NOT to dismiss on this repo — but under a manual
+  force-push, not gh-stack's auto-rebase: on #2338, review `5055356943` was
+  submitted 2026-08-28T21:50:49Z against commit `990de705`, whose
+  `.commit.committer.date` is 2026-08-29T17:49:54Z — an approval predating by
+  ~20h the commit it names, which only happens if GitHub silently re-pointed
+  the review onto a newer commit object (a review's `commit_id` must name a
+  commit that already existed at submission time). But `pulls/2338` reads
+  `stack: null` — not a stack member — and its `head_ref_force_pushed` events
+  (2026-08-29T17:17:27Z and 2026-08-29T18:08:06Z, both `by=LeiShi`) are manual
+  force-pushes, not gh-stack's auto-rebase. So #2338 shows the
+  review-repointing machinery exists under this setting; it says nothing about
+  the auto-rebase path itself. One control worth naming, and its limit: the
+  same PR also carries review `5055246690` against commit `8aaf46ea`, whose
+  committer date (`2026-08-28T20:15:26Z`) sits seventy-six minutes *before*
+  that review's own `2026-08-28T21:31:28Z` submission, unlike `990de705`. So
+  `commit_id` is not uniformly the PR's current head — that much is solid. It
+  does not, on its own, rule out an artifact of how the field gets populated:
+  the two reviews also differ in dismissal state — `5055246690` was DISMISSED
+  at `2026-08-28T21:47:54Z`, before either force-push, while `5055356943` was
+  never dismissed — so freezing on dismissal rather than migrating on rebase is
+  not excluded, and if true it would make liveness itself the predicting
+  property this paragraph says nothing is known to be. What would decide it: a
+  live, never-dismissed approval whose `commit_id` does NOT move, or a
+  dismissed review whose `commit_id` DOES move. We have neither. Read
+  `.commit.committer.date`, NOT `.commit.author.date` — a rebase preserves the
+  author date and stamps a fresh committer date, and `990de705`'s author date
+  (2026-08-28T21:47:22Z, three minutes before the review) points the wrong way.
+  And read `submitted_at` against the commit's own creation time, never the
+  review STATE — #2338 also carries two genuinely fresh approvals on the same
+  commit, so a state-based read (dismiss-then-approve) cannot tell migration
+  from re-approval by itself. So: the auto-rebase path has two
+  observations and both dismissed; the migration case belongs to a different
+  mechanism — a manual force-push, not the auto-rebase — and does not bear on
+  what the auto-rebase does. Plan for dismissal, read the approval back off
+  `pulls/<N>/reviews` after every layer, and never reason about whether it
+  ought to have survived.
 
 > **Duplicated by hand in engram-alpha, umwelt, and soma `CLAUDE.md`** (Lei,
 > 2026-08-29: whichever repo a session starts from must load it), with no
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
+> **Exception, as of 2026-09-14 (Kepler, interim ruling pending Lei's word):**
+> the fairy-round-timing clarification in "Mechanical check at the merge
+> seat" above (issue #2920) is deliberately NOT synced to soma. Soma's own
+> merged PR#58 requires the opposite — the fairy round must match the exact
+> merge tip — a deliberate safety rule for a repo with no human backstop that
+> drives a physical robot around Lei's family. Soma keeps its stricter local
+> rule until Lei or Ariadne says otherwise; see engram-alpha#2930's
+> discussion and `ask-Lei.md` for the open question.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
@@ -642,6 +1060,23 @@ to encode in always-loaded identity rules.
 unwritten in the workflow doc; the hierarchy itself has been practiced
 since the multi-agent coordination work started in 2026-05.
 
+## Attribution convention — Lei's functional-vs-marker test (alpha#2270)
+
+**The rule is Lei's, ruled 2026-08-15, not open and not interim.** Naming a colleague in a shipped artifact — a PR comment, a code comment, a test docstring — is governed by whether the name is *functional and will mislead general users* (something a reader or a tool would act on, and misread as coming from a real contributor to the project) or a *marker* (attribution that identifies who did something, acted on by nobody). Both conjuncts must hold to prohibit — functional alone or misleading alone is not enough, only functional-and-misleading blocks. The inert-but-misleading case (a name that invites no tool action yet could still mislead a reader into believing a human they've never heard of is a project contributor) is exactly what keeps case 2 below open, rather than being settled by the functional prong the way case 1 is. Lei's own words, relayed verbatim by Borges from his graph (quote-verified, source_class user_stated):
+
+> "Fine as attribution, same rule as my name, as long as it's not functional and will mislead general users, it's fine as development markers."
+
+Kepler's own amendment on alpha#2270 states the relation between this test and the worked application below precisely: *"The governing rule is therefore Lei's FUNCTIONAL-vs-MARKER discriminator, not my handle-vs-human split — mine becomes the worked application (they agree on every case in front of us today, and come apart only at edges: his form permits a human name inside a pure attribution marker, and forbids an agent handle that is functional/misleading)."* The handle-vs-human split is not a competing axis; it's what applying Lei's test looks like in the one case decided so far.
+
+**Worked application — agent handles vs. human names:**
+
+1. **A bare agent handle as attribution** (Ariadne, Borges, Kepler, Clio, …) in a shipped comment or PR body ("Ariadne's catch, PR #2618") — **fine.** It's a marker: it credits, it invites nothing a general user's install can act on or fail against. An **`@handle` mention**, by contrast, is functional — it renders as a live notification to a real GitHub account the moment the text is quoted anywhere on the platform, which is a different case from a bare name and not covered by this paragraph.
+2. **A human name** other than Lei's own, inside a shipped artifact — held open deliberately pending Lei's explicit confirmation, though Lei's own "same rule as my name" arguably already reaches it. Do not extend the agent-handle answer to this case by inference.
+
+**Why the two related gates differ in severity, and that difference is principled, not accidental:** `no-new-shipped-node-ids` **blocks** because a shipped concrete node ID is functional-and-dead — it invites an `engram_inspect` that fails on every install but the author's, by construction (see "PR — issue closure" §Body-text trap discipline for the sibling case of a keyword the parser *does* act on). `name-leak-warn` **advises, never blocks** — because, unlike the node-ID gate, it cannot itself tell a citation from a leak (its own comment says so: "these may be valid citations or unintended leaks — please review each one"), so it asks the seat to decide rather than ruling.
+
+**For the merge seat:** an advisory `name-leak-warn` hit on a **bare agent handle** is never, by itself, grounds to hold a PR — not because the gate has ruled (it explicitly hasn't; see above), but because Lei's 2026-08-15 ruling already has, for this one case. The seat's job on a hit is first to identify *which* name matched — the gate reports one pattern per line and does not name the category, so a line with several candidate names does not tell you which one tripped it — and only then apply this rule to a bare agent handle specifically. Scrubbing a colleague's attribution under a self-invented "cite the PR, not the person" habit is the exact over-application this section exists to name: it happened twice on this repo (engram-alpha#2618, #2697) before this paragraph landed, both scrubbing the same colleague's credit, both against Lei's already-ruled test.
+
 ## Project-as-bunch coordination (multi-agent mode)
 
 When this host runs **multiple ENGRAM agents** (e.g. Ariadne + Borges), open
@@ -784,6 +1219,24 @@ body. Don't rely on a "wrap-up PR I'll file later" — that PR rarely materializ
 (empirical: 7 of 11 stale-but-addressed candidates in the 2026-05-28 backlog
 scan followed this pattern, leaving their parent issues open indefinitely).
 
+**A `[part of #N]` PR deliberately never auto-closes #N — which means the
+epic body is the one artifact in this whole pipeline that nothing points at**:
+not the auto-close parser, not CI, not a review gate (#2617, 2026-09-06).
+Two epics were found reading as open to-do lists in one sweep, after every
+one of their workstreams had already shipped — work units got assigned off
+the stale body before anyone checked the actual PR history. The convention,
+adopted from that incident: **a `[part of #N]` PR ticks its own workstream
+line in the epic body (checkbox, or a `— landed as #M (sha)` suffix) as part
+of merging** — the same shape as "a fairy round that isn't transcribed to the
+PR didn't happen": a workstream that isn't ticked stays an imperative, no
+matter how done the work actually is. **The knowledge of which workstream
+line a given PR corresponds to sits with the PR's own author, not with
+whoever merges it** — so the author names that line in the PR's own body
+(e.g. "ticks #N's `WS3` line"), and the merge seat ticks the line the PR
+itself named rather than reverse-engineering it from the epic. This is
+discipline, not a mechanical gate (tracked as a follow-up only if the
+convention gets walked past).
+
 **For partial work that addresses but doesn't fully close:** omit the closing
 tag from both title AND body. Comment on the issue describing what landed and
 what remains, so the scope is durable.
@@ -805,6 +1258,23 @@ auto-close on merge. Two consequences: (a) an *intentional* `Closes #N` must be
 below is a plain regex that **does** match inside backticks, so it conservatively
 over-flags backticked refs — a backticked match is safe-from-the-real-parser, so
 confirm it rather than treating it as an auto-close risk.
+
+**Fenced code blocks are the SAME exception, measured separately (#2630,
+2026-09-06):** a closing keyword inside a triple-backtick fence or a tilde
+(`~~~`) fence also does **not** populate `closingIssuesReferences` — a
+throwaway PR with `Closes #N.` inside each fence type read empty on 9
+consecutive `closingIssuesReferences` queries spanning ~140s (well past the
+documented propagation lag in either direction). This settles the question
+#2539/#2540's fence-swallow fix left open for the three CI gates that still
+run the naive `` sed 's/`[^`]*`//g' `` strip on PR bodies
+(`pr-checks.yml:104`, `anti-dup-retro-check.yml:55`/`181`): the strip's
+blind spot is **correct**, not a hole — GitHub's own parser is blind to the
+same fenced content those gates strip, so there is no accidental-auto-close
+case they're failing to catch. No fence-aware port needed there. **The same
+two-sided consequence as the backtick case above applies**: an *intentional*
+`Closes #N` inside a fence will silently fail to auto-close on merge, exactly
+like a backticked one — plain text near the issue number is still the only
+form that fires the parser.
 
 **Empirical traps caught (2026-05-30):**
 - PR #516 body said `"this PR does NOT close #510"` → auto-closed #510 on merge

@@ -39,9 +39,15 @@ def test_dag_exempt_matches_pre_refactor_set():
     # it names the CREATION-ORDER exemption set) and this new relation is
     # deliberately temporal_causal=False despite carrying dag=True (real
     # acyclicity, checked separately — see EDGE_TIER_DIVERGENCE_ACK).
+    # `generalizes` added 2026-09-10 (#2753 epic WS1, D1): temporal_causal=
+    # False by design (a later concrete cornerstone can still generalize to
+    # an older principle), same shape as instantiates/serves — but ALSO
+    # carries dag=True (real acyclicity matters here, unlike
+    # instantiates/serves/exemplifies), the intentional divergence
+    # acknowledged in EDGE_TIER_DIVERGENCE_ACK.
     expected = frozenset({"contradicts", "about", "exemplifies", "instantiates",
                           "resolves", "tensions", "serves",
-                          "acknowledged_derives_from"})
+                          "acknowledged_derives_from", "generalizes"})
     # Allow the new constant to add `cites` ONLY if a separate ob/dv
     # cites the design call that allowed it.
     assert DAG_EXEMPT_RELATIONS == expected, (
@@ -52,8 +58,10 @@ def test_dag_exempt_matches_pre_refactor_set():
 def test_removable_matches_pre_refactor_set():
     # `instantiates` removable per #530 spec (pure relevance marker —
     # over-applied wiring must be correctable without surgical tools).
+    # `generalizes` removable per #2753 epic WS1, D1 — same shape (a pure
+    # routing/classification edge, over-applied wiring must be correctable).
     expected = frozenset({"about", "tensions", "subtask_of", "serves", "exemplifies",
-                          "instantiates"})
+                          "instantiates", "generalizes"})
     assert _REMOVABLE_EDGE_RELATIONS == expected, (
         f"_REMOVABLE_EDGE_RELATIONS drift: got {sorted(_REMOVABLE_EDGE_RELATIONS)}, "
         f"expected {sorted(expected)}."
@@ -89,6 +97,8 @@ def test_no_unclassified_relations_in_schema():
                          # acknowledgement edge, part of #2013.
         "resolves", "retracts", "serves", "subtask_of", "supersedes",
         "supported_by", "tensions",
+        "generalizes",  # #2753 (2026-09-10) — epic WS1, D1: general ->
+                         # specific abstraction/classification edge.
     }
     assert set(EDGE_CLASSIFICATIONS.keys()) == known_relations, (
         f"Drift between EDGE_CLASSIFICATIONS and known relations: "

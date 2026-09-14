@@ -213,6 +213,36 @@ class TestProjectInit:
         c = app.test_client()
         assert c.post("/api/projects", json={"agent": "luria"}).status_code == 503
 
+    def test_colleague_persists_and_renders_on_show(self, client):
+        """#2764: colleague= at init is now actually persisted, not just
+        used to shape participants + a client-side print."""
+        resp = client.post("/api/projects", json={
+            "agent": "luria",
+            "project_id": "PR-103",
+            "title": "t",
+            "status": "in-progress",
+            "turn": "luria",
+            "participants": ["luria", "ariadne"],
+            "turn_reason": "r",
+            "colleague": "ariadne",
+        })
+        assert resp.status_code == 201
+        raw = client.get("/api/projects/PR-103").get_json()["raw"]
+        assert "colleague: ariadne" in raw
+
+    def test_colleague_omitted_when_not_passed(self, client):
+        client.post("/api/projects", json={
+            "agent": "luria",
+            "project_id": "PR-104",
+            "title": "t",
+            "status": "in-progress",
+            "turn": "luria",
+            "participants": ["luria"],
+            "turn_reason": "r",
+        })
+        raw = client.get("/api/projects/PR-104").get_json()["raw"]
+        assert "colleague:" not in raw
+
 
 # ---------------------------------------------------------------------------
 # POST /api/projects/<pid>/flip
@@ -556,6 +586,81 @@ class TestProjectAddParticipant:
         show_resp = client.get("/api/projects/PR-42")
         assert show_resp.status_code == 200
         assert "borges" in show_resp.get_json()["raw"]
+
+
+# ---------------------------------------------------------------------------
+# POST /api/projects/<pid>/colleague  (#2764)
+# ---------------------------------------------------------------------------
+# Seeded PR-42 turn=ariadne, participants=[ariadne, luria] (see the `app` fixture above).
+
+class TestProjectSetColleague:
+    def test_set_colleague_returns_201_and_participant_added_true(self, client):
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "ariadne",
+            "colleague": "borges",  # not yet a participant
+        })
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["participant_added"] is True
+        assert "seq" in data
+
+    def test_set_colleague_already_participant_returns_participant_added_false(self, client):
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "ariadne",
+            "colleague": "luria",  # already a seeded participant
+        })
+        assert resp.status_code == 201
+        data = resp.get_json()
+        assert data["participant_added"] is False
+
+    def test_set_colleague_by_participant_who_is_not_holder_succeeds(self, client):
+        """luria is a participant but not the turn holder (ariadne) -- still allowed."""
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "luria",
+            "colleague": "borges",
+        })
+        assert resp.status_code == 201
+
+    def test_set_colleague_403_when_agent_neither_participant_nor_holder(self, client):
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "casey",  # not in [ariadne, luria], not the turn holder
+            "colleague": "borges",
+        })
+        assert resp.status_code == 403
+
+    def test_set_colleague_400_missing_agent(self, client):
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "colleague": "borges",
+        })
+        assert resp.status_code == 400
+
+    def test_set_colleague_400_missing_colleague(self, client):
+        resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "ariadne",
+        })
+        assert resp.status_code == 400
+
+    def test_set_colleague_404_missing_project(self, client):
+        resp = client.post("/api/projects/MISSING/colleague", json={
+            "agent": "ariadne",
+            "colleague": "borges",
+        })
+        assert resp.status_code == 404
+
+    def test_set_colleague_persists_and_renders_on_show(self, client):
+        """The API-layer half of the #2764 fix: colleague: is now readable
+        via a plain GET (which baton show just prints raw) -- pre-fix,
+        nothing was ever persisted server-side for --colleague to render."""
+        set_resp = client.post("/api/projects/PR-42/colleague", json={
+            "agent": "ariadne",
+            "colleague": "borges",
+        })
+        assert set_resp.status_code == 201
+
+        show_resp = client.get("/api/projects/PR-42")
+        assert show_resp.status_code == 200
+        raw = show_resp.get_json()["raw"]
+        assert "colleague: borges" in raw
 
 
 # ---------------------------------------------------------------------------

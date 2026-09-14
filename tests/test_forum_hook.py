@@ -1141,10 +1141,20 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
     module docstring for why that helper was NOT extracted into forum's
     call site).
 
+    Updated again for engram-alpha#2863 WS2: this hook now imports
+    `_hooklib.emit_context` and `_harness.{detect_harness,get_harness_budgets}`
+    unconditionally at module load (see the hook's own prologue comment), so
+    `_harness.py` must also be present as a sibling in the recreated
+    flattened layout or the whole module import raises ModuleNotFoundError
+    before any of this test's probes even run (same incidental-regression
+    class as engram-surface-hook.py's own #2876 fix to
+    tests/test_hook_emitter_path_resolution.py's `_SHARED_SIBLINGS`).
+
     Recreate the deployed layout (hooks/<name>.py with a SIBLING tools/ AND
-    SIBLING _hooklib.py / _prompthooklib.py) with CLAUDE_PLUGIN_ROOT unset
-    and assert that _status_derive resolves: a resolved import leaves
-    derive_own_status as a callable; a broken import leaves it None.
+    SIBLING _hooklib.py / _prompthooklib.py / _harness.py) with
+    CLAUDE_PLUGIN_ROOT unset and assert that _status_derive resolves: a
+    resolved import leaves derive_own_status as a callable; a broken import
+    leaves it None.
     """
     root = tmp_path / "engram"
     (root / "hooks").mkdir(parents=True)
@@ -1158,9 +1168,14 @@ def test_tools_resolution_in_flattened_deployed_topology(tmp_path):
         Path(__file__).parent.parent
         / "src" / "engram" / "hooks" / "claude" / "_prompthooklib.py"
     )
+    harness_src = (
+        Path(__file__).parent.parent
+        / "src" / "engram" / "hooks" / "claude" / "_harness.py"
+    )
     (root / "hooks" / "engram-forum-prompt-hook.py").write_text(hook_src.read_text())
     (root / "hooks" / "_hooklib.py").write_text(hooklib_src.read_text())
     (root / "hooks" / "_prompthooklib.py").write_text(prompthooklib_src.read_text())
+    (root / "hooks" / "_harness.py").write_text(harness_src.read_text())
     # Stub _status_derive.py so the import can succeed.
     (root / "tools" / "_status_derive.py").write_text(
         "def derive_own_status(agent_name): return None, None, None, None\n"

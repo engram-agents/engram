@@ -1,4 +1,5 @@
-"""Edge tier audit: completeness gate + soft temporal_causal/tier drift warning.
+"""Edge tier audit: completeness gate + soft temporal_causal/tier drift warning
++ hard dag/tier divergence-acknowledgment gate.
 
 Design (issue #1080, Lei 2026-06-10 decision):
   - The per-edge temporal_causal flags in EDGE_CLASSIFICATIONS are INDEPENDENT design
@@ -13,6 +14,17 @@ Design (issue #1080, Lei 2026-06-10 decision):
     emits warnings.warn for human review. The test still PASSES — divergence is
     a signal for human attention, not a failure. An intentional divergence is
     acknowledged in EDGE_TIER_DIVERGENCE_ACK to suppress the warning.
+  - HARD assert (#2753 epic WS1, R2): a SEPARATE divergence axis — the `dag`
+    flag (real structural acyclicity, #2357) against the SAME tier
+    expectation table — is NOT covered by the soft warn above (which checks
+    temporal_causal only). `generalizes` is classification-tier with
+    dag=True, diverging from every other classification-tier relation
+    (dag=False) — and the soft warn above would NEVER catch its ack entry
+    going missing, because it never looks at `dag` at all. This is exactly
+    the gap R2 names: "the existing guard will NOT catch its absence."
+    test_generalizes_dag_tier_divergence_must_be_acknowledged below is a
+    HARD FAILURE (not a warning) if any relation's `dag` flag diverges from
+    its tier's expectation while absent from EDGE_TIER_DIVERGENCE_ACK.
 
 Import-pattern contract (#948 wave C):
     Imports engram_core directly; contains no ``import server``.
@@ -124,3 +136,97 @@ def test_temporal_causal_tier_drift_warn():
                     stacklevel=2,
                 )
     # Always passes — divergence is a warning for human review, not a failure.
+
+
+# ── HARD dag/tier divergence-acknowledgment gate (#2753 epic WS1, R2) ──────
+#
+# A SEPARATE axis from the soft warn above: this checks the `dag` flag
+# (real structural acyclicity, #2357), not `temporal_causal`. The soft warn
+# above NEVER inspects `dag` at all, so an unacknowledged `dag`/tier
+# divergence would ship silently through that check with no signal
+# whatsoever — R2's exact concern. `generalizes` (classification tier,
+# dag=True) is the first relation to diverge on this axis; every other
+# classification-tier relation today (instantiates/serves/exemplifies) is
+# dag=False, matching the tier's usual (though not name-encoded) pattern.
+#
+# Reuses `_TIER_DAG_EXPECTATION` for the expected-per-tier value: despite
+# its name (predating #2357's dag/temporal_causal split), its values
+# (dependency=True, relational=False, classification=False) are the same
+# per-tier expectation this dag-axis check needs — verified empirically for
+# every relation EXISTING before `generalizes` was added (dag ==
+# temporal_causal's tier-expectation for all of them; `generalizes` is the
+# first to diverge on `dag` while matching on `temporal_causal`, the
+# opposite of `acknowledged_derives_from`'s divergence, which is on
+# `temporal_causal` while matching on `dag`).
+
+def _unacknowledged_dag_tier_divergences(
+    classifications: dict, tiers: dict, ack: dict
+) -> "list[str]":
+    """Relations whose `dag` flag diverges from its tier's expectation
+    while ABSENT from `ack`. Empty list == fully acknowledged (the healthy
+    state). Extracted as a plain function (not inlined in the pytest test
+    body) specifically so the mutation-check test below can call it
+    directly against a locally modified `ack` dict, rather than needing to
+    trigger pytest's own pass/fail machinery to prove the detection logic
+    works.
+    """
+    unacknowledged = []
+    for relation, tier in tiers.items():
+        if tier not in _TIER_DAG_EXPECTATION:
+            continue  # unknown tier — the completeness test above catches this
+        if relation not in classifications:
+            continue  # stale tier entry — the completeness test above catches this
+
+        expected_dag = _TIER_DAG_EXPECTATION[tier]
+        actual_dag = classifications[relation]["dag"]
+        if actual_dag != expected_dag and relation not in ack:
+            unacknowledged.append(relation)
+    return unacknowledged
+
+
+def test_generalizes_dag_tier_divergence_must_be_acknowledged():
+    """HARD FAILURE (not a warning) if any relation's `dag` flag diverges
+    from its tier's expectation while absent from EDGE_TIER_DIVERGENCE_ACK.
+
+    #2753 epic WS1, R2: "the existing guard will NOT catch its absence" —
+    the soft warn above checks temporal_causal only, and would stay silent
+    forever on a `dag`-only divergence going unacknowledged. This test is
+    the one that actually fails the build. Covers `generalizes` today (and
+    any future dag-divergent relation, since the check is general, not
+    hand-keyed to 'generalizes').
+    """
+    unacknowledged = _unacknowledged_dag_tier_divergences(
+        EDGE_CLASSIFICATIONS, EDGE_TIERS, EDGE_TIER_DIVERGENCE_ACK
+    )
+    assert not unacknowledged, (
+        f"Relation(s) with an unacknowledged dag/tier divergence: "
+        f"{unacknowledged}. Add each to EDGE_TIER_DIVERGENCE_ACK in "
+        f"engram_core.py with a reason string (see the 'generalizes' entry "
+        f"for the pattern)."
+    )
+
+
+def test_mutation_check_dag_tier_gate_actually_fails_without_ack():
+    """Mutation-verify test_generalizes_dag_tier_divergence_must_be_acknowledged:
+    call the SAME detection helper with a locally modified ack dict that
+    omits 'generalizes' (simulating the omission R2 warns ships silently
+    otherwise) and confirm it IS reported — proving the hard-failing test
+    above actually depends on the ack entry being present, not merely
+    passing by construction. The real EDGE_TIER_DIVERGENCE_ACK imported
+    from engram_core is never mutated (a plain local dict copy is used
+    instead) — no monkeypatch/restore needed for this one.
+    """
+    assert "generalizes" in EDGE_TIER_DIVERGENCE_ACK, (
+        "precondition: the real table must currently acknowledge "
+        "'generalizes' for this mutation check to mean anything"
+    )
+    ack_without_generalizes = {
+        k: v for k, v in EDGE_TIER_DIVERGENCE_ACK.items() if k != "generalizes"
+    }
+    unacknowledged = _unacknowledged_dag_tier_divergences(
+        EDGE_CLASSIFICATIONS, EDGE_TIERS, ack_without_generalizes
+    )
+    assert "generalizes" in unacknowledged, (
+        "mutation check did not reproduce the unacknowledged-divergence "
+        f"shape -- the detection helper may not be the actual gate: {unacknowledged}"
+    )

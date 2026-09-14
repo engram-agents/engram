@@ -61,13 +61,6 @@ Importing this module as a bare name would shadow them at delegation time.
 Caller (server.py) uses the alias form::
 
     import engram_observation as _observation_mod
-
-_obs_creator wiring (#918 predicted, wave 9 delivers):
-  server.py's wave-6 compat forwarder for _retract_impl injects
-  ``_obs_creator=_add_observation_impl``.  Before wave 9 that referenced the
-  server-resident name (now a compat forwarder itself).  After wave 9 the
-  wiring is updated to point at the module source of truth:
-  ``_obs_creator=_observation_mod._add_observation_impl``.
 """
 
 from __future__ import annotations
@@ -87,7 +80,23 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import engram_core as core
-from engram_log_emitter import emit_if_initialized
+from engram_anchoring import anchor as _anchor_claim
+from engram_anchoring import quote_claim_similarity as _quote_claim_similarity
+from engram_log_emitter import Emitter, emit_if_initialized
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience (WS1's
+# own tiering judgment call -- src/build/packaging/tiers.json), while THIS
+# file ships at tier=essential. A plain top-level import here would make an
+# essential-tier module hard-depend on a convenience-tier one, breaking an
+# Essential-only build (tests/test_tiers_manifest.py's
+# test_import_dep_tier_consistency enforces exactly this). Guarded import +
+# no-op stub keeps this module's own tool functions gating-nothing-T1
+# (docs/2574-telemetry-design.md §8) even if the store ships without it.
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 # VALID_QUOTE_TYPES and VALID_SOURCE_CLASSES come from engram_confidence via
 # server.py imports.  Family A receives them as arguments or via the function
@@ -757,17 +766,35 @@ def _verify_quote_in_source(url: str, quoted_text: str) -> Optional[str]:
         return None  # Found via equivalence normalization
 
     # All strategies failed — try to find near matches for the agent
+    is_pdf_source = file_path.lower().endswith(".pdf")
     near = _find_near_matches(content, escaped, file_path)
-    msg = (
-        f"Quoted text not found in '{os.path.basename(file_path)}'. "
-        "The quoted_text must be a verbatim substring of the evidence source. "
-        "Do not paraphrase, summarize, or fabricate quotes.\n\n"
-        "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
-        "pre-verification script. For JSONL files, messages may not have flushed "
-        "yet — verify the quote exists in the file BEFORE calling this tool. "
-        "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
-    )
-    if near:
+    if is_pdf_source:
+        # engram-alpha#2765: a PDF archive holds raw bytes, not extracted
+        # text — the generic "verbatim substring" message sends the agent
+        # hunting for a typo in an otherwise-correct quote. Name the format
+        # gap explicitly, and say so plainly (Ariadne's amendment on #2765:
+        # "Your quote may be exactly correct" is the load-bearing sentence).
+        msg = (
+            f"Quoted text not found in '{os.path.basename(file_path)}'. "
+            "This source is a PDF: quotes cannot be verified against PDF bytes, "
+            "only against extracted text. Extract first (pdftotext <f> <f>.txt), "
+            "snapshot the .txt, and cite that. Your quote may be exactly correct."
+        )
+    else:
+        msg = (
+            f"Quoted text not found in '{os.path.basename(file_path)}'. "
+            "The quoted_text must be a verbatim substring of the evidence source. "
+            "Do not paraphrase, summarize, or fabricate quotes.\n\n"
+            "BEFORE RETRYING: check the engram-observe skill (Step A.4) for the "
+            "pre-verification script. For JSONL files, messages may not have flushed "
+            "yet — verify the quote exists in the file BEFORE calling this tool. "
+            "Run: ~/.engram/tools/verify_quote.py <file> <phrase>"
+        )
+    # Near-matches are computed against `content` -- for a PDF that's raw
+    # bytes decoded as UTF-8 with errors="replace", i.e. noise. Suggesting
+    # "copy from a match above" on garbage would contradict the PDF message's
+    # own "your quote may be exactly correct" — skip the suggestion path.
+    if near and not is_pdf_source:
         suggestions = []
         for i, m in enumerate(near, 1):
             suggestions.append(
@@ -1090,6 +1117,75 @@ def _predictive_hint(is_predictive: bool,
     )
 
 
+def _log_anchoring_advisory(entry: dict) -> None:
+    """Append one JSONL line per observation write — the calibration input
+    for #2602 facets 3/4. Not read by anything in this PR. Best-effort:
+    logging failures must never block a write (same discipline as
+    engram_query.py's _pattern_telemetry_log)."""
+    try:
+        path = Path(core.DATA_DIR) / "anchoring_advisory.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def _build_anchoring_advisory(
+    node_id: str, claim: str, quoted_text: str, interpretation: str,
+    quote_type: str, source_class: str, confidence: Optional[float],
+) -> dict:
+    """Facet 2 (#2602): advisory-only hard-token anchoring measurement
+    attached to every observation write's response.
+
+    Loud, never fatal — any exception here becomes an
+    {"status": "unavailable", "reason": ...} advisory rather than failing
+    the write (a broken advisory must never block an observation).
+    """
+    try:
+        result = _anchor_claim(claim, quoted_text)
+        similarity, similarity_reason = _quote_claim_similarity(quoted_text, claim)
+        body_to_quote_ratio = (len(claim or "") + len(interpretation or "")) / max(len(quoted_text or ""), 1)
+
+        advisory: dict = {
+            "hard_tokens": result.hard_tokens,
+            "anchored": result.anchored,
+            "ratio": result.ratio,
+            "unanchored": result.unanchored[:20],
+            "body_to_quote_ratio": body_to_quote_ratio,
+            "quote_claim_similarity": similarity,
+        }
+        if similarity is None and similarity_reason:
+            advisory["similarity_status"] = f"unavailable: {similarity_reason}"
+        if quote_type == "hard_data" and result.unanchored:
+            advisory["hint"] = (
+                f"hard_data: {len(result.unanchored)} claim token(s) absent from the "
+                "quote — widen the quote, move the fact to `interpretation`, or "
+                "downgrade quote_type. Advisory only (#2602 facet 2)."
+            )
+
+        _log_anchoring_advisory({
+            "ts": core._now(),
+            "node_id": node_id,
+            "quote_type": quote_type,
+            "source_class": source_class,
+            "confidence": confidence,
+            "hard_tokens": result.hard_tokens,
+            "anchored": result.anchored,
+            "ratio": result.ratio,
+            "unanchored": result.unanchored[:20],
+            "quote_len": len(quoted_text or ""),
+            "claim_len": len(claim or ""),
+            "interp_len": len(interpretation or ""),
+            "body_to_quote_ratio": body_to_quote_ratio,
+            "quote_claim_similarity": similarity,
+        })
+        return advisory
+    except Exception as exc:  # noqa: BLE001 — advisory must never fail a write
+        logging.warning("anchoring advisory failed for %s: %s", node_id, exc)
+        return {"status": "unavailable", "reason": str(exc)[:200]}
+
+
 def _add_observation_impl(
     quoted_text: str = "",
     interpretation: str = "",
@@ -1117,6 +1213,8 @@ def _add_observation_impl(
     session_id: str = "",
     recall_summary: str = "",
     recall_keywords: Optional[list] = None,
+    evidence_type: str = "",
+    original_url: str = "",
 ) -> str:
     """Internal implementation — see engram_add_observation MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server
@@ -1327,6 +1425,21 @@ def _add_observation_impl(
             )
         })
 
+    # evidence_type validation (#2606 facet 1 unit 2): closed vocabulary,
+    # matching engram-snapshot's EVIDENCE_TYPE_BY_SOURCE. Not inferred from
+    # content or fs_class -- the capturer (engram-snapshot, or a caller citing
+    # a known source kind) names it; a later reader only ever reads it back.
+    _EVIDENCE_TYPE_ENUM = {
+        "forum_thread", "session_transcript", "local_file", "web_page", "pdf",
+    }
+    if evidence_type and evidence_type not in _EVIDENCE_TYPE_ENUM:
+        return json.dumps({
+            "error": (
+                f"Invalid evidence_type '{evidence_type}'. Must be one of: "
+                f"{', '.join(sorted(_EVIDENCE_TYPE_ENUM))}"
+            )
+        })
+
     # Resolve evidence node: either from evidence_id or auto-create from url+title
     if not evidence_id and not url:
         return json.dumps(
@@ -1354,13 +1467,49 @@ def _add_observation_impl(
     try:
         # Validate evidence exists
         ev = conn.execute(
-            "SELECT id, source_url FROM nodes WHERE id = ? AND type = 'evidence'",
+            "SELECT id, source_url, metadata FROM nodes WHERE id = ? AND type = 'evidence'",
             (evidence_id,),
         ).fetchone()
         if not ev:
             return json.dumps(
                 {"error": f"Evidence node '{evidence_id}' not found."}
             )
+
+        # evidence_type / original_url passthrough onto the evidence node's
+        # metadata (#2606 facet 1 units 2+3), whether that node was just
+        # created above or is being reused (evidence_id-cite path or
+        # url-match reuse inside _add_evidence_impl). First-capture-wins: a
+        # value already present is never overwritten; a caller naming a
+        # DIFFERING value surfaces as a *_conflict key in the response rather
+        # than silently resolving one way or the other. Absent/empty
+        # arguments never touch the evidence node -- an evidence node created
+        # without a snapshot must not grow a spurious key.
+        _ev_metadata = json.loads(ev["metadata"] or "{}")
+        _ev_metadata_changed = False
+        _evidence_type_conflict = None
+        _original_url_conflict = None
+
+        if evidence_type:
+            _existing_evidence_type = _ev_metadata.get("evidence_type")
+            if _existing_evidence_type is None:
+                _ev_metadata["evidence_type"] = evidence_type
+                _ev_metadata_changed = True
+            elif _existing_evidence_type != evidence_type:
+                _evidence_type_conflict = {
+                    "existing": _existing_evidence_type,
+                    "attempted": evidence_type,
+                }
+
+        if original_url:
+            _existing_original_url = _ev_metadata.get("original_url")
+            if _existing_original_url is None:
+                _ev_metadata["original_url"] = original_url
+                _ev_metadata_changed = True
+            elif _existing_original_url != original_url:
+                _original_url_conflict = {
+                    "existing": _existing_original_url,
+                    "attempted": original_url,
+                }
 
         # Verify quoted_text exists in the evidence source (file:// only)
         ev_url = ev["source_url"] or ""
@@ -1465,12 +1614,36 @@ def _add_observation_impl(
             "quote_verified": quote_verified,
         }
         if not quote_verified:
-            result["quote_provenance_warning"] = (
-                "Web-sourced quoted_text is unverified at encoding — no page fetch "
-                "occurs at observation creation time. The quote may not appear verbatim "
-                "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
-                "citations, verify manually. See #1204."
-            )
+            if ev_url.lower().endswith(".pdf"):
+                # engram-alpha#2765: a url:-sourced PDF observation never gets
+                # a page fetch at creation time, same as any other web
+                # source -- but for a PDF the check could NEVER have run
+                # even with a fetch (quotes verify against extracted text,
+                # not raw bytes). The generic web-source caveat reads
+                # identically for "we didn't fetch" and "this format can't
+                # verify"; name the PDF case so it doesn't read as an
+                # ordinary, softer caveat.
+                result["quote_provenance_warning"] = (
+                    "This source is a PDF: the quote check could not run on it, and "
+                    "could not have, even with a page fetch — PDF quotes verify only "
+                    "against extracted text, never raw bytes. Extract first "
+                    "(pdftotext <f> <f>.txt), snapshot the .txt, and cite that for a "
+                    "verifiable quote. See #2765."
+                )
+            else:
+                result["quote_provenance_warning"] = (
+                    "Web-sourced quoted_text is unverified at encoding — no page fetch "
+                    "occurs at observation creation time. The quote may not appear verbatim "
+                    "at the cited URL (paraphrase, page-change, paywall). For high-stakes "
+                    "citations, verify manually. See #1204."
+                )
+
+        # Advisory hard-token anchoring (#2602 facet 2) — attaches to every
+        # write, all quote types; never refuses, never changes confidence.
+        result["anchoring_advisory"] = _build_anchoring_advisory(
+            node_id, claim, quoted_text, interpretation, quote_type,
+            source_class, confidence,
+        )
 
         # Handle prediction decomposition
         prediction_id = None
@@ -1644,6 +1817,21 @@ def _add_observation_impl(
         if _pred_hint:
             result["predictive_hint"] = _pred_hint
 
+        # Persist the evidence_type / original_url metadata update (if any)
+        # in the SAME transaction as the observation insert above -- an
+        # early return before this point (a validation failure) leaves both
+        # un-committed together, so the evidence node's metadata never
+        # changes for an observation that itself was never created.
+        if _ev_metadata_changed:
+            conn.execute(
+                "UPDATE nodes SET metadata = ? WHERE id = ?",
+                (json.dumps(_ev_metadata), evidence_id),
+            )
+        if _evidence_type_conflict:
+            result["evidence_type_conflict"] = _evidence_type_conflict
+        if _original_url_conflict:
+            result["original_url_conflict"] = _original_url_conflict
+
         conn.commit()
 
         # Durability dual read-back (alpha#2193; supersedes the single
@@ -1720,21 +1908,52 @@ def _add_observation_impl(
             if sims:
                 _highest_sim = max(sims)
             _first_hint = similar_matches[0].get("action_hint")
-        emit_if_initialized(
-            event_type="engram.tool.engram_call",
-            level=1,
-            data={
-                "tool_name": "engram_add_observation",
-                "similar_existing_returned_count": _similar_count,
-                "highest_similarity": _highest_sim,
-                "dedup_action_hint": _first_hint,
-                "result_status": result.get("status"),
-                "result_node_id": result.get("observation_id"),
-                "validation_warnings": (
-                    [result["yellow_card_warning"]] if result.get("yellow_card_warning") else []
-                ),
-            },
-        )
+        # alpha #2574 WS5: site attestation + outcome recording +
+        # protection (docs/2574-telemetry-design.md §1/§4/§5). New,
+        # narrowly-scoped try/except around this new code only -- see
+        # engram_derive.py's _derive_impl blocked-path site for the full
+        # rationale (identical shape: this function's own try/finally has
+        # no except, so an uncaught raise here would propagate straight
+        # out of this MCP tool call, breaching §8).
+        _site = "server.engram_add_observation"
+        try:
+            _had_emitter = Emitter.get() is not None
+            _uid = emit_if_initialized(
+                event_type="engram.tool.engram_call",
+                level=1,
+                data={
+                    "tool_name": "engram_add_observation",
+                    "similar_existing_returned_count": _similar_count,
+                    "highest_similarity": _highest_sim,
+                    "dedup_action_hint": _first_hint,
+                    "result_status": result.get("status"),
+                    "result_node_id": result.get("observation_id"),
+                    "validation_warnings": (
+                        [result["yellow_card_warning"]] if result.get("yellow_card_warning") else []
+                    ),
+                },
+                site="server.engram_add_observation",
+            )
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={
+                    "outcome": (
+                        "delivered" if _uid is not None
+                        else "dropped" if _had_emitter
+                        else "no_emitter"
+                    )
+                },
+            )
+        except Exception:
+            try:
+                write_telemetry_record(
+                    manifest_id=_site,
+                    event_type="engram.tool.engram_call",
+                    fields={"outcome": "init_failed"},
+                )
+            except Exception:
+                pass
         return json.dumps(core._strip_agent_facing(result))
     finally:
         conn.close()
@@ -1876,22 +2095,50 @@ def _add_observation_batch_impl(
     # --- engram.tool.engram_call event (DESIGN.md §4.2) ---
     # Batch-level summary event — one event for the entire batch MCP call.
     # Per-observation events are already emitted by _add_observation_impl above.
-    emit_if_initialized(
-        event_type="engram.tool.engram_call",
-        level=1,
-        data={
-            "tool_name": "engram_add_observation_batch",
-            "result_status": "batch_complete",
-            "result_node_id": None,
-            "batch_total": len(observations),
-            "batch_created": len(created),
-            "batch_error_count": len(observations) - len(created),
-            "validation_warnings": (
-                [batch_result["yellow_card_warning"]]
-                if batch_result.get("yellow_card_warning")
-                else []
-            ),
-        },
-    )
+    # alpha #2574 WS5: this site sits with NO surrounding try at all (§0.1) --
+    # a NEW try wraps it (§10: "a new try wrapping each of the two
+    # no-try-at-all consumer sites"), same protective purpose and shape as
+    # the try/finally sites above.
+    _site = "server.engram_add_observation_batch"
+    try:
+        _had_emitter = Emitter.get() is not None
+        _uid = emit_if_initialized(
+            event_type="engram.tool.engram_call",
+            level=1,
+            data={
+                "tool_name": "engram_add_observation_batch",
+                "result_status": "batch_complete",
+                "result_node_id": None,
+                "batch_total": len(observations),
+                "batch_created": len(created),
+                "batch_error_count": len(observations) - len(created),
+                "validation_warnings": (
+                    [batch_result["yellow_card_warning"]]
+                    if batch_result.get("yellow_card_warning")
+                    else []
+                ),
+            },
+            site="server.engram_add_observation_batch",
+        )
+        write_telemetry_record(
+            manifest_id=_site,
+            event_type="engram.tool.engram_call",
+            fields={
+                "outcome": (
+                    "delivered" if _uid is not None
+                    else "dropped" if _had_emitter
+                    else "no_emitter"
+                )
+            },
+        )
+    except Exception:
+        try:
+            write_telemetry_record(
+                manifest_id=_site,
+                event_type="engram.tool.engram_call",
+                fields={"outcome": "init_failed"},
+            )
+        except Exception:
+            pass
 
     return json.dumps(core._strip_agent_facing(batch_result))

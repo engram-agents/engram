@@ -1,0 +1,722 @@
+"""Tests for health/metrics.py — the aspect A/B/C signal + scoring
+function catalogue (engram-alpha#1991, PR2+PR3 of 4).
+
+Builds a small, real, throwaway SQLite fixture DB (the ``nodes``/``edges``
+tables' real column shape, a subset of engram_core.py's CREATE TABLE) per
+test, and asserts each signal function returns the EXACT expected rate
+against it — not just "doesn't crash". Explicitly covers the
+empty_denominator UNAVAILABLE case (zero claim-bearing nodes ->
+pending_premise_rate is UNAVAILABLE, not 0 or a ZeroDivisionError).
+
+UPDATED (engram-alpha#2520 round 2, fold #2, 2026-09-03): open_contradiction_
+rate's empty-denominator policy CHANGED from "clean" (0.0) to UNAVAILABLE —
+see health.metrics.open_contradiction_rate's own docstring for the
+full reasoning (the "hold out, renormalize, report" design ruling makes the
+old "clean" reasoning fabricate a number for an unmeasured population). It
+now matches its epistemic_integrity sibling's (pending_premise_rate, per
+engram-alpha#2905 PR-B's unification of the prior separate
+taint_rate/stale_derivation_rate) empty-population treatment exactly.
+
+UPDATED (engram-alpha#2518, 2026-09-04): Aspect B's four metrics now return
+their OWN LITERAL coverage/goodness fraction (1.0 = fully covered/best,
+0.0 = none covered/worst) — see health/metrics.py's module docstring
+"SIGN CONVENTION" note. Before this PR they returned the badness-rate
+COMPLEMENT of their coverage-style names instead (polarity lived in the raw
+signal's sign); every test below now asserts against the literal coverage
+value, not the old complement.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import sys
+from unittest import mock
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import engram_core  # noqa: E402
+from health import metrics as hem  # noqa: E402
+from health.config import UNAVAILABLE  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Fixture DB — real nodes-table column shape (subset of engram_core.py's
+# CREATE TABLE nodes; only the columns any signal function in this module
+# actually SELECTs).
+# ---------------------------------------------------------------------------
+
+_NODES_DDL = """
+CREATE TABLE nodes (
+    id             TEXT PRIMARY KEY,
+    type           TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    evidence_id    TEXT,
+    status         TEXT DEFAULT 'active',
+    is_current     INTEGER DEFAULT 1,
+    metadata       TEXT DEFAULT '{}',
+    recall_summary  TEXT,
+    recall_keywords TEXT,
+    embedding       TEXT
+);
+
+CREATE TABLE edges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id   TEXT NOT NULL,
+    target_id   TEXT NOT NULL,
+    relation    TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE cascade_markers (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id                 TEXT NOT NULL REFERENCES nodes(id),
+    cascade_event           TEXT NOT NULL,
+    root_node               TEXT NOT NULL,
+    root_op                 TEXT NOT NULL CHECK (root_op IN ('retract', 'supersede')),
+    status                  TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'resolved')),
+    resolution_kind         TEXT,
+    resolution_replacement_id TEXT,
+    created_at              TEXT NOT NULL,
+    resolved_at             TEXT,
+    backfill_provenance     TEXT,
+    backfill_anomaly        INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(node_id, cascade_event)
+);
+"""
+
+
+def _make_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_NODES_DDL)
+    return conn
+
+
+def _insert(conn, id, type, created_at="t0", evidence_id=None, status="active",
+            is_current=1, metadata=None, recall_summary=None,
+            recall_keywords=None, embedding=None):
+    conn.execute(
+        "INSERT INTO nodes (id, type, created_at, evidence_id, status, is_current,"
+        " metadata, recall_summary, recall_keywords, embedding)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (id, type, created_at, evidence_id, status, is_current,
+         json.dumps(metadata) if metadata is not None else "{}",
+         recall_summary,
+         json.dumps(recall_keywords) if recall_keywords is not None else None,
+         embedding),
+    )
+    conn.commit()
+
+
+def _insert_edge(conn, source_id, target_id, relation, created_at="t0"):
+    conn.execute(
+        "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, ?, ?)",
+        (source_id, target_id, relation, created_at),
+    )
+    conn.commit()
+
+
+_marker_seq = 0
+
+
+def _insert_marker(conn, node_id, root_op, status="pending", cascade_event=None):
+    """Insert a cascade_markers row for node_id/root_op.
+
+    cascade_event defaults to an auto-generated unique value per call (each
+    call = a distinct cascade event by default), since the
+    UNIQUE(node_id, cascade_event) constraint means two markers on the same
+    node need distinct cascade_event values to coexist. Pass an explicit
+    cascade_event to simulate the same node caught in a specific event.
+    """
+    global _marker_seq
+    _marker_seq += 1
+    if cascade_event is None:
+        cascade_event = f"cev_{_marker_seq}"
+    conn.execute(
+        "INSERT INTO cascade_markers"
+        " (node_id, cascade_event, root_node, root_op, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (node_id, cascade_event, "root_x", root_op, status, "t0"),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Aspect A — pending_premise_rate (engram-alpha#2905 PR-B: unifies the prior
+# stale_derivation_rate + taint_rate signals into one -- a claim-bearing
+# node carrying EITHER a pending retract OR a pending supersede marker
+# counts once toward the numerator, regardless of cause).
+# ---------------------------------------------------------------------------
+
+
+class TestPendingPremiseRate:
+    def test_empty_denominator_is_unavailable(self):
+        """Zero current claim-bearing nodes -> UNAVAILABLE, not 0 or a
+        ZeroDivisionError."""
+        conn = _make_conn()
+        assert hem.pending_premise_rate(conn) is UNAVAILABLE
+
+    def test_mixed_pending_and_clean_claim_bearing_nodes(self):
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "ob_2", "observation_factual")
+        _insert(conn, "dv_1", "derivation")
+        _insert_marker(conn, "ob_1", "retract")
+        assert hem.pending_premise_rate(conn) == 1.0 / 3
+
+    def test_non_claim_bearing_nodes_excluded_from_denominator(self):
+        """A pending-looking marker on a non-claim-bearing node type (e.g.
+        definition) must not count toward either numerator or denominator —
+        only claim-bearing types are candidates."""
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "df_1", "definition")
+        _insert_marker(conn, "ob_1", "retract")
+        _insert_marker(conn, "df_1", "retract")
+        assert hem.pending_premise_rate(conn) == 1.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual", is_current=0)
+        _insert(conn, "ob_2", "observation_factual")
+        _insert_marker(conn, "ob_1", "retract")
+        assert hem.pending_premise_rate(conn) == 0.0
+
+    def test_resolved_marker_does_not_count_as_pending(self):
+        """A cascade_markers row with status='resolved' must NOT count —
+        this is the literal defect being fixed (resolving a marker must
+        change the rate). Also the cascade_markers-era translation of the
+        old metadata-based test that checked an empty ``stale_by``/
+        ``tainted_by`` list didn't count — same underlying intent ("a
+        technically-present but non-signaling marker must not count"),
+        expressed against the new source."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "dv_2", "derivation")
+        _insert_marker(conn, "dv_1", "supersede", status="resolved")
+        assert hem.pending_premise_rate(conn) == 0.0
+
+    def test_all_pending_is_one(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "dv_2", "derivation")
+        _insert_marker(conn, "dv_1", "supersede")
+        _insert_marker(conn, "dv_2", "supersede")
+        assert hem.pending_premise_rate(conn) == 1.0
+
+    def test_scope_is_claim_bearing_not_all_node_types(self):
+        """A pending-marked non-claim-bearing node (e.g. a contradiction)
+        must NOT affect this metric — scope is claim-bearing nodes, same
+        denominator taint_rate used (not stale_derivation_rate's narrower
+        derivations-only one, which is retired along with the metric)."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ct_1", "contradiction")
+        _insert_marker(conn, "ct_1", "supersede")
+        assert hem.pending_premise_rate(conn) == 0.0
+
+    def test_retract_marker_counts_on_any_claim_bearing_type(self):
+        """Unified from taint_rate: a pending root_op='retract' marker
+        counts, on ANY claim-bearing type (not just derivations — that
+        scope restriction was stale_derivation_rate's, now retired)."""
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "ob_2", "observation_factual")
+        _insert_marker(conn, "ob_1", "retract")
+        assert hem.pending_premise_rate(conn) == 0.5
+
+    def test_supersede_marker_counts_on_any_claim_bearing_type(self):
+        """Unified from stale_derivation_rate: a pending root_op='supersede'
+        marker counts, on ANY claim-bearing type (not just derivations)."""
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "ob_2", "observation_factual")
+        _insert_marker(conn, "ob_1", "supersede")
+        assert hem.pending_premise_rate(conn) == 0.5
+
+    def test_two_pending_markers_same_op_count_once_not_twice(self):
+        """A node caught in TWO cascade events of the SAME root_op (two
+        pending marker rows) still counts ONCE in the numerator —
+        COUNT(DISTINCT n.id), not marker-row count."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "dv_2", "derivation")
+        _insert_marker(conn, "dv_1", "supersede", cascade_event="cev_a")
+        _insert_marker(conn, "dv_1", "supersede", cascade_event="cev_b")
+        assert hem.pending_premise_rate(conn) == 0.5
+
+    def test_dedupes_one_node_both_marker_kinds(self):
+        """THE LOAD-BEARING DEDUP PROPERTY (engram-alpha#2905 PR-B, mirrors
+        tests/test_health_measurements.py::TestNumerators's L0-layer version
+        of this same property): a node carrying BOTH a pending retract
+        marker row AND a pending supersede marker row counts ONCE, not
+        twice — this is the whole reason unifying taint_rate/
+        stale_derivation_rate into one metric is sound: post-cascade-
+        machine, the two marker kinds do the same thing to a node's
+        usability as a premise."""
+        conn = _make_conn()
+        _insert(conn, "ax_1", "axiom")
+        _insert(conn, "ax_2", "axiom")
+        _insert_marker(conn, "ax_1", "retract")
+        _insert_marker(conn, "ax_1", "supersede")
+        assert hem.pending_premise_rate(conn) == 0.5
+
+    def test_dedup_control_via_row_count(self):
+        """THE REQUIRED CONTROL for the dedup test above (same discipline as
+        this module's other "a test that has only ever been seen to pass
+        has not been shown capable of failing" controls, and the rate-level
+        mirror of tests/test_health_measurements.py::TestNumerators's own
+        row-count control for this same dedup property at the L0 layer): on
+        a fixture with ONE claim-bearing node carrying TWO marker rows (one
+        retract, one supersede — same shape as the dedup test above, minus
+        the second clean node), a plain COUNT(n.id) — i.e. the mutation
+        COUNT(DISTINCT n.id) -> COUNT(n.id) would produce — is 2, genuinely
+        different from the real function's numerator of 1. Proves the dedup
+        assertion above is discriminating, not vacuously true on a fixture
+        where distinct-vs-row count happen to coincide."""
+        conn = _make_conn()
+        _insert(conn, "ax_1", "axiom")
+        _insert_marker(conn, "ax_1", "retract")
+        _insert_marker(conn, "ax_1", "supersede")
+        claim_bearing_types = tuple(sorted(engram_core.CLAIM_BEARING_TYPES))
+        placeholders = ",".join("?" * len(claim_bearing_types))
+        row_count = conn.execute(
+            f"""SELECT COUNT(n.id) as c
+                FROM nodes n
+                JOIN cascade_markers m ON m.node_id = n.id
+                WHERE n.is_current = 1 AND n.type IN ({placeholders})
+                  AND m.root_op IN ('retract', 'supersede') AND m.status = 'pending'""",
+            claim_bearing_types,
+        ).fetchone()["c"]
+        assert row_count == 2, (
+            "control setup failed: expected 2 marker rows on the one node"
+        )
+        # denominator is 1 (one claim-bearing node total), so a broken
+        # COUNT(n.id) mutation would read 2/1 == 2.0, not the real 1/1 == 1.0.
+        mutated_rate = row_count / 1
+        real_rate = hem.pending_premise_rate(conn)
+        assert real_rate == 1.0
+        assert real_rate != mutated_rate, (
+            "control failed: COUNT(DISTINCT n.id) coincided with the row "
+            "count on this fixture -- it would not catch the "
+            "COUNT(DISTINCT n.id) -> COUNT(n.id) mutation"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Aspect A — open_contradiction_rate
+# ---------------------------------------------------------------------------
+
+
+class TestOpenContradictionRate:
+    def test_empty_denominator_is_unavailable(self):
+        """Zero current contradiction nodes -> UNAVAILABLE, not a
+        fabricated 0.0 (CHANGED — engram-alpha#2520 round 2, fold #2,
+        2026-09-03: see this function's own docstring for why the design
+        doc's original 'clean' reasoning no longer holds). Matches
+        pending_premise_rate's own empty-denominator treatment exactly
+        (pending_premise_rate unifies the prior separate taint_rate/
+        stale_derivation_rate referenced here originally — engram-alpha#2905
+        PR-B)."""
+        conn = _make_conn()
+        assert hem.open_contradiction_rate(conn) is UNAVAILABLE
+
+    def test_active_counts_as_open(self):
+        conn = _make_conn()
+        _insert(conn, "ct_1", "contradiction", status="active")
+        _insert(conn, "ct_2", "contradiction", status="resolved")
+        assert hem.open_contradiction_rate(conn) == 0.5
+
+    def test_partially_resolved_counts_as_open(self):
+        conn = _make_conn()
+        _insert(conn, "ct_1", "contradiction", status="partially_resolved")
+        _insert(conn, "ct_2", "contradiction", status="resolved")
+        assert hem.open_contradiction_rate(conn) == 0.5
+
+    def test_all_resolved_is_zero(self):
+        conn = _make_conn()
+        _insert(conn, "ct_1", "contradiction", status="resolved")
+        _insert(conn, "ct_2", "contradiction", status="resolved")
+        assert hem.open_contradiction_rate(conn) == 0.0
+
+    def test_all_open_is_one(self):
+        conn = _make_conn()
+        _insert(conn, "ct_1", "contradiction", status="active")
+        _insert(conn, "ct_2", "contradiction", status="partially_resolved")
+        assert hem.open_contradiction_rate(conn) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect C — uncited_observation_rate
+# ---------------------------------------------------------------------------
+
+
+class TestUncitedObservationRate:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.uncited_observation_rate(conn) is UNAVAILABLE
+
+    def test_mixed_cited_and_uncited(self):
+        conn = _make_conn()
+        _insert(conn, "ev_1", "evidence")
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_1")
+        _insert(conn, "ob_2", "observation_factual", evidence_id=None)
+        _insert(conn, "ob_3", "observation_predictive", evidence_id=None)
+        assert hem.uncited_observation_rate(conn) == 2.0 / 3
+
+    def test_non_observation_types_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual", evidence_id=None)
+        _insert(conn, "dv_1", "derivation", evidence_id=None)
+        assert hem.uncited_observation_rate(conn) == 1.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "ob_1", "observation_factual", evidence_id=None, is_current=0)
+        _insert(conn, "ob_2", "observation_factual", evidence_id="ev_1")
+        assert hem.uncited_observation_rate(conn) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect C — dangling_evidence_rate
+# ---------------------------------------------------------------------------
+
+
+class TestDanglingEvidenceRate:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.dangling_evidence_rate(conn) is UNAVAILABLE
+
+    def test_mixed_dangling_and_cited(self):
+        conn = _make_conn()
+        _insert(conn, "ev_1", "evidence")
+        _insert(conn, "ev_2", "evidence")
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_2")
+        assert hem.dangling_evidence_rate(conn) == 0.5
+
+    def test_citation_from_non_current_observation_does_not_rescue_evidence(self):
+        """An evidence node cited only by a non-current (superseded/retracted)
+        observation is still dangling — the citing observation itself must
+        be current."""
+        conn = _make_conn()
+        _insert(conn, "ev_1", "evidence")
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_1", is_current=0)
+        assert hem.dangling_evidence_rate(conn) == 1.0
+
+    def test_non_current_evidence_excluded_from_denominator(self):
+        conn = _make_conn()
+        _insert(conn, "ev_1", "evidence", is_current=0)
+        _insert(conn, "ev_2", "evidence")
+        _insert(conn, "ob_1", "observation_factual", evidence_id="ev_2")
+        assert hem.dangling_evidence_rate(conn) == 0.0
+
+    def test_all_dangling_is_one(self):
+        conn = _make_conn()
+        _insert(conn, "ev_1", "evidence")
+        _insert(conn, "ev_2", "evidence")
+        assert hem.dangling_evidence_rate(conn) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — recall_summary_coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRecallSummaryCoverage:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.recall_summary_coverage(conn) is UNAVAILABLE
+
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
+        """Literal-coverage convention (engram-alpha#2518): return value is
+        the COVERED fraction, not the missing fraction. (Numerically
+        unchanged from the old complement for this specific 1-of-2 split —
+        0.5 is its own complement — but asserted here under the new,
+        correct reading.)"""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="a short summary")
+        _insert(conn, "ob_1", "observation_factual", recall_summary=None)
+        assert hem.recall_summary_coverage(conn) == 0.5
+
+    def test_all_covered_is_one(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="s1")
+        _insert(conn, "ob_1", "observation_factual", recall_summary="s2")
+        assert hem.recall_summary_coverage(conn) == 1.0
+
+    def test_all_missing_is_zero(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        assert hem.recall_summary_coverage(conn) == 0.0
+
+    def test_whitespace_only_summary_counts_as_missing(self):
+        """Mirrors engram_core._validate_recall_fields's own .strip() check
+        — a whitespace-only summary is absent, not a real one."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary="   ")
+        assert hem.recall_summary_coverage(conn) == 0.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        """A definition node (recall_summary-capable at write time, but NOT
+        claim-bearing) must not affect the rate either way."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary=None)
+        _insert(conn, "df_1", "definition", recall_summary="covered")
+        assert hem.recall_summary_coverage(conn) == 0.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_summary=None, is_current=0)
+        _insert(conn, "ob_1", "observation_factual", recall_summary="s")
+        assert hem.recall_summary_coverage(conn) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — recall_keywords_coverage
+# ---------------------------------------------------------------------------
+
+
+class TestRecallKeywordsCoverage:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.recall_keywords_coverage(conn) is UNAVAILABLE
+
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
+        """Literal-coverage convention (engram-alpha#2518): numerically
+        unchanged from the old complement for this 1-of-2 split (0.5 is its
+        own complement), asserted here under the new, correct reading."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=["kw1", "kw2"])
+        _insert(conn, "ob_1", "observation_factual", recall_keywords=None)
+        assert hem.recall_keywords_coverage(conn) == 0.5
+
+    def test_empty_list_counts_as_missing(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=[])
+        assert hem.recall_keywords_coverage(conn) == 0.0
+
+    def test_malformed_json_counts_as_missing(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        conn.execute(
+            "UPDATE nodes SET recall_keywords = ? WHERE id = ?",
+            ("{not valid json", "dv_1"),
+        )
+        conn.commit()
+        assert hem.recall_keywords_coverage(conn) == 0.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=None)
+        _insert(conn, "df_1", "definition", recall_keywords=["kw"])
+        assert hem.recall_keywords_coverage(conn) == 0.0
+
+    def test_non_current_excluded(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", recall_keywords=None, is_current=0)
+        _insert(conn, "ob_1", "observation_factual", recall_keywords=["kw"])
+        assert hem.recall_keywords_coverage(conn) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — embedding_coverage
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingCoverage:
+    """All tests below except the two in the 'embedder structurally
+    unavailable' block patch ``core._embedder.is_available`` to True — the
+    real test suite runs with ENGRAM_NO_EMBEDDINGS=1, under which it's
+    False, and these tests are exercising the per-node coverage-counting
+    logic, not the availability gate itself (that's covered separately
+    below, per Borges's PR3 colleague review 2026-08-23 blocker 1)."""
+
+    def test_empty_denominator_is_unavailable(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_default_fixture_state_is_all_missing(self):
+        """Mirrors the real ENGRAM_NO_EMBEDDINGS=1 test-suite gotcha flagged
+        in the PR3 build spec: without explicitly setting the embedding
+        column, every node reads as uncovered — literal coverage 0.0
+        (engram-alpha#2518)."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation")
+            _insert(conn, "ob_1", "observation_factual")
+            assert hem.embedding_coverage(conn) == 0.0
+
+    def test_mixed_covered_and_missing_returns_coverage_rate(self):
+        """A real populated embedding column (set directly in the fixture,
+        not via the real embedding pipeline) proves the 'has coverage'
+        branch actually works, not just the always-missing default.
+        Literal-coverage convention (engram-alpha#2518): numerically
+        unchanged from the old complement for this 1-of-2 split."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1, 0.2, 0.3]))
+            _insert(conn, "ob_1", "observation_factual", embedding=None)
+            assert hem.embedding_coverage(conn) == 0.5
+
+    def test_all_covered_is_one(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.2]))
+            assert hem.embedding_coverage(conn) == 1.0
+
+    def test_non_claim_bearing_nodes_excluded(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=None)
+            _insert(conn, "df_1", "definition", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) == 0.0
+
+    def test_non_current_excluded(self):
+        with mock.patch("engram_core._embedder.is_available", return_value=True):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=None, is_current=0)
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) == 1.0
+
+    # -- embedder structurally unavailable: a CONFIGURATION state, must gate
+    #    to UNAVAILABLE regardless of what the embedding column holds
+    #    (Borges, PR3 colleague review, 2026-08-23, blocker 1) --------------
+
+    def test_embedder_unavailable_is_unavailable_even_with_real_data(self):
+        """Even a graph with real, populated embeddings must read as
+        UNAVAILABLE (not a real coverage number) when the embedder is
+        structurally unavailable in THIS install -- the column contents are
+        irrelevant to a metric that can't be trusted to reflect a live
+        install's actual retrievability."""
+        with mock.patch("engram_core._embedder.is_available", return_value=False):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            _insert(conn, "ob_1", "observation_factual", embedding=json.dumps([0.2]))
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_embeddings_disabled_in_config_is_unavailable(self):
+        """The other half of the compound gate: is_available() True but
+        embeddings disabled via config still reads as UNAVAILABLE."""
+        with mock.patch("engram_core._embedder.is_available", return_value=True), \
+             mock.patch("engram_core._get_embedding_config", return_value={"enabled": False}):
+            conn = _make_conn()
+            _insert(conn, "dv_1", "derivation", embedding=json.dumps([0.1]))
+            assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+    def test_default_test_suite_state_is_unavailable(self):
+        """No patching at all -- the real ENGRAM_NO_EMBEDDINGS=1 test-suite
+        default. Documents the gate is actually active under the same
+        conditions every other test in this module runs under."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        assert hem.embedding_coverage(conn) is UNAVAILABLE
+
+
+# ---------------------------------------------------------------------------
+# Aspect B — giant_component_fraction
+# ---------------------------------------------------------------------------
+
+
+class TestGiantComponentFraction:
+    def test_empty_denominator_is_unavailable(self):
+        conn = _make_conn()
+        assert hem.giant_component_fraction(conn) is UNAVAILABLE
+
+    def test_single_node_is_fully_connected(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        assert hem.giant_component_fraction(conn) == 1.0
+
+    def test_disconnected_nodes_are_fully_fragmented(self):
+        """Two claim-bearing nodes, no edge between them -> each is its own
+        singleton component -> largest=1/total=2 -> giant-component fraction
+        0.5. Numerically unchanged from the old fragmentation-rate reading
+        (engram-alpha#2518) since 0.5 is the curve's own fixed point
+        (1 - 0.5 == 0.5) — asserted here under the new, literal reading."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        assert hem.giant_component_fraction(conn) == 0.5
+
+    def test_edge_between_claim_bearing_nodes_connects_them(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert_edge(conn, "dv_1", "ob_1", "derives_from")
+        assert hem.giant_component_fraction(conn) == 1.0
+
+    def test_edge_through_non_claim_bearing_node_does_not_bridge(self):
+        """The induced subgraph only counts an edge if BOTH endpoints are
+        claim-bearing — a path through a non-claim-bearing node (e.g.
+        evidence) must NOT connect the two claim-bearing nodes either side
+        of it."""
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert(conn, "ev_1", "evidence")
+        _insert_edge(conn, "dv_1", "ev_1", "derives_from")
+        _insert_edge(conn, "ev_1", "ob_1", "cites")
+        # dv_1 and ob_1 remain disconnected in the induced claim-bearing
+        # subgraph -> still fully fragmented, same as no edges at all.
+        assert hem.giant_component_fraction(conn) == 0.5
+
+    def test_three_node_chain_all_claim_bearing_is_fully_connected(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation")
+        _insert(conn, "dv_2", "derivation")
+        _insert(conn, "ob_1", "observation_factual")
+        _insert_edge(conn, "dv_1", "dv_2", "derives_from")
+        _insert_edge(conn, "dv_2", "ob_1", "derives_from")
+        assert hem.giant_component_fraction(conn) == 1.0
+
+    def test_non_current_nodes_excluded_from_population(self):
+        conn = _make_conn()
+        _insert(conn, "dv_1", "derivation", is_current=0)
+        _insert(conn, "ob_1", "observation_factual")
+        assert hem.giant_component_fraction(conn) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Shared aspect scoring — aspect_geometric_mean_scoring
+# ---------------------------------------------------------------------------
+
+
+class TestAspectGeometricMeanScoring:
+    def test_all_perfect_rates_score_100(self):
+        assert hem.aspect_geometric_mean_scoring({"m1": 0.0, "m2": 0.0}) == 100.0
+
+    def test_any_unavailable_propagates(self):
+        assert hem.aspect_geometric_mean_scoring(
+            {"m1": 0.0, "m2": UNAVAILABLE}
+        ) is UNAVAILABLE
+
+    def test_empty_raw_by_metric_is_unavailable(self):
+        assert hem.aspect_geometric_mean_scoring({}) is UNAVAILABLE
+
+    def test_single_metric_matches_the_transform_directly(self):
+        # good = 100*(1-rate); geometric mean of a single value is itself.
+        assert hem.aspect_geometric_mean_scoring({"m1": 0.25}) == 75.0
+
+    def test_full_collapse_floors_at_one_not_zero(self):
+        """rate=1.0 -> good=0, floored to 1 (design doc §3's floor, applied
+        one level down per this PR's aspect-scoring judgment call) — never a
+        literal 0, which would make the geometric mean permanently zero
+        regardless of other metrics."""
+        assert hem.aspect_geometric_mean_scoring({"m1": 1.0}) == 1.0
+
+    def test_two_metrics_geometric_mean_is_lower_than_arithmetic_mean(self):
+        """One perfect metric + one badly collapsed metric should read closer
+        to the collapsed one than a naive average would — the whole point of
+        geometric mean over arithmetic mean (a collapsed metric drags the
+        aspect down, not averaged away)."""
+        score = hem.aspect_geometric_mean_scoring({"good": 0.0, "bad": 0.9})
+        arithmetic_mean = (100.0 + 10.0) / 2  # 55.0
+        assert score < arithmetic_mean
+        assert score == pytest.approx((100.0 * 10.0) ** 0.5)

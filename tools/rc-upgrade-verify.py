@@ -63,6 +63,72 @@ def bank(nodes, entries, events, by_op, anomalies, gate_past):
         print(f"NOTE: could not write {BASELINE} ({e}) — paste the line above instead.")
 
 
+def _report_clean(exp_nodes, exp_entries, exp_events, by_op, anom, already_migrated=False):
+    """Shared CLEAN-result reporting for the two paths that can reach it: a
+    migration that just ran this call, and one whose gate was already past
+    but whose existing cascade_markers already agree with the independent
+    pre-count (added after this exact case gave a false FAIL — see the
+    'already migrated, matches' branch in main())."""
+    qualifier = " (migrated earlier, not by this run)" if already_migrated else ""
+    print(f"\nRESULT: CLEAN{qualifier} — two independent signals agree at "
+          f"{exp_nodes} nodes / {exp_entries} markers / {exp_events} events.")
+    # CURRENT is the qualifier that decides it: rung 5 selects
+    # "WHERE is_current = 1", so NON-current tainted_by exercises nothing.
+    # (Ariadne caught my earlier ask omitting this — it would have
+    # collected seats reading raw counts who test nothing.)
+    if by_op["retract"] == 0:
+        print("COVERAGE: tainted_by->retract NOT exercised (0 CURRENT tainted_by).")
+    else:
+        print(f"COVERAGE: *** this seat exercises tainted_by->retract "
+              f"({by_op['retract']} CURRENT) — POST THIS. No measured seat has. ***")
+    print(f"COVERAGE: anomaly branch {'exercised (%d)' % anom if anom else 'NOT exercised'}.")
+    print("\nPRE-REGISTER THESE for tonight, before you upgrade — paste to #2411:")
+    print(f"  seat=<you> nodes={exp_nodes} markers={exp_entries} events={exp_events} "
+          f"by_op={{'supersede': {by_op['supersede']}, 'retract': {by_op['retract']}}} anomalies={anom}")
+    if already_migrated:
+        print("  (the gate is already past on your live DB too — tonight's real "
+              "\n   migration will find nothing to do and print no line; these numbers "
+              "\n   are your already-migrated baseline instead of a pre-migration one)")
+    else:
+        print("  (tonight's real migration must print exactly this node count; anything"
+              "\n   else is a signal rather than a number with nothing to compare against)")
+    bank(exp_nodes, exp_entries, exp_events, by_op, anom, already_migrated)
+
+
+def _bf_scoped_counts(c):
+    """Backfill-origin-only counts (rows, nodes, events, anomalies, by_op),
+    scoped via `backfill_provenance IS NOT NULL`.
+
+    A live retract/supersede cascade (engram_revision.py's cascade-marking,
+    not the one-time backfill in engram_core.py) inserts into
+    cascade_markers with backfill_provenance left NULL -- and precount()
+    can only ever see legacy nodes.metadata, which is retired as a store
+    the moment a seat is migrated (engram_core.py:7190). An UNSCOPED table
+    read therefore diverges from precount() on any already-migrated seat
+    that did an ordinary supersede/retract-with-dependents before running
+    this script: the SAME false-FAIL class this script exists to remove,
+    one case over (Borges's colleague catch, PR #2461 review, 2026-08-30).
+
+    IS NOT NULL, not '= recovered': precount() reconstructs every legacy
+    backfill entry regardless of whether its original timestamp was
+    recoverable from edit_history -- the same set the migration's own
+    self-check counts as its TOTAL marker count (engram_core.py:3409), not
+    just the 'recovered' subset it separately reports as a sub-metric
+    (:3413). Matching that existing scoping choice, not guessing a new one."""
+    rows   = c.execute("SELECT COUNT(*) FROM cascade_markers "
+                        "WHERE backfill_provenance IS NOT NULL").fetchone()[0]
+    rnodes = c.execute("SELECT COUNT(DISTINCT node_id) FROM cascade_markers "
+                        "WHERE backfill_provenance IS NOT NULL").fetchone()[0]
+    events = c.execute("SELECT COUNT(DISTINCT cascade_event) FROM cascade_markers "
+                        "WHERE backfill_provenance IS NOT NULL").fetchone()[0]
+    anom   = c.execute("SELECT COUNT(*) FROM cascade_markers WHERE backfill_anomaly "
+                        "AND backfill_provenance IS NOT NULL").fetchone()[0]
+    ops    = dict(c.execute("SELECT root_op, COUNT(*) FROM cascade_markers "
+                             "WHERE backfill_provenance IS NOT NULL "
+                             "GROUP BY root_op").fetchall())
+    return rows, rnodes, events, anom, ops
+
+
 def precount(db):
     """Structured key-presence. NOT truthiness (eats empty lists, under-counts).
     NOT substring (eats the phrase in prose, over-counts). Both were measured
@@ -137,14 +203,25 @@ def main():
         if line is None:
             c = sqlite3.connect(copy)
             try:
-                rows = c.execute("SELECT COUNT(*) FROM cascade_markers").fetchone()[0]
+                total_rows = c.execute("SELECT COUNT(*) FROM cascade_markers").fetchone()[0]
             except sqlite3.OperationalError:
-                rows = None          # table absent entirely
+                total_rows = None          # table absent entirely
             uv = c.execute("PRAGMA user_version").fetchone()[0]
+            # Defined unconditionally so the "already migrated, matches" check
+            # below never depends on and-chain short-circuit order for safety
+            # (a reviewer-fairy flagged the implicit version as fragile to a
+            # future reorder — PR #2461 review, 2026-08-30). Backfill-origin
+            # scoped (see _bf_scoped_counts) so a live-path marker (from an
+            # ordinary post-migration supersede/retract, not the backfill)
+            # can't inflate these against a precount that will never see it.
+            rows, rnodes, events, anom, ops = 0, 0, 0, 0, {}
+            if total_rows:
+                rows, rnodes, events, anom, ops = _bf_scoped_counts(c)
             c.close()
             print(f"MIGRATION DID NOT REPORT (user_version={uv}, "
-                  f"cascade_markers rows={rows if rows is not None else 'NO TABLE'})")
-            if exp_nodes == 0 and rows in (0, None):
+                  f"cascade_markers rows={total_rows if total_rows is not None else 'NO TABLE'} "
+                  f"total, {rows} backfill-origin)")
+            if exp_nodes == 0 and rows == 0:
                 print("\nRESULT: CLEAN — nothing to migrate on this seat, and the "
                       "migration is already gated off. Both signals agree at zero.")
                 print("COVERAGE: this seat exercises NO migration branch at all.")
@@ -152,19 +229,40 @@ def main():
                       f"(gate already past; expect no migration line tonight)")
                 bank(0, 0, 0, {"supersede": 0, "retract": 0}, 0, True)
                 return
+            # Third case, missed until a real seat hit it (#2411, 2026-08-30):
+            # gate already past AND legacy markers exist AND the existing
+            # cascade_markers rows already agree with the independent
+            # pre-count on every dimension. That is a seat whose migration
+            # ran successfully at some earlier DB touch (rung 5 fires lazily
+            # on ANY touch, not just tonight's) — a clean pass, not a failure.
+            # Conflating it with "gated off and truly unmigrated" produced a
+            # false FAIL on a seat whose MCP server had been active all day.
+            if (rows and rnodes == exp_nodes and rows == exp_entries
+                    and events == exp_events and ops.get("supersede", 0) == by_op["supersede"]
+                    and ops.get("retract", 0) == by_op["retract"]):
+                print("NOTE: gate already past, but existing cascade_markers already "
+                      "agree with the independent pre-count on every dimension — this "
+                      "seat's migration completed at an earlier DB touch, not tonight.")
+                _report_clean(exp_nodes, exp_entries, exp_events, by_op, anom,
+                              already_migrated=True)
+                return
             sys.exit(f"RESULT: FAIL — the migration is gated off (user_version={uv}) "
                      f"but this seat has {exp_nodes} nodes of legacy markers to "
-                     f"migrate. They will NOT be migrated and nothing else would "
-                     f"have said so. Do not upgrade until this is understood.")
+                     f"migrate and the existing cascade_markers state does not "
+                     f"account for them. They will NOT be migrated and nothing "
+                     f"else would have said so. Do not upgrade until this is "
+                     f"understood.")
         print(f"MIGRATION SAYS: {line.strip()}")
 
         got = int(line.split("backfill):")[1].split("nodes")[0].strip())
         c = sqlite3.connect(copy)
-        rows   = c.execute("SELECT COUNT(*) FROM cascade_markers").fetchone()[0]
-        rnodes = c.execute("SELECT COUNT(DISTINCT node_id) FROM cascade_markers").fetchone()[0]
-        events = c.execute("SELECT COUNT(DISTINCT cascade_event) FROM cascade_markers").fetchone()[0]
-        anom   = c.execute("SELECT COUNT(*) FROM cascade_markers WHERE backfill_anomaly").fetchone()[0]
-        ops    = dict(c.execute("SELECT root_op, COUNT(*) FROM cascade_markers GROUP BY root_op").fetchall())
+        # Same backfill-origin scoping as the gate-already-past branch (see
+        # _bf_scoped_counts) — a no-op on a fresh migration's first run
+        # (the table can't hold a live-path marker before it exists to
+        # cascade-mark into), but keeps both CLEAN-reaching code paths
+        # reading cascade_markers the same way rather than one scoped and
+        # one not (Borges's Suggestion 1, PR #2461 review).
+        rows, rnodes, events, anom, ops = _bf_scoped_counts(c)
         c.close()
         print(f"IN TABLE: {rows} rows, {rnodes} nodes, {events} events, "
               f"{anom} anomalies, by_op={ops}")
@@ -177,24 +275,7 @@ def main():
         if fails:
             print("\n".join("MISMATCH: " + f for f in fails))
             sys.exit("RESULT: FAIL — do not upgrade until this is understood.")
-        print(f"\nRESULT: CLEAN — two independent signals agree at {exp_nodes} nodes / "
-              f"{exp_entries} markers / {exp_events} events.")
-        # CURRENT is the qualifier that decides it: rung 5 selects
-        # "WHERE is_current = 1", so NON-current tainted_by exercises nothing.
-        # (Ariadne caught my earlier ask omitting this — it would have
-        # collected seats reading raw counts who test nothing.)
-        if by_op["retract"] == 0:
-            print("COVERAGE: tainted_by->retract NOT exercised (0 CURRENT tainted_by).")
-        else:
-            print(f"COVERAGE: *** this seat exercises tainted_by->retract "
-                  f"({by_op['retract']} CURRENT) — POST THIS. No measured seat has. ***")
-        print(f"COVERAGE: anomaly branch {'exercised (%d)' % anom if anom else 'NOT exercised'}.")
-        print("\nPRE-REGISTER THESE for tonight, before you upgrade — paste to #2411:")
-        print(f"  seat=<you> nodes={exp_nodes} markers={exp_entries} events={exp_events} "
-              f"by_op={{'supersede': {by_op['supersede']}, 'retract': {by_op['retract']}}} anomalies={anom}")
-        print("  (tonight's real migration must print exactly this node count; anything"
-              "\n   else is a signal rather than a number with nothing to compare against)")
-        bank(exp_nodes, exp_entries, exp_events, by_op, anom, False)
+        _report_clean(exp_nodes, exp_entries, exp_events, by_op, anom)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

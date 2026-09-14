@@ -3,6 +3,12 @@ __pycache__/
 *.pyc
 *.pyo
 
+# Coverage instrumentation output (#2774) — local pytest-cov / coverage-diff.sh
+# runs write these at the repo root; never intended to be committed.
+.coverage
+coverage.xml
+htmlcov/
+
 # HuggingFace / sentence-transformers caches that may land in CWD when a
 # tool runs with HF_HOME unset or empty (e.g. an install-sandbox shell
 # that forgets to pin the cache path). The model is ~90 MB — keep it

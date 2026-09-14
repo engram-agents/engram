@@ -727,12 +727,23 @@ def _diagnose_impl() -> str:
         epistemic["weakly_grounded"] = weakly_grounded
 
         # Single-source derivations
-        single_source_dvs = conn.execute("""
-            SELECT COUNT(*) as c FROM nodes n
-            WHERE n.type = 'derivation' AND n.is_current = 1
-              AND (SELECT COUNT(*) FROM edges e
-                   WHERE e.source_id = n.id AND e.relation = 'derives_from') <= 1
-        """).fetchone()["c"]
+        # #2624: same one-hop-premise question as engram_lifecycle.py's
+        # "thin support" scan (identical metric, sibling module) -- ranges
+        # over core.CITATION_SUPPORT_RELATIONS (derives_from, supported_by,
+        # acknowledged_derives_from), the general "direct premises" notion
+        # core._direct_premise_ids uses, not the confidence-formula's
+        # narrower core.CASCADE_RELATIONS (which excludes supported_by
+        # deliberately -- see #2618's engram_core.py comment). This is a
+        # grounding-breadth health metric, not a confidence recompute.
+        _single_source_rels = sorted(core.CITATION_SUPPORT_RELATIONS)
+        single_source_dvs = conn.execute(
+            "SELECT COUNT(*) as c FROM nodes n "
+            "WHERE n.type = 'derivation' AND n.is_current = 1 "
+            "AND (SELECT COUNT(*) FROM edges e "
+            "WHERE e.source_id = n.id AND e.relation IN "
+            f"({','.join('?' for _ in _single_source_rels)})) <= 1",
+            tuple(_single_source_rels),
+        ).fetchone()["c"]
         epistemic["single_source_derivations"] = single_source_dvs
 
         # Tainted nodes. Migrated off metadata.tainted_by to cascade_markers
@@ -995,12 +1006,22 @@ def _diagnose_impl() -> str:
         cross_ev = 0
         single_ev = 0
         pure_chain = 0
+        # #2624: enumerating a derivation's direct premises is exactly what
+        # core._direct_premise_ids does, over core.CITATION_SUPPORT_RELATIONS
+        # (derives_from, supported_by, acknowledged_derives_from) -- not the
+        # confidence-formula's narrower core.CASCADE_RELATIONS. This metric
+        # asks "how many distinct evidence sources feed this derivation,"
+        # which wants the general premise notion (a supported_by premise's
+        # evidence counts toward diversity same as a derives_from one), not
+        # the formula-input-only set.
+        _cross_ev_rels = sorted(core.CITATION_SUPPORT_RELATIONS)
         for dv in dv_rows:
             premises = conn.execute(
-                """SELECT n.evidence_id FROM edges e
-                   JOIN nodes n ON e.target_id = n.id
-                   WHERE e.source_id = ? AND e.relation = 'derives_from'""",
-                (dv["id"],),
+                "SELECT n.evidence_id FROM edges e "
+                "JOIN nodes n ON e.target_id = n.id "
+                "WHERE e.source_id = ? AND e.relation IN "
+                f"({','.join('?' for _ in _cross_ev_rels)})",
+                (dv["id"], *_cross_ev_rels),
             ).fetchall()
             ev_set = {p["evidence_id"] for p in premises if p["evidence_id"]}
             if len(ev_set) > 1:

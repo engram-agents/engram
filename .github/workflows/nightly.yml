@@ -14,10 +14,12 @@ name: nightly
 # default — so this exercises dev, which is the whole point.
 on:
   schedule:
-    # 07:37 UTC daily — deliberately off-peak and off-:00. GitHub queues
-    # on-the-hour scheduled runs heavily and can skip them under load; an
-    # odd minute lands far more reliably.
-    - cron: "37 7 * * *"
+    # 03:37 UTC daily. Cron is UTC, so this is 23:37 EDT / 22:37 EST — after
+    # the team's sleep time, leaving ~4h of queue headroom before the morning
+    # read. Deliberately off-peak and off-:00: GitHub queues on-the-hour
+    # scheduled runs heavily and can skip them under load; an odd minute
+    # lands far more reliably.
+    - cron: "37 3 * * *"
   workflow_dispatch:
 
 permissions:
@@ -40,6 +42,23 @@ jobs:
       # Skip the optional sentence-transformers embedding path so we don't pay
       # the ~500MB model download per run. Tests pass either way. (Mirrors
       # tests.yml / affected-tests.yml.)
+      #
+      # ⚠ COVERAGE TRAP (#2774): with this flag set, the sentence-transformers
+      # / embedding code path (EmbeddingManager._load_model / .embed's model
+      # branch in engram_core.py; the CrossEncoder path; the embedding-gate
+      # check in server.py) is NEVER exercised in this run — not because it's
+      # dead code, but because THIS configuration deliberately skips it. Under
+      # the coverage-as-spec-completeness-finder framing (#2774), an uncovered
+      # line is a candidate flaw-register entry — so without this note, every
+      # night manufactures a false flaw for the embedding path. No .coveragerc
+      # exclusion is applied for it: the embedding code is interleaved inside
+      # large, otherwise-well-tested files (engram_core.py, server.py) rather
+      # than isolated in its own module, so a file-level `omit` would hide real
+      # gaps in those files, and a line/block-level `exclude_lines` regex
+      # risked being wrong in a way that's hard to verify without a second
+      # coverage run under ENGRAM_NO_EMBEDDINGS=0. The "Write coverage summary"
+      # step below annotates this explicitly instead — read its output before
+      # treating embedding-path lines as a real gap.
       ENGRAM_NO_EMBEDDINGS: "1"
     steps:
       - uses: actions/checkout@v4
@@ -63,6 +82,46 @@ jobs:
       - name: Run full pytest suite
         # Same explicit paths as tests.yml (pytest.ini sets no testpaths):
         # the main suite AND src/forum/tests/.
+        #
+        # Coverage (#2774): --cov-branch, not line-only — a line executed on
+        # only one side of an `if` is a behaviour half-specified, and this
+        # coverage run is a SPEC-completeness finder (candidate flaw-register
+        # entries), not a quality gate. Deliberately NO --cov-fail-under and
+        # no threshold anywhere in this workflow — the output is a list of
+        # uncovered locations, not a number to optimise.
+        #
+        # ⚠ WAS A DEFECT — FIXED BY THE SINGLE `--cov=src` ROOT BELOW. DO NOT
+        # "clarify" it back into `--cov=src/engram --cov=src/forum`. That was
+        # the original shape here, and it silently broke coverage.xml (not the
+        # terminal report, not htmlcov/ — only the XML that diff-cover and the
+        # "Write coverage summary" step below both parse): coverage.py's
+        # Cobertura writer groups classes by (package, filename) relative to
+        # each --cov root, and both src/engram and src/forum have a root "."
+        # package containing a file named server.py — the two roots' XML
+        # <class filename="server.py"> entries collided into ONE, one
+        # silently overwriting the other (verified: reordering the two --cov
+        # flags did not change which one won, so this wasn't a simple
+        # ordering fix). A single `--cov=src` root resolves it — coverage.py
+        # then emits distinct filename="engram/server.py" and
+        # filename="forum/server.py" entries (verified by grepping the
+        # emitted XML for filename="[^"]*server\.py" under both shapes).
+        #
+        # The single-root switch has its OWN failure mode if unaccompanied:
+        # neither src/engram nor src/build has a top-level __init__.py, and
+        # coverage.py's "report files nobody ever imported, as a gap" walk
+        # requires __init__.py in every subdirectory below the named --cov
+        # root unless `include_namespace_packages = True` — so `.coveragerc`
+        # carries that setting, and it is NOT optional decoration. See
+        # `.coveragerc`'s own `[report]` comment for the measured before/after
+        # (22 vs 137 engram files reported on an identical test subset).
+        #
+        # SCOPE CONSEQUENCE, named rather than left to be discovered: src/
+        # holds THREE packages (src/build, src/engram, src/forum), so
+        # `--cov=src` also brings src/build (the packaging/build engine) into
+        # the measured set — the old two-root flag excluded it. Judged
+        # correct, not incidental: build code is production code whose
+        # behaviour should be specified too, under this project's
+        # prescriptive-SPEC framing.
         id: suite
         shell: bash
         run: |
@@ -71,7 +130,128 @@ jobs:
           # success()` closes any open ci-nightly issue on a red suite
           # (umwelt#738 round 1 / CLAUDE.md's umwelt#558 pipe-exit note).
           set -o pipefail
-          pytest tests/ src/forum/tests/ -v --tb=short 2>&1 | tee /tmp/nightly-output.log
+          pytest tests/ src/forum/tests/ -v --tb=short \
+            --cov=src --cov-branch \
+            --cov-report=xml:coverage.xml --cov-report=html:htmlcov --cov-report=term \
+            2>&1 | tee /tmp/nightly-output.log
+
+      - name: Upload coverage artifacts
+        # A red suite should still yield its partial report (#2774) — hence
+        # if: always() rather than the implicit success()-only default.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Write coverage summary
+        # #2774 — coverage is a SPEC-completeness finder: this writes total %
+        # plus the lowest-covered files to the run page summary so the number
+        # is readable without downloading the artifact. if: always() so a red
+        # suite still gets its partial summary (pytest-cov writes coverage.xml
+        # even when tests fail, unless the run crashes before pytest starts).
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          import xml.etree.ElementTree as ET
+
+          path = "coverage.xml"
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          def write(text):
+              if summary_path:
+                  with open(summary_path, "a") as f:
+                      f.write(text)
+              else:
+                  print(text, end="")
+
+          if not os.path.isfile(path):
+              write(
+                  "## Coverage (issue #2774)\n\n"
+                  "`coverage.xml` was not produced -- the suite likely failed before "
+                  "pytest-cov could write it. No coverage summary available for this "
+                  "run.\n"
+              )
+              raise SystemExit(0)
+
+          try:
+              root = ET.parse(path).getroot()
+          except ET.ParseError as e:
+              # A present-but-malformed/truncated coverage.xml (e.g. the
+              # runner OOMs or is killed mid-write) must fail loud with a
+              # clear message naming the file, not a bare traceback -- and
+              # not silently emit nothing either (that would be the same
+              # silent-failure class this whole PR exists to close). Same
+              # "no coverage summary available" fallback shape as the
+              # missing-file guard above.
+              write(
+                  "## Coverage (issue #2774)\n\n"
+                  "`{}` could not be parsed as XML ({}). It was produced but "
+                  "is malformed or truncated -- likely the run was killed "
+                  "mid-write. No coverage summary available for this "
+                  "run.\n".format(path, e)
+              )
+              raise SystemExit(0)
+
+          line_rate = float(root.get("line-rate", "0"))
+          branch_rate = float(root.get("branch-rate", "0"))
+
+          rows = []
+          for package in root.findall(".//package"):
+              for cls in package.findall("./classes/class"):
+                  # filename is already the full path relative to the --cov=src
+                  # root (e.g. "engram/server.py", "build/engine/build.py") --
+                  # verified against a real run with include_namespace_packages
+                  # = True (#2774): do NOT prepend the package name too, that
+                  # double-counts it (package "build.engine" + filename
+                  # "build/engine/build.py" would wrongly read
+                  # "build.engine/build/engine/build.py").
+                  display = cls.get("filename", "")
+                  lr = float(cls.get("line-rate", "0"))
+                  br_attr = cls.get("branch-rate")
+                  br = float(br_attr) if br_attr is not None else None
+                  lines = cls.findall("./lines/line")
+                  lines_valid = len(lines)
+                  branches_valid = sum(1 for ln in lines if ln.get("branch") == "true")
+                  if lines_valid == 0:
+                      continue
+                  sort_key = br if (br is not None and branches_valid > 0) else lr
+                  rows.append((sort_key, display, lr, br))
+
+          rows.sort(key=lambda r: r[0])
+          lowest = rows[:10]
+
+          out = []
+          out.append("## Coverage (issue #2774 -- spec-completeness finder, not a quality gate)\n\n")
+          out.append("**Total: {:.1f}% line / {:.1f}% branch**\n\n".format(line_rate * 100, branch_rate * 100))
+          out.append(
+              "One known blind spot in this report -- read before treating a row "
+              "below as a real gap: `ENGRAM_NO_EMBEDDINGS=1` skips the "
+              "sentence-transformers / embedding path (in `engram_core.py`, "
+              "`server.py`) -- it is not dead code, this run configuration "
+              "deliberately doesn't exercise it. See the workflow's own comment "
+              "above the pytest step.\n\n"
+              "(A prior version of this report also warned that "
+              "`src/engram/server.py` and `src/forum/server.py` collided into "
+              "one XML row -- fixed by switching to a single `--cov=src` root; "
+              "see the workflow's comment above the pytest step and "
+              "`.coveragerc`'s `[report]` comment for why that flag must stay "
+              "as one root.)\n\n"
+          )
+          out.append("**Lowest-covered files** (branch coverage where available, else line):\n\n")
+          out.append("| file | line % | branch % |\n|---|---|---|\n")
+          for _, display, lr, br in lowest:
+              br_s = "{:.1f}%".format(br * 100) if br is not None else "n/a"
+              out.append("| `{}` | {:.1f}% | {} |\n".format(display, lr * 100, br_s))
+
+          write("".join(out))
+          PYEOF
 
       - name: ensure the ci-nightly label exists
         # gh label create --force is idempotent, so this is safe to run every

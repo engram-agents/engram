@@ -177,7 +177,8 @@ unchanged) and split from a new, independent `dag` (real edge-walk
 acyclicity) flag, not shown in this table (this doc covers the CB/NCB
 partition, not DAG/acyclicity design — see `engram_dag_conformance.py` and
 issue #2357 for that property). For every relation below except
-`acknowledged_derives_from`, `dag` equals `temporal_causal`.
+`acknowledged_derives_from` and `generalizes` (#2753 epic WS1, 2026-09-10),
+`dag` equals `temporal_causal`.
 
 | relation | cascade | provenance | temporal_causal | removable | notes |
 |---|---|---|---|---|---|
@@ -192,6 +193,7 @@ issue #2357 for that property). For every relation below except
 | `contradicts` | False | False | False | False | structural commitment, DAG-exempt |
 | `exemplifies` | False | False | False | True | incident→lesson membership, DAG-exempt |
 | `instantiates` | False | False | False | True | achievement-shaped relevance marker, DAG-exempt |
+| `generalizes` | False | False | False | True | #2753 epic WS1: general→specific abstraction/membership edge — NOT DAG-exempt (`dag=True`, real acyclicity, cycle-guarded at write time; diverges from `temporal_causal` like `acknowledged_derives_from` above) |
 | `resolves` | False | False | False | False | back-reference, DAG-exempt |
 | `serves` | False | False | False | True | intent-shaped relevance marker, DAG-exempt |
 | `subtask_of` | False | False | True | True | |

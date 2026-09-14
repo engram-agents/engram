@@ -388,11 +388,11 @@ Entry points:
 
 **how** — Columns (added via migration in `engram_core.py` DB init): recall_summary (TEXT), recall_keywords (TEXT JSON array). Fetch in `_build_inspect_recall_view()` in `engram_query.py:704` and tiered result rendering in `_build_tiered_results()` in `engram_query.py:1601`.
 
-Tool: `engram_set_recall_summaries()` (16872–16965) batch-applies valid entries, returns per-item errors. Validation via `tools/recall_summary_validator.py` (single source of truth for both this tool and summary-fairy).
+Tool: `engram_set_recall_summaries()` (`engram_recall_summaries.py:63–219`) batch-applies valid entries, returns per-item errors. Accepts EXACTLY ONE of inline `summaries` or an absolute-path `summaries_file` (reads + parses that JSON file, same `{"summaries": [...], "failures": [...]}` shape — for large batches, e.g. the sleep cycle's cohort-dispatch output; a relative path is rejected; the response echoes `summaries_file` back on the file-path call). Validation via `tools/recall_summary_validator.py` (single source of truth for both this tool and summary-fairy).
 
 **status-candidate** — **prod-presumed** (infrastructure active; backfill depends on sleep-cycle execution).
 
-**files** — `engram_core.py` (column migrations in DB init). `engram_query.py` (`_build_inspect_recall_view()` :704; `_build_tiered_results()` :1601). `engram_recall_summaries.py` (batch-write impl). server.py (wrapper `engram_set_recall_summaries` :5097). `tools/recall_summary_validator.py` (validation constants).
+**files** — `engram_core.py` (column migrations in DB init). `engram_query.py` (`_build_inspect_recall_view()` :704; `_build_tiered_results()` :1601). `engram_recall_summaries.py` (batch-write impl). server.py (wrapper `engram_set_recall_summaries` :6933). `tools/recall_summary_validator.py` (validation constants).
 
 **key constants** — Max 120 chars (soft), 200 chars (hard cap: `RECALL_SUMMARY_HARD_CAP` in `tools/recall_summary_validator.py:19`).
 

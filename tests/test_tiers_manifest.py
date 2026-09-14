@@ -103,12 +103,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
+import tempfile
 
 import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MANIFEST_PATH = os.path.join(REPO_ROOT, "src", "build", "packaging", "tiers.json")
 BUILD_PLUGIN_SH = os.path.join(REPO_ROOT, "tools", "build-plugin.sh")
+
+sys.path.insert(0, REPO_ROOT)
+from tools import telemetry_manifest_gate as telemetry_gate  # noqa: E402
 
 VALID_TIERS = {"essential", "convenience", "dev"}
 
@@ -279,11 +284,17 @@ def _enumerate_candidate_paths() -> set[str]:
                 candidates.add(f"tools/{parts[1]}")
 
     # Top-level named files (relative to source_root, not repo root — Phase 4)
+    # viz_server.py removed here (engram-alpha#2555 PR A): it no longer exists
+    # as a root-level file -- it split into the viz/ package. No replacement
+    # walker was added for viz/ specifically, matching the existing precedent
+    # that health/ (a prior package-ification, #2537) also has no walker here
+    # — package-level directories are covered by the separate, more thorough
+    # whole-tree gate (test_whole_tree_every_tracked_file_has_a_role below),
+    # not by this narrower candidate enumerator.
     for fname in [
         "server.py",
         "bootstrap.py",
         "launch-engram-server.sh",
-        "viz_server.py",
     ]:
         if os.path.exists(os.path.join(src_root, fname)):
             candidates.add(fname)
@@ -604,28 +615,151 @@ def test_identity_coupled_hooks_are_known():
     )
 
 
-def test_import_dep_tier_consistency():
-    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+def _resolve_import_candidates(node: "ast.Import | ast.ImportFrom", importer_path: str) -> list[str]:
+    """Resolve an import AST node to candidate mechanism paths.
 
-    Prevents the #1087/#1088 class: an importer shipping in contexts where
-    the importee doesn't, causing ImportError at runtime.
+    Subdirectory-aware (engram-alpha#2549): a DOTTED module name is walked
+    into a nested path (``a.b.c`` → ``a/b/c.py``), not just resolved as a
+    same-directory single-segment name — this is what closes the gap where
+    an import crossing INTO a subpackage from a sibling file (``import
+    health.engine``, ``from health.engine import X``) could never resolve
+    to ``health/engine.py`` under the old same-directory-only logic.
 
     Only checks top-level module-scope imports in Python mechanism files.
-    Resolves module names to mechanism paths by checking the same directory
-    as the importing file (the pattern used by the scripts in this repo).
     Stdlib and external packages are automatically excluded (they won't
     resolve to any mechanism entry).
+
+    Level-aware for ``ast.ImportFrom`` (the old code silently ignored
+    ``node.level`` entirely, which happened to still work for the common
+    single-level relative case by accident): a plain ``ast.Import`` is
+    ALWAYS absolute (Python has no relative form for it), so it resolves
+    from the manifest's source root regardless of the importer's own
+    location. An ``ast.ImportFrom`` with ``level == 0`` is likewise
+    absolute (resolved from source root); with ``level >= 1`` it's
+    explicitly relative, resolved within the importer's own package
+    directory — ``level=1`` is "this package" (the importer's own
+    dirname), each additional level strips one more trailing directory
+    component, mirroring Python's own relative-import semantics.
+
+    ``from X import Y`` — TWO candidates per imported name, not one, because
+    the AST alone cannot tell whether ``Y`` is a plain attribute defined in
+    ``X`` (module ``X`` is the real target — e.g. ``from health.curves
+    import CurveSpec``) or ``Y`` is itself a SUBMODULE of package ``X``
+    (``X/Y`` is the real target — e.g. ``from health import engine`` when
+    ``engine`` is ``health/engine.py``, not an attribute of
+    ``health/__init__.py``). Caught by this function's own test suite: an
+    earlier version of this fix resolved only the module-level candidate
+    and silently missed the ``from health import engine`` entry-point
+    spelling, one of the three shapes engram-alpha#2549 was filed to fix.
+    Both candidates are always emitted (module-level AND
+    module/name-as-submodule); a wrong guess simply fails to match any real
+    mechanism entry in ``path_to_entry`` and is silently ignored — same
+    mechanism that already excludes stdlib/external imports today, so this
+    costs nothing when the guess is wrong. This also incidentally resolves
+    ``from . import x`` (``node.module is None``, no module-level candidate
+    possible) via the submodule-per-name candidate alone.
+
+    ALSO same-directory, for absolute imports (``level == 0`` ``ImportFrom``,
+    and every plain ``ast.Import``) — caught by reviewer-fairy round 1 on
+    this fix (engram-alpha#2550): this repo extensively uses its OWN
+    `sys.path.insert(0, dirname(__file__))` + bare-sibling-import
+    convention in ``tools/`` and ``hooks/claude/`` (e.g. ``tools/baton.py``
+    doing ``from forum_api import (...)`` — a level-0 ``ImportFrom`` — where
+    ``forum_api.py`` lives in the SAME ``tools/`` directory as
+    ``baton.py``, resolvable only because that convention puts the
+    importer's own directory on `sys.path` at runtime, not because
+    `forum_api` sits at the manifest source root). Treating ``level ==
+    0``/bare `import` as "always resolve from source root, never
+    same-directory" is correct for a genuine absolute import but silently
+    dropped same-directory resolution for every file using this repo's own
+    sibling-import convention — measured on the real tree as 20 real
+    import statements across 16 files that the pre-fix resolver checked
+    and a source-root-only resolver would silently stop checking. So a
+    same-directory candidate is ALWAYS added alongside the source-root
+    candidate for every absolute import, same "wrong guess costs nothing"
+    reasoning as the X/X.Y case above — one of the two will usually be
+    spurious and fail to match `path_to_entry`, but which one is spurious
+    depends on which convention the importing file actually uses, and this
+    function has no way to know that up front.
+
+    Known dormant residual (round-2 reviewer-fairy, engram-alpha#2550): the
+    same-directory candidate above is only generated for the MODULE-level
+    candidate of a ``from X import Y``, never for the submodule-per-name
+    candidate — i.e. for ``level == 0``, ``{importer_dir}/{X}/{Y}.py`` is
+    never emitted, only ``{source_root}/{X}/{Y}.py``. So a hypothetical
+    ``from X import Y`` where ``Y`` is a submodule reachable only via this
+    repo's same-directory sys.path convention (rather than from the source
+    root) would not resolve. Confirmed dormant, not a live false negative:
+    a full scan of the real manifest found zero instances of this shape.
+    Left unfixed deliberately (no real case to regression-test against);
+    revisit if a future import actually needs it.
+
+    History (engram-alpha#2549, 2026-09-04): until this fix, the resolver
+    ignored ``.level`` entirely and had no subdirectory-path notion at all
+    — an import crossing INTO a subpackage from a sibling file
+    (``from health import engine``, ``import health.engine``, ``from
+    health.engine import X``) could never resolve under any spelling, so
+    the tier-closure guarantee wasn't enforced at a subpackage's entry
+    point. Both gaps documented in detail in PR #2548 (now historical —
+    see that PR's diff for the full original write-up) are closed here.
     """
     import ast
 
-    manifest = _load_manifest()
-    mechanisms = manifest["mechanisms"]
-    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    candidates: list[str] = []
+    importer_dir = os.path.dirname(importer_path)
 
-    # Build path→entry lookup for Python files
+    if isinstance(node, ast.ImportFrom):
+        module = node.module or ""
+        module_as_path = module.replace(".", "/") if module else ""
+
+        if node.level == 0:
+            base_dir = ""
+        else:
+            dir_part = importer_dir
+            for _ in range(node.level - 1):
+                dir_part = os.path.dirname(dir_part)
+            base_dir = dir_part
+
+        if module_as_path:
+            module_path = f"{base_dir}/{module_as_path}" if base_dir else module_as_path
+            candidates.append(f"{module_path}.py")
+            submodule_base = module_path
+            if node.level == 0 and importer_dir:
+                # Also try same-directory resolution for this absolute
+                # import — see the docstring's "ALSO same-directory" note.
+                candidates.append(f"{importer_dir}/{module_as_path}.py")
+        else:
+            # "from . import x" (or "from .. import x", etc.) — no module
+            # name at all; every imported name can only be a submodule of
+            # the resolved relative directory.
+            submodule_base = base_dir
+
+        for alias in node.names:
+            candidates.append(f"{submodule_base}/{alias.name}.py" if submodule_base else f"{alias.name}.py")
+    else:  # ast.Import — always absolute, no "level" attribute exists on this node type
+        for alias in node.names:
+            module_as_path = alias.name.replace(".", "/")
+            candidates.append(f"{module_as_path}.py")
+            if importer_dir:
+                candidates.append(f"{importer_dir}/{module_as_path}.py")
+
+    return candidates
+
+
+def _find_tier_violations(mechanisms: list[dict], src_root: str) -> list[str]:
+    """Scan every Python mechanism's top-level imports and return a list of
+    tier/multi_agent inconsistency violation strings (empty = clean).
+
+    Factored out of ``test_import_dep_tier_consistency`` (engram-alpha#2549)
+    so a synthetic-manifest falsifier test can call the exact same scan
+    logic the real gate uses, over a fake mechanisms list + fake files,
+    rather than re-implementing (and risking silently drifting from) the
+    real detection logic.
+    """
+    import ast
+
     path_to_entry = {e["path"]: e for e in mechanisms}
-
-    violations = []
+    violations: list[str] = []
 
     for entry in mechanisms:
         path = entry["path"]
@@ -647,21 +781,7 @@ def test_import_dep_tier_consistency():
             if not isinstance(node, (ast.Import, ast.ImportFrom)):
                 continue
 
-            # Resolve the module name(s) to potential mechanism paths
-            module_names = []
-            if isinstance(node, ast.ImportFrom):
-                module = node.module or ""
-                # Only handle simple names (no dots) — same-dir resolution
-                if "." not in module and module:
-                    dir_part = os.path.dirname(path)
-                    candidate = f"{dir_part}/{module}.py" if dir_part else f"{module}.py"
-                    module_names.append(candidate)
-            else:  # ast.Import
-                for alias in node.names:
-                    name = alias.name.split(".")[0]  # top-level package only
-                    dir_part = os.path.dirname(path)
-                    candidate = f"{dir_part}/{name}.py" if dir_part else f"{name}.py"
-                    module_names.append(candidate)
+            module_names = _resolve_import_candidates(node, path)
 
             for importee_path in module_names:
                 if importee_path not in path_to_entry:
@@ -687,7 +807,253 @@ def test_import_dep_tier_consistency():
                         f"imports {importee_path!r} (multi_agent=True → single-agent build drops it)"
                     )
 
+    return violations
+
+
+def test_import_dep_tier_consistency():
+    """If A ships at (tier, topology) T and imports B, B must also ship at T.
+
+    Prevents the #1087/#1088 class: an importer shipping in contexts where
+    the importee doesn't, causing ImportError at runtime.
+
+    Only checks top-level module-scope imports in Python mechanism files.
+    Resolution (engram-alpha#2549) is subdirectory- and level-aware — see
+    ``_resolve_import_candidates``'s own docstring for the exact rules and
+    its one known-dormant residual gap (a same-directory ``from X import Y``
+    submodule case, confirmed to have zero live instances on the real
+    manifest). Stdlib and external packages are automatically excluded
+    (they won't resolve to any mechanism entry).
+    """
+    manifest = _load_manifest()
+    mechanisms = manifest["mechanisms"]
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+
+    violations = _find_tier_violations(mechanisms, src_root)
+
     assert not violations, (
         f"Import-dep tier/flag inconsistencies found ({len(violations)}):\n"
         + "\n".join(f"  {v}" for v in violations)
     )
+
+
+# ---------------------------------------------------------------------------
+# Telemetry manifest gate (issue #2574, workstream WS2 — §4a)
+#
+# See docs/2574-telemetry-design.md §1 (PARTICIPATION DEFINITION) and §4a
+# (the registry) for the design. tools/telemetry_manifest_gate.py holds the
+# extraction/walk/scan logic these tests exercise; see its own module
+# docstring and `--self-test` for the synthetic positive/negative fixtures
+# that pin the extraction logic itself (independent of these pytest tests,
+# which focus on the MANIFEST-facing contract).
+# ---------------------------------------------------------------------------
+
+
+def test_telemetry_key_required_on_emitting_mechanisms():
+    """Any manifest entry whose path is a hook or tool that CAN emit must
+    carry a `telemetry` key — either `telemetry: []` (declaring, explicitly,
+    that it emits from nowhere) or one record per call site.
+
+    The required-declaration population is MECHANICAL (AST-derived from the
+    real source tree), not a hand-maintained list — a newly added emit call
+    automatically enters this test's population, same discipline as
+    ``test_every_shippable_path_is_tagged``'s filesystem-derived candidate
+    enumeration above.
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    sites = telemetry_gate.find_emit_call_sites(src_root)
+    emitting_paths = telemetry_gate.emitting_mechanism_paths(manifest, src_root, sites)
+
+    path_to_entry = {e["path"]: e for e in manifest["mechanisms"]}
+    missing = sorted(p for p in emitting_paths if "telemetry" not in path_to_entry.get(p, {}))
+
+    assert not missing, (
+        "packaging/tiers.json is missing a `telemetry` key for these "
+        "emitting mechanism paths (add `telemetry: []` or per-call-site "
+        "records — see docs/2574-telemetry-design.md §4a):\n"
+        + "\n".join(f"  {p}" for p in missing)
+    )
+
+
+def test_telemetry_gate_clean_on_real_tree():
+    """The §4a gate (NOT_WIRED / UNDECLARED / unresolved dynamic-dispatch)
+    must report clean on the real manifest + real source tree.
+
+    Today L = M = ∅ everywhere (no `site=` kwarg exists in source yet — that
+    is WS3's job), so NOT_WIRED and UNDECLARED are trivially empty; this test
+    would catch either set becoming non-empty (WS3 wiring a site whose id
+    doesn't match a manifest record, or vice versa) as well as a REGRESSION
+    in the dynamic-dispatch exclusion set (a new dynamic-dispatch call site
+    appearing in the tree with no matching declared exclusion).
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    report = telemetry_gate.run_gate(src_root, manifest)
+
+    assert not report.not_wired, f"NOT WIRED (manifest declares, source never emits): {sorted(report.not_wired)}"
+    assert not report.undeclared, f"UNDECLARED (source emits, manifest has no record): {sorted(report.undeclared)}"
+    assert not report.unresolved_dynamic_hits, (
+        "Unresolved dynamic-dispatch hits (declare an exclusion with a reason "
+        "in packaging/tiers.json's telemetry.dynamic_dispatch_exclusions, or "
+        "show the backward walk cannot reach a declared site):\n"
+        + "\n".join(f"  {h.file}:{h.lineno} (shape {h.shape}) — {h.snippet}" for h in report.unresolved_dynamic_hits)
+    )
+
+
+def test_telemetry_participation_static_not_wired_control():
+    """§9 test 2 — the participation/static test ('round-6 correction').
+
+    Add a manifest site record whose literal id has NO matching
+    `emit(..., site=...)` call anywhere in source; assert the §4a gate
+    reports it under NOT_WIRED (M - L). Purely static — no window is run
+    and no trigger is fired, per the design's own bound: conflating this
+    with a runtime test made an earlier draft's stored observables
+    identical to the time-axis test's, which made the design unfalsifiable
+    exactly where it claimed to be falsifiable (§9 note on test 2).
+
+    Uses synthetic manifest data over the REAL source tree's L (which is
+    ∅ today) rather than mutating the real manifest file.
+    """
+    manifest = _load_manifest()
+    src_root = os.path.join(REPO_ROOT, manifest.get("source_root", "."))
+    sites = telemetry_gate.find_emit_call_sites(src_root)
+    L = telemetry_gate.compute_L(sites)
+
+    phantom_manifest = {
+        "mechanisms": [
+            {
+                "path": "hooks/claude/engram-postcompact-hook.py",
+                "telemetry": [
+                    {"site": "phantom.site.never_emitted", "trigger": "PostCompact"},
+                ],
+            },
+        ],
+    }
+    M = telemetry_gate.compute_M(phantom_manifest)
+
+    nw = telemetry_gate.not_wired(L, M)
+    assert nw == {"phantom.site.never_emitted"}, (
+        f"expected NOT_WIRED == {{'phantom.site.never_emitted'}}, got {nw}"
+    )
+
+
+def test_telemetry_manifest_gate_test_missing_telemetry_key():
+    """§9 test 3 — the manifest gate test.
+
+    Add a hook path with no `telemetry` key at all; assert the manifest-gate
+    logic (the same logic ``test_telemetry_key_required_on_emitting_mechanisms``
+    runs on the real manifest) fails, naming the offending path.
+
+    Built as a synthetic fixture tree + synthetic manifest (same pattern as
+    ``test_whole_tree_synthetic_undeclared_path_is_flagged`` above) rather
+    than mutating the real manifest.
+    """
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-test3-") as tmp:
+        hook_path = os.path.join(tmp, "hooks", "claude", "fake-emitting-hook.py")
+        os.makedirs(os.path.dirname(hook_path), exist_ok=True)
+        with open(hook_path, "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def main():\n"
+                '    emit_if_initialized("engram.fake.fired", 1, {})\n\n'
+                'if __name__ == "__main__":\n'
+                "    main()\n"
+            )
+
+        fake_manifest = {
+            "mechanisms": [
+                {"path": "hooks/claude/fake-emitting-hook.py"},  # no "telemetry" key — the defect
+            ],
+        }
+
+        sites = telemetry_gate.find_emit_call_sites(tmp)
+        emitting_paths = telemetry_gate.emitting_mechanism_paths(fake_manifest, tmp, sites)
+        path_to_entry = {e["path"]: e for e in fake_manifest["mechanisms"]}
+        missing = sorted(p for p in emitting_paths if "telemetry" not in path_to_entry.get(p, {}))
+
+        assert missing == ["hooks/claude/fake-emitting-hook.py"], (
+            f"expected the manifest gate to flag the missing telemetry key, got missing={missing}"
+        )
+
+
+def test_telemetry_dynamic_dispatch_discriminating_control():
+    """§9 test 3b's SECOND control — 'on the gate rather than the runtime'.
+
+    The discriminating case (round 11's correction) is a site with ONE
+    DIRECT caller (a real dispatch target) PLUS one dynamic caller elsewhere
+    in the tree — NOT a site reachable only through a dynamic call, which
+    reddens via the zero-target disjunct alone and never exercises the
+    dynamic-dispatch-scan clause specifically (round 10's non-discriminating
+    version). With one direct caller the walk returns a NON-EMPTY target
+    set, so only the static dynamic-dispatch scan can fail this fixture.
+
+    Uses a synthetic fixture tree (mirrors
+    ``telemetry_manifest_gate.py``'s own ``--self-test`` discriminating
+    fixture, exposed here as a first-class pytest test per the design's
+    §9/§10 assignment of this control to WS2).
+    """
+    with tempfile.TemporaryDirectory(prefix="telemetry-gate-test3b-") as tmp:
+        with open(os.path.join(tmp, "disc_impl.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def emit_if_initialized(event_type, level, data, site=None):\n"
+                "    pass\n\n"
+                "def _disc_impl():\n"
+                '    emit_if_initialized("engram.disc.fired", 1, {}, site="engram.disc.fired")\n'
+            )
+        with open(os.path.join(tmp, "disc_server.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import disc_impl as _impl_mod\n\n"
+                "class mcp:\n"
+                "    @staticmethod\n"
+                "    def tool():\n"
+                "        def deco(f):\n"
+                "            return f\n"
+                "        return deco\n\n"
+                "@mcp.tool()\n"
+                "def disc_tool():\n"
+                "    return _impl_mod._disc_impl()\n"
+            )
+        with open(os.path.join(tmp, "disc_dynamic_caller.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "def maybe_call_it():\n"
+                "    table = {'x': None}\n"
+                "    table['x']()\n"
+            )
+
+        graph = telemetry_gate.build_call_graph(tmp)
+        sites = telemetry_gate.find_emit_call_sites(tmp)
+        site = next(s for s in sites if s.file == "disc_impl.py")
+        found = telemetry_gate.derive_dispatch_targets(graph, telemetry_gate.enclosing_key_for_site(site))
+
+        # The direct-caller path IS resolved -- the zero-target disjunct
+        # must stay silent, so this control actually discriminates.
+        assert found == {("disc_server.py", "disc_tool")}, (
+            f"expected a NON-EMPTY dispatch-target set (the discriminating "
+            f"precondition), got {found}"
+        )
+
+        manifest = {
+            "mechanisms": [
+                {
+                    "path": "disc_impl.py",
+                    "telemetry": [{"site": "engram.disc.fired", "trigger": "MCP tool body"}],
+                },
+            ],
+        }
+        report = telemetry_gate.run_gate(tmp, manifest)
+
+        # The gate must still FAIL CI -- on the unresolved dynamic-dispatch
+        # hit alone, since NOT_WIRED/UNDECLARED are clean and the target set
+        # is non-empty.
+        assert not report.not_wired
+        assert not report.undeclared
+        assert report.unresolved_dynamic_hits, (
+            "expected an UNRESOLVED dynamic-dispatch hit in "
+            "disc_dynamic_caller.py; finding none means the static-scan "
+            "clause is silently non-discriminating (the round-10 defect)."
+        )
+        assert not telemetry_gate.check_ok(report), (
+            "expected check_ok() == False (unresolved dynamic-dispatch hit "
+            "must fail CI even though the target set is non-empty)"
+        )

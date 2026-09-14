@@ -3,7 +3,7 @@
 The migration unifies the 8-arg surface (observations_json + url + title + domain
 + source_date + evidence_id + content_hash + git_sha) into one payload_json
 object. The inner `observations_json` field is itself a stringified JSON array
-(nested encoding — matches engram_retract's `replacement_json` pattern).
+(nested encoding — same shape as engram_set_recall_summaries' `summaries` field).
 
 Coverage:
   1. Happy path — well-formed payload creates observations.

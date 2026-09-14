@@ -18,6 +18,13 @@ name: pr-checks
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
+#   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
+#      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
+#      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
+#      nightly full suite, so a plaintext-stdout regression to a shipped
+#      hook (#2700) went green through pr-checks and broke hours later in
+#      a nightly nobody watches live (#2717). Path-scoped so it does not
+#      reintroduce full-suite cost on every PR.)
 
 on:
   pull_request:
@@ -61,7 +68,15 @@ jobs:
         with:
           # fetch-depth: 0 needed by no-new-shipped-node-ids and name-leak-warn
           # for base-branch diff; harmless for checks that don't use history.
+          # fetch-tags: true (#2563 Gap 3) — the health-version tag-diff gate
+          # below enumerates refs/tags/v* + refs/tags/deploy/* via
+          # `git for-each-ref`, so the runner's checkout must actually carry
+          # tag objects. This job has one shared checkout for all its steps
+          # (pr-checks is a single combined job, see header); adding
+          # fetch-tags here is a one-line change that covers every step,
+          # rather than a second checkout scoped to this one gate.
           fetch-depth: 0
+          fetch-tags: true
 
       # ── 1. anti-dup ────────────────────────────────────────────────────
       # (from anti-dup-check.yml)
@@ -169,16 +184,53 @@ jobs:
           # (random text rarely matches `xx_NNNN+` boundaries).
           PATTERN='\b[a-z]{2}_[0-9]{4,}\b'
 
-          # Allowlist scope rationale:
-          #   tests/, paper_draft/, active-work/, cycle/ — non-shipped surfaces
-          #     (cycle/ = self-improvement-cycle process docs — charter, chronicle,
-          #      review packages, dream-pass protocol; node IDs are load-bearing
-          #      provenance there by design, and build-plugin.sh does not bundle it)
+          # Allowlist scope rationale — the criterion is SHARED-SOURCE HYGIENE,
+          # not build-bundling: a concrete node ID is install-private (every
+          # install renumbers its own graph from scratch, per DEVELOPMENT.md
+          # "Shipped files" / issue #51), so it resolves to nothing — or to an
+          # unrelated node — for ANY reader of a shared or public repo,
+          # regardless of whether the file in question ships inside a plugin
+          # install. "Not bundled" is therefore not a reason on its own; each
+          # exclusion below needs its own positive reason — most on the
+          # hygiene axis; CHANGELOG.md and this file are excluded for the
+          # unrelated reasons noted inline below.
+          #   tests/, src/forum/tests/ — excluded for two DIFFERENT reasons,
+          #     not one, and no claim here about the split between them:
+          #     (a) some matches are synthetic fixture-payload data — an
+          #     id-shaped string passed as example input, test-scenario
+          #     data and never a citation, so nothing is offered to a
+          #     reader as resolvable provenance; (b) some matches are
+          #     genuine developer-graph citations in module docstrings
+          #     naming the migration wave or design decision that produced
+          #     the test — excluded on the SAME audience argument as the
+          #     process docs above: the reader is an agent working this
+          #     repo, not a general shared-repo reader.
+          #   paper_draft/, active-work/ — ephemeral drafting/scratch
+          #     surfaces; any node-ID text there is a working note for the
+          #     author's own session, not a citation offered to a reader.
+          #   docs/cycle/ — self-improvement-cycle process docs (charter,
+          #     chronicle, review packages, dream-pass protocol). These are
+          #     process artifacts whose whole value IS author-graph
+          #     provenance — the record of which claim drove which decision —
+          #     read by agents working the cycle who hold (or can resolve
+          #     against) the graph the docs were written from. A dangling ID
+          #     here is expected background for that audience, not a hollow
+          #     citation offered to an uninformed reader.
           #   docs/handbook/ — dev-internal developer handbook (accuracy-pass
-          #     reference docs; concrete node IDs are load-bearing provenance
-          #     by design, and the build engine does not bundle docs/ into the
-          #     plugin — same rationale as cycle/ and the other non-shipped surfaces)
-          #   README.md — documents seed-graph IDs that ARE in every install
+          #     reference docs assembled by agents auditing the substrate
+          #     against their own graph, with observation- and derivation-
+          #     level provenance citations throughout, e.g. 03-hooks.md).
+          #     Same reasoning as cycle/: the IDs are load-bearing provenance
+          #     for a reader who holds the graph, not a citation offered to a
+          #     general shared-repo reader.
+          #   README.md — currently carries no node-ID citations (the
+          #     seed-graph example block went with the scatter installer's
+          #     retirement in a1ddd75a); excluded pre-emptively in case a
+          #     future rewrite reintroduces install-identical seed IDs,
+          #     which would be install-state reference — an ID identical
+          #     across every install — rather than developer provenance,
+          #     a different and valid non-hygiene-problem argument from the
+          #     insider-provenance one the bullets above use.
           #   CHANGELOG.md — historical record; scrub planned separately
           #   this workflow file — contains the pattern literally
           # IN scope (intentionally NOT excluded; flag if added to):
@@ -497,6 +549,35 @@ jobs:
         # frontmatter block.
         run: python3 -m pytest tests/test_skill_frontmatter_lint.py -q
 
+      - name: invariant-checks — health L0 set hash (MAJOR-bump gate)
+        # Pins a SHA over the canonical L0 measurement set — every
+        # MeasurementDef's (name, population, definition_inputs). An add,
+        # remove, or silent redefinition through a remote constant (e.g.
+        # CLAIM_BEARING_TYPES) fails this until health.version.MAJOR is
+        # bumped and the pin re-set IN THE SAME COMMIT. Pure stdlib+pytest,
+        # 27 tests in well under a second — same cost class as the gates
+        # above, and it is the only enforcement of the MAJOR-bump
+        # convention on dev PRs.
+        run: python3 -m pytest tests/test_health_measurements.py -q
+
+      - name: invariant-checks — health version tag-diff gate (engram-alpha#2563 Gap 3)
+        # Checks health/version.py's (MAJOR, MINOR) against how HEAD's L0
+        # measurement set differs from the last deployable tag (refs/tags/v*
+        # union refs/tags/deploy/*). Two independent checks: well-formedness
+        # of the staged version delta (pure arithmetic, denies malformed
+        # shapes without ever touching hashes), then adequacy of that delta
+        # against the required severity computed from L0 hashes at HEAD vs
+        # at the tag. Gap 2 (the derived-layer hash) is not built yet, so
+        # the required severity can only be MAJOR or NONE in this PR — see
+        # the test module's docstring. PASSES with a stated "gate inactive"
+        # reason today, since no deployable tag yet carries health/version.py.
+        # After the pytest line (which passes silently either way), print the
+        # live gate verdict so the CI log names T — an inactive gate and an
+        # active one otherwise leave the same "N passed" log (#2588 review).
+        run: |
+          python3 -m pytest tests/test_health_version_gate.py -q
+          python3 -c "import importlib.util as u; s=u.spec_from_file_location('g','tests/test_health_version_gate.py'); g=u.module_from_spec(s); s.loader.exec_module(g); status, msg = g.run_live_gate(); print(f'health-version gate (live): {status} | {msg}')"
+
       # ── 7. manifest-gate ───────────────────────────────────────────────
       # (from manifest-gate.yml)
       # Cheap tag-once tiering gate — runs on EVERY dev PR (and main PRs).
@@ -611,3 +692,55 @@ jobs:
           python3 tools/test_id_set_check.py \
             --base "$BASE_SHA" --head HEAD \
             --pr-body-file /tmp/pr_body.txt
+
+      # ── 9. hooks-stdout-audit ───────────────────────────────────────────
+      # #2718 — tests/test_hooks_json_stdout_audit.py previously ran ONLY in
+      # the nightly full suite (tests.yml). Per this repo's CI cost model, dev
+      # PRs run only pr-checks — so a PR adding a plaintext-stdout `echo` to a
+      # referenced shell hook was green on every gate that ran at PR time and
+      # failed hours later in a nightly nobody watches live. Measured: #2700
+      # (d266825b) passed fairy, colleague, and pr-checks, then broke the
+      # audit in the 13:38Z nightly (#2717). "A gate positioned outside the
+      # path where the decision is made cannot protect the thing it audits."
+      #
+      # Path-scoped (not unconditional) to avoid reintroducing full-suite-class
+      # cost on every PR: the audit itself is fast (<1s, pure stdlib+pytest —
+      # same carve-out as manifest-gate / stdlib-only guards above), but the
+      # PRINCIPLE from #1597 is per-check cost discipline, not just wall-clock
+      # — so it only runs when the diff could plausibly regress it.
+      #
+      # No existing paths:-filter idiom exists in this repo's workflows (the
+      # `on: pull_request` trigger above deliberately carries no `paths:`, and
+      # no workflow here uses dorny/paths-filter or an equivalent action) — so
+      # this follows the closest in-file idiom instead: the roster-check /
+      # scan pair in the name-leak-warn step above (id: + $GITHUB_OUTPUT +
+      # `if: steps.<id>.outputs.<flag>` on the next step), rather than
+      # inventing a new mechanism or adding a new action dependency.
+      #
+      # BLOCKING (unlike name-leak-warn's advisory pattern it borrows the
+      # shape from) — the whole point of this gate is that a real regression
+      # here is currently free at PR time; an advisory posture would leave it
+      # free, same reasoning as test-id-set-check above.
+      - name: hooks-stdout-audit — check whether the diff touches src/engram/hooks/ or hooks.json
+        id: hooks-diff-check
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          # --no-renames: --name-only collapses a detected rename to the
+          # destination path alone. A hook file moved OUT of
+          # src/engram/hooks/ while being modified (hooks.json untouched)
+          # would then show only the new path and the predicate below would
+          # miss it — a false SKIP on exactly the change most likely to
+          # break the audit. --no-renames forces both the old and new path
+          # to appear as separate entries so the predicate still matches.
+          CHANGED=$(git diff --no-renames --name-only "$BASE_REF...HEAD")
+          if echo "$CHANGED" | grep -qE '^src/engram/hooks/|(^|/)hooks\.json$'; then
+            echo "Diff touches src/engram/hooks/ or hooks.json — audit will run."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Diff does not touch src/engram/hooks/ or hooks.json — audit self-skips."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: hooks-stdout-audit — run test_hooks_json_stdout_audit.py
+        if: steps.hooks-diff-check.outputs.run == 'true'
+        run: python3 -m pytest tests/test_hooks_json_stdout_audit.py -q

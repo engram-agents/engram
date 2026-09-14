@@ -1,0 +1,60 @@
+    /* engram-alpha#2555 PR C -- shared frozen-header typography baseline
+       (forum #389's final ruling). One body{} rule for all four
+       pages' shared background/color/font, so nav/footer render IDENTICALLY
+       everywhere instead of drifting per-page -- the frozen-header bug was
+       chrome font-size set in em against an inherited body font-size that
+       differed page-to-page (graph.html pinned its own 13px; the other
+       three left it at the browser's implicit 16px default), so identical
+       "0.9em" text rendered at two different pixel sizes. font-size: 16px
+       makes that previously-implicit default explicit -- a stable,
+       documented baseline the em->px conversions below were computed
+       against, not a behavior change for the three pages that already
+       relied on it. Page-local body{} rules (health.html/stats.html/
+       config.html) now carry ONLY their page-specific padding; graph.css's
+       body{} now carries ONLY its layout properties (display/flex-
+       direction/height/overflow) -- see graph.css's own comment for why its
+       font moved onto #content-row/#tooltip instead of staying on body. */
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+           font-size: 16px; background: #1a1a2e; color: #e0e0e0; }
+
+    /* Sole copy -- PR C's sweep found this trio duplicated byte-identical
+       across base.css/graph.css/health.html/stats.html/config.html (PR B's
+       nav-CSS consolidation below covered .nav/.nav a/.nav a:hover but
+       missed this trio, so the em->px fix would otherwise have been
+       silently shadowed by a page-local copy declared later in the
+       cascade). Consolidated here; the other four copies are deleted. */
+    .nav-agent-label { color: #7ecfff; font-size: 14px; margin-right: 6px; }
+    .nav-agent-select { padding: 4px 8px; background: #0d1b36; border: 1px solid #1a4a8a;
+                        border-radius: 4px; color: #e0e0e0; font-size: 14px; outline: none; }
+    #nav-agent-wrapper { display: none; margin-left: auto; }
+
+    /* engram-alpha#2555 PR B amendment-1 nav-CSS consolidation (forum #389):
+       the one .nav/.nav a/.nav a:hover block for all four pages.
+       flex-shrink: 0 is deliberately kept -- it's load-bearing layout for
+       the graph page's 100vh flex column; inert (no-op) everywhere else.
+       PR C (frozen-header fix, forum #389) adds position: sticky + a
+       background (matching body's, so scrolled content doesn't show
+       through) so the nav stays visible while a page's own content scrolls
+       under it -- the three padded pages (health/stats/config) are what
+       this is actually for; graph.html's body has no scroll context of its
+       own (overflow: hidden, 100vh), so sticky is a harmless no-op there,
+       the same "inert everywhere else" shape as flex-shrink above.
+       z-index: 10 clears every other z-index in this codebase: the highest
+       anywhere is 100 (graph.css's #tooltip; config.html's separate
+       .tooltip-icon:hover::after popup, not the same selector, same value
+       by coincidence) -- neither is meant to sit under a scrolled-past nav. */
+    .nav         { margin-bottom: 16px; display: flex; align-items: center; flex-shrink: 0;
+                   position: sticky; top: 0; z-index: 10; background: #1a1a2e; }
+    .nav a       { color: #00d4ff; text-decoration: none; margin-right: 16px; font-size: 14px; }
+    .nav a:hover { text-decoration: underline; }
+
+    /* engram-alpha#2555 PR B amendment-1 footer (forum #389 ruling):
+       product + provenance (two shas: data anchor, code sha) +
+       license/disclaimer, present on every page. Muted styling -- this is
+       reference/trust information, not a call to action. */
+    .viz-footer { margin-top: 24px; padding: 12px 0 8px; border-top: 1px solid #1a4a8a;
+                  font-size: 12px; color: #7a8aa0; display: flex; flex-wrap: wrap;
+                  gap: 4px 16px; align-items: baseline; }
+    .viz-footer-product { color: #7ecfff; font-weight: 600; }
+    .viz-footer-provenance { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .viz-footer-disclaimer { color: #556; }

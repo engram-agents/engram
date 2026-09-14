@@ -246,6 +246,32 @@ Safe to run unconditionally: the tool skips dirty worktrees, skips worktrees wit
 
 Run this step from the repo root. Skip if `tools/worktree-gc.py` is not present (pre-T2 install or worktree GC not yet shipped).
 
+### Step 3.8 — Reconcile lesson auto-demotion leases (engram-alpha#2544)
+
+alpha#1944's blocking-lesson auto-demotion is a **read-time lease, not a durable write**: `engram-lesson-tripwire-hook.py` computes a blocking lesson's *effective* `prevention_type` from the prevention ledger at match time (advisory once it has crossed `overrides` overrides within `window_days`), but never rewrites the lesson's own stored `prevention_type` — deliberately, since the hook has no `engram_core`/`engram_epistemic` import and the no-raw-DB-edits rule keeps audit-trail logging (field_traces, edit_history, turn stamp) inside `engram_update_lesson`, the module that owns it. Left alone, a demoted lesson stays stored as `"blocking"` indefinitely.
+
+Run the read-only detector once per sleep, from the repo root:
+
+```bash
+python3 tools/reconcile_lesson_demotions.py
+```
+
+Output is JSON: `{"candidates": [{"lesson_id", "override_count", "threshold", "window_days", "reason"}, ...]}` on success (exit 0). The script performs no writes — it reads the prevention ledger and each candidate's *current* stored `prevention_type` read-only, and only reports a lesson whose lease is **still hot right now** (a fresh override recount, not the ledger entry's stale timestamp). A lesson whose overrides have aged out of the window is correctly NOT reported — the read-time hook would resume blocking on it today, so a durable demotion now would be stricter than the lease itself currently demands.
+
+**Check the exit code before trusting an empty list.** `{"candidates": []}` (exit 0) is the healthy common case — no lesson has ever crossed the lease threshold. A genuine failure to check (missing `knowledge.db`, or a prevention ledger that exists but couldn't be read) is a *different* shape: `{"error": "...", "candidates": null}` with a non-zero exit code. Never read a non-zero exit's `candidates: null` as "nothing to do" — log the error line in today's history file instead, so a silently-broken reconcile pass doesn't read identically to a quiet night.
+
+For each candidate, call `engram_update_lesson` to make the demotion durable — `node_id` top-level, the changed field nested under `updates` (NOT `lesson_id` / a top-level `prevention_type` — verified against the tool's own real schema, not assumed):
+
+```
+engram_update_lesson(payload_json=json.dumps({
+    "node_id": candidate["lesson_id"],
+    "updates": {"prevention_type": "advisory"},
+    "reason": candidate["reason"],
+}))
+```
+
+Empty `candidates` list is the common case (most cycles) — no lesson has ever crossed the lease threshold. Log the outcome (count reconciled, or "none this cycle") in today's history file alongside the other Phase A milestones. This step runs in Phase A, by the awake parent, not the dream master. Not because the dream master lacks the tool access — its own spec grants `tools: *` and it already calls `engram_update_lesson`-adjacent tools (supersede, retract, derive, resolve, contradict, update_task) — but because it needs no fairy investigation and no consolidation judgment, only a mechanical read-then-write, and inserting an unreviewed new step into that dense, heavily-negotiated spec is a cost this task doesn't need to pay.
+
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
 `~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md`, which captures consolidation output.
@@ -424,18 +450,23 @@ fi
 > all dispatched every night.** A weight-aging lottery (`tools/dream_lottery.py`)
 > draws a small subset each cycle — see Step 6 below for the mechanism. **The
 > all-or-nothing invariant still holds, just at a different grain: once the
-> lottery has decided tonight's set (the draw plus any cascade-interrupt
-> force-includes), that ENTIRE set is mandatory — never drop a category the
-> lottery drew "for context economy."** The lottery itself, not agent
-> discretion, is now the only sanctioned mechanism for a category not running
-> on a given night. Skipping a drawn category is exactly the 2026-06-24
-> incident this invariant was written to prevent; running fewer categories
-> than the draw is not a lighter version of the routine, it's the same failure
-> in a new shape.
+> lottery has decided tonight's set, that ENTIRE set is mandatory — never drop
+> a category the lottery drew "for context economy."** The lottery itself, not
+> agent discretion, is now the only sanctioned mechanism for a category not
+> running on a given night. Skipping a drawn category is exactly the
+> 2026-06-24 incident this invariant was written to prevent; running fewer
+> categories than the draw is not a lighter version of the routine, it's the
+> same failure in a new shape.
 >
 > Design of record: Lei, converged with Kepler 2026-08-03
 > (engram-alpha#1901), refined same night to three classes (comment on
-> #1901):
+> #1901). The third class — an urgency interrupt that force-included
+> cascade-sensitive categories when the day's retraction/supersede-cascade
+> markers met a threshold — was **removed 2026-09-11 (issue #2399, Lei's
+> ruling)**: the #2013 cascade-frontier machine (this skill's own mode-B
+> sweep, below) made nightly marker cleanup an unconditional dream-master
+> obligation, and a scan that already runs every night needs no forcing.
+> What remains is a two-class split:
 >
 > 1. **Always-on** — the batch-summary (`recall_summary`) cohort step (Steps
 >    5–7.5 below). Its work scales with the day's new-node cohort and is
@@ -445,16 +476,6 @@ fi
 >    `dream_lottery.py`'s `CATEGORIES` dict is the count's SSoT). Exactly one is
 >    drawn per sleep by default (`--count` can raise this later per the
 >    design note "maybe two later").
-> 3. **Urgency interrupt** — if the day's retraction/supersede-cascade
->    markers meet a threshold, cascade-sensitive categories are force-included
->    regardless of the draw. Lottery = frequency; interrupt = urgency.
->    **Currently unarmed pending #2013:** #2137 emptied the default
->    force-include set (`DEFAULT_INTERRUPT_TYPES = frozenset()`), so on the
->    default config there is nothing for the interrupt to force-include and
->    it structurally cannot fire — the mechanism above describes what
->    `--interrupt-types` re-arms, not the current default behavior. It
->    re-arms when the #2013 cascade machine gives dreams a principled
->    marker-resolution path.
 >
 > **Window semantics under rotation (the audit precondition #1901 asked for,
 > before wiring the lottery in):** a category that doesn't run every night
@@ -496,8 +517,12 @@ fi
 **As of #1952 PR3, the batch-summary fairy is reviewer of outliers, not
 author of record.** Write-time `recall_summary`/`recall_keywords` (#1952 PR1)
 means most new nodes already carry a fine summary by the time sleep runs —
-the fairy's cohort is now the union of two outlier classes, capped at 50
-total, and should be near-zero most nights:
+the fairy's cohort is the union of two outlier classes. **The original design
+expectation was that this would be near-zero most nights; measured 2026-09-10 it is
+not, and the doc said otherwise until this line was corrected** — 203 live outliers
+graph-wide immediately AFTER that night's 50 were applied, on a night whose fresh
+half alone was 53. Treat a non-trivial cohort as the normal case, and read the
+near-zero framing as an aspiration write-time authoring has not yet reached:
 
 1. **`needs_tightening`-flagged** — a write-time summary was soft-accepted
    over the 140-char target (under the 280-char hard-reject gate), OR a
@@ -535,30 +560,90 @@ Use `engram_list` in structured-filter mode to enumerate today's-cohort node IDs
 }
 ```
 
-If today's-cohort count < 50, top up from the backlog:
+**Pass `unlimited: true` on this call — it is load-bearing now that the fresh half has no cap.**
+`engram_list` defaults to `limit` 100, so a day that produces more than 100 outliers would silently
+return exactly 100 and read as a complete cohort; the truncation appears only in `total_matched`,
+which nothing else in this step tells you to compare. Under the old 50-node cap the default could
+never bind and this was safe to leave unsaid — **removing the cap is what made the default
+dangerous**, which is the kind of dependency a cap change carries invisibly.
 
-- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter — DROP the `created_at` lower bound — sort by `created_at` ascending (oldest first), limit to fill to 50
+**Then hand the expected total to `prepare --expect-total` — do not merely eyeball it.** Reading the
+number back is vigilance and gets skipped; passing it makes the pipeline itself refuse a truncated
+cohort. `prepare` compares it against the resolved id count and, on mismatch, exits non-zero having
+written NOTHING (no chunk dirs, no payloads, no manifest), so there is no half-prepared cohort to
+mistake for a good one. It also names the likely cause when the received count is exactly 100.
+
+⚠ **There are TWO `engram_list` calls feeding ONE cohort, so `--expect-total` is NOT either call's
+`total_matched` on its own.** Compute it:
+
+```
+COHORT_TOTAL = fresh_total_matched + min(backfill_total_matched, 60)
+```
+
+Both wrong readings fail the same way and fail LOUDLY-BUT-FALSELY, which is the dangerous kind —
+a gate that cries wolf nightly gets worked around, and then you have neither the gate nor the
+vigilance it replaced. Passing the fresh call's `total_matched` alone under-counts by the whole
+backfill. Summing both RAW over-counts whenever the real backlog exceeds its 60 cap — which, at the
+backlog sizes measured above, is the normal case and not an edge one. The `min()` is doing the work,
+and it is exact only because the two queries partition on `PREV_SLEEP` rather than overlap.
+
+**The fresh cohort is UNCAPPED — take every matching node since the last sleep, however many there are.**
+Then top up from the older backlog, capped at **60**:
+
+- Re-run `engram_list` with the same `is_current = 1` AND `type != 'evidence'` AND (`needs_tightening = 1` OR `recall_summary IS NULL`) filter, but **REPLACE the `created_at >= PREV_SLEEP` bound with `created_at < PREV_SLEEP`** — sort by `created_at` ascending (oldest first), limit **60**, and pass `unlimited: false` here (the 60 IS the limit)
+- **Replace the bound, do not merely drop it.** Dropping it makes the two queries OVERLAP rather than partition: the backfill's oldest-first scan only avoids today's nodes while the genuine backlog still exceeds 60, so the overlap appears *precisely once this redesign succeeds at draining the backlog* — and then `prepare` dedups the duplicates away, the id count lands under the expected total, and the truncation gate fires falsely on a correct cohort. An upper bound makes fresh and backfill disjoint by construction, which is also what makes the expected-total arithmetic below EXACT rather than approximate
+- The backfill cap is independent of the fresh cohort, not a fill-to-N remainder: a heavy writing day does NOT reduce the backfill, and a quiet one does not inflate it
 - This is the attrition pattern: every cycle drains the oldest outlier nodes, `needs_tightening` and legacy-NULL alike
 
 > Evidence nodes (`ev_*`) are URL + verbatim-quote citations, not claim-bearing — they don't render via `engram_surface` and don't benefit from a recall_summary. Excluding them from the cohort prevents wasted summary-fairy compute and lets the real backfill drain faster. The exclusion is applied client-side on the returned set — `ev_*` IDs are prefix-typed, so `type != 'evidence'` works even if a tool's return doesn't surface a `type` field.
 
-Cap at 50 protects the cycle's fairy compute budget. The backfill naturally drains the legacy-NULL pool over many cycles; the `needs_tightening` pool should stay small night-to-night by design (a growing one is worth investigating, not just draining).
+**Why the fresh half is uncapped and only the backfill is bounded** (Lei, 2026-09-10, replacing a
+flat 50-node cap on the union). A single cap over both classes made the two failure modes trade
+against each other: on 2026-09-10 the fresh cohort alone was 53 — over the cap by itself — so the
+backfill got ZERO and the pool grew on a night that looked fully processed. That was the third
+consecutive carry-over. A node's one cheap chance at a summary is the cycle that closes the turn it
+was written in; miss it and it becomes indistinguishable from decade-old backlog. So the fresh half
+must never be rationed — its size is bounded by how much the agent actually wrote that day, which is
+self-limiting in a way a backlog is not. The backfill is the half that can be arbitrarily large, so
+it is the half that carries the cap. **A backfill that stays pinned at 60 night after night is a
+signal to raise it or file an issue, not to keep draining**; the `needs_tightening` pool in
+particular should stay small by design, and a growing one is worth investigating.
 
 **If your install's recall-summary substrate isn't deployed yet** (no `recall_summary` column on `nodes`, or no `engram_set_recall_summaries` MCP tool registered): skip the batch summary step entirely — run Step 6's lottery draw and dispatch only the drawn dream-fairy set, spawn the dream master with a manifest of just that set, and proceed. The architecture is forward-compat: the dream master handles a fairy-manifest of any size cleanly.
 
 **Run cohort_dispatch prepare** to chunk the cohort and write per-chunk payload files.
-**Pass the cohort IDs inline via `--ids`** — the list from the step above fits
-comfortably in a shell variable (50 ids max, per the cap above), so there is
-no need for an intermediate file at all:
+
+Run this step from the repo root — `cohort_dispatch` is invoked via `python3 -m tools.cohort_dispatch`, which requires cwd = the repo root.
+
+**Pass the cohort IDs inline via `--ids` when the list is small enough to read
+in one glance** (roughly the historical 50-id shape), so there is no intermediate
+file. **With the fresh half uncapped the list no longer has a fixed ceiling.** The
+constraint is NOT the shell: measured 2026-09-10, `ARG_MAX` is 2 MB here and a
+300-id list is 2399 bytes — 0.1% of it — so an inline variable would carry
+thousands of ids without complaint. The constraint is that **you cannot eyeball a
+300-id list for correctness**, and a silently wrong cohort list produces a clean-
+looking run over the wrong nodes. So above roughly the size you would actually read,
+use `--ids-file` and write the list under your OWN `$HOME/.engram/tmp/` (never a
+shared `/tmp` path — see the collision note below; `prepare` enforces an owner-uid
+check), where it can be diffed and re-read:
 
 ```bash
 COHORT_IDS="ob_XXXX,ob_YYYY,..."  # comma-separated list from the step above
-COHORT_DIR=.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)
+# Truncation gate. NOT either call's total_matched alone — see the formula above.
+# Fill these two in from the two engram_list calls you just made:
+FRESH_TOTAL_MATCHED=<total_matched from the FRESH call (created_at >= PREV_SLEEP)>
+BACKFILL_TOTAL_MATCHED=<total_matched from the BACKFILL call (created_at < PREV_SLEEP)>
+COHORT_TOTAL=$(( FRESH_TOTAL_MATCHED + (BACKFILL_TOTAL_MATCHED < 60 ? BACKFILL_TOTAL_MATCHED : 60) ))
+COHORT_DIR="$(pwd)/.claude/agent-scratch/dream-cohort-$(date +%Y-%m-%d)"  # ABSOLUTE — Step 7.5 hands
+# this path to engram_set_recall_summaries, which runs in the MCP server's own
+# long-lived process (a different cwd than this shell); a relative path there
+# would resolve against the wrong directory.
 
 python3 -m tools.cohort_dispatch prepare \
   --ids "$COHORT_IDS" \
   --out "$COHORT_DIR" \
   --chunk-size 15 \
+  --expect-total "$COHORT_TOTAL" \
   --db ~/.engram/knowledge.db
 ```
 
@@ -605,11 +690,10 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
   --turn <CURRENT_TURN>   # from engram_stats / engram_reflect — the turn this cohort is closing, pre-advance
 ```
 
-(Omit `--state`/`--interrupt-types`/`--interrupt-threshold` to use the defaults documented in `dream_lottery.py`'s module docstring; override only if the standing design call has changed.) The command prints and persists a JSON result:
+(Omit `--state` to use the defaults documented in `dream_lottery.py`'s module docstring; override only if the standing design call has changed.) The command prints and persists a JSON result:
 
-- `types_to_run` — the category numbers to dispatch this cycle (drawn ∪ interrupt-forced; disjoint, so no category is double-counted).
+- `types_to_run` — the category numbers to dispatch this cycle (the drawn set).
 - `types_to_run_slugs` — `{category_num: slug}` for the categories above, for building dispatch prompts.
-- `interrupt_fired` / `interrupt_types` / `cascade_marker_count` — whether the cascade-urgency interrupt forced any categories in tonight, and why.
 - `window_params` — `{category_num: prev_last_run_at_or_null}` for the window-scoped categories (currently 6 and 7 — see the Phase B audit note above). Only present for categories that are both window-scoped AND running tonight.
 - `weights_before` / `weights_after` — for the dream record (Step 8/9's "logged draws" requirement). As of #1909, `draw` also appends this full result to an append-only history file (`~/.engram/dream-lottery-history.jsonl` by default) automatically, so a missed dream-record transcription is now recoverable from that file rather than lost — the dream-record transcription below is still required (belt and braces: the dream record is the narrative/reviewable form, the history file is the raw mechanical log), but it is no longer the *only* copy.
 
@@ -630,15 +714,16 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
 | 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
 | 11 | Cornerstones/lessons with support_lost | support-lost |
+| 12 | Generalization candidates | generalization-candidates |
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (12, 13).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (13, 14).
 > [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.
 
-**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (typically 1–4 fairies for a 50-node cohort at chunk-size=15). For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
+**Batch-summary fairies** — one `subagent_type="engram-batch-summary-fairy"` per chunk from the manifest (4 chunks for a 50-node cohort at chunk-size=15; **the count now scales with the cohort and is no longer bounded by a 50-node cap**, so read it off the manifest rather than assuming a small number). **This is the one place uncapping changes FAN-OUT rather than just volume** — the chunk count is the fairy count. It stays bounded because the fresh half is limited by a single day's writing and the backfill half is capped at 60. **Order of magnitude, REASONED FROM two measured points rather than observed across nights** — 2026-09-10 produced ~77 nodes and a 53-node fresh cohort, so a heavy night plus a full backfill is roughly 140 nodes ≈ 10 chunks. **Numeric trip-wire, so the trigger is not your in-the-moment comfort: if `prepare` returns MORE THAN 12 CHUNKS (>180 nodes), stop and raise it with Lei before dispatching.** Do not silently trim the cohort to get under it — trimming is the failure this uncapping exists to remove, and a genuine >12-chunk night is information about the backlog, not a dispatch problem to be hidden. For each chunk, construct a short dispatch prompt inline using the paths from the manifest. Example:
 
 ```
 Read your input payload from: <chunk_dir>/payload.json
@@ -650,7 +735,7 @@ Use `_build_initial_prompt(payload_path, output_path)` from `tools/cohort_dispat
 
 All fairies fire in parallel with `run_in_background=true`; the harness fires a task-notification when each completes.
 
-**Why batch-summary replaces serial summary-fairy**: the serial engram-summary-fairy uses ~56 turns / ~2.37M tokens for a 50-node cohort. Parallel batch fairies at chunk-size=15 cover a 50-node cohort (4 chunks) at ~110K tokens total — ~95% token reduction. Quality validated empirically on 2026-05-27 (mean Δ cosine = +0.043, pooled stdev = 0.118, ratio = 0.36 — well below 1.0 "indistinguishable from ground truth" threshold).
+**Why batch-summary replaces serial summary-fairy** (both figures measured at a 50-node cohort, which was the cap at the time and is no longer a ceiling — they are a per-node rate, not a budget): the serial engram-summary-fairy uses ~56 turns / ~2.37M tokens for a 50-node cohort. Parallel batch fairies at chunk-size=15 cover a 50-node cohort (4 chunks) at ~110K tokens total — ~95% token reduction. Quality validated empirically on 2026-05-27 (mean Δ cosine = +0.043, pooled stdev = 0.118, ratio = 0.36 — well below 1.0 "indistinguishable from ground truth" threshold).
 
 ### Step 7 — Wait for all fairies + collect reports; run validate + retry loop
 
@@ -777,13 +862,22 @@ When `final_payload.json` exists, the parent applies recall summaries now — be
 - The dream master's spawn prompt is leaner (no payload inline)
 - The dream master focuses purely on consolidation (reflect → buckets → resolve/supersede/retract/derive → turn-advance → dream record)
 
-Read `$COHORT_DIR/final_payload.json` and apply via the MCP tool:
+Apply `$COHORT_DIR/final_payload.json` via the MCP tool's file-based input path —
+pass the path, not the file's contents:
 
 ```python
-engram_set_recall_summaries(payload_json=open(f"{COHORT_DIR}/final_payload.json").read())
+engram_set_recall_summaries(payload_json=json.dumps({"summaries_file": f"{COHORT_DIR}/final_payload.json"}))
 ```
 
-(This is a Claude tool call, not a shell command. The payload is the `{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py validate` / `incorporate`.)
+(This is a Claude tool call, not a shell command. `final_payload.json` — the
+`{"summaries": [...], "failures": [...]}` JSON produced by `cohort_dispatch.py
+validate` / `incorporate` — is what the tool reads once it receives the path;
+`$COHORT_DIR` must be absolute, per its definition above. A live cohort
+payload runs tens of KB with the cohort cap removed, and re-emitting it
+verbatim through the model to pass inline is pure transcription waste with a
+silent failure mode — the file-path form has the tool read the file itself
+instead. The response echoes back `summaries_file`, confirming which file was
+actually read.)
 
 Log the result: X summaries applied, Y failures deferred to next cycle.
 
@@ -809,7 +903,7 @@ Agent(
     automatically, so a missed transcription here is recoverable from that file — but
     still transcribe it; the dream record is the reviewable narrative copy, the history
     file is the raw mechanical backstop, not a substitute):
-    - Drawn: <drawn_types_slugs> | Interrupt-forced: <interrupt_types_slugs, or "none — cascade_marker_count <N> below threshold <T>">
+    - Drawn: <drawn_types_slugs>
     - weights_before: <weights_before JSON> -> weights_after: <weights_after JSON>
 
     DREAM-FAIRY REPORTS (full content on disk — read each before integrating; this cycle's
@@ -823,7 +917,7 @@ Agent(
     ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
     - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
     - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
-    - Total: <K+L> ≤ 50, split across <N> chunks of ≤15 each
+    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved". They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)
@@ -841,7 +935,7 @@ Agent(
     FIRST because a plain supersede/retract is REFUSED on a node carrying a pending marker
     (#2343/#2392), and the supersedes/retractions buckets below WILL CONTAIN such nodes.
 
-    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/interrupt/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
+    Then execute one bucket at a time in ALL_BUCKET_NAMES order (tools/dream_master_batch.py is canonical: resolutions → supersedes → retractions → new_derivations → lessons → cornerstone_moves → goal_tension_resolutions → edge_wiring → task_closures → coverage_gaps; unknown bucket last, log-only), calling check_snapshot_divergence before each MCP write. Log diverged findings in the dream record. Include tonight's lottery-draw provenance (drawn/weights-before/weights-after, given above) in the dream record's own text — this is the durable log the design calls for. Call engram_advance_turn when your completion checklist is satisfied. Write the dream record.
 
     FINAL RETURN: dream record path + top-line counts (resolved / superseded / promoted / refuted / recall-summaries applied) + the cascade-sweep line (pending-at-start -> remaining, passes run, and any loud stop verbatim) + health score delta + flagged-for-user count. The parent relays this to the user verbatim.""",
     run_in_background=true
@@ -888,7 +982,7 @@ This is why the ordering is Phase A → Phase B, and why Phase A must complete b
 - **Dream master** (`engram-dream-master`) — owns the consolidation this skill orchestrates. Spec at `~/.claude/agents/engram-dream-master.md`.
 - **Batch-summary fairies** (`engram-batch-summary-fairy`) — one-shot batch generators dispatched by the parent after `cohort_dispatch.py prepare`. Each fairy receives a short dispatch prompt naming its input payload path and output path; it Reads the payload file (≤15 nodes), generates recall_summary + recall_keywords, and Writes the output JSON. Tool list: `[Read, Write]`. No inline payload embedding in the dispatch prompt. Sole dispatch path for recall_summary generation in the sleep cycle. Spec at `~/.claude/agents/engram-batch-summary-fairy.md`.
 - **cohort_dispatch.py** — orchestration script in `tools/cohort_dispatch.py`. Five subcommands: `prepare` (chunk cohort → per-chunk payload.json), `verify-in` (pre-flight integrity checks), `validate` (split clean vs failures, auto-write retry_payload.json), `incorporate` / `incorporate-retry` (merge retry output → final_payload.json + retry_payload.json + unfixable.json + attempt_count). Drives the always-on batch-summary step; unaffected by the lottery (#1901).
-- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set (frequency) + applies the cascade-urgency interrupt (force-include regardless of draw). `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn vs interrupt-forced counts per category, cycles, interrupt-cycle count).
+- **dream_lottery.py** — weight-aging lottery draw in `tools/dream_lottery.py` (#1901). `draw` subcommand: picks tonight's dream-fairy category set. `status` subcommand: prints current per-type weights/watermarks. State at `~/.engram/dream-lottery.json`. Every `draw` also appends the full per-draw record to an append-only history file (`~/.engram/dream-lottery-history.jsonl`, #1909); the `history` subcommand tallies it (drawn counts per category, cycles counted). (The urgency-interrupt mechanism this module once carried was removed 2026-09-11, issue #2399 — see Phase B's design-of-record note above.)
 - **Dream fairies** (`engram-dream-fairy`) — read-only consolidation-suggestion scanners, one category per dispatch (roster SSoT: `dream_lottery.py`'s `CATEGORIES` dict), the lottery-drawn subset each night (was all-categories-nightly pre-#1901). Spec at `~/.claude/agents/engram-dream-fairy.md`.
 - **End-of-day-detector hook** — surfaces engram-sleep on wrap-up phrases; user "Yes" triggers this skill.
 

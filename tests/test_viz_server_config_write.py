@@ -1,4 +1,5 @@
-"""Tests for viz_server config write infrastructure (PR-2: PUT /api/config/<key>).
+"""Tests for viz.data.config write infrastructure (PR-2: PUT /api/config/<key>)
+(engram-alpha#2555 PR A retarget -- was viz_server).
 
 Covers:
 1.  Valid write round-trips (value survives to disk and is read back correctly).
@@ -31,7 +32,9 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz import agents as viz_agents
+from viz import server as viz_server
+from viz.data import config as viz_config_data
 
 
 # ---------------------------------------------------------------------------
@@ -72,9 +75,9 @@ class ConfigWriteBase(unittest.TestCase):
     """Common setUp/tearDown: temp engram dir + AGENTS registry."""
 
     def setUp(self):
-        self._saved_agents = viz_server.AGENTS
-        self._saved_backups = dict(viz_server._CONFIG_WRITE_BACKUPS)
-        viz_server._CONFIG_WRITE_BACKUPS.clear()
+        self._saved_agents = viz_agents.AGENTS
+        self._saved_backups = dict(viz_config_data._CONFIG_WRITE_BACKUPS)
+        viz_config_data._CONFIG_WRITE_BACKUPS.clear()
 
         self.tmpdir = tempfile.mkdtemp(prefix="engram_cfg_write_test_")
         self.engram_home = Path(self.tmpdir) / "agent_dir"
@@ -84,7 +87,7 @@ class ConfigWriteBase(unittest.TestCase):
         self.config_path = self.engram_home / "config.json"
         self.config_path.write_text(json.dumps(_make_config(), indent=2))
 
-        viz_server.AGENTS = {
+        viz_agents.AGENTS = {
             "test": {
                 "name": "test",
                 "label": "Test",
@@ -93,9 +96,9 @@ class ConfigWriteBase(unittest.TestCase):
         }
 
     def tearDown(self):
-        viz_server.AGENTS = self._saved_agents
-        viz_server._CONFIG_WRITE_BACKUPS.clear()
-        viz_server._CONFIG_WRITE_BACKUPS.update(self._saved_backups)
+        viz_agents.AGENTS = self._saved_agents
+        viz_config_data._CONFIG_WRITE_BACKUPS.clear()
+        viz_config_data._CONFIG_WRITE_BACKUPS.update(self._saved_backups)
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _read_config(self) -> dict:
@@ -110,7 +113,7 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
     """Valid writes persist to disk."""
 
     def test_integer_key_round_trips(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 75
         )
         self.assertTrue(result["ok"], result)
@@ -119,21 +122,21 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
         self.assertEqual(cfg["cadence"]["drowsiness_caution_pct"], 75)
 
     def test_float_key_round_trips(self):
-        result = viz_server.write_config_key("test", "memory.decay_base", 1.05)
+        result = viz_config_data.write_config_key("test", "memory.decay_base", 1.05)
         self.assertTrue(result["ok"], result)
         self.assertAlmostEqual(result["validated_value"], 1.05)
         cfg = self._read_config()
         self.assertAlmostEqual(cfg["memory"]["decay_base"], 1.05)
 
     def test_boolean_key_round_trips(self):
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_enabled", True)
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_enabled", True)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], True)
         cfg = self._read_config()
         self.assertEqual(cfg["cadence"]["auto_sleep_enabled"], True)
 
     def test_string_key_round_trips(self):
-        result = viz_server.write_config_key("test", "primary_user", "alice")
+        result = viz_config_data.write_config_key("test", "primary_user", "alice")
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], "alice")
         cfg = self._read_config()
@@ -141,7 +144,7 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
 
     def test_list_key_round_trips(self):
         new_pool = ["reuters.com", "apnews.com"]
-        result = viz_server.write_config_key("test", "trust_pool", new_pool)
+        result = viz_config_data.write_config_key("test", "trust_pool", new_pool)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], new_pool)
         cfg = self._read_config()
@@ -149,24 +152,24 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
 
     def test_integer_coerced_from_string(self):
         # Browser form inputs send strings — the write path should coerce.
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_urgent_pct", "85"
         )
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], 85)
 
     def test_float_coerced_from_string(self):
-        result = viz_server.write_config_key("test", "memory.decay_base", "1.020")
+        result = viz_config_data.write_config_key("test", "memory.decay_base", "1.020")
         self.assertTrue(result["ok"], result)
         self.assertAlmostEqual(result["validated_value"], 1.020)
 
     def test_boolean_coerced_from_string_true(self):
-        result = viz_server.write_config_key("test", "polarity.enabled", "true")
+        result = viz_config_data.write_config_key("test", "polarity.enabled", "true")
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], True)
 
     def test_boolean_coerced_from_string_false(self):
-        result = viz_server.write_config_key("test", "polarity.enabled", "false")
+        result = viz_config_data.write_config_key("test", "polarity.enabled", "false")
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["validated_value"], False)
 
@@ -176,13 +179,13 @@ class TestWriteConfigKeyRoundTrip(ConfigWriteBase):
         # This test documents the current behavior — not a contract that it
         # must be accepted, but a record of what the code actually does so
         # any future change to reject bools here is deliberate.
-        result_true = viz_server.write_config_key(
+        result_true = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", True
         )
         self.assertTrue(result_true["ok"], result_true)
         self.assertEqual(result_true["validated_value"], 1)
 
-        result_false = viz_server.write_config_key(
+        result_false = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", False
         )
         self.assertTrue(result_false["ok"], result_false)
@@ -193,25 +196,25 @@ class TestWriteConfigKeyValidationRejection(ConfigWriteBase):
     """Invalid inputs return ok=False without touching disk."""
 
     def test_wrong_type_integer_rejected(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", "not-a-number"
         )
         self.assertFalse(result["ok"])
         self.assertIn("integer", result["error"].lower())
 
     def test_wrong_type_float_rejected(self):
-        result = viz_server.write_config_key("test", "memory.decay_base", "banana")
+        result = viz_config_data.write_config_key("test", "memory.decay_base", "banana")
         self.assertFalse(result["ok"])
         self.assertIn("float", result["error"].lower())
 
     def test_wrong_type_string_for_list_rejected(self):
-        result = viz_server.write_config_key("test", "trust_pool", "reuters.com")
+        result = viz_config_data.write_config_key("test", "trust_pool", "reuters.com")
         self.assertFalse(result["ok"])
         self.assertIn("list", result["error"].lower())
 
     def test_out_of_range_min_rejected(self):
         # cadence.drowsiness_caution_pct min=0; send -1
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", -1
         )
         self.assertFalse(result["ok"])
@@ -219,7 +222,7 @@ class TestWriteConfigKeyValidationRejection(ConfigWriteBase):
 
     def test_out_of_range_max_rejected(self):
         # cadence.drowsiness_caution_pct max=100; send 101
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 101
         )
         self.assertFalse(result["ok"])
@@ -227,12 +230,12 @@ class TestWriteConfigKeyValidationRejection(ConfigWriteBase):
 
     def test_out_of_range_float_rejected(self):
         # memory.decay_base min=1.0 max=1.5; send 2.0
-        result = viz_server.write_config_key("test", "memory.decay_base", 2.0)
+        result = viz_config_data.write_config_key("test", "memory.decay_base", 2.0)
         self.assertFalse(result["ok"])
         self.assertIn("maximum", result["error"].lower())
 
     def test_unknown_key_rejected(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "nonexistent.totally_fake_key", 42
         )
         self.assertFalse(result["ok"])
@@ -240,7 +243,7 @@ class TestWriteConfigKeyValidationRejection(ConfigWriteBase):
 
     def test_readonly_key_rejected(self):
         # embedding.model is editable=False
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "embedding.model", "some-new-model"
         )
         self.assertFalse(result["ok"])
@@ -248,12 +251,12 @@ class TestWriteConfigKeyValidationRejection(ConfigWriteBase):
 
     def test_disk_not_touched_on_validation_error(self):
         mtime_before = os.path.getmtime(str(self.config_path))
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 999)
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 999)
         mtime_after = os.path.getmtime(str(self.config_path))
         self.assertEqual(mtime_before, mtime_after)
 
     def test_unknown_agent_rejected(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "no_such_agent", "cadence.drowsiness_caution_pct", 75
         )
         self.assertFalse(result["ok"])
@@ -264,36 +267,36 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
     """Backup created exactly once per session per agent."""
 
     def test_backup_created_on_first_write(self):
-        self.assertEqual(len(viz_server._CONFIG_WRITE_BACKUPS), 0)
-        result = viz_server.write_config_key(
+        self.assertEqual(len(viz_config_data._CONFIG_WRITE_BACKUPS), 0)
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 70
         )
         self.assertTrue(result["ok"])
-        self.assertIn("test", viz_server._CONFIG_WRITE_BACKUPS)
-        backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        self.assertIn("test", viz_config_data._CONFIG_WRITE_BACKUPS)
+        backup_path = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
         self.assertTrue(os.path.exists(backup_path), "Backup file should exist")
 
     def test_backup_contains_last_good_value_after_write(self):
         # After a successful write (80 → 70), the backup is refreshed to the
         # written value (70) so a later rollback lands on last-good, not session-start.
         # (#380 backup-refresh fix)
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
-        backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
+        backup_path = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
         backup_cfg = json.loads(Path(backup_path).read_text())
         self.assertEqual(backup_cfg["cadence"]["drowsiness_caution_pct"], 70)
 
     def test_backup_created_only_once(self):
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
-        backup_path_1 = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
+        backup_path_1 = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
 
-        viz_server.write_config_key("test", "cadence.drowsiness_urgent_pct", 85)
-        backup_path_2 = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        viz_config_data.write_config_key("test", "cadence.drowsiness_urgent_pct", 85)
+        backup_path_2 = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
 
         self.assertEqual(backup_path_1, backup_path_2, "Same backup for second write")
 
     def test_backup_path_includes_timestamp(self):
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
-        backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
+        backup_path = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
         self.assertIn(".bak.", backup_path)
         # Should end with something like 20260524T120000Z
         self.assertTrue(Path(backup_path).name.endswith("Z"),
@@ -308,13 +311,13 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
         """
         # Session-start value for drowsiness_caution_pct is 80 (_make_config).
         # Write A: set to 70.
-        result_a = viz_server.write_config_key(
+        result_a = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 70
         )
         self.assertTrue(result_a["ok"], result_a)
 
         # After successful write A, backup must contain A's value (70), not 80.
-        backup_path = viz_server._CONFIG_WRITE_BACKUPS["test"]
+        backup_path = viz_config_data._CONFIG_WRITE_BACKUPS["test"]
         backup_cfg = json.loads(Path(backup_path).read_text())
         self.assertEqual(
             backup_cfg["cadence"]["drowsiness_caution_pct"], 70,
@@ -331,7 +334,7 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
         write #2 correctly restores 70.
         """
         # Write A succeeds: caution_pct 80 → 70.
-        result_a = viz_server.write_config_key(
+        result_a = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 70
         )
         self.assertTrue(result_a["ok"], result_a)
@@ -351,7 +354,7 @@ class TestWriteConfigKeyBackup(ConfigWriteBase):
 
         shutil.copyfileobj = torn_then_real
         try:
-            result_b = viz_server.write_config_key(
+            result_b = viz_config_data.write_config_key(
                 "test", "cadence.drowsiness_urgent_pct", 95
             )
         finally:
@@ -373,26 +376,26 @@ class TestWriteConfigKeyRestartRequired(ConfigWriteBase):
     """restart_required flag reflects schema metadata."""
 
     def test_restart_required_true_for_polarity_enabled(self):
-        result = viz_server.write_config_key("test", "polarity.enabled", True)
+        result = viz_config_data.write_config_key("test", "polarity.enabled", True)
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["restart_required"])
 
     def test_restart_required_true_for_polarity_model(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "polarity.model", "some-model/name"
         )
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["restart_required"])
 
     def test_restart_required_false_for_drowsiness_caution_pct(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 75
         )
         self.assertTrue(result["ok"], result)
         self.assertFalse(result["restart_required"])
 
     def test_restart_required_false_for_trust_pool(self):
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "trust_pool", ["reuters.com"]
         )
         self.assertTrue(result["ok"], result)
@@ -403,36 +406,36 @@ class TestWriteConfigKeyAtomicity(ConfigWriteBase):
     """Atomic write: no partial file left on disk after failure."""
 
     def test_no_temp_files_after_successful_write(self):
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
         # Scan for leftover .tmp files in the config dir
         tmp_files = list(self.engram_home.glob(".config_write_*.tmp"))
         self.assertEqual(tmp_files, [], f"Leftover temp files: {tmp_files}")
 
     def test_config_json_remains_valid_after_write(self):
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 70)
         # config.json must still be valid JSON after write
         cfg = json.loads(self.config_path.read_text())
         self.assertIsInstance(cfg, dict)
 
     def test_rollback_on_verify_failure(self):
         """Simulate verify failure by patching _get_nested to return _MISSING."""
-        original_get_nested = viz_server._get_nested
+        original_get_nested = viz_config_data._get_nested
 
         call_count = [0]
 
         def fake_get_nested(config, key):
             call_count[0] += 1
-            return viz_server._MISSING  # always fail verify
+            return viz_config_data._MISSING  # always fail verify
 
-        viz_server._get_nested = fake_get_nested
+        viz_config_data._get_nested = fake_get_nested
         try:
-            result = viz_server.write_config_key(
+            result = viz_config_data.write_config_key(
                 "test", "cadence.drowsiness_caution_pct", 70
             )
         finally:
-            viz_server._get_nested = original_get_nested
+            viz_config_data._get_nested = original_get_nested
             # Clear backup tracking so tearDown works cleanly
-            viz_server._CONFIG_WRITE_BACKUPS.pop("test", None)
+            viz_config_data._CONFIG_WRITE_BACKUPS.pop("test", None)
 
         self.assertFalse(result["ok"])
         self.assertIn("verify failed", result["error"])
@@ -466,12 +469,12 @@ class TestWriteConfigKeyAtomicity(ConfigWriteBase):
 
         shutil.copyfileobj = torn_then_real
         try:
-            result = viz_server.write_config_key(
+            result = viz_config_data.write_config_key(
                 "test", "cadence.drowsiness_caution_pct", 99
             )
         finally:
             shutil.copyfileobj = real_copyfileobj
-            viz_server._CONFIG_WRITE_BACKUPS.pop("test", None)
+            viz_config_data._CONFIG_WRITE_BACKUPS.pop("test", None)
 
         self.assertFalse(result["ok"])
         self.assertIn("Write failed", result["error"])
@@ -487,7 +490,7 @@ class TestWriteConfigKeyPreservesInode(ConfigWriteBase):
 
     def test_inode_preserved_across_write(self):
         st_before = os.stat(str(self.config_path))
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 70
         )
         self.assertTrue(result["ok"], result)
@@ -502,7 +505,7 @@ class TestWriteConfigKeyPreservesInode(ConfigWriteBase):
     def test_mode_preserved_across_write(self):
         os.chmod(str(self.config_path), 0o600)
         st_before = os.stat(str(self.config_path))
-        result = viz_server.write_config_key(
+        result = viz_config_data.write_config_key(
             "test", "cadence.drowsiness_caution_pct", 71
         )
         self.assertTrue(result["ok"], result)
@@ -513,7 +516,7 @@ class TestWriteConfigKeyPreservesInode(ConfigWriteBase):
         )
 
     def test_value_still_persists_with_inplace_write(self):
-        viz_server.write_config_key("test", "cadence.drowsiness_caution_pct", 72)
+        viz_config_data.write_config_key("test", "cadence.drowsiness_caution_pct", 72)
         cfg = self._read_config()
         self.assertEqual(cfg["cadence"]["drowsiness_caution_pct"], 72)
 
@@ -649,50 +652,50 @@ class TestAutoSleepTimePatternValidation(ConfigWriteBase):
 
     def test_valid_hhmm_accepted(self):
         """'03:00' is a valid HH:MM value and must be accepted."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "03:00")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "03:00")
         self.assertTrue(result["ok"], f"Expected ok=True for '03:00'; got: {result}")
         self.assertEqual(result["validated_value"], "03:00")
 
     def test_midnight_accepted(self):
         """'00:00' (midnight) is a valid HH:MM value."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "00:00")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "00:00")
         self.assertTrue(result["ok"], f"Expected ok=True for '00:00'; got: {result}")
 
     def test_end_of_day_accepted(self):
         """'23:59' (last minute of day) is a valid HH:MM value."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "23:59")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "23:59")
         self.assertTrue(result["ok"], f"Expected ok=True for '23:59'; got: {result}")
 
     def test_am_suffix_rejected(self):
         """'03 am' (12h with suffix) must be rejected — not HH:MM 24h format."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "03 am")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "03 am")
         self.assertFalse(result["ok"], "Expected ok=False for '03 am'")
         self.assertIn("HH:MM", result.get("error", ""),
                       f"Error should mention HH:MM format; got: {result.get('error')}")
 
     def test_24h_format_rejected(self):
         """'3:00' (single-digit hour) must be rejected — zero-padding required."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "3:00")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "3:00")
         self.assertFalse(result["ok"], "Expected ok=False for '3:00' (no zero-pad)")
 
     def test_invalid_hour_rejected(self):
         """'25:00' (hour > 23) must be rejected."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "25:00")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "25:00")
         self.assertFalse(result["ok"], "Expected ok=False for '25:00'")
 
     def test_invalid_minute_rejected(self):
         """'12:60' (minute > 59) must be rejected."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "12:60")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "12:60")
         self.assertFalse(result["ok"], "Expected ok=False for '12:60'")
 
     def test_free_text_rejected(self):
         """'bedtime' (arbitrary string) must be rejected."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "bedtime")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "bedtime")
         self.assertFalse(result["ok"], "Expected ok=False for 'bedtime'")
 
     def test_value_persists_on_valid_write(self):
         """Valid write persists to config.json at cadence.auto_sleep_time."""
-        result = viz_server.write_config_key("test", "cadence.auto_sleep_time", "22:30")
+        result = viz_config_data.write_config_key("test", "cadence.auto_sleep_time", "22:30")
         self.assertTrue(result["ok"], result)
         cfg = self._read_config()
         self.assertEqual(cfg["cadence"]["auto_sleep_time"], "22:30")
@@ -703,17 +706,17 @@ class TestSelfLineagePatternValidation(ConfigWriteBase):
 
     def test_valid_lineage_accepted(self):
         """'anthropic:opus' is a valid provider:family value."""
-        result = viz_server.write_config_key("test", "self_lineage", "anthropic:opus")
+        result = viz_config_data.write_config_key("test", "self_lineage", "anthropic:opus")
         self.assertTrue(result["ok"], result)
 
     def test_empty_lineage_accepted(self):
         """Empty string is valid (disables the feature)."""
-        result = viz_server.write_config_key("test", "self_lineage", "")
+        result = viz_config_data.write_config_key("test", "self_lineage", "")
         self.assertTrue(result["ok"], result)
 
     def test_invalid_lineage_rejected(self):
         """An invalid value must be rejected and the error must not mention 'HH:MM'."""
-        result = viz_server.write_config_key("test", "self_lineage", "invalid!value")
+        result = viz_config_data.write_config_key("test", "self_lineage", "invalid!value")
         self.assertFalse(result["ok"], "Expected ok=False for 'invalid!value'")
         error = result.get("error", "")
         self.assertNotIn("HH:MM", error,

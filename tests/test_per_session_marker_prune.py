@@ -284,3 +284,66 @@ def test_write_marker_fairy_cwd_detection(tmp_path):
     with open(written) as f:
         data = json.load(f)
     assert data["role"] == "fairy"
+
+
+# ---------------------------------------------------------------------------
+# (d) #2859 follow-up (reviewer-fairy catch on PR-2925): piece_c_git_log()'s
+# sidecar file is pruned alongside its marker, not left to accumulate.
+# ---------------------------------------------------------------------------
+
+def test_prune_deletes_piece_c_sidecar_alongside_stale_marker(tmp_path):
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    session_id = "ffff6666-aaaa-bbbb-cccc-ddddeeeeffff"
+    marker = sessions_dir / f"{session_id}.json"
+    sidecar = sessions_dir / f"{session_id}-piece-c.txt"
+    marker.write_text("{}")
+    sidecar.write_text("Piece C — recent commits (2 days ago), 3 commit(s) across 1 repo(s):\n")
+
+    _set_mtime(marker, 8 * 86400)  # 8 days old — should be pruned
+    _set_mtime(sidecar, 8 * 86400)
+
+    module = _load_hook(tmp_path / "engram")
+    module.prune_stale_session_markers("aaaa0000-bbbb-cccc-dddd-eeeeffff2222")
+
+    assert not marker.exists(), "8-day marker should have been deleted"
+    assert not sidecar.exists(), "its piece-c sidecar should be deleted alongside it"
+
+
+def test_prune_keeps_piece_c_sidecar_for_fresh_marker(tmp_path):
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    session_id = "bbbb1111-cccc-dddd-eeee-ffffaaaa3333"
+    marker = sessions_dir / f"{session_id}.json"
+    sidecar = sessions_dir / f"{session_id}-piece-c.txt"
+    marker.write_text("{}")
+    sidecar.write_text("Piece C — recent commits (2 days ago), 1 commit(s) across 1 repo(s):\n")
+
+    _set_mtime(marker, 10)  # 10 seconds old — should survive
+    _set_mtime(sidecar, 10)
+
+    module = _load_hook(tmp_path / "engram")
+    module.prune_stale_session_markers("cccc2222-dddd-eeee-ffff-aaaabbbb4444")
+
+    assert marker.exists(), "fresh marker should be kept"
+    assert sidecar.exists(), "its piece-c sidecar should be kept too, not deleted unconditionally"
+
+
+def test_prune_does_not_crash_when_marker_has_no_sidecar(tmp_path):
+    """Most markers never had a Piece C sidecar at all (zero commits in the
+    window, or a pre-#2859 marker) -- the prune step must not assume one
+    exists."""
+    sessions_dir = tmp_path / "engram" / "sessions"
+    sessions_dir.mkdir(parents=True)
+
+    session_id = "dddd3333-eeee-ffff-aaaa-bbbbcccc5555"
+    marker = sessions_dir / f"{session_id}.json"
+    marker.write_text("{}")
+    _set_mtime(marker, 8 * 86400)
+
+    module = _load_hook(tmp_path / "engram")
+    module.prune_stale_session_markers("eeee4444-ffff-aaaa-bbbb-ccccdddd6666")  # must not raise
+
+    assert not marker.exists(), "marker should still be deleted even with no sidecar present"

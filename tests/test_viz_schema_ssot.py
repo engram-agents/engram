@@ -1,11 +1,13 @@
-"""CI drift gate: viz_server.get_schema_data() must stay in sync with the schema SSoT.
+"""CI drift gate: viz.data.schema.get_schema_data() must stay in sync with
+the schema SSoT (engram-alpha#2555 PR A retarget -- was viz_server).
 
 Tests import get_schema_data() directly (no HTTP) so CI catches any divergence
 between the /api/schema endpoint and the engram_core / engram_query / engram_stats
 constants immediately — before it can silently drift again.
 
 Import pattern mirrors test_viz_server_stats.py: conftest.py already inserts
-src/engram into sys.path, so both viz_server and the engram_* modules resolve.
+src/engram into sys.path, so both viz.data.schema and the engram_* modules
+resolve.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from pathlib import Path
 # Belt-and-suspenders path insertion (mirrors test_viz_server_stats.py pattern).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import viz_server
+from viz.data import schema as viz_schema_data
 import engram_core
 
 
@@ -25,7 +27,7 @@ class TestGetSchemaDataNodeTypes(unittest.TestCase):
     """Every node type in the schema SSoT must appear in get_schema_data()."""
 
     def test_node_types_match_ssot(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertEqual(
             data["node_types"],
             sorted(engram_core.VALID_NODE_TYPES),
@@ -34,7 +36,7 @@ class TestGetSchemaDataNodeTypes(unittest.TestCase):
         )
 
     def test_node_types_count(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         # Concrete count check: catches accidental deletion from VALID_NODE_TYPES.
         self.assertEqual(
             len(data["node_types"]),
@@ -43,7 +45,7 @@ class TestGetSchemaDataNodeTypes(unittest.TestCase):
 
     def test_cornerstone_is_present(self):
         """Regression: cornerstone was missing from the old hardcoded JS map."""
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertIn(
             "cornerstone",
             data["node_types"],
@@ -52,7 +54,7 @@ class TestGetSchemaDataNodeTypes(unittest.TestCase):
         )
 
     def test_claim_bearing_types_match_ssot(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertEqual(
             data["claim_bearing_types"],
             sorted(engram_core.CLAIM_BEARING_TYPES),
@@ -63,7 +65,7 @@ class TestGetSchemaDataRelations(unittest.TestCase):
     """Every relation in the schema SSoT must appear in get_schema_data()."""
 
     def test_all_valid_relations_present(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         for rel in engram_core.VALID_RELATIONS:
             self.assertIn(
                 rel,
@@ -74,7 +76,7 @@ class TestGetSchemaDataRelations(unittest.TestCase):
             )
 
     def test_no_extra_relations(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         for rel in data["relations"]:
             self.assertIn(
                 rel,
@@ -84,7 +86,7 @@ class TestGetSchemaDataRelations(unittest.TestCase):
             )
 
     def test_cascade_provenance_bools_match_edge_classifications(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         for rel, info in data["relations"].items():
             expected_cascade = bool(
                 engram_core.EDGE_CLASSIFICATIONS.get(rel, {}).get("cascade", False)
@@ -107,7 +109,7 @@ class TestGetSchemaDataRelations(unittest.TestCase):
 
     def test_instantiates_present(self):
         """Regression: instantiates was in VALID_RELATIONS but unclassified."""
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertIn(
             "instantiates",
             data["relations"],
@@ -133,14 +135,14 @@ class TestGetSchemaDataConfidenceBearingTypes(unittest.TestCase):
 
     def test_confidence_bearing_types_match_ssot(self):
         import engram_stats
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertEqual(
             data["confidence_bearing_types"],
             sorted(engram_stats._CONFIDENCE_BEARING_TYPES),
         )
 
     def test_confidence_bearing_types_nonempty(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         self.assertGreater(
             len(data["confidence_bearing_types"]),
             0,
@@ -149,7 +151,7 @@ class TestGetSchemaDataConfidenceBearingTypes(unittest.TestCase):
 
     def test_confidence_bearing_types_are_valid_node_types(self):
         """Every confidence-bearing type must be a valid node type."""
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         for t in data["confidence_bearing_types"]:
             self.assertIn(
                 t,
@@ -170,7 +172,7 @@ class TestGetSchemaDataRelationClassification(unittest.TestCase):
     """
 
     def test_union_equals_valid_relations(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         logical = set(data["logical_substrate_relations"])
         contextual = set(data["contextual_relations"])
         combined = logical | contextual
@@ -185,7 +187,7 @@ class TestGetSchemaDataRelationClassification(unittest.TestCase):
         )
 
     def test_no_overlap_between_sets(self):
-        data = viz_server.get_schema_data()
+        data = viz_schema_data.get_schema_data()
         logical = set(data["logical_substrate_relations"])
         contextual = set(data["contextual_relations"])
         overlap = logical & contextual

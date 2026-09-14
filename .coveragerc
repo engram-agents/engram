@@ -1,0 +1,87 @@
+# .coveragerc — coverage instrumentation config (issue #2774).
+#
+# Coverage here is a SPEC-COMPLETENESS FINDER, not a quality metric: under the
+# prescriptive-SPEC ruling, production code that no test executes is a
+# candidate flaw-register entry. Two consequences for this file:
+#
+#   1. The denominator must be PRODUCTION code only — a test file measuring
+#      its own execution is noise, not a spec-completeness signal, and left
+#      unfiltered it dilutes the total and pollutes the "lowest-covered
+#      files" list with test files themselves. Measured on a real full-suite
+#      run (2026-09-09): with --cov=src/engram --cov=src/forum and no omit,
+#      21 of 32 files in the "lowest-covered" pool were src/*/tests/*.py, and
+#      the TOTAL read 78% only because those (mostly well-covered-by-their-own-
+#      execution) test files were counted as "production" rows. The `omit`
+#      list below excludes them.
+#   2. No fail_under / gate is set anywhere in this file, deliberately — the
+#      output is a list of uncovered locations, and turning the percentage
+#      into a target is explicitly out of scope for this feature.
+[run]
+omit =
+    */tests/*
+    */test_*.py
+    */conftest.py
+
+# ── THE ENGRAM_NO_EMBEDDINGS CAVEAT — READ BEFORE ADDING AN OMIT HERE ──────
+# The nightly workflow (.github/workflows/nightly.yml) sets
+# ENGRAM_NO_EMBEDDINGS=1 to skip the ~500MB sentence-transformers model
+# download; under that flag the embedding path (EmbeddingManager._load_model
+# / .embed in engram_core.py, the CrossEncoder path, the embedding-gate check
+# in server.py) is never exercised — not because it's dead code, but because
+# this run configuration deliberately doesn't exercise it. It is deliberately
+# NOT omitted here: that code lives interleaved inside engram_core.py /
+# server.py alongside heavily-tested unrelated code, so a file-level omit
+# would hide real gaps in those files rather than just the embedding path.
+# See nightly.yml's own comment above its "Run full pytest suite" step (and
+# its "Write coverage summary" step) for how this is handled instead — an
+# explicit annotation in the run's summary, not a coverage exclusion.
+
+[report]
+# include_namespace_packages = True is NOT decorative — it is load-bearing
+# for BOTH the single-source-root design (nightly.yml + tools/coverage-diff.sh
+# both use `--cov=src`, not `--cov=src/engram --cov=src/forum`) and this
+# repo's own layout. Two things it fixes at once (#2774):
+#
+#   1. THE COLLISION IT WAS ADDED TO FIX. Two source roots
+#      (`--cov=src/engram --cov=src/forum`) made coverage.py's Cobertura XML
+#      writer emit BOTH src/engram/server.py and src/forum/server.py as
+#      filename="server.py" under the same "." package identity — one
+#      silently overwrote the other's numbers in coverage.xml (verified: the
+#      terminal report and htmlcov/ were unaffected; only the XML, which
+#      diff-cover and the step-summary both parse, lost fidelity — and
+#      reordering the two --cov flags did not change which file won,
+#      ruling out a quick reordering fix). A SINGLE root (`--cov=src`)
+#      resolves it: coverage.py then emits distinct filename="engram/server.py"
+#      and filename="forum/server.py" entries. Verified empirically, not just
+#      reasoned: grepping the emitted XML for filename="[^"]*server\.py" under
+#      each flag shape confirmed the collision and confirmed the fix.
+#   2. THE REGRESSION SWITCHING TO A SINGLE ROOT WOULD OTHERWISE CAUSE.
+#      coverage.py's unexecuted-file walk (coverage/files.py's
+#      find_python_files) requires __init__.py in every subdirectory below
+#      the one named by --cov, UNLESS include_namespace_packages is set —
+#      and neither src/engram nor src/build (only src/forum) has a top-level
+#      __init__.py. So `--cov=src` ALONE (without this setting) silently
+#      PRUNES src/engram and src/build from the "report untested files as a
+#      gap" walk — genuinely-untested engram/build files would not appear in
+#      the report AT ALL (neither as covered nor as a gap), rather than being
+#      merely mis-attributed as under the two-root collision. Measured: with
+#      this setting unset, a single-file test subset reported only 22 of
+#      src/engram's own files (exactly the ones that test happened to
+#      import); with it set to True, the same subset reported 137 engram
+#      files (the full tree, matching --cov=src/engram alone's own count).
+#
+# DO NOT split this back into `--cov=src/engram --cov=src/forum` "for
+# clarity" — that reintroduces defect (1). And do not remove this setting
+# "since it looks unused" — without it, defect (2) reappears, silently,
+# because a namespace-pruned package still parses as valid XML; it just
+# quietly stops reporting most of its own untested files as gaps.
+#
+# SCOPE CONSEQUENCE, named so it is not discovered by whoever reads the first
+# report: src/ holds THREE packages (src/build, src/engram, src/forum), so
+# `--cov=src` also brings src/build (the packaging/build engine) into the
+# measured set, which the old two-root flag excluded. That is judged correct,
+# not incidental — under this project's prescriptive-SPEC framing, build code
+# is production code whose behaviour should be specified too.
+include_namespace_packages = True
+show_missing = True
+skip_covered = False

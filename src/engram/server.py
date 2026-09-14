@@ -35,9 +35,27 @@ from fastmcp import FastMCP
 # silent no-op when the singleton has not been initialized, which is the
 # normal state for server.py: it runs as a long-lived MCP process serving
 # multiple Claude sessions and has no single session_id to bind to.
-# Phase 4 will add a separate init path for server-side events.
+# alpha #2574 WS5 is Phase 4 -- see the Emitter.init() call in
+# `if __name__ == "__main__":` below.
 # See alpha #175 (two-level logging architecture) for the spec.
-from engram_log_emitter import emit_if_initialized  # noqa: E402
+from engram_log_emitter import Emitter, emit_if_initialized  # noqa: E402
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience
+# (WS1's own tiering judgment call -- src/build/packaging/tiers.json), while
+# server.py ships at tier=essential. A plain top-level import here would
+# make an essential-tier module hard-depend on a convenience-tier one,
+# breaking an Essential-only build
+# (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces
+# exactly this). Guarded import + no-op stub keeps every MCP tool call
+# gating-nothing-T1 (docs/2574-telemetry-design.md §8) even if the store
+# ships without it -- same pattern as the four engram_*.py impl modules
+# this workstream also touches (engram_derive.py, engram_observation.py,
+# engram_query.py, engram_revision.py).
+try:
+    from engram_telemetry_store import write_telemetry_record  # noqa: E402
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 # sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
 # O(N) pure-Python cosine loop in _semantic_search. If the extension fails to
@@ -612,8 +630,6 @@ def _graph_lineage_count(*args, **kwargs):
 # Impls + cascade helpers moved to engram_revision.py (family E).
 # Constants VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT also moved;
 # aliased here so server-level references and tests continue to resolve.
-# _retract_impl injects _add_observation_impl to preserve the optional
-# replacement path (acyclic: family modules may not import server.py).
 VALID_ERROR_TYPES = _revision_mod.VALID_ERROR_TYPES
 _THRESHOLD_GATE_DISCIPLINE_HINT = _revision_mod._THRESHOLD_GATE_DISCIPLINE_HINT
 
@@ -630,14 +646,11 @@ def _supersede_impl(*args, **kwargs):
     return _revision_mod._supersede_impl(*args, **kwargs)
 
 def _retract_impl(*args, **kwargs):
-    # NOTE: do not pass _obs_creator through this forwarder — it is wired here
-    # (composition root); a caller-supplied value would raise TypeError
-    # ("multiple values for keyword argument").
-    # Wave 9: updated wiring from the server-resident compat forwarder name to
-    # the module source of truth (_observation_mod._add_observation_impl).
-    # This is the one-line change PR #918 predicted — composition root now
-    # references the canonical implementation, not the forwarder chain.
-    return _revision_mod._retract_impl(*args, _obs_creator=_observation_mod._add_observation_impl, **kwargs)
+    # #2612 retired the mint-inside-retraction path — no more callable
+    # injection across the module boundary here. The replacement node (if
+    # any) is created by the caller via its own canonical creation tool,
+    # before calling engram_retract, and named by replacement_id.
+    return _revision_mod._retract_impl(*args, **kwargs)
 # ---- end #872 wave-6 compat forwarders --------------------------------
 
 # ---- engram_cascade_frontier (engram-alpha#2013 slice 3) --------------
@@ -1281,8 +1294,9 @@ def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
 # Keys that contain long free-text content (user-authored claims, quoted text,
 # reasoning chains) are excluded from the data JSON stored in index.db so the
 # stats dashboard never surfaces L2-equivalent content through an L1 path.
-# Per viz_server.py:2617 privacy note ("L2 events are indexed but never
-# surfaced through this dashboard"). Only non-sensitive metadata is kept:
+# Per viz/templates/stats.html's privacy note ("L2 (content) events are
+# indexed but never surfaced through this dashboard"). Only non-sensitive
+# metadata is kept:
 # node/evidence IDs, shape descriptors, counts, filter parameters, etc.
 # ---------------------------------------------------------------------------
 _PAYLOAD_PRIVATE_KEYS = frozenset({
@@ -1580,6 +1594,17 @@ def _parse_payload(payload_json):
     non-string payload returns the standard error envelope instead of an uncaught
     exception (issue #1683). Error strings are byte-identical to the prior inline
     blocks — this is behavior-preserving except that TypeError is now caught.
+
+    alpha#1944 — pops "override_lesson" before returning, if present. It is a
+    reserved field: engram-lesson-tripwire-hook.py's PreToolUse deny gate reads
+    it directly off the RAW tool_input (before the server ever sees the call)
+    to let a single overridden call through a "blocking" lesson. By the time
+    _parse_payload runs, the hook has already made its allow/deny decision —
+    the field has done its job and would otherwise fail every tool's own
+    unknown-field check (each tool's allowlist has no reason to know this
+    name). Stripped here, centrally, rather than added to every tool's
+    allowlist: one choke point instead of a per-tool list nobody keeps
+    current. No-op for the vast majority of calls, which never carry it.
     """
     try:
         params = json.loads(payload_json)
@@ -1587,6 +1612,7 @@ def _parse_payload(payload_json):
         return None, json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
     if not isinstance(params, dict):
         return None, json.dumps({"error": "payload_json must be a JSON object"})
+    params.pop("override_lesson", None)
     return params, None
 
 
@@ -1673,6 +1699,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "session_id",
     "recall_summary",
     "recall_keywords",
+    "evidence_type",
+    "original_url",
 })
 
 
@@ -1737,6 +1765,15 @@ def engram_add_observation(payload_json: str) -> str:
     prompted to use it. (A claim-text keyword/regex trigger was evaluated
     and removed pre-merge on measured zero precision; redesign tracked in
     #2264.)
+
+    Advisory anchoring_advisory (#2602 facet 2): every response also carries
+    an "anchoring_advisory" object measuring how many of the claim's "hard"
+    facts (node ids, issue/PR refs, hex shas, 3+-digit numbers, dates/times)
+    are literal substrings of quoted_text. For quote_type=hard_data, "the
+    quoted text IS the data" — unanchored hard tokens in the claim are the
+    signal to widen the quote, move the fact to interpretation, or downgrade
+    the quote type. Advisory only until #2602 facet 3 — nothing here refuses
+    a write or changes a confidence.
 
     Simplest — citing the CURRENT chat (pass your injected session_id; the
     server resolves the transcript, defaults quote_type=personal_communication
@@ -1844,11 +1881,18 @@ def engram_add_observation(payload_json: str) -> str:
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
             recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
+            evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time — the capturer knows what it just archived; a later reader has to guess. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit. See #2606 facet 1.
+            original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata, for traceability only: it is NOT a re-fetch pointer, and nothing reads it back to refetch. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes. See #2606 facet 1.
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
+    # alpha #2574 WS5: `reached` -- unconditional, before any argument
+    # validation/guard/early-return, per docs/2574-telemetry-design.md §1's
+    # TRIGGER ENTRY / NEGATIVE EVIDENCE. write_telemetry_record() never
+    # raises (WS1's contract) so this needs no protective try.
+    write_telemetry_record(manifest_id="server.py:engram_add_observation", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -1889,10 +1933,10 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # source_class confidence determination. Same substrate guards as singleton
 # add_observation — the bulk is purely a transaction-shape optimization.
 #
-# Nested-encoding pattern (matches engram_retract's replacement_json): inner
-# field `observations_json` is itself a stringified JSON array. The outer
-# wrapper is the payload_json contract; the inner is the per-observation list.
-# Don't confuse the two levels.
+# Nested-encoding pattern (same shape as engram_set_recall_summaries'
+# `summaries` field): inner field `observations_json` is itself a
+# stringified JSON array. The outer wrapper is the payload_json contract;
+# the inner is the per-observation list. Don't confuse the two levels.
 #
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99) — antml-prefix swallow
 # protection same as singleton add_observation.
@@ -1976,6 +2020,10 @@ def engram_add_observation_batch(payload_json: str) -> str:
     See _add_observation_batch_impl for full per-observation semantics + the
     evidence-resolution logic.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale (identical shape at every one of this workstream's 9
+    # dispatch targets).
+    write_telemetry_record(manifest_id="server.py:engram_add_observation_batch", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2340,6 +2388,9 @@ def engram_query(payload_json: str) -> str:
     See _query_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2759,6 +2810,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
 
     See _cascade_resolve_impl (engram_revision.py) for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is one of the 3 FAN-IN targets: it is
+    # itself reached from TWO sites (engram_revision.py:2543 via
+    # _supersede_impl, and :3281 via _retract_impl) -- both land on this
+    # SAME manifest_id, which is exactly the union-over-targets semantics
+    # this workstream's spec calls for; no special-casing needed here.
+    write_telemetry_record(manifest_id="server.py:engram_cascade_resolve", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -4469,7 +4527,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
     "tag", "title", "new_frame",
-    "prior_frame", "triggering_experience", "supporting_ids",
+    "prior_frame", "triggering_experience", "supporting_ids", "generalized_by",
 })
 
 
@@ -4526,6 +4584,13 @@ def engram_add_cornerstone(payload_json: str) -> str:
             prior_frame (str, optional): What I operated under before.
             triggering_experience (str, optional): Narrative of the experience that caused the reframe.
             supporting_ids (str, optional): Comma-separated IDs of supporting nodes.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this cornerstone (#2753 epic WS1, D4).
+                Must be current nodes of type cornerstone, axiom, or goal.
+                Writes `<parent> generalizes <new cornerstone>` edges at
+                mint time, cycle-guarded. Strict: an invalid parent
+                (missing, non-current, or wrong-type pair) refuses the
+                whole call.
 
     Returns:
         JSON with the new cornerstone node ID and linked supporting nodes.
@@ -4782,8 +4847,8 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_remove_edge",
     capability=(
         "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
-        "serves, exemplifies, instantiates). Cascade/provenance edges blocked — use "
-        "engram-surgical."
+        "serves, exemplifies, instantiates, generalizes). Cascade/provenance edges "
+        "blocked — use engram-surgical."
     ),
     annotations={
         "title": "Remove a Non-Cascade Edge Between Nodes",
@@ -4840,8 +4905,9 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # adding non-cascade relational edges (e.g. relevance-marker edges, subtask
 # groupings) previously required engram-surgical or an engram_supersede call.
 #
-# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions.
-# All are non-cascade, non-structural-commitment, non-provenance relations.
+# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
+# generalizes. All are non-cascade, non-structural-commitment, non-provenance
+# relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
 #   - Provenance-bearing: every relation with `provenance: True` in
@@ -4885,7 +4951,8 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_add_edge",
     capability=(
         "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
-        "exemplifies, serves, subtask_of, tensions, instantiates). Idempotent."
+        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes). "
+        "Idempotent."
     ),
     annotations={
         "title": "Add a Non-Cascade Edge Between Nodes",
@@ -4899,12 +4966,12 @@ def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
     Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
-    tensions). Cascade / structural / provenance edges blocked — those must
-    be created at node-add time (via the source node's payload) or via the
-    dedicated mutation tool (supersede / retract). Generic add-edge is only
-    for non-claim-bearing topological edges.
+    tensions, generalizes). Cascade / structural / provenance edges blocked
+    — those must be created at node-add time (via the source node's
+    payload) or via the dedicated mutation tool (supersede / retract).
+    Generic add-edge is only for non-claim-bearing topological edges.
 
-    Relation boundaries (the three-way split):
+    Relation boundaries (the four-way split):
       exemplifies  — this incident is an instance of this lesson's
                      error/success pattern (incident → lesson ONLY; feeds
                      the tripwire engine).
@@ -4916,6 +4983,14 @@ def engram_add_edge(payload_json: str) -> str:
                      pointer to exemplifies). The post-hoc wiring tool for
                      goal realizations and axiom grounding from practice
                      observations.
+      generalizes  — this principle IS THE MORE GENERAL FORM of that
+                     principle (#2753 epic WS1; general → specific;
+                     lesson→lesson, cornerstone→lesson,
+                     cornerstone→cornerstone, axiom→cornerstone, or
+                     goal→cornerstone ONLY — concrete nodes stay on
+                     exemplifies/instantiates). Cycle-guarded at write
+                     time. Coexists with `supported_by` — never a
+                     replacement for it.
 
     Idempotent: no_op_already_exists is a successful return.
 
@@ -5121,7 +5196,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "recall_summary", "recall_keywords",
+    "prevention_type", "recall_summary", "recall_keywords", "generalized_by",
 })
 
 
@@ -5210,6 +5285,15 @@ def engram_add_lesson(payload_json: str) -> str:
                 bypass_prose_check: true so the graph can audit how often this
                 override was actually exercised. Has no effect when situation_pattern
                 doesn't look like prose, or is empty.
+            prevention_type (str, optional): One of "advisory" (default) or "shadow"
+                (alpha#1944). "advisory" only ever injects the nudge, same as every
+                lesson before this field existed. "shadow" is a candidate for
+                blocking: still always allows the call, but the PreToolUse tripwire
+                hook logs every would-have-blocked fire so a promotion gate can
+                measure precision. "blocking" is REFUSED at creation — a lesson
+                earns blocking only via engram_update_lesson, after a real shadow
+                window with measured zero false positives; nothing can mint straight
+                to blocking.
             recall_summary (str, optional, always provide when you can): Compress
                 the corrective pattern into a ≤140-char recall-scent string — don't
                 start from a blank line. Not content preservation (the full claim
@@ -5220,6 +5304,12 @@ def engram_add_lesson(payload_json: str) -> str:
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this lesson (#2753 epic WS1, D4). Must
+                be current nodes of type lesson (meta-lesson) or cornerstone.
+                Writes `<parent> generalizes <new lesson>` edges at mint
+                time, cycle-guarded. Strict: an invalid parent (missing,
+                non-current, or wrong-type pair) refuses the whole call.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
@@ -5411,10 +5501,11 @@ def engram_update_lesson(payload_json: str) -> str:
     (action="lesson_field_updated") — an in-place update still shows up as
     a graph-mutation event, distinct from creating a new node.
 
-    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
-    scaffolding_nudge — mechanical retrieval/actionability metadata you can
-    refine from real firing experience, never the lesson's epistemic content
-    (claim, logical_chain, confidence, reasoning_type stay supersede-only).
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened again for
+    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    — mechanical retrieval/actionability metadata you can refine from real
+    firing experience, never the lesson's epistemic content (claim,
+    logical_chain, confidence, reasoning_type stay supersede-only).
 
     situation_pattern, set to a non-empty value, runs the SAME #1864
     prose-shape gate engram_add_lesson runs at creation time — must compile
@@ -5426,13 +5517,19 @@ def engram_update_lesson(payload_json: str) -> str:
     failure mode to guard against. No approval gate on either field: neither
     carries trust/security weight (#1826's own scoping call).
 
+    prevention_type must be one of "advisory", "shadow", "blocking"
+    (#1944) — unlike engram_add_lesson, which REFUSES "blocking" outright,
+    this tool MAY promote a lesson to "blocking": that promotion is exactly
+    what an update is for, earned after a real shadow window (measured
+    zero false positives), never re-litigated by this validation.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
-                fields: situation_pattern, scaffolding_nudge. Attempting to
-                update any other field returns an error.
+                fields: situation_pattern, scaffolding_nudge, prevention_type.
+                Attempting to update any other field returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same
                 override semantics as engram_add_lesson's field of the same
@@ -5938,6 +6035,12 @@ def engram_derive(payload_json: str) -> str:
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is reached from BOTH of engram_derive.py's
+    # _derive_impl sites (:283 blocked-path, :365 success-path -- see
+    # docs/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
+    # this single `reached` write covers both.
+    write_telemetry_record(manifest_id="server.py:engram_derive", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6019,6 +6122,9 @@ def engram_contradict(payload_json: str) -> str:
 
     See _contradict_impl for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_contradict", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6300,6 +6406,9 @@ def engram_supersede(payload_json: str) -> str:
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_supersede", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6334,7 +6443,7 @@ def engram_supersede(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 # Set of legitimate field names for the engram_retract payload.
 _RETRACT_FIELDS = frozenset({
-    "node_id", "error_type", "reason", "replacement_json",
+    "node_id", "error_type", "reason", "replacement_id",
     "initiation", "initiation_gate",
 })
 
@@ -6355,13 +6464,13 @@ _RETRACT_FIELDS = frozenset({
 # hallucinated_claim, duplicate, other. These name the failure modes — agents
 # can later scan-by-error-type to learn which kinds of errors they make.
 #
-# Optional replacement (replacement_json field): the retract can be paired with
-# a corrected observation that cites the same evidence. This is the typical
-# pattern — retract WITH a fix, not just retract-and-leave-empty.
-#
-# Naming caution: the outer param is payload_json; the INNER field is
-# replacement_json. They're distinct — outer is wrapper-protocol JSON; inner
-# is the replacement-observation JSON.
+# Optional replacement (replacement_id field): the retract can be paired with
+# a corrected node, named by id. #2612 retired the earlier mint-inside-
+# retraction path (a nested replacement_json field that minted the
+# replacement inline) — this is a purely relational operation, like
+# engram_supersede's new_node_id: the caller creates the replacement first,
+# via its own canonical creation tool (engram_add_observation for
+# observations), then names it here.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -6395,9 +6504,7 @@ def engram_retract(payload_json: str) -> str:
     resolution_kind='retracted'). A retract resolved that way is a partial
     resolution of the existing cascade event, not a new one.
 
-    Pass all fields as one JSON object string in payload_json. Note: the
-    outer wrapper parameter is `payload_json` and there is also an INNER
-    field named `replacement_json` — distinct things.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -6405,10 +6512,14 @@ def engram_retract(payload_json: str) -> str:
             error_type (str, required): One of: fabricated_quote, wrong_citation,
                 wrong_evidence, hallucinated_claim, duplicate, other.
             reason (str, required): Human-readable explanation of the error.
-            replacement_json (str, optional): JSON object string with replacement
-                observation fields {quoted_text, interpretation, claim,
-                quote_type, source_class}. The replacement cites the same
-                evidence.
+            replacement_id (str, optional): The replacement node's id, already
+                created via its type's canonical creation tool
+                (engram_add_observation, for observations) BEFORE calling
+                engram_retract — a purely relational operation, it does NOT
+                create a new node (matches engram_supersede's new_node_id
+                convention). Must name a node that exists, is_current=1,
+                differs from node_id, and is not older than node_id (the
+                retracts edge it lands on is temporal_causal=True).
             initiation (str, optional): Who initiated the retraction. One of:
                 user_prompted, gate_prompted, unprompted.
             initiation_gate (str, optional): Which gate triggered the
@@ -6421,9 +6532,23 @@ def engram_retract(payload_json: str) -> str:
 
     See _retract_impl for full semantics + error-type catalog.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_retract", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
+
+    # #2612 migration error: replacement_json was retired — targeted message,
+    # not the generic unknown-field rejection below.
+    if "replacement_json" in params:
+        return json.dumps({
+            "error": "replacement_json was retired (#2612) — engram_retract no "
+                     "longer mints a replacement inline. Create the replacement "
+                     "first via its own canonical creation tool "
+                     "(engram_add_observation for observations), then pass its "
+                     "id as replacement_id."
+        })
 
     unknown = set(params.keys()) - _RETRACT_FIELDS
     if unknown:
@@ -6441,7 +6566,7 @@ def engram_retract(payload_json: str) -> str:
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
-# Compat forwarder above in wave-6 compat block (injects _obs_creator=_add_observation_impl).
+# Compat forwarder above in wave-6 compat block.
 # ---------------------------------------------------------------------------
 # Focus mode — family G (engram_focus.py)
 # ---------------------------------------------------------------------------
@@ -6869,7 +6994,8 @@ def engram_focus_delete_set(payload_json: str) -> str:
     name="engram_set_recall_summaries",
     capability=(
         "Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, "
-        "partial failures don't roll back the batch."
+        "partial failures don't roll back the batch. Accepts either inline 'summaries' or "
+        "an absolute-path 'summaries_file' pointing at a JSON file of the same shape."
     ),
     annotations={
         "title": "Batch-Set Recall Summaries and Keywords",
@@ -6887,20 +7013,33 @@ def engram_set_recall_summaries(payload_json: str) -> str:
     backfill operations.
 
     Args:
-        payload_json: JSON object string with required key:
+        payload_json: JSON object string with EXACTLY ONE of:
             summaries (list): list of entry objects, each with:
                 node_id (str): target node. Must exist + is_current=1.
                 recall_summary (str): curated summary. Authoring target ≤120
                     chars; hard cap 200 chars (defensive guard).
                 recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
                     no duplicates (case-sensitive).
+            summaries_file (str): ABSOLUTE path to a JSON file on disk with
+                the same {"summaries": [...], "failures": [...]} shape as
+                above (the shape cohort_dispatch's "validate" subcommand
+                writes to final_payload.json, and PayloadBuilder.to_json()
+                emits). Use this for large batches instead of re-typing the
+                whole payload inline — the sleep cycle's cohort dispatch
+                already writes this file; pass its path instead of its
+                contents. MUST be absolute: the MCP server is a long-lived
+                process whose cwd is not guaranteed to track the calling
+                agent's own. Relative paths are rejected. Providing BOTH
+                "summaries" and "summaries_file" is a loud error (ambiguous
+                input, nothing applied); providing NEITHER is also an error.
 
     Returns:
         JSON: {
             "ok": [{"node_id": "..."}, ...],
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
-            "failed": M
+            "failed": M,
+            "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """
     return _attach_walguard_banner(_recall_summaries_mod._set_recall_summaries_impl(payload_json))
@@ -6919,7 +7058,9 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 #
 # Two modes, mutually exclusive:
 #   Single-field mode (backward compat): node_type and/or status as plain
-#     strings. Compact triage shape with claim truncated to 130 chars.
+#     strings. Compact triage shape; `claim` carries recall_summary
+#     (truncated to 200 chars with an ellipsis if longer) when populated,
+#     else the claim truncated to 130 chars.
 #   Structured-filter mode (issue #81): filters_json with recursive condition
 #     tree. AND/OR/NOT composition, text contains, ID-range, date-range,
 #     NULL handling, cross-table cites/cited_by virtual fields. fields_json
@@ -6962,8 +7103,10 @@ def engram_list(payload_json: str = "{}") -> str:
     Two modes, mutually exclusive:
 
     Single-field mode (default, backward compat): pass node_type and/or
-    status as plain strings. Returns the compact triage shape with claim
-    truncated to 130 chars.
+    status as plain strings. Returns the compact triage shape; the `claim`
+    key carries `recall_summary` when populated — truncated to 200 chars
+    with an ellipsis if longer — falling back to the claim truncated to
+    130 chars.
 
     Structured-filter mode (issue #81): pass filters_json with a recursive
     condition tree. Supports multi-field AND/OR/NOT composition, text
@@ -7163,6 +7306,9 @@ def engram_query_pattern(payload_json: str) -> str:
     See _query_pattern_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query_pattern", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -7335,42 +7481,309 @@ def engram_embedding_cluster(payload_json: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _prewarm_embeddings(model_name: str) -> None:
-    """Pre-warm the embedding model from the HuggingFace local cache.
+def _embedding_cache_status(model_name: str) -> bool:
+    """Cheap, synchronous filesystem check: is `model_name` in the local
+    HuggingFace cache?
 
-    Called on a daemon thread at startup (#276). If the model is not cached,
-    semantic search is disabled for the session without blocking mcp.run().
-    If the model IS cached, it is loaded in the background so the first
-    engram_query call hits a warm model rather than paying the load cost.
+    #345: embeddings are mandatory, so this check now runs on the MAIN
+    thread, before mcp.run() — a cache miss must fail startup loudly rather
+    than let the server come up and silently file nodes with NULL
+    embeddings (permanently excluded from semantic recall). It is safe to
+    run synchronously precisely because it is a `try_to_load_from_cache`
+    filesystem lookup, NOT a model load — the expensive part (the actual
+    model load) stays on the daemon thread in `_prewarm_embeddings` below,
+    per the #276 constraint (synchronous pre-warm can exceed Claude Code's
+    30s MCP connection timeout).
+
+    #2835: mirrors all THREE clauses of `SentenceTransformer.__init__`'s
+    name-resolution branch (sentence_transformers 5.3.0,
+    `SentenceTransformer.py:301-308`), not just the org-prefix rule -- a
+    partial mirror let a local absolute path (the documented workaround for
+    a network where the Hub is blocked) raise `HFValidationError` out of
+    this gate instead of returning a clean verdict.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    # Clause 1 -- the loader tests os.path.exists FIRST. If the name is a path
+    # that exists, it is a local model and the Hub is never consulted. That is
+    # the documented workaround where the Hub is blocked at the network edge:
+    # download the model elsewhere, point embedding.model at the directory.
+    # The local analogue of the hub arm's config.json probe is to require one
+    # of the two files the loader will actually read: modules.json (a
+    # sentence-transformers export -> _load_sbert_model) or config.json (a
+    # plain transformer dir -> _load_auto_model). An existing-but-EMPTY
+    # directory must still fail the gate, or #345's hole reopens for
+    # local-path installs -- the server would boot and file NULL embeddings.
+    # Deliberately no expanduser(): the loader does not expand "~" either, so
+    # mirroring means "~/models/x" is correctly refused (with the path-shaped
+    # remedy message from the caller), not silently resolved.
+    #
+    # Disclosed gap (#2841 round 1): a PEFT/LoRA adapter directory carrying
+    # only adapter_config.json has NEITHER of these files, and the loader
+    # does accept it -- Transformer._load_config calls
+    # find_adapter_config_file unconditionally on any local path, ahead of
+    # any config.json requirement. So this gate refuses a layout the loader
+    # would load. That is deliberate, not an oversight: an adapter directory
+    # names a BASE model it does not contain, and resolving that base is
+    # exactly what reaches the Hub. Accepting adapter_config.json here would
+    # pass the gate and then fail the base-model fetch on the background
+    # thread -- a silent degrade to NULL embeddings, in precisely the
+    # Hub-blocked network this fix exists to serve. A loud refusal is the
+    # right error for that case; real adapter support needs the base model
+    # local too, which is a larger change than a filename.
+    #
+    # Boundary, stated because "a false PASS is the severe failure" is this
+    # gate's whole premise: the check is presence-only, not content. A
+    # directory holding an empty or malformed modules.json passes here and
+    # fails later on the background thread, which degrades rather than
+    # exits. That is the loader's own precondition strength
+    # (is_sentence_transformer_model also only tests existence) and the same
+    # tradeoff clause 3 already makes (a cached config.json does not prove
+    # the weights are cached). What is new is the POPULATION: before this
+    # change every local path raised, so no local directory could reach that
+    # tradeoff at all.
+    if os.path.exists(model_name):
+        return any(
+            os.path.isfile(os.path.join(model_name, f))
+            for f in ("modules.json", "config.json")
+        )
+
+    # Clause 2 -- not a path, and a shape the loader refuses outright with
+    # FileNotFoundError. A cache lookup here is meaningless, and it is what
+    # raised HFValidationError out of this gate (#2835). Refuse cleanly.
+    if "\\" in model_name or model_name.count("/") > 1:
+        return False
+
+    # Clause 3 -- a hub repo id. The loader prepends the org prefix only when
+    # the name contains no "/" AND is not one of the 68 legacy no-org names in
+    # `basic_transformer_models`. That list is a FUNCTION-LOCAL variable inside
+    # SentenceTransformer.__init__ (5.3.0, line 230) -- not importable, so an
+    # exact mirror would mean copying 68 literals here and drifting silently
+    # from upstream. Probe BOTH candidate repo ids instead: the prefixed form
+    # (the common case) then the bare form (the legacy case). This can never
+    # produce a false cache-MISS, which is the failure that refuses to boot a
+    # correctly-configured server. The residual imprecision is a false HIT only
+    # if a legacy bare name is cached ONLY under a "sentence-transformers/"
+    # -prefixed repo id that does not exist upstream.
+    candidates = [model_name]
+    if "/" not in model_name:
+        candidates.insert(0, f"sentence-transformers/{model_name}")
+
+    for repo_id in candidates:
+        try:
+            if try_to_load_from_cache(repo_id, "config.json") is not None:
+                return True
+        except ValueError:
+            # HFValidationError subclasses ValueError. A repo id this gate
+            # built and the hub rejects is a clean negative here, never a
+            # traceback out of a startup gate.
+            #
+            # Not widened to `except Exception` on purpose (#2841 round 1).
+            # Traced against huggingface_hub 1.8.0: the only ValueError
+            # reachable at this call site is HFValidationError from the
+            # repo-id validator; a genuinely corrupted cache raises OSError
+            # from the os.path/os.listdir calls inside, and that still
+            # propagates. Swallowing it would turn "your cache is broken"
+            # into "your model is not cached", and send the operator to
+            # pre-warm a cache that is present and unreadable. A loud
+            # traceback is the better error there: the goal is no traceback
+            # for a CONFIGURATION mistake, not no traceback ever.
+            continue
+    return False
+
+
+def _looks_like_local_model_path(model_name: str) -> bool:
+    """True when the configured embedding model name is path-shaped.
+
+    Deliberately does NOT treat a single "/" as path evidence:
+    "BAAI/bge-small-en" is an org-qualified hub repo id, not a path. Used only
+    to choose which recovery message the startup gate prints (#2835) -- the
+    pre-warm one-liner is wrong advice for a path.
+    """
+    return (
+        os.path.isabs(model_name)
+        or model_name.startswith(("~", "./", "../", ".\\", "..\\"))
+        or "\\" in model_name
+        or model_name.count("/") > 1
+    )
+
+
+def _prewarm_embeddings(model_name: str) -> None:
+    """Load the embedding model in the background (daemon thread).
+
+    Called on a daemon thread at startup (#276), AFTER the synchronous
+    startup gate in __main__ has already confirmed (via
+    `_embedding_cache_status`) that the model is available locally -- either
+    present in the local HuggingFace cache, or (since #2835) an on-disk model
+    directory that was never in that cache at all — so a cache miss can no longer reach this function.
+    This function does only the expensive part (the actual model load), off
+    the main thread so mcp.run() can start serving connections immediately
+    rather than blocking on it.
+
+    A failure here (the gate already passed) is genuinely unexpected and
+    must be visible: it is logged to stderr, never swallowed silently. This
+    runs on a daemon thread, so it must NOT exit the process — a fatal
+    embedding failure can only be enforced from the main thread's
+    synchronous gate, before this thread is ever started.
     """
     import sys
 
     try:
-        from huggingface_hub import try_to_load_from_cache
-        cached = try_to_load_from_cache(
-            f"sentence-transformers/{model_name}", "config.json"
-        )
-        if cached is None:
+        _embedder._load_model(model_name)
+        if _embedder._model is not None:
             print(
-                f"[engram] Embedding model '{model_name}' not cached locally. "
-                f"Disabling semantic search for this session.\n"
-                f"  To enable: run this in PowerShell first:\n"
-                f"  python -c \"from sentence_transformers import SentenceTransformer; "
-                f"SentenceTransformer('{model_name}')\"",
+                f"[engram] Embedding model '{model_name}' loaded (background).",
                 file=sys.stderr,
             )
-            _embedder._failed_models.add(model_name)
         else:
-            _embedder._load_model(model_name)
-            if _embedder._model is not None:
-                print(
-                    f"[engram] Embedding model '{model_name}' loaded (background).",
-                    file=sys.stderr,
-                )
-    except ImportError:
-        pass  # huggingface_hub not available, let it try normally
-    except Exception:
+            # _load_model() already logs its own ImportError/Exception cases
+            # to stderr (engram_core.py). This branch covers the residual
+            # case where it returns cleanly with the model still unset, so
+            # that outcome is never silent either.
+            print(
+                f"[engram] Embedding model '{model_name}' failed to load on "
+                f"the background thread, after the startup cache check had "
+                f"already passed. Semantic search is disabled for this "
+                f"session.",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(
+            f"[engram] Unexpected error loading embedding model "
+            f"'{model_name}' on background thread: {e!r}",
+            file=sys.stderr,
+        )
         _embedder._failed_models.add(model_name)
+
+
+def _embedding_startup_gate() -> None:
+    """Fail-loud startup gate for the embedding model (#345).
+
+    Embeddings are mandatory: a node with a NULL embedding is excluded from
+    the semantic-recall candidate set entirely (both the sqlite-vec path and
+    the pure-Python cosine fallback filter `embedding IS NOT NULL`), at any
+    threshold, for any query. So unlike a normal degrade-and-continue guard,
+    an unavailable or uncached model here must fail startup loudly (print an
+    actionable message to stderr + `sys.exit(1)`) rather than let the server
+    come up and silently file permanently-unrecallable nodes.
+
+    The gate is split in two on purpose:
+      - the cache-presence check (`_embedding_cache_status`) is a cheap
+        filesystem lookup and runs HERE, synchronously — blocking startup on
+        it is fine.
+      - the actual model LOAD stays on the daemon thread
+        (`_prewarm_embeddings`, started at the end of this function) per the
+        #276 constraint: synchronous pre-warm can exceed Claude Code's 30s
+        MCP connection timeout and leave every engram_* tool unavailable for
+        the session. Do NOT collapse that split — it is load-bearing.
+
+    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
+    scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
+    for an operator who must start deliberately degraded.
+
+    `embedding.enabled: false` also bypasses this gate — see the comment at
+    that check below for why this is deliberately NOT also-fatal.
+    """
+    import sys
+
+    if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
+        return
+
+    # config["embedding"]["enabled"] (default True) is a real, still-active,
+    # documented toggle (README-AGENT.md, viz UI affordance) honored by 5
+    # call sites in engram_core.py / engram_query.py. Retiring it entirely is
+    # a *separate* slice of #345 (not landed here). Bypass rather than
+    # also-fatal is deliberate, not an oversight: an operator who has
+    # deliberately set `enabled: false` -- plausibly because they never
+    # installed the ~500MB sentence_transformers dependency -- previously
+    # got a clean boot with semantic search cleanly disabled at every query
+    # site. Making this fatal would change a documented, currently-honored
+    # configuration's behavior without the documentation, migration note, or
+    # release-note that the toggle's eventual retirement will carry. This
+    # gate closes the *unintentional* hole (a missing or uncached model);
+    # the *deliberate* opt-out keeps working as documented until it is
+    # retired on purpose. Checked before is_available() so an operator who
+    # disabled embeddings never sees a fatal about sentence_transformers.
+    emb_config = _get_embedding_config()
+    if not emb_config.get("enabled", True):
+        return
+
+    if not _embedder.is_available():
+        print(
+            "[engram] FATAL: embeddings are mandatory (#345) and "
+            "sentence_transformers is not importable. Starting anyway would "
+            "file nodes with NULL embeddings, permanently excluded from "
+            "semantic recall at any threshold, for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  Run Phase 0 setup:", file=sys.stderr)
+        print("    python3 -m venv ~/.engram/venv", file=sys.stderr)
+        print("    source ~/.engram/venv/bin/activate", file=sys.stderr)
+        print("    pip install -r requirements/requirements.txt", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    import threading
+
+    model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
+
+    if not _embedding_cache_status(model_name):
+        if _looks_like_local_model_path(model_name):
+            # #2835: a path-shaped name that failed the gate is not a cache
+            # miss -- the pre-warm one-liner below is wrong advice for it
+            # (SentenceTransformer('/opt/models/x') fails the same way, Hub
+            # never consulted). Point at the directory contract instead.
+            print(
+                f"[engram] FATAL: embedding model directory '{model_name}' "
+                f"is not usable. Embeddings are mandatory (#345) — starting "
+                f"anyway would file nodes with NULL embeddings, permanently "
+                f"excluded from semantic recall at any threshold, for any "
+                f"query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(
+                "  To fix, check that the directory exists and contains "
+                "modules.json (a sentence-transformers export) or "
+                "config.json (a plain transformer directory). Note: \"~\" "
+                "is not expanded here -- use an absolute path.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[engram] FATAL: embedding model '{model_name}' is not cached "
+                f"locally. Embeddings are mandatory (#345) — starting anyway "
+                f"would file nodes with NULL embeddings, permanently excluded "
+                f"from semantic recall at any threshold, for any query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print("  To fix, pre-warm the cache once:", file=sys.stderr)
+            print(
+                f"  python -c \"from sentence_transformers import "
+                f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
+                file=sys.stderr,
+            )
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    threading.Thread(
+        target=_prewarm_embeddings,
+        args=(model_name,),
+        daemon=True,
+        name="engram-prewarm",
+    ).start()
 
 
 def _write_mcp_ready_marker() -> None:
@@ -7425,24 +7838,44 @@ if __name__ == "__main__":
             file=_sys.stderr,
         )
 
+    # alpha #2574 WS5 (Phase 4 the engram_log_emitter.py header comment
+    # deferred to): initialize the server-side telemetry emitter singleton,
+    # so the 9 engram.tool.engram_call emit_if_initialized() sites in
+    # engram_derive.py/engram_observation.py/engram_query.py/engram_revision.py
+    # stop being permanently NO_EMITTER (docs/2574-telemetry-design.md §0.1).
+    # Best-effort, same shape as the snapshot worker start above and the
+    # embedding gate below: a failure here must never block server boot
+    # (§8 "telemetry gates nothing T1" -- server.py is the literal T1 MCP
+    # server every engram_* tool call goes through).
+    #
+    # session_id/transcript_path judgment call (flagged for review, per this
+    # workstream's spec): there is no real per-session identity for this
+    # long-lived, multi-session server process -- exactly why the design
+    # doc's §1 WINDOW/SCOPE explicitly does NOT require session_id at the
+    # record level, and §11.1 rules session_id out of scope for a "real
+    # per-request" fix. "server"/"" are literal sentinels that read
+    # unambiguously as "this is the server process, not a session" rather
+    # than a real session id; the design doc does not specify the exact
+    # sentinel string.
+    try:
+        Emitter.init(session_id="server", transcript_path="")
+    except Exception as _em_e:
+        import sys as _sys
+        print(
+            f"[engram] telemetry emitter init failed (server-side telemetry "
+            f"stays NO_EMITTER for this process): {_em_e}",
+            file=_sys.stderr,
+        )
+
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
-    # serving connections immediately. On cold caches under concurrent system
-    # load, synchronous pre-warm can exceed Claude Code's 30s MCP connection
-    # timeout and leave all engram_* tools unavailable for the session (#276).
-    # If a query arrives during pre-warm, _load_model() handles the late-bind
-    # path via the existing lazy code path.
-    if _embedder.is_available():
-        import sys, threading
+    # serving connections immediately (or exit non-zero first -- see
+    # _embedding_startup_gate). On cold caches under concurrent system load,
+    # synchronous pre-warm can exceed Claude Code's 30s MCP connection
+    # timeout and leave all engram_* tools unavailable for the session
+    # (#276). If a query arrives during pre-warm, _load_model() handles the
+    # late-bind path via the existing lazy code path.
+    _embedding_startup_gate()
 
-        emb_config = _get_embedding_config()
-        model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-
-        threading.Thread(
-            target=_prewarm_embeddings,
-            args=(model_name,),
-            daemon=True,
-            name="engram-prewarm",
-        ).start()
 
     _write_mcp_ready_marker()   # two-signal liveness: written after init, before serve
     mcp.run()

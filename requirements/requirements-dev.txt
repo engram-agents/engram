@@ -1,3 +1,12 @@
 # Dev dependencies (CI + local test runs). Includes runtime deps + tooling.
 -r requirements.txt
 pytest
+
+# Coverage instrumentation (#2774) -- pytest-cov/coverage power the nightly's
+# --cov-branch run (.github/workflows/nightly.yml) and tools/coverage-diff.sh's
+# affected-test run; diff-cover powers tools/coverage-diff.sh's diff-scoped
+# report. Verified (pip --dry-run, then read-back after install): installs
+# into the existing venv with zero upgrades to any runtime dependency.
+coverage
+pytest-cov
+diff-cover

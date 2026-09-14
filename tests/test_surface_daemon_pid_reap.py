@@ -23,6 +23,18 @@ import time
 import unittest
 from pathlib import Path
 
+# Cross-file reuse (mirrors the established
+# test_pgrep_liveness_reap_patterns._extract_reap_pattern import
+# convention): #2652 phase-0 unit 4's fold gates this file's reap-loop
+# scenarios behind the new supervisor-registration check, so
+# TestReapBeforeStart needs a deterministic way to force the
+# UNSUPERVISED state regardless of this host's own ambient systemctl
+# behavior (measured "Failed to connect to bus" here, which reads
+# `unavailable` and would otherwise make the reap loop unreachable for a
+# reason unrelated to what these tests are actually about).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from test_start_daemon_probe_branch_logging import _make_fake_systemctl  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DAEMON_DIR = REPO_ROOT / "src" / "engram" / "hooks" / "claude"
 DAEMON_PY_PATH = DAEMON_DIR / "engram-surface-daemon.py"
@@ -150,6 +162,27 @@ class TestReapBeforeStart(unittest.TestCase):
         self.engram_home = self.tmp / "engram_home"
         self.engram_home.mkdir()
 
+        # #2652 phase-0 unit 4 fold: force the UNSUPERVISED/not-registered
+        # supervisor state deterministically -- see this file's own import
+        # comment for why (this host's real systemctl reads `unavailable`,
+        # which would otherwise make the reap loop below unreachable).
+        self._fake_systemctl_dir = self.tmp / "fakebin-systemctl"
+        self._fake_systemctl_dir.mkdir()
+        _make_fake_systemctl(
+            self._fake_systemctl_dir, mode="show",
+            load_state="not-found", active_state="inactive", sub_state="dead",
+        )
+
+    def _env(self) -> dict:
+        """Base env for every `subprocess.run(["bash", str(self.script)],
+        ...)` call below: ENGRAM_HOME plus the fake-systemctl-prepended
+        PATH (harmless for the branch-4 healthy-daemon scenario, which
+        exits before the supervisor check is ever reached)."""
+        env = dict(os.environ)
+        env["ENGRAM_HOME"] = str(self.engram_home)
+        env["PATH"] = f"{self._fake_systemctl_dir}:{env.get('PATH', '')}"
+        return env
+
     def _spawn_decoy_daemon(self, engram_home=None):
         """A real process whose argv contains the daemon script's own
         basename literally -- exactly the shape a stray prior instance
@@ -173,10 +206,8 @@ class TestReapBeforeStart(unittest.TestCase):
         try:
             self.assertIsNone(decoy.poll(), "decoy failed to start -- test setup broken")
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -212,10 +243,10 @@ class TestReapBeforeStart(unittest.TestCase):
                 unrelated_decoy.poll(), "decoy failed to start -- test setup broken"
             )
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)  # a DIFFERENT home than the decoy's
+            # self._env()'s ENGRAM_HOME is self.engram_home -- a DIFFERENT
+            # home than the decoy's.
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -244,10 +275,10 @@ class TestReapBeforeStart(unittest.TestCase):
         try:
             self.assertIsNone(decoy.poll(), "decoy failed to start -- test setup broken")
 
-            env = dict(os.environ)
-            env["ENGRAM_HOME"] = str(self.engram_home)  # a PREFIX of the decoy's home
+            # self._env()'s ENGRAM_HOME is self.engram_home -- a PREFIX of
+            # the decoy's home.
             result = subprocess.run(
-                ["bash", str(self.script)], env=env, capture_output=True,
+                ["bash", str(self.script)], env=self._env(), capture_output=True,
                 text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -283,10 +314,8 @@ class TestReapBeforeStart(unittest.TestCase):
             srv.bind(str(socket_path))
             srv.listen(1)
             try:
-                env = dict(os.environ)
-                env["ENGRAM_HOME"] = str(self.engram_home)
                 result = subprocess.run(
-                    ["bash", str(self.script)], env=env, capture_output=True,
+                    ["bash", str(self.script)], env=self._env(), capture_output=True,
                     text=True, timeout=10,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -310,7 +339,12 @@ class TestReapBeforeStart(unittest.TestCase):
 
 class TestCleanupOwnershipGuard(unittest.TestCase):
     """A delayed cleanup() from a superseded instance must not delete a
-    newer instance's fresh PID/socket files."""
+    newer instance's fresh PID file, or a socket this instance never
+    bound (#2713 -- the SOCKET_PATH predicate changed from PID_PATH
+    identity to a bind-time-set `_bound_socket` flag; PID_PATH's own
+    predicate is unchanged). See tests/test_surface_daemon_socket_ownership.py
+    for the dedicated #2713 regression coverage this class was updated
+    alongside."""
 
     def setUp(self):
         import tempfile
@@ -320,11 +354,17 @@ class TestCleanupOwnershipGuard(unittest.TestCase):
         self.mod = _load_daemon_module()
         self.mod.PID_PATH = str(self.tmp / "recall-daemon.pid")
         self.mod.SOCKET_PATH = str(self.tmp / "recall-daemon.sock")
+        # Fresh module load already defaults this to False; state it
+        # explicitly since it's the load-bearing predicate for these tests.
+        self.mod._bound_socket = False
 
     def test_does_not_unlink_when_pid_path_names_a_different_process(self):
         """PID_PATH already holds a DIFFERENT (newer) pid than ours -- the
         exact shape of a delayed cleanup() firing after a superseded
-        instance's SIGTERM was slow to land. Both files must survive."""
+        instance's SIGTERM was slow to land. PID_PATH must survive (its
+        identity check fails); SOCKET_PATH must survive too, but now for
+        an independent reason -- this instance never bound it either
+        (_bound_socket stays False)."""
         Path(self.mod.SOCKET_PATH).write_text("not a real socket, just a marker")
         Path(self.mod.PID_PATH).write_text(str(os.getpid() + 1))  # "someone else's" pid
 
@@ -333,18 +373,21 @@ class TestCleanupOwnershipGuard(unittest.TestCase):
 
         self.assertTrue(
             Path(self.mod.SOCKET_PATH).exists(),
-            "cleanup() deleted a socket owned by a DIFFERENT (newer) instance",
+            "cleanup() deleted a socket this process never bound",
         )
         self.assertTrue(
             Path(self.mod.PID_PATH).exists(),
             "cleanup() deleted a pidfile owned by a DIFFERENT (newer) instance",
         )
 
-    def test_unlinks_when_pid_path_names_this_process(self):
-        """The normal case -- PID_PATH genuinely names this process -- must
-        still clean up exactly as before the guard was added."""
+    def test_unlinks_when_pid_path_names_this_process_and_bound_socket(self):
+        """The normal, fully-owning case -- PID_PATH genuinely names this
+        process AND this process bound the socket -- must still clean up
+        both files. (#2713: SOCKET_PATH's predicate is now `_bound_socket`,
+        set explicitly here rather than following PID_PATH identity.)"""
         Path(self.mod.SOCKET_PATH).write_text("marker")
         Path(self.mod.PID_PATH).write_text(str(os.getpid()))
+        self.mod._bound_socket = True
 
         with self.assertRaises(SystemExit):
             self.mod.cleanup()
@@ -352,15 +395,23 @@ class TestCleanupOwnershipGuard(unittest.TestCase):
         self.assertFalse(Path(self.mod.SOCKET_PATH).exists())
         self.assertFalse(Path(self.mod.PID_PATH).exists())
 
-    def test_unlinks_when_pid_path_absent(self):
-        """No pidfile at all -- nothing to protect against, proceed as
-        before (matches the pre-guard unconditional behavior for this case)."""
+    def test_pid_path_absent_no_longer_sufficient_alone_to_unlink_socket(self):
+        """#2713 test 3: no pidfile at all used to be read as "nothing to
+        protect, proceed" for BOTH resources (the pre-fix fallback). It is
+        no longer sufficient, ON ITS OWN, to unlink the socket -- only
+        `_bound_socket` (left False here) decides that now. PID_PATH's own
+        "nothing to protect" fallback for ITSELF is unchanged (there's
+        nothing there to unlink, so no assertion needed on PID_PATH)."""
         Path(self.mod.SOCKET_PATH).write_text("marker")
 
         with self.assertRaises(SystemExit):
             self.mod.cleanup()
 
-        self.assertFalse(Path(self.mod.SOCKET_PATH).exists())
+        self.assertTrue(
+            Path(self.mod.SOCKET_PATH).exists(),
+            "pidfile-absence alone unlinked the socket -- must no longer "
+            "be sufficient on its own (#2713)",
+        )
 
 
 if __name__ == "__main__":

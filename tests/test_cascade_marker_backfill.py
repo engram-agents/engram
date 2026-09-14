@@ -28,7 +28,11 @@ import sqlite3
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram"))
+# #2565: append (not insert(0)) -- putting src/engram at position 0
+# outranks the repo-root tools/ package for the rest of the process,
+# a live instance of the tools/-package-name-clash class found while
+# building #2565's durable guard (tests/conftest.py).
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "engram"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from conftest import fresh_module  # noqa: E402
