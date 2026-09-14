@@ -400,7 +400,7 @@ Validate your draft record with `health.engine.validate_repair_record(record)` b
 
 ## The driver loop
 
-Iterate metric bindings in **declaration order** — the canonical order is `[m.signal for m in health.model.MODEL_SPEC.metrics]`, read live rather than trusted from a copy here (a hardcoded copy would silently drift the moment a future PR reorders `MODEL_SPEC`). **Never sorted, never by score or weight** — the pass must stay outcome-blind, with no incentive to prioritize whichever metric currently looks worst. (For orientation only, NOT as the source of truth: as of `dev@dfeb5219` that order is taint_rate, stale_derivation_rate, open_contradiction_rate, uncited_observation_rate, dangling_evidence_rate, embedding_coverage, recall_summary_coverage, recall_keywords_coverage, giant_component_fraction.) For each metric's own entry in the projection's `metrics` dict (`metrics[signal]`, carrying `signal`, `score`, `admitted`, `detector`, `repair`, `delta_since_last` — see `health/engine.py`'s `_build_dream_projection`):
+Iterate metric bindings in **declaration order** — the canonical order is `[m.signal for m in health.model.MODEL_SPEC.metrics]`, read live rather than trusted from a copy here (a hardcoded copy would silently drift the moment a future PR reorders `MODEL_SPEC`). **Never sorted, never by score or weight** — the pass must stay outcome-blind, with no incentive to prioritize whichever metric currently looks worst. (For orientation only, NOT as the source of truth: as of `dev@e9d4d0f9` that order is pending_premise_rate, open_contradiction_rate, uncited_observation_rate, dangling_evidence_rate, embedding_coverage, recall_summary_coverage, recall_keywords_coverage, giant_component_fraction.) For each metric's own entry in the projection's `metrics` dict (`metrics[signal]`, carrying `signal`, `score`, `admitted`, `detector`, `repair`, `delta_since_last` — see `health/engine.py`'s `_build_dream_projection`):
 
 **Every metric, in every case, gets a written entry** (round 2, engram-alpha#2519, Kepler's ruling on the parent PR review, 2026-09-03 — corrects round 1's step 2 below, which wrote NOTHING for an admitted-but-signal-unavailable metric: a missing entry must mean exactly one thing after this round — the pass did not run for that metric at all — and round 1's silent-skip case gave a missing entry two meanings, "not covered" and "signal unavailable," indistinguishably). The only thing that branches below is which `status`/`reason`/`findings_count`/`repairs_dispatched` a given metric's entry carries:
 
@@ -408,7 +408,7 @@ Iterate metric bindings in **declaration order** — the canonical order is `[m.
 
 2. **A real repair mapping exists (`repair` is non-null), but tonight's projection reports this metric's `signal` as the string `"UNAVAILABLE"`** — write a provenance entry with `status: "unavailable"`, `reason: "signal_unavailable_this_run"`, `findings_count: null`, `repairs_dispatched: null` (contrast with step 1: a DIFFERENT reason string names WHY this metric landed at the same status — round 1 wrote NOTHING at all here; round 2 always writes an entry). `detector`/`population` still come from the projection's own fields, same as step 1. Continue to the next metric.
 
-3. **Admitted, available, `repair == "tool:cascade-resolve"`** (`taint_rate`, `stale_derivation_rate`) — **no new scan.** The provenance is a RE-READ of the cascade sweep's own end-state, which you already ran earlier THIS SAME CYCLE (see "# The cascade sweep (mode B)", above — it runs before anything else that writes). Both metrics share the one underlying sweep, so both get the SAME `findings_count`/`repairs_dispatched`/`status` — only their `detector`/`population` differ, each metric's own:
+3. **Admitted, available, `repair == "tool:cascade-resolve"`** (`pending_premise_rate`) — **no new scan.** The provenance is a RE-READ of the cascade sweep's own end-state, which you already ran earlier THIS SAME CYCLE (see "# The cascade sweep (mode B)", above — it runs before anything else that writes). `detector`/`population` come straight from this metric's own binding (`scan:cascade-frontier` / `claim_bearing_nodes`):
    - `findings_count` = `total_pending_nodes` from the sweep's FIRST `engram_cascade_frontier({})` call (driver-loop step 1 of the cascade sweep) — the frontier size at the START of tonight's sweep.
    - `repairs_dispatched` = the count of `engram_cascade_resolve` calls the sweep actually made, across all its passes (acknowledged + superseded + retracted, combined).
    - `status`: `"carried"` if the sweep did NOT reach a clear frontier (one of the four "Stop loud, never silent" conditions fired, OR the per-night pass cap was hit) — the remaining node IDs already live in the dream record's own "Cascade sweep" section; a bare `status: "carried"` here is enough, do not duplicate the full list into this record. Otherwise `"done"`. `reason: null` in either case (round 2: nothing to explain beyond `status` itself — this branch's own logic is UNCHANGED by round 2's ruling).
@@ -445,7 +445,7 @@ Write the repair record as JSON to a NEW fixed path, sibling to the dream projec
   "status": "ran",
   "reason": null,
   "metrics": {
-    "taint_rate": {
+    "pending_premise_rate": {
       "detector": "scan:cascade-frontier",
       "population": "claim_bearing_nodes",
       "findings_count": 12,
