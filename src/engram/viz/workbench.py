@@ -63,10 +63,16 @@ Usage::
     python -m viz.workbench --port 5021 --db /path/to/knowledge.db
     python -m viz.workbench --config /path/to/agents.json
 
-No systemd unit / launch script ships with this module -- per the issue's
-own words, "no systemd unit needed -- Lei runs it when he wants it." This
-is a foreground, operator-launched developer tool, not managed
-infrastructure like ``viz.server``.
+A systemd user unit ships for this module as of #2894/#2907
+(``engram-workbench-user.service``), installed via
+``tools/operator-setup-viz.sh`` on Linux the same way ``viz.server``'s own
+unit is -- Lei asked for one explicitly ("A user service sounds good, find
+someone build it please"), superseding the earlier "no systemd unit
+needed" call made for #2754. The module still ships at DEV tier only (see
+``tiers.json``): the installer's workbench gate is a separate, non-fatal
+check, so the unit is skipped (not an install failure) on a build that
+doesn't carry the dev-tier files, and the module can still be run in the
+foreground directly (``python -m viz.workbench``) either way.
 """
 
 from __future__ import annotations
