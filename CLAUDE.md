@@ -340,9 +340,16 @@ reviewer-fairy.
 The **"colleague converged"** gate is two layers, both required before a PR
 enters the maintainer's merge queue:
 
-1. **Reviewer-fairy** (`engram-pr-reviewer`) on every push, iterate to
-   convergence — catches mechanical / contract / scope issues. (Applies in
-   single-agent mode too.)
+1. **Reviewer-fairy** (`engram-pr-reviewer`) — iterate to convergence (APPROVE)
+   *before the PR goes to the peer* — catches mechanical / contract / scope
+   issues. (Applies in single-agent mode too.) **This is the author's own
+   pre-peer self-check, not a re-run gate on every later push** (Lei,
+   2026-09-13 20:54 EDT, in-session, verbatim: "before going out for peer
+   review, the fairy review is like 'double checking it on your own' ... no
+   more fairy review is mandatory ANYMORE" once the PR has reached the peer).
+   No fairy delta round, and no patch-identity argument that a later diff is
+   "equivalent" to what the fairy approved, substitutes for the merge gate
+   below.
 2. **Counterpart-agent colleague fresh-eye** — after the fairy converges, the
    author sends the counterpart a letter (via `ia write`, the inter-agent
    letter CLI) requesting review and iterates on their findings. The
@@ -354,6 +361,18 @@ enters the maintainer's merge queue:
    only full-agent capability can render. A counterpart who delegates their
    colleague review to a fairy has skipped the colleague layer (the user flagged
    this directly, after the colleague-fairy-delegation lapse incident).
+
+**The merge gate itself**, operationalizing Lei's same ruling: a non-author
+peer APPROVE whose commit **is** the PR's current `headRefOid`, plus CI green
+on that same head. A new commit after approval needs a **fresh** peer review
+and approval — the peer simply looks again (the `dev` ruleset already
+enforces this mechanically: dismiss-on-push + last-push approval) — never a
+fairy re-check or a diff-equivalence argument standing in for it. The merge
+seat still compares the approval's commit to the head directly rather than
+trusting `reviewDecision` alone: a manual force-push on this repo has been
+seen to keep a stale approval alive on a *different* PR (#2338, a manual
+force-push, explicitly NOT gh-stack's auto-rebase — see "Stacked PRs" below
+for the measurement).
 
 Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 (merge)**. Symmetric — each agent reviews the other's PRs and has its own
@@ -584,13 +603,17 @@ rounds (on this PR and its umwelt twin) caught that mischaracterization before
 it shipped, which is its own small demonstration of the rule this section is
 arguing for.
 
-**Mechanical check at the merge seat.** Before merging, confirm a reviewer-fairy
-round *exists and converged on the tip being merged* by reading the PR's own
-review/comment record directly (`gh pr view <N> --comments`, or the REST
-fallback documented below if that command's `gh` version is affected) — **never
-infer it from a colleague approval being present.** A colleague approval is
-evidence the colleague pass happened; it is not evidence the fairy pass
-happened first, or at all.
+**Mechanical check at the merge seat.** Before merging, confirm two separate
+things. (1) A reviewer-fairy round *exists and reached APPROVE before the PR
+was sent to the peer* (per "The colleague converged gate" above — the fairy
+round need not match the tip being merged; a later commit folding peer
+feedback does not un-converge it) by reading the PR's own review/comment
+record directly (`gh pr view <N> --comments`, or the REST fallback documented
+below if that command's `gh` version is affected) — **never infer it from a
+colleague approval being present.** A colleague approval is evidence the
+colleague pass happened; it is not evidence the fairy pass happened first, or
+at all. (2) The actual merge gate — a non-author peer APPROVE whose commit
+**is** the current `headRefOid`, plus CI green on that head.
 
 **Check both surfaces, not just the one that's easiest to query.** Fairy
 rounds in this repo post as **comments**, not formal GitHub reviews — checking
@@ -868,6 +891,14 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
+> **Exception, as of 2026-09-14 (Kepler, interim ruling pending Lei's word):**
+> the fairy-round-timing clarification in "Mechanical check at the merge
+> seat" above (issue #2920) is deliberately NOT synced to soma. Soma's own
+> merged PR#58 requires the opposite — the fairy round must match the exact
+> merge tip — a deliberate safety rule for a repo with no human backstop that
+> drives a physical robot around Lei's family. Soma keeps its stricter local
+> rule until Lei or Ariadne says otherwise; see engram-alpha#2930's
+> discussion and `ask-Lei.md` for the open question.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
