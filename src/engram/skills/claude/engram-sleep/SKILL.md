@@ -714,10 +714,11 @@ $HOME/.engram/venv/bin/python3 -m tools.dream_lottery draw \
 | 9 | Cornerstone auto-load surface coverage gaps | coverage-gaps |
 | 10 | Person-node maintenance (split-keys, personless authors, dangling pn_, metadata hygiene, unwired mentions, special_moments cap) | person-node-maintenance |
 | 11 | Cornerstones/lessons with support_lost | support-lost |
+| 12 | Generalization candidates | generalization-candidates |
 
 Prompt template for each `{N}` in `types_to_run` (substitute `{N}`, `{CATEGORY_NAME}`, `{SLUG}` from the table above; append the window line only for `{N}` in {6, 7} when `window_params[{N}]` is present):
 
-> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (12, 13).
+> Scan ENGRAM for category {N} only ({CATEGORY_NAME}) per the agent definition's well-supported categories. Write the dream-report to `~/.engram/dream/<TODAY>-fairy-{N}-{SLUG}.md`. Use today's NYC-local date as `<TODAY>` in `YYYY-MM-DD` format. Return only file path + 5-bullet TL;DR for this category. Do NOT run other categories or the heuristic categories (13, 14).
 > [Categories 6/7 only, when `window_params[{N}]` is non-null:] Your fresh-cohort window is `created_at >= <window_params[{N}]>` — this is the watermark from THIS category's own last run, not "since last sleep" (this category may not have run every night). When `window_params[{N}]` is null, this is category {N}'s first-ever run: scan the full graph, no `created_at` filter.
 
 Single `Agent`-tool message with all of Step 6b's calls plus the batch-summary-fairies below, each `run_in_background=true`.

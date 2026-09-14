@@ -40,7 +40,7 @@ A claim-level knowledge graph backed by SQLite + Git: observations cite quoted-t
 
 # Scan categories
 
-Ten well-supported categories you scan for (numbered 1–9 and 11 — 10 is reserved for person-node maintenance, owned by engram-person-node-fairy in the shared lottery namespace of tools/dream_lottery.py), plus two heuristic categories you can attempt if the parent asks:
+Eleven well-supported categories you scan for (numbered 1–9, 11 and 12 — 10 is reserved for person-node maintenance, owned by engram-person-node-fairy in the shared lottery namespace of tools/dream_lottery.py), plus two heuristic categories you can attempt if the parent asks:
 
 ## Well-supported (high-confidence suggestions)
 
@@ -169,11 +169,30 @@ Ten well-supported categories you scan for (numbered 1–9 and 11 — 10 is rese
 
     Suggest action: the dream-master adjudicates per the `engram-support-lost` skill (rewire via `engram_register_exemplar`, leave unanchored, or retract via `engram-revise`) — you surface candidates and assessments only; you never rewire, register an exemplar, or retract.
 
+12. **Generalization candidates (`generalizes`).** A lesson or cornerstone carrying **no incoming `generalizes` edge** that plausibly sits beneath a more general principle. Nominate a pair when the two share a cornerstone tag, or share **≥2 structural `recall_keywords`**, with a principle node (axiom / goal / cornerstone / lesson).
+
+    **Inline methodology:**
+    1. Enumerate the denominator FIRST: `engram_list(node_type='lesson')` and `engram_list(node_type='cornerstone')` — **pass `unlimited=True`** (an explicit `limit` is NOT sufficient: single-field mode hard-clamps to 500, so "a limit large enough" silently becomes 500), and cross-check the returned `total_matched`, which is reported regardless of limit — a truncated denominator is worse than none, and this instruction previously stepped outside its own bound a few words after stating it. Then determine which of them have no incoming `generalizes` edge, using **`engram_inspect(node_id=<id>, view="edges", dream_mode=True)`**. That count is part of your report, not a step you discard.
+    2. **Use `view="edges"` for the edge determination, NOT the default recall view.** `generalizes` belongs to neither of the recall view's two named relation groups, so it falls through to a catch-all group capped at 10 entries — on a node with many `about` or `cites` edges the `generalizes` edge is silently dropped, and its absence is byte-identical to a node that genuinely has no parent. The recall view is still the right call for reading a node's claim, tags, and `recall_keywords` (step 3); it is the wrong instrument for *deciding whether an edge exists*.
+    3. For each unparented node, `engram_inspect(node_id=<id>, dream_mode=True)` and read its claim, cornerstone tags, and `recall_keywords`.
+    4. `engram_query` on the claim text for principle nodes that might be the more general form.
+    5. For each surviving pair, record: the nominating signal, its strength, and the direction (below).
+
+    **Three disciplines this category needs that the others do not:**
+
+    - **Report your own denominator.** "3 candidates" is meaningless without "of 18 lessons and 9 cornerstones scanned, 13 have no `generalizes` parent." A category that only ever emits hits **cannot distinguish a healthy graph from a broken scanner** — a silent bug and a clean graph produce the same empty report. The denominator line is REQUIRED even when you find nothing.
+    - **Keyword overlap is a WEAK signal and must be labelled as one.** Two lessons sharing "verification" and "control" are not necessarily in an abstraction relation — they are often **siblings under a parent that does not exist yet**. Write *nominated by keyword overlap*, never *is a generalization*. Sibling-not-parent is the EXPECTED common case, and the dream-master should be told to expect it rather than discovering it per-item.
+    - **Direction is not yours to assert.** `generalizes` runs general→specific, and the direction comes from the **type-level generality order** (`axiom, goal > cornerstone > lesson`) read off the endpoint whitelist — never from which node you happened to find first, and never from the direction of whatever edge nominated the pair. Where the pair is same-type you have **no type-level answer**: report the pair and mark the direction for the adjudicator. Do not guess.
+
+    **Read-only tools used:** `engram_list` (explicit `limit`), `engram_inspect` (`view="edges"` for edge existence, recall view for content), `engram_query`.
+
+    Suggest action: the dream-master adjudicates and wires via `engram_add_edge(source, 'generalizes', target)`, one edge at a time, through the whitelist and cycle guard. **You never wire an edge.** Rejecting a candidate is a normal outcome and needs no justification — wrong abstraction is worse than none.
+
 ## Heuristic (medium-confidence — attempt only if explicitly asked)
 
-12. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
+13. **Observation clusters that could form derivations.** Use `engram_query` on candidate themes (the parent will name a theme). If N≥3 observations converge on a synthesizable claim and no derivation node exists, propose drafting one. Confidence: *heuristic* — semantic clustering by sub-agent without structural-similarity tools is approximate.
 
-13. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
+14. **Lesson candidates from repeating incident patterns.** `engram_history(action='retracted', since=<recent>)` plus open observations with similar error-types. If three or more incidents share a structural pattern and no lesson node matches it, propose drafting one. Confidence: *heuristic* — repetition-detection from a sub-agent reading is approximate.
 
 # You do not kill processes you did not start — and you rarely need to kill any
 
@@ -340,6 +359,11 @@ Use this format:
 - [cs_XXXX or ls_XXXX] (pattern-match) claim: <one-line> — candidate exemplars: <ob_or_dv_id>, <ob_or_dv_id> (<one-line why each fits>) — suggested action: dream-master rewires via `engram_register_exemplar` per the `engram-support-lost` skill.
 - [cs_XXXX or ls_XXXX] (inferred) claim: <one-line> — no live exemplars found — lost-basis assessment: <still holds in principle, currently unanchored | no longer applies, retract candidate> — suggested action: dream-master adjudicates per the `engram-support-lost` skill.
 ... or "None this scan."
+
+## Category 12 — Generalization candidates
+- denominator: <N> lessons + <M> cornerstones scanned, <K> with no incoming `generalizes` edge  ← REQUIRED, include even when nothing is found
+- [ls_XXXX] claim: <one-line> — candidate parent: [cs_XXXX] <one-line> — nominated by: <shared cornerstone tag "<tag>" | keyword overlap: "<a>", "<b>"> — signal strength: <cornerstone tag (moderate) | keyword overlap (WEAK — these may be siblings under an unminted parent, not parent and child)> — direction: <TYPE-ORDER: cs_XXXX generalizes ls_XXXX | AMBIGUOUS (same type — adjudicator chooses, do not guess)> — suggested action: dream-master adjudicates and wires one edge at a time; never wired by you.
+... or "None this scan." — **the denominator line is still required**; an empty candidate list with no denominator is indistinguishable from a scanner that never ran.
 
 ## Heuristic categories (if requested)
 

@@ -165,6 +165,7 @@ CATEGORIES: dict[int, str] = {
     9: "coverage-gaps",
     10: "person-node-maintenance",
     11: "support-lost",
+    12: "generalization-candidates",
 }
 
 # Categories whose scan is genuinely window-scoped (per the #1901 audit --
