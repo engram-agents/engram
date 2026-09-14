@@ -490,11 +490,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/session.py",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "tools/compute_task_time.py",
       "tier": "convenience"
     },
@@ -503,22 +498,12 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/_session_context.py",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "tools/engram-pkg",
       "tier": "convenience"
     },
     {
       "path": "tools/engram-snapshot",
       "tier": "convenience"
-    },
-    {
-      "path": "tools/collab-letter-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
     },
     {
       "path": "tools/collab-baton-monitor.sh",
@@ -553,11 +538,6 @@
     {
       "path": "tools/baton.py",
       "tier": "convenience"
-    },
-    {
-      "path": "tools/_channel.py",
-      "tier": "convenience",
-      "multi_agent": true
     },
     {
       "path": "tools/forum.py",
@@ -1081,11 +1061,6 @@
       "tier": "convenience"
     },
     {
-      "path": "templates/agents.json.example",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "health/__init__.py",
       "tier": "essential",
       "note": "engram-alpha#2537 amendment 3 folder move: PEP 420 makes this non-load-bearing (Luria measured both import styles resolve without it), kept as an explicit package marker matching the tools/ package precedent."
@@ -1275,6 +1250,14 @@
     {
       "path": "src/build/instruction_manifestation/harnesses",
       "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "tools/_channel.py",
+      "reason": "#2857 step 2: its only live importer is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _channel.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
+    },
+    {
+      "path": "templates/agents.json.example",
+      "reason": "#2857 step 2: Lei's ruling (relayed by Kepler, 2026-09-14) -- exclude from public release. Local multi-agent support (this file's viz-server multi-agent config example) has no clean guideline/tooling story yet, and every current external user runs single-agent-per-machine, so there's no reason to ship a multi-agent topology example to them now."
     }
   ],
   "repo_only": [

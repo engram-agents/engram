@@ -103,15 +103,15 @@ class TestPredicate:
     # forum-backed hook/skill (baton/inter-agent hooks, engram-letter/
     # engram-baton/engram-collaborating-loop skills) was un-gated, since
     # baton/letter/forum are symmetric for any agent once a forum is
-    # configured. The two remaining MA-gated fixtures below are plain
-    # tools/scripts, not a hook or skill — see tiers.json's 6-item "leave
-    # gated" list (session.py / _channel.py / _session_context.py /
-    # agents.json.example / the two collab-*-monitor.sh scripts), none of
-    # which are forum-backed.
-    MA_GATED_ENTRY_1 = "tools/session.py"
-
-    # A second MA-gated entry (convenience+MA) — needs --multi-agent.
-    MA_GATED_ENTRY_2 = "tools/collab-baton-monitor.sh"
+    # configured. NOTE (#2857 step 2): of the 6-item "leave gated" list from
+    # step 1 (session.py / _channel.py / _session_context.py /
+    # agents.json.example / the two collab-*-monitor.sh scripts), three were
+    # deleted outright (session.py, _session_context.py, and the sibling
+    # collab-letter-monitor.sh) and two were reclassified to excluded[]
+    # (_channel.py, agents.json.example) rather than left multi_agent-gated
+    # in mechanisms[]. tools/collab-baton-monitor.sh is the only entry left
+    # with multi_agent: true, so it is now the single MA-gated fixture below.
+    MA_GATED_ENTRY = "tools/collab-baton-monitor.sh"
 
     # A convenience tool with no MA flag (forum.py) — ships at convenience, no MA needed
     FORUM_TOOL = "tools/forum.py"
@@ -158,33 +158,22 @@ class TestPredicate:
     def test_dev_tool_ships_at_dev_ma(self):
         assert ships(self.manifest, self.DEV_TOOL, "dev", multi_agent=True)
 
-    # --- MA-gated entry 1: needs right tier AND --multi-agent ---
+    # --- MA-gated entry: needs right tier AND --multi-agent ---
 
-    def test_ma_gated_entry_1_blocked_without_ma_flag(self):
-        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "convenience", multi_agent=False)
+    def test_ma_gated_entry_blocked_without_ma_flag(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY, "convenience", multi_agent=False)
 
-    def test_ma_gated_entry_1_blocked_without_ma_flag_dev(self):
-        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "dev", multi_agent=False)
+    def test_ma_gated_entry_blocked_without_ma_flag_dev(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY, "dev", multi_agent=False)
 
-    def test_ma_gated_entry_1_blocked_with_ma_but_too_low_tier(self):
-        assert not ships(self.manifest, self.MA_GATED_ENTRY_1, "essential", multi_agent=True)
+    def test_ma_gated_entry_blocked_with_ma_but_too_low_tier(self):
+        assert not ships(self.manifest, self.MA_GATED_ENTRY, "essential", multi_agent=True)
 
-    def test_ma_gated_entry_1_ships_at_convenience_with_ma(self):
-        assert ships(self.manifest, self.MA_GATED_ENTRY_1, "convenience", multi_agent=True)
+    def test_ma_gated_entry_ships_at_convenience_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY, "convenience", multi_agent=True)
 
-    def test_ma_gated_entry_1_ships_at_dev_with_ma(self):
-        assert ships(self.manifest, self.MA_GATED_ENTRY_1, "dev", multi_agent=True)
-
-    # --- MA-gated entry 2: same pattern ---
-
-    def test_ma_gated_entry_2_blocked_without_ma_flag(self):
-        assert not ships(self.manifest, self.MA_GATED_ENTRY_2, "convenience", multi_agent=False)
-
-    def test_ma_gated_entry_2_ships_at_convenience_with_ma(self):
-        assert ships(self.manifest, self.MA_GATED_ENTRY_2, "convenience", multi_agent=True)
-
-    def test_ma_gated_entry_2_ships_at_dev_with_ma(self):
-        assert ships(self.manifest, self.MA_GATED_ENTRY_2, "dev", multi_agent=True)
+    def test_ma_gated_entry_ships_at_dev_with_ma(self):
+        assert ships(self.manifest, self.MA_GATED_ENTRY, "dev", multi_agent=True)
 
     # --- forum.py: convenience, no MA flag → ships at convenience without --multi-agent ---
 

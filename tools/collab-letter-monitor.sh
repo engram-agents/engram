@@ -1,1 +1,0 @@
-../src/engram/tools/collab-letter-monitor.sh

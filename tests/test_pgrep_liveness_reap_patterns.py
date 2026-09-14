@@ -27,11 +27,10 @@ short "could this match the invoker / a co-tenant?" answer):
   `^(\\S*/)?-?bash\\s+...` per #2028's boot-charge fix, so the candidate stage
   alone already excludes the self-quoting-charge-text decoy):
     - collab-baton-monitor.sh
-    - collab-letter-monitor.sh
-      Previously carried the same self-match trap #1933 fixed in the two
-      forum-*-monitor.sh siblings: a single-layer unanchored `pgrep -f
-      <script>\\.sh` feeding directly into `kill`, no argv verification, no
-      warn-not-kill guard. Now fixed.
+      (#1935 originally ported the identical fix to collab-letter-monitor.sh
+      too — that script was deleted as dead code in #2857 step 2, its
+      watched channel retired by the 2026-06-28 UCS cutover to forum DMs —
+      and its coverage removed from this file in the same PR.)
 
     - deploy/autostart/boot-charge-default.md / boot-charge-quiet.md's
       monitor-verify step: `pgrep -u "$USER" -af
@@ -560,8 +559,8 @@ class TestForumUpdatesMonitorCandidatePattern(_TwoLayerMonitorFixture):
 
 
 # ===========================================================================
-# FINDING (xfail, not fixed here): collab-baton-monitor.sh /
-# collab-letter-monitor.sh -- single-layer unanchored pgrep -f feeding
+# FINDING (xfail, not fixed here): collab-baton-monitor.sh --
+# single-layer unanchored pgrep -f feeding
 # directly into `kill`, no argv verification, no warn-not-kill guard.
 # ===========================================================================
 
@@ -632,28 +631,6 @@ class TestCollabBatonMonitorReapPattern(_SingleLayerReapMonitorFixture):
         # Desired safe behavior (what this asserts, and what currently
         # fails): only the target + wrapper (genuine instances meant to be
         # reaped) match -- the self-quote decoy must NOT.
-        assert matched == [target_pid, wrapper_pid]
-
-
-class TestCollabLetterMonitorReapPattern(_SingleLayerReapMonitorFixture):
-    """FIXED by #1935 (porting #1933/#2028's process-name-anchored candidate
-    pattern -- collab-letter-monitor.sh no longer feeds an unanchored
-    substring match straight into `kill`; the candidate pgrep pattern is now
-    itself anchored on `^(\\S*/)?-?bash\\s+...` so the self-quoting-charge-text
-    decoy is excluded even before any /proc/<pid>/cmdline verification runs,
-    and the script also gained the /proc two-layer verification + warn-not-kill
-    posture (see the script's own inline comments)."""
-
-    SCRIPT = _TOOLS / "collab-letter-monitor.sh"
-
-    def test_reap_pattern_matches_exactly_the_target_and_wrapper(self):
-        purpose = "unittestpurpose"
-        pattern = self._pattern("collab-letter-monitor.sh", purpose)
-        table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid) = self._build_table(
-            "collab-letter-monitor.sh", purpose
-        )
-
-        matched = simulate_pgrep_f(pattern, table, uid=1000)
         assert matched == [target_pid, wrapper_pid]
 
 

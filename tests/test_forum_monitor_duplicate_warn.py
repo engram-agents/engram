@@ -1,22 +1,28 @@
 """Tests for the duplicate-instance detection in forum-updates-monitor.sh,
 forum-mention-monitor.sh (#1933: warn-not-kill), and — since #1935 ported the
-identical structure — collab-baton-monitor.sh / collab-letter-monitor.sh.
+identical structure — collab-baton-monitor.sh.
 
-Background: all four monitors used to SIGTERM any pgrep -f match against
+(This suite originally also covered collab-letter-monitor.sh, ported
+alongside collab-baton-monitor.sh in #1935. That script was deleted as dead
+code in #2857 step 2 — its watched channel was retired by the 2026-06-28
+UCS cutover to forum DMs — and its coverage removed from this file in the
+same PR.)
+
+Background: all three monitors used to SIGTERM any pgrep -f match against
 their own script basename on arm ("last-arm-wins" reap). pgrep -f is an
 unanchored substring match over the WHOLE cmdline, and `agentctl
 --charge-file` appends the boot charge text to `claude`'s own argv — so once
 a charge embedded a monitor's script path (#1865), every charge-booted
 `claude` process carried that path as a substring of its own cmdline and
 reaped (killed) itself, taking its whole session down (#1933, fixed for the
-two forum monitors; #1935 ports the fix to the two collab monitors, which
+two forum monitors; #1935 ports the fix to the collab monitor(s), which
 also gained a process-name-anchored candidate pattern per #2028). Lei's
 ruling: a substring match must never be an execution decision — reap NEVER
 kills; it WARNS on stdout (the Monitor event stream) and lets the agent
 decide.
 
 Isolation note (load-bearing, not just style): this suite runs on a live,
-shared, multi-agent host. Real production instances of all four monitors are
+shared, multi-agent host. Real production instances of all three monitors are
 routinely running under this SAME uid with the DEFAULT purpose (no
 --purpose flag) — pgrep -u $(id -u) -f <script-basename> would legitimately
 match them too. Every test below arms its monitors with a unique, per-test
@@ -25,15 +31,15 @@ can never match a real production monitor's cmdline (those run under
 "default" or a different named purpose). This is what makes it safe to run
 this suite against the real host: it exercises the genuine reap/warn code
 path without ever making a real production process a pgrep candidate. The
-two collab monitors ADD a second isolation axis: each test also points their
-watched directory (BATON_DIR / INTER_AGENT_DIR) at an empty per-test scratch
-dir, rather than the real shared production dirs
-(/home/agents-shared/forum/projects, /home/agents-shared/inter-agent) — the
+collab monitor ADDS a second isolation axis: each test also points its
+watched directory (BATON_DIR) at an empty per-test scratch
+dir, rather than the real shared production dir
+(/home/agents-shared/forum/projects) — the
 duplicate-detection code path runs before directory resolution either way,
 so this is belt-and-suspenders isolation, not a correctness requirement.
 
 Verifies (per #1933's fix + the parent spec's required coverage), for all
-four scripts:
+three scripts:
   1. A decoy whose argv merely CONTAINS the script path + purpose text as a
      python3 one-liner's argument (mirrors the real boot-charge repro) is
      left alive and is NOT reported as a suspect.
@@ -82,23 +88,20 @@ _SCRIPTS = {
         "path": _TOOLS / "forum-mention-monitor.sh",
         "no_reap_env": "FORUM_MENTION_NO_REAP",
     },
-    # #1935: collab-baton-monitor.sh / collab-letter-monitor.sh gained the
-    # identical warn-not-kill + /proc two-layer verification structure. Both
-    # take a watched-directory env override (unlike the forum scripts, which
-    # poll a URL) -- "dir_env" names it so each test below can point the
-    # watched dir at an empty per-test scratch directory instead of the real
-    # shared production dir (/home/agents-shared/forum/projects,
-    # /home/agents-shared/inter-agent), keeping this suite's live-host
-    # isolation property (see the module docstring) intact for these two too.
+    # #1935: collab-baton-monitor.sh gained the identical warn-not-kill +
+    # /proc two-layer verification structure (originally ported alongside
+    # collab-letter-monitor.sh, which was deleted as dead code in #2857
+    # step 2 -- its watched channel was retired by the 2026-06-28 UCS
+    # cutover to forum DMs). It takes a watched-directory env override
+    # (unlike the forum scripts, which poll a URL) -- "dir_env" names it so
+    # each test below can point the watched dir at an empty per-test scratch
+    # directory instead of the real shared production dir
+    # (/home/agents-shared/forum/projects), keeping this suite's live-host
+    # isolation property (see the module docstring) intact for this one too.
     "collab-baton-monitor.sh": {
         "path": _TOOLS / "collab-baton-monitor.sh",
         "no_reap_env": "COLLAB_MONITOR_NO_REAP",
         "dir_env": "BATON_DIR",
-    },
-    "collab-letter-monitor.sh": {
-        "path": _TOOLS / "collab-letter-monitor.sh",
-        "no_reap_env": "COLLAB_MONITOR_NO_REAP",
-        "dir_env": "INTER_AGENT_DIR",
     },
 }
 

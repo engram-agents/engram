@@ -57,7 +57,7 @@
 
 ## Secondary CLI-capable tools (tiered)
 
-engram-pkg (convenience — package authoring, isolated namespace) · inspect_raw.py, verify_quote.py, recall_summary_validator.py, cohort_dispatch.py, dream_master_batch.py, write_sleep_marker.py, engram-regenerate-embeddings.py (essential) · session.py, compute_task_time.py (convenience).
+engram-pkg (convenience — package authoring, isolated namespace) · inspect_raw.py, verify_quote.py, recall_summary_validator.py, cohort_dispatch.py, dream_master_batch.py, write_sleep_marker.py, engram-regenerate-embeddings.py (essential) · compute_task_time.py (convenience).
 
 ## Manifest gaps (dispatcher-verified)
 
@@ -99,7 +99,6 @@ User-facing command-line tools. Typically symlinked into `/home/agents-shared/bi
 | `tools/ia.py` | `engram-letter` | T2+MA |
 | `tools/baton.py` | `engram-baton` | T2+MA |
 | `tools/forum.py` | `engram-forum` | T2 |
-| `tools/collab-letter-monitor.sh` | `engram-letter` (Monitor wake companion) | T2+MA |
 | `tools/forum-mention-monitor.sh` | `engram-forum` (Monitor wake companion) | T2+MA |
 | `tools/engram-pkg/engram-pkg` | (package authoring, self-contained) | T2 |
 | `tools/engine/` | `engram-upgrade` (build half) | T2 |
@@ -113,9 +112,8 @@ Imported by runtime processes (hooks, server, sleep cycle scripts). Never invoke
 | File | Caller / role | Tier |
 |---|---|---|
 | `tools/__init__.py` | Python package init (required for intra-tools imports) | T1 |
-| `tools/_channel.py` | `session.py`, `_session_context.py`, `telegram_bot.py` (message channel abstraction) | T2+MA |
+| `tools/_channel.py` | `telegram_bot.py` (message channel abstraction) | excluded (#2857 step 2 — sole live importer, `telegram_bot.py`, is itself excluded) |
 | `tools/_common.py` | hooks, session tooling (shared utilities) | T2 |
-| `tools/_session_context.py` | session tooling (session-scoped state) | T2 |
 | `tools/cohort_dispatch.py` | `engram-sleep` Phase B (batch-summary fairy dispatch) | T1 |
 | `tools/dream_master_batch.py` | `engram-sleep` Phase B (dream-master cohort) | T1 |
 | `tools/recall_summary_payload.py` | summary-fairy, server (payload builder) | T1 |
@@ -159,7 +157,6 @@ Measurement, debugging, and DB-surgery tools. Never imported. Not shipped to pro
 | `tools/scan-leaks.py` | Env/config leak scanner (CI + manual use) |
 | `tools/deference_baseline.py` | Deference-detector calibration baseline |
 | `tools/antml_repair_baseline.py` | antml-prefix repair baseline measurement |
-| `tools/session.py` | Session transcript inspection |
 | `tools/dump_mcp_schema.py` | Dump MCP tool schemas for inspection |
 | `tools/run_touched_tests.py` | Run only tests touching changed files |
 | `tools/run_matrix.py` | Test matrix runner (multi-env) |

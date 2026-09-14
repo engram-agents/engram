@@ -486,11 +486,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/collab-letter-monitor.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for collab-letter-monitor.sh"
-    },
-    {
       "path_prefix_or_glob": "tools/collab-baton-monitor.sh",
       "test_globs": [
         "tests/test_baton_monitor.py"
@@ -635,10 +630,6 @@
       "reason": "Internal helper with no dedicated test file; tested indirectly through tools that use it"
     },
     {
-      "path": "tools/_session_context.py",
-      "reason": "Internal session context helper with no dedicated test file"
-    },
-    {
       "path": "tools/antml_repair_baseline.py",
       "reason": "Dev-tier baseline tool; no dedicated test file"
     },
@@ -676,10 +667,6 @@
     },
     {
       "path": "tools/forum_regen_derived.py",
-      "reason": "No dedicated test file found"
-    },
-    {
-      "path": "tools/session.py",
       "reason": "No dedicated test file found"
     },
     {

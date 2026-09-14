@@ -1,5 +1,14 @@
 # Hot-Seat Shared Scratchpad (v0.1)
 
+> **STATUS: retired design, never implemented.** This is a proposal built
+> atop the v0 "Channel Dispatcher" hot-seat architecture (see
+> session_context_design.md's status note), which README.md §7/§9 already
+> documents as retired. The proposed extension point, `tools/session.py`,
+> was deleted as dead code in #2857 step 2. `tools/_channel.py`'s
+> `atomic_write` pattern referenced below still exists in the repo, but is
+> no longer a shipped mechanism (reclassified to `excluded[]` in the same
+> PR — its only live importer is `tools/telegram_bot.py`).
+
 The Shared Scratchpad is a same-filesystem primitive for high-frequency collaborative editing between agents. It provides a semi-structured space for drafting, state-tracking, and brainstorming that persists across messages within a "hot-seat" session.
 
 ## Storage
