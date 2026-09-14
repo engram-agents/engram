@@ -265,8 +265,18 @@ class TestCmdFlip:
         stderr = capsys.readouterr().err
         assert "baton anchor PR-99 --github pr/<owner>/<repo>/42" in stderr
 
-    def test_unqualified_anchor_unaffected_when_not_flipping_to_sentinel(self, monkeypatch):
-        """Unqualified anchor + flip to a non-sentinel participant is untouched by the gate."""
+    def test_unqualified_anchor_refuses_for_maintainer_flip_to_non_sentinel_participant(self, monkeypatch):
+        """#2914: the maintainer-role gate fires on ANY flip that isn't a
+        self-flip or a flip to the registered colleague -- not only the
+        literal pool sentinel. Flipping to "ariadne" here is neither
+        (current holder is "borges", no colleague is registered on this
+        baton), so it IS a maintainer-role flip, and the unqualified-anchor
+        refusal must fire on it exactly as it does on flip-to-sentinel.
+
+        Supersedes this method's pre-#2914 premise ("flip to a non-sentinel
+        participant is untouched by the gate") -- that was only ever true of
+        the OLD gate, which fired on the literal pool-sentinel name alone.
+        """
         raw = _make_raw_baton("PR-99", github="pr/42")
         client = _make_client(
             post_return={"seq": 7},
@@ -274,9 +284,10 @@ class TestCmdFlip:
         )
         args = _ns(project_id="PR-99", to="ariadne", reason="fairy-converged")
 
-        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
-
-        client.post.assert_called_once()
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
 
     def test_qualified_anchor_flip_to_pool_sentinel_still_works(self, monkeypatch):
         """A repo-qualified anchor flip-to-sentinel is unaffected -- proceeds to post."""
