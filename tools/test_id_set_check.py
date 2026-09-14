@@ -654,10 +654,25 @@ def _run_git(repo_root: Path, args: list[str]) -> str:
     return result.stdout
 
 
+# Every directory tests.yml's full-suite invocation collects
+# (`pytest tests/ src/forum/tests/ -v --tb=short` — see
+# .github/workflows/tests.yml). This tool's own git-ls-tree scan roots
+# must track that list by hand — the two are NOT auto-synced (there is no
+# shared config file between a Python tool and a YAML workflow step), so a
+# THIRD scan root added to tests.yml in the future needs a matching entry
+# here, same "duplicated by hand, change together" convention as this
+# repo's other cross-file-kept-in-sync lists.
+TEST_SCAN_ROOTS: tuple[str, ...] = ("tests/", "src/forum/tests/")
+
+
 def list_test_files(repo_root: Path, rev: str) -> list[str]:
-    """Enumerate every *.py under tests/ at `rev`, POSIX-relpath, via git ls-tree."""
-    out = _run_git(repo_root, ["ls-tree", "-r", "--name-only", rev, "--", "tests/"])
-    return [line for line in out.splitlines() if line.endswith(".py")]
+    """Enumerate every *.py under any of TEST_SCAN_ROOTS at `rev`, POSIX-relpath,
+    via git ls-tree."""
+    paths: list[str] = []
+    for root in TEST_SCAN_ROOTS:
+        out = _run_git(repo_root, ["ls-tree", "-r", "--name-only", rev, "--", root])
+        paths.extend(line for line in out.splitlines() if line.endswith(".py"))
+    return paths
 
 
 def read_sources_at_rev(repo_root: Path, rev: str) -> dict[str, str]:

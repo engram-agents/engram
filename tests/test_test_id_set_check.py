@@ -63,6 +63,8 @@ main = _mod.main
 warn_if_base_is_not_ancestor = _mod.warn_if_base_is_not_ancestor
 _is_ancestor = _mod._is_ancestor
 _merge_base = _mod._merge_base
+list_test_files = _mod.list_test_files
+read_sources_at_rev = _mod.read_sources_at_rev
 
 
 # ---------------------------------------------------------------------------
@@ -1436,3 +1438,120 @@ def test_2568_removed_line_shaped_like_dashes_header_is_not_dropped(tmp_path: Pa
         "genuine '-- ' content prefix) made the following added '++'-shaped "
         "line be mistaken for a diff header pair and silently dropped"
     )
+
+
+# ---------------------------------------------------------------------------
+# #2939 -- list_test_files must scan every root tests.yml's full-suite
+# invocation collects (`pytest tests/ src/forum/tests/`), not just tests/.
+# Before this fix, a test removed from src/forum/tests/ never registered as
+# a disappearance -- the same defect class as #2350's original motivation
+# (a deleted test that CI cannot see), but on the SCANNING side rather than
+# the diffing side.
+# ---------------------------------------------------------------------------
+
+
+def _make_scan_roots_fixture(tmp_path: Path) -> dict[str, str]:
+    """A real repo with test files under THREE directories: `tests/` (an
+    already-scanned root), `src/forum/tests/` (the root #2939 adds), and
+    `scripts/` (a plain, never-scanned directory that happens to contain a
+    `def test_*`-shaped function -- the negative control proving the fix
+    didn't widen the scan to "everywhere"). `head` removes one test id from
+    EACH of the three files, so a scanning-root regression on any of them
+    is independently visible."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "test")
+    _git(repo, "config", "user.email", "test@example.com")
+
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_a.py").write_text(
+        "def test_from_tests():\n    assert True\n\n\n"
+        "def test_from_tests_removed():\n    assert True\n"
+    )
+
+    forum_tests_dir = repo / "src" / "forum" / "tests"
+    forum_tests_dir.mkdir(parents=True)
+    (forum_tests_dir / "test_forum.py").write_text(
+        "def test_from_forum():\n    assert True\n\n\n"
+        "def test_from_forum_removed():\n    assert True\n"
+    )
+
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "not_a_test.py").write_text(
+        "def test_should_not_be_scanned():\n    assert True\n"
+    )
+
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    (tests_dir / "test_a.py").write_text("def test_from_tests():\n    assert True\n")
+    (forum_tests_dir / "test_forum.py").write_text(
+        "def test_from_forum():\n    assert True\n"
+    )
+    scripts_dir_file = scripts_dir / "not_a_test.py"
+    scripts_dir_file.write_text("")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "head")
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    return {"repo": str(repo), "base": base, "head": head}
+
+
+def test_2939_control_removed_test_under_forum_tests_is_reported_disappeared(tmp_path: Path):
+    """The control this issue is about: a test function removed from a file
+    under src/forum/tests/ between base and head must end up in
+    base_ids - head_ids when scanned via list_test_files/read_sources_at_rev
+    -- before the fix, list_test_files ignored this root entirely and the
+    id never existed in either set, so it could never be REPORTED missing."""
+    fx = _make_scan_roots_fixture(tmp_path)
+    repo_root = Path(fx["repo"])
+    base_ids = collect_ids(read_sources_at_rev(repo_root, fx["base"]))
+    head_ids = collect_ids(read_sources_at_rev(repo_root, fx["head"]))
+    assert "src/forum/tests/test_forum.py::test_from_forum_removed" in (base_ids - head_ids)
+
+
+def test_2939_no_regression_removed_test_under_tests_is_still_reported_disappeared(tmp_path: Path):
+    """Same shape, `tests/` root -- must keep working exactly as before the
+    fix (the pre-existing root is not accidentally dropped while adding the
+    new one)."""
+    fx = _make_scan_roots_fixture(tmp_path)
+    repo_root = Path(fx["repo"])
+    base_ids = collect_ids(read_sources_at_rev(repo_root, fx["base"]))
+    head_ids = collect_ids(read_sources_at_rev(repo_root, fx["head"]))
+    assert "tests/test_a.py::test_from_tests_removed" in (base_ids - head_ids)
+
+
+def test_2939_scripts_directory_is_not_scanned(tmp_path: Path):
+    """Negative control: a `def test_*`-shaped function living under
+    `scripts/` (not one of TEST_SCAN_ROOTS) must never be collected, at
+    either revision -- confirming the fix widened the scan to exactly the
+    two named roots, not to the whole tree."""
+    fx = _make_scan_roots_fixture(tmp_path)
+    repo_root = Path(fx["repo"])
+    assert set(list_test_files(repo_root, fx["base"])) == {
+        "tests/test_a.py",
+        "src/forum/tests/test_forum.py",
+    }
+    base_ids = collect_ids(read_sources_at_rev(repo_root, fx["base"]))
+    head_ids = collect_ids(read_sources_at_rev(repo_root, fx["head"]))
+    assert not any("scripts/" in tid for tid in base_ids | head_ids)
+    assert not any("test_should_not_be_scanned" in tid for tid in base_ids | head_ids)
+
+
+def test_2939_end_to_end_via_main_reports_both_scan_roots(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """End-to-end through main(), matching the real CI invocation shape:
+    both disappearances (tests/ and src/forum/tests/) are unaccounted and
+    named in the FAIL output; the scripts/ id never appears at all."""
+    fx = _make_scan_roots_fixture(tmp_path)
+    exit_code = main(["--base", fx["base"], "--head", fx["head"], "--repo-root", fx["repo"]])
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "tests/test_a.py::test_from_tests_removed" in captured.out
+    assert "src/forum/tests/test_forum.py::test_from_forum_removed" in captured.out
+    assert "test_should_not_be_scanned" not in captured.out
