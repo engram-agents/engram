@@ -25,19 +25,29 @@ REPURPOSED (option (b) of the PR5 spec's "retire vs repurpose" choice,
 preferred over deleting outright because this file's fixture-DB
 infrastructure — a realistic multi-metric, multi-aspect graph exercising
 all nine real signal functions at once — is worth reusing): this file now
-tests that health.engine.MODEL's ONE v1 curve (``badness_default``),
+tests that every curve health.engine.MODEL's real metrics are bound to,
 wired through the REAL composition path (``health.engine.build_snapshot``),
 produces SANE results against this same realistic fixture — bounded scores,
 no NaN.
 
-As of engram-alpha#2788, ``badness_default`` is DATA-LOADED from
-curves.json and ships Lei's placeholder ``1 - x`` shape rather than the
-earlier hand-tuned reproduction of ``metric_goodness``'s old shape — so the
-per-metric score assertion below now pins that explicit placeholder shape
-(``score == 1 - rate``) directly, informationally, not as a load-bearing
-requirement going forward (same status the old ``metric_goodness``
-comparison had — see health/curves.py's ``BADNESS_DEFAULT_CURVE``
-docstring for the current shape and its provenance).
+As of engram-alpha#2788, ``badness_default``/``goodness_default`` are
+DATA-LOADED from curves.json and ship Lei's placeholder ``1 - x``/``x``
+shapes rather than the earlier hand-tuned reproduction of
+``metric_goodness``'s old shape — so the per-metric score assertion below
+pins that explicit placeholder shape (``score == 1 - rate``) directly,
+informationally, not as a load-bearing requirement going forward (same
+status the old ``metric_goodness`` comparison had — see health/curves.py's
+``BADNESS_DEFAULT_CURVE`` docstring for the current shape and its
+provenance), for the metrics STILL bound to one of those two placeholder
+curves. As of engram-alpha#2905 PR-A, this is no longer ALL nine real
+metrics — five of them (``taint_rate``, ``stale_derivation_rate``,
+``embedding_coverage``, ``recall_summary_coverage``,
+``recall_keywords_coverage``) rebound to genuinely different curve shapes
+(``badness_pending_premise``/``goodness_coverage``, see health/model.py's
+``MODEL_SPEC``); the placeholder-shape pin is skipped for those five (their
+sanity — bounded, no NaN — is still asserted, same as every metric), since
+asserting the OLD placeholder formula against a curve that was
+DELIBERATELY reshaped away from it would be asserting something false.
 """
 
 from __future__ import annotations
@@ -241,13 +251,23 @@ def test_model_has_exactly_nine_real_metric_bindings():
     }
 
 
+# The two ORIGINAL v1 placeholder curve names (engram-alpha#2788, Lei's
+# 2026-09-09 ruling) -- still the simple identity/1-x shape today. The
+# informational pin below fires only for a metric still bound to one of
+# these two; a metric rebound to one of #2905 PR-A's genuinely different
+# curve shapes (badness_pending_premise/goodness_coverage) is exempted, per
+# this file's own module docstring.
+_PLACEHOLDER_CURVE_NAMES = {"badness_default", "goodness_default"}
+
+
 @pytest.mark.parametrize("binding", _ALL_REAL_BINDINGS, ids=lambda m: m.signal)
-def test_badness_default_curve_produces_sane_scores_for_every_real_metric(binding):
+def test_bound_curve_produces_sane_scores_for_every_real_metric(binding):
     """For each real metric binding: run its REAL signal function (via
     health.model.SIGNALS — the name registry, clarification 2)
     against the fixture db to get an actual current rate, then assert its
-    bound curve (``badness_default`` for all nine today) produces a SANE
-    score: bounded to [0,1] (its declared output_range), never NaN.
+    bound curve (one of the four real v1.2 curves — see health/model.py's
+    ``CURVES``) produces a SANE score: bounded to [0,1] (its declared
+    output_range), never NaN.
 
     Wrapped in a mock of ``engram_core._embedder.is_available`` for every
     metric (not just embedding_coverage) — harmless for the other eight,
@@ -272,14 +292,24 @@ def test_badness_default_curve_produces_sane_scores_for_every_real_metric(bindin
     lo, hi = curve.output_range
     assert lo <= score <= hi, f"{binding.signal}: score {score!r} outside {curve.output_range!r}"
 
-    # Informational, NOT the load-bearing guard anymore (see module
-    # docstring). As of engram-alpha#2788, badness_default is the
-    # DATA-LOADED placeholder curve(x) == 1 - x (curves.json), not the
+    if binding.curve not in _PLACEHOLDER_CURVE_NAMES:
+        # engram-alpha#2905 PR-A: this metric rebound to a genuinely
+        # different (non-placeholder) curve shape -- the 1-x/x placeholder
+        # pin below does not apply; sanity (bounded, no NaN) is already
+        # asserted above, which is this test's load-bearing contract.
+        return
+
+    # Informational, NOT the load-bearing guard (see module docstring). As
+    # of engram-alpha#2788, badness_default/goodness_default are the
+    # DATA-LOADED placeholder curve(x) == 1 - x / x (curves.json), not the
     # earlier hand-tuned reproduction of metric_goodness's old shape — pin
     # the curve's own declared placeholder shape here instead of the
     # retired formula, so this stays a live check rather than a stale
-    # coincidence.
-    assert score == pytest.approx(1.0 - rate, abs=1e-9)
+    # coincidence, for the metrics that still carry that shape.
+    if binding.curve == "badness_default":
+        assert score == pytest.approx(1.0 - rate, abs=1e-9)
+    else:
+        assert score == pytest.approx(rate, abs=1e-9)
 
 
 def test_full_build_snapshot_wired_through_the_new_model_produces_sane_results():
@@ -345,39 +375,63 @@ class TestCurveDataFileIsGenuinelyWiredIn:
         """Load the real data file, build a model, score this file's
         realistic fixture, and pin the composed score. Then edit a COPY of
         curves.json (never the real file on disk) reshaping
-        ``badness_default``'s knots, rebuild that one ``CurveSpec`` from
-        the edited copy via ``health.curves._load_curve_defs`` /
+        ``badness_pending_premise``'s knots, rebuild that one ``CurveSpec``
+        from the edited copy via ``health.curves._load_curve_defs`` /
         ``_curve_from_defs``, swap it into the live model
         (``mock.patch.dict`` — the same real dict ``health.model.CURVES``
         and ``health.engine.MODEL.curves`` both reference, per
         ``health.model.load()``'s own "same object identity" contract),
         and re-score: the composed score must CHANGE. On exiting the patch
         the model reverts to the real ``curves.json``-loaded curve; a final
-        re-score must land back on the ORIGINAL composed score."""
+        re-score must land back on the ORIGINAL composed score.
+
+        engram-alpha#2905 PR-A: reshapes ``badness_pending_premise``, not
+        ``badness_default`` (the pre-PR-A target) — as of this PR, NO
+        admitted metric is bound to ``badness_default`` any more
+        (``open_contradiction_rate``/``uncited_observation_rate``/
+        ``dangling_evidence_rate`` all carry it at importance 0.0, and
+        ``giant_component_fraction`` — importance 0.0 too — is the only
+        admitted-aspect metric anywhere near it, on ``goodness_default``),
+        so reshaping ``badness_default`` would no longer move the composed
+        score and this test would stop proving what it exists to prove.
+        ``badness_pending_premise`` is where the admitted epistemic_
+        integrity metrics (``taint_rate``/``stale_derivation_rate``) live
+        instead."""
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             original_snap = he.build_snapshot(_build_fixture_conn(), "nap")
         original_composed = original_snap["scores"]["composed"]
 
-        # A COPY of the real curves.json, with badness_default reshaped to
-        # a different (still valid: sorted, non-degenerate, decreasing,
-        # same (0.0, 1.0) domain) curve -- the real file on disk is never
-        # touched.
+        # A COPY of the real curves.json, with badness_pending_premise
+        # reshaped to a different (still valid: sorted, same (0.0, 1.0)
+        # domain, still decreasing throughout) curve -- the real file on
+        # disk is never touched.
         edited_defs = json.loads(hc.CURVES_JSON_PATH.read_text())
-        assert edited_defs["badness_default"]["knots"] == [[0.0, 1.0], [1.0, 0.0]], (
-            "this test's premise (badness_default's current placeholder "
-            "knots) has drifted from curves.json -- update the fixture "
-            "reshape below to still be a genuine change"
+        assert edited_defs["badness_pending_premise"]["knots"] == [
+            [0.0, 1.0], [0.01, 0.9], [0.05, 0.8], [0.2, 0.5], [0.5, 0.2], [1.0, 0.0],
+        ], (
+            "this test's premise (badness_pending_premise's current knots) "
+            "has drifted from curves.json -- update the fixture reshape "
+            "below to still be a genuine change"
         )
-        edited_defs["badness_default"]["knots"] = [[0.0, 1.0], [1.0, 0.5]]
+        # Reshape the (0.5, 0.2) knot specifically (not the tail) -- this
+        # fixture's stale_derivation_rate lands EXACTLY on x=0.5 and
+        # taint_rate's rate falls in the (0.2, 0.5) segment whose right
+        # endpoint is this same knot, so both metrics' scores actually move;
+        # reshaping only the (1.0, ...) tail knot (unreached by either
+        # rate here) would leave the composed score unchanged and this test
+        # would falsely conclude the wiring is inert.
+        edited_defs["badness_pending_premise"]["knots"] = [
+            [0.0, 1.0], [0.01, 0.9], [0.05, 0.8], [0.2, 0.5], [0.5, 0.35], [1.0, 0.0],
+        ]
         edited_path = tmp_path / "curves.json"
         edited_path.write_text(json.dumps(edited_defs))
 
         reloaded_defs = hc._load_curve_defs(edited_path)
-        reshaped = hc._curve_from_defs("badness_default", reloaded_defs)
-        assert reshaped.knots != hc.BADNESS_DEFAULT_CURVE.knots
+        reshaped = hc._curve_from_defs("badness_pending_premise", reloaded_defs)
+        assert reshaped.knots != hc.BADNESS_PENDING_PREMISE_CURVE.knots
 
-        with mock.patch.dict(hem_model.CURVES, {"badness_default": reshaped}):
-            assert he.MODEL.curves["badness_default"] is reshaped, (
+        with mock.patch.dict(hem_model.CURVES, {"badness_pending_premise": reshaped}):
+            assert he.MODEL.curves["badness_pending_premise"] is reshaped, (
                 "health.engine.MODEL.curves and health.model.CURVES are "
                 "not the same dict object -- this test's patch would be "
                 "inert against the real composition path"
@@ -389,14 +443,14 @@ class TestCurveDataFileIsGenuinelyWiredIn:
             edited_composed = edited_snap["scores"]["composed"]
 
         assert edited_composed != pytest.approx(original_composed), (
-            "editing badness_default's knots in a copy of curves.json did "
-            "not move the composed score through the real composition "
-            "path -- the wiring is not genuinely data-driven"
+            "editing badness_pending_premise's knots in a copy of "
+            "curves.json did not move the composed score through the real "
+            "composition path -- the wiring is not genuinely data-driven"
         )
 
         # Reverted (the mock.patch.dict context above has exited) -- must
         # land back on the exact original composed score.
-        assert he.MODEL.curves["badness_default"] is hc.BADNESS_DEFAULT_CURVE
+        assert he.MODEL.curves["badness_pending_premise"] is hc.BADNESS_PENDING_PREMISE_CURVE
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             reverted_snap = he.build_snapshot(_build_fixture_conn(), "nap")
         assert reverted_snap["scores"]["composed"] == pytest.approx(

@@ -1059,11 +1059,13 @@ class TestBuildSnapshot:
         above for the dedicated test of that fact, and health/engine.py's
         module docstring "RESOLVED" section for the full reasoning. This
         fixture deliberately carries NO contradiction node, so open_
-        contradiction_rate (round 2's fold #2: UNAVAILABLE on an EMPTY
-        population) is one of epistemic_integrity's three admitted metrics
-        going unavailable this run — proving the metric-level renormalize
-        (addendum 2) lands a REAL epistemic_integrity score anyway, over
-        the remaining two available metrics."""
+        contradiction_rate's own UNAVAILABLE (empty population) is asserted
+        below too, but [engram-alpha#2905 PR-A, 2026-09-13] it no longer
+        affects epistemic_integrity's coverage at all: Lei's 2026-09-13
+        ruling moved open_contradiction_rate's importance to 0.0 (HOLD-OUT,
+        informational), so it is not an ADMITTED metric any more -- coverage
+        is now a clean 2-of-2 (taint_rate, stale_derivation_rate), not the
+        pre-PR-A 2-of-3 renormalize this docstring used to describe."""
         conn = _make_conn()
         # Give every real metric a non-empty denominator with a clean signal
         # — including aspect B's four: both claim-bearing nodes carry a
@@ -1094,16 +1096,18 @@ class TestBuildSnapshot:
         assert snap["scores"]["unscored_aspects"] == ["provenance_integrity"]
         assert snap["scores"]["points_in_play"] == pytest.approx(75.0)
         assert snap["scores"]["composed_coverage"] == pytest.approx(0.75)
-        # open_contradiction_rate's own UNAVAILABLE (empty population, no
-        # contradiction node in this fixture) does NOT drag epistemic_
-        # integrity down to UNAVAILABLE -- it renormalizes over the
-        # remaining two available admitted metrics (addendum 2).
+        # open_contradiction_rate's own signal is still UNAVAILABLE (empty
+        # population, no contradiction node in this fixture) -- but as of
+        # engram-alpha#2905 PR-A it is importance=0.0 (HOLD-OUT), so it is
+        # not an admitted metric and does not enter epistemic_integrity's
+        # coverage accounting at all: coverage is a clean 2-of-2 over
+        # taint_rate/stale_derivation_rate, not a 2-of-3 renormalize.
         assert snap["signals"]["open_contradiction_rate"] == "UNAVAILABLE"
         epistemic_coverage = snap["scores"]["aspect_coverage"]["epistemic_integrity"]
         assert set(epistemic_coverage["metrics_in_play"]) == {
             "taint_rate", "stale_derivation_rate",
         }
-        assert epistemic_coverage["coverage"] == pytest.approx(2.0 / 3.0)
+        assert epistemic_coverage["coverage"] == pytest.approx(1.0)
 
         # Fully covered + connected -> all four aspect-B raw signals
         # (literal-coverage convention, engram-alpha#2518 — before that PR

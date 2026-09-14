@@ -199,43 +199,67 @@ class TestRealModelShape:
             "giant_component_fraction",
         }
 
-    def test_every_metric_uses_one_of_the_two_v1_curves(self):
+    def test_every_metric_uses_one_of_the_four_v1_2_curves(self):
         """Clarification 3 (originally: exactly ONE named curve for v1,
         shared by every metric) — AMENDED by engram-alpha#2518: raw signal
         = literal meaning of its own name; direction/polarity moved into
-        the curve. The four retrievability metrics (naturally
-        coverage-style) are now bound to the increasing "goodness_default"
-        curve; every other metric (badness-rate) stays on the decreasing
-        "badness_default" curve. Still exactly two named curves for v1, not
-        per-metric differentiation."""
+        the curve. AMENDED AGAIN by engram-alpha#2905 PR-A (the 2026-09-13
+        Lei+Kepler curves session): two more named curves joined the
+        registry (``badness_pending_premise``, ``goodness_coverage``), and
+        five of the nine real metrics rebound to them — see
+        tests/test_health_model_defs.py's ``TestV1_2CurveRebindings`` for
+        the direct per-metric assertions. Still a small,
+        named-curve-per-family v1 simplification, not per-metric
+        differentiation — now four named curves rather than two."""
         assert {m.curve for m in MODEL_SPEC.metrics} == {
             "badness_default",
             "goodness_default",
+            "badness_pending_premise",
+            "goodness_coverage",
         }
         assert set(MODEL_SPEC.curves.keys()) == {
             "badness_default",
             "goodness_default",
+            "badness_pending_premise",
+            "goodness_coverage",
         }
 
-    def test_retrievability_metrics_use_goodness_default_curve(self):
-        """engram-alpha#2518: exactly the four retrievability metrics are
-        bound to "goodness_default" — every other metric stays on
-        "badness_default"."""
-        goodness_bound = {
-            m.signal for m in MODEL_SPEC.metrics if m.curve == "goodness_default"
+    def test_retrievability_metrics_curve_bindings(self):
+        """engram-alpha#2518 ESTABLISHED "goodness_default" for all four
+        retrievability metrics; engram-alpha#2905 PR-A (2026-09-13) moved
+        three of those four (embedding_coverage, recall_summary_coverage,
+        recall_keywords_coverage) onto the new "goodness_coverage" curve,
+        leaving giant_component_fraction alone on "goodness_default". On
+        the badness side, PR-A also moved taint_rate/stale_derivation_rate
+        off "badness_default" onto the new "badness_pending_premise" curve,
+        leaving open_contradiction_rate/uncited_observation_rate/
+        dangling_evidence_rate as the only metrics still on
+        "badness_default" — see tests/test_health_model_defs.py's
+        ``TestV1_2CurveRebindings`` for the direct per-metric assertions
+        this test summarizes at the curve-membership level."""
+        goodness_coverage_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "goodness_coverage"
         }
-        assert goodness_bound == {
+        assert goodness_coverage_bound == {
             "embedding_coverage",
             "recall_summary_coverage",
             "recall_keywords_coverage",
-            "giant_component_fraction",
         }
-        badness_bound = {
-            m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_default"
+        goodness_default_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "goodness_default"
         }
-        assert badness_bound == {
+        assert goodness_default_bound == {"giant_component_fraction"}
+        badness_pending_premise_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_pending_premise"
+        }
+        assert badness_pending_premise_bound == {
             "taint_rate",
             "stale_derivation_rate",
+        }
+        badness_default_bound = {
+            m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_default"
+        }
+        assert badness_default_bound == {
             "open_contradiction_rate",
             "uncited_observation_rate",
             "dangling_evidence_rate",
@@ -248,18 +272,23 @@ class TestRealModelShape:
         assert MODEL_SPEC.curves["goodness_default"] is GOODNESS_DEFAULT_CURVE
         assert MODEL_SPEC.curves["goodness_default"].monotone_direction == "increasing"
 
-    def test_six_admitted_three_diagnostic(self):
+    def test_five_admitted_four_diagnostic(self):
+        """engram-alpha#2905 PR-A (2026-09-13, Lei's ruling): open_
+        contradiction_rate moved from admitted (importance 1.0) to
+        diagnostic HOLD-OUT (importance 0.0) -- six-admitted/three-
+        diagnostic (this test's pre-PR-A name and shape) is now
+        five-admitted/four-diagnostic."""
         admitted = [m for m in MODEL_SPEC.metrics if m.importance > 0]
         diagnostic = [m for m in MODEL_SPEC.metrics if m.importance <= 0]
         assert {m.signal for m in admitted} == {
             "taint_rate",
             "stale_derivation_rate",
-            "open_contradiction_rate",
             "embedding_coverage",
             "recall_summary_coverage",
             "recall_keywords_coverage",
         }
         assert {m.signal for m in diagnostic} == {
+            "open_contradiction_rate",
             "uncited_observation_rate",
             "dangling_evidence_rate",
             "giant_component_fraction",

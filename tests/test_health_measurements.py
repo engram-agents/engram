@@ -448,11 +448,14 @@ class TestDerivedHashGate:
     from health import measurements as h; print(h.canonical_derived_hash())"``,
     paste the new digest below, in the SAME commit as the bump."""
 
-    _PINNED_DERIVED_HASH = "9f9c135ae176ba90bf140993c3e6ab129127f014e618deef727b4cc2ab461087"
-    # Re-pinned by engram-alpha#2788 (curve knots moved to curves.json,
-    # reshaped to Lei's 2026-09-09 placeholder identity/1-x curves) in the
-    # same commit as health.version.MINOR's bump to 1, per this class's own
-    # docstring instructions.
+    _PINNED_DERIVED_HASH = "67d9b6f1bf2e5dda45dab322e79bbb895454ccafc5677a131a3782a517e1fd9b"
+    # Re-pinned by engram-alpha#2905 PR-A (the 2026-09-13 Lei+Kepler curves
+    # session): two new curves added to curves.json (badness_pending_premise,
+    # goodness_coverage) and six metric-binding changes in health/model.py's
+    # MODEL_SPEC (three curve rebinds, one importance hold-out, two importance
+    # reweights — see health/version.py's MINOR docstring for the full list)
+    # in the same commit as health.version.MINOR's bump to 2, per this
+    # class's own docstring instructions.
 
     def test_derived_set_hash_matches_pinned_value(self):
         computed = hem_l0.canonical_derived_hash()

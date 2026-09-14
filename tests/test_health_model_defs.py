@@ -376,3 +376,101 @@ def test_reduced_model_scores_only_remaining_aspects_and_metrics():
     # points_in_play reflects only the REMAINING declared points.
     assert reduced_scores["points_in_play"] == 75.0
     assert reduced_scores["composed"] != "UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# engram-alpha#2905 PR-A -- v1.2 curve rebindings (direct assertions).
+# health-v1.2 (the 2026-09-13 Lei+Kepler curves session): two new curves
+# (badness_pending_premise, goodness_coverage) and six metric-binding
+# changes in health.model.MODEL_SPEC. Reads straight off health_engine.MODEL
+# (this file's own established convention -- see every test above, which
+# reads the real production model via health_engine.MODEL, never
+# health.model.MODEL_SPEC directly).
+# ---------------------------------------------------------------------------
+
+
+def _metric_by_signal() -> dict:
+    return {m.signal: m for m in health_engine.MODEL.metrics}
+
+
+class TestV1_2CurveRebindings:
+    def test_taint_and_stale_derivation_rebind_to_pending_premise_curve(self):
+        bindings = _metric_by_signal()
+        assert bindings["taint_rate"].curve == "badness_pending_premise"
+        assert bindings["stale_derivation_rate"].curve == "badness_pending_premise"
+
+    def test_open_contradiction_rate_is_held_out(self):
+        """Lei's 2026-09-13 ruling: importance 0.0 (HOLD-OUT, informational)
+        -- the curve itself stays "badness_default", deliberately NOT
+        rebound (unlike taint_rate/stale_derivation_rate above)."""
+        binding = _metric_by_signal()["open_contradiction_rate"]
+        assert binding.importance == 0.0
+        assert binding.curve == "badness_default"
+
+    def test_three_retrievability_coverage_metrics_rebind_with_new_importances(self):
+        bindings = _metric_by_signal()
+        expected = {
+            "embedding_coverage": 1.0,
+            "recall_summary_coverage": 0.5,
+            "recall_keywords_coverage": 0.25,
+        }
+        for signal, importance in expected.items():
+            binding = bindings[signal]
+            assert binding.curve == "goodness_coverage", signal
+            assert binding.importance == importance, signal
+
+    def test_untouched_metrics_are_a_control(self):
+        """giant_component_fraction, uncited_observation_rate,
+        dangling_evidence_rate are explicitly UNCHANGED by this PR
+        (importance 0.0, original curve) -- a control, so a future
+        accidental rebind of one of these three is caught here."""
+        bindings = _metric_by_signal()
+        assert bindings["giant_component_fraction"].importance == 0.0
+        assert bindings["giant_component_fraction"].curve == "goodness_default"
+        assert bindings["uncited_observation_rate"].importance == 0.0
+        assert bindings["uncited_observation_rate"].curve == "badness_default"
+        assert bindings["dangling_evidence_rate"].importance == 0.0
+        assert bindings["dangling_evidence_rate"].curve == "badness_default"
+
+    def test_new_curves_present_with_exact_knots(self):
+        """NOTE: ``CURVES`` (the name->CurveSpec registry) is declared in
+        health.model, not health.curves (health.curves only ships the bare
+        CurveSpec constants + CURVE_PROVENANCE) -- read via
+        health_engine.MODEL.curves, this file's own established convention
+        for reaching the real production model."""
+        assert health_engine.MODEL.curves["badness_pending_premise"].knots == (
+            (0.0, 1.0), (0.01, 0.9), (0.05, 0.8), (0.2, 0.5), (0.5, 0.2), (1.0, 0.0),
+        )
+        assert health_engine.MODEL.curves["goodness_coverage"].knots == (
+            (0.0, 0.0), (0.5, 0.05), (0.75, 0.2), (0.95, 0.6), (0.99, 0.9), (1.0, 1.0),
+        )
+
+    def test_new_curve_provenance_loaded(self):
+        """Confirms the provenance DATA actually loaded from curves.json --
+        not just that the keys exist."""
+        from health import curves as health_curves
+
+        assert (
+            "ratio of premises not available for derivation"
+            in health_curves.CURVE_PROVENANCE["badness_pending_premise"]
+        )
+        assert (
+            "100% is the norm"
+            in health_curves.CURVE_PROVENANCE["goodness_coverage"]
+        )
+
+    def test_health_version_current_is_v1_2_end_to_end(self):
+        """health.version.CURRENT == "health-v1.2", confirmed through the
+        full model/engine version-stamping path (build_snapshot's
+        health_version key) -- mirrors tests/test_health_engine.py's
+        ``test_version_stamps_present_and_match_health_version`` (the
+        dynamic version of this check, unaffected by any MINOR bump), pinned
+        here against the LITERAL v1.2 string so a regression in either
+        health.version.MINOR or the snapshot wiring is caught."""
+        from health import version as health_version
+
+        assert health_version.CURRENT == "health-v1.2"
+        conn = _make_conn()
+        snap = health_engine.build_snapshot(conn, "nap")
+        assert snap["health_version"] == "health-v1.2"
+        assert snap["model_version"] == 2

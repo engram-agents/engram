@@ -64,7 +64,13 @@ from typing import Callable
 
 from . import metrics
 from .config import EngineConfig, _Unavailable, _check_weights_sum
-from .curves import BADNESS_DEFAULT_CURVE, CurveSpec, GOODNESS_DEFAULT_CURVE
+from .curves import (
+    BADNESS_DEFAULT_CURVE,
+    BADNESS_PENDING_PREMISE_CURVE,
+    CurveSpec,
+    GOODNESS_COVERAGE_CURVE,
+    GOODNESS_DEFAULT_CURVE,
+)
 
 
 def _log(msg: str) -> None:
@@ -161,16 +167,33 @@ SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
 # retrievability aspect's four metrics (embedding_coverage,
 # recall_summary_coverage, recall_keywords_coverage,
 # giant_component_fraction — all naturally coverage-style, HIGH is good)
-# are now bound to the increasing "goodness_default" curve instead of the
+# were bound to the increasing "goodness_default" curve instead of the
 # decreasing "badness_default" curve; every other metric is unchanged.
 # This is STILL the same "one curve per direction, not per metric" v1
 # simplification the paragraph above describes — per-metric curve
 # differentiation beyond direction remains future work — it is just no
 # longer literally ONE shared curve object for all six admitted metrics.
+#
+# [engram-alpha#2905 PR-A, 2026-09-13] TWO MORE curves joined the registry
+# from the 2026-09-13 Lei+Kepler curves session (see docs/design/
+# health-v1-curves-session-2026-09-13.md): BADNESS_PENDING_PREMISE_CURVE
+# ("badness_pending_premise") and GOODNESS_COVERAGE_CURVE
+# ("goodness_coverage"). The four-metric "goodness_default" statement two
+# paragraphs up is now ONLY TRUE OF "goodness_default" ITSELF — three of
+# those four (embedding_coverage, recall_summary_coverage,
+# recall_keywords_coverage) moved to the new increasing "goodness_coverage"
+# curve instead (same shape shared by all three; importance differentiates
+# them — see MODEL_SPEC below). "giant_component_fraction" alone remains
+# bound to "goodness_default". taint_rate / stale_derivation_rate moved
+# from "badness_default" to the new decreasing "badness_pending_premise"
+# curve, as an interim per-metric rebind ahead of PR-B's unification of
+# both signals into one L0 measurement (pending_premise_rate).
 
 CURVES: dict[str, CurveSpec] = {
     "badness_default": BADNESS_DEFAULT_CURVE,
     "goodness_default": GOODNESS_DEFAULT_CURVE,
+    "badness_pending_premise": BADNESS_PENDING_PREMISE_CURVE,
+    "goodness_coverage": GOODNESS_COVERAGE_CURVE,
 }
 
 
@@ -602,7 +625,12 @@ def load(spec: ScoringModel, config: EngineConfig) -> ScoringModel:
 # ---------------------------------------------------------------------------
 # The real production model SPEC — draft-2 §4's metric table, unmerged
 # (clarification 5: taint_rate / stale_derivation_rate stay two separate
-# metrics; the pending_marker_ratio merge is Lei's open call, non-blocking).
+# metrics; the pending_marker_ratio merge was Lei's open call, non-blocking,
+# at PR5 time — as of engram-alpha#2905 PR-A it is DECIDED and coming in
+# PR-B (the unification into a single "pending_premise_rate" L0 measurement).
+# The two signals genuinely DO stay separate IN THIS PR — PR-A only rebinds
+# their curve, interim-bound to "badness_pending_premise" pending PR-B's
+# unification; see each binding's own #2905 comment below).
 #
 # UNVALIDATED at this point (round 3): constructing this ``ScoringModel``
 # does NOT run ``validate_model`` — see that dataclass's own docstring for
@@ -642,10 +670,14 @@ MODEL_SPEC = ScoringModel(
     ),
     metrics=(
         # --- epistemic_integrity (40 points) --------------------------------
+        # engram-alpha#2905 PR-A: curve rebind badness_default ->
+        # badness_pending_premise (interim; PR-B unifies taint_rate +
+        # stale_derivation_rate into one pending_premise_rate L0
+        # measurement). Importance/detector/repair unchanged.
         MetricBinding(
             signal="taint_rate",
             aspect="epistemic_integrity",
-            curve="badness_default",
+            curve="badness_pending_premise",
             importance=_DEFAULT_IMPORTANCE,
             detector=DetectorRef(name="scan:cascade-frontier", population="claim_bearing_nodes"),
             additional_detector=DetectorRef(name="lottery:tainted-valid", population="claim_bearing_nodes"),
@@ -657,19 +689,29 @@ MODEL_SPEC = ScoringModel(
         # colleague read of draft 2, 2026-09-03): "category 3 in the
         # lottery is a different notion of 'stale' than this metric
         # measures" — scan:cascade-frontier remains its sole detector.
+        # engram-alpha#2905 PR-A: same curve rebind as taint_rate above
+        # (badness_default -> badness_pending_premise), interim ahead of
+        # PR-B's unification. Importance/detector/repair unchanged.
         MetricBinding(
             signal="stale_derivation_rate",
             aspect="epistemic_integrity",
-            curve="badness_default",
+            curve="badness_pending_premise",
             importance=_DEFAULT_IMPORTANCE,
             detector=DetectorRef(name="scan:cascade-frontier", population="derivations"),
             repair="tool:cascade-resolve",
         ),
+        # engram-alpha#2905 PR-A: importance _DEFAULT_IMPORTANCE -> 0.0
+        # (HOLD-OUT, informational — Lei's 2026-09-13 ruling: this signal
+        # measures a resolution HABIT, not what unresolved contradictions
+        # DO to daily engram activity; the contradiction subsystem needs
+        # dedicated design before a score depends on it). Curve stays
+        # "badness_default" — deliberately NOT rebound. Detector/repair
+        # unchanged.
         MetricBinding(
             signal="open_contradiction_rate",
             aspect="epistemic_integrity",
             curve="badness_default",
-            importance=_DEFAULT_IMPORTANCE,
+            importance=0.0,
             detector=DetectorRef(name="scan:open-contradictions", population="contradictions"),
             additional_detector=DetectorRef(name="lottery:contradictions", population="contradictions"),
             repair="tool:resolve",
@@ -697,27 +739,43 @@ MODEL_SPEC = ScoringModel(
             repair=None,
         ),
         # --- retrievability (35 points) -------------------------------------
+        # engram-alpha#2905 PR-A: curve rebind goodness_default ->
+        # goodness_coverage (shared with recall_summary_coverage /
+        # recall_keywords_coverage below, same knots, importance
+        # differentiates). Importance stays 1.0 (the aspect's reference
+        # metric, unchanged). Detector/repair unchanged.
         MetricBinding(
             signal="embedding_coverage",
             aspect="retrievability",
-            curve="goodness_default",
+            curve="goodness_coverage",
             importance=1.0,  # the aspect's reference metric (draft-2 §1)
             detector=DetectorRef(name="scan:null-embeddings", population="claim_bearing_nodes"),
             repair="tool:embedding-backfill",
         ),
+        # engram-alpha#2905 PR-A: curve rebind goodness_default ->
+        # goodness_coverage; importance _DEFAULT_IMPORTANCE -> 0.5 (Kepler's
+        # proposal, Lei-confirmed 2026-09-13: Tier-1 recall scent, weighted
+        # below the reference metric embedding_coverage). Detector/repair
+        # unchanged.
         MetricBinding(
             signal="recall_summary_coverage",
             aspect="retrievability",
-            curve="goodness_default",
-            importance=_DEFAULT_IMPORTANCE,
+            curve="goodness_coverage",
+            importance=0.5,
             detector=DetectorRef(name="scan:summary-absent", population="claim_bearing_nodes"),
             repair="tool:batch-summary-fairy",
         ),
+        # engram-alpha#2905 PR-A: curve rebind goodness_default ->
+        # goodness_coverage; importance _DEFAULT_IMPORTANCE -> 0.25
+        # (Kepler's proposal, Lei-confirmed 2026-09-13: Tier-2 recall scent,
+        # and the tie-break for recall_summary_coverage/recall_keywords_
+        # coverage's near-coincident missing sets — see the curves-session
+        # doc's M4/M5 section). Detector/repair unchanged.
         MetricBinding(
             signal="recall_keywords_coverage",
             aspect="retrievability",
-            curve="goodness_default",
-            importance=_DEFAULT_IMPORTANCE,
+            curve="goodness_coverage",
+            importance=0.25,
             detector=DetectorRef(name="scan:summary-absent", population="claim_bearing_nodes"),
             repair="tool:batch-summary-fairy",
         ),

@@ -71,14 +71,23 @@ whenever a measurement in ``health.measurements.MEASUREMENTS`` is added,
 removed, or redefined — enforced mechanically by the L0 hash gate
 (``tests/test_health_measurements.py``), not left to memory."""
 
-MINOR = 1
+MINOR = 2
 """Identity of everything DERIVED from L0 — formulas, curves, importances,
 aspect points, the unavailability policy. Started at 0 (slice 1 introduced
 no derived-layer changes); bumped to 1 by engram-alpha#2788 (curve knots
 moved to a versioned data file, curves.json, and reshaped to Lei's
 placeholder identity/``1 - x`` curves) — a curve reshape is exactly the
 class of change this counter exists to track, per the derived-layer hash
-gate in tests/test_health_measurements.py."""
+gate in tests/test_health_measurements.py. Bumped to 2 by engram-alpha#2905
+PR-A (the 2026-09-13 Lei+Kepler curves session): two new curves added to
+curves.json (``badness_pending_premise``, ``goodness_coverage``) and six
+metric-binding changes in health/model.py's ``MODEL_SPEC`` — three curve
+rebinds (``taint_rate``/``stale_derivation_rate`` -> ``badness_pending_
+premise``, and ``embedding_coverage``/``recall_summary_coverage``/
+``recall_keywords_coverage`` -> ``goodness_coverage``), one importance
+hold-out (``open_contradiction_rate`` -> 0.0), and two importance reweights
+(``recall_summary_coverage`` -> 0.5, ``recall_keywords_coverage`` ->
+0.25)."""
 
 
 def format_version(major: int = MAJOR, minor: int = MINOR) -> str:

@@ -434,6 +434,79 @@ permanent regression test in tests/test_health_engine_curves.py, unaffected
 by this data-file migration. This supersedes the earlier hand-derived
 mirror (worked out against the pre-#2788 ``BADNESS_DEFAULT_CURVE``'s own
 three knots); see git history for that derivation.
+
+AS OF engram-alpha#2905 PR-A: three of the original four retrievability
+metrics this docstring names above (``embedding_coverage``,
+``recall_summary_coverage``, ``recall_keywords_coverage``) moved to the
+new ``GOODNESS_COVERAGE_CURVE``/``"goodness_coverage"`` below — the
+"four literal-coverage Aspect-B metrics" list two paragraphs up is
+historical (as of the #2518 binding, superseded here). Only
+``giant_component_fraction`` still binds to this curve; see
+health/model.py's module comment above its ``CURVES`` dict for the
+current binding statement.
+"""
+
+
+# ---------------------------------------------------------------------------
+# BADNESS_PENDING_PREMISE_CURVE / GOODNESS_COVERAGE_CURVE — engram-alpha#2905
+# PR-A (health-v1.2, MINOR bump). DATA-LOADED from curves.json, same pattern
+# as the two v1 placeholder curves above.
+# ---------------------------------------------------------------------------
+
+BADNESS_PENDING_PREMISE_CURVE = _curve_from_defs("badness_pending_premise")
+"""The badness curve for the future unified ``pending_premise_rate`` metric
+(engram-alpha#2905 PR-B) — and, in THIS PR (PR-A), the interim curve
+``taint_rate`` and ``stale_derivation_rate`` rebind to individually, ahead of
+PR-B's unification into a single L0 measurement (see health/model.py's
+``MODEL_SPEC``). DATA-LOADED from ``curves.json``, not a Python literal, same
+pattern as ``BADNESS_DEFAULT_CURVE`` above.
+
+CURRENT SHAPE — ``CURVE_PROVENANCE["badness_pending_premise"]`` (Lei +
+Kepler, 2026-09-13 curves session, engram-alpha#2905): decreasing,
+piecewise-linear through ``(0.0, 1.0), (0.01, 0.9), (0.05, 0.8), (0.2, 0.5),
+(0.5, 0.2), (1.0, 0.0)`` — steep over the first 1% to surface first onset of
+a pending-cascade backlog, with ``(0.5, 0.2)`` anchoring "half the
+denominator's premises pending" as effectively-blocked derivation (an
+anchor knot, not a reachable point on most graphs — see the provenance
+string for the reachable-range caveat). Knots are intuition for v1, to be
+calibrated from real accumulation events in a later version (the curves
+session doc, ``docs/design/health-v1-curves-session-2026-09-13.md``, has
+the full method and the first real calibration event on record).
+
+NOT the same curve as ``BADNESS_DEFAULT_CURVE`` — this is a genuinely
+different shape (six knots, front-loaded steepness) chosen specifically for
+an early-warning, all-zero-history metric; see the curves-session doc's
+method insights I2/I3 for why that shape was chosen.
+"""
+
+
+GOODNESS_COVERAGE_CURVE = _curve_from_defs("goodness_coverage")
+"""The shared goodness curve for the three recall-affecting coverage
+metrics — ``embedding_coverage``, ``recall_summary_coverage``,
+``recall_keywords_coverage`` (engram-alpha#2905 PR-A) — same knots for all
+three; ``importance`` (1.0 / 0.5 / 0.25 respectively, see health/model.py's
+``MODEL_SPEC``) is what differentiates them, not the curve shape.
+DATA-LOADED from ``curves.json``, not a Python literal, same pattern as
+``GOODNESS_DEFAULT_CURVE`` above.
+
+CURRENT SHAPE — ``CURVE_PROVENANCE["goodness_coverage"]`` (Lei + Kepler,
+2026-09-13 curves session, engram-alpha#2905): increasing, piecewise-linear
+through ``(0.0, 0.0), (0.5, 0.05), (0.75, 0.2), (0.95, 0.6), (0.99, 0.9),
+(1.0, 1.0)`` — designed for a 100%-is-normal metric: near-zero below 50%
+coverage (mechanism broken, how far below is irrelevant), then increasingly
+steep near full coverage so that backfill (recovering the last few percent)
+is rewarded with a large score gain. Chosen from ``embedding_coverage``'s
+own write-path semantics (embeddings are written at node-write time, so
+sub-99% coverage reflects a real historical gap, not routine lag) and
+reused for the two scent-coverage metrics on the same reasoning (see the
+curves-session doc's M3-M5 sections for the full derivation, including why
+one shared curve id rather than three named copies).
+
+NOT the same curve as ``GOODNESS_DEFAULT_CURVE`` — this is a genuinely
+different (lower-convex, top-steep) shape chosen for a 100%-is-normal
+metric family, whereas ``GOODNESS_DEFAULT_CURVE`` remains the simple
+identity placeholder pending Lei's final shape for ``giant_component_
+fraction``, the one retrievability metric still bound to it.
 """
 
 
