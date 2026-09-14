@@ -14,10 +14,12 @@ name: nightly
 # default — so this exercises dev, which is the whole point.
 on:
   schedule:
-    # 07:37 UTC daily — deliberately off-peak and off-:00. GitHub queues
-    # on-the-hour scheduled runs heavily and can skip them under load; an
-    # odd minute lands far more reliably.
-    - cron: "37 7 * * *"
+    # 03:37 UTC daily. Cron is UTC, so this is 23:37 EDT / 22:37 EST — after
+    # the team's sleep time, leaving ~4h of queue headroom before the morning
+    # read. Deliberately off-peak and off-:00: GitHub queues on-the-hour
+    # scheduled runs heavily and can skip them under load; an odd minute
+    # lands far more reliably.
+    - cron: "37 3 * * *"
   workflow_dispatch:
 
 permissions:
