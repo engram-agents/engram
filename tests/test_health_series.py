@@ -1201,7 +1201,9 @@ def test_equality_control_agrees_then_named_mutation_disagrees(tmp_path):
       and retracting it cannot move either (removing an item that was never
       in the numerator changes nothing).
     - Given NO cascade-marker row of any kind -- so
-      ``claim_bearing_pending_retract_marker`` cannot move.
+      ``claim_bearing_pending_marker`` (engram-alpha#2905 PR-B; formerly the
+      separate ``claim_bearing_pending_retract_marker``/``derivations_
+      pending_supersede_marker``) cannot move.
     - Given NO edges to any other node -- it is its own connected component
       of size 1. The fixture separately connects a derivation ``d1`` and an
       observation ``o1`` (also claim-bearing) with one edge, forming a
@@ -1209,10 +1211,9 @@ def test_equality_control_agrees_then_named_mutation_disagrees(tmp_path):
       ``t1``'s own component (size 1) was never the largest, removing it
       cannot move ``claim_bearing_giant_component_size`` either.
     - ``evidence_current``/``evidence_uncited``/``observations_without_
-      evidence_id``/``contradictions_current``/``contradictions_open``/
-      ``derivations_pending_supersede_marker`` are all untouched by
-      anything to do with ``t1`` -- they range over evidence/contradiction/
-      derivation-marker populations ``t1`` was never part of.
+      evidence_id``/``contradictions_current``/``contradictions_open`` are
+      all untouched by anything to do with ``t1`` -- they range over
+      evidence/contradiction populations ``t1`` was never part of.
     - ``claim_bearing_null_embedding`` (``replay="stripped"``) and the two
       embedder booleans (``replay="environment"``) are excluded from the
       equality comparison entirely (``equality_check`` compares only
@@ -1487,11 +1488,15 @@ def test_schema_missing_yields_null_with_discovered_reason_never_zero(tmp_path):
 
     full_measurements, full_unreplayable = series.replay_commit(repo_dir, k_full)
     # The always-declared unreplayables (stripped/environment) are present
-    # on every replay regardless of schema -- only the two schema-dependent
-    # (discovered) ones are absent here, since cascade_markers exists.
+    # on every replay regardless of schema -- only the one schema-dependent
+    # (discovered) one is absent here, since cascade_markers exists.
+    # engram-alpha#2905 PR-B: the prior two separate schema-dependent
+    # measurements (derivations_pending_supersede_marker,
+    # claim_bearing_pending_retract_marker) are unified into ONE,
+    # claim_bearing_pending_marker -- d1 (supersede) and o1 (retract) both
+    # count toward it, so the value is 2, not 1 each.
     assert {n for n, info in full_unreplayable.items() if info["class"] == "discovered"} == set()
-    assert full_measurements["derivations_pending_supersede_marker"] == 1
-    assert full_measurements["claim_bearing_pending_retract_marker"] == 1
+    assert full_measurements["claim_bearing_pending_marker"] == 2
 
     dropped_measurements, dropped_unreplayable = series.replay_commit(
         repo_dir, k_no_markers
@@ -1500,8 +1505,7 @@ def test_schema_missing_yields_null_with_discovered_reason_never_zero(tmp_path):
         n for n, info in dropped_unreplayable.items() if info["class"] == "discovered"
     }
     assert discovered_names == {
-        "derivations_pending_supersede_marker",
-        "claim_bearing_pending_retract_marker",
+        "claim_bearing_pending_marker",
     }
     for name in discovered_names:
         info = dropped_unreplayable[name]
@@ -1517,10 +1521,8 @@ def test_schema_missing_yields_null_with_discovered_reason_never_zero(tmp_path):
             "dump even though nothing outside cascade_markers changed"
         )
     # never silently 0 where the un-dropped replay had a real non-zero:
-    assert full_measurements["derivations_pending_supersede_marker"] != 0
-    assert full_measurements["claim_bearing_pending_retract_marker"] != 0
-    assert dropped_measurements["derivations_pending_supersede_marker"] is None
-    assert dropped_measurements["claim_bearing_pending_retract_marker"] is None
+    assert full_measurements["claim_bearing_pending_marker"] != 0
+    assert dropped_measurements["claim_bearing_pending_marker"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2824,18 +2826,20 @@ def test_derive_equality_control_agrees_on_real_snapshot(tmp_path):
 
 def test_derive_named_mutation_curve_defs_disagrees(tmp_path):
     """Named mutation 1 (proves as-of-stored, not HEAD): mutate the y of the
-    knot ``taint_rate``'s curve reads at ``raw == 0.0`` (verified by
-    construction -- the populated fixture has no pending-retract markers,
-    so ``taint_rate``'s raw value is exactly the curve's own domain-start
-    knot) -- ``scores["metrics"]["taint_rate"]`` must differ from the
+    knot ``pending_premise_rate``'s curve reads at ``raw == 0.0`` (verified
+    by construction -- the populated fixture has no pending cascade
+    markers, so ``pending_premise_rate``'s raw value is exactly the curve's
+    own domain-start knot; engram-alpha#2905 PR-B unified the prior
+    ``taint_rate`` this test targeted before) --
+    ``scores["metrics"]["pending_premise_rate"]`` must differ from the
     snapshot's own, and ``derive_checks`` must record ``disagree`` naming
-    ``taint_rate`` in the diff."""
+    ``pending_premise_rate`` in the diff."""
     repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
-    assert snap["signals"]["taint_rate"] == 0.0
+    assert snap["signals"]["pending_premise_rate"] == 0.0
 
     conn = series.open_store(db_path)
     model_defs = json.loads(conn.execute("SELECT model_defs FROM declarations").fetchone()["model_defs"])
-    curve_name = next(m["curve"] for m in model_defs["metrics"] if m["signal"] == "taint_rate")
+    curve_name = next(m["curve"] for m in model_defs["metrics"] if m["signal"] == "pending_premise_rate")
     curve_defs = json.loads(conn.execute("SELECT curve_defs FROM declarations").fetchone()["curve_defs"])
     original_y = curve_defs[curve_name]["knots"][0][1]
     mutated_y = 0.5 if original_y != 0.5 else 0.25
@@ -2851,7 +2855,7 @@ def test_derive_named_mutation_curve_defs_disagrees(tmp_path):
     disagreement = result["detail"]["disagreements"][0]
     assert disagreement["commit_sha"] == commit_sha
     assert "scores_metrics" in disagreement
-    assert "taint_rate" in disagreement["scores_metrics"]["names"]
+    assert "pending_premise_rate" in disagreement["scores_metrics"]["names"]
 
     conn = series.open_store(db_path)
     row = conn.execute(
@@ -2862,25 +2866,48 @@ def test_derive_named_mutation_curve_defs_disagrees(tmp_path):
     conn.close()
 
     derived_scores = json.loads(row["scores"])
-    assert derived_scores["metrics"]["taint_rate"] != snap["scores"]["metrics"]["taint_rate"]
-    assert derived_scores["metrics"]["taint_rate"] == pytest.approx(mutated_y)
+    assert derived_scores["metrics"]["pending_premise_rate"] != snap["scores"]["metrics"]["pending_premise_rate"]
+    assert derived_scores["metrics"]["pending_premise_rate"] == pytest.approx(mutated_y)
     assert verdict == "disagree"
 
 
 def test_derive_named_mutation_model_defs_importance_disagrees(tmp_path):
-    """Named mutation 2: zero out ``taint_rate``'s importance in
-    ``model_defs`` -- ``epistemic_integrity``'s score changes (renormalized
-    over its remaining admitted metrics), ``metrics_in_play`` drops
-    ``taint_rate``, and the verdict is ``disagree`` (this mutation is not
-    required to NAME the dropped signal, per the spec -- only mutation 1
-    is)."""
+    """Named mutation 2: zero out an admitted metric's importance in
+    ``model_defs`` -- its aspect's ``aspect_coverage`` bookkeeping changes
+    (``metrics_in_play`` drops the zeroed metric, renormalized over its
+    remaining admitted metrics), and the verdict is ``disagree`` (this
+    mutation is not required to NAME the dropped signal, per the spec --
+    only mutation 1 is; empirically this one surfaces as a structural
+    ``scores_other`` diff, not a ``scores_metrics`` one -- on this fixture
+    every admitted retrievability metric reads a perfect raw 1.0, so the
+    aspect's own numeric SCORE stays 1.0 either way; only the
+    ``metrics_in_play`` list shrinks).
+
+    JUDGMENT CALL (engram-alpha#2905 PR-B round 2): retargeted from
+    ``epistemic_integrity``'s ``taint_rate`` to ``retrievability``'s
+    ``recall_keywords_coverage``. PR-B unified ``taint_rate`` +
+    ``stale_derivation_rate`` into ONE admitted epistemic_integrity metric
+    (``pending_premise_rate`` -- ``open_contradiction_rate`` is the
+    aspect's only other metric and is HOLD-OUT at importance 0.0, per
+    engram-alpha#2905 PR-A), so zeroing it now leaves epistemic_integrity
+    with ZERO admitted metrics -- the WHOLE ASPECT is held out (no
+    ``aspect_coverage["epistemic_integrity"]`` entry at all, per
+    "hold out, renormalize, report"), not "renormalized over its
+    remaining admitted metrics" as this test's docstring originally
+    described. ``retrievability`` still has three admitted metrics
+    (``embedding_coverage`` [the aspect's reference_metric -- avoided, per
+    ``validate_model``'s "reference_metric must name an admitted metric"
+    invariant], ``recall_summary_coverage``, ``recall_keywords_coverage``),
+    so zeroing the non-reference ``recall_keywords_coverage`` preserves the
+    ORIGINAL test's exact shape: aspect stays scored, drops one metric from
+    ``metrics_in_play``, renormalizes over what remains."""
     repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
 
     conn = series.open_store(db_path)
     model_defs = json.loads(conn.execute("SELECT model_defs FROM declarations").fetchone()["model_defs"])
     for m in model_defs["metrics"]:
-        if m["signal"] == "taint_rate":
-            assert m["importance"] > 0.0, "fixture assumption: taint_rate starts admitted"
+        if m["signal"] == "recall_keywords_coverage":
+            assert m["importance"] > 0.0, "fixture assumption: recall_keywords_coverage starts admitted"
             m["importance"] = 0.0
     conn.execute("UPDATE declarations SET model_defs = ?", (json.dumps(model_defs),))
     conn.commit()
@@ -2897,11 +2924,11 @@ def test_derive_named_mutation_model_defs_importance_disagrees(tmp_path):
     ).fetchone()
     conn.close()
     derived_scores = json.loads(row["scores"])
-    assert "taint_rate" not in derived_scores["aspect_coverage"]["epistemic_integrity"]["metrics_in_play"]
-    assert "taint_rate" in snap["scores"]["aspect_coverage"]["epistemic_integrity"]["metrics_in_play"]
+    assert "recall_keywords_coverage" not in derived_scores["aspect_coverage"]["retrievability"]["metrics_in_play"]
+    assert "recall_keywords_coverage" in snap["scores"]["aspect_coverage"]["retrievability"]["metrics_in_play"]
     assert (
-        derived_scores["aspect_coverage"]["epistemic_integrity"]
-        != snap["scores"]["aspect_coverage"]["epistemic_integrity"]
+        derived_scores["aspect_coverage"]["retrievability"]
+        != snap["scores"]["aspect_coverage"]["retrievability"]
     )
 
 
@@ -2931,12 +2958,22 @@ def test_derive_versions_independently_recomputed_d41(tmp_path):
     # literals): `current_v` must equal `health.version.CURRENT` for r1's
     # seed-from-live branch to fire at all (derive()'s own contract); a
     # hardcoded "health-v1.0" broke this test the moment CURRENT moved past
-    # it (engram-alpha#2788's MINOR bump). `next_v` only needs to differ
-    # from `current_v` -- "health-v1.99" is a deliberately synthetic label
-    # (same convention as this file's "health-v9.9"/"health-v0.9" elsewhere)
-    # that can't collide with a real CURRENT for a long time.
+    # it (engram-alpha#2788's MINOR bump). `next_v` must NOT differ in
+    # MAJOR from `current_v` -- derive()'s own candidate selection is
+    # health_major-scoped ("every l0_points row with health_major ==
+    # ... major"), and this test's l0_points rows are stored under
+    # current_v's major, so a MAJOR-mismatched next_v finds zero
+    # candidates and derives zero rows (empty v11_rows) regardless of how
+    # "far" the literal string looks from colliding. A hardcoded
+    # "health-v1.99" broke exactly this way the moment CURRENT's MAJOR
+    # moved past 1 (engram-alpha#2905 PR-B's L0-set change, version.py's
+    # own MAJOR 1 -> 2 bump) -- same failure MODE as the MINOR case above,
+    # different axis. Use the SAME-major, bumped-MINOR pattern already
+    # established by test_export_raw_l0_fallback_for_bumped_minor_version
+    # below, rather than a hardcoded literal.
     current_v = series.health_version_module.CURRENT
-    next_v = "health-v1.99"
+    _current_major, _current_minor = series.health_version_module.parse_version(current_v)
+    next_v = series.health_version_module.format_version(_current_major, _current_minor + 99)
 
     repo_dir, snapshots_dir, snap, commit_sha, db_path = _setup_populated_store(tmp_path)
 
@@ -3031,16 +3068,13 @@ def test_derive_null_l0_to_unavailable_not_zero(tmp_path):
     conn.close()
     signals = json.loads(row["signals"])
 
-    assert signals["taint_rate"] == "UNAVAILABLE"
-    assert signals["stale_derivation_rate"] == "UNAVAILABLE"
+    assert signals["pending_premise_rate"] == "UNAVAILABLE"
     assert isinstance(signals["open_contradiction_rate"], (int, float)) or (
         signals["open_contradiction_rate"] == "UNAVAILABLE"
     )
     # Explicitly never a numeric 0/0.0 standing in for "unmeasurable".
-    assert signals["taint_rate"] != 0
-    assert signals["taint_rate"] != 0.0
-    assert signals["stale_derivation_rate"] != 0
-    assert signals["stale_derivation_rate"] != 0.0
+    assert signals["pending_premise_rate"] != 0
+    assert signals["pending_premise_rate"] != 0.0
 
 
 # --- 8.4: model_defs absent --------------------------------------------------
@@ -3188,7 +3222,7 @@ def test_derive_never_mutate_and_export_prefers_stored(tmp_path):
     assert n == 2
 
     ex = series.export(db_path)
-    all_points = ex["signals"]["taint_rate"]
+    all_points = ex["signals"]["pending_premise_rate"]
     matching = [p for p in all_points if p["commit"] == commit_sha]
     assert len(matching) == 1
     assert matching[0]["source"] == "stored"
@@ -3262,14 +3296,14 @@ def test_export_shape_ordering_num_den_unreplayable_and_signal_filter(tmp_path):
     assert set(ex.keys()) == {"version", "replay_decl_hash", "signals", "aspects", "composed", "scores_available"}
     assert set(ex["signals"].keys()) == set(snap["signal_defs"].keys())
 
-    point = ex["signals"]["taint_rate"][0]
+    point = ex["signals"]["pending_premise_rate"][0]
     assert point["commit"] == commit_sha
-    assert point["num"] == snap["measurements"]["claim_bearing_pending_retract_marker"]
+    assert point["num"] == snap["measurements"]["claim_bearing_pending_marker"]
     assert point["den"] == snap["measurements"]["claim_bearing_current"]
     assert point["unreplayable"] is None
 
-    ex_filtered = series.export(db_path, signal="taint_rate")
-    assert set(ex_filtered["signals"].keys()) == {"taint_rate"}
+    ex_filtered = series.export(db_path, signal="pending_premise_rate")
+    assert set(ex_filtered["signals"].keys()) == {"pending_premise_rate"}
 
 
 def test_export_unreplayable_populated_for_replay_row(tmp_path):
@@ -3282,11 +3316,11 @@ def test_export_unreplayable_populated_for_replay_row(tmp_path):
     series.backfill(repo_dir, db_path)
     series.derive(db_path)
 
-    ex = series.export(db_path, signal="taint_rate")
-    point = ex["signals"]["taint_rate"][0]
+    ex = series.export(db_path, signal="pending_premise_rate")
+    point = ex["signals"]["pending_premise_rate"][0]
     assert point["source"] == "git_replay"
     assert point["unreplayable"] is not None
-    assert "claim_bearing_pending_retract_marker" in point["unreplayable"]
+    assert "claim_bearing_pending_marker" in point["unreplayable"]
 
 
 def test_export_fail_honest_reasons(tmp_path):
@@ -3319,9 +3353,9 @@ def test_export_raw_l0_fallback_when_never_derived(tmp_path):
     assert "error" not in ex
     assert ex["scores_available"] is False
     assert set(ex["signals"].keys()) == set(snap["signal_defs"].keys())
-    point = ex["signals"]["taint_rate"][0]
+    point = ex["signals"]["pending_premise_rate"][0]
     assert point["commit"] == commit_sha
-    assert point["num"] == snap["measurements"]["claim_bearing_pending_retract_marker"]
+    assert point["num"] == snap["measurements"]["claim_bearing_pending_marker"]
     assert point["den"] == snap["measurements"]["claim_bearing_current"]
     assert isinstance(point["raw"], float)  # live-derived via derive_point, not None
     assert point["score"] is None
@@ -3348,7 +3382,7 @@ def test_export_raw_l0_fallback_for_bumped_minor_version(tmp_path):
     # control: the ORIGINAL, fully-derived version is completely unaffected.
     ex_full = series.export(db_path, health_version=stored_version)
     assert ex_full["scores_available"] is True
-    assert ex_full["signals"]["taint_rate"][0]["score"] is not None
+    assert ex_full["signals"]["pending_premise_rate"][0]["score"] is not None
 
     # control: a MAJOR with zero L0 data at all still errors (unchanged
     # behavior, matches test_export_fail_honest_reasons's health-v9.9 case).
@@ -3379,7 +3413,7 @@ def test_export_raw_l0_fallback_uses_live_signal_defs_for_current_version(tmp_pa
     assert "error" not in ex
     assert ex["version"] == stored_version
     assert ex["scores_available"] is False
-    point = ex["signals"]["taint_rate"][0]
+    point = ex["signals"]["pending_premise_rate"][0]
     assert point["commit"] == commit_sha
     assert isinstance(point["raw"], float)
     assert point["score"] is None
@@ -3463,7 +3497,7 @@ def test_export_no_spurious_composed_point_for_partial_derive_coverage(tmp_path)
     # Round-1's own intended fix (raw-signal-always-available) is untouched
     # by this narrower fix: commit2 still appears in signals_out with a
     # real raw value (computed live via derive_point) and score None.
-    point2 = [p for p in ex["signals"]["taint_rate"] if p["commit"] == commit2]
+    point2 = [p for p in ex["signals"]["pending_premise_rate"] if p["commit"] == commit2]
     assert len(point2) == 1
     assert isinstance(point2[0]["raw"], float)
     assert point2[0]["score"] is None
@@ -3604,13 +3638,13 @@ def test_cli_derive_and_export_run_as_script(tmp_path):
     assert payload["commits_done"] == 1
 
     result2 = subprocess.run(
-        [sys.executable, str(SERIES_PATH), "export", "--db", str(db_path), "--signal", "taint_rate"],
+        [sys.executable, str(SERIES_PATH), "export", "--db", str(db_path), "--signal", "pending_premise_rate"],
         capture_output=True,
         text=True,
     )
     assert result2.returncode == 0, result2.stderr
     payload2 = json.loads(result2.stdout)
-    assert set(payload2["signals"].keys()) == {"taint_rate"}
+    assert set(payload2["signals"].keys()) == {"pending_premise_rate"}
 
 
 def test_cli_status_reports_derive_checks_and_verdicts(tmp_path):

@@ -311,32 +311,28 @@ from .model import ScoringModel
 # order — its own functions re-resolve engram_core lazily per call too.
 
 SCHEMA_VERSION = "1"
-# PR5 of 5: the scoring/composition layer is replaced wholesale (Kepler's
-# draft-2, "the dream-side contract") — weighted-arithmetic-sum aspect_score
-# and composed formulas, driven by MODEL (below), replace the PR2/PR3-era
-# geometric-mean composition. The raw-signal layer (CONFIG,
-# below) is unchanged. Bump when the CONFIG's aspect/metric shape OR the
-# scoring model's shape changes in a way that would make an old stored
-# snapshot's `config` block non-comparable to a fresh one.
-ENGINE_VERSION = "0.4.0-pr5"
+# Bump when the CONFIG's aspect/metric shape OR the scoring model's shape
+# changes in a way that would make an old stored snapshot's `config` block
+# non-comparable to a fresh one. That rule fires here: engram-alpha#2905
+# PR-B unifies aspect A's stale_derivation_rate + taint_rate into one
+# pending_premise_rate metric, changing both Aspect A's metric count and
+# membership (3 -> 2 MetricDefs). The `-prN` suffix on the prior value
+# tracked the closed 5-part health-v1 redesign series ("PR5 of 5" — the
+# ENGINE_VERSION git history shows 0.2.0-pr2 -> 0.3.0-pr3 -> 0.4.0-pr5,
+# each tied to that series' own numbered PRs, engram-alpha#1991). This
+# change is NOT part of that series — it is #2905's independent
+# taint/stale-derivation unification — so continuing as "-pr6" would
+# misleadingly imply membership in a closed series; the suffix is dropped.
+ENGINE_VERSION = "0.5.0"
 
 
 # ---------------------------------------------------------------------------
 # Aspect A — Epistemic integrity (weight 40, design doc §2)
 # ---------------------------------------------------------------------------
 
-_STALE_DERIVATION_RATE = MetricDef(
-    name="stale_derivation_rate",
-    signal_fn=metrics.stale_derivation_rate,
-    denominator_population="derivations",
-    empty_denominator="unavailable",
-    scored=True,
-    state_valued=True,
-)
-
-_TAINT_RATE = MetricDef(
-    name="taint_rate",
-    signal_fn=metrics.taint_rate,
+_PENDING_PREMISE_RATE = MetricDef(
+    name="pending_premise_rate",
+    signal_fn=metrics.pending_premise_rate,
     denominator_population="claim_bearing_nodes",
     empty_denominator="unavailable",
     scored=True,
@@ -366,7 +362,7 @@ _OPEN_CONTRADICTION_RATE = MetricDef(
 ASPECT_A_EPISTEMIC_INTEGRITY = AspectDef(
     name="epistemic_integrity",
     weight=40.0,
-    metrics=(_STALE_DERIVATION_RATE, _TAINT_RATE, _OPEN_CONTRADICTION_RATE),
+    metrics=(_PENDING_PREMISE_RATE, _OPEN_CONTRADICTION_RATE),
     scoring_fn=metrics.aspect_geometric_mean_scoring,
 )
 
@@ -405,7 +401,7 @@ ASPECT_C_PROVENANCE_INTEGRITY = AspectDef(
 # Aspect B — Retrievability (weight 35, design doc §2) — real as of PR3;
 # polarity flipped to literal coverage in engram-alpha#2518.
 # Denominator for all four is "claim_bearing_nodes" (same population aspect
-# A's taint_rate already uses) — see health/config.py's
+# A's pending_premise_rate already uses) — see health/config.py's
 # DECLARED_POPULATIONS comment and health/metrics.py's aspect-B
 # section docstring for why. Every raw signal below returns its OWN LITERAL
 # coverage/fraction meaning (1.0 = fully covered/connected, 0.0 = none) —
@@ -781,8 +777,7 @@ def _verify_l1_against_live_signal_fns(
 # CONFIG's list under a new name; the two happening to name the same
 # functions today is a fact this control's own logic does not depend on.
 _LIVE_SIGNAL_FNS_FOR_VERIFICATION: dict[str, "Callable[[sqlite3.Connection], float | _Unavailable]"] = {
-    "stale_derivation_rate": metrics.stale_derivation_rate,
-    "taint_rate": metrics.taint_rate,
+    "pending_premise_rate": metrics.pending_premise_rate,
     "open_contradiction_rate": metrics.open_contradiction_rate,
     "uncited_observation_rate": metrics.uncited_observation_rate,
     "dangling_evidence_rate": metrics.dangling_evidence_rate,
@@ -937,7 +932,7 @@ def _config_to_dict(config: EngineConfig) -> dict:
 # markers do (``_snapshot_path``, ``_config_to_dict``). It documents a
 # SCHEMA FIELD (dive_target, emitted per-metric by _metric_def_to_dict
 # above), not a metric, so a global note here beats duplicating the same
-# text onto all nine metric entries (today none of them actually populate
+# text onto all eight metric entries (today none of them actually populate
 # dive_target — see CONFIG above).
 _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
     "_dive_target": {
@@ -951,43 +946,34 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
             "deprecated, not dead)."
         ),
     },
-    "stale_derivation_rate": {
+    "pending_premise_rate": {
         "meaning": (
-            "Fraction of current derivations carrying a stale marker "
-            "(metadata.stale_by and/or metadata.stale_via non-empty) — "
-            "built on a premise that has since been directly or "
-            "cascade-superseded."
-        ),
-        "denominator": "total current derivations",
-        "why_that_denominator": (
-            "Scope is derivations only (stale-DERIVATION rate), not all "
-            "node types, per design doc §2."
-        ),
-        "unit": (
-            "nodes, not marker rows — a node can carry more than one "
-            "pending marker row (see health/metrics.py's "
-            "stale_derivation_rate docstring, 'UNIT' note); the OLD formula "
-            "shipped for months with the unit unstated, per draft-2 §4."
-        ),
-    },
-    "taint_rate": {
-        "meaning": (
-            "Fraction of current claim-bearing nodes carrying a "
-            "metadata.tainted_by marker (downstream of a retracted "
-            "premise)."
+            "Fraction of current claim-bearing nodes carrying an unresolved "
+            "cascade marker (root_op IN ('retract', 'supersede'), status "
+            "'pending') -- downstream of a retracted OR superseded premise. "
+            "Unifies the prior separate stale_derivation_rate / taint_rate "
+            "metrics (engram-alpha#2905 PR-B): post-cascade-machine, a "
+            "pending retract marker and a pending supersede marker do the "
+            "same thing to a node's usability as a premise, regardless of "
+            "cause -- so this is scored as one metric, not two."
         ),
         "denominator": (
             "total current claim-bearing nodes (engram_core."
-            "CLAIM_BEARING_TYPES)"
+            "CLAIM_BEARING_TYPES) -- same population taint_rate used; "
+            "stale_derivation_rate's narrower derivations-only denominator "
+            "is retired along with the metric, since the unified numerator "
+            "can touch any claim-bearing node type, not derivations alone."
         ),
         "why_that_denominator": (
-            "Only claim-bearing nodes can be tainted in the epistemic "
-            "sense; a definition/person/task/goal node is never a "
-            "candidate."
+            "Only claim-bearing nodes can carry a premise-blocking marker "
+            "in the epistemic sense; a definition/person/task/goal node is "
+            "never a candidate."
         ),
         "unit": (
-            "nodes, not marker rows — same convention as "
-            "stale_derivation_rate (see that entry's 'unit' note)."
+            "nodes, not marker rows -- a node carrying both a pending "
+            "retract AND a pending supersede marker counts once (see "
+            "health/metrics.py's pending_premise_rate docstring, 'UNIT' "
+            "note)."
         ),
     },
     "open_contradiction_rate": {
@@ -1003,9 +989,11 @@ _METRIC_DEFINITIONS: dict[str, dict[str, str]] = {
             "worked example predates the 'hold out, renormalize, report' "
             "design ruling (Kepler, engram-alpha#2520 review comment, "
             "2026-09-03), which treats a metric with nothing to measure "
-            "as unmeasured, not as evidence of health. Matches taint_rate "
-            "/ stale_derivation_rate's existing empty-population "
-            "treatment (same aspect)."
+            "as unmeasured, not as evidence of health. Matches "
+            "pending_premise_rate's existing empty-population treatment "
+            "(same aspect; pending_premise_rate unifies the prior separate "
+            "taint_rate/stale_derivation_rate referenced here originally — "
+            "engram-alpha#2905 PR-B)."
         ),
     },
     "uncited_observation_rate": {
@@ -1135,8 +1123,9 @@ def _cascade_marker_age_diagnostics(conn: sqlite3.Connection, current_turn: int)
     """Max age + histogram (in turn-equivalent units) of live cascade markers.
 
     "Cascade marker" = a ``cascade_markers`` row with ``status = 'pending'``
-    — the SAME population Aspect A's stale_derivation_rate/taint_rate
-    already score the BACKLOG SIZE of (design doc §2: "A keeps backlog SIZE
+    — the SAME population Aspect A's pending_premise_rate (engram-alpha#2905
+    PR-B; formerly the separate stale_derivation_rate/taint_rate) already
+    scores the BACKLOG SIZE of (design doc §2: "A keeps backlog SIZE
     via its three state-valued rates; age distribution ... lives in
     diagnostics"). Age of one marker = time since
     ``cascade_markers.created_at``, converted to turn-equivalent units via

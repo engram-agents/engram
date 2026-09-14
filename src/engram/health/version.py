@@ -65,13 +65,23 @@ schema, not to the purely-additive L0 layer) and stays out of scope here.
 
 from __future__ import annotations
 
-MAJOR = 1
+MAJOR = 2
 """Identity of the current L0 (bare-data) measurement set. Bump this
 whenever a measurement in ``health.measurements.MEASUREMENTS`` is added,
 removed, or redefined — enforced mechanically by the L0 hash gate
-(``tests/test_health_measurements.py``), not left to memory."""
+(``tests/test_health_measurements.py``), not left to memory. Bumped to 2
+by engram-alpha#2905 PR-B: the L0 set itself changed — two measurements
+retired (``derivations_pending_supersede_marker``,
+``claim_bearing_pending_retract_marker``) and one added
+(``claim_bearing_pending_marker``, unifying both into a single DISTINCT
+count over claim-bearing nodes carrying EITHER a pending retract OR a
+pending supersede cascade marker), which is exactly the add/remove/
+redefine class this counter exists to track — a MAJOR bump, not MINOR,
+because the bare-data set's own identity changed, not just what is
+derived from it. MINOR resets to 0 on any MAJOR bump (see MINOR's own
+docstring)."""
 
-MINOR = 2
+MINOR = 0
 """Identity of everything DERIVED from L0 — formulas, curves, importances,
 aspect points, the unavailability policy. Started at 0 (slice 1 introduced
 no derived-layer changes); bumped to 1 by engram-alpha#2788 (curve knots
@@ -87,7 +97,16 @@ premise``, and ``embedding_coverage``/``recall_summary_coverage``/
 ``recall_keywords_coverage`` -> ``goodness_coverage``), one importance
 hold-out (``open_contradiction_rate`` -> 0.0), and two importance reweights
 (``recall_summary_coverage`` -> 0.5, ``recall_keywords_coverage`` ->
-0.25)."""
+0.25). RESET to 0 by engram-alpha#2905 PR-B's MAJOR bump (see MAJOR's own
+docstring) — a MAJOR bump always resets MINOR (confirmed against
+``tests/test_health_version_gate.py``'s own ``classify_delta`` test cases,
+e.g. its "skips a major"/(1,0)->(3,0) case family): the L0 set changing
+means everything derived from it starts a fresh identity too, even though
+PR-B's own derived-layer declarations (signals/model bindings) ALSO
+changed in the same commit (the taint_rate/stale_derivation_rate ->
+pending_premise_rate signal and metric-binding unification) — that
+derived-layer change does not get its own separate MINOR increment because
+it is subsumed by the MAJOR bump's reset, not layered on top of it."""
 
 
 def format_version(major: int = MAJOR, minor: int = MINOR) -> str:

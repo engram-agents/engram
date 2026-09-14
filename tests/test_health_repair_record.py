@@ -411,13 +411,17 @@ class TestRepairRecordMissingMetricNames:
         assert len(expected) > 0  # sanity: MODEL actually declares metrics
 
     def test_one_missing_metric_is_named(self):
+        # engram-alpha#2905 PR-B: taint_rate retired (unified into
+        # pending_premise_rate) -- the excluded name must be a real,
+        # currently-declared MODEL.metrics signal or this filter is a
+        # silent no-op and the test vacuously passes an empty list.
         all_but_one = {
             m.signal: _metric_entry()
             for m in he.MODEL.metrics
-            if m.signal != "taint_rate"
+            if m.signal != "pending_premise_rate"
         }
         rec = _record(metrics=all_but_one)
-        assert he.repair_record_missing_metric_names(rec) == ["taint_rate"]
+        assert he.repair_record_missing_metric_names(rec) == ["pending_premise_rate"]
 
     def test_malformed_record_reports_every_declared_metric_missing(self):
         expected = sorted(m.signal for m in he.MODEL.metrics)

@@ -61,18 +61,18 @@ graph run — not a hypothetical warning.
 AST-enumerated (Borges, #2537 comment) as closed for today's code — exactly
 three live cross-module symbols in ``health/metrics.py`` (the
 PRE-EXISTING signal-function file, not this module): ``engram_core.
-CLAIM_BEARING_TYPES`` (5 call sites there, backing 6 of the 14 L0
+CLAIM_BEARING_TYPES`` (5 call sites there, backing 6 of the 13 L0
 measurements below — the shared ``claim_bearing_current`` denominator plus
 its 5 numerator siblings) and ``engram_core._embedder`` / ``engram_core.
 _get_embedding_config`` (1 call site, one conjunction). Concretely, two
-consequences beyond the 14 integers a naive reading of the L0 set would
+consequences beyond the 13 integers a naive reading of the L0 set would
 produce:
 
 - ``claim_bearing_types_resolved`` — the sorted CLAIM_BEARING_TYPES list
   itself, resolved at measurement time. Without it, a future edit to that
   constant (it already moved once — ``lesson`` dropped 2026-08-26, commit
   7c1ba579, under a commit whose subject named "confidence" and nothing
-  about health) silently changes what six of the fourteen counts *count*
+  about health) silently changes what six of the thirteen counts *count*
   while every L0 name stays identical — the redefinition would be invisible.
   Storing the resolved list makes a redefinition a stored-value MISMATCH,
   loud, instead of a fact nobody watches for.
@@ -86,9 +86,11 @@ produce:
   way ``health.metrics.embedding_coverage``'s own gate already reads
   them.
 
-So the stored set is 14 ints + 2 embedder booleans + 1 resolved type list +
-1 version stamp = 18 keys, not the issue body's literal "15 items" — the
-count moved when the remote-definition amendment was accepted; the issue
+So the stored set is 13 ints + 2 embedder booleans + 1 resolved type list +
+1 version stamp = 17 keys (16 measurements + the version stamp), not the
+issue body's literal "15 items" — the count moved when the remote-
+definition amendment was accepted, and again when engram-alpha#2905 PR-B
+unified two numerators into one; the issue
 text itself was never updated to match (flagged to Ariadne in the reply
 DM that accompanies this PR).
 
@@ -228,7 +230,7 @@ class MeasurementDef:
     must treat this measurement when replaying a historical ``knowledge.sql``
     dump rather than a live graph:
 
-    - ``"graph"`` (the default, 14 of today's 17 measurements) — a plain
+    - ``"graph"`` (the default, 13 of today's 16 measurements) — a plain
       read off the graph; replay runs ``compute_fn`` against the restored
       dump exactly as it would against a live connection. On
       ``sqlite3.OperationalError`` (the dump predates a table/column this
@@ -376,23 +378,15 @@ def m_evidence_current(conn: sqlite3.Connection) -> int:
 # ---------------------------------------------------------------------------
 
 
-def m_derivations_pending_supersede_marker(conn: sqlite3.Connection) -> int:
-    """DISTINCT current derivations carrying a pending
-    ``root_op='supersede'`` cascade marker. Numerator for
-    ``stale_derivation_rate``."""
-    return conn.execute(
-        """SELECT COUNT(DISTINCT n.id) as c
-           FROM nodes n
-           JOIN cascade_markers m ON m.node_id = n.id
-           WHERE n.type = 'derivation' AND n.is_current = 1
-             AND m.root_op = 'supersede' AND m.status = 'pending'"""
-    ).fetchone()["c"]
-
-
-def m_claim_bearing_pending_retract_marker(conn: sqlite3.Connection) -> int:
-    """DISTINCT current claim-bearing nodes carrying a pending
-    ``root_op='retract'`` cascade marker. Numerator for ``taint_rate``."""
-    import engram_core as core  # lazy — see module docstring
+def m_claim_bearing_pending_marker(conn: sqlite3.Connection) -> int:
+    """DISTINCT current claim-bearing nodes carrying ANY pending cascade
+    marker (root_op IN ('retract', 'supersede')) -- a node carrying both
+    marker kinds counts once. Numerator for ``pending_premise_rate``
+    (engram-alpha#2905 PR-B), unifying the prior separate taint_rate /
+    stale_derivation_rate numerators: post-cascade-machine, a pending
+    retract and a pending supersede marker do the same thing to a node's
+    usability as a premise -- block it, regardless of cause."""
+    import engram_core as core  # lazy -- match this module's existing convention
 
     claim_bearing_types = tuple(sorted(core.CLAIM_BEARING_TYPES))
     placeholders = ",".join("?" * len(claim_bearing_types))
@@ -401,7 +395,7 @@ def m_claim_bearing_pending_retract_marker(conn: sqlite3.Connection) -> int:
             FROM nodes n
             JOIN cascade_markers m ON m.node_id = n.id
             WHERE n.is_current = 1 AND n.type IN ({placeholders})
-              AND m.root_op = 'retract' AND m.status = 'pending'""",
+              AND m.root_op IN ('retract', 'supersede') AND m.status = 'pending'""",
         claim_bearing_types,
     ).fetchone()["c"]
 
@@ -660,7 +654,7 @@ def m_claim_bearing_types_resolved(conn: sqlite3.Connection) -> "tuple[str, ...]
 
     This is the remote-definition rule's answer for the constant that moved
     once already (``lesson`` dropped 2026-08-26, commit 7c1ba579) and backs
-    six of the fourteen numeric measurements (the shared denominator
+    six of the thirteen numeric measurements (the shared denominator
     ``claim_bearing_current`` plus its 5 numerator siblings) — storing it
     makes a future
     redefinition a loud stored-value mismatch instead of a silent population
@@ -713,17 +707,11 @@ MEASUREMENTS: "dict[str, MeasurementDef]" = {
             label="current evidence",
         ),
         MeasurementDef(
-            "derivations_pending_supersede_marker",
-            "current derivations with a pending root_op=supersede cascade marker",
-            m_derivations_pending_supersede_marker,
-            label="derivations pending a supersede cascade",
-        ),
-        MeasurementDef(
-            "claim_bearing_pending_retract_marker",
-            "current claim-bearing nodes with a pending root_op=retract cascade marker",
-            m_claim_bearing_pending_retract_marker,
+            "claim_bearing_pending_marker",
+            "current claim-bearing nodes with a pending retract OR supersede cascade marker",
+            m_claim_bearing_pending_marker,
             definition_inputs=_CLAIM_BEARING_TYPES_RESOLVED,
-            label="claim-bearing nodes pending a retract cascade",
+            label="claim-bearing nodes pending any cascade marker",
         ),
         MeasurementDef(
             "contradictions_open",

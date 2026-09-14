@@ -50,7 +50,7 @@ from viz.data import health_v2 as viz_health_v2_data  # noqa: E402
 
 def _make_fixture_snapshot(turn: int, checkpoint_mode: str) -> dict:
     return {
-        "health_version": "0.4.0-pr5",
+        "health_version": "0.5.0",
         "raw_schema_version": "1",
         "model_version": "1",
         "anchor": "deadbeef",
@@ -334,7 +334,7 @@ class TestGetHealthV2DataPopulated(unittest.TestCase):
         self.assertEqual(prov["snapshot_id"], "5-nap-20260904T120000Z")
         self.assertEqual(prov["turn"], 5)
         self.assertEqual(prov["checkpoint_mode"], "nap")
-        self.assertEqual(prov["health_version"], "0.4.0-pr5")
+        self.assertEqual(prov["health_version"], "0.5.0")
         self.assertEqual(prov["raw_schema_version"], "1")
         self.assertEqual(prov["model_version"], "1")
         self.assertEqual(prov["anchor"], "deadbeef")

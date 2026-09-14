@@ -53,20 +53,18 @@ class TestRateHelper:
 
 
 class TestSimpleRateSignals:
-    """The five signals with no coverage-polarity flip and no environment
-    gate: numerator/denominator, straight through."""
+    """The four signals with no coverage-polarity flip and no environment
+    gate: numerator/denominator, straight through. (Was five before
+    engram-alpha#2905 PR-B unified taint_rate + stale_derivation_rate into
+    pending_premise_rate.)"""
 
-    def test_stale_derivation_rate(self):
-        m = {"derivations_pending_supersede_marker": 1, "derivations_current": 4}
-        assert signals.stale_derivation_rate(m) == 0.25
+    def test_pending_premise_rate(self):
+        m = {"claim_bearing_pending_marker": 2, "claim_bearing_current": 8}
+        assert signals.pending_premise_rate(m) == 0.25
 
-    def test_stale_derivation_rate_empty_population(self):
-        m = {"derivations_pending_supersede_marker": 0, "derivations_current": 0}
-        assert signals.stale_derivation_rate(m) is UNAVAILABLE
-
-    def test_taint_rate(self):
-        m = {"claim_bearing_pending_retract_marker": 2, "claim_bearing_current": 8}
-        assert signals.taint_rate(m) == 0.25
+    def test_pending_premise_rate_empty_population(self):
+        m = {"claim_bearing_pending_marker": 0, "claim_bearing_current": 0}
+        assert signals.pending_premise_rate(m) is UNAVAILABLE
 
     def test_open_contradiction_rate(self):
         m = {"contradictions_open": 1, "contradictions_current": 2}
@@ -179,8 +177,7 @@ class TestGiantComponentFraction:
 class TestComputeAllSignals:
     def test_covers_every_registered_signal(self):
         m = {
-            "derivations_pending_supersede_marker": 1, "derivations_current": 4,
-            "claim_bearing_pending_retract_marker": 1, "claim_bearing_current": 4,
+            "claim_bearing_pending_marker": 1, "claim_bearing_current": 4,
             "contradictions_open": 1, "contradictions_current": 4,
             "observations_without_evidence_id": 1, "observations_current": 4,
             "evidence_uncited": 1, "evidence_current": 4,
@@ -192,18 +189,18 @@ class TestComputeAllSignals:
         }
         result = signals.compute_all_signals(m)
         assert set(result.keys()) == set(signals.SIGNALS.keys())
-        assert len(result) == 9
+        assert len(result) == 8
 
     def test_perturbing_a_nonzero_input_changes_the_output(self):
         """THE REQUIRED CONTROL, applied to this module directly rather
         than only via test_health_measurements.py's cross-check — a test
         that has only ever been seen to pass has not been shown capable of
         failing."""
-        m = {"claim_bearing_pending_retract_marker": 1, "claim_bearing_current": 4}
-        before = signals.taint_rate(m)
+        m = {"claim_bearing_pending_marker": 1, "claim_bearing_current": 4}
+        before = signals.pending_premise_rate(m)
         perturbed = dict(m)
-        perturbed["claim_bearing_pending_retract_marker"] = 2
-        after = signals.taint_rate(perturbed)
+        perturbed["claim_bearing_pending_marker"] = 2
+        after = signals.pending_premise_rate(perturbed)
         assert before != after, (
             "control failed to detect the perturbation: "
             f"before={before!r} after={after!r}"
@@ -285,9 +282,9 @@ class TestSignalDefsShape:
 
 class TestFormulaText:
     def test_rate_formula_text(self):
-        d = signals.SIGNAL_DEFS["taint_rate"]
+        d = signals.SIGNAL_DEFS["pending_premise_rate"]
         assert d.formula_text == (
-            "claim_bearing_pending_retract_marker / claim_bearing_current"
+            "claim_bearing_pending_marker / claim_bearing_current"
         )
 
     def test_one_minus_rate_formula_text(self):
@@ -318,11 +315,13 @@ class TestSignalDefsJsonable:
             assert entry["formula"] == d.formula_text
             assert entry["doc"] == d.doc
 
-    def test_doc_nonempty_for_all_nine_signals(self):
+    def test_doc_nonempty_for_all_eight_signals(self):
         """engram-alpha#2580: signal_defs_jsonable() carries each signal's
-        own hand-written doc, non-empty for all nine registered signals."""
+        own hand-written doc, non-empty for all eight registered signals
+        (nine before engram-alpha#2905 PR-B unified taint_rate +
+        stale_derivation_rate into pending_premise_rate)."""
         rendered = signals.signal_defs_jsonable()
-        assert len(rendered) == 9
+        assert len(rendered) == 8
         for name, entry in rendered.items():
             assert isinstance(entry["doc"], str) and entry["doc"].strip(), (
                 f"{name} has an empty/missing doc"
@@ -383,11 +382,11 @@ def _make_conn() -> sqlite3.Connection:
 
 
 class TestBuildSnapshotSignalDefs:
-    def test_signal_defs_present_with_nine_entries_matching_signals(self):
+    def test_signal_defs_present_with_eight_entries_matching_signals(self):
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
         assert "signal_defs" in snap
-        assert len(snap["signal_defs"]) == 9
+        assert len(snap["signal_defs"]) == 8
         assert set(snap["signal_defs"].keys()) == set(snap["signals"].keys())
 
 
@@ -466,40 +465,47 @@ class TestEqualityControlFailsOnPerturbedDefs:
             with pytest.raises(health_engine.HealthEngineSSoTError):
                 health_engine._verify_l1_against_live_signal_fns(conn, perturbed_l1)
 
-    def test_taint_rate_numerator_swap_is_caught(self):
-        """Perturbation (b): point ``taint_rate``'s numerator at a
-        DIFFERENT registered L0 key.
+    def test_open_contradiction_rate_numerator_swap_is_caught(self):
+        """Perturbation (b): point ``open_contradiction_rate``'s numerator
+        at a DIFFERENT registered L0 key.
 
-        DECISION (flagged per the brief's own escape hatch): the brief's own
-        example key, ``derivations_pending_supersede_marker``, is vacuous on
-        this fixture -- its value is 1, identical to the real numerator
-        ``claim_bearing_pending_retract_marker`` (also 1), and both share the
-        same denominator (``claim_bearing_current``=7), so the swap produces
-        the SAME 1/7 value as the live signal and the verifier would not
-        raise. Using ``claim_bearing_without_recall_keywords`` (fixture
-        value 2) instead: 2/7≈0.286 vs the live taint_rate's 1/7≈0.143 --
-        genuinely different, not vacuous."""
+        NOTE (engram-alpha#2905 PR-B): this perturbation previously
+        targeted ``taint_rate``, now retired and unified into
+        ``pending_premise_rate`` -- which has NO live-oracle entry in
+        ``_LIVE_SIGNAL_FNS_FOR_VERIFICATION`` (health/engine.py; see that
+        dict's own comment) -- health.metrics has no equivalent function
+        (out of PR-B's declared scope), so a perturbation of
+        ``pending_premise_rate`` would not be caught by this control at
+        all (the verifier's comparison loop simply never looks at it).
+        Swapped to a signal that IS still independently oracled.
+
+        DECISION (flagged per the original brief's own escape hatch, ported
+        forward): the fixture's ``contradictions_open``=1,
+        ``contradictions_current``=2 -> 0.5. Using
+        ``claim_bearing_without_recall_keywords`` (fixture value 2) instead:
+        2/2=1.0 vs the live open_contradiction_rate's 0.5 -- genuinely
+        different, not vacuous."""
         conn = _build_populated_fixture()
         patch_a, patch_b = self._embedder_patches()
         with patch_a, patch_b:
             measurements = health_measurements.compute_all_measurements(conn)
             l1 = compute_all_signals(measurements)
 
-            orig_def = SIGNAL_DEFS["taint_rate"]
+            orig_def = SIGNAL_DEFS["open_contradiction_rate"]
             perturbed_def = dataclasses.replace(
                 orig_def, numerator="claim_bearing_without_recall_keywords"
             )
             perturbed_fn = _build(perturbed_def)
             perturbed_value = perturbed_fn(measurements)
 
-            assert perturbed_value != l1["taint_rate"], (
+            assert perturbed_value != l1["open_contradiction_rate"], (
                 "control setup failed: the numerator swap did not change "
                 "the value on this fixture -- the perturbation would be "
                 "vacuous"
             )
 
             perturbed_l1 = dict(l1)
-            perturbed_l1["taint_rate"] = perturbed_value
+            perturbed_l1["open_contradiction_rate"] = perturbed_value
 
             with pytest.raises(health_engine.HealthEngineSSoTError):
                 health_engine._verify_l1_against_live_signal_fns(conn, perturbed_l1)

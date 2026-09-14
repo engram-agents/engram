@@ -144,26 +144,17 @@ SIGNAL_DEFS: "dict[str, SignalDef]" = {
     d.name: d
     for d in (
         SignalDef(
-            "stale_derivation_rate",
-            numerator="derivations_pending_supersede_marker",
-            denominator="derivations_current",
-            form="rate",
-            doc=(
-                "Fraction of current derivations carrying a pending "
-                "supersede marker. Mirrors "
-                "``health.metrics.stale_derivation_rate``'s own SQL "
-                "exactly."
-            ),
-        ),
-        SignalDef(
-            "taint_rate",
-            numerator="claim_bearing_pending_retract_marker",
+            "pending_premise_rate",
+            numerator="claim_bearing_pending_marker",
             denominator="claim_bearing_current",
             form="rate",
             doc=(
-                "Fraction of current claim-bearing nodes carrying a "
-                "pending retract marker. Mirrors "
-                "``health.metrics.taint_rate``'s own SQL exactly."
+                "Fraction of current claim-bearing nodes carrying a pending "
+                "cascade marker (retract or supersede) -- premises currently "
+                "not available for derivation. Unifies the prior taint_rate / "
+                "stale_derivation_rate (engram-alpha#2905 PR-B): both measured "
+                "the same underlying condition (a pending marker blocking a "
+                "node as a premise) under two separate mechanisms."
             ),
         ),
         SignalDef(
@@ -315,10 +306,9 @@ SIGNALS: dict[str, "Callable[[MeasurementDict], float | _Unavailable]"] = {
     name: _build(d) for name, d in SIGNAL_DEFS.items()
 }
 
-# Thin aliases so existing importers/tests referring to the nine
-# module-level function names keep working unchanged.
-stale_derivation_rate = SIGNALS["stale_derivation_rate"]
-taint_rate = SIGNALS["taint_rate"]
+# Thin aliases so existing importers/tests referring to the module-level
+# function names keep working unchanged.
+pending_premise_rate = SIGNALS["pending_premise_rate"]
 open_contradiction_rate = SIGNALS["open_contradiction_rate"]
 uncited_observation_rate = SIGNALS["uncited_observation_rate"]
 dangling_evidence_rate = SIGNALS["dangling_evidence_rate"]

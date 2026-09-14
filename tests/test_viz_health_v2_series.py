@@ -115,14 +115,14 @@ class TestHealthV2SeriesRoute(_LiveServerBase):
         self.assertEqual(body["agent"], "test_agent")
         self.assertIn("signals", body)
         self.assertEqual(set(body["signals"].keys()), set(self.snap["signal_defs"].keys()))
-        point = body["signals"]["taint_rate"][0]
+        point = body["signals"]["pending_premise_rate"][0]
         self.assertEqual(point["commit"], self.commit_sha)
         self.assertEqual(point["source"], "stored")
 
     def test_signal_filter(self):
-        status, body = self._get("/api/health/v2/series?agent=test_agent&signal=taint_rate")
+        status, body = self._get("/api/health/v2/series?agent=test_agent&signal=pending_premise_rate")
         self.assertEqual(status, 200)
-        self.assertEqual(set(body["signals"].keys()), {"taint_rate"})
+        self.assertEqual(set(body["signals"].keys()), {"pending_premise_rate"})
 
     def test_version_absent(self):
         status, body = self._get("/api/health/v2/series?agent=test_agent&version=health-v9.9")

@@ -8,9 +8,11 @@ and §5 (engine contract).
 
 Scope of this module: the actual signal functions (``Callable[[sqlite3.
 Connection], float | _Unavailable]`` per health.config.MetricDef's
-type) for aspect A's three metrics, aspect B's four metrics (PR3), and
-aspect C's two metrics, plus one shared aspect-level scoring function used
-by every real AspectDef in health/engine.py.
+type) for aspect A's two metrics (engram-alpha#2905 PR-B unified the prior
+three-metric stale_derivation_rate/taint_rate/open_contradiction_rate set
+into pending_premise_rate/open_contradiction_rate), aspect B's four metrics
+(PR3), and aspect C's two metrics, plus one shared aspect-level scoring
+function used by every real AspectDef in health/engine.py.
 
 Each signal function is SELF-CONTAINED: it takes only ``conn`` (per PR1's
 fixed ``Callable[[sqlite3.Connection], float | _Unavailable]`` signature —
@@ -93,60 +95,40 @@ from .config import UNAVAILABLE, _Unavailable
 # ---------------------------------------------------------------------------
 
 
-def stale_derivation_rate(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fraction of current derivations with an unresolved cascade marker
-    from a supersede event (i.e. currently stale per the live cascade
-    machine).
+def pending_premise_rate(conn: sqlite3.Connection) -> float | _Unavailable:
+    """Fraction of current claim-bearing nodes carrying an unresolved
+    cascade marker from EITHER a retract OR a supersede event (i.e.
+    currently blocked as a premise per the live cascade machine).
 
-    Reads ``cascade_markers`` (root_op='supersede', status='pending'),
-    NOT ``metadata.stale_by``/``stale_via`` — those metadata fields were
-    retired by the cascade machine (commit 7f068db1, 2026-08-28) and no
-    longer update on retract/supersede. See engram-alpha#1991 comment
-    5478591738 §1 for the measured defect this replaces.
+    Reads ``cascade_markers`` (root_op IN ('retract', 'supersede'),
+    status='pending'), NOT ``metadata.tainted_by``/``stale_by``/
+    ``stale_via`` — those metadata fields were retired by the cascade
+    machine (commit 7f068db1, 2026-08-28) and no longer update on
+    retract/supersede. See engram-alpha#1991 comment 5478591738 §1 for the
+    measured defect this replaces.
+
+    Unifies the prior separate ``stale_derivation_rate`` (supersede-only,
+    derivations-only) and ``taint_rate`` (retract-only, claim-bearing-wide)
+    metrics (engram-alpha#2905 PR-B): post-cascade-machine, a pending
+    retract marker and a pending supersede marker do the same thing to a
+    node's usability as a premise — block it — regardless of cause, so
+    this is scored as one metric, not two.
 
     UNIT: the scored quantity is NODES with a pending marker (one per
-    node, regardless of how many pending marker rows that node has), NOT
-    marker rows — a node can be caught by more than one cascade_event.
-    State this explicitly because the OLD formula shipped for months with
-    the unit unstated and it was a real spec error then.
-
-    Scope: derivations only (``type = 'derivation'``), matching "stale-
-    DERIVATION rate" literally.
-
-    empty_denominator: UNAVAILABLE when there are zero current derivations
-    — a graph with no derivations can't have a meaningful stale-derivation
-    RATE (0/0, not 0%).
-    """
-    total = conn.execute(
-        "SELECT COUNT(*) as c FROM nodes WHERE type = 'derivation' AND is_current = 1"
-    ).fetchone()["c"]
-    if total == 0:
-        return UNAVAILABLE
-
-    stale = conn.execute(
-        """SELECT COUNT(DISTINCT n.id) as c
-           FROM nodes n
-           JOIN cascade_markers m ON m.node_id = n.id
-           WHERE n.type = 'derivation' AND n.is_current = 1
-             AND m.root_op = 'supersede' AND m.status = 'pending'"""
-    ).fetchone()["c"]
-    return stale / total
-
-
-def taint_rate(conn: sqlite3.Connection) -> float | _Unavailable:
-    """Fraction of current claim-bearing nodes with an unresolved cascade
-    marker from a retract event (i.e. currently tainted per the live
-    cascade machine).
-
-    Reads ``cascade_markers`` (root_op='retract', status='pending'), NOT
-    ``metadata.tainted_by`` — see stale_derivation_rate's docstring for why.
-
-    UNIT: NODES with a pending marker, not marker rows — same convention
-    as stale_derivation_rate.
+    node, regardless of how many pending marker rows — of either kind —
+    that node has), NOT marker rows — a node can be caught by more than
+    one cascade_event, and a node caught by BOTH a retract and a supersede
+    event still counts once. State this explicitly because the OLD
+    formula shipped for months with the unit unstated and it was a real
+    spec error then.
 
     Denominator is claim-bearing nodes (``engram_core.CLAIM_BEARING_TYPES``),
     not every current node — a definition/person/task/goal node is never
-    claim-bearing and can't be tainted in the epistemic sense.
+    claim-bearing and can't carry a premise-blocking marker in the
+    epistemic sense. This is ``taint_rate``'s prior denominator, not
+    ``stale_derivation_rate``'s narrower derivations-only one — the
+    unified numerator can touch any claim-bearing node type, not
+    derivations alone.
 
     empty_denominator: UNAVAILABLE when there are zero current claim-bearing
     nodes (degenerate, but handled per contract rather than assumed
@@ -163,15 +145,15 @@ def taint_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     if total == 0:
         return UNAVAILABLE
 
-    tainted = conn.execute(
+    pending = conn.execute(
         f"""SELECT COUNT(DISTINCT n.id) as c
             FROM nodes n
             JOIN cascade_markers m ON m.node_id = n.id
             WHERE n.is_current = 1 AND n.type IN ({placeholders})
-              AND m.root_op = 'retract' AND m.status = 'pending'""",
+              AND m.root_op IN ('retract', 'supersede') AND m.status = 'pending'""",
         claim_bearing_types,
     ).fetchone()["c"]
-    return tainted / total
+    return pending / total
 
 
 def open_contradiction_rate(conn: sqlite3.Connection) -> float | _Unavailable:
@@ -189,12 +171,14 @@ def open_contradiction_rate(conn: sqlite3.Connection) -> float | _Unavailable:
     every brand-new/tiny graph: a graph with literally zero contradiction
     NODES (not zero OPEN ones) hasn't demonstrated anything about its
     open-contradiction rate at all, "clean" or otherwise — there is
-    nothing to report a rate over. This now matches taint_rate /
-    stale_derivation_rate's existing UNAVAILABLE-on-empty-population
-    convention exactly (same aspect, same treatment) — the prior asymmetry
-    (this one epistemic_integrity metric alone returning a "clean" 0.0 for
-    an empty population, its two siblings both returning UNAVAILABLE for
-    the same condition) was itself the inconsistency this fold closes.
+    nothing to report a rate over. This now matches pending_premise_rate's
+    existing UNAVAILABLE-on-empty-population convention exactly (same
+    aspect, same treatment; pending_premise_rate unifies the prior
+    separate taint_rate/stale_derivation_rate siblings referenced here
+    originally — see engram-alpha#2905 PR-B) — the prior asymmetry (this
+    one epistemic_integrity metric alone returning a "clean" 0.0 for an
+    empty population, its sibling(s) returning UNAVAILABLE for the same
+    condition) was itself the inconsistency this fold closes.
     """
     rows = conn.execute(
         "SELECT status FROM nodes WHERE type = 'contradiction' AND is_current = 1"

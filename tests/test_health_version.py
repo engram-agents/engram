@@ -20,7 +20,7 @@ from health import version as health_version  # noqa: E402
 
 class TestFormatVersion:
     def test_default_formats_current_major_minor(self):
-        assert health_version.format_version() == "health-v1.2"
+        assert health_version.format_version() == "health-v2.0"
 
     def test_explicit_args_override_defaults(self):
         assert health_version.format_version(2, 5) == "health-v2.5"
@@ -60,13 +60,14 @@ class TestCurrent:
             health_version.MAJOR, health_version.MINOR
         )
 
-    def test_current_is_health_v1_2_today(self):
-        """Pinned literally, not just structurally — health-v1.2 as of
-        engram-alpha#2905 PR-A's MINOR bump (the 2026-09-13 Lei+Kepler
-        curves session: two new curves added to curves.json and six
-        metric-binding changes in health/model.py's MODEL_SPEC), regardless
-        of ENGRAM's own version, per the module docstring."""
-        assert health_version.CURRENT == "health-v1.2"
+    def test_current_is_health_v2_0_today(self):
+        """Pinned literally, not just structurally — health-v2.0 as of
+        engram-alpha#2905 PR-B's MAJOR bump (unifying taint_rate +
+        stale_derivation_rate into one L0 measurement,
+        claim_bearing_pending_marker, backing the new pending_premise_rate
+        signal): MAJOR 1->2, MINOR resets to 0. Regardless of ENGRAM's own
+        version, per the module docstring."""
+        assert health_version.CURRENT == "health-v2.0"
 
     def test_current_never_looks_like_an_engram_build_string(self):
         """The collision this module exists to prevent: no ENGRAM-shaped

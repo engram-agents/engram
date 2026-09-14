@@ -125,8 +125,15 @@ class ModelError(Exception):
 # explicitly future work, gated on a ruling that has not been made.
 
 SIGNALS: dict[str, Callable[[sqlite3.Connection], float | _Unavailable]] = {
-    "stale_derivation_rate": metrics.stale_derivation_rate,
-    "taint_rate": metrics.taint_rate,
+    # engram-alpha#2905 PR-B round 2: stale_derivation_rate + taint_rate
+    # retired from health/metrics.py and unified into pending_premise_rate
+    # -- this registry (a plain name -> metrics.py-callable mapping, NOT
+    # the same object as health.signals.SIGNALS, which round 1 already
+    # updated) must name exactly what MODEL_SPEC's MetricBinding.signal
+    # values resolve against (validate_model's "does not resolve in the
+    # signals registry" check reads THIS dict's keys), or the real
+    # pending_premise_rate MetricBinding below fails to validate.
+    "pending_premise_rate": metrics.pending_premise_rate,
     "open_contradiction_rate": metrics.open_contradiction_rate,
     "uncited_observation_rate": metrics.uncited_observation_rate,
     "dangling_evidence_rate": metrics.dangling_evidence_rate,
@@ -623,14 +630,15 @@ def load(spec: ScoringModel, config: EngineConfig) -> ScoringModel:
 
 
 # ---------------------------------------------------------------------------
-# The real production model SPEC — draft-2 §4's metric table, unmerged
-# (clarification 5: taint_rate / stale_derivation_rate stay two separate
-# metrics; the pending_marker_ratio merge was Lei's open call, non-blocking,
-# at PR5 time — as of engram-alpha#2905 PR-A it is DECIDED and coming in
-# PR-B (the unification into a single "pending_premise_rate" L0 measurement).
-# The two signals genuinely DO stay separate IN THIS PR — PR-A only rebinds
-# their curve, interim-bound to "badness_pending_premise" pending PR-B's
-# unification; see each binding's own #2905 comment below).
+# The real production model SPEC — draft-2 §4's metric table
+# (clarification 5, originally: taint_rate / stale_derivation_rate stay two
+# separate metrics; the pending_marker_ratio merge was Lei's open call,
+# non-blocking, at PR5 time. As of engram-alpha#2905 PR-A that call was
+# DECIDED, and PR-B (round 2, this same commit) IS the merge: taint_rate and
+# stale_derivation_rate are unified below into a single pending_premise_rate
+# MetricBinding, backed by one L0 measurement (claim_bearing_pending_marker).
+# PR-A only rebound their curve, interim-bound to "badness_pending_premise"
+# pending this unification; see each binding's own #2905 comment below).
 #
 # UNVALIDATED at this point (round 3): constructing this ``ScoringModel``
 # does NOT run ``validate_model`` — see that dataclass's own docstring for
@@ -670,34 +678,26 @@ MODEL_SPEC = ScoringModel(
     ),
     metrics=(
         # --- epistemic_integrity (40 points) --------------------------------
-        # engram-alpha#2905 PR-A: curve rebind badness_default ->
-        # badness_pending_premise (interim; PR-B unifies taint_rate +
-        # stale_derivation_rate into one pending_premise_rate L0
-        # measurement). Importance/detector/repair unchanged.
+        # engram-alpha#2905 PR-B: unifies taint_rate + stale_derivation_rate
+        # (PR-A's interim curve rebind onto badness_pending_premise) into
+        # ONE signal, pending_premise_rate, backed by ONE L0 measurement
+        # (claim_bearing_pending_marker -- a claim-bearing node with EITHER
+        # a pending retract OR a pending supersede marker, deduped). Curve
+        # stays badness_pending_premise (PR-A's rebind was already the
+        # right shape for this). additional_detector "lottery:tainted-valid"
+        # carries over from taint_rate's binding; stale_derivation_rate's
+        # own additional_detector was already dropped by addendum 2 on
+        # engram-alpha#1991 (Kepler via Borges's colleague read of draft 2,
+        # 2026-09-03): "category 3 in the lottery is a different notion of
+        # 'stale' than this metric measures" -- so there is no second
+        # additional_detector to reconcile here.
         MetricBinding(
-            signal="taint_rate",
+            signal="pending_premise_rate",
             aspect="epistemic_integrity",
             curve="badness_pending_premise",
             importance=_DEFAULT_IMPORTANCE,
             detector=DetectorRef(name="scan:cascade-frontier", population="claim_bearing_nodes"),
             additional_detector=DetectorRef(name="lottery:tainted-valid", population="claim_bearing_nodes"),
-            repair="tool:cascade-resolve",
-        ),
-        # stale_derivation_rate's additional_detector (previously
-        # "lottery:tainted-valid"'s sibling, "lottery:stale-load-bearing")
-        # is DROPPED (addendum 2 on engram-alpha#1991, Kepler via Borges's
-        # colleague read of draft 2, 2026-09-03): "category 3 in the
-        # lottery is a different notion of 'stale' than this metric
-        # measures" — scan:cascade-frontier remains its sole detector.
-        # engram-alpha#2905 PR-A: same curve rebind as taint_rate above
-        # (badness_default -> badness_pending_premise), interim ahead of
-        # PR-B's unification. Importance/detector/repair unchanged.
-        MetricBinding(
-            signal="stale_derivation_rate",
-            aspect="epistemic_integrity",
-            curve="badness_pending_premise",
-            importance=_DEFAULT_IMPORTANCE,
-            detector=DetectorRef(name="scan:cascade-frontier", population="derivations"),
             repair="tool:cascade-resolve",
         ),
         # engram-alpha#2905 PR-A: importance _DEFAULT_IMPORTANCE -> 0.0

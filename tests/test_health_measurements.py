@@ -12,15 +12,22 @@ Two jobs, kept deliberately separate:
 
 2. **The acceptance criterion, with its required control** (#2537 build
    brief + Ariadne's amendment DM, both non-negotiable per that brief):
-   for each of the nine signals, the value DERIVED from L0 measurements
+   for each of the (originally nine, now eight per engram-alpha#2905 PR-B's
+   taint_rate/stale_derivation_rate unification into pending_premise_rate)
+   signals, the value DERIVED from L0 measurements
    (arithmetic written here, mirroring each signal function's own formula —
    NOT shipped code; wiring signals as formulas over measurements is slice 2,
    #2537, out of scope for this PR) must equal the value the LIVE signal
    function in ``health/metrics.py`` returns, on the SAME connection
    (Ariadne's amendment #3 — two reads off one ``conn``, never two connections,
    so a concurrent-write artifact can't be mistaken for a decomposition bug).
+   NOTE (PR-B): ``pending_premise_rate`` has NO live-oracle entry in
+   ``_LIVE_SIGNAL_FNS`` below — ``health.metrics`` has no equivalent
+   function (out of PR-B's declared scope, engram-alpha#2905) — so the
+   acceptance loop below no longer independently cross-checks this one
+   signal; see ``_LIVE_SIGNAL_FNS``'s own comment.
 
-   The fixture is SYNTHETIC but GENUINELY POPULATED — every one of the 14
+   The fixture is SYNTHETIC but GENUINELY POPULATED — every one of the 13
    counts is non-zero on it (Ariadne's amendment #2: an all-zero fixture
    passes an equality test against a broken decomposition, and passes a
    perturbation test too if the perturbation happens to land on an
@@ -30,8 +37,8 @@ Two jobs, kept deliberately separate:
    (not reproducible in CI), so it does not appear in this file.
 
    ``test_perturbing_a_nonzero_measurement_is_detected`` is the required
-   control: perturbs ``claim_bearing_pending_retract_marker`` (real fixture
-   value 1, not 0) and asserts the equality check FAILS. A test that has
+   control: perturbs ``claim_bearing_pending_marker`` (real fixture
+   value 2, not 0) and asserts the derived value changes. A test that has
    only ever been seen to pass has not been shown capable of failing.
 """
 
@@ -200,19 +207,72 @@ class TestDenominators:
 
 
 class TestNumerators:
-    def test_derivations_pending_supersede_marker_counts_distinct_nodes(self):
+    def test_claim_bearing_pending_marker_dedupes_one_node_both_marker_kinds(self):
+        """THE LOAD-BEARING DEDUP PROPERTY (engram-alpha#2905 PR-B): a node
+        carrying BOTH a pending retract marker row AND a pending supersede
+        marker row counts ONCE, not twice -- COUNT(DISTINCT n.id), not
+        COUNT(n.id). This is the whole reason the issue calls out "a node
+        with both marker kinds counts once" as load-bearing."""
+        conn = _make_conn()
+        _insert(conn, "ax_1", "axiom")
+        _insert_marker(conn, "ax_1", "retract")
+        _insert_marker(conn, "ax_1", "supersede")
+        assert hem_l0.m_claim_bearing_pending_marker(conn) == 1
+
+    def test_claim_bearing_pending_marker_dedup_control_via_row_count(self):
+        """THE REQUIRED CONTROL for the dedup test above (same discipline as
+        this module's other "a test that has only ever been seen to pass has
+        not been shown capable of failing" controls): on the SAME fixture as
+        the dedup test (one node, two marker rows), a plain COUNT(n.id) --
+        i.e. the mutation ``COUNT(DISTINCT n.id)`` -> ``COUNT(n.id)`` would
+        produce -- is 2, genuinely different from the real function's 1.
+        Proves the dedup assertion above is discriminating, not vacuously
+        true on a fixture where distinct-vs-row count happen to coincide."""
+        conn = _make_conn()
+        _insert(conn, "ax_1", "axiom")
+        _insert_marker(conn, "ax_1", "retract")
+        _insert_marker(conn, "ax_1", "supersede")
+        claim_bearing_types = tuple(sorted(engram_core.CLAIM_BEARING_TYPES))
+        placeholders = ",".join("?" * len(claim_bearing_types))
+        row_count = conn.execute(
+            f"""SELECT COUNT(n.id) as c
+                FROM nodes n
+                JOIN cascade_markers m ON m.node_id = n.id
+                WHERE n.is_current = 1 AND n.type IN ({placeholders})
+                  AND m.root_op IN ('retract', 'supersede') AND m.status = 'pending'""",
+            claim_bearing_types,
+        ).fetchone()["c"]
+        assert row_count == 2, (
+            "control setup failed: expected 2 marker rows on the one node"
+        )
+        distinct_count = hem_l0.m_claim_bearing_pending_marker(conn)
+        assert distinct_count == 1
+        assert distinct_count != row_count, (
+            "control failed: COUNT(DISTINCT n.id) coincided with the row "
+            "count on this fixture -- it would not catch the "
+            "COUNT(DISTINCT n.id) -> COUNT(n.id) mutation"
+        )
+
+    def test_claim_bearing_pending_marker_two_different_nodes_count_two(self):
+        """The straightforward control (per the PR-B spec): two DIFFERENT
+        nodes, each with one marker (one retract, one supersede) -- both
+        count, distinctly, not collapsed together."""
+        conn = _make_conn()
+        _insert(conn, "ax_1", "axiom")
+        _insert_marker(conn, "ax_1", "retract")
+        _insert(conn, "dv_1", "derivation")
+        _insert_marker(conn, "dv_1", "supersede")
+        assert hem_l0.m_claim_bearing_pending_marker(conn) == 2
+
+    def test_claim_bearing_pending_marker_distinct_nodes_same_root_op(self):
+        """Mirrors the old per-measurement spot-check (pre-PR-B): multiple
+        marker rows of the SAME root_op on one node still count once."""
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation")
         _insert_marker(conn, "dv_1", "supersede", cascade_event="a")
         _insert_marker(conn, "dv_1", "supersede", cascade_event="b")  # 2nd event, same node
-        _insert_marker(conn, "dv_1", "retract")  # wrong root_op, ignored
-        assert hem_l0.m_derivations_pending_supersede_marker(conn) == 1
-
-    def test_claim_bearing_pending_retract_marker(self):
-        conn = _make_conn()
-        _insert(conn, "ax_1", "axiom")
-        _insert_marker(conn, "ax_1", "retract")
-        assert hem_l0.m_claim_bearing_pending_retract_marker(conn) == 1
+        _insert_marker(conn, "dv_1", "retract")  # different root_op, same node -- still 1
+        assert hem_l0.m_claim_bearing_pending_marker(conn) == 1
 
     def test_contradictions_open_excludes_resolved(self):
         conn = _make_conn()
@@ -294,11 +354,13 @@ class TestEnvironmentFacts:
 
 
 class TestRegistryAndComputeAll:
-    def test_registry_has_seventeen_entries(self):
-        """14 counts + 2 embedder booleans + 1 resolved type list = 17
-        registered MeasurementDefs; raw_schema_version is stamped separately
-        by compute_all_measurements, not registered as a MeasurementDef."""
-        assert len(hem_l0.MEASUREMENTS) == 17
+    def test_registry_has_sixteen_entries(self):
+        """13 counts + 2 embedder booleans + 1 resolved type list = 16
+        registered MeasurementDefs (engram-alpha#2905 PR-B: 17 -> 16, two
+        numerators unified into one); raw_schema_version is stamped
+        separately by compute_all_measurements, not registered as a
+        MeasurementDef."""
+        assert len(hem_l0.MEASUREMENTS) == 16
 
     def test_compute_all_measurements_is_json_safe_and_stamps_version(self):
         conn = _make_conn()
@@ -312,7 +374,7 @@ class TestRegistryAndComputeAll:
         assert result["raw_schema_version"] == health_version.MAJOR
         assert isinstance(result["claim_bearing_types_resolved"], list)
         json.dumps(result)  # must not raise — every value is JSON-safe
-        assert len(result) == 18  # 17 measurements + the version stamp
+        assert len(result) == 17  # 16 measurements + the version stamp
 
     def test_every_measurement_has_a_nonempty_population_label(self):
         """population is DATA the L0 hash gate hashes, not decoration — a
@@ -341,7 +403,11 @@ class TestL0HashGate:
     from health import measurements as h; print(h.canonical_l0_hash())"``,
     paste the new digest below, in the SAME commit as the MAJOR bump."""
 
-    _PINNED_L0_HASH = "ed3ac22132ff3377710aeea99501d136e69a04838e94cb7e700f1ab74aeb8fed"
+    _PINNED_L0_HASH = "fa69ad5675040420c472fcb2452125b88b058d6fef03817549b4aba559da2542"
+    # Re-pinned by engram-alpha#2905 PR-B: two L0 numerators retired
+    # (derivations_pending_supersede_marker, claim_bearing_pending_retract_
+    # marker) and one added (claim_bearing_pending_marker, unifying both),
+    # in the same commit as health.version.MAJOR's bump to 2.
 
     def test_l0_set_hash_matches_pinned_value(self):
         computed = hem_l0.canonical_l0_hash()
@@ -448,14 +514,19 @@ class TestDerivedHashGate:
     from health import measurements as h; print(h.canonical_derived_hash())"``,
     paste the new digest below, in the SAME commit as the bump."""
 
-    _PINNED_DERIVED_HASH = "67d9b6f1bf2e5dda45dab322e79bbb895454ccafc5677a131a3782a517e1fd9b"
-    # Re-pinned by engram-alpha#2905 PR-A (the 2026-09-13 Lei+Kepler curves
-    # session): two new curves added to curves.json (badness_pending_premise,
+    _PINNED_DERIVED_HASH = "41a6c92c2f429b805845b3e0f05666242fe0ed5c6949d4560c0a1404a11ca0db"
+    # Re-pinned by engram-alpha#2905 PR-B: taint_rate + stale_derivation_rate
+    # (PR-A's interim curve rebind onto badness_pending_premise) unified into
+    # ONE signal, pending_premise_rate, on the same curve, in the same
+    # epistemic_integrity metric-binding slot -- in the same commit as
+    # health.version.MAJOR's bump to 2 (which resets MINOR to 0, per this
+    # class's own docstring instructions: a MAJOR bump re-pins BOTH hashes).
+    #
+    # Prior pin history (PR-A, the 2026-09-13 Lei+Kepler curves session): two
+    # new curves added to curves.json (badness_pending_premise,
     # goodness_coverage) and six metric-binding changes in health/model.py's
     # MODEL_SPEC (three curve rebinds, one importance hold-out, two importance
-    # reweights — see health/version.py's MINOR docstring for the full list)
-    # in the same commit as health.version.MINOR's bump to 2, per this
-    # class's own docstring instructions.
+    # reweights — see health/version.py's MINOR docstring for the full list).
 
     def test_derived_set_hash_matches_pinned_value(self):
         computed = hem_l0.canonical_derived_hash()
@@ -622,8 +693,7 @@ _EXPECTED_L0 = {
     "contradictions_current": 2,
     "observations_current": 2,
     "evidence_current": 2,
-    "derivations_pending_supersede_marker": 1,
-    "claim_bearing_pending_retract_marker": 1,
+    "claim_bearing_pending_marker": 2,  # dv_2 (supersede) + ax_1 (retract) -- two distinct nodes
     "contradictions_open": 1,
     "observations_without_evidence_id": 1,
     "evidence_uncited": 1,
@@ -652,19 +722,17 @@ def _rate(numerator: int, denominator: int) -> "float | _Unavailable":
 
 
 def _derive_signals_from_measurements(m: dict) -> dict:
-    """Mirrors each of the nine LIVE signal functions' own arithmetic AND
-    empty-denominator policy, reading ONLY from an L0 measurements dict —
-    this is what slice 2 will ship as real code; here it exists solely to
-    prove the decomposition is complete and correct today, on ANY graph
-    (not just a fixture engineered to keep every denominator non-zero). NOT
-    shipped, NOT imported by health/engine.py — see module docstring."""
+    """Mirrors each of the (originally nine, now eight per engram-alpha#2905
+    PR-B) LIVE signal functions' own arithmetic AND empty-denominator
+    policy, reading ONLY from an L0 measurements dict — this is what slice 2
+    will ship as real code; here it exists solely to prove the decomposition
+    is complete and correct today, on ANY graph (not just a fixture
+    engineered to keep every denominator non-zero). NOT shipped, NOT
+    imported by health/engine.py — see module docstring."""
     derived = {}
 
-    derived["stale_derivation_rate"] = _rate(
-        m["derivations_pending_supersede_marker"], m["derivations_current"]
-    )
-    derived["taint_rate"] = _rate(
-        m["claim_bearing_pending_retract_marker"], m["claim_bearing_current"]
+    derived["pending_premise_rate"] = _rate(
+        m["claim_bearing_pending_marker"], m["claim_bearing_current"]
     )
     derived["open_contradiction_rate"] = _rate(
         m["contradictions_open"], m["contradictions_current"]
@@ -723,9 +791,18 @@ def _derive_signals_from_measurements(m: dict) -> dict:
     return derived
 
 
+# engram-alpha#2905 PR-B: "pending_premise_rate" deliberately has NO entry
+# here. health.metrics (the pre-existing, independent-oracle SQL file) has
+# no equivalent function -- adding one is out of PR-B's declared scope
+# (Scope: measurements.py, signals.py, model.py, version.py, plus their
+# test files -- health/metrics.py is not among them). This means
+# test_l0_decomposition_matches_live_signals_exactly below no longer
+# independently cross-checks pending_premise_rate against a live-SQL
+# oracle -- a real, flagged reduction in this class's coverage, not a
+# silent one. Flagged in the PR-B coder-fairy handoff as a load-bearing
+# scope gap requiring a parent decision (a companion health/metrics.py +
+# health/engine.py CONFIG change) before this coverage can be restored.
 _LIVE_SIGNAL_FNS = {
-    "stale_derivation_rate": metrics.stale_derivation_rate,
-    "taint_rate": metrics.taint_rate,
     "open_contradiction_rate": metrics.open_contradiction_rate,
     "uncited_observation_rate": metrics.uncited_observation_rate,
     "dangling_evidence_rate": metrics.dangling_evidence_rate,
@@ -774,26 +851,35 @@ class TestAcceptanceCriterion:
     def test_perturbing_a_nonzero_measurement_is_detected(self):
         """THE REQUIRED CONTROL (non-optional per the #2537 build brief and
         Ariadne's amendment #2). Perturbs
-        ``claim_bearing_pending_retract_marker`` — real fixture value 1, NOT
+        ``claim_bearing_without_recall_summary`` — real fixture value 1, NOT
         0 (per the amendment: a perturbation landing on an already-zero
         value demonstrates nothing) — and asserts the equality check FAILS.
         A test that has only ever been seen to pass has not been shown
-        capable of failing."""
+        capable of failing.
+
+        NOTE (engram-alpha#2905 PR-B): this control previously perturbed
+        ``claim_bearing_pending_retract_marker`` (now retired, unified into
+        ``claim_bearing_pending_marker``). Switched to
+        ``claim_bearing_without_recall_summary`` because
+        ``pending_premise_rate`` has no live-oracle entry in
+        ``_LIVE_SIGNAL_FNS`` (see that dict's own comment) — this control
+        needs a measurement whose signal IS still independently oracled."""
         conn = _build_populated_fixture()
         with mock.patch("engram_core._embedder.is_available", return_value=True), \
              mock.patch("engram_core._get_embedding_config", return_value={"enabled": True}):
             measurements = hem_l0.compute_all_measurements(conn)
-            assert measurements["claim_bearing_pending_retract_marker"] == 1  # non-zero, per amendment #2
+            assert measurements["claim_bearing_without_recall_summary"] == 1  # non-zero, per amendment #2
 
             perturbed = dict(measurements)
-            perturbed["claim_bearing_pending_retract_marker"] = 2  # corrupt: 1 -> 2
+            perturbed["claim_bearing_without_recall_summary"] = 2  # corrupt: 1 -> 2
 
             derived = _derive_signals_from_measurements(perturbed)
-            live_taint_rate = metrics.taint_rate(conn)  # same conn, unperturbed graph
+            live_recall_summary_coverage = metrics.recall_summary_coverage(conn)  # same conn, unperturbed graph
 
-            assert derived["taint_rate"] != live_taint_rate, (
+            assert derived["recall_summary_coverage"] != live_recall_summary_coverage, (
                 "control failed to detect the perturbation: derived "
-                f"{derived['taint_rate']!r} vs live {live_taint_rate!r} — "
+                f"{derived['recall_summary_coverage']!r} vs live "
+                f"{live_recall_summary_coverage!r} — "
                 "the perturbation should have produced a mismatch"
             )
 
@@ -902,8 +988,9 @@ class TestReplayField:
     def test_replay_declarations_today(self):
         """Exactly three non-``graph`` declarations today (D2/§3's table):
         ``claim_bearing_null_embedding`` is ``stripped``; the two embedder
-        booleans are ``environment``; every other one of the 17 registered
-        measurements is ``graph`` (14 of them). ``replay_decl_hash()`` is a
+        booleans are ``environment``; every other one of the 16 registered
+        measurements is ``graph`` (13 of them, per engram-alpha#2905 PR-B's
+        unification of two numerators into one). ``replay_decl_hash()`` is a
         64-hex-char sha256 digest, and it CHANGES when a single declared
         value is flipped on a registry copy (never touching the real
         module-level ``MEASUREMENTS``)."""
@@ -919,8 +1006,8 @@ class TestReplayField:
             "embedder_config_enabled": "environment",
         }
         graph_names = {name for name, v in declarations.items() if v == "graph"}
-        assert len(graph_names) == 14
-        assert len(declarations) == 17
+        assert len(graph_names) == 13
+        assert len(declarations) == 16
 
         current_hash = hem_l0.replay_decl_hash()
         assert isinstance(current_hash, str)

@@ -145,12 +145,16 @@ def _populated_conn() -> sqlite3.Connection:
     retrievability reads a REAL (non-UNAVAILABLE) score -- base scenario
     from tests/test_health_engine.py's own
     ``test_populated_graph_produces_real_aspect_scores``, EXTENDED with a
-    pending supersede marker on the derivation node so
-    ``stale_derivation_rate`` (raw 1.0, badness-curved near 0) reads a REAL
-    score genuinely DIFFERENT from ``taint_rate`` (raw 0.0, badness-curved
-    at 1.0) -- the round-trip importance-mutation test below needs two
-    admitted metrics with DIFFERENT scores in the same aspect, or removing
-    one from the weighted mean would not move the aspect score at all."""
+    pending supersede marker on the derivation node so ``pending_premise_
+    rate`` (engram-alpha#2905 PR-B; raw 0.5 on this fixture -- dv_1, one of
+    two claim-bearing nodes, carries the pending marker) reads a REAL,
+    non-trivial score. NOTE (PR-B): epistemic_integrity now has exactly ONE
+    admitted metric (pending_premise_rate -- open_contradiction_rate is a
+    0.0-importance hold-out, per PR-A) -- the round-trip importance-
+    mutation test below drops that SOLE admitted metric, making the whole
+    aspect go UNAVAILABLE rather than merely shifting its score between two
+    metrics (the pre-PR-B framing, when taint_rate/stale_derivation_rate
+    were two separate admitted metrics)."""
     conn = _make_conn()
     _insert(conn, "dv_1", "derivation", metadata={},
             recall_summary="s1", recall_keywords=["k1"],
@@ -245,7 +249,7 @@ def test_round_trip_knot_mutation_changes_that_signals_score():
         snapshot = health_engine.build_snapshot(conn, "nap")
         l1 = _live_l1(conn)
 
-        target_signal = "taint_rate"
+        target_signal = "pending_premise_rate"
         assert snapshot["signals"][target_signal] != "UNAVAILABLE"
         curve_name = next(
             m["curve"] for m in snapshot["model_defs"]["metrics"]
@@ -254,12 +258,15 @@ def test_round_trip_knot_mutation_changes_that_signals_score():
 
         mutated_curve_defs = copy.deepcopy(snapshot["curve_defs"])
         knots = mutated_curve_defs[curve_name]["knots"]
-        # Mutate the FIRST knot's y -- taint_rate's raw signal is 0.0 in
-        # this fixture (a clean graph), which is exactly the knot at
-        # x=0.0; mutating a knot the raw value does not land on (e.g. the
-        # last knot) would silently pass without exercising anything.
-        first_y = knots[0][1]
-        knots[0][1] = first_y - 0.5 if first_y >= 0.5 else first_y + 0.5
+        # Mutate the knot at x=0.5's y -- pending_premise_rate's raw signal
+        # is 0.5 in this fixture (1 of 2 claim-bearing nodes carries the
+        # pending marker), which is exactly badness_pending_premise's knot
+        # at x=0.5; mutating a knot the raw value does not land on (e.g.
+        # the last knot) would silently pass without exercising anything.
+        target_x = 0.5
+        knot_idx = next(i for i, (x, _y) in enumerate(knots) if x == target_x)
+        first_y = knots[knot_idx][1]
+        knots[knot_idx][1] = first_y - 0.1 if first_y >= 0.5 else first_y + 0.1
 
         m2 = model_from_defs(snapshot["model_defs"], mutated_curve_defs)
         _, scores_mutated = health_engine.score_signals(l1, m2)
@@ -271,13 +278,37 @@ def test_round_trip_knot_mutation_changes_that_signals_score():
 def test_round_trip_importance_mutation_drops_metric_from_play():
     """Named mutation 2: set one admitted metric's importance to 0.0 in a
     copy of model_defs -> that aspect's score changes and
-    aspect_coverage[aspect]["metrics_in_play"] drops the signal."""
+    aspect_coverage[aspect]["metrics_in_play"] drops the signal.
+
+    NOTE (engram-alpha#2905 PR-B): ``pending_premise_rate`` is now
+    epistemic_integrity's SOLE admitted metric (open_contradiction_rate is
+    a 0.0-importance hold-out, per PR-A) -- dropping its importance to 0.0
+    makes the WHOLE ASPECT go UNAVAILABLE (zero admitted metrics, held out
+    and renormalized per the design ruling), a stronger demonstration than
+    the pre-PR-B two-admitted-metrics framing (where the aspect score
+    merely shifted). The ``!=`` assertion below still holds (a real float
+    vs "UNAVAILABLE" are never equal).
+
+    FIX (round 2, engram-alpha#2905 PR-B): this docstring note already
+    correctly anticipated the WHOLE-ASPECT-held-out consequence, but the
+    original ``target_signal not in scores_mutated["aspect_coverage"]
+    [target_aspect]["metrics_in_play"]`` assertion still assumed
+    ``aspect_coverage[target_aspect]`` EXISTS in the mutated result -- it
+    does not: a held-out aspect has NO entry in ``aspect_coverage`` at all
+    (per ``build_snapshot``'s own scoping -- see
+    ``TestRealModelCompositionConsequence`` in test_health_engine.py,
+    "provenance_integrity has NO entry in aspect_coverage"), so the
+    original assertion raised ``KeyError`` rather than testing anything.
+    Never actually run before this round -- the import chain round 1's own
+    commit message flagged as blocked (health.engine raising at import
+    time) prevented this test from executing at all until this round's
+    engine.py/model.py fix landed."""
     conn = _populated_conn()
     with mock.patch("engram_core._embedder.is_available", return_value=True):
         snapshot = health_engine.build_snapshot(conn, "nap")
         l1 = _live_l1(conn)
 
-        target_signal = "stale_derivation_rate"
+        target_signal = "pending_premise_rate"
         assert snapshot["signals"][target_signal] != "UNAVAILABLE"
         target_aspect = next(
             m["aspect"] for m in snapshot["model_defs"]["metrics"]
@@ -297,9 +328,10 @@ def test_round_trip_importance_mutation_drops_metric_from_play():
         _, scores_mutated = health_engine.score_signals(l1, m2)
         _, scores_live = health_engine.score_signals(l1, health_engine.MODEL)
 
+    assert scores_mutated["aspects"][target_aspect] == "UNAVAILABLE"
     assert scores_mutated["aspects"][target_aspect] != scores_live["aspects"][target_aspect]
     assert target_signal in scores_live["aspect_coverage"][target_aspect]["metrics_in_play"]
-    assert target_signal not in scores_mutated["aspect_coverage"][target_aspect]["metrics_in_play"]
+    assert target_aspect not in scores_mutated["aspect_coverage"]
 
 
 # ---------------------------------------------------------------------------
@@ -394,10 +426,28 @@ def _metric_by_signal() -> dict:
 
 
 class TestV1_2CurveRebindings:
-    def test_taint_and_stale_derivation_rebind_to_pending_premise_curve(self):
+    def test_pending_premise_rate_bound_to_pending_premise_curve(self):
+        """engram-alpha#2905 PR-B: unifies taint_rate + stale_derivation_rate
+        (PR-A's interim per-metric rebind onto badness_pending_premise) into
+        ONE signal, pending_premise_rate, bound to the SAME curve at
+        importance 1.0 in epistemic_integrity."""
         bindings = _metric_by_signal()
-        assert bindings["taint_rate"].curve == "badness_pending_premise"
-        assert bindings["stale_derivation_rate"].curve == "badness_pending_premise"
+        binding = bindings["pending_premise_rate"]
+        assert binding.curve == "badness_pending_premise"
+        assert binding.aspect == "epistemic_integrity"
+        assert binding.importance == 1.0
+
+    def test_taint_rate_and_stale_derivation_rate_no_longer_registered(self):
+        """engram-alpha#2905 PR-B retires both signals -- neither the
+        model's metric bindings nor health.signals' SIGNALS/SIGNAL_DEFS
+        registries carry them anymore."""
+        bindings = _metric_by_signal()
+        assert "taint_rate" not in bindings
+        assert "stale_derivation_rate" not in bindings
+        assert health_signals.SIGNALS.get("taint_rate") is None
+        assert health_signals.SIGNALS.get("stale_derivation_rate") is None
+        assert "taint_rate" not in health_signals.SIGNAL_DEFS
+        assert "stale_derivation_rate" not in health_signals.SIGNAL_DEFS
 
     def test_open_contradiction_rate_is_held_out(self):
         """Lei's 2026-09-13 ruling: importance 0.0 (HOLD-OUT, informational)
@@ -459,18 +509,20 @@ class TestV1_2CurveRebindings:
             in health_curves.CURVE_PROVENANCE["goodness_coverage"]
         )
 
-    def test_health_version_current_is_v1_2_end_to_end(self):
-        """health.version.CURRENT == "health-v1.2", confirmed through the
+    def test_health_version_current_is_v2_0_end_to_end(self):
+        """health.version.CURRENT == "health-v2.0", confirmed through the
         full model/engine version-stamping path (build_snapshot's
         health_version key) -- mirrors tests/test_health_engine.py's
         ``test_version_stamps_present_and_match_health_version`` (the
         dynamic version of this check, unaffected by any MINOR bump), pinned
-        here against the LITERAL v1.2 string so a regression in either
-        health.version.MINOR or the snapshot wiring is caught."""
+        here against the LITERAL v2.0 string so a regression in either
+        health.version.MAJOR/MINOR or the snapshot wiring is caught.
+        ``model_version`` (health_version.MINOR) is 0, not 2 -- PR-B's MAJOR
+        bump resets MINOR (see health/version.py's own docstring)."""
         from health import version as health_version
 
-        assert health_version.CURRENT == "health-v1.2"
+        assert health_version.CURRENT == "health-v2.0"
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
-        assert snap["health_version"] == "health-v1.2"
-        assert snap["model_version"] == 2
+        assert snap["health_version"] == "health-v2.0"
+        assert snap["model_version"] == 0

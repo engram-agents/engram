@@ -6,7 +6,9 @@ WHY THIS FILE CHANGED: this file used to prove that a hand-built
 matched PR1-3's per-metric scoring behavior EXACTLY (``LEGACY_GOODNESS_
 TRANSITION_CURVE``'s own regression-safety role, still documented in
 health/curves.py). That guarantee — "the first shipped curve-library
-model must reproduce today's nine scores" — was the design doc's transition
+model must reproduce today's nine scores" (nine at the time this rule was
+written; engram-alpha#2905 PR-B later unified two of those nine into one,
+see below) — was the design doc's transition
 rule for PR4's buildable slice, when the curve library was NOT YET wired
 into any real scoring path (PR4's own module docstring: "additive-only,
 this module is new and is not imported by health/engine.py ... in this
@@ -24,7 +26,9 @@ exact-score reproduction is not required for v2.
 REPURPOSED (option (b) of the PR5 spec's "retire vs repurpose" choice,
 preferred over deleting outright because this file's fixture-DB
 infrastructure — a realistic multi-metric, multi-aspect graph exercising
-all nine real signal functions at once — is worth reusing): this file now
+all real signal functions at once (nine at the time this note was written;
+eight as of engram-alpha#2905 PR-B, see below) — is worth reusing): this
+file now
 tests that every curve health.engine.MODEL's real metrics are bound to,
 wired through the REAL composition path (``health.engine.build_snapshot``),
 produces SANE results against this same realistic fixture — bounded scores,
@@ -39,15 +43,21 @@ informationally, not as a load-bearing requirement going forward (same
 status the old ``metric_goodness`` comparison had — see health/curves.py's
 ``BADNESS_DEFAULT_CURVE`` docstring for the current shape and its
 provenance), for the metrics STILL bound to one of those two placeholder
-curves. As of engram-alpha#2905 PR-A, this is no longer ALL nine real
+curves. As of engram-alpha#2905 PR-A, this was no longer ALL nine real
 metrics — five of them (``taint_rate``, ``stale_derivation_rate``,
 ``embedding_coverage``, ``recall_summary_coverage``,
 ``recall_keywords_coverage``) rebound to genuinely different curve shapes
 (``badness_pending_premise``/``goodness_coverage``, see health/model.py's
-``MODEL_SPEC``); the placeholder-shape pin is skipped for those five (their
-sanity — bounded, no NaN — is still asserted, same as every metric), since
-asserting the OLD placeholder formula against a curve that was
-DELIBERATELY reshaped away from it would be asserting something false.
+``MODEL_SPEC``). PR-B (round 2) then unified ``taint_rate`` +
+``stale_derivation_rate`` into one ``pending_premise_rate`` metric (still
+bound to ``badness_pending_premise``), so it is now four of the eight real
+metrics (``pending_premise_rate``, ``embedding_coverage``,
+``recall_summary_coverage``, ``recall_keywords_coverage``) that rebound
+away from the two placeholder curves; the placeholder-shape pin is skipped
+for those four (their sanity — bounded, no NaN — is still asserted, same
+as every metric), since asserting the OLD placeholder formula against a
+curve that was DELIBERATELY reshaped away from it would be asserting
+something false.
 """
 
 from __future__ import annotations
@@ -167,14 +177,18 @@ def _insert_marker(conn, node_id, root_op, status="pending", cascade_event=None)
 
 
 def _build_fixture_conn() -> sqlite3.Connection:
-    """One small, realistic fixture DB exercising ALL NINE real metrics'
-    signal functions at once, each landing on a non-degenerate,
-    non-UNAVAILABLE rate. UNCHANGED from the pre-PR5 version of this file —
-    see module docstring for why this infrastructure survives the repurpose.
+    """One small, realistic fixture DB exercising ALL real metrics' signal
+    functions at once (nine at the time this docstring was written; eight
+    as of engram-alpha#2905 PR-B's taint_rate/stale_derivation_rate
+    unification — see module docstring), each landing on a non-degenerate,
+    non-UNAVAILABLE rate. The fixture DATA is UNCHANGED from the pre-PR5
+    version of this file — see module docstring for why this
+    infrastructure survives the repurpose.
 
     Layout (deliberately cross-cutting — the same 4 claim-bearing nodes
-    dv_1/dv_2/ob_1/ob_2 feed taint_rate AND all four aspect-B metrics, per
-    their shared "claim_bearing_nodes" denominator population):
+    dv_1/dv_2/ob_1/ob_2 feed pending_premise_rate AND all four aspect-B
+    metrics, per their shared "claim_bearing_nodes" denominator
+    population):
       - dv_1, dv_2: derivations. dv_1 carries a pending supersede marker
         (stale); dv_1 also carries a real recall_summary/recall_keywords/
         embedding (covered on all three aspect-B coverage axes). dv_2 has
@@ -222,25 +236,28 @@ def _build_fixture_conn() -> sqlite3.Connection:
 
 
 # ---------------------------------------------------------------------------
-# The nine real metric bindings — read off health.engine.MODEL (round 3: the
-# validated model, built by health/engine.py via health.model.load()
-# — no longer importable ready-made as health.model.MODEL, see that
-# module's own docstring), never hand-copied (same discipline the pre-PR5
-# version of this file applied to health.engine.CONFIG).
+# The eight real metric bindings (nine before engram-alpha#2905 PR-B's
+# taint_rate/stale_derivation_rate unification into pending_premise_rate) —
+# read off health.engine.MODEL (round 3: the validated model, built by
+# health/engine.py via health.model.load() — no longer importable
+# ready-made as health.model.MODEL, see that module's own docstring), never
+# hand-copied (same discipline the pre-PR5 version of this file applied to
+# health.engine.CONFIG).
 # ---------------------------------------------------------------------------
 
 _ALL_REAL_BINDINGS = he.MODEL.metrics
 
 
-def test_model_has_exactly_nine_real_metric_bindings():
+def test_model_has_exactly_eight_real_metric_bindings():
     """Sanity check on this test file's own premise — if this ever drifts
-    (a tenth metric added, one removed, e.g. the pending_marker_ratio
-    merge), the parametrize below would silently test a different N; this
-    makes that visible instead."""
-    assert len(_ALL_REAL_BINDINGS) == 9
+    (a ninth metric added, one removed), the parametrize below would
+    silently test a different N; this makes that visible instead.
+    engram-alpha#2905 PR-B is the merge this test's prior name/docstring
+    anticipated ("the pending_marker_ratio merge") — it already landed,
+    dropping the count from nine to eight."""
+    assert len(_ALL_REAL_BINDINGS) == 8
     assert {m.signal for m in _ALL_REAL_BINDINGS} == {
-        "stale_derivation_rate",
-        "taint_rate",
+        "pending_premise_rate",
         "open_contradiction_rate",
         "uncited_observation_rate",
         "dangling_evidence_rate",
@@ -395,8 +412,10 @@ class TestCurveDataFileIsGenuinelyWiredIn:
         so reshaping ``badness_default`` would no longer move the composed
         score and this test would stop proving what it exists to prove.
         ``badness_pending_premise`` is where the admitted epistemic_
-        integrity metrics (``taint_rate``/``stale_derivation_rate``) live
-        instead."""
+        integrity metric lives instead — ``taint_rate``/
+        ``stale_derivation_rate`` at PR-A time, unified into one
+        ``pending_premise_rate`` MetricBinding by PR-B (round 2), still
+        bound to the same curve."""
         with mock.patch("engram_core._embedder.is_available", return_value=True):
             original_snap = he.build_snapshot(_build_fixture_conn(), "nap")
         original_composed = original_snap["scores"]["composed"]
@@ -414,12 +433,14 @@ class TestCurveDataFileIsGenuinelyWiredIn:
             "below to still be a genuine change"
         )
         # Reshape the (0.5, 0.2) knot specifically (not the tail) -- this
-        # fixture's stale_derivation_rate lands EXACTLY on x=0.5 and
-        # taint_rate's rate falls in the (0.2, 0.5) segment whose right
-        # endpoint is this same knot, so both metrics' scores actually move;
-        # reshaping only the (1.0, ...) tail knot (unreached by either
-        # rate here) would leave the composed score unchanged and this test
-        # would falsely conclude the wiring is inert.
+        # fixture's pending_premise_rate (engram-alpha#2905 PR-B's
+        # unification of taint_rate + stale_derivation_rate: 2 of the 4
+        # claim-bearing nodes -- dv_1 via its pending supersede marker,
+        # ob_1 via its pending retract marker -- carry a pending marker)
+        # lands EXACTLY on x=0.5, so its score actually moves; reshaping
+        # only the (1.0, ...) tail knot (unreached by this rate here) would
+        # leave the composed score unchanged and this test would falsely
+        # conclude the wiring is inert.
         edited_defs["badness_pending_premise"]["knots"] = [
             [0.0, 1.0], [0.01, 0.9], [0.05, 0.8], [0.2, 0.5], [0.5, 0.35], [1.0, 0.0],
         ]

@@ -66,9 +66,11 @@ from viz.data import health_workbench as viz_health_workbench_data  # noqa: E402
 def _make_fixture_snapshot(turn: int) -> dict:
     """A minimal but real-shaped health-v2 snapshot, one signal
     (``taint_rate``), enough to exercise the workbench route without
-    depending on all nine real model signals being present."""
+    depending on all real model signals being present (nine at the time
+    this docstring was written; eight as of engram-alpha#2905 PR-B's
+    taint_rate/stale_derivation_rate unification)."""
     return {
-        "health_version": "0.4.0-pr5",
+        "health_version": "0.5.0",
         "raw_schema_version": "1",
         "model_version": "1",
         "anchor": "deadbeef",

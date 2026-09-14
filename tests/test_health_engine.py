@@ -137,7 +137,8 @@ CREATE TABLE edit_history (
     details     TEXT DEFAULT '{}'
 );
 
--- health.metrics.stale_derivation_rate/taint_rate query this table
+-- health.metrics.pending_premise_rate (engram-alpha#2905 PR-B; formerly the
+-- separate stale_derivation_rate/taint_rate) queries this table
 -- (cascade machine, #1991 sec1 re-point) -- present here so any test that
 -- exercises build_snapshot() over a real derivation/claim-bearing node
 -- doesn't hit sqlite3.OperationalError: no such table. Mirrors
@@ -235,11 +236,13 @@ class TestConfigShape:
             "retrievability": 35.0,
         }
 
-    def test_epistemic_integrity_has_three_metrics(self):
+    def test_epistemic_integrity_has_two_metrics(self):
+        """engram-alpha#2905 PR-B: stale_derivation_rate + taint_rate unified
+        into one pending_premise_rate MetricDef -- Aspect A drops from 3
+        metrics to 2."""
         aspect = next(a for a in health_engine.CONFIG.aspects if a.name == "epistemic_integrity")
         assert {m.name for m in aspect.metrics} == {
-            "stale_derivation_rate",
-            "taint_rate",
+            "pending_premise_rate",
             "open_contradiction_rate",
         }
 
@@ -671,8 +674,9 @@ class TestZeroAdmittedAspectExtensibility:
     builds adversarial/fake models — via dataclasses.replace off the REAL
     MODEL (round 3: ``health_engine.MODEL``, the validated model — no
     longer importable ready-made from health/model.py, see that
-    module's own docstring), never a hand-rewritten copy of the 9-metric
-    table (which would risk silently drifting from the real shape)."""
+    module's own docstring), never a hand-rewritten copy of the 8-metric
+    table (engram-alpha#2905 PR-B: nine -> eight; which would risk
+    silently drifting from the real shape)."""
 
     def _model_with_uncited_observation_rate_admitted(self):
         import dataclasses
@@ -850,17 +854,17 @@ class TestBuildSnapshot:
         build_snapshot raises HealthEngineSSoTError rather than silently
         accepting the divergence."""
         conn = _make_conn()
-        # Populate enough that taint_rate's denominator (claim_bearing_
-        # current) is non-zero, so L1's real computed value is a genuine
-        # float the patched constant is guaranteed to differ from (0.0
-        # could coincidentally match on an all-empty graph — this fixture
-        # avoids that).
+        # Populate enough that pending_premise_rate's denominator (claim_
+        # bearing_current) is non-zero, so L1's real computed value is a
+        # genuine float the patched constant is guaranteed to differ from
+        # (0.0 could coincidentally match on an all-empty graph — this
+        # fixture avoids that).
         _insert(conn, "obs_1", "observation_factual")
         with mock.patch.dict(
             health_engine._LIVE_SIGNAL_FNS_FOR_VERIFICATION,
-            {"taint_rate": lambda _conn: 0.987654321},
+            {"pending_premise_rate": lambda _conn: 0.987654321},
         ):
-            with pytest.raises(health_engine.HealthEngineSSoTError, match="taint_rate"):
+            with pytest.raises(health_engine.HealthEngineSSoTError, match="pending_premise_rate"):
                 health_engine.build_snapshot(conn, "nap")
 
     def test_verification_table_is_complete_against_l1_signals(self):
@@ -999,16 +1003,17 @@ class TestBuildSnapshot:
         """RENAMED (round 2 of engram-alpha#2520, fold #2): open_
         contradiction_rate no longer returns a "clean" 0.0 on zero current
         contradiction nodes — it now declines (UNAVAILABLE) exactly like
-        its two epistemic_integrity siblings, so on a truly EMPTY graph
-        every one of the nine signals is UNAVAILABLE. With ZERO available
+        its epistemic_integrity sibling, so on a truly EMPTY graph
+        every one of the eight signals is UNAVAILABLE (engram-alpha#2905
+        PR-B: stale_derivation_rate + taint_rate unified into
+        pending_premise_rate, nine -> eight). With ZERO available
         admitted metrics anywhere, all THREE aspects are held out (round 2,
         addendum 2's generalization) and composed is UNAVAILABLE too — the
         one remaining case where nothing anywhere is scored (see
         compose_aspect_scores's own "all aspects unavailable" branch)."""
         conn = _make_conn()
         snap = health_engine.build_snapshot(conn, "nap")
-        assert snap["signals"]["stale_derivation_rate"] == "UNAVAILABLE"
-        assert snap["signals"]["taint_rate"] == "UNAVAILABLE"
+        assert snap["signals"]["pending_premise_rate"] == "UNAVAILABLE"
         assert snap["signals"]["uncited_observation_rate"] == "UNAVAILABLE"
         assert snap["signals"]["dangling_evidence_rate"] == "UNAVAILABLE"
         # aspect B (PR3): empty claim-bearing population -> all four UNAVAILABLE too
@@ -1039,13 +1044,13 @@ class TestBuildSnapshot:
         snap = health_engine.build_snapshot(conn, "nap")
         raw = json.dumps(snap)
         parsed = json.loads(raw)
-        assert parsed["signals"]["stale_derivation_rate"] == "UNAVAILABLE"
-        assert parsed["signals"]["stale_derivation_rate"] != -1
-        assert parsed["signals"]["stale_derivation_rate"] is not None
+        assert parsed["signals"]["pending_premise_rate"] == "UNAVAILABLE"
+        assert parsed["signals"]["pending_premise_rate"] != -1
+        assert parsed["signals"]["pending_premise_rate"] is not None
         # And the raw JSON text itself must contain the literal string, not
         # a bare `null` or `-1` at that key's position.
-        assert '"stale_derivation_rate": "UNAVAILABLE"' in json.dumps(snap, indent=2) or \
-            '"stale_derivation_rate":"UNAVAILABLE"' in raw
+        assert '"pending_premise_rate": "UNAVAILABLE"' in json.dumps(snap, indent=2) or \
+            '"pending_premise_rate":"UNAVAILABLE"' in raw
 
     def test_populated_graph_produces_real_aspect_scores(self):
         """[PR5, updated; round 2 of engram-alpha#2520 changes composed's
@@ -1064,8 +1069,10 @@ class TestBuildSnapshot:
         affects epistemic_integrity's coverage at all: Lei's 2026-09-13
         ruling moved open_contradiction_rate's importance to 0.0 (HOLD-OUT,
         informational), so it is not an ADMITTED metric any more -- coverage
-        is now a clean 2-of-2 (taint_rate, stale_derivation_rate), not the
-        pre-PR-A 2-of-3 renormalize this docstring used to describe."""
+        is now a clean 1-of-1 (pending_premise_rate, engram-alpha#2905 PR-B's
+        unification of the prior taint_rate/stale_derivation_rate pair into
+        one metric), not the pre-PR-A 2-of-3 renormalize this docstring used
+        to describe."""
         conn = _make_conn()
         # Give every real metric a non-empty denominator with a clean signal
         # — including aspect B's four: both claim-bearing nodes carry a
@@ -1100,12 +1107,13 @@ class TestBuildSnapshot:
         # population, no contradiction node in this fixture) -- but as of
         # engram-alpha#2905 PR-A it is importance=0.0 (HOLD-OUT), so it is
         # not an admitted metric and does not enter epistemic_integrity's
-        # coverage accounting at all: coverage is a clean 2-of-2 over
-        # taint_rate/stale_derivation_rate, not a 2-of-3 renormalize.
+        # coverage accounting at all: coverage is a clean 1-of-1 over
+        # pending_premise_rate (PR-B's unification of the prior
+        # taint_rate/stale_derivation_rate pair), not a 2-of-3 renormalize.
         assert snap["signals"]["open_contradiction_rate"] == "UNAVAILABLE"
         epistemic_coverage = snap["scores"]["aspect_coverage"]["epistemic_integrity"]
         assert set(epistemic_coverage["metrics_in_play"]) == {
-            "taint_rate", "stale_derivation_rate",
+            "pending_premise_rate",
         }
         assert epistemic_coverage["coverage"] == pytest.approx(1.0)
 
@@ -1125,11 +1133,16 @@ class TestBuildSnapshot:
     def test_per_metric_display_score_matches_the_shared_curve_transform(self):
         """[PR5, rewritten] build_snapshot's per-metric display score
         (snap["scores"]["metrics"]) must be derived from the SAME curve the
-        real scoring model binds to that metric (``badness_default`` for
-        five of the nine real metrics, ``goodness_default`` for the other
-        four as of engram-alpha#2518 — see health/model.py's
-        ``CURVES``) — not an independently re-implemented copy of the
-        transform that could silently diverge. This test exercises
+        real scoring model binds to that metric — as of engram-alpha#2905
+        PR-B (nine -> eight real metrics), ``badness_default`` for three
+        (open_contradiction_rate, uncited_observation_rate,
+        dangling_evidence_rate), ``badness_pending_premise`` for one
+        (pending_premise_rate), ``goodness_coverage`` for three
+        (recall_summary_coverage, recall_keywords_coverage,
+        embedding_coverage), and ``goodness_default`` for the remaining one
+        (giant_component_fraction) — see health/model.py's ``CURVES`` —
+        not an independently re-implemented copy of the transform that
+        could silently diverge. This test exercises
         ``open_contradiction_rate`` specifically, which stays on
         ``badness_default``, unaffected by #2518's flip.
         Supersedes the PR2/PR3-era version of this test, which compared
@@ -1672,7 +1685,9 @@ class TestDreamProjection:
 
         assert set(projection.keys()) & self._FORBIDDEN_TOP_LEVEL_KEYS == set()
         assert "metrics" in projection
-        assert len(projection["metrics"]) == 9
+        # engram-alpha#2905 PR-B: stale_derivation_rate + taint_rate unified
+        # into pending_premise_rate, nine -> eight metrics.
+        assert len(projection["metrics"]) == 8
         for metric_name, entry in projection["metrics"].items():
             assert set(entry.keys()) & self._FORBIDDEN_PER_METRIC_KEYS == set()
             assert set(entry.keys()) == {
@@ -1708,18 +1723,18 @@ class TestDreamProjection:
         monkeypatch.setattr(core, "DATA_DIR", tmp_path)
         conn = _make_conn()
         _insert(conn, "dv_1", "derivation")
-        health_engine.write_snapshot(conn, "nap")  # first write: taint_rate score = 1.0 (clean)
+        health_engine.write_snapshot(conn, "nap")  # first write: pending_premise_rate score = 1.0 (clean)
 
-        _insert_marker(conn, "dv_1", root_op="supersede")  # now stale
+        _insert_marker(conn, "dv_1", root_op="supersede")  # now pending
         snap2 = health_engine.write_snapshot(conn, "nap")
         projection2 = json.loads(open(snap2["_dream_projection_path"], encoding="utf-8").read())
-        entry = projection2["metrics"]["stale_derivation_rate"]
+        entry = projection2["metrics"]["pending_premise_rate"]
         assert entry["signal"] == 1.0
-        # As of engram-alpha#2788, badness_default is the DATA-LOADED
-        # placeholder curve(x) == 1 - x (curves.json) -- no floor anymore,
-        # so a rate of 1.0 scores exactly 0.0 (was the 0.01 floor under
-        # the old hand-tuned shape).
-        assert entry["score"] == pytest.approx(0.0)  # badness_default(1.0) == 1 - 1.0
+        # pending_premise_rate is bound to the badness_pending_premise curve
+        # (engram-alpha#2905 PR-A/PR-B), a DATA-LOADED curve (curves.json)
+        # whose knots include (1.0, 0.0) exactly, so a rate of 1.0 scores
+        # exactly 0.0.
+        assert entry["score"] == pytest.approx(0.0)
         assert entry["delta_since_last"] == pytest.approx(0.0 - 1.0)
 
     def test_unavailable_signal_projects_as_the_string_literal(self, tmp_path, monkeypatch):
@@ -1731,7 +1746,7 @@ class TestDreamProjection:
         conn = _make_conn()
         snap = health_engine.write_snapshot(conn, "nap")
         projection = json.loads(open(snap["_dream_projection_path"], encoding="utf-8").read())
-        entry = projection["metrics"]["taint_rate"]
+        entry = projection["metrics"]["pending_premise_rate"]
         assert entry["signal"] == "UNAVAILABLE"
         assert entry["score"] == "UNAVAILABLE"
         assert entry["delta_since_last"] is None

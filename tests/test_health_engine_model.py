@@ -23,7 +23,9 @@ positive tests changed to make the equivalent claim via an explicit
 
 Covers:
   1. The real production model SPEC (``health.model.MODEL_SPEC``) —
-     shape (3 aspects, 9 metrics), points sum to 100, every admitted metric
+     shape (3 aspects, 8 metrics [engram-alpha#2905 PR-B: nine -> eight,
+     stale_derivation_rate + taint_rate unified into pending_premise_rate]),
+     points sum to 100, every admitted metric
      has a registered detector + repair, [engram-alpha#2518] exactly the
      two named v1 curves are used (badness_default for badness-rate
      metrics, goodness_default for the four retrievability coverage-style
@@ -33,7 +35,7 @@ Covers:
      REAL ``health.engine.CONFIG`` via ``load()``.
   2. ``validate_model``/``load`` — one test per contract clause, built from
      small FAKE fixture ``ScoringModel``s + a matching fake ``EngineConfig``
-     (never referencing the real 9 metrics), mirroring
+     (never referencing the real 8 metrics), mirroring
      test_health_engine_config.py's fixture style. A multi-violation test
      proves ALL violations are collected in one ``ModelError``, not just the
      first.
@@ -182,14 +184,15 @@ class TestRealModelShape:
             "retrievability": 35.0,
         }
 
-    def test_nine_metric_bindings_unmerged(self):
-        """Clarification 5: taint_rate / stale_derivation_rate stay two
-        separate metrics — the pending_marker_ratio merge is NOT this PR's
-        job."""
-        assert len(MODEL_SPEC.metrics) == 9
+    def test_eight_metric_bindings_unified(self):
+        """Clarification 5 (originally: taint_rate / stale_derivation_rate
+        stay two separate metrics — "the pending_marker_ratio merge is NOT
+        this PR's job") — SUPERSEDED by engram-alpha#2905 PR-B, which IS
+        that merge: taint_rate and stale_derivation_rate are unified into
+        one pending_premise_rate MetricBinding, nine bindings -> eight."""
+        assert len(MODEL_SPEC.metrics) == 8
         assert {m.signal for m in MODEL_SPEC.metrics} == {
-            "stale_derivation_rate",
-            "taint_rate",
+            "pending_premise_rate",
             "open_contradiction_rate",
             "uncited_observation_rate",
             "dangling_evidence_rate",
@@ -206,7 +209,8 @@ class TestRealModelShape:
         the curve. AMENDED AGAIN by engram-alpha#2905 PR-A (the 2026-09-13
         Lei+Kepler curves session): two more named curves joined the
         registry (``badness_pending_premise``, ``goodness_coverage``), and
-        five of the nine real metrics rebound to them — see
+        five of the (then-nine, now-eight per PR-B's unification) real
+        metrics rebound to them — see
         tests/test_health_model_defs.py's ``TestV1_2CurveRebindings`` for
         the direct per-metric assertions. Still a small,
         named-curve-per-family v1 simplification, not per-metric
@@ -230,11 +234,13 @@ class TestRealModelShape:
         three of those four (embedding_coverage, recall_summary_coverage,
         recall_keywords_coverage) onto the new "goodness_coverage" curve,
         leaving giant_component_fraction alone on "goodness_default". On
-        the badness side, PR-A also moved taint_rate/stale_derivation_rate
-        off "badness_default" onto the new "badness_pending_premise" curve,
-        leaving open_contradiction_rate/uncited_observation_rate/
-        dangling_evidence_rate as the only metrics still on
-        "badness_default" — see tests/test_health_model_defs.py's
+        the badness side, PR-A moved taint_rate/stale_derivation_rate off
+        "badness_default" onto the new "badness_pending_premise" curve
+        (interim, still two separate metrics); PR-B (round 2) then unified
+        those two into ONE pending_premise_rate metric, still bound to
+        "badness_pending_premise", leaving open_contradiction_rate/
+        uncited_observation_rate/dangling_evidence_rate as the only metrics
+        still on "badness_default" — see tests/test_health_model_defs.py's
         ``TestV1_2CurveRebindings`` for the direct per-metric assertions
         this test summarizes at the curve-membership level."""
         goodness_coverage_bound = {
@@ -253,8 +259,7 @@ class TestRealModelShape:
             m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_pending_premise"
         }
         assert badness_pending_premise_bound == {
-            "taint_rate",
-            "stale_derivation_rate",
+            "pending_premise_rate",
         }
         badness_default_bound = {
             m.signal for m in MODEL_SPEC.metrics if m.curve == "badness_default"
@@ -272,17 +277,20 @@ class TestRealModelShape:
         assert MODEL_SPEC.curves["goodness_default"] is GOODNESS_DEFAULT_CURVE
         assert MODEL_SPEC.curves["goodness_default"].monotone_direction == "increasing"
 
-    def test_five_admitted_four_diagnostic(self):
+    def test_four_admitted_four_diagnostic(self):
         """engram-alpha#2905 PR-A (2026-09-13, Lei's ruling): open_
         contradiction_rate moved from admitted (importance 1.0) to
         diagnostic HOLD-OUT (importance 0.0) -- six-admitted/three-
-        diagnostic (this test's pre-PR-A name and shape) is now
-        five-admitted/four-diagnostic."""
+        diagnostic (this test's pre-PR-A name and shape) became
+        five-admitted/four-diagnostic. PR-B (round 2) then unified
+        taint_rate + stale_derivation_rate into one admitted
+        pending_premise_rate MetricBinding, dropping admitted count to
+        four (five-admitted/four-diagnostic -> four-admitted/four-
+        diagnostic; eight total, not nine)."""
         admitted = [m for m in MODEL_SPEC.metrics if m.importance > 0]
         diagnostic = [m for m in MODEL_SPEC.metrics if m.importance <= 0]
         assert {m.signal for m in admitted} == {
-            "taint_rate",
-            "stale_derivation_rate",
+            "pending_premise_rate",
             "embedding_coverage",
             "recall_summary_coverage",
             "recall_keywords_coverage",
@@ -327,17 +335,27 @@ class TestRealModelShape:
                     == config_metric.denominator_population
                 )
 
-    def test_stale_derivation_rate_has_no_additional_detector(self):
-        """Fold #1 (Kepler via Borges, addendum 2 on #1991, 2026-09-03):
-        the 'lottery:stale-load-bearing' additional route is DROPPED —
-        'category 3 in the lottery is a different notion of stale than
-        this metric measures'. scan:cascade-frontier remains its sole
-        (primary) detector."""
-        binding = hem.METRIC_BY_SIGNAL["stale_derivation_rate"]
+    def test_pending_premise_rate_carries_taint_rates_additional_detector(self):
+        """Fold #1 (Kepler via Borges, addendum 2 on #1991, 2026-09-03) had
+        dropped stale_derivation_rate's own 'lottery:stale-load-bearing'
+        additional route — 'category 3 in the lottery is a different notion
+        of stale than this metric measures' — leaving stale_derivation_rate
+        with scan:cascade-frontier as its sole (primary) detector, while
+        taint_rate kept its own additional_detector
+        ('lottery:tainted-valid'). engram-alpha#2905 PR-B unifies the two
+        into one pending_premise_rate MetricBinding, over the claim_bearing_
+        nodes population (taint_rate's, not stale_derivation_rate's
+        narrower derivations-only one) — it carries taint_rate's
+        additional_detector forward; there is no second additional_detector
+        to reconcile, since fold #1 had already dropped
+        stale_derivation_rate's."""
+        binding = hem.METRIC_BY_SIGNAL["pending_premise_rate"]
         assert binding.detector == DetectorRef(
-            name="scan:cascade-frontier", population="derivations"
+            name="scan:cascade-frontier", population="claim_bearing_nodes"
         )
-        assert binding.additional_detector is None
+        assert binding.additional_detector == DetectorRef(
+            name="lottery:tainted-valid", population="claim_bearing_nodes"
+        )
 
     def test_retrievability_reference_metric_is_embedding_coverage(self):
         aspect = next(a for a in MODEL_SPEC.aspects if a.name == "retrievability")
