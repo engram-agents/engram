@@ -66,6 +66,42 @@ import sqlite3
 import engram_core as core
 
 
+# #2943, round 2 (found live on two fleet graphs): the original fix exempted
+# only supersedes/retracts edges themselves from resolution, but the phantom
+# self-loop is NOT specific to those two relations — it fires for ANY dag
+# edge whose target has been superseded specifically BY the edge's own
+# source, regardless of what relation the edge itself is on. Concretely: a
+# node that supersedes another commonly ALSO carries a plain `derives_from`
+# (or `cites`) edge to the very claim it replaced — e.g. node N derives_from
+# (or cites) node M, and N ALSO supersedes M. The derives_from/cites edge is
+# not exempt under the relation-based carve-out, so it still gets resolved:
+# resolve(N) = N (current), resolve(M) = N (M's own successor, via the SAME
+# supersedes fact) -> (N, N), the identical phantom. Confirmed live on two
+# independent graphs with this exact shape, one via derives_from+supersedes,
+# one via cites+supersedes.
+#
+# The correct invariant, refined once more (a colleague's live-graph review
+# caught the first cut of this too broad): dropping EVERY resolved self-loop
+# unconditionally also drops a GENUINE one-node cycle — a literal raw
+# self-edge already in the table (e.g. some_relation edge whose RAW source_id
+# equals its RAW target_id) is a real, if degenerate, DAG violation and must
+# still be reported, not silently swallowed alongside the resolution
+# artifact. The distinguishing test is whether the RAW endpoints already
+# equalled each other BEFORE resolution: if raw_sid == raw_tid, resolution
+# didn't manufacture anything — this is a genuine self-loop, keep it. If
+# raw_sid != raw_tid but resolution makes them equal, THAT is the artifact
+# (an edge whose target was independently superseded by the edge's own
+# source) — drop it. Dropping only the manufactured case can still never
+# hide a genuine multi-node cycle: a self-loop edge (raw or resolved) adds no
+# reachability to any node other than itself, so removing the ARTIFACT kind
+# changes nothing about whether a real cycle elsewhere in the graph is
+# found. No relation-based special-casing is needed at all — _HISTORY_
+# RELATIONS is retired; every dag edge resolves through the chain uniformly,
+# exactly as #2827/#2813 originally intended, and the raw-vs-resolved
+# self-loop distinction (not a relation carve-out) is what separates the
+# artifact from the real thing.
+
+
 def _resolve_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
     """Resolve ``node_id`` to its CURRENT version via the supersedes chain.
 
@@ -109,6 +145,15 @@ def _live_dag_edges(conn: sqlite3.Connection) -> "list[tuple[str, str]]":
     dead-ends with no live node to attribute it to (e.g. a retracted node
     with no replacement) — the same "dead-ended chain" reasoning
     ``core._generalizes_cycle_path`` uses for its own resolve-then-walk.
+
+    #2943 (round 3): an edge whose RESOLVED endpoints collapse to the same
+    node is dropped ONLY when its RAW endpoints did not already — i.e. only
+    when resolution itself manufactured the self-loop, never when a genuine
+    raw self-edge already existed in the table. See the module-level comment
+    above `_resolve_current`'s call sites for the full reasoning (a colleague's
+    live-graph review caught round 2's blanket drop as too broad). This
+    replaces the round-1 relation-based `_HISTORY_RELATIONS` carve-out
+    entirely; every dag edge now resolves through the chain uniformly.
     """
     relations = sorted(core.DAG_RELATIONS)
     if not relations:
@@ -130,10 +175,13 @@ def _live_dag_edges(conn: sqlite3.Connection) -> "list[tuple[str, str]]":
 
     edges: "set[tuple[str, str]]" = set()
     for row in rows:
-        r_sid = _res(row["sid"])
-        r_tid = _res(row["tid"])
+        raw_sid, raw_tid = row["sid"], row["tid"]
+        r_sid = _res(raw_sid)
+        r_tid = _res(raw_tid)
         if r_sid is None or r_tid is None:
             continue  # dead-ended chain: no live node to attribute the edge to
+        if r_sid == r_tid and raw_sid != raw_tid:
+            continue  # resolution MANUFACTURED this self-loop -- not a real cycle
         edges.add((r_sid, r_tid))
     return sorted(edges)
 
