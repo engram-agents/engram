@@ -1101,6 +1101,10 @@
       "reason": "maintainer/CI-time regeneration tool for the #1958 tool-capability index: reads server.py's real TOOL_CAPABILITIES dict + FastMCP's registered tool set and writes the checked-in tool_capability_index.txt artifact (root-level, not a generated/ subdirectory). No install ever needs to run it — it's invoked by repo contributors when a tool's capability line changes or a new tool is added, and by the drift-guard test in CI. Same shape as tools/engram-backfill-special-moment-edges.py's excluded[] entry: idempotent, safe to re-run, but not a recurring shipped mechanism."
     },
     {
+      "path": "tools/propose-generalizes-migration.py",
+      "reason": "one-shot adjudicated migration proposer for the `generalizes` relation (epic #2753, decision D5): opens the graph READ-ONLY and emits a candidate report that an agent adjudicates row by row via engram_add_edge, so it writes nothing itself and is run once per graph when the relation is introduced. Maintainer/migration tooling rather than a recurring shipped mechanism — same shape as the migrate_*/backfill one-shots already listed here (migrate_stranded_supported_by.py, migrate_prediction_pairing_edges.py, migrate_person_nodes.py, engram-backfill-special-moment-edges.py)."
+    },
+    {
       "path": "tools/selftest.py",
       "reason": "developer pre-deploy test runner — wraps pytest for quick confidence checks; not shipped in any install tier"
     },
