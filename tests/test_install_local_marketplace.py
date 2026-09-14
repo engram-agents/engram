@@ -550,6 +550,81 @@ def test_install_local_marketplace_provisions_venv_convenience_tier_runtime_only
     assert "requirements/requirements-dev.txt" not in calls
 
 
+def test_install_local_marketplace_multi_agent_convenience_tier_installs_forum_reqs(tmp_path):
+    """A multi-agent seat gets src/forum/requirements.txt installed into its
+    venv independent of depth tier (#2944) — the forum/coordination package
+    composes with any depth tier via the orthogonal --multi-agent flag, so a
+    convenience-tier multi-agent seat must still get forum deps, not just
+    dev-tier ones."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: convenience" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements.txt" in calls
+    assert "requirements/requirements-dev.txt" not in calls
+    assert "src/forum/requirements.txt" in calls
+
+
+def test_install_local_marketplace_multi_agent_via_mode_installs_forum_reqs(tmp_path):
+    """The mode=="multi" spelling (not just multi_agent==true) must also
+    trigger the forum-requirements install — same boolean logic as the
+    earlier jq-based multi-agent read elsewhere in this script."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "mode": "multi"})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" in calls
+
+
+def test_install_local_marketplace_non_multi_agent_skips_forum_reqs(tmp_path):
+    """A non-multi-agent seat (even at dev tier) does NOT get forum
+    requirements installed — the forum package is only needed by seats that
+    actually run the forum/coordination tooling."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Dev tier: installing test dependencies" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" not in calls
+
+
+def test_install_local_marketplace_multi_agent_dev_tier_installs_both(tmp_path):
+    """Multi-agent + dev tier is a THIRD independent conditional, not nested
+    inside the dev-tier block — both requirements-dev.txt AND
+    src/forum/requirements.txt must install together."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "dev", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Dev tier: installing test dependencies" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements-dev.txt" in calls
+    assert "src/forum/requirements.txt" in calls
+
+
 def test_install_local_marketplace_skips_venv_provisioning_when_no_venv(tmp_path):
     """A fresh ENGRAM_HOME with no venv is left alone — the provisioning block
     is a no-op, not an error, so a first install before venv creation still

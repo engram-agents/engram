@@ -501,6 +501,18 @@ except Exception:
     print('convenience')
 " "$ENGRAM_HOME/config.json" 2>/dev/null)"
   [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
+  # Independent of tier (#2944): is this seat multi-agent? Same boolean logic
+  # as the earlier jq-based read above (multi_agent==true OR mode=="multi"),
+  # reimplemented via python3 here to match this later block's jq-optional
+  # style (this block already doesn't assume jq is present).
+  _eff_multi_agent="$(python3 -c "import json,sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print('true' if (d.get('multi_agent') is True or d.get('mode') == 'multi') else 'false')
+except Exception:
+    print('false')
+" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+  [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
     log "Provisioning venv at $ENGRAM_HOME/venv (tier: $_eff_tier)"
@@ -523,6 +535,21 @@ except Exception:
       # server update, so this is WARN-and-continue only (NOT flagged).
       "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_dev_req" \
         || log "WARN: venv dev-requirements install failed (continuing; server still runs)"
+    fi
+  fi
+  if [[ "$_eff_multi_agent" == "true" ]]; then
+    _forum_req="$REPO_ROOT/src/forum/requirements.txt"
+    if [[ -f "$_forum_req" ]]; then
+      log "Multi-agent: installing forum package dependencies into $ENGRAM_HOME/venv"
+      # A failed FORUM-requirements install (Flask, bleach, beautifulsoup4,
+      # html5lib, markdown-it-py, sentence-transformers, huggingface_hub,
+      # sqlite-vec) only affects local forum-test collection (src/forum/tests/)
+      # — the server still runs on the runtime reqs above. Failing the whole
+      # install over a missing forum-test dep would block a working server
+      # update, so this is WARN-and-continue only (NOT flagged), matching the
+      # dev-requirements install above.
+      "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_forum_req" \
+        || log "WARN: venv forum-requirements install failed (continuing; server still runs)"
     fi
   fi
 fi
