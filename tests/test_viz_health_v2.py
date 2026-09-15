@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import HTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
@@ -479,6 +480,62 @@ class TestLatestSnapshotIntegerSort(unittest.TestCase):
         (self.snap_dir / "3-nap-20260904T030000Z.json").write_text("{}")
         picked = viz_health_v2_data._latest_snapshot_filename(str(self.snap_dir))
         self.assertEqual(picked, "15-nap-20260904T150000Z.json")
+
+    def test_latest_snapshot_filename_breaks_same_turn_ties_by_timestamp(self):
+        """engram-alpha#2940 round 3 (reviewer-fairy blocker on round 3's
+        OWN fix, round 3.5): turn only advances at sleep, so any number of
+        same-turn checkpoints is the NORMAL case (multiple naps in one
+        day), not an edge case. Before this fix, comparing turn alone left
+        ties resolved by whichever file os.listdir() happened to return
+        first, not the genuinely latest one.
+
+        The FIRST version of this test (round 3) wrote the two files to
+        disk and relied on real filesystem write order standing in for
+        iteration order -- a round-3 reviewer-fairy round PROVED that
+        non-discriminating by reverting the production fix and re-running
+        the test unmodified: it still passed, because on macOS/APFS
+        os.listdir() returns entries in creation order, which
+        coincidentally matched the old buggy "first-encountered-wins"
+        tie-break for that specific write order. Fixed by mocking
+        os.listdir() directly to return an EXPLICIT, adversarial order,
+        decoupled from any real filesystem's enumeration behavior."""
+        fake_names = [
+            "7-nap-20260904T090000Z.json",          # wrong answer, listed first
+            "7-pre_sleep-20260904T235900Z.json",    # correct answer, listed second
+        ]
+        with mock.patch(
+            "viz.data.health_v2.os.listdir", return_value=fake_names
+        ):
+            picked = viz_health_v2_data._latest_snapshot_filename(str(self.snap_dir))
+        self.assertEqual(picked, "7-pre_sleep-20260904T235900Z.json")
+
+    def test_latest_snapshot_filename_breaks_equal_second_ties_by_mtime(self):
+        """engram-alpha#2940 round 3.6 (reviewer-fairy round on Mira's OWN
+        colleague review, her exact-head repro reproduced in miniature
+        here): write_snapshot() stamps the filename's timestamp token at
+        SECOND resolution only, and checkpoint_mode is a separate filename
+        component -- so two DIFFERENT-mode checkpoints (nap, pre_sleep)
+        genuinely written within the same wall-clock second share an
+        identical (turn, ts_token) pair. Round 3.5's fix stopped one level
+        too early: that tie fell through to whichever file os.listdir()
+        happened to return first. Fixed by adding the file's own mtime_ns
+        as a further tiebreaker. Mocks BOTH os.listdir (adversarial order)
+        AND os.stat (explicit mtimes) so this cannot pass by accident of
+        real filesystem timing or enumeration order."""
+        older_name = "7-nap-20260904T145100Z.json"
+        newer_name = "7-pre_sleep-20260904T145100Z.json"
+        fake_names = [older_name, newer_name]  # correct (newer) answer listed SECOND
+        mtimes = {older_name: 1_000_000_000, newer_name: 2_000_000_000}
+
+        def fake_stat(path):
+            name = os.path.basename(str(path))
+            return mock.Mock(st_mtime_ns=mtimes[name])
+
+        with mock.patch(
+            "viz.data.health_v2.os.listdir", return_value=fake_names
+        ), mock.patch("viz.data.health_v2.os.stat", side_effect=fake_stat):
+            picked = viz_health_v2_data._latest_snapshot_filename(str(self.snap_dir))
+        self.assertEqual(picked, newer_name)
 
 
 class _LiveServerBase(unittest.TestCase):

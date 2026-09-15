@@ -85,22 +85,49 @@ def _latest_snapshot_filename(snapshots_dir: str) -> "str | None":
     ignoring anything that doesn't match ``_SNAPSHOT_FILENAME_RE`` -- this
     excludes the fixed-name dream projection
     (``health-snapshot-dream.json``) and any ``.error`` sentinel sibling,
-    neither of which is turn-numbered. Sorts by the PARSED integer turn
-    (never filename string-sort -- turns aren't zero-padded). Returns
-    ``None`` if the directory doesn't exist or has no matching files."""
+    neither of which is turn-numbered. Sorts by a TOTAL, deterministic
+    ordering key -- ``(turn, ts_token, mtime_ns, name)`` -- so no two
+    distinct files can ever tie (round-3.6 fix, engram-alpha#2940
+    reviewer-fairy round on Mira's own colleague review; identical fix
+    landed in this function's sibling copy in ``health/engine.py`` -- see
+    that copy's docstring for the full reasoning behind each key
+    component):
+
+    1. Parsed integer ``turn`` (turn only advances at sleep -- same-turn
+       checkpoints are the normal case, not an edge case).
+    2. The filename's own ``ts_token`` (second-resolution, sorts correctly
+       as a plain string) -- but two DIFFERENT-mode files (e.g. ``nap`` and
+       ``pre_sleep``) can genuinely share both turn and this token if
+       written within the same wall-clock second.
+    3. The file's own ``mtime_ns`` (nanosecond resolution) -- breaks that
+       tie by reading real write-order off the filesystem. A file that
+       fails to ``stat()`` (e.g. a race with deletion) sorts as ``-1``
+       rather than raising, so it never wins a tie it can't prove it
+       belongs in.
+    4. The filename string itself -- a purely mechanical final tiebreaker
+       guaranteeing a TOTAL ordering; never fires in practice.
+
+    Returns ``None`` if the directory doesn't exist or has no matching
+    files."""
     try:
         names = os.listdir(snapshots_dir)
     except OSError:
         return None
     best_name = None
-    best_turn = None
+    best_key = None
     for name in names:
         m = _SNAPSHOT_FILENAME_RE.match(name)
         if not m:
             continue
         turn = int(m.group(1))
-        if best_turn is None or turn > best_turn:
-            best_turn = turn
+        ts_token = m.group(3)
+        try:
+            mtime_ns = os.stat(os.path.join(snapshots_dir, name)).st_mtime_ns
+        except OSError:
+            mtime_ns = -1  # vanished between listdir() and stat() -- never wins a tie
+        key = (turn, ts_token, mtime_ns, name)
+        if best_key is None or key > best_key:
+            best_key = key
             best_name = name
     return best_name
 

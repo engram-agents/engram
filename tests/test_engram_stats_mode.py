@@ -458,11 +458,16 @@ def test_sections_multiple():
 
 
 def test_sections_health_score_no_op():
-    """health_score is a recognized section name but _stats_impl doesn't compute it;
-    requesting it should not error and other sections should still work."""
+    """health_score is a recognized section name and _stats_impl DOES compute
+    it now (engram-alpha#2940), via the health-v2 checkpoint reader
+    (health.engine.read_latest_composed_summary()) -- not a no-op. This test
+    still passes because a fresh graph has no checkpoint written yet, so the
+    new code returns health_score: None (with a reason in
+    health_score_detail) rather than raising -- requesting it must not
+    error, and other sections must still work."""
     stats, _obs, _derive, _epistemic, _core = _make_fresh_mods()
-    # health_score is a known name — requesting it alone is a no-op (nothing returned)
-    # but must not crash
+    # health_score is a known name — on a fresh graph with no checkpoint yet
+    # it resolves to None, but must not crash
     r = json.loads(stats._stats_impl(sections=["health_score"]))
     assert "error" not in r, r
 

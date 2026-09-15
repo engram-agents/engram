@@ -3319,6 +3319,12 @@ def engram_stats(payload_json: str = "{}") -> str:
                 open_predictions, reasoning_breakdown, weakest_nodes,
                 health_score, memory, version. Default (omitted or null): all
                 sections. Unknown names are ignored with a logged warning.
+                health_score is sourced from the latest health-v2 checkpoint
+                (health.engine.read_latest_composed_summary(); see the
+                Returns section below) -- it is not itself live-computed.
+                health_score_detail is not a selectable section name; it
+                rides alongside health_score automatically whenever that
+                section is included.
 
     Returns:
         JSON with comprehensive graph statistics. Top-level keys (all sections):
@@ -3353,9 +3359,12 @@ def engram_stats(payload_json: str = "{}") -> str:
         })
 
     # Section name validation is handled inside _stats_impl (engram_stats.py).
-    # "health_score" is a recognized name but engram_stats doesn't compute
-    # it (that's engram_diagnose's domain); including it in sections is a
-    # no-op that doesn't error.
+    # engram-alpha#2940: engram_stats DOES compute "health_score" (plus a
+    # sibling "health_score_detail" object) when that section is requested,
+    # reading the latest health-v2 checkpoint via
+    # health.engine.read_latest_composed_summary() -- the same source
+    # engram_diagnose uses. health_score is None when no checkpoint has
+    # ever been written (never a fabricated live number).
     if sections_param is not None:
         if not isinstance(sections_param, list):
             return json.dumps({"error": "sections must be a list of strings"})
@@ -3381,11 +3390,18 @@ def engram_stats(payload_json: str = "{}") -> str:
 # confidence-distribution shape per type/quote_type/reasoning_type/source_class) +
 # read-tool contention (flagged session buckets where recall tools may compete).
 #
-# Health score: composite 0-100 with documented penalty/bonus rules — DAG
-# violations / tainted / stale / orphans / low embedding coverage / high
-# retraction rate / uncited-observation overflow penalize; active resolution
-# work (>50% questions resolved) bonuses. Numbers tuned the dream-mode context-hunger observation to prevent
-# doc-config drift.
+# Health score: engram-alpha#2940 retired the old hand-rolled penalty
+# formula. health_score (composite 0-100) is now sourced from health-v2's
+# own composed score, read back from the latest checkpoint via
+# health.engine.read_latest_composed_summary() -- see health/engine.py's
+# own module docstring for the composition formula (single source of
+# truth; not re-described here to avoid a second copy that drifts).
+# health_score_detail rides alongside it with points_in_play,
+# unscored_aspects, snapshot_id, checkpoint_mode, written_at, and
+# composed_coverage -- provenance for which checkpoint the number came
+# from. There is NO live-compute path for v2 (it is per-checkpoint only);
+# health_score is null when no checkpoint has ever run (fresh install, no
+# nap/sleep yet) -- never a fabricated number.
 #
 # Config summary block surfaces the runtime tunables (memory tiers, decay
 # base, utility scoring α/β, etc.) so the diagnose snapshot doubles as an
@@ -3416,7 +3432,12 @@ def engram_diagnose() -> str:
     Returns:
         JSON with metrics grouped into: structure, epistemic, memory,
         provenance, experience, calibration, and a top-level health_score
-        (0-100).
+        (0-100), sourced from the latest health-v2 checkpoint (see
+        health.engine.read_latest_composed_summary()) -- null when no
+        checkpoint has ever run. A sibling health_score_detail object
+        rides alongside it with points_in_play, unscored_aspects,
+        snapshot_id, checkpoint_mode, written_at, and composed_coverage
+        (or {"error": <reason>} when health_score is null).
 
         - calibration (new, weight=0 in health_score):
           - corpus: confidence distribution from _compute_confidence_distribution (no time filter) —

@@ -222,114 +222,6 @@ def _percentile(sorted_vals: list, p: float) -> float:
 
 
 
-def _compute_health_score(conn) -> float:
-    """THE health-score formula — single source of truth (charter §6 fold).
-
-    Self-contained: runs all of its own queries so both consuming surfaces
-    (engram_stats sections=["health_score"] and engram_diagnose) report the
-    SAME number from the SAME implementation. The cycle's frozen stability
-    metric reads this function; tests/test_health_score_pinning.py pins it
-    in both probe directions (D3), and the stats↔diagnose parity test pins
-    the single-source property itself.
-
-    Formula (frozen for the duration of the epistemic-foundations cycle):
-    100 minus capped penalties (DAG violations, tainted, stale, orphans,
-    embedding-coverage gap, excess retraction rate, excess uncited-obs
-    ratio) plus the question-resolution bonus, clamped to [0, 100].
-    """
-    score = 100.0
-
-    # DAG violations (source created_at < target created_at, non-exempt)
-    _exempt = ",".join("?" * len(core.DAG_EXEMPT_RELATIONS))
-    dag_violations = conn.execute(
-        f"""SELECT COUNT(*) as c FROM edges e
-            JOIN nodes s ON e.source_id = s.id
-            JOIN nodes t ON e.target_id = t.id
-            WHERE s.created_at < t.created_at
-              AND e.relation NOT IN ({_exempt})""",
-        tuple(core.DAG_EXEMPT_RELATIONS),
-    ).fetchone()["c"]
-    score -= min(dag_violations * 5, 20)
-
-    # Tainted nodes (downstream of retracted premises).
-    # Migrated off metadata.tainted_by to cascade_markers (#2013/#2009
-    # slice 1) — count DISTINCT nodes with at least one pending
-    # taint-severity marker, joined against is_current so a node that was
-    # itself later superseded/retracted (no longer live) doesn't count.
-    tainted = conn.execute(
-        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
-        "JOIN nodes n ON n.id = cm.node_id "
-        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'retract'"
-    ).fetchone()["c"]
-    score -= min(tainted * 3, 15)
-
-    # Stale nodes (downstream of superseded premises). Same migration.
-    stale = conn.execute(
-        "SELECT COUNT(DISTINCT cm.node_id) as c FROM cascade_markers cm "
-        "JOIN nodes n ON n.id = cm.node_id "
-        "WHERE n.is_current = 1 AND cm.status = 'pending' AND cm.root_op = 'supersede'"
-    ).fetchone()["c"]
-    score -= min(stale * 2, 10)
-
-    # Orphan nodes (no edges at all)
-    orphans = conn.execute("""
-        SELECT COUNT(*) as c FROM nodes n
-        WHERE n.is_current = 1
-          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.source_id = n.id)
-          AND NOT EXISTS (SELECT 1 FROM edges e WHERE e.target_id = n.id)
-    """).fetchone()["c"]
-    score -= min(orphans * 1, 10)
-
-    # Embedding coverage gap
-    emb_row = conn.execute(
-        "SELECT COUNT(*) as total,"
-        " SUM(CASE WHEN embedding IS NOT NULL THEN 1 ELSE 0 END) as has_emb"
-        " FROM nodes WHERE is_current = 1"
-    ).fetchone()
-    emb_total = emb_row["total"] or 0
-    emb_has = emb_row["has_emb"] or 0
-    emb_pct = (100 * emb_has / emb_total) if emb_total else 100
-    score -= min((100 - emb_pct) * 0.1, 10)
-
-    # Excess retraction rate (>10% of total nodes)
-    all_row = conn.execute(
-        "SELECT COUNT(*) as total,"
-        " SUM(CASE WHEN status = 'retracted' THEN 1 ELSE 0 END) as retracted"
-        " FROM nodes"
-    ).fetchone()
-    all_total = all_row["total"] or 0
-    all_retracted = all_row["retracted"] or 0
-    if all_total > 0:
-        retract_rate = all_retracted / all_total
-        if retract_rate > 0.1:
-            score -= min((retract_rate - 0.1) * 100, 15)
-
-    # Excess uncited observations (>50% of observations)
-    obs_row = conn.execute(
-        "SELECT COUNT(*) as total,"
-        " SUM(CASE WHEN evidence_id IS NULL THEN 1 ELSE 0 END) as uncited"
-        " FROM nodes WHERE is_current = 1"
-        " AND type IN ('observation_factual', 'observation_predictive')"
-    ).fetchone()
-    obs_total = obs_row["total"] or 0
-    obs_uncited = obs_row["uncited"] or 0
-    if obs_total > 0 and obs_uncited / obs_total > 0.5:
-        score -= min((obs_uncited / obs_total - 0.5) * 20, 10)
-
-    # Bonus: active resolution work (+5 if >50% questions resolved)
-    qu_row = conn.execute(
-        "SELECT COUNT(*) as total,"
-        " SUM(CASE WHEN status = 'resolved' THEN 1 ELSE 0 END) as resolved"
-        " FROM nodes WHERE type = 'question'"
-    ).fetchone()
-    qu_total = qu_row["total"] or 0
-    qu_resolved = qu_row["resolved"] or 0
-    if qu_total > 0 and qu_resolved / qu_total > 0.5:
-        score = min(score + 5, 100)
-
-    return round(max(score, 0), 1)
-
-
 def _stats_impl(mode: str = "all", sections=None) -> str:
     """Impl for engram_stats — callable with named kwargs for in-server callers.
 
@@ -525,12 +417,32 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             )
 
         # ── health_score ────────────────────────────────────────────────────
-        # Self-contained computation: all queries run inline so this section
-        # is correct whether or not "structure" was also requested.
-        # ── health_score ────────────────────────────────────────────────────
-        # Single source of truth: the shared helper (charter §6).
+        # engram-alpha#2940: retires the old pre-v2 penalty formula in favor
+        # of health-v2's own composed score (health/engine.py) as the single
+        # source of truth. There is NO live-compute path for v2 -- it is
+        # per-checkpoint only -- so this reads back the LAST WRITTEN
+        # checkpoint's score, never fabricating a live number. When no
+        # checkpoint has ever run (fresh install, no nap/sleep yet),
+        # health_score is None with a reason in health_score_detail -- never
+        # a fabricated neutral default.
         if _want("health_score"):
-            result["health_score"] = _compute_health_score(conn)
+            from health import engine as health_engine  # lazy, see house rules
+
+            summary = health_engine.read_latest_composed_summary()
+            if summary["has_snapshot"]:
+                result["health_score"] = summary["score"]
+                result["health_score_detail"] = {
+                    "points_in_play": summary["points_in_play"],
+                    "unscored_aspects": summary["unscored_aspects"],
+                    "composed_coverage": summary["composed_coverage"],
+                    "snapshot_id": summary["snapshot_id"],
+                    "checkpoint_mode": summary["checkpoint_mode"],
+                    "written_at": summary["written_at"],
+                    "turn": summary["turn"],
+                }
+            else:
+                result["health_score"] = None
+                result["health_score_detail"] = {"error": summary["reason"]}
 
         # ── version ─────────────────────────────────────────────────────────
         if _want("version"):
@@ -1426,10 +1338,31 @@ def _diagnose_impl() -> str:
             metrics["principle_coverage"] = {"error": "principle coverage check failed"}
 
         # ── Health Score (0-100) ─────────────────────────────────────────
-        # Single source of truth: the shared helper (charter §6 fold). The
-        # intermediates computed above remain for their own report sections;
-        # the SCORE comes from one implementation shared with engram_stats.
-        metrics["health_score"] = _compute_health_score(conn)
+        # engram-alpha#2940: sourced from health-v2's own composed score
+        # (health/engine.py), the same reader engram_stats uses -- single
+        # source of truth is now "both read
+        # health.engine.read_latest_composed_summary()", not a shared
+        # penalty-formula function. There is NO live-compute path for v2 --
+        # this reads back the LAST WRITTEN checkpoint's score, with that
+        # checkpoint's own provenance attached; health_score is None (with a
+        # reason in health_score_detail) when no checkpoint has ever run.
+        from health import engine as health_engine  # lazy, see house rules
+
+        summary = health_engine.read_latest_composed_summary()
+        if summary["has_snapshot"]:
+            metrics["health_score"] = summary["score"]
+            metrics["health_score_detail"] = {
+                "points_in_play": summary["points_in_play"],
+                "unscored_aspects": summary["unscored_aspects"],
+                "composed_coverage": summary["composed_coverage"],
+                "snapshot_id": summary["snapshot_id"],
+                "checkpoint_mode": summary["checkpoint_mode"],
+                "written_at": summary["written_at"],
+                "turn": summary["turn"],
+            }
+        else:
+            metrics["health_score"] = None
+            metrics["health_score_detail"] = {"error": summary["reason"]}
 
         # ── Config Summary (the dream-mode context-hunger observation: prevent doc-config drift) ──────────
         mem = core._get_memory_config()

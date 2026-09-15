@@ -265,6 +265,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -1558,6 +1559,261 @@ def _snapshot_dir() -> Path:
         except OSError:
             pass  # best-effort -- see write_snapshot's docstring
     return d
+
+
+def _snapshot_dir_for_read() -> Path:
+    """Read-only twin of ``_snapshot_dir()`` (engram-alpha#2940 round 3,
+    reviewer-fairy blocker): resolves the SAME path
+    (``core.DATA_DIR / "health-snapshots"``) but never creates or chmods
+    it. ``_snapshot_dir()`` is the WRITE-path helper -- its
+    mkdir/first-creation-chmod is correct there (a checkpoint writer must
+    ensure the directory exists), but ``read_latest_composed_summary()``'s
+    default (no explicit ``snapshots_dir`` override) path had been calling
+    ``_snapshot_dir()`` too, which meant a plain READ (``engram_stats``/
+    ``engram_diagnose``, both declared side-effect-free / readOnlyHint=True)
+    silently CREATED ``health-snapshots/`` on disk as a side effect --
+    and made ``read_latest_composed_summary``'s own
+    ``not os.path.isdir(snapshots_dir)`` "no directory yet" branch
+    unreachable, since the directory had just been created by the very
+    call that was about to check for its absence. This function is what a
+    read path should call instead: same resolution, zero side effects."""
+    import engram_core as core  # lazy — see module-top NOTE
+
+    return core.DATA_DIR / "health-snapshots"
+
+
+# ---------------------------------------------------------------------------
+# Latest composed-score reader (engram-alpha#2940) -- retires the OLD
+# pre-v2 health formula (engram_stats.py's now-retired penalty function) in favor of
+# THIS module's own composed score as the single source of truth for
+# engram_stats/engram_diagnose/the legacy viz /api/health endpoint. There is
+# NO live-compute path for the v2 score -- it is per-checkpoint only (see
+# write_snapshot above) -- so this function reads back whatever the LAST
+# checkpoint wrote, never recomputes one live. Mirrors
+# viz.data.health_v2.get_health_v2_data's own has_snapshot/reason convention
+# (see that module's docstring) but is a plain function in THIS module
+# rather than an import from viz -- viz depends on health, never the
+# other way around, and viz's own filename-discovery/multi-tenant AGENTS
+# resolution is deliberately not reused here (this module only ever reads
+# its OWN process's snapshot dir, already known via _snapshot_dir() above).
+# ---------------------------------------------------------------------------
+
+# Matches write_snapshot's own filename shape exactly -- a deliberate SEPARATE
+# copy of viz.data.health_v2's identical regex (same rationale as
+# _LIVE_SIGNAL_FNS_FOR_VERIFICATION being a separate table above: this
+# module's own contract, not a shared import). See that module's comment for
+# the full "why not zero-padded, why `[^-]+`" reasoning -- unchanged here.
+_SNAPSHOT_FILENAME_RE = re.compile(r"^(\d+)-([^-]+)-(\d{8}T\d{6}Z)\.json$")
+
+
+def _latest_snapshot_filename(snapshots_dir: Path) -> "str | None":
+    """Pick the highest-turn-number snapshot filename in *snapshots_dir*,
+    ignoring anything that doesn't match ``_SNAPSHOT_FILENAME_RE`` (excludes
+    the fixed-name dream projection and any ``.error`` sentinel sibling).
+    Sorts by a TOTAL, deterministic ordering key -- ``(turn, ts_token,
+    mtime_ns, name)`` -- so no two distinct files can ever tie (round-3.6
+    fix, engram-alpha#2940 reviewer-fairy round on Mira's own colleague
+    review):
+
+    1. Parsed integer ``turn`` -- turn only advances at sleep, so any
+       number of same-turn checkpoints (multiple naps in one day) is the
+       NORMAL case, not an edge case (round-3 fix).
+    2. The filename's own ``ts_token`` (``%Y%m%dT%H%M%SZ``, fixed width,
+       zero-padded, UTC -- sorts correctly as a plain string, no datetime
+       parsing needed) -- but ``write_snapshot`` stamps only SECOND
+       resolution, and the checkpoint_mode is a separate filename
+       component, so two DIFFERENT-mode files (e.g. a ``nap`` and a
+       ``pre_sleep``) genuinely written within the same wall-clock second
+       still tie here (round-3.5's fix stopped one level too early --
+       Mira's own exact-head repro: same turn, same ts_token, later
+       ``mtime_ns`` file lost to an earlier-listed one).
+    3. The file's own ``mtime_ns`` (nanosecond resolution, far finer than
+       the filename's second-resolution token) -- breaks the case above by
+       reading real write-order off the filesystem directly, independent
+       of anything embedded in the name. A file that fails to ``stat()``
+       (e.g. deleted between ``listdir`` and this read -- a real, if rare,
+       race) sorts as the lowest possible key (``-1``) rather than raising,
+       so a vanished file never wins a tie it can't prove it belongs in.
+    4. The filename string itself, as the final, purely mechanical
+       tiebreaker -- guarantees a TOTAL ordering (no two distinct filenames
+       are equal) even in the vanishingly unlikely case two files share
+       identical turn, timestamp token, AND mtime_ns (e.g. a filesystem
+       with coarser mtime resolution than nanoseconds). This step never
+       fires in practice; it exists so the comparison can never raise or
+       return a nondeterministic choice, full stop.
+
+    Returns ``None`` if the directory doesn't exist or has no matching
+    files."""
+    try:
+        names = os.listdir(snapshots_dir)
+    except OSError:
+        return None
+    best_name = None
+    best_key = None
+    for name in names:
+        m = _SNAPSHOT_FILENAME_RE.match(name)
+        if not m:
+            continue
+        turn = int(m.group(1))
+        ts_token = m.group(3)
+        try:
+            mtime_ns = os.stat(os.path.join(snapshots_dir, name)).st_mtime_ns
+        except OSError:
+            mtime_ns = -1  # vanished between listdir() and stat() -- never wins a tie
+        key = (turn, ts_token, mtime_ns, name)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_name = name
+    return best_name
+
+
+def _written_at_for_summary(snapshot_path: Path, filename: str) -> str:
+    """Best-effort ISO-8601 write timestamp -- same derivation as
+    ``viz.data.health_v2._written_at`` (parse the filename's own
+    ``%Y%m%dT%H%M%SZ`` timestamp token; fall back to the file's mtime when
+    that fails), re-derived here rather than imported (see this section's
+    own header comment)."""
+    m = _SNAPSHOT_FILENAME_RE.match(filename)
+    if m:
+        ts_token = m.group(3)
+        try:
+            dt = datetime.strptime(ts_token, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        except ValueError:
+            pass  # fall through to the mtime fallback below
+    try:
+        return datetime.fromtimestamp(
+            os.path.getmtime(snapshot_path), tz=timezone.utc
+        ).isoformat()
+    except OSError:
+        return ""
+
+
+def read_latest_composed_summary(snapshots_dir: "Path | None" = None) -> dict:
+    """Read the most recent health-v2 snapshot (by parsed turn number,
+    matching ``write_snapshot``'s own filename convention) and extract the
+    composed-score summary that ``engram_stats``/``engram_diagnose``/the
+    legacy ``/api/health`` endpoint need (engram-alpha#2940). Never raises --
+    always returns a dict, with ``has_snapshot=False`` + a ``reason`` string
+    for every empty/error/old-format case (mirrors
+    ``viz.data.health_v2.get_health_v2_data``'s own has_snapshot/reason
+    convention -- see that module for the precedent this follows).
+
+    There is NO live-compute path here -- v2 is per-checkpoint only (written
+    by ``write_snapshot`` from a nap/sleep checkpoint) -- so this reads back
+    whatever the LAST checkpoint wrote; it never recomputes a live score.
+
+    ``snapshots_dir``, round-2 addition (engram-alpha#2940 reviewer-fairy
+    blocker 2): defaults to ``None``, which resolves to this PROCESS's own
+    ``_snapshot_dir_for_read()`` (read-only twin of ``_snapshot_dir()``,
+    same path -- ``core.DATA_DIR / "health-snapshots"`` -- with no
+    mkdir/chmod side effect; round 3 fix, see that function's own
+    docstring) -- correct for ``engram_stats``/``engram_diagnose``, which
+    only ever report on their
+    own live agent. An explicit ``snapshots_dir`` lets a MULTI-TENANT caller
+    (the legacy ``viz/data/health.py`` ``/api/health`` endpoint, which is
+    handed an arbitrary agent's ``db_path`` and must report THAT agent's
+    score, not the viz process's own) point this reader at a different
+    agent's snapshot directory instead of silently substituting the wrong
+    agent's number under the requested agent's identity -- the regression
+    reviewer-fairy round 1 caught and reproduced directly. Every other
+    behavior (UNAVAILABLE-string guard, has_snapshot/reason contract) is
+    identical regardless of which directory is read.
+
+    Returns, when ``has_snapshot`` is True:
+        {
+          "has_snapshot": True,
+          "score": <float, the composed score, 0-100 -- OR None when the
+                    checkpoint's own composed score is UNAVAILABLE (every
+                    aspect held out, e.g. a genuinely empty graph); in that
+                    case ``unscored_aspects`` below names every held-out
+                    aspect, so ``score: None`` is self-explanatory, never
+                    an unqualified null>,
+          "points_in_play": <float>,
+          "unscored_aspects": [<str>, ...],
+          "composed_coverage": <float>,
+          "snapshot_id": <str, filename minus ".json">,
+          "checkpoint_mode": <str, "nap"/"pre_sleep"/"post_dream">,
+          "written_at": <str, ISO-8601 UTC>,
+          "turn": <int>,
+        }
+    When ``has_snapshot`` is False: ``{"has_snapshot": False, "reason": <str>}``
+    -- the ``score: None``-because-UNAVAILABLE case above is distinct from
+    this: the checkpoint DOES exist (``has_snapshot`` stays True), only its
+    composed score does not.
+    """
+    if snapshots_dir is None:
+        snapshots_dir = _snapshot_dir_for_read()
+    filename = _latest_snapshot_filename(snapshots_dir)
+    if filename is None:
+        if not os.path.isdir(snapshots_dir):
+            return {
+                "has_snapshot": False,
+                "reason": "No health-snapshots directory yet -- has a checkpoint ever run?",
+            }
+        return {
+            "has_snapshot": False,
+            "reason": "health-snapshots directory exists but has no snapshot files yet",
+        }
+
+    snapshot_path = snapshots_dir / filename
+    try:
+        with open(snapshot_path, "r", encoding="utf-8") as f:
+            snapshot = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "has_snapshot": False,
+            "reason": f"Failed to read/parse snapshot {filename!r}: {exc}",
+        }
+
+    # Guard against an old-format (pre-health-v2) snapshot -- same signal
+    # viz.data.health_v2.get_health_v2_data uses: it's missing the
+    # "measurements" key. Never fall back to an older, usable snapshot
+    # nearby -- see that module's docstring for why (a stale writer's
+    # higher-turn old-format file sitting beside a lower-turn current-format
+    # one means the fix is rebuilding/reconnecting the stale writer, not
+    # silently reporting stale data as current).
+    if "measurements" not in snapshot:
+        return {
+            "has_snapshot": False,
+            "reason": (
+                f"Snapshot {filename!r} is an old-format (pre-health-v2) "
+                "snapshot -- it is missing the 'measurements' key. Rebuild "
+                "the plugin build and reconnect the MCP server to write a "
+                "current-format snapshot."
+            ),
+        }
+
+    scores = snapshot.get("scores") or {}
+    snapshot_id = filename[:-len(".json")] if filename.endswith(".json") else filename
+
+    # engram-alpha#2940 round-2 (reviewer-fairy blocker 1): `scores["composed"]`
+    # can legitimately be the SENTINEL STRING "UNAVAILABLE" -- serialized by
+    # health.engine._to_jsonable / compose_aspect_scores whenever EVERY aspect
+    # is held out (points_in_play <= 0, e.g. a genuinely empty graph). That is
+    # a real, reachable state (reproduced directly against a fresh graph with
+    # zero claim-bearing nodes), not a hypothetical -- and `has_snapshot` is
+    # still True there (the checkpoint file exists and is current-format), so
+    # it is NOT the has_snapshot=False path above. Without this guard, callers
+    # (engram_stats/engram_diagnose/legacy /api/health, none of which expect a
+    # non-numeric health_score) would silently receive the literal string
+    # "UNAVAILABLE" where this function's own docstring promises a float.
+    # unscored_aspects already names every held-out aspect in this case, so
+    # the caller has the "why" without a separate reason field.
+    composed = scores.get("composed")
+    score = None if composed == "UNAVAILABLE" else composed
+
+    return {
+        "has_snapshot": True,
+        "score": score,
+        "points_in_play": scores.get("points_in_play"),
+        "unscored_aspects": scores.get("unscored_aspects"),
+        "composed_coverage": scores.get("composed_coverage"),
+        "snapshot_id": snapshot_id,
+        "checkpoint_mode": snapshot.get("checkpoint_mode"),
+        "written_at": _written_at_for_summary(snapshot_path, filename),
+        "turn": snapshot.get("turn"),
+    }
 
 
 # ---------------------------------------------------------------------------

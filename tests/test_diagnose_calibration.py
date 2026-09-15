@@ -294,18 +294,34 @@ def test_drift_delta_signed_negative_when_this_turn_lower():
 
 
 def test_health_score_unaffected_by_calibration():
-    """health_score must not change when calibration data changes (weight=0).
+    """health_score must not change when calibration data changes.
 
     Strategy: run engram_diagnose, capture health_score. Then mock
     _compute_confidence_distribution to return wildly different confidence
-    numbers. health_score must be identical (calibration_weight=0).
+    numbers. health_score must be identical.
 
     After Fix 1 (PR #245 round-2), engram_diagnose calls _compute_confidence_distribution
     directly (not engram_stats), so we mock the helper instead.
+
+    Post-engram-alpha#2940 note: health_score is now sourced from the last
+    health-v2 checkpoint (health.engine.read_latest_composed_summary()), not
+    a live per-call formula -- so this no longer pins a "calibration weight
+    is 0" property of a scoring formula (the v2 composed score has no such
+    weight concept at all). It pins the weaker but still real invariant that
+    a checkpoint-sourced health_score is immune to ANYTHING that happens
+    between checkpoints, calibration included -- which is exactly what a
+    per-checkpoint (not live-computed) source is for. A checkpoint must
+    exist first (write one via health.engine.write_snapshot) for health_score
+    to be non-None at all.
     """
     stats, obs, _derive, _epistemic, _core = _make_fresh_mods()
     for i in range(3):
         _seed_observation(obs, f"Health score weight=0 obs {i}")
+
+    from health import engine as health_engine
+    conn = _core._get_db()
+    health_engine.write_snapshot(conn, "nap")
+    conn.close()
 
     # First run: real calibration
     r1 = json.loads(stats._diagnose_impl())
@@ -334,7 +350,8 @@ def test_health_score_unaffected_by_calibration():
     score2 = r2["health_score"]
 
     assert score1 == score2, (
-        f"health_score changed after calibration mock (weight=0 violation): "
+        f"health_score changed after calibration mock -- it should be immune, "
+        f"sourced from the frozen last checkpoint, not live-recomputed: "
         f"{score1} → {score2}"
     )
 

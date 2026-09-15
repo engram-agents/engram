@@ -18,25 +18,6 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-def _format_import_error(exc: BaseException) -> str:
-    """A human-readable reason string for an ImportError -- falls back to
-    the exception's own class name when str(exc) is empty (some ImportError
-    subclasses/constructions carry no message). Factored out of the
-    try/except below so it's independently unit-testable (engram-alpha#2524,
-    reviewer-fairy round 1 on PR #2763: the original inline expression had
-    no test exercising its own empty-message fallback branch)."""
-    return str(exc) or type(exc).__name__
-
-
-try:
-    from engram_stats import _compute_health_score  # noqa: E402
-    _HEALTH_SCORE_AVAILABLE = True
-    _HEALTH_SCORE_IMPORT_ERROR: str | None = None
-except ImportError as _health_score_import_error:  # engram-alpha#2524
-    _HEALTH_SCORE_AVAILABLE = False
-    _compute_health_score = None  # type: ignore[assignment]
-    _HEALTH_SCORE_IMPORT_ERROR = _format_import_error(_health_score_import_error)
-
 
 def get_health_data(db_path: str) -> dict:
     """Compute live health metrics + trend from diagnostic_history."""
@@ -183,27 +164,52 @@ def get_health_data(db_path: str) -> dict:
             data["health_trend"] = []
 
         # ── Compute live health score ────────────────────────────────
-        # Use the canonical single-source-of-truth formula from engram_stats
-        # (_compute_health_score) so the viz dashboard always matches
-        # engram_diagnose / engram_stats. The previous reimplementation here
-        # excluded only 'contradicts' from DAG-exempt relations, over-counting
-        # dag-exempt edges (exemplifies/instantiates/serves/resolves) as
-        # violations → full -20 penalty → wrong score (issue #1148).
-        if _HEALTH_SCORE_AVAILABLE:
-            data["health_score"] = _compute_health_score(conn)
+        # engram-alpha#2940: retires the OLD pre-v2 penalty formula
+        # (engram_stats.py's now-retired penalty function) in favor of health-v2's own
+        # composed score (health/engine.py) as the single source of truth
+        # -- the same source engram_stats/engram_diagnose now read. There
+        # is NO live-compute path for v2 -- it is per-checkpoint only -- so
+        # this reads back the LAST WRITTEN checkpoint's score, never
+        # recomputing one live.
+        #
+        # engram-alpha#2940 round 2 (reviewer-fairy blocker 2): this function
+        # is called for ANY agent's db_path (multi-tenant viz), so the
+        # snapshots dir MUST be derived from db_path, not from the calling
+        # viz process's own DATA_DIR -- passing no argument here would
+        # silently report the WRONG agent's score under this agent's
+        # identity (the pre-fix regression, reproduced directly by the
+        # reviewer). Same directory-layout convention
+        # viz.data.health_v2._resolve_health_snapshots_dir already uses for
+        # the SAME reason on /api/health/v2.
+        from health import engine as health_engine  # lazy, see module docstring
+
+        snapshots_dir = Path(db_path).resolve().parent / "health-snapshots"
+        summary = health_engine.read_latest_composed_summary(snapshots_dir=snapshots_dir)
+        if summary["has_snapshot"]:
+            data["health_score"] = summary["score"]
             data["health_score_error"] = None
+            data["health_score_detail"] = {
+                "points_in_play": summary["points_in_play"],
+                "unscored_aspects": summary["unscored_aspects"],
+                "composed_coverage": summary["composed_coverage"],
+                "snapshot_id": summary["snapshot_id"],
+                "checkpoint_mode": summary["checkpoint_mode"],
+                "written_at": summary["written_at"],
+                "turn": summary["turn"],
+            }
         else:
-            # engram-alpha#2524: an import failure (version skew, a moved
-            # module, a broken venv) is not a health signal. The previous
-            # `health_score = 0.0` fallback fabricated a "maximally
-            # unhealthy" reading indistinguishable from a real one -- same
-            # class as the fabricated-neutral-default the #2520 hold-out
-            # ruling rejected at the aspect level (an unscored aspect
-            # reports `unscored`, never a number). Render null + the reason
-            # instead, loudly, so the panel can't be silently misread as
-            # "the graph is fine, it just scored zero."
+            # engram-alpha#2940 (was #2524, for the old ImportError-fallback
+            # trigger): a missing/unreadable checkpoint is not a health
+            # signal. The previous `health_score = 0.0` fallback fabricated
+            # a "maximally unhealthy" reading indistinguishable from a real
+            # one -- same class as the fabricated-neutral-default the #2520
+            # hold-out ruling rejected at the aspect level (an unscored
+            # aspect reports `unscored`, never a number). Render null + the
+            # reason instead, loudly, so the panel can't be silently
+            # misread as "the graph is fine, it just scored zero."
             data["health_score"] = None
-            data["health_score_error"] = f"health_score unavailable: {_HEALTH_SCORE_IMPORT_ERROR}"
+            data["health_score_error"] = f"health_score unavailable: {summary['reason']}"
+            data["health_score_detail"] = {"error": summary["reason"]}
 
         conn.close()
         return data
