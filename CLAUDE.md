@@ -891,14 +891,17 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
-> **Exception, as of 2026-09-14 (Kepler, interim ruling pending Lei's word):**
-> the fairy-round-timing clarification in "Mechanical check at the merge
-> seat" above (issue #2920) is deliberately NOT synced to soma. Soma's own
-> merged PR#58 requires the opposite — the fairy round must match the exact
-> merge tip — a deliberate safety rule for a repo with no human backstop that
-> drives a physical robot around Lei's family. Soma keeps its stricter local
-> rule until Lei or Ariadne says otherwise; see engram-alpha#2930's
-> discussion and `ask-Lei.md` for the open question.
+> Lei's 2026-09-15 01:01Z ruling ("the Soma review can just use the same
+> team-wide convention, no need for a special exception") retires the
+> 2026-09-14 interim exception that had carved soma out of the fairy-round-
+> timing clarification in "Mechanical check at the merge seat" above (issue
+> #2920) — this repo's own copy of the exception is removed by THIS PR.
+> The other two copies are separate, still-open PRs at time of writing:
+> soma's own transcription (soma#60) and umwelt's matching removal
+> (umwelt#816) — **do not read this note as "already synced across all
+> three"; it is synced once all three of this PR / soma#60 / umwelt#816
+> have merged.** See soma's `CLAUDE.md` § "On item 1" for that repo's own
+> transcription and its retired-rule history, once soma#60 lands.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 
