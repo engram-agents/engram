@@ -1733,7 +1733,12 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
 
     Gate ladder (all must pass in order):
       1. Baton exists (via forum API) for PR-N.         (never forceable)
-      2. turn == pool sentinel.                           (never forceable)
+      2. turn is a maintainer-role holder -- the pool     (never forceable)
+         sentinel OR any named agent that is not the
+         registered colleague or the PR's own author
+         (#2913; see Gate 2's own comment for the reused
+         _is_maintainer_flip predicate and why the check
+         reduces cleanly to a terminal-state read).
       3. CI green via _pr_ci_state.                      (--force skips)
       4. Approval fresh via _pr_approval_state (oid).    (--force skips)
       5. gh pr merge <N> --squash.
@@ -1787,15 +1792,53 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_VALIDATION)
 
-    # ---- Gate 2: turn == pool sentinel --------------------------------
+    # ---- Gate 2: turn is a maintainer-role holder, not the literal
+    # pool sentinel specifically --------------------------------------
+    #
+    # #2913 (same root cause as #2912's cmd_flip fix): the bare
+    # `_is_pool_sentinel(current_turn)` check requires the baton to be
+    # flipped to the LITERAL sentinel string (e.g. "lei shi") before
+    # `baton merge` will proceed. But this team's actual convention --
+    # every flip performed this session, and CLAUDE.md's own baton
+    # lifecycle -- presents a PR to a NAMED maintainer agent (e.g.
+    # "kepler", "ariadne"), never the literal sentinel. So this gate, as
+    # written, would refuse to merge a baton in the exact state the real
+    # pipeline actually leaves it in.
+    #
+    # Reuses `_is_maintainer_flip` (already defined above, the same
+    # function `cmd_flip` calls) rather than adding a fourth copy of this
+    # classification logic. The DIRECTION differs from cmd_flip's own use:
+    # cmd_flip asks "is flipping TO to_agent a merge presentation" (a
+    # transition); Gate 2 asks "IS the current holder a merge-presented
+    # maintainer" (a terminal-state check, no transition in view). Passed
+    # as `_is_maintainer_flip(current_turn, "", colleague_name, author_name)`
+    # -- the empty string for `current_holder` deliberately disables the
+    # self-flip branch, which has no meaning here (there is no "flipping
+    # away from" state to compare against; current_turn already IS both
+    # the value being classified and the only state in hand). This is
+    # exactly the reduction _is_maintainer_flip needs to fall through to
+    # its actual "still with the colleague" / "still with the author" /
+    # "everyone else, including the sentinel" logic, and the guaranteed-
+    # non-empty check on current_turn just above rules out the one input
+    # where an empty `current_holder` sentinel could spuriously self-match.
     sentinel = _pool_sentinel()
     current_turn = fields.get("turn", "").strip().lower()
-    if not _is_pool_sentinel(current_turn):
-        holder = current_turn or "(unknown)"
+    if not current_turn:
         print(
-            f"baton merge: turn is with {holder} — not presented for merge. "
+            "baton merge: turn is with (unknown) — not presented for merge. "
             f"The baton must be flipped to the pool sentinel ('{sentinel}') "
-            "before merging.",
+            "or a maintainer agent before merging.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    _merge_colleague_name = fields.get("colleague", "").strip().lower()
+    _merge_author_name = fields.get("author", "").strip().lower() or _derive_legacy_author(body)
+    if not _is_maintainer_flip(current_turn, "", _merge_colleague_name, _merge_author_name):
+        print(
+            f"baton merge: turn is with {current_turn} — not presented for "
+            "merge (still with the registered colleague or the PR's own "
+            f"author). The baton must be flipped to the pool sentinel "
+            f"('{sentinel}') or a maintainer agent before merging.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -1906,7 +1949,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     if dry_run:
         print(f"baton merge --dry-run: PR #{pr_number} ({project_id})")
         print(f"  gate 1 (baton exists): PASS")
-        print(f"  gate 2 (turn=sentinel): PASS — turn={current_turn}")
+        print(f"  gate 2 (turn=maintainer): PASS — turn={current_turn}")
         print(f"  gate 3 (CI):            {_ci_verdict}")
         print(f"  gate 4 (approval):      {_ap_verdict}")
         print(f"  merge: DRY-RUN — no merge performed")

@@ -1827,7 +1827,131 @@ class TestPoolSentinel:
         _baton.cmd_merge(args, owner_config, "borges", client)
 
         captured = capsys.readouterr()
-        assert "gate 2 (turn=sentinel): PASS" in captured.out
+        assert "gate 2 (turn=maintainer): PASS" in captured.out
+
+    def test_merge_gate2_accepts_named_maintainer_not_sentinel(self, engram_home, monkeypatch, capsys):
+        """#2913: the actual bug. This team's real convention -- every flip
+        performed this session, and CLAUDE.md's own baton lifecycle -- ends
+        a PR's review at a NAMED maintainer agent (e.g. "kepler"), never
+        the literal pool sentinel string. Pre-#2913, `_is_pool_sentinel`
+        alone would refuse this exact, correct, real-world state."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9998", title="named-maintainer merge gate test", turn="kepler",
+                participants="[clio, ariadne, kepler]", status="in-progress",
+                github="pr/example-org/example-repo/9998", colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9998", dry_run=True, force=True)
+        _baton.cmd_merge(args, owner_config, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "gate 2 (turn=maintainer): PASS" in captured.out
+        assert "not presented for merge" not in captured.err
+
+    def test_merge_gate2_refuses_while_turn_still_with_colleague(self, engram_home, monkeypatch, capsys):
+        """Companion control: turn == the registered colleague means the PR
+        is still in review, not presented for merge -- must stay refused,
+        same as it always has (the fix adds an exemption for NAMED
+        maintainers, it does not turn Gate 2 into a rubber stamp)."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9997", title="colleague-holds merge gate test", turn="ariadne",
+                participants="[clio, ariadne]", status="in-progress",
+                github="pr/example-org/example-repo/9997", colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9997", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not presented for merge" in captured.err
+
+    def test_merge_gate2_refuses_while_turn_back_with_author(self, engram_home, monkeypatch, capsys):
+        """Companion control: turn == the PR's own author (explicit
+        `author:` field or the #2966 legacy-log fallback) means a
+        colleague sent it back with a blocker -- must stay refused, not be
+        read as merge-ready just because it isn't the literal colleague
+        field either."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        raw = _make_raw_baton(
+            "PR-9996", title="author-holds merge gate test", turn="clio",
+            participants="[clio, ariadne]", status="in-progress",
+            github="pr/example-org/example-repo/9996", colleague="ariadne",
+        )
+        # Faithful legacy shape (no explicit author: field) -- exercises
+        # the #2966 turn-log fallback, the same as production batons.
+        raw = raw.replace(
+            "- 2026-06-26T12:00:00Z initialized",
+            "- 2026-06-26T12:00:00Z initialized → clio: project initialized by clio",
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(pr="PR-9996", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not presented for merge" in captured.err
+
+    def test_merge_gate2_refuses_empty_turn(self, engram_home, monkeypatch, capsys):
+        """Edge case named in Gate 2's own comment: a baton with no `turn`
+        key at all must refuse with "(unknown)", not spuriously pass by
+        matching the disabled `current_holder=""` sentinel
+        `_is_maintainer_flip` is called with. Built by hand rather than
+        via `_make_raw_baton(turn="")`: that helper writes an unquoted
+        empty value (`turn: `) which corrupts the line-based frontmatter
+        parser on the FOLLOWING key (the same fragility `turn_by`/
+        `turn_reason` are deliberately quoted to avoid in production
+        code) -- a pre-existing test-helper limitation, not something
+        this fix should route around. Omitting the key entirely is both
+        the realistic shape (production writers never emit an empty
+        `turn:` line) and the one that actually reaches Gate 2's
+        `if not current_turn` branch cleanly."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        raw = (
+            "---\n"
+            "project: PR-9995\n"
+            "title: empty-turn merge gate test\n"
+            "status: in-progress\n"
+            "turn_since: 2026-06-26T12:00:00Z\n"
+            "turn_reason: start\n"
+            "participants: [clio, ariadne]\n"
+            "github: pr/example-org/example-repo/9995\n"
+            "colleague: ariadne\n"
+            "---\n\n## Turn log\n\n- 2026-06-26T12:00:00Z initialized\n"
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(pr="PR-9995", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "(unknown)" in captured.err
 
     def test_merge_repo_qualified_ci_red_refuses(self, engram_home, monkeypatch, capsys):
         """#1715 round-2 (reviewer-fairy-caught blocker): cmd_merge is a
