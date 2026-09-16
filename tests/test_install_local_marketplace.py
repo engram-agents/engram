@@ -59,6 +59,41 @@ def _path_without_timeout_wrappers(dest_dir):
     return str(dest_dir)
 
 
+def _path_without_jq(dest_dir):
+    """Build a PATH value that genuinely has no `jq` binary reachable
+    anywhere on it, for engram-alpha#2955's falsifier: the installer must
+    read multi_agent/install_tier via python3 unconditionally, never jq, so
+    it must build correctly even when jq is entirely absent from PATH (not
+    merely absent on this particular runner).
+
+    Same masking technique as `_path_without_timeout_wrappers` above:
+    symlink every OTHER currently-reachable executable name into a fresh
+    directory and point PATH at that directory alone -- bash/git/python3/etc.
+    all stay resolvable; only `jq` does not.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            names = os.listdir(entry)
+        except OSError:
+            continue
+        for name in names:
+            if name == "jq" or name in seen:
+                continue
+            src = os.path.join(entry, name)
+            if not os.path.isfile(src) or not os.access(src, os.X_OK):
+                continue
+            try:
+                os.symlink(src, dest_dir / name)
+            except OSError:
+                continue
+            seen.add(name)
+    return str(dest_dir)
+
+
 def _write_fake_plugin(build_root, *, platform=None, codex_agent=False):
     build_root.mkdir(parents=True, exist_ok=True)
     (build_root / "plugin.json").write_text(
@@ -103,6 +138,119 @@ def test_install_local_marketplace_builds_codex_target(tmp_path):
     assert manifest["target"] == "codex"
     assert manifest["multi_agent"] is True
     assert manifest["tier"] == "dev"
+
+
+def test_install_local_marketplace_builds_without_jq_on_path(tmp_path):
+    """engram-alpha#2955: the installer must read multi_agent/install_tier via
+    python3, never jq -- confirm by stripping jq from PATH entirely (not just
+    checking jq happens to be absent on this runner) and confirming the
+    build still succeeds and reads the config correctly."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"multi_agent": True, "install_tier": "dev"})
+    )
+    masked_path = _path_without_jq(tmp_path / "masked-path-bin-no-jq")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, PATH=masked_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    assert "target: codex" in result.stdout
+    assert "multi-agent: yes, target: codex" in result.stdout
+
+    plugin_root = tmp_path / "marketplace" / "plugins" / "engram"
+    manifest = json.loads((plugin_root / ".engram-build-manifest.json").read_text())
+    assert manifest["target"] == "codex"
+    assert manifest["multi_agent"] is True
+    assert manifest["tier"] == "dev"
+
+
+def test_install_local_marketplace_fails_loud_on_malformed_config(tmp_path):
+    """engram-alpha#2955: a genuinely malformed config.json must still abort
+    the install with a non-zero exit and a clear stderr message -- matching
+    the OLD jq path's `set -e` abort behavior on an unparseable file. The
+    python3 replacement must never silently default to a flagless build on
+    a parse error."""
+    (tmp_path / "config.json").write_text("{not valid json")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower()
+
+
+def test_install_local_marketplace_fails_loud_on_non_object_config(tmp_path):
+    """engram-alpha#2955 round 1 (reviewer-fairy suggestion): a config.json
+    that is syntactically VALID JSON but not an object at the top level
+    (e.g. a bare array) must still abort loudly with the same clean
+    one-line message as the malformed-JSON case above -- not a raw Python
+    traceback from an uncaught AttributeError on d.get(). Fail-loud held
+    either way (non-zero exit), but the message quality regressed until
+    this fix widened the try/except to cover the type check too."""
+    (tmp_path / "config.json").write_text("[]")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "Traceback" not in result.stderr, (
+        f"expected the clean one-line error message, got a raw traceback:\n{result.stderr}"
+    )
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower() or "expected" in result.stderr.lower()
+
+
+def test_install_local_marketplace_fails_loud_on_embedded_newline_in_tier(tmp_path):
+    """engram-alpha#2958 round 2 (Mira's reviewer catch): the python heredoc
+    hands multi_agent/install_tier to bash as two stdout lines, split via
+    `sed -n '1p'`/`sed -n '2p'`. An install_tier value containing an embedded
+    newline (e.g. "dev\\nbogus") prints as TWO lines from the tier value
+    alone, so `sed -n '2p'` silently captures only "dev" and "bogus" is
+    dropped from the pipeline with no error -- the old jq path passed the
+    whole string as a single shell argument and would have failed loud
+    instead. The installer must now reject this config.json with a non-zero
+    exit and a clear stderr message, rather than exiting 0 and rewriting
+    config.json with the truncated, unvalidated install_tier value."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"multi_agent": True, "install_tier": "dev\nbogus"})
+    )
+    original_config_text = config_path.read_text()
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "newline" in result.stderr.lower()
+    # config.json must be left untouched -- no truncated install_tier rewrite,
+    # confirming the installer aborted before reaching the persist-back block.
+    assert config_path.read_text() == original_config_text
 
 
 def test_install_local_marketplace_accepts_equals_target_form(tmp_path):

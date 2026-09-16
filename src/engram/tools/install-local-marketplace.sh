@@ -326,21 +326,69 @@ else
   build_flags=()
   _cfg="$ENGRAM_HOME/config.json"
   if [[ -f "$_cfg" ]]; then
-    # Hard-require jq when a config exists: without it the build silently
-    # proceeds flagless and drops configured surfaces (multi-agent / dev tier)
-    # — the #704 class. Same contract as migrate-to-plugin.sh's require_jq.
-    if ! command -v jq &>/dev/null; then
-      {
-        printf '[install-local-marketplace] ERROR: jq is required to read %s (multi_agent/install_tier).\n' "$_cfg"
-        printf '[install-local-marketplace]   Install jq:  brew install jq  (macOS)  |  sudo apt-get install jq  (Debian/Ubuntu)\n'
-        printf '[install-local-marketplace]   No-jq path:  bash tools/build-plugin.sh --tier <tier> --multi-agent\n'
-        printf '[install-local-marketplace]                bash tools/install-local-marketplace.sh --skip-build\n'
-        printf '[install-local-marketplace]   Without jq the build silently drops configured surfaces (#704 class).\n'
-      } >&2
+    # Read multi_agent/install_tier via python3, not jq (#2955) — python3 is
+    # already a hard requirement of this script (see the config-persist block
+    # below), so there is nothing left to require a system jq binary for.
+    # One python3 invocation reads both fields from a single parse (cheaper
+    # than two separate calls, and keeps the pair atomically consistent) and
+    # prints them as two stdout lines. This is a DELIBERATE style choice
+    # against the later _eff_tier/_eff_multi_agent block (~line 497 below),
+    # which makes two separate python3 -c calls — that shape predates this
+    # fix and is unrelated pre-existing code (its own silent-exception-swallow
+    # anti-pattern is tracked separately under #2951; not the model to follow
+    # here). On ANY parse error this block prints a clear message to stderr
+    # and exits non-zero — the same fail-loud contract the old jq path got
+    # for free from `set -e`, just with a cleaner message than a raw
+    # traceback.
+    if ! _ma_tier_out="$(python3 - "$_cfg" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError(f"expected a JSON object at the top level, got {type(d).__name__}")
+    ma = "true" if (d.get("multi_agent") is True or d.get("mode") == "multi") else "false"
+    # Match jq install_tier // empty semantics: only null/missing falls back
+    # to empty -- an already-empty-string value passes through as itself.
+    tier = d.get("install_tier")
+    if tier is None or tier is False:
+        tier = ""
+    # Reviewer catch (#2958, Mira): this block hands ma/tier to bash as two
+    # stdout lines, split via `sed -n '1p'`/`sed -n '2p'` (see below) --
+    # unlike the old single-jq-argument path, a value containing an embedded
+    # newline is silently split across MULTIPLE lines and the sed split then
+    # truncates it to just its first line, with everything after the
+    # newline dropped from the pipeline with no error. Reject it here
+    # instead, matching the fail-loud contract already used above. `ma` is always
+    # "true"/"false" (derived above, never copied from user input) so it can
+    # never contain a newline -- only `tier`, a raw string straight out of
+    # config.json, is at risk.
+    if "\n" in tier:
+        raise ValueError(
+            "install_tier must not contain a newline "
+            f"(got {tier!r})"
+        )
+except Exception as e:
+    # Reviewer-fairy round 1 (#2955): the ORIGINAL version of this block only
+    # wrapped the open()+json.load() call, so a syntactically-valid-but-wrong-
+    # shape config (e.g. a bare JSON array or string at the top level) still
+    # aborted the script (d.get() raised AttributeError, uncaught, non-zero
+    # exit -- fail-loud held) but with a raw Python traceback instead of this
+    # clean one-line message. Widened to cover every failure mode with the
+    # SAME message, matching the safety property this whole block exists for.
+    print(f"[install-local-marketplace] ERROR: failed to parse {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+print(ma)
+print(tier)
+PY
+    )"; then
       exit 1
     fi
-    _ma="$(jq -r 'if (.multi_agent == true) or (.mode == "multi") then "true" else "false" end' "$_cfg")"
-    _tier="$(jq -r '.install_tier // empty' "$_cfg")"
+    # Split the two stdout lines without readarray/mapfile -- unavailable
+    # on bash 3.2 (macOS's system /usr/bin/env bash target).
+    _ma="$(printf '%s\n' "$_ma_tier_out" | sed -n '1p')"
+    _tier="$(printf '%s\n' "$_ma_tier_out" | sed -n '2p')"
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
