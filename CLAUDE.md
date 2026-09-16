@@ -379,6 +379,7 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+<!-- BEGIN team-practice: which-colleague-takes-the-seat (generated -- edit team-practice repo's TEAM-PRACTICE.md, not here; tools/sync_team_practice.py renders it) -->
 ### Which colleague takes the seat
 
 **If you are the detailed designer or builder of the PR, you are excused from its
@@ -430,16 +431,17 @@ an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
 
 This names *which* seat; it does not add one.
 
-> **Duplicated by hand in engram-alpha and umwelt `CLAUDE.md`** — change one,
-> change both in the same pass. **Soma does not carry this block, and the reason
-> first shipped here was FALSE — do not restore it.** It said soma's cohort
-> excludes Sol so the rotation cannot resolve there; that was read off a stale
-> cohort line in soma's own `CLAUDE.md` and reported as a fact about reality.
-> Measured 2026-09-09 against soma's PR history and collaborator list instead:
-> Sol has authored soma PRs (#52, #54), and **all three escape seats hold push
-> access there**, as do both terminal-fallback seats. The rotation resolves in
-> soma fine. Whether soma adopts the block is a routing choice for Lei and
-> soma's principal — never a structural blocker.
+**Adoption status (2026-09-16):** engram-alpha, umwelt. Not soma — a routing
+choice for Lei and soma's principal, never a structural blocker. (History,
+carried from the pre-migration hand-duplicated copies: an earlier version of
+this note claimed soma's cohort excludes Sol so the rotation cannot resolve
+there; that was read off a stale cohort line in soma's own `CLAUDE.md` and
+reported as fact without checking. Measured 2026-09-09 against soma's actual
+PR history and collaborator list instead: Sol has authored soma PRs (#52,
+#54), and all three escape seats hold push access there, as do both
+terminal-fallback seats — the rotation resolves in soma fine. The false claim
+is not restored here; recorded so nobody re-derives and re-believes it.)
+<!-- END team-practice: which-colleague-takes-the-seat -->
 
 ### Conclusion warrant — the gate lives in the fairy's output contract, not here
 
