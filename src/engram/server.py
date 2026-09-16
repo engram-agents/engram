@@ -1745,90 +1745,34 @@ def engram_add_observation(payload_json: str) -> str:
 
     Pass all fields as one JSON object string in payload_json.
 
-    Source identification: provide EITHER url+title (evidence node auto-created
-    or reused) OR evidence_id (cite an existing evidence node) OR session_id
-    (cite the current chat — the server resolves the transcript for you).
-    evidence_id takes precedence over url when both are given (pre-existing
-    behavior); session_id may not be combined with url or evidence_id —
-    passing it alongside either is an error.
+    Source identification — exactly one of:
+        url + title   evidence node auto-created or reused
+        evidence_id   cite an existing evidence node
+        session_id    cite the current chat (server resolves the transcript)
+    evidence_id takes precedence over url when both are given; session_id may
+    NOT be combined with either — passing it alongside url or evidence_id is an
+    error.
+
+    The quote must be a VERBATIM substring of the source. This is checked
+    server-side on every path, session_id included, and fails loud.
+
+    Ephemeral sources (forum threads, web pages, local files not committed to a
+    repo) must be archived with engram-snapshot first and cited by the file://
+    URL it emits. Raw forum/localhost URLs are rejected by the evidence-URL
+    guard, an uncommitted file is rejected as unverifiable, and a synthetic
+    conversation:// scheme is rejected.
 
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
 
-    Advisory predictive_hint (#2252 Stage 1.4): when is_predictive is falsy,
-    the result may carry a "predictive_hint" key because
-    predicted_event/resolution_timeframe were passed without is_predictive.
-    This is advisory only: it never blocks or alters node creation, and is
-    suppressed whenever is_predictive is true. It exists because the
-    pairing invariant (a claim-bearing predictive observation paired with a
-    non-claim-bearing prediction node) protects nothing if nobody is
-    prompted to use it. (A claim-text keyword/regex trigger was evaluated
-    and removed pre-merge on measured zero precision; redesign tracked in
-    #2264.)
-
-    Advisory anchoring_advisory (#2602 facet 2): every response also carries
-    an "anchoring_advisory" object measuring how many of the claim's "hard"
-    facts (node ids, issue/PR refs, hex shas, 3+-digit numbers, dates/times)
-    are literal substrings of quoted_text. For quote_type=hard_data, "the
-    quoted text IS the data" — unanchored hard tokens in the claim are the
-    signal to widen the quote, move the fact to interpretation, or downgrade
-    the quote type. Advisory only until #2602 facet 3 — nothing here refuses
-    a write or changes a confidence.
-
-    Simplest — citing the CURRENT chat (pass your injected session_id; the
-    server resolves the transcript, defaults quote_type=personal_communication
-    + source_class=user_stated; a wrong or stale session_id fails loud via the
-    same server-side verbatim-quote check used by every other filing path —
-    no separate verify step needed, but the quote must still be an exact
-    substring of the transcript):
+    Minimal call, citing the current chat:
         {"quoted_text": "...", "interpretation": "...", "claim": "...",
-         "session_id": "<the session id injected at session start / shown in your banner>"}
+         "session_id": "<the session id injected at session start>"}
 
-    Common usage — citing the user's chat log as evidence
-    (the most common friction point for new sessions; verbatim-quote check is
-    enforced server-side and WILL fail loudly if you skip step 2):
-
-        Step 1 — Identify the current session JSONL transcript:
-            ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
-            The path is also available via the active session's env or by
-            sorting ~/.claude/projects/<encoded-cwd>/ by mtime descending.
-
-        Step 2 — Verify the quote is VERBATIM in the transcript BEFORE filing:
-            ~/.engram/tools/verify_quote.py <jsonl-path> "<exact quote>"
-            On match → proceed to step 3.
-            On miss → DIAGNOSE, don't retry. Likely the JSONL hasn't flushed
-            yet (the user's most recent line may lag by seconds). Re-reading
-            the file after a brief wait usually surfaces it. Blind retries of
-            engram_add_observation will loop on the same verbatim mismatch.
-
-        Step 3 — Call engram_add_observation with the JSONL path as the
-            file:// URL (NOT a synthetic conversation:// scheme — that's
-            rejected; the substrate classifies file:///.claude/projects/...jsonl
-            as a "conversation" source automatically):
-            {"quoted_text": "<the verified quote>",
-             "interpretation": "<what this means in context>",
-             "claim": "<the atomic falsifiable claim>",
-             "quote_type": "personal_communication",
-             "url": "file:///home/<agent>/.claude/projects/<encoded-cwd>/<session-id>.jsonl",
-             "title": "Chat log <YYYY-MM-DD>",
-             "source_class": "user_stated"}
-
-    Common usage — citing forum threads, transcript spans, or any ephemeral source:
-        Ephemeral sources (LAN forum threads, session transcript spans, web pages,
-        local files that aren't committed to a repo) MUST be archived first.
-        Raw forum/localhost URLs are rejected by the evidence-URL guard (no stable
-        domain — that's intentional). Use engram-snapshot, which content-addresses
-        the content and emits a file:// URL designed to feed this tool directly:
-
-            engram-snapshot forum:<thread_id>        # archive a forum thread
-            engram-snapshot jsonl:<session-id>       # archive a session transcript span
-            engram-snapshot jsonl:                   # bare — current session (most common)
-            engram-snapshot file:<path>              # archive a local file
-
-        Then cite the returned "file_url" as the url field here. The resulting
-        evidence node is content-hash-pinned + verbatim-checkable even if the
-        original source changes or disappears. For web pages: fetch the page
-        (WebFetch / curl), save to a file, then use engram-snapshot file:<path>.
+    Worked examples, the quote-verification workflow, quote_type/source_class
+    selection, node-grain guidance, and the advisory response keys: the
+    engram-observe skill. Identifier conventions for standpoint_author_id: the
+    engram-standpoint skill.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -1855,23 +1799,12 @@ def engram_add_observation(payload_json: str) -> str:
             content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
-                produced the source claim (the "who observes" axis). Used for provenance-uniformity
-                detection. Tiered convention: for in-graph entities (peer agents, anyone already a
-                person node) use the pn_* node ID — it carries trust-tier, bio, and about edges, and
-                MUST resolve to an existing, current person node. For external one-off authors (a
-                cited journalist, paper author) use a canonical namespaced string such as
-                orcid:0000-0001-2345-6789, doi-author:10.1000/xyz123, or domain:handle — NOT a raw
-                display name; the independence gate needs same-author → same-string and
-                different-author → different-string, and display names are bad join keys ('J. Smith'
-                ≠ 'John Smith'; homonym collisions). Promote a namespaced string to a pn_* node when
-                the author becomes load-bearing (cited ≥2 times or a reliability view forms) —
-                mirrors conjecture→derivation promotion. Non-goal: minting a person node for every
-                author; the independence gate needs only a stable equality key. Write-time hard gate
-                (#1827): a raw display-name shape, or a well-formed pn_* id that does not resolve to
-                an existing current person node, is REJECTED with a repair hint (a fuzzy-matched
-                existing person, or a mint-one pointer to engram_add_person). Config kill-switch
-                `standpoint.author_id_hard_gate` (default true) restores the pre-#1827 warn-not-reject
-                behavior when set false.
+                produced the source claim (the "who observes" axis). Use the pn_* node ID for an
+                in-graph entity — it MUST resolve to an existing, current person node. Use a
+                canonical namespaced string (orcid:..., doi-author:..., domain:handle) for an
+                external one-off author. A raw display name is REJECTED at write time, as is a
+                pn_* that does not resolve; the error carries a repair hint. Conventions,
+                promotion policy and the config kill-switch: the engram-standpoint skill.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
@@ -1879,10 +1812,10 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
-            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
-            evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time — the capturer knows what it just archived; a later reader has to guess. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit. See #2606 facet 1.
-            original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata, for traceability only: it is NOT a re-fetch pointer, and nothing reads it back to refetch. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes. See #2606 facet 1.
+            evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit.
+            original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes.
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
