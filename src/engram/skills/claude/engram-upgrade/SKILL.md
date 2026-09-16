@@ -199,12 +199,16 @@ The plugin rebuild (Step 3) replaced the `viz/` package (`viz/server.py` and its
 
 **macOS note:** systemd is Linux-only. On macOS, skip to the manual-start path below. launchd integration is a known gap (see #402); it is not handled here.
 
+`tools/operator-setup-viz.sh` is the canonical path (idempotent; its last step
+is this same restart) — use the bare restart below only for a code-only
+refresh where setup is already known-good.
+
 ```bash
 # Check if a systemd service is registered (Linux only):
-systemctl --user status engram-viz 2>/dev/null || echo "no systemd service"
+systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd service"
 
 # If registered, restart it:
-systemctl --user restart engram-viz && echo "viz restarted" || echo "viz restart failed — check journalctl --user -u engram-viz"
+systemctl --user restart engram-viz-user.service && echo "viz restarted" || echo "viz restart failed — check journalctl --user -u engram-viz-user.service"
 ```
 
 **If not a systemd service** (manual-start install, or macOS): the old process is still running. Tell the user:

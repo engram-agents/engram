@@ -287,8 +287,11 @@ A populated value means the viz server is up and can read that seat's graph DB.
 **FAIL:** connection refused, non-200 response, or no `health_score` in the JSON.
 
 ```bash
-# Check if it's supposed to be running (systemd service or manual start):
-systemctl --user status engram-viz 2>/dev/null || echo "no systemd service"
+# Check if it's supposed to be running (systemd service or manual start).
+# tools/operator-setup-viz.sh is the canonical path (idempotent; its last
+# step is this same restart) -- use the bare restart below only for a
+# code-only refresh where setup is already known-good.
+systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd service"
 # Manual start (viz/server.py uses relative imports -- must run as a
 # module with the plugin engram dir as the working directory, not as a
 # direct script path):
