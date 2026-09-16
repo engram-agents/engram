@@ -804,6 +804,7 @@ def init(
     by_agent: str = "",
     github: Optional[str] = None,
     colleague: Optional[str] = None,
+    author: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Create a new project baton from scratch; return the assigned seq.
@@ -816,7 +817,7 @@ def init(
     title constraints) is the caller's job.
 
     Frontmatter field order mirrors ``baton cmd_init``:
-      project / title / status / turn / turn_since / turn_reason / turn_by / participants / github (optional) / colleague (optional)
+      project / title / status / turn / turn_since / turn_reason / turn_by / participants / github (optional) / colleague (optional) / author (optional)
 
     Log format: ``- {ts} initialized → {turn}: {turn_reason}``
 
@@ -845,6 +846,25 @@ def init(
             ``participants`` alone (unchanged scope — #2764 is about
             visibility/settability of the colleague identity, not
             enforcement).
+        author: optional PR-author identity (#2961), persisted verbatim
+            (lowercased/stripped) as the ``author:`` frontmatter field and
+            never touched again by ``flip``/``claim``/``release`` (unlike
+            ``turn_by``, which is overwritten on every turn-change to record
+            the ACTOR, not the original author — the exact reason ``turn_by``
+            cannot serve as an author proxy past the first flip). Consumed by
+            ``_is_maintainer_flip`` to exempt a colleague's "send it back to
+            the author after a blocker" flip from the merge-presentation gate
+            — that flip target matches neither the self-flip nor the
+            flip-to-colleague exemption, so without this field it was
+            misclassified as presenting-for-merge and demanded an approval
+            that cannot exist (the colleague is the one objecting). The
+            caller (``cmd_init``) is responsible for supplying the right
+            value — the established convention is the initial ``turn``
+            holder, since a PR baton is normally initialized by its own
+            author with ``turn`` pointing at themselves. Omitted (``None`` /
+            falsy) on an existing baton created before this field existed —
+            ``_is_maintainer_flip`` treats a missing author as "no exemption
+            available," identical to pre-#2961 behavior, not as an error.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -879,6 +899,8 @@ def init(
         fm_lines.append(f"github: {github}")
     if colleague:
         fm_lines.append(f"colleague: {colleague.strip().lower()}")
+    if author:
+        fm_lines.append(f"author: {author.strip().lower()}")
     fm_lines.append("---")
     fm_lines.append("")
 

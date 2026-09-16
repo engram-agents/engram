@@ -295,6 +295,14 @@
       ]
     },
     {
+      "path_prefix_or_glob": "tools/baton_gate.py",
+      "test_globs": [
+        "tests/test_baton_gate.py",
+        "tests/test_baton.py"
+      ],
+      "note": "#2884 (second half): CI-green / post-approval-freshness / colleague-approval gate helpers shared between tools/baton.py's cmd_flip and src/forum/server.py's api_project_flip. tests/test_baton_gate.py covers the module directly (including the TestSentinelPredicateParity anti-drift check); tests/test_baton.py exercises _parse_github_anchor/_pr_ci_state/_pr_approval_state/_dedupe_checks_by_latest indirectly via tools/baton.py's own import of them. The server-side endpoint tests live in src/forum/tests/test_projects_api.py, outside this test-map's src/engram-scoped surface."
+    },
+    {
       "path_prefix_or_glob": "tools/check-claude-md-drift.py",
       "test_globs": ["tests/test_check_claude_md_drift.py"],
       "note": "standalone subprocess CLI (not import-reachable); dedicated CLI test covers arg handling + exit codes 0/1/2 + drift-diff output"

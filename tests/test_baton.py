@@ -3319,6 +3319,87 @@ class TestFlipMaintainerRoleGate:
         assert "has no repo-qualified github anchor" in captured.err
 
 
+class TestFlipLegacyAuthorFallback:
+    """#2961 follow-up (Ariadne's round-2 catch on PR#2966): the CLI path
+    (cmd_flip) must recover the author-proxy from a legacy baton's own
+    turn log, the same as the REST path's _check_flip_gate does -- this
+    is the 1,493-existing-baton gap a bulk migration would otherwise have
+    needed a live write to close. Uses the same pinned-sentinel fixture
+    convention as TestFlipMaintainerRoleGate above."""
+
+    def test_cmd_flip_recovers_author_from_turn_log_without_author_field(self, monkeypatch, capsys):
+        """No `author:` frontmatter field at all (the pre-#2961 shape) --
+        but the turn log's own first line names "clio" as the real
+        author. Flipping FROM ariadne (the current holder, post-review)
+        BACK TO clio must succeed ungated, exactly as it would if an
+        explicit `author: clio` field were present -- CI is deliberately
+        mocked red, so a false-positive "maintainer flip" classification
+        would refuse this and fail the test."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_ci_state must not be called -- the legacy-author "
+                "fallback should have exempted this flip before any "
+                "CI/approval check runs"
+            )
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+
+        raw = _make_raw_baton(
+            "PR-9300", github="pr/example-org/example-repo/9300",
+            turn="ariadne", participants="[clio, ariadne]",
+            colleague="ariadne",
+        )
+        # _make_raw_baton's default body line is a synthetic stub
+        # ("- ... initialized", no arrow/target) -- replace it with the
+        # REAL shape init() actually writes, naming clio as the author.
+        raw = raw.replace(
+            "- 2026-06-26T12:00:00Z initialized",
+            "- 2026-06-26T12:00:00Z initialized → clio: project initialized by clio",
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(
+            project_id="PR-9300", to="clio", reason="one blocker, back to author", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        captured = capsys.readouterr()
+        assert captured.err.strip() == ""
+
+    def test_cmd_flip_with_no_initialized_line_still_gates(self, monkeypatch, capsys):
+        """Companion control: a baton with no `author:` field AND no
+        parseable "initialized -> X:" line at all (the synthetic stub
+        _make_raw_baton produces by default) has no fallback to recover --
+        the flip must still be gated exactly as it was before this fix,
+        never silently exempted."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9301", github="pr/example-org/example-repo/9301",
+                turn="ariadne", participants="[clio, ariadne]",
+                colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9301", to="clio", reason="one blocker, back to author", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+
 class TestIsMaintainerFlip:
     """Direct-call unit tests for _is_maintainer_flip (#2912) -- the
     broadened trigger predicate cmd_flip now uses in place of the bare
@@ -3386,6 +3467,43 @@ class TestIsMaintainerFlip:
             # Flip to the registered colleague (to_agent == colleague_name;
             # neither ever equals the sentinel in this loop): always False.
             assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
+
+    def test_flip_to_author_is_not_maintainer_flip(self, monkeypatch):
+        """#2961: PR-2926's real shape -- colleague "ariadne" holds the
+        baton after reviewing, finds a blocker, and flips it back to the
+        PR's author "clio". to_agent (clio) is neither the current holder
+        (ariadne) nor the colleague (ariadne) -- pre-#2961 this fell
+        through to True (misclassified as presenting-for-merge) and
+        demanded an approval that cannot exist, since the colleague is the
+        one objecting. With `author="clio"` passed, it must be False."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne") is True  # pre-#2961 shape, no author arg
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne", "clio") is False
+
+    def test_missing_author_is_pre_2961_behavior(self, monkeypatch):
+        """An empty/falsy `author` (a baton created before #2961, with no
+        `author:` frontmatter field) must reproduce the exact pre-#2961
+        answer -- the exemption simply cannot fire, not an error and not a
+        different default classification."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne", "") is True
+        assert _baton._is_maintainer_flip("ariadne", "borges", "sol", "") is True
+        assert _baton._is_maintainer_flip("borges", "borges", "sol", "") is False
+        assert _baton._is_maintainer_flip("sol", "borges", "sol", "") is False
+
+    def test_author_exemption_does_not_override_sentinel_or_self_flip(self, monkeypatch):
+        """The author exemption is checked LAST -- a flip to the pool
+        sentinel, or a self-flip, must keep its own answer even when the
+        target also happens to equal `author` (an author flipping the
+        baton to the human maintainer, or to themselves, is unaffected by
+        this new parameter)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        # to_agent is both the sentinel AND (contrived) the stored author --
+        # sentinel wins, still True.
+        assert _baton._is_maintainer_flip("casey", "borges", "sol", "casey") is True
+        # to_agent is both the current holder AND the stored author --
+        # self-flip wins, still False.
+        assert _baton._is_maintainer_flip("borges", "borges", "sol", "borges") is False
 
 
 # ===========================================================================
