@@ -65,6 +65,8 @@ _is_ancestor = _mod._is_ancestor
 _merge_base = _mod._merge_base
 list_test_files = _mod.list_test_files
 read_sources_at_rev = _mod.read_sources_at_rev
+_parse_workflow_scan_roots = _mod._parse_workflow_scan_roots
+TEST_SCAN_ROOTS = _mod.TEST_SCAN_ROOTS
 
 
 # ---------------------------------------------------------------------------
@@ -1555,3 +1557,174 @@ def test_2939_end_to_end_via_main_reports_both_scan_roots(
     assert "tests/test_a.py::test_from_tests_removed" in captured.out
     assert "src/forum/tests/test_forum.py::test_from_forum_removed" in captured.out
     assert "test_should_not_be_scanned" not in captured.out
+
+
+# ---------------------------------------------------------------------------
+# #2950 -- TEST_SCAN_ROOTS <-> tests.yml sync gate. Nothing previously
+# enforced that this tool's own scan roots track tests.yml's actual
+# full-suite pytest invocation line by hand, as the TEST_SCAN_ROOTS comment
+# says they must -- a third root added to one side and not the other would
+# go uncaught. This section adds the CI-enforced comparison the issue asks
+# for, plus a mutation-control proving the comparison itself is sound (would
+# actually go red on a real drift, not merely "ran without raising").
+# ---------------------------------------------------------------------------
+
+
+def test_2950_real_workflow_scan_roots_match_test_scan_roots_constant():
+    """THE actual CI-enforced gate: parse the REAL .github/workflows/tests.yml
+    from this repo and assert its pytest invocation's roots equal
+    TEST_SCAN_ROOTS exactly (as sets). When this fails, it's real signal --
+    someone changed one side (a new scan root added to the workflow, or to
+    the constant) and not the other.
+
+    Compared as SETS, not tuples/order: a workflow author could plausibly
+    write the roots in a different order than TEST_SCAN_ROOTS's declared
+    tuple order without that being real drift -- the tool's own
+    `list_test_files` iterates TEST_SCAN_ROOTS and unions the results
+    regardless of order, so scan-root ORDER is not semantically load-bearing
+    to begin with; only MEMBERSHIP is.
+    """
+    workflow_text = (REPO_ROOT / ".github" / "workflows" / "tests.yml").read_text()
+    workflow_roots = _parse_workflow_scan_roots(workflow_text)
+    assert set(workflow_roots) == set(TEST_SCAN_ROOTS)
+
+
+def test_2950_synthetic_third_root_is_detected_as_a_mismatch():
+    """Mutation-control (the "mutation-tested" property the issue's own
+    colleague reference names): feed the parser a FAKE, inline
+    workflow-yaml-shaped string naming a THIRD root the real
+    TEST_SCAN_ROOTS does not have, and assert the comparison against the
+    real constant correctly reports a MISMATCH.
+
+    This does not merely check that the parser extracted the right strings
+    from the fake input in isolation (that's parser-robustness territory,
+    covered below) -- it exercises the exact comparison
+    `test_2950_real_workflow_scan_roots_match_test_scan_roots_constant`
+    performs, so that comparison is proven capable of going False on a real
+    drift, not vacuously true no matter what it's given."""
+    fake_workflow_text = (
+        "      - name: Run pytest\n"
+        "        run: pytest tests/ src/forum/tests/ src/somewhere_new/tests/ -v --tb=short\n"
+    )
+    fake_roots = _parse_workflow_scan_roots(fake_workflow_text)
+    assert set(fake_roots) != set(TEST_SCAN_ROOTS)
+    assert "src/somewhere_new/tests/" in fake_roots
+
+
+def test_2950_parser_tolerates_extra_whitespace_and_single_root():
+    """Robustness: the parser isn't brittle-matched to one exact byte
+    string -- extra whitespace around `run:`/`pytest`/between roots, and a
+    line naming only a single root, both still parse correctly."""
+    assert _parse_workflow_scan_roots(
+        "run:    pytest    tests/    src/forum/tests/    -v   --tb=short"
+    ) == ("tests/", "src/forum/tests/")
+    assert _parse_workflow_scan_roots("run: pytest tests/") == ("tests/",)
+
+
+def test_2950_parser_stops_at_the_first_flag_token():
+    """Robustness: flags are recognized as anything starting with '-', not
+    just the two specific flags (`-v`, `--tb=short`) the real line
+    currently uses -- a differently-flagged invocation still extracts only
+    the bare positional roots preceding the first flag."""
+    assert _parse_workflow_scan_roots("run: pytest tests/ --maxfail=1 -x") == ("tests/",)
+    assert _parse_workflow_scan_roots("run: pytest tests/ src/forum/tests/ -q") == (
+        "tests/",
+        "src/forum/tests/",
+    )
+
+
+def test_2950_no_invocation_line_raises_rather_than_passing_vacuously():
+    """The 'no invocation line found' failure mode (escape valve in the
+    module docstring's own design intent): a workflow-shaped string with NO
+    `run: pytest ...` line at all must raise, not silently return an empty
+    tuple or None -- either of those would let the sync-check comparison
+    pass VACUOUSLY (an empty set trivially differs from TEST_SCAN_ROOTS, so
+    this particular case happens to still fail loudly by luck, but a caller
+    that special-cased an empty result as "nothing to compare, skip" would
+    not) -- exactly the kind of drift this whole gate exists to catch."""
+    workflow_shaped_text = (
+        "name: tests\n"
+        "jobs:\n"
+        "  pytest:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - name: Run something else entirely\n"
+        "        run: echo 'no pytest here'\n"
+    )
+    with pytest.raises(ValueError):
+        _parse_workflow_scan_roots(workflow_shaped_text)
+
+
+def test_2950_multiple_invocation_lines_raises_ambiguous_rather_than_picking_one():
+    """Reviewer-fairy round 1 suggestion: the original version returned on
+    the FIRST matching 'run: pytest ...' line -- safe today (the real
+    workflow has exactly one such line) but silently fragile if a second
+    pytest step were ever added elsewhere (e.g. a narrower smoke-test job).
+    Two matching lines must raise, naming the ambiguity, rather than
+    arbitrarily picking whichever happens to come first."""
+    workflow_shaped_text = (
+        "name: tests\n"
+        "jobs:\n"
+        "  smoke:\n"
+        "    steps:\n"
+        "      - name: Smoke test\n"
+        "        run: pytest tests/test_smoke.py -x\n"
+        "  full:\n"
+        "    steps:\n"
+        "      - name: Run pytest\n"
+        "        run: pytest tests/ src/forum/tests/ -v --tb=short\n"
+    )
+    with pytest.raises(ValueError, match="found 2"):
+        _parse_workflow_scan_roots(workflow_shaped_text)
+
+
+def test_2950_commented_out_invocation_line_is_not_treated_as_real():
+    """Reviewer-fairy round 2 negative control #1 (#2950/#2959): the prior
+    unanchored `_WORKFLOW_PYTEST_RUN_RE.search()` matched `run: pytest ...`
+    ANYWHERE in a line, so a COMMENTED-OUT invocation line still parsed as
+    the live one — a PR that comments out the real `run: pytest ...` step
+    (silently disabling the actual CI invocation) would still read as a
+    false-green sync check, because the comment's text alone was enough to
+    satisfy the old regex.
+
+    With no OTHER genuine `run: pytest ...` line present, the parser must
+    raise "no invocation line found" — the same fail-loud path
+    `test_2950_no_invocation_line_raises_rather_than_passing_vacuously`
+    exercises — rather than silently returning the roots read out of the
+    comment text."""
+    workflow_shaped_text = (
+        "name: tests\n"
+        "jobs:\n"
+        "  pytest:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - name: Run pytest\n"
+        "        # run: pytest tests/ src/forum/tests/ -v --tb=short\n"
+    )
+    with pytest.raises(ValueError, match="no 'run: pytest"):
+        _parse_workflow_scan_roots(workflow_shaped_text)
+
+
+def test_2950_pytest_text_embedded_in_a_different_command_is_not_treated_as_real():
+    """Reviewer-fairy round 2 negative control #2 (#2950/#2959): pytest-
+    shaped text embedded inside a DIFFERENT command's string argument (here,
+    `echo`) must not be mistaken for a genuine pytest invocation — the
+    line's actual command is `echo`, not `pytest`. The prior unanchored
+    regex matched the `run: pytest ...` substring wherever it appeared in
+    the line, including inside the echoed string, and would have silently
+    extracted roots from text that never actually runs pytest.
+
+    With no OTHER genuine `run: pytest ...` line present, the parser must
+    raise "no invocation line found" rather than silently returning the
+    roots read out of the echoed text."""
+    workflow_shaped_text = (
+        "name: tests\n"
+        "jobs:\n"
+        "  pytest:\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - name: Not actually running pytest\n"
+        '        run: echo "run: pytest tests/ src/forum/tests/ -v"\n'
+    )
+    with pytest.raises(ValueError, match="no 'run: pytest"):
+        _parse_workflow_scan_roots(workflow_shaped_text)

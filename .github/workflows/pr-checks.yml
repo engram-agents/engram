@@ -18,6 +18,14 @@ name: pr-checks
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
+#   8b. test-id-set-check-unit-tests (#2950/#2959 — BLOCKING; runs
+#      tests/test_test_id_set_check.py itself, including the TEST_SCAN_ROOTS
+#      <-> tests.yml sync gate — this repo's dev-PR gate previously ran ONLY
+#      the tool invocation above (step 8), never its own test suite, so a
+#      regression to the sync gate (or to the parser it depends on) was
+#      invisible until the dev->main release cut. Same shape as
+#      hooks-stdout-audit below: a gate positioned outside the path where
+#      the decision is made cannot protect the thing it audits.)
 #   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
 #      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
 #      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
@@ -692,6 +700,39 @@ jobs:
           python3 tools/test_id_set_check.py \
             --base "$BASE_SHA" --head HEAD \
             --pr-body-file /tmp/pr_body.txt
+
+      # ── 8b. test-id-set-check-unit-tests ────────────────────────────────
+      # #2950/#2959 — reviewer-fairy round 2: step 8 above runs the TOOL
+      # against this PR's own diff, but the tool's own test suite
+      # (tests/test_test_id_set_check.py) was not wired into any dev-PR
+      # gate — including test_2950_real_workflow_scan_roots_match_test_
+      # scan_roots_constant, the CI-enforced comparison that catches
+      # TEST_SCAN_ROOTS (this file's constant) drifting from
+      # .github/workflows/tests.yml's actual full-suite pytest invocation.
+      # A drift PR — or a regression to the workflow-line parser itself —
+      # was therefore green through pr-checks and would only fail on the
+      # dev->main release cut, the same "gate positioned outside the path
+      # where the decision is made cannot protect the thing it audits"
+      # shape as hooks-stdout-audit below (#2718/#2717).
+      #
+      # BLOCKING, same posture as step 8 (its own tool-invocation test):
+      # a silent regression to the sync gate is currently free at PR time;
+      # an advisory posture would leave it free.
+      #
+      # Whole file, not `-k`-filtered to the #2950 tests alone — same
+      # precedent as manifest-gate's `pytest tests/test_tiers_manifest.py
+      # -q` above: run the file that owns the gate. Fits the same "pure
+      # stdlib + pytest" carve-out already used by manifest-gate /
+      # stdlib-only guards / cascade-behaviour-acceptance above (no
+      # requirements-dev.txt install) — the tool module under test imports
+      # only argparse/ast/json/re/subprocess/sys/dataclasses/pathlib
+      # (confirmed via its own imports), and the suite's git-backed tests
+      # (#2381) run real `git` subprocess calls against THIS checkout,
+      # which the job's `actions/checkout@v4` step already provides with
+      # `fetch-depth: 0` / `fetch-tags: true`. Measured locally: 83 passed
+      # in ~6s.
+      - name: test-id-set-check-unit-tests — run tests/test_test_id_set_check.py (includes the #2950 TEST_SCAN_ROOTS <-> tests.yml sync gate)
+        run: python3 -m pytest tests/test_test_id_set_check.py -q
 
       # ── 9. hooks-stdout-audit ───────────────────────────────────────────
       # #2718 — tests/test_hooks_json_stdout_audit.py previously ran ONLY in
