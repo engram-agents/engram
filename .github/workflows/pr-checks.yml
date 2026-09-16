@@ -845,6 +845,12 @@ jobs:
       # was deleted, renamed, or mis-scoped, and that must be a loud
       # failure, not a silent skip. `continue-on-error` is now an
       # expression: true (advisory) only when the PR head is a fork.
+      # persist-credentials: false — TEAM_PRACTICE_TOKEN is a longer-lived
+      # fine-grained PAT (not a per-job-expiring App installation token),
+      # and nothing downstream needs git credentials persisted in this
+      # clone — the next step only reads one file with python3. Same
+      # posture the security-seat guidance on exam-room#24 names for the
+      # analogous App-token case.
       - name: team-practice-drift-gate — checkout team-practice
         id: team-practice-checkout
         continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
@@ -853,6 +859,7 @@ jobs:
           repository: engram-agents/team-practice
           path: team-practice
           token: ${{ secrets.TEAM_PRACTICE_TOKEN }}
+          persist-credentials: false
 
       - name: team-practice-drift-gate — run sync_team_practice.py --check
         if: steps.team-practice-checkout.outcome == 'success'
@@ -860,7 +867,29 @@ jobs:
           python3 team-practice/tools/sync_team_practice.py --check CLAUDE.md \
             --team-practice team-practice/TEAM-PRACTICE.md
 
-      - name: team-practice-drift-gate — advisory notice (checkout unavailable, fork PR only)
+      # This step's own `if:` cannot currently fire on a same-repo checkout
+      # failure — GitHub implicitly prepends success() to any custom `if:`
+      # that doesn't itself reference success()/failure()/always()/
+      # cancelled(), so once the checkout step fails WITHOUT continue-on-
+      # error (the same-repo case), the job's success() goes false and this
+      # step is skipped right along with the check step above — empirically
+      # confirmed on run 35107780940 (2026-09-16 14:20Z): checkout=failure,
+      # check=skipped, advisory=skipped, not fired. So the message below is
+      # NOT currently reachable in the same-repo-failure case despite its
+      # own `!= 'success'` condition looking unconditional on paper.
+      #
+      # Kept fork-agnostic anyway, defense-in-depth: if this step's `if:`
+      # is ever changed to explicitly include always()/failure() (a change
+      # that would legitimately make it reachable on a same-repo failure),
+      # a message that unconditionally blames "this fork PR" would become
+      # actively misleading exactly when a real secret problem needs a
+      # clear diagnosis. Cheap to get right now rather than rediscover
+      # later.
+      - name: team-practice-drift-gate — advisory notice (checkout unavailable)
         if: steps.team-practice-checkout.outcome != 'success'
         run: |
-          echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811. This warning firing on a same-repo branch PR would mean something is wrong; on a fork it is expected."
+          if [ "${{ github.event.pull_request.head.repo.full_name != github.repository }}" = "true" ]; then
+            echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
+          else
+            echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice, and this is NOT a fork PR — that means the secret was deleted, renamed, or mis-scoped. CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
+          fi
