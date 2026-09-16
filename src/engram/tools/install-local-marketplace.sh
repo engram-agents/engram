@@ -348,10 +348,23 @@ try:
         d = json.load(f)
     if not isinstance(d, dict):
         raise ValueError(f"expected a JSON object at the top level, got {type(d).__name__}")
-    ma = "true" if (d.get("multi_agent") is True or d.get("mode") == "multi") else "false"
+    # #2965: the TOP LEVEL was type-checked above; the VALUES were not, so a
+    # well-formed config with a wrong-typed value (install_tier: 0, an int
+    # whose str() is non-empty) silently passed the `-z` fallback check
+    # further down and dropped dev/forum requirements with no signal --
+    # exactly the outcome #2951's own contract says absence should never
+    # produce. Reject a present-but-wrong-typed value the same fail-loud way
+    # a malformed file is already rejected, rather than let it degrade to a
+    # convenience/single-agent default.
+    ma_raw = d.get("multi_agent")
+    if ma_raw is not None and not isinstance(ma_raw, bool):
+        raise ValueError(f"multi_agent must be a boolean (or null/absent), got {type(ma_raw).__name__}: {ma_raw!r}")
+    ma = "true" if (ma_raw is True or d.get("mode") == "multi") else "false"
     # Match jq install_tier // empty semantics: only null/missing falls back
     # to empty -- an already-empty-string value passes through as itself.
     tier = d.get("install_tier")
+    if tier is not None and tier is not False and not isinstance(tier, str):
+        raise ValueError(f"install_tier must be a string (or null/absent/false), got {type(tier).__name__}: {tier!r}")
     if tier is None or tier is False:
         tier = ""
     # Reviewer catch (#2958, Mira): this block hands ma/tier to bash as two
@@ -563,6 +576,11 @@ try:
     if not isinstance(d, dict):
         raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
     tier = d.get('install_tier')
+    # #2965: reject a present-but-wrong-typed value (e.g. an int/list/dict)
+    # instead of letting it fall through non-empty and silently defeat the
+    # [[ -z ... ]] && _eff_tier=convenience fallback below.
+    if tier is not None and tier is not False and not isinstance(tier, str):
+        raise ValueError('install_tier must be a string (or null/absent/false), got ' + type(tier).__name__ + ': ' + repr(tier))
     if tier is None or tier is False:
         tier = ''
 except Exception as e:
@@ -586,7 +604,13 @@ try:
         d = json.load(f)
     if not isinstance(d, dict):
         raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
-    print('true' if (d.get('multi_agent') is True or d.get('mode') == 'multi') else 'false')
+    _ma_raw = d.get('multi_agent')
+    # #2965: reject a present-but-wrong-typed value (e.g. the string 'true',
+    # or 1) instead of letting it silently resolve to false and drop the
+    # forum package requirements with no signal.
+    if _ma_raw is not None and not isinstance(_ma_raw, bool):
+        raise ValueError('multi_agent must be a boolean (or null/absent), got ' + type(_ma_raw).__name__ + ': ' + repr(_ma_raw))
+    print('true' if (_ma_raw is True or d.get('mode') == 'multi') else 'false')
 except Exception as e:
     print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
     sys.exit(1)

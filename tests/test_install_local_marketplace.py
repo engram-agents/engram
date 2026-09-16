@@ -253,6 +253,55 @@ def test_install_local_marketplace_fails_loud_on_embedded_newline_in_tier(tmp_pa
     assert config_path.read_text() == original_config_text
 
 
+def test_install_local_marketplace_fails_loud_on_wrong_typed_install_tier(tmp_path):
+    """engram-alpha#2965: a WELL-FORMED config.json whose install_tier value
+    is present but the wrong type (a dict, here) must fail loud, not fall
+    through and get treated as a real (bogus) tier name. A dict is
+    deliberately chosen over an int: `"\\n" in tier` (the pre-existing
+    #2958 newline guard) happens to raise TypeError on an int too, which
+    would make this test pass for an unrelated reason -- `"\\n" in {"a":1}`
+    is valid dict-key-membership syntax and evaluates to False without
+    error, so only the #2965 type check catches this case. Verified by
+    temporarily removing the type check: an int value still failed (via
+    the accidental TypeError), but this dict value exited 0 with the raw
+    dict printed as the tier."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": {"a": 1}}))
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "install_tier must be a string" in result.stderr
+
+
+def test_install_local_marketplace_fails_loud_on_wrong_typed_multi_agent(tmp_path):
+    """engram-alpha#2965: multi_agent's sibling case -- a string "true" (a
+    plausible hand-edit typo) must fail loud rather than silently resolve
+    to false and drop the forum package requirements with no signal.
+    Pre-#2965, this exact config exited 0 as if multi_agent were absent."""
+    (tmp_path / "config.json").write_text(json.dumps({"multi_agent": "true"}))
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "multi_agent must be a boolean" in result.stderr
+
+
 def test_install_local_marketplace_accepts_equals_target_form(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps({"multi_agent": True, "install_tier": "dev"})
@@ -888,6 +937,54 @@ def test_install_local_marketplace_skip_build_fails_loud_on_non_object_config(tm
         f"expected the clean one-line error message, got a raw traceback:\n{result.stderr}"
     )
     assert "config.json" in result.stderr or "parse" in result.stderr.lower() or "expected" in result.stderr.lower()
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_install_tier(tmp_path):
+    """engram-alpha#2965: the --skip-build venv-provisioning path's own
+    separate _eff_tier read has the identical gap as the main build-flags
+    path -- a wrong-typed install_tier (a list, here) must fail loud rather
+    than pass the `[[ -z ... ]]` fallback check as a non-empty string."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": ["dev"]}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "install_tier must be a string" in result.stderr
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_multi_agent(tmp_path):
+    """engram-alpha#2965: the --skip-build path's separate _eff_multi_agent
+    read has the identical gap -- multi_agent: 1 (an int, not a bool) must
+    fail loud rather than silently resolve to false and skip the forum
+    package requirements install with no signal."""
+    (tmp_path / "config.json").write_text(json.dumps({"multi_agent": 1}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "multi_agent must be a boolean" in result.stderr
 
 
 def test_install_local_marketplace_warns_on_missing_forum_requirements(tmp_path):
