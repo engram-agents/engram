@@ -379,6 +379,7 @@ Review hierarchy: **reviewer-fairy → counterpart colleague → maintainer
 reviewed in turn. Review-mode: `--comment` for in-flight iteration; `--approve`
 is posted by a reviewer (fairy or colleague) when converged, never by the author.
 
+<!-- BEGIN team-practice: which-colleague-takes-the-seat (generated -- edit team-practice repo's TEAM-PRACTICE.md, not here; tools/sync_team_practice.py renders it) -->
 ### Which colleague takes the seat
 
 **If you are the detailed designer or builder of the PR, you are excused from its
@@ -430,16 +431,17 @@ an oversight: Opus seats focus on design, Sonnet seats on building and reviewing
 
 This names *which* seat; it does not add one.
 
-> **Duplicated by hand in engram-alpha and umwelt `CLAUDE.md`** — change one,
-> change both in the same pass. **Soma does not carry this block, and the reason
-> first shipped here was FALSE — do not restore it.** It said soma's cohort
-> excludes Sol so the rotation cannot resolve there; that was read off a stale
-> cohort line in soma's own `CLAUDE.md` and reported as a fact about reality.
-> Measured 2026-09-09 against soma's PR history and collaborator list instead:
-> Sol has authored soma PRs (#52, #54), and **all three escape seats hold push
-> access there**, as do both terminal-fallback seats. The rotation resolves in
-> soma fine. Whether soma adopts the block is a routing choice for Lei and
-> soma's principal — never a structural blocker.
+**Adoption status (2026-09-16):** engram-alpha, umwelt. Not soma — a routing
+choice for Lei and soma's principal, never a structural blocker. (History,
+carried from the pre-migration hand-duplicated copies: an earlier version of
+this note claimed soma's cohort excludes Sol so the rotation cannot resolve
+there; that was read off a stale cohort line in soma's own `CLAUDE.md` and
+reported as fact without checking. Measured 2026-09-09 against soma's actual
+PR history and collaborator list instead: Sol has authored soma PRs (#52,
+#54), and all three escape seats hold push access there, as do both
+terminal-fallback seats — the rotation resolves in soma fine. The false claim
+is not restored here; recorded so nobody re-derives and re-believes it.)
+<!-- END team-practice: which-colleague-takes-the-seat -->
 
 ### Conclusion warrant — the gate lives in the fairy's output contract, not here
 
@@ -891,14 +893,17 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
 > generator or test binding them. Change one, change all three in the same
 > pass — **but the ruleset paragraph and any repo-specific merge-authority
 > clause are deliberately per-repo; sync the rules, not the local facts.**
-> **Exception, as of 2026-09-14 (Kepler, interim ruling pending Lei's word):**
-> the fairy-round-timing clarification in "Mechanical check at the merge
-> seat" above (issue #2920) is deliberately NOT synced to soma. Soma's own
-> merged PR#58 requires the opposite — the fairy round must match the exact
-> merge tip — a deliberate safety rule for a repo with no human backstop that
-> drives a physical robot around Lei's family. Soma keeps its stricter local
-> rule until Lei or Ariadne says otherwise; see engram-alpha#2930's
-> discussion and `ask-Lei.md` for the open question.
+> Lei's 2026-09-15 01:01Z ruling ("the Soma review can just use the same
+> team-wide convention, no need for a special exception") retires the
+> 2026-09-14 interim exception that had carved soma out of the fairy-round-
+> timing clarification in "Mechanical check at the merge seat" above (issue
+> #2920) — this repo's own copy of the exception is removed by THIS PR.
+> The other two copies are separate, still-open PRs at time of writing:
+> soma's own transcription (soma#60) and umwelt's matching removal
+> (umwelt#816) — **do not read this note as "already synced across all
+> three"; it is synced once all three of this PR / soma#60 / umwelt#816
+> have merged.** See soma's `CLAUDE.md` § "On item 1" for that repo's own
+> transcription and its retired-rule history, once soma#60 lands.
 
 ### PR inheritance — read the open PRs first; make status readable from the LIST
 

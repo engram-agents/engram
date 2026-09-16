@@ -654,10 +654,118 @@ def _run_git(repo_root: Path, args: list[str]) -> str:
     return result.stdout
 
 
+# Every directory tests.yml's full-suite invocation collects
+# (`pytest tests/ src/forum/tests/ -v --tb=short` — see
+# .github/workflows/tests.yml). This tool's own git-ls-tree scan roots
+# must track that list by hand — the two are NOT auto-synced (there is no
+# shared config file between a Python tool and a YAML workflow step), so a
+# THIRD scan root added to tests.yml in the future needs a matching entry
+# here, same "duplicated by hand, change together" convention as this
+# repo's other cross-file-kept-in-sync lists. tests/test_test_id_set_check.py
+# now CI-enforces this sync (#2950) — see `_parse_workflow_scan_roots` below.
+TEST_SCAN_ROOTS: tuple[str, ...] = ("tests/", "src/forum/tests/")
+
+
+# Matches a GENUINE YAML `run:` step key invoking pytest (e.g. `        run:
+# pytest tests/ src/forum/tests/ -v --tb=short`), tolerant of extra
+# whitespace around `run:`/`pytest` — see `_parse_workflow_scan_roots`.
+#
+# Anchored to the actual START of the line (ignoring only leading
+# whitespace/indentation and an optional YAML list-item `-` marker before
+# the key) and matched with `.match()`, not `.search()` — reviewer-fairy
+# round 2 (#2950/#2959): the prior unanchored `run:\s*pytest\s+(.+)` was
+# applied via `.search()`, which finds the pattern ANYWHERE in a line, so
+# both of these false-positived as the live invocation:
+#   `# run: pytest tests/ src/forum/tests/ -v --tb=short` (a COMMENT)
+#   `run: echo "run: pytest tests/ src/forum/tests/ -v"`   (pytest TEXT
+#       embedded inside a different command's string argument -- the
+#       line's real command is `echo`, not `pytest`)
+# Commenting out the real invocation line could therefore leave a
+# false-green sync check. Anchoring to the line's own start (via `.match()`,
+# which only tries position 0) and requiring `pytest` immediately after
+# `run:` (only whitespace between) means neither false shape can match: a
+# `#`-prefixed comment line fails the anchor, and `run: echo ...` fails
+# because the token right after `run:` is `echo`, not `pytest` -- the
+# `pytest` text later in the same line is never reached, since `.match()`
+# does not retry from later positions the way `.search()` does.
+_WORKFLOW_PYTEST_RUN_RE = re.compile(r"^[ \t]*(?:-[ \t]+)?run:[ \t]*pytest[ \t]+(.+)")
+
+
+def _parse_workflow_scan_roots(workflow_text: str) -> tuple[str, ...]:
+    """Parse the bare positional path arguments out of a workflow YAML's
+    full-suite `run: pytest ...` invocation line (#2950) — the counterpart
+    a CI-enforced test compares against TEST_SCAN_ROOTS above to catch the
+    two drifting apart (a third scan root added to one side and not the
+    other).
+
+    Pure — takes the workflow file's TEXT CONTENT as a string; does no file
+    I/O of its own (the caller reads the file and passes the text), matching
+    this whole test suite's stated "no git, no tmp repos" pure-function
+    testability-seam design philosophy (see this file's module docstring).
+
+    Robust to minor formatting variation (extra whitespace around `run:`/
+    `pytest`, a single root, no trailing flags) — deliberately NOT
+    brittle-matched to today's exact byte string. Scans `workflow_text`
+    line by line for a line whose own START (ignoring only leading
+    whitespace and an optional YAML list-item `-` marker) matches
+    `run:[ \\t]*pytest[ \\t]+(.+)` — NOT a bare substring search, so a
+    comment (`# run: pytest ...`) or pytest-shaped text embedded inside a
+    different command's string argument (`run: echo "run: pytest ..."`)
+    is never mistaken for the real invocation (#2950 reviewer-fairy round
+    2; see `_WORKFLOW_PYTEST_RUN_RE`'s own comment for the false-positive
+    shapes this closes). From the matching line's captured remainder, takes
+    the BARE POSITIONAL tokens — those that don't start with `-` — stopping
+    at the first flag-shaped token (`-v`, `--tb=short`, …), which mirrors
+    the real invocation's own shape (positional path args first, flags
+    last).
+
+    Raises ValueError — never returns an empty tuple or None — when NO
+    `run: pytest ...` line is found at all, or when MORE THAN ONE is found
+    (reviewer-fairy round 1, #2950: the original version returned on the
+    first match, which is safe today — the real workflow has exactly one
+    such line — but would silently pick a decoy if a second `run: pytest
+    ...` step were ever added elsewhere in the workflow, e.g. a narrower
+    smoke-test job). A workflow file restructured such that this parser can
+    no longer find its own invocation line UNAMBIGUOUSLY is exactly the
+    kind of drift this gate exists to catch; staying silent here (an empty
+    tuple comparing "equal" to nothing, a None the caller might not check,
+    or an arbitrarily-chosen one of several matches) would defeat the
+    gate's own purpose.
+    """
+    matches = [
+        _WORKFLOW_PYTEST_RUN_RE.match(line) for line in workflow_text.splitlines()
+    ]
+    matches = [m for m in matches if m is not None]
+    if not matches:
+        raise ValueError(
+            "_parse_workflow_scan_roots: no 'run: pytest ...' invocation line "
+            "found in the given workflow text — the workflow may have been "
+            "restructured (matrix/composite action/etc.); this parser needs "
+            "updating to match the new shape (#2950)."
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"_parse_workflow_scan_roots: found {len(matches)} 'run: pytest ...' "
+            "invocation lines in the given workflow text -- expected exactly one. "
+            "Ambiguous: this parser can't tell which is the full-suite invocation "
+            "TEST_SCAN_ROOTS should track (#2950)."
+        )
+    roots: list[str] = []
+    for token in matches[0].group(1).split():
+        if token.startswith("-"):
+            break
+        roots.append(token)
+    return tuple(roots)
+
+
 def list_test_files(repo_root: Path, rev: str) -> list[str]:
-    """Enumerate every *.py under tests/ at `rev`, POSIX-relpath, via git ls-tree."""
-    out = _run_git(repo_root, ["ls-tree", "-r", "--name-only", rev, "--", "tests/"])
-    return [line for line in out.splitlines() if line.endswith(".py")]
+    """Enumerate every *.py under any of TEST_SCAN_ROOTS at `rev`, POSIX-relpath,
+    via git ls-tree."""
+    paths: list[str] = []
+    for root in TEST_SCAN_ROOTS:
+        out = _run_git(repo_root, ["ls-tree", "-r", "--name-only", rev, "--", root])
+        paths.extend(line for line in out.splitlines() if line.endswith(".py"))
+    return paths
 
 
 def read_sources_at_rev(repo_root: Path, rev: str) -> dict[str, str]:

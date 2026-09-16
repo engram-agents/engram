@@ -540,6 +540,10 @@
       "tier": "convenience"
     },
     {
+      "path": "tools/baton_gate.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/forum.py",
       "tier": "convenience"
     },

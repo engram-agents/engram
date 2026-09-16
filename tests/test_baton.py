@@ -1827,7 +1827,131 @@ class TestPoolSentinel:
         _baton.cmd_merge(args, owner_config, "borges", client)
 
         captured = capsys.readouterr()
-        assert "gate 2 (turn=sentinel): PASS" in captured.out
+        assert "gate 2 (turn=maintainer): PASS" in captured.out
+
+    def test_merge_gate2_accepts_named_maintainer_not_sentinel(self, engram_home, monkeypatch, capsys):
+        """#2913: the actual bug. This team's real convention -- every flip
+        performed this session, and CLAUDE.md's own baton lifecycle -- ends
+        a PR's review at a NAMED maintainer agent (e.g. "kepler"), never
+        the literal pool sentinel string. Pre-#2913, `_is_pool_sentinel`
+        alone would refuse this exact, correct, real-world state."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
+
+        client = _make_client(
+            post_return={"seq": 1},
+            get_return={"raw": _make_raw_baton(
+                "PR-9998", title="named-maintainer merge gate test", turn="kepler",
+                participants="[clio, ariadne, kepler]", status="in-progress",
+                github="pr/example-org/example-repo/9998", colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9998", dry_run=True, force=True)
+        _baton.cmd_merge(args, owner_config, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "gate 2 (turn=maintainer): PASS" in captured.out
+        assert "not presented for merge" not in captured.err
+
+    def test_merge_gate2_refuses_while_turn_still_with_colleague(self, engram_home, monkeypatch, capsys):
+        """Companion control: turn == the registered colleague means the PR
+        is still in review, not presented for merge -- must stay refused,
+        same as it always has (the fix adds an exemption for NAMED
+        maintainers, it does not turn Gate 2 into a rubber stamp)."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9997", title="colleague-holds merge gate test", turn="ariadne",
+                participants="[clio, ariadne]", status="in-progress",
+                github="pr/example-org/example-repo/9997", colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(pr="PR-9997", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not presented for merge" in captured.err
+
+    def test_merge_gate2_refuses_while_turn_back_with_author(self, engram_home, monkeypatch, capsys):
+        """Companion control: turn == the PR's own author (explicit
+        `author:` field or the #2966 legacy-log fallback) means a
+        colleague sent it back with a blocker -- must stay refused, not be
+        read as merge-ready just because it isn't the literal colleague
+        field either."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        raw = _make_raw_baton(
+            "PR-9996", title="author-holds merge gate test", turn="clio",
+            participants="[clio, ariadne]", status="in-progress",
+            github="pr/example-org/example-repo/9996", colleague="ariadne",
+        )
+        # Faithful legacy shape (no explicit author: field) -- exercises
+        # the #2966 turn-log fallback, the same as production batons.
+        raw = raw.replace(
+            "- 2026-06-26T12:00:00Z initialized",
+            "- 2026-06-26T12:00:00Z initialized → clio: project initialized by clio",
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(pr="PR-9996", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "not presented for merge" in captured.err
+
+    def test_merge_gate2_refuses_empty_turn(self, engram_home, monkeypatch, capsys):
+        """Edge case named in Gate 2's own comment: a baton with no `turn`
+        key at all must refuse with "(unknown)", not spuriously pass by
+        matching the disabled `current_holder=""` sentinel
+        `_is_maintainer_flip` is called with. Built by hand rather than
+        via `_make_raw_baton(turn="")`: that helper writes an unquoted
+        empty value (`turn: `) which corrupts the line-based frontmatter
+        parser on the FOLLOWING key (the same fragility `turn_by`/
+        `turn_reason` are deliberately quoted to avoid in production
+        code) -- a pre-existing test-helper limitation, not something
+        this fix should route around. Omitting the key entirely is both
+        the realistic shape (production writers never emit an empty
+        `turn:` line) and the one that actually reaches Gate 2's
+        `if not current_turn` branch cleanly."""
+        owner_config = {"mode": "multi", "agent_name": "borges", "primary_user": "Lei Shi"}
+        _write_config(engram_home, agent_name="borges", primary_user="Lei Shi")
+        monkeypatch.setenv("ENGRAM_HOME", str(engram_home))
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        raw = (
+            "---\n"
+            "project: PR-9995\n"
+            "title: empty-turn merge gate test\n"
+            "status: in-progress\n"
+            "turn_since: 2026-06-26T12:00:00Z\n"
+            "turn_reason: start\n"
+            "participants: [clio, ariadne]\n"
+            "github: pr/example-org/example-repo/9995\n"
+            "colleague: ariadne\n"
+            "---\n\n## Turn log\n\n- 2026-06-26T12:00:00Z initialized\n"
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(pr="PR-9995", dry_run=True, force=True)
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_merge(args, owner_config, "borges", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        captured = capsys.readouterr()
+        assert "(unknown)" in captured.err
 
     def test_merge_repo_qualified_ci_red_refuses(self, engram_home, monkeypatch, capsys):
         """#1715 round-2 (reviewer-fairy-caught blocker): cmd_merge is a
@@ -3319,6 +3443,87 @@ class TestFlipMaintainerRoleGate:
         assert "has no repo-qualified github anchor" in captured.err
 
 
+class TestFlipLegacyAuthorFallback:
+    """#2961 follow-up (Ariadne's round-2 catch on PR#2966): the CLI path
+    (cmd_flip) must recover the author-proxy from a legacy baton's own
+    turn log, the same as the REST path's _check_flip_gate does -- this
+    is the 1,493-existing-baton gap a bulk migration would otherwise have
+    needed a live write to close. Uses the same pinned-sentinel fixture
+    convention as TestFlipMaintainerRoleGate above."""
+
+    def test_cmd_flip_recovers_author_from_turn_log_without_author_field(self, monkeypatch, capsys):
+        """No `author:` frontmatter field at all (the pre-#2961 shape) --
+        but the turn log's own first line names "clio" as the real
+        author. Flipping FROM ariadne (the current holder, post-review)
+        BACK TO clio must succeed ungated, exactly as it would if an
+        explicit `author: clio` field were present -- CI is deliberately
+        mocked red, so a false-positive "maintainer flip" classification
+        would refuse this and fail the test."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_ci_state must not be called -- the legacy-author "
+                "fallback should have exempted this flip before any "
+                "CI/approval check runs"
+            )
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+
+        raw = _make_raw_baton(
+            "PR-9300", github="pr/example-org/example-repo/9300",
+            turn="ariadne", participants="[clio, ariadne]",
+            colleague="ariadne",
+        )
+        # _make_raw_baton's default body line is a synthetic stub
+        # ("- ... initialized", no arrow/target) -- replace it with the
+        # REAL shape init() actually writes, naming clio as the author.
+        raw = raw.replace(
+            "- 2026-06-26T12:00:00Z initialized",
+            "- 2026-06-26T12:00:00Z initialized → clio: project initialized by clio",
+        )
+        client = _make_client(get_return={"raw": raw})
+        args = argparse.Namespace(
+            project_id="PR-9300", to="clio", reason="one blocker, back to author", force=False,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        captured = capsys.readouterr()
+        assert captured.err.strip() == ""
+
+    def test_cmd_flip_with_no_initialized_line_still_gates(self, monkeypatch, capsys):
+        """Companion control: a baton with no `author:` field AND no
+        parseable "initialized -> X:" line at all (the synthetic stub
+        _make_raw_baton produces by default) has no fallback to recover --
+        the flip must still be gated exactly as it was before this fix,
+        never silently exempted."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+
+        def _fake_ci_state(pr_num, repo=None):
+            return ("red", "check 'pr-checks' conclusion=FAILURE")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _fake_ci_state)
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-9301", github="pr/example-org/example-repo/9301",
+                turn="ariadne", participants="[clio, ariadne]",
+                colleague="ariadne",
+            )},
+        )
+        args = argparse.Namespace(
+            project_id="PR-9301", to="clio", reason="one blocker, back to author", force=False,
+        )
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+        captured = capsys.readouterr()
+        assert "CI is red" in captured.err
+
+
 class TestIsMaintainerFlip:
     """Direct-call unit tests for _is_maintainer_flip (#2912) -- the
     broadened trigger predicate cmd_flip now uses in place of the bare
@@ -3386,6 +3591,43 @@ class TestIsMaintainerFlip:
             # Flip to the registered colleague (to_agent == colleague_name;
             # neither ever equals the sentinel in this loop): always False.
             assert _baton._is_maintainer_flip("sol", "borges", "sol") is False
+
+    def test_flip_to_author_is_not_maintainer_flip(self, monkeypatch):
+        """#2961: PR-2926's real shape -- colleague "ariadne" holds the
+        baton after reviewing, finds a blocker, and flips it back to the
+        PR's author "clio". to_agent (clio) is neither the current holder
+        (ariadne) nor the colleague (ariadne) -- pre-#2961 this fell
+        through to True (misclassified as presenting-for-merge) and
+        demanded an approval that cannot exist, since the colleague is the
+        one objecting. With `author="clio"` passed, it must be False."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne") is True  # pre-#2961 shape, no author arg
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne", "clio") is False
+
+    def test_missing_author_is_pre_2961_behavior(self, monkeypatch):
+        """An empty/falsy `author` (a baton created before #2961, with no
+        `author:` frontmatter field) must reproduce the exact pre-#2961
+        answer -- the exemption simply cannot fire, not an error and not a
+        different default classification."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        assert _baton._is_maintainer_flip("clio", "ariadne", "ariadne", "") is True
+        assert _baton._is_maintainer_flip("ariadne", "borges", "sol", "") is True
+        assert _baton._is_maintainer_flip("borges", "borges", "sol", "") is False
+        assert _baton._is_maintainer_flip("sol", "borges", "sol", "") is False
+
+    def test_author_exemption_does_not_override_sentinel_or_self_flip(self, monkeypatch):
+        """The author exemption is checked LAST -- a flip to the pool
+        sentinel, or a self-flip, must keep its own answer even when the
+        target also happens to equal `author` (an author flipping the
+        baton to the human maintainer, or to themselves, is unaffected by
+        this new parameter)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        # to_agent is both the sentinel AND (contrived) the stored author --
+        # sentinel wins, still True.
+        assert _baton._is_maintainer_flip("casey", "borges", "sol", "casey") is True
+        # to_agent is both the current holder AND the stored author --
+        # self-flip wins, still False.
+        assert _baton._is_maintainer_flip("borges", "borges", "sol", "borges") is False
 
 
 # ===========================================================================

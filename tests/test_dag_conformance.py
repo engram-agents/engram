@@ -43,6 +43,48 @@ test_deep_chain_with_cycle_still_found — pre-existing at #2813 time and
 not enumerated in this list before this file was touched; left as found,
 not renumbered, since fixing that drift is outside #2813's scope.)
 
+#2943 regression coverage (appended, not renumbered into the list above for
+the same reason as the two tests noted just above): a vanilla single
+supersedes/retracts edge was reporting a phantom one-node cycle
+(cycle_path: [X, X]), because `_live_dag_edges` resolved EVERY dag-relation
+edge's endpoints through `_resolve_current` -- including supersedes/retracts
+edges themselves, whose own target's resolution IS the edge's source by
+construction (A supersedes B => resolve(B) == A => edge (A, B) resolves to
+the tautological self-loop (A, A)).
+
+Round 1 fixed this by carving supersedes/retracts out of the
+resolve-through-chain treatment (a `_HISTORY_RELATIONS` relation-based
+special case). Round 2 (Kepler's live-graph counter-example) found the
+carve-out was too narrow: the phantom fires for ANY dag edge whose target
+has been superseded specifically by the edge's own source, regardless of
+that edge's OWN relation -- e.g. a node that both `derives_from` AND
+`supersedes` the same predecessor still manufactures the identical
+self-loop via its (non-exempt) `derives_from` edge. Round 2 replaces the
+relation-based carve-out with the correct general invariant: a resolved
+edge whose endpoints collapse to the SAME node is dropped, never added as
+a self-loop, regardless of which relation it is on -- this can never mask
+a genuine multi-node cycle, since a self-loop edge adds no reachability to
+any node besides itself. `_HISTORY_RELATIONS` is retired; every dag edge
+resolves through the chain uniformly again, exactly as #2827/#2813
+originally intended.
+
+The cross-relation real-cycle case (#2813's own motivating shape, covered
+above by test_cycle_through_superseded_endpoint_is_caught) and a genuine
+cycle purely among supersedes edges must both remain caught -- see
+test_vanilla_supersedes_edge_not_flagged,
+test_vanilla_retracts_edge_not_flagged,
+test_genuine_cycle_among_supersedes_edges_still_caught,
+test_derives_from_and_supersedes_same_target_not_flagged, and
+test_cites_and_supersedes_same_target_not_flagged below.
+
+Round 3 (a colleague's live-graph review): round 2's "drop any resolved
+self-loop" rule was too broad -- it also silently drops a GENUINE raw
+self-edge already in the table (source_id == target_id, no resolution
+involved), which is the simplest real DAG violation there is. Fixed by
+distinguishing raw-already-equal (keep, real cycle) from resolution-
+manufactured-equal (drop, artifact) -- see
+test_genuine_raw_self_edge_still_caught below.
+
 Import-pattern contract (#948 wave C): imports engram_core and
 engram_dag_conformance directly; no ``import server``.
 """
@@ -260,6 +302,145 @@ def test_dead_ended_supersede_chain_dropped_not_crashed():
         "must be dropped, leaving zero live dag edges to cycle over"
     )
     assert out["cycle_path"] == []
+
+
+def test_vanilla_supersedes_edge_not_flagged():
+    """#2943: a single, completely normal supersedes edge (A supersedes B;
+    B is now non-current, superseded_by='A') must NOT report a cycle.
+
+    Root cause of the bug this guards: `_live_dag_edges` resolves EVERY
+    dag-relation edge's endpoints through `_resolve_current`. Resolving B
+    (superseded_by='A') returns A, so the raw edge (A, B) resolves to
+    (A, A) -- a tautological self-loop manufactured purely by resolving a
+    supersedes edge's target through the very relation the edge represents.
+    This happens for EVERY vanilla supersedes edge in any graph. The fix
+    (round 2, general): a resolved edge whose endpoints collapse to the
+    same node is dropped, never added -- see the module docstring above."""
+    conn = _new_conn()
+    _add_node(conn, "a", is_current=1)
+    _add_node(conn, "b", is_current=0, superseded_by="a")
+    _add_edge(conn, "a", "b", "supersedes")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is False, (
+        f"a single vanilla supersedes edge must never report a cycle -- got "
+        f"{out}"
+    )
+    assert out["cycle_path"] == []
+
+
+def test_vanilla_retracts_edge_not_flagged():
+    """#2943 sibling: same phantom-self-loop bug, on `retracts` instead of
+    `supersedes` -- both relations are dag=True and both are the historical
+    record that defines node currency, so both hit the same collapse."""
+    conn = _new_conn()
+    _add_node(conn, "a", is_current=1)
+    _add_node(conn, "b", is_current=0, superseded_by="a")
+    _add_edge(conn, "a", "b", "retracts")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is False, (
+        f"a single vanilla retracts edge must never report a cycle -- got "
+        f"{out}"
+    )
+    assert out["cycle_path"] == []
+
+
+def test_derives_from_and_supersedes_same_target_not_flagged():
+    """#2943 round 2 (found live on a real fleet graph): a node that both
+    `derives_from` AND `supersedes` the same predecessor must not report a
+    cycle via the (non-history) derives_from edge.
+
+    `newer` derives_from `older` (a normal citation of the claim it's
+    replacing) AND `newer` supersedes `older`. The supersedes edge itself
+    is fine either way, but the derives_from edge is NOT on a history
+    relation -- under the round-1 relation-based carve-out it still got
+    resolved: resolve(newer)=newer (current), resolve(older)=newer
+    (older's own successor, via the very supersedes fact) -> the identical
+    phantom self-loop (newer, newer). This is what proved the round-1
+    fix's relation-based carve-out was scoped to the wrong axis."""
+    conn = _new_conn()
+    _add_node(conn, "newer", is_current=1)
+    _add_node(conn, "older", is_current=0, superseded_by="newer")
+    _add_edge(conn, "newer", "older", "derives_from")
+    _add_edge(conn, "newer", "older", "supersedes")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is False, (
+        f"derives_from + supersedes to the same predecessor must never "
+        f"report a cycle -- got {out}"
+    )
+    assert out["cycle_path"] == []
+
+
+def test_cites_and_supersedes_same_target_not_flagged():
+    """#2943 round 2 sibling (found live on a second, independent fleet
+    graph): the identical collapse via `cites` instead of `derives_from` --
+    confirms the fix is relation-agnostic, not specific to one non-history
+    relation."""
+    conn = _new_conn()
+    _add_node(conn, "newest", is_current=1)
+    _add_node(conn, "oldest", is_current=0, superseded_by="newest")
+    _add_edge(conn, "newest", "oldest", "cites")
+    _add_edge(conn, "newest", "oldest", "supersedes")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is False, (
+        f"cites + supersedes to the same predecessor must never report a "
+        f"cycle -- got {out}"
+    )
+    assert out["cycle_path"] == []
+
+
+def test_genuine_cycle_among_supersedes_edges_still_caught():
+    """#2943 control: the fix must not create a blind spot. A genuine
+    malformed 2-cycle purely among supersedes edges -- P and Q both
+    is_current=1, P supersedes Q AND Q supersedes P -- is an actually
+    impossible/invariant-violating state and must still be caught. Since
+    both nodes are already current, resolution is the identity for both
+    and the raw 2-cycle is found unchanged."""
+    conn = _new_conn()
+    _add_node(conn, "p", is_current=1)
+    _add_node(conn, "q", is_current=1)
+    _add_edge(conn, "p", "q", "supersedes")
+    _add_edge(conn, "q", "p", "supersedes")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is True, (
+        f"a genuine 2-cycle purely among supersedes edges must still be "
+        f"caught -- got {out}"
+    )
+    assert {"p", "q"}.issubset(set(out["cycle_path"]))
+
+
+def test_genuine_raw_self_edge_still_caught():
+    """#2943 round 3 (a colleague's live-graph review, real catch): round 2's
+    blanket "drop any resolved self-loop" rule was too broad -- it also drops
+    a GENUINE one-node cycle, a literal raw self-edge already in the table
+    (source_id == target_id before any resolution happens at all). That is
+    the simplest real DAG violation there is, and it must still be reported.
+
+    single_node cites itself directly -- no supersedes/resolution involved
+    whatsoever, is_current=1 throughout. Distinguishing test from the
+    manufactured-self-loop cases above: here the RAW endpoints already
+    equalled each other before resolution, so this is not an artifact of
+    resolving a superseded target -- it's a genuine self-reference."""
+    conn = _new_conn()
+    _add_node(conn, "single_node", is_current=1)
+    _add_edge(conn, "single_node", "single_node", "cites")
+    conn.commit()
+
+    out = dagconf.check_dag_conformance(conn)
+    assert out["cycle_found"] is True, (
+        f"a genuine raw self-edge must still be reported as a cycle -- got "
+        f"{out}"
+    )
+    assert "single_node" in out["cycle_path"]
 
 
 def test_non_dag_relation_cycle_not_flagged():

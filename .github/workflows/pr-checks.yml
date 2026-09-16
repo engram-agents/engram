@@ -18,6 +18,14 @@ name: pr-checks
 #      nothing beyond stdlib+pytest, same carve-out as manifest-gate above)
 #   8. test-id-set-check         (#2350 — BLOCKING; a deleted test cannot fail, so a
 #      PR that removes coverage is exactly as green as a PR that adds it)
+#   8b. test-id-set-check-unit-tests (#2950/#2959 — BLOCKING; runs
+#      tests/test_test_id_set_check.py itself, including the TEST_SCAN_ROOTS
+#      <-> tests.yml sync gate — this repo's dev-PR gate previously ran ONLY
+#      the tool invocation above (step 8), never its own test suite, so a
+#      regression to the sync gate (or to the parser it depends on) was
+#      invisible until the dev->main release cut. Same shape as
+#      hooks-stdout-audit below: a gate positioned outside the path where
+#      the decision is made cannot protect the thing it audits.)
 #   9. hooks-stdout-audit         (#2718 — BLOCKING when the diff touches
 #      src/engram/hooks/ or hooks.json, self-skips otherwise; the audit
 #      (tests/test_hooks_json_stdout_audit.py) previously ran ONLY in the
@@ -25,6 +33,23 @@ name: pr-checks
 #      hook (#2700) went green through pr-checks and broke hours later in
 #      a nightly nobody watches live (#2717). Path-scoped so it does not
 #      reintroduce full-suite cost on every PR.)
+#   10. team-practice-drift-gate  (umwelt#811 — ADVISORY until a cross-repo
+#      read credential exists, matching the established remedy for this
+#      exact defect class on exam-room#23/#24 — checks out
+#      engram-agents/team-practice and runs its sync_team_practice.py
+#      --check against this repo's CLAUDE.md. A hand-edit inside a
+#      generated `<!-- BEGIN team-practice: ... -->` region is the drift
+#      this exists to catch — the whole reason for generated regions
+#      instead of the old hand-duplicated-across-repos convention. One
+#      block migrated so far (which-colleague-takes-the-seat); more move
+#      in follow-up PRs. Default GITHUB_TOKEN cannot read a private
+#      sibling repo in this org (measured, not assumed — matches
+#      exam-room#23's identical finding); mira-verala's exam-room#24
+#      recommendation (a dedicated org-owned GitHub App, Contents:
+#      Read-only, installed on team-practice only) is the credential this
+#      step is waiting on. `continue-on-error` on the checkout keeps this
+#      advisory (a loud ::warning::, never a silent pass) until then, so
+#      it does not block every PR to this repo on an org-admin item.)
 
 on:
   pull_request:
@@ -693,6 +718,39 @@ jobs:
             --base "$BASE_SHA" --head HEAD \
             --pr-body-file /tmp/pr_body.txt
 
+      # ── 8b. test-id-set-check-unit-tests ────────────────────────────────
+      # #2950/#2959 — reviewer-fairy round 2: step 8 above runs the TOOL
+      # against this PR's own diff, but the tool's own test suite
+      # (tests/test_test_id_set_check.py) was not wired into any dev-PR
+      # gate — including test_2950_real_workflow_scan_roots_match_test_
+      # scan_roots_constant, the CI-enforced comparison that catches
+      # TEST_SCAN_ROOTS (this file's constant) drifting from
+      # .github/workflows/tests.yml's actual full-suite pytest invocation.
+      # A drift PR — or a regression to the workflow-line parser itself —
+      # was therefore green through pr-checks and would only fail on the
+      # dev->main release cut, the same "gate positioned outside the path
+      # where the decision is made cannot protect the thing it audits"
+      # shape as hooks-stdout-audit below (#2718/#2717).
+      #
+      # BLOCKING, same posture as step 8 (its own tool-invocation test):
+      # a silent regression to the sync gate is currently free at PR time;
+      # an advisory posture would leave it free.
+      #
+      # Whole file, not `-k`-filtered to the #2950 tests alone — same
+      # precedent as manifest-gate's `pytest tests/test_tiers_manifest.py
+      # -q` above: run the file that owns the gate. Fits the same "pure
+      # stdlib + pytest" carve-out already used by manifest-gate /
+      # stdlib-only guards / cascade-behaviour-acceptance above (no
+      # requirements-dev.txt install) — the tool module under test imports
+      # only argparse/ast/json/re/subprocess/sys/dataclasses/pathlib
+      # (confirmed via its own imports), and the suite's git-backed tests
+      # (#2381) run real `git` subprocess calls against THIS checkout,
+      # which the job's `actions/checkout@v4` step already provides with
+      # `fetch-depth: 0` / `fetch-tags: true`. Measured locally: 83 passed
+      # in ~6s.
+      - name: test-id-set-check-unit-tests — run tests/test_test_id_set_check.py (includes the #2950 TEST_SCAN_ROOTS <-> tests.yml sync gate)
+        run: python3 -m pytest tests/test_test_id_set_check.py -q
+
       # ── 9. hooks-stdout-audit ───────────────────────────────────────────
       # #2718 — tests/test_hooks_json_stdout_audit.py previously ran ONLY in
       # the nightly full suite (tests.yml). Per this repo's CI cost model, dev
@@ -744,3 +802,65 @@ jobs:
       - name: hooks-stdout-audit — run test_hooks_json_stdout_audit.py
         if: steps.hooks-diff-check.outputs.run == 'true'
         run: python3 -m pytest tests/test_hooks_json_stdout_audit.py -q
+
+      # ── 10. team-practice-drift-gate (umwelt#811) ───────────────────────
+      # A generated `<!-- BEGIN team-practice: <key> ... -->` region in this
+      # file's CLAUDE.md must match what team-practice's TEAM-PRACTICE.md
+      # would currently render — a hand-edit inside one is exactly the
+      # silent-drift shape the generated-region mechanism (chosen over a
+      # CLAUDE.md `@import`, which was shown to silently fail in unattended
+      # sessions — umwelt#811) exists to make loud instead.
+      #
+      # ADVISORY, NOT BLOCKING, until a cross-repo read credential exists —
+      # this is not a fresh design choice, it mirrors an already-established
+      # remedy for the identical defect class: exam-room#23 hit this exact
+      # failure (default GITHUB_TOKEN cannot read a private sibling repo in
+      # this org — a GitHub platform limit, not an org-config toggle) and
+      # reverted to a loud non-blocking warning; exam-room#24 (still open)
+      # carries mira-verala's security-seat recommendation — a dedicated
+      # org-owned GitHub App installed on team-practice only, Contents:
+      # Read-only, installation token minted per job, NOT a classic PAT —
+      # exam-room#24's own recommended shape. Lei's actual provisioned
+      # credential (2026-09-16) is a fine-grained PAT, `TEAM_PRACTICE_TOKEN`
+      # (contents:read on team-practice, scoped to alpha/umwelt/soma) —
+      # simpler than the App for this narrower, lower-stakes case; his call,
+      # not re-litigated here. Making this step unconditionally BLOCKING (as
+      # an earlier revision of this PR did) would have held every future PR
+      # to this repo hostage to the org-admin item landing, which is a
+      # materially worse failure than "the drift check doesn't run yet" —
+      # `continue-on-error` stays on the checkout as a safety margin (a
+      # misconfigured/expired secret degrades to advisory, never blocks
+      # every PR again) even now that the token exists.
+      #
+      # KEPLER'S CORRECTION (2026-09-16, forum #414) — advisory-for-everyone
+      # was itself a silent-pass hazard, caught reading this exact PR's own
+      # CI log at the per-step level: the checkout's `conclusion` reads
+      # `success` even when it FAILED, because `continue-on-error` masks
+      # that at the job/API level by design — a `gh pr checks`/`gh api
+      # jobs` read (conclusion-level) cannot tell "the real check ran and
+      # passed" from "the real check was skipped because checkout failed,
+      # but that failure was masked." Fork PRs structurally cannot carry
+      # this repo's secrets, so advisory is correct for them — but a PR
+      # from a branch of THIS repo failing the checkout means the secret
+      # was deleted, renamed, or mis-scoped, and that must be a loud
+      # failure, not a silent skip. `continue-on-error` is now an
+      # expression: true (advisory) only when the PR head is a fork.
+      - name: team-practice-drift-gate — checkout team-practice
+        id: team-practice-checkout
+        continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/checkout@v4
+        with:
+          repository: engram-agents/team-practice
+          path: team-practice
+          token: ${{ secrets.TEAM_PRACTICE_TOKEN }}
+
+      - name: team-practice-drift-gate — run sync_team_practice.py --check
+        if: steps.team-practice-checkout.outcome == 'success'
+        run: |
+          python3 team-practice/tools/sync_team_practice.py --check CLAUDE.md \
+            --team-practice team-practice/TEAM-PRACTICE.md
+
+      - name: team-practice-drift-gate — advisory notice (checkout unavailable, fork PR only)
+        if: steps.team-practice-checkout.outcome != 'success'
+        run: |
+          echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice from this fork PR (fork PRs cannot carry this repo's secrets by design). CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811. This warning firing on a same-repo branch PR would mean something is wrong; on a fork it is expected."

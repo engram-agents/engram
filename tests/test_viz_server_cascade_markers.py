@@ -209,13 +209,23 @@ def test_get_health_data_tainted_stale_counts_match_pending_markers():
 
 
 def test_get_health_data_health_score_available_reports_a_number_and_no_error():
-    """When _compute_health_score imports cleanly, health_score is a real
-    number and health_score_error is None -- the companion field to the
-    #2524 fallback test below, confirming the happy path wasn't disturbed
-    by adding the error field alongside it."""
+    """When a real health-v2 checkpoint has been written, health_score is a
+    real number and health_score_error is None -- the companion test to the
+    #2940 no-snapshot-yet fallback test below, confirming the happy path
+    wasn't disturbed by re-pointing health_score at the health-v2 reader
+    (engram-alpha#2940)."""
     rev, obs, derive, core = _make_fresh_mods()
     _seed_ob(obs)  # the DB file/schema is created on first write, not at _ensure_data_dir()
     db_path = str(core.DB_PATH)
+
+    from health import engine as health_engine
+
+    conn = core._get_db()
+    try:
+        health_engine.write_snapshot(conn, "nap")
+    finally:
+        conn.close()
+
     health = viz_health_data.get_health_data(db_path)
     assert "error" not in health, health
     assert health["health_score"] is not None
@@ -223,42 +233,108 @@ def test_get_health_data_health_score_available_reports_a_number_and_no_error():
     assert health["health_score_error"] is None
 
 
-def test_format_import_error_uses_message_when_present():
-    """_format_import_error() (engram-alpha#2524, factored out on
-    reviewer-fairy round 1 of PR #2763 so this expression is independently
-    testable): a real message wins over the class name."""
-    exc = ImportError("No module named 'engram_stats'")
-    assert viz_health_data._format_import_error(exc) == "No module named 'engram_stats'"
-
-
-def test_format_import_error_falls_back_to_class_name_on_empty_message():
-    """The empty-message branch: some ImportError constructions carry no
-    str() text at all -- e.g. a bare ImportError() with no args."""
-    exc = ImportError()
-    assert viz_health_data._format_import_error(exc) == "ImportError"
-
-
-def test_get_health_data_health_score_import_failure_reports_null_not_zero(monkeypatch):
-    """engram-alpha#2524: an ImportError must not fabricate a 0.0
-    'maximally unhealthy' reading indistinguishable from a real one.
-    Monkeypatches the module's own availability flags (set once at import
-    time from a real try/except ImportError) rather than trying to force
-    an actual import failure -- the flags are exactly what the runtime
-    code branches on, so this exercises the same code path a genuine
-    ImportError would."""
+def test_get_health_data_health_score_no_snapshot_yet_reports_null_not_zero():
+    """engram-alpha#2940: retiring the old pre-v2 formula moved the "must
+    not fabricate a fake number" guard from an ImportError fallback
+    (engram-alpha#2524's _HEALTH_SCORE_AVAILABLE flag, now retired along
+    with the now-retired penalty function) to a no-snapshot-yet fallback -- same
+    principle, new trigger. A genuinely fresh temp dir (via
+    _make_fresh_mods(), no nap/sleep checkpoint ever run against it) has no
+    health-snapshots/ directory at all, so
+    health.engine.read_latest_composed_summary() reports has_snapshot=False
+    and get_health_data must render null + a reason, never a fabricated
+    0.0 'maximally unhealthy' reading indistinguishable from a real one."""
     rev, obs, derive, core = _make_fresh_mods()
     _seed_ob(obs)  # the DB file/schema is created on first write, not at _ensure_data_dir()
     db_path = str(core.DB_PATH)
 
-    monkeypatch.setattr(viz_health_data, "_HEALTH_SCORE_AVAILABLE", False)
-    monkeypatch.setattr(
-        viz_health_data, "_HEALTH_SCORE_IMPORT_ERROR", "No module named 'engram_stats'"
-    )
-
     health = viz_health_data.get_health_data(db_path)
     assert "error" not in health, health
     assert health["health_score"] is None, (
-        f"expected None on import failure, got a fabricated number: {health['health_score']!r}"
+        f"expected None with no checkpoint written yet, got a fabricated "
+        f"number: {health['health_score']!r}"
     )
     assert health["health_score_error"] is not None
-    assert "engram_stats" in health["health_score_error"]
+
+
+def test_get_health_data_reads_the_requested_agents_own_checkpoint_not_the_process_default():
+    """engram-alpha#2940 round 2 (reviewer-fairy blocker 2): get_health_data(db_path)
+    is called by viz/server.py for potentially ANY agent's dashboard
+    (multi-tenant viz) -- it must report THAT agent's own health-v2
+    checkpoint, never silently substitute the calling process's own
+    default agent's checkpoint under the requested agent's identity. This
+    is the exact regression reviewer-fairy round 1 reproduced directly:
+    read_latest_composed_summary() with no argument always resolved its
+    own process's DATA_DIR, ignoring db_path entirely.
+
+    Sets up two SEPARATE agent trees ("A" and "B", each with their own
+    knowledge.db + health-snapshots dir + distinct checkpoint), makes the
+    calling PROCESS's own default agent B (the live engram_core module
+    state _make_fresh_mods() leaves behind), then calls
+    get_health_data(<agent A's db_path>) and asserts the result reflects
+    A's checkpoint (via snapshot_id, not just a possibly-coincidental
+    score/turn match) -- not B's.
+    """
+    from health import engine as health_engine
+
+    # ── Agent A: seed, checkpoint, capture its OWN expected summary while
+    # the process still points at A (self-scoped read, the ground truth).
+    # Force A onto a distinct turn number (write_snapshot's own filename is
+    # f"{turn}-{mode}-{timestamp}.json" -- two fresh graphs both checkpoint
+    # at turn 0 by default, and a fast test can collide on the
+    # second-resolution timestamp too, making snapshot_id an unreliable
+    # discriminator unless turn itself is forced to differ). ──
+    rev, obs, derive, core = _make_fresh_mods()
+    _seed_ob(obs, "Agent A's own observation.")
+    core._set_current_turn(101)
+    conn_a = core._get_db()
+    try:
+        health_engine.write_snapshot(conn_a, "nap")
+    finally:
+        conn_a.close()
+    a_expected = health_engine.read_latest_composed_summary()
+    assert a_expected["has_snapshot"], a_expected
+    a_db_path = str(core.DB_PATH)
+
+    # TEST_DIR is a single shared module-level path that _make_fresh_mods()
+    # rmtree's on every call -- copy agent A's tree out before reusing it
+    # for agent B below, or A's own files would be wiped from under us.
+    a_dir_copy = tempfile.mkdtemp(prefix="engram_test_viz_cascade_markers_agent_a_")
+    shutil.copytree(os.path.dirname(a_db_path), a_dir_copy, dirs_exist_ok=True)
+    a_db_path_copy = os.path.join(a_dir_copy, os.path.basename(a_db_path))
+
+    # ── Agent B: a completely different tree, seeded differently, its own
+    # checkpoint -- and this call leaves the PROCESS's own engram_core
+    # module state pointed at B, simulating "the viz process's own live
+    # agent is B" while we're about to ask for A's dashboard. ──
+    rev, obs, derive, core = _make_fresh_mods()
+    _seed_ob(obs, "Agent B's own, DIFFERENT observation -- must not leak into A's read.")
+    core._set_current_turn(202)
+    conn_b = core._get_db()
+    try:
+        health_engine.write_snapshot(conn_b, "nap")
+    finally:
+        conn_b.close()
+    b_expected = health_engine.read_latest_composed_summary()
+    assert b_expected["has_snapshot"], b_expected
+
+    assert a_expected["snapshot_id"] != b_expected["snapshot_id"], (
+        "test precondition failed -- agent A's and agent B's checkpoints "
+        "produced the same snapshot_id, so this test cannot discriminate "
+        f"'read A' from 'silently read B instead': {a_expected['snapshot_id']!r}"
+    )
+
+    try:
+        # Process default is now B. Request A's dashboard by db_path.
+        result = viz_health_data.get_health_data(a_db_path_copy)
+        assert "error" not in result, result
+        assert result["health_score_detail"]["snapshot_id"] == a_expected["snapshot_id"], (
+            f"get_health_data(agent A's db_path) must read AGENT A's own "
+            f"checkpoint ({a_expected['snapshot_id']!r}), not the calling "
+            f"process's own default agent B's "
+            f"({result['health_score_detail']['snapshot_id']!r} returned, "
+            f"vs B's actual {b_expected['snapshot_id']!r}) -- multi-tenant "
+            f"wrong-identity-attribution regression"
+        )
+    finally:
+        shutil.rmtree(a_dir_copy, ignore_errors=True)

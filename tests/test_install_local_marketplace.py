@@ -59,6 +59,41 @@ def _path_without_timeout_wrappers(dest_dir):
     return str(dest_dir)
 
 
+def _path_without_jq(dest_dir):
+    """Build a PATH value that genuinely has no `jq` binary reachable
+    anywhere on it, for engram-alpha#2955's falsifier: the installer must
+    read multi_agent/install_tier via python3 unconditionally, never jq, so
+    it must build correctly even when jq is entirely absent from PATH (not
+    merely absent on this particular runner).
+
+    Same masking technique as `_path_without_timeout_wrappers` above:
+    symlink every OTHER currently-reachable executable name into a fresh
+    directory and point PATH at that directory alone -- bash/git/python3/etc.
+    all stay resolvable; only `jq` does not.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    seen = set()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            names = os.listdir(entry)
+        except OSError:
+            continue
+        for name in names:
+            if name == "jq" or name in seen:
+                continue
+            src = os.path.join(entry, name)
+            if not os.path.isfile(src) or not os.access(src, os.X_OK):
+                continue
+            try:
+                os.symlink(src, dest_dir / name)
+            except OSError:
+                continue
+            seen.add(name)
+    return str(dest_dir)
+
+
 def _write_fake_plugin(build_root, *, platform=None, codex_agent=False):
     build_root.mkdir(parents=True, exist_ok=True)
     (build_root / "plugin.json").write_text(
@@ -103,6 +138,168 @@ def test_install_local_marketplace_builds_codex_target(tmp_path):
     assert manifest["target"] == "codex"
     assert manifest["multi_agent"] is True
     assert manifest["tier"] == "dev"
+
+
+def test_install_local_marketplace_builds_without_jq_on_path(tmp_path):
+    """engram-alpha#2955: the installer must read multi_agent/install_tier via
+    python3, never jq -- confirm by stripping jq from PATH entirely (not just
+    checking jq happens to be absent on this runner) and confirming the
+    build still succeeds and reads the config correctly."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"multi_agent": True, "install_tier": "dev"})
+    )
+    masked_path = _path_without_jq(tmp_path / "masked-path-bin-no-jq")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, PATH=masked_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+
+    assert "target: codex" in result.stdout
+    assert "multi-agent: yes, target: codex" in result.stdout
+
+    plugin_root = tmp_path / "marketplace" / "plugins" / "engram"
+    manifest = json.loads((plugin_root / ".engram-build-manifest.json").read_text())
+    assert manifest["target"] == "codex"
+    assert manifest["multi_agent"] is True
+    assert manifest["tier"] == "dev"
+
+
+def test_install_local_marketplace_fails_loud_on_malformed_config(tmp_path):
+    """engram-alpha#2955: a genuinely malformed config.json must still abort
+    the install with a non-zero exit and a clear stderr message -- matching
+    the OLD jq path's `set -e` abort behavior on an unparseable file. The
+    python3 replacement must never silently default to a flagless build on
+    a parse error."""
+    (tmp_path / "config.json").write_text("{not valid json")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower()
+
+
+def test_install_local_marketplace_fails_loud_on_non_object_config(tmp_path):
+    """engram-alpha#2955 round 1 (reviewer-fairy suggestion): a config.json
+    that is syntactically VALID JSON but not an object at the top level
+    (e.g. a bare array) must still abort loudly with the same clean
+    one-line message as the malformed-JSON case above -- not a raw Python
+    traceback from an uncaught AttributeError on d.get(). Fail-loud held
+    either way (non-zero exit), but the message quality regressed until
+    this fix widened the try/except to cover the type check too."""
+    (tmp_path / "config.json").write_text("[]")
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "Traceback" not in result.stderr, (
+        f"expected the clean one-line error message, got a raw traceback:\n{result.stderr}"
+    )
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower() or "expected" in result.stderr.lower()
+
+
+def test_install_local_marketplace_fails_loud_on_embedded_newline_in_tier(tmp_path):
+    """engram-alpha#2958 round 2 (Mira's reviewer catch): the python heredoc
+    hands multi_agent/install_tier to bash as two stdout lines, split via
+    `sed -n '1p'`/`sed -n '2p'`. An install_tier value containing an embedded
+    newline (e.g. "dev\\nbogus") prints as TWO lines from the tier value
+    alone, so `sed -n '2p'` silently captures only "dev" and "bogus" is
+    dropped from the pipeline with no error -- the old jq path passed the
+    whole string as a single shell argument and would have failed loud
+    instead. The installer must now reject this config.json with a non-zero
+    exit and a clear stderr message, rather than exiting 0 and rewriting
+    config.json with the truncated, unvalidated install_tier value."""
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps({"multi_agent": True, "install_tier": "dev\nbogus"})
+    )
+    original_config_text = config_path.read_text()
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "newline" in result.stderr.lower()
+    # config.json must be left untouched -- no truncated install_tier rewrite,
+    # confirming the installer aborted before reaching the persist-back block.
+    assert config_path.read_text() == original_config_text
+
+
+def test_install_local_marketplace_fails_loud_on_wrong_typed_install_tier(tmp_path):
+    """engram-alpha#2965: a WELL-FORMED config.json whose install_tier value
+    is present but the wrong type (a dict, here) must fail loud, not fall
+    through and get treated as a real (bogus) tier name. A dict is
+    deliberately chosen over an int: `"\\n" in tier` (the pre-existing
+    #2958 newline guard) happens to raise TypeError on an int too, which
+    would make this test pass for an unrelated reason -- `"\\n" in {"a":1}`
+    is valid dict-key-membership syntax and evaluates to False without
+    error, so only the #2965 type check catches this case. Verified by
+    temporarily removing the type check: an int value still failed (via
+    the accidental TypeError), but this dict value exited 0 with the raw
+    dict printed as the tier."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": {"a": 1}}))
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "install_tier must be a string" in result.stderr
+
+
+def test_install_local_marketplace_fails_loud_on_wrong_typed_multi_agent(tmp_path):
+    """engram-alpha#2965: multi_agent's sibling case -- a string "true" (a
+    plausible hand-edit typo) must fail loud rather than silently resolve
+    to false and drop the forum package requirements with no signal.
+    Pre-#2965, this exact config exited 0 as if multi_agent were absent."""
+    (tmp_path / "config.json").write_text(json.dumps({"multi_agent": "true"}))
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "codex", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "multi_agent must be a boolean" in result.stderr
 
 
 def test_install_local_marketplace_accepts_equals_target_form(tmp_path):
@@ -550,6 +747,81 @@ def test_install_local_marketplace_provisions_venv_convenience_tier_runtime_only
     assert "requirements/requirements-dev.txt" not in calls
 
 
+def test_install_local_marketplace_multi_agent_convenience_tier_installs_forum_reqs(tmp_path):
+    """A multi-agent seat gets src/forum/requirements.txt installed into its
+    venv independent of depth tier (#2944) — the forum/coordination package
+    composes with any depth tier via the orthogonal --multi-agent flag, so a
+    convenience-tier multi-agent seat must still get forum deps, not just
+    dev-tier ones."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Provisioning venv at" in result.stdout
+    assert "tier: convenience" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements.txt" in calls
+    assert "requirements/requirements-dev.txt" not in calls
+    assert "src/forum/requirements.txt" in calls
+
+
+def test_install_local_marketplace_multi_agent_via_mode_installs_forum_reqs(tmp_path):
+    """The mode=="multi" spelling (not just multi_agent==true) must also
+    trigger the forum-requirements install — same boolean logic as the
+    earlier jq-based multi-agent read elsewhere in this script."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "mode": "multi"})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" in calls
+
+
+def test_install_local_marketplace_non_multi_agent_skips_forum_reqs(tmp_path):
+    """A non-multi-agent seat (even at dev tier) does NOT get forum
+    requirements installed — the forum package is only needed by seats that
+    actually run the forum/coordination tooling."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": "dev"}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Dev tier: installing test dependencies" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" not in calls
+
+
+def test_install_local_marketplace_multi_agent_dev_tier_installs_both(tmp_path):
+    """Multi-agent + dev tier is a THIRD independent conditional, not nested
+    inside the dev-tier block — both requirements-dev.txt AND
+    src/forum/requirements.txt must install together."""
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "dev", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert "Dev tier: installing test dependencies" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" in result.stdout
+    calls = log_file.read_text()
+    assert "requirements/requirements-dev.txt" in calls
+    assert "src/forum/requirements.txt" in calls
+
+
 def test_install_local_marketplace_skips_venv_provisioning_when_no_venv(tmp_path):
     """A fresh ENGRAM_HOME with no venv is left alone — the provisioning block
     is a no-op, not an error, so a first install before venv creation still
@@ -593,6 +865,184 @@ def test_install_local_marketplace_runtime_req_failure_exits_nonzero(tmp_path):
     assert result.returncode != 0
     # The fake venv was actually invoked for the runtime install.
     assert "requirements/requirements.txt" in log_file.read_text()
+
+
+# ── #2951 fail-loud on the --skip-build venv-provisioning config reads ───────
+#
+# The main build-flags-assembly block's config.json read (_ma_tier_out, above)
+# was already made fail-loud by #2955/#2958. The --skip-build path never
+# reaches that block at all (it's inside the `else` of `if [[ $SKIP_BUILD -eq
+# 1 ]] ... else ... fi`) -- it reads config.json a SECOND time, independently,
+# in the venv-provisioning block below (_eff_tier / _eff_multi_agent), which
+# is why that second read needed its own fail-loud fix under this issue.
+#
+# Empirically confirmed (see PR discussion): the venv-provisioning block is
+# itself gated behind `if [[ -f "$_ENGRAM_VENV_PY" ]] ...` -- with NO venv
+# present, the whole block (including the config.json read) is skipped
+# entirely and the installer exits 0, matching
+# test_install_local_marketplace_skips_venv_provisioning_when_no_venv above.
+# So a --skip-build run against a malformed config.json with no fake venv
+# present never even reaches the fixed code -- the two tests below use
+# _fake_venv() to make sure the block actually runs and the fail-loud path is
+# genuinely exercised.
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_malformed_config(tmp_path):
+    """engram-alpha#2951: on the --skip-build path, a genuinely malformed
+    config.json read by the venv-provisioning block's _eff_tier/_eff_multi_agent
+    python3 calls must abort the install with a non-zero exit and a clear
+    stderr message -- not silently resolve to convenience/not-multi-agent and
+    continue, dropping the dev/forum requirements with no signal."""
+    (tmp_path / "config.json").write_text("{not valid json")
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower()
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_non_object_config(tmp_path):
+    """engram-alpha#2951: same as above but for a syntactically-valid,
+    wrong-shape config.json (a bare JSON array) -- fail-loud must hold with
+    the same clean one-line message, not a raw Python traceback from an
+    uncaught AttributeError on d.get()."""
+    (tmp_path / "config.json").write_text("[]")
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "Traceback" not in result.stderr, (
+        f"expected the clean one-line error message, got a raw traceback:\n{result.stderr}"
+    )
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower() or "expected" in result.stderr.lower()
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_install_tier(tmp_path):
+    """engram-alpha#2965: the --skip-build venv-provisioning path's own
+    separate _eff_tier read has the identical gap as the main build-flags
+    path -- a wrong-typed install_tier (a list, here) must fail loud rather
+    than pass the `[[ -z ... ]]` fallback check as a non-empty string."""
+    (tmp_path / "config.json").write_text(json.dumps({"install_tier": ["dev"]}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "install_tier must be a string" in result.stderr
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_wrong_typed_multi_agent(tmp_path):
+    """engram-alpha#2965: the --skip-build path's separate _eff_multi_agent
+    read has the identical gap -- multi_agent: 1 (an int, not a bool) must
+    fail loud rather than silently resolve to false and skip the forum
+    package requirements install with no signal."""
+    (tmp_path / "config.json").write_text(json.dumps({"multi_agent": 1}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "multi_agent must be a boolean" in result.stderr
+
+
+def test_install_local_marketplace_warns_on_missing_forum_requirements(tmp_path):
+    """engram-alpha#2951 (Kepler's fold-in): a multi-agent seat whose
+    src/forum/requirements.txt is missing must get a WARN naming the gap,
+    not a silent no-op -- unlike the install-failed case (which already
+    WARNs), a missing file previously produced zero log output.
+
+    This needs the REAL src/forum/requirements.txt (REPO_ROOT-relative, not
+    env-overridable) to be absent for the duration of the test only. The real
+    file is moved aside via shutil.move and unconditionally restored in a
+    finally block, mirroring careful handling of shared repo state during a
+    test run."""
+    real_forum_req = REPO_ROOT / "src" / "forum" / "requirements.txt"
+    assert real_forum_req.is_file(), (
+        f"expected {real_forum_req} to exist before the test moves it aside"
+    )
+    parked_forum_req = tmp_path / "requirements.txt.parked"
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    shutil.move(str(real_forum_req), str(parked_forum_req))
+    try:
+        result = _run_installer_skip_build(tmp_path, env_extra={})
+    finally:
+        shutil.move(str(parked_forum_req), str(real_forum_req))
+
+    assert result.returncode == 0
+    assert "WARN" in result.stdout
+    assert "forum" in result.stdout
+    assert "not found" in result.stdout
+
+
+def test_install_local_marketplace_skip_build_omitted_keys_default_cleanly(tmp_path):
+    """engram-alpha#2964 reviewer-fairy suggestion: the property this whole
+    fix exists to preserve -- a well-formed config.json that simply OMITS
+    install_tier/multi_agent entirely (not malformed, not present-but-empty)
+    must still exit 0 and resolve to the legitimate convenience/non-multi-agent
+    defaults via the existing bash `[[ -z ... ]]` lines, never take the new
+    fail-loud path. No test in the suite exercised the both-keys-fully-absent
+    shape before this one -- the nearest existing coverage
+    (test_install_local_marketplace_non_multi_agent_skips_forum_reqs) always
+    sets install_tier explicitly."""
+    (tmp_path / "config.json").write_text(json.dumps({}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert result.returncode == 0
+    assert "tier: convenience" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" not in calls
 
 
 # ── #2586 tag guard ──────────────────────────────────────────────────────────

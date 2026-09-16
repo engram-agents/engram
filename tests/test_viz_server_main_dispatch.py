@@ -96,7 +96,7 @@ class _MainDispatchBase(unittest.TestCase):
         mock_server_instance.serve_forever.side_effect = KeyboardInterrupt()
 
         server_patches = {
-            "HTTPServer": MagicMock(return_value=mock_server_instance),
+            "ThreadingHTTPServer": MagicMock(return_value=mock_server_instance),
         }
         agents_patches = dict(extra_patches) if extra_patches else {}
 
@@ -140,7 +140,7 @@ class TestMainDbFlag(unittest.TestCase):
         mock_server_instance.serve_forever.side_effect = KeyboardInterrupt()
 
         with patch.object(sys, "argv", ["viz_server"] + argv_tail):
-            with patch("viz.server.HTTPServer", return_value=mock_server_instance):
+            with patch("viz.server.ThreadingHTTPServer", return_value=mock_server_instance):
                 try:
                     main()
                 except KeyboardInterrupt:

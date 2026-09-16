@@ -23,6 +23,29 @@ doesn't deliver, a daemon that restarts with a bad socket, a viz server that cra
 
 ---
 
+## Step 0 — Plugin tree and compatibility links
+
+The live plugin tree must exist. Legacy helper paths may be symlinks, but a
+symlink can survive while its old install target disappears, so `test -L`
+alone is not enough to call it healthy.
+
+```bash
+test -d ~/.engram/marketplace/plugins/engram
+for path in tools hooks; do
+  test -e "$HOME/.engram/$path" \
+    && echo "PASS: ~/.engram/$path -> $(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.engram/$path")" \
+    || echo "FAIL: ~/.engram/$path is absent or dangling"
+done
+```
+
+**PASS:** the plugin tree exists and both compatibility paths resolve to
+existing targets. **FAIL:** either path is absent/dangling. Repoint a dangling
+symlink to `~/.engram/marketplace/plugins/engram/<path>`; preserve a real
+directory and follow `engram-upgrade`'s pinned-scatter remediation instead of
+replacing it blindly.
+
+---
+
 ## Step 1 — MCP server round-trip
 
 Call `engram_stats`. The MCP server must answer and the graph DB must be readable.
@@ -31,7 +54,9 @@ Call `engram_stats`. The MCP server must answer and the graph DB must be readabl
 engram_stats({})
 ```
 
-**PASS:** the response includes `total_nodes` (≥ 0) and `health_score` (0.0–1.0) without error.
+**PASS:** the response includes a non-empty `node_counts_by_type` mapping and a
+numeric `health_score` without error. (`health_score` is currently reported on
+a 0–100 scale; see #2940 for the old-vs-v2 formula-surface decision.)
 
 **FAIL:** the tool call errors, times out, or returns an empty response.
 
@@ -55,9 +80,10 @@ The SessionStart hook writes a per-session marker. Verify it fired AND delivered
 # Check that the current session marker exists (hook wrote it):
 ls -t ~/.engram/sessions/ | head -5
 
-# Confirm the hook injected content into the session banner by checking
-# that the warm-briefing was loaded (proxy: the file's mtime is recent):
-stat ~/.engram/warm-briefing.md 2>/dev/null | grep -i modify
+# Inspect the newest marker. The hook writes a fresh marker; it does not touch
+# warm-briefing.md, so that file's mtime is not a delivery signal.
+marker=$(ls -t ~/.engram/sessions/*.json 2>/dev/null | head -1)
+python3 -m json.tool "$marker"
 ```
 
 **PASS:** a `.json` session marker file exists for the current session (most-recent by mtime); the session
@@ -82,8 +108,8 @@ cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool
 The forum-prompt hook (`engram-forum-prompt-hook.py`) fires on every prompt and updates `~/.engram/forum-surfaced-cursor.txt`.
 
 ```bash
-# Check the surfaced cursor was updated recently (within the last few minutes):
-stat ~/.engram/forum-surfaced-cursor.txt 2>/dev/null | grep -i modify
+# Check the surfaced cursor timestamp (portable across GNU/Linux and macOS):
+python3 -c "import os,time; p=os.path.expanduser('~/.engram/forum-surfaced-cursor.txt'); print(time.ctime(os.path.getmtime(p)), p)"
 
 # And confirm the surface hook is registered:
 cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "UserPromptSubmit"
@@ -100,7 +126,7 @@ Remediation — same muted-stdout class:
 # Check if the daemon is running (surface hook depends on it):
 pgrep -f "engram-surface-daemon" || echo "daemon not running"
 # Restart the daemon if absent (it auto-restarts on next hook fire if the start-daemon script is registered):
-bash ~/.engram/marketplace/plugins/engram/hooks/claude/start-engram-daemon.sh
+bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 ```
 
 ---
@@ -117,7 +143,7 @@ pgrep -af "engram-surface-daemon" || echo "daemon not running"
 Then call `engram_query` with a term you know is in the graph (any recent topic):
 
 ```
-engram_query({"payload_json": "{\"query\": \"<a term from your recent work>\", \"limit\": 3}"})
+engram_query({"payload_json": "{\"query\": \"<a term from your recent work>\", \"top_k\": 3}"})
 ```
 
 **PASS:** daemon process exists; `engram_query` returns ≥ 1 result (semantic recall working).
@@ -127,7 +153,7 @@ matches). Not a hard block, but degrades surfacing quality.
 
 Remediation:
 ```bash
-bash ~/.engram/marketplace/plugins/engram/hooks/claude/start-engram-daemon.sh
+bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 # Wait 10s, then re-check pgrep
 ```
 
@@ -148,10 +174,13 @@ Call `engram_diagnose` to check for schema anomalies.
 engram_diagnose({})
 ```
 
-**PASS:** `engram_diagnose` returns without an error in the `errors` list; health score roughly aligns
-with `engram_stats`.
+**PASS:** `engram_diagnose` returns structured `structure`, `epistemic`, and
+`memory` sections without a tool error. Its `health_score` is numeric. Do not
+require it to equal the viz health-v2 score while #2940 is unresolved: they are
+currently different live formula surfaces.
 
-**FAIL:** the tool errors, or `errors` contains unexpected entries. Proceed to the manual schema check.
+**FAIL:** the tool errors, returns an empty response, or omits those core
+sections. Proceed to the manual schema check.
 
 ```bash
 # Check what schema version the DB is at (stored in the SQLite user_version pragma):
@@ -248,17 +277,21 @@ on a graph at least as large as the ones above.
 Skip this step if you do not use the viz dashboard (T2 feature, may not be installed).
 
 ```bash
-curl -s http://localhost:5001/api/health | python3 -m json.tool
+agent=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.engram/config.json')))['agent_name'])")
+curl -s "http://localhost:5001/api/health?agent=$agent" | python3 -m json.tool
 ```
 
-**PASS:** JSON response with a `health_score` field (number 0.0–1.0). A populated `health_score` means
-the viz server is up and can read the graph DB.
+**PASS:** JSON response for the expected `agent` with a numeric `health_score`.
+A populated value means the viz server is up and can read that seat's graph DB.
 
 **FAIL:** connection refused, non-200 response, or no `health_score` in the JSON.
 
 ```bash
-# Check if it's supposed to be running (systemd service or manual start):
-systemctl --user status engram-viz 2>/dev/null || echo "no systemd service"
+# Check if it's supposed to be running (systemd service or manual start).
+# tools/operator-setup-viz.sh is the canonical path (idempotent; its last
+# step is this same restart) -- use the bare restart below only for a
+# code-only refresh where setup is already known-good.
+systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd service"
 # Manual start (viz/server.py uses relative imports -- must run as a
 # module with the plugin engram dir as the working directory, not as a
 # direct script path):
