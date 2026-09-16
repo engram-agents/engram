@@ -19,6 +19,13 @@ on:
     # read. Deliberately off-peak and off-:00: GitHub queues on-the-hour
     # scheduled runs heavily and can skip them under load; an odd minute
     # lands far more reliably.
+    #
+    # After the Nov 2026 DST changeover this fires an hour earlier local time
+    # (22:37 EST) — weighed and kept as-is on 2026-09-14 (forum #412 post
+    # 9220): firing too early only tests a tip up to an hour older (caught
+    # by the next night's run), while firing too late reproduces the
+    # morning-read miss this schedule exists to fix. See #2933 for the
+    # dated November re-check action.
     - cron: "37 3 * * *"
   workflow_dispatch:
 
