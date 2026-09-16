@@ -11,6 +11,41 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.1] - 2026-09-14
 
+### rc2 fix round — 2026-09-16 (found on the rc1 soak; tracking #2941)
+
+- **Health score is single-sourced on health-v2.** The pre-v2 formula that
+  `engram_stats`/`diagnose`/the session banner still reported (95.0 beside the
+  v2 panel's 100) is retired (#2957).
+- **Installer hardening.** The `jq` dependency is gone; config is read with
+  python3 (#2958). Malformed `config.json` now fails loud on the venv-provisioning
+  reads instead of silently resolving tier/multi-agent to defaults (#2964), and a
+  well-formed config with a wrong-typed `install_tier`/`multi_agent` value is
+  rejected the same way (#2973). A missing `src/forum/requirements.txt` on a
+  multi-agent seat warns instead of silently skipping (#2964).
+- **Forum package requirements are installed into the multi-agent venv**, so a
+  fresh dev venv can collect the forum tests (#2949); the test-id gate now scans
+  `src/forum/tests` (#2948) and enforces scan-roots ↔ `tests.yml` sync (#2959).
+- **`dag_conformance` no longer reports a phantom one-node cycle** for
+  supersedes/retracts edges (#2947).
+- **Viz server**: gzip responses, `ThreadingHTTPServer`, and an in-flight guard,
+  with config writes serialized under one lock (#2926).
+- **Skills**: the health-exam skill matches the rc1 runtime and is portable
+  (#2946); two skills name the live `engram-viz-user.service` unit and
+  `tools/operator-setup-viz.sh` as the canonical restart path (#2971); the
+  upgrade skill documents the Codex 0.154 live-refresh boundary (#2954).
+- **Baton gates**: the REST flip endpoint now runs the same CI-green /
+  approval-staleness / colleague-approval gate as the CLI, fail-closed when the
+  shared gate module cannot load, with an `author:` field and a legacy-author
+  fallback (#2966); `cmd_merge`'s Gate 2 accepts a maintainer-role holder, not
+  only the literal pool sentinel (#2969).
+- **Team practice**: the "which colleague takes the seat" block of `CLAUDE.md`
+  is a generated region checked by a CI drift gate against the private
+  team-practice repo (#2963); `engram_add_observation`'s docstring is trimmed to
+  its contract with the WHY moved to the `engram-observe`/`engram-standpoint`
+  skills (#2962); the interim soma review-convention exception is retired (#2956).
+- **CI**: both nightly workflows record the DST-changeover weighing decision
+  beside their cron line (#2970).
+
 **A scoring-system release.** 204 commits since the `v0.5.0-rc3` cut
 (2026-08-30 through 2026-09-14). The headline arc is the **Health Score v2.0
 curve system**, with the new **Curve Workbench** tool built to tune it —
