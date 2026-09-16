@@ -61,12 +61,22 @@ def serve_static(handler, filename: str) -> None:
     """
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         handler.send_response(404)
+        # Reviewer-fairy catch on PR-2926 (2026-09-14): Content-Length: 0 is
+        # required so a keep-alive HTTP/1.1 client doesn't hang waiting for a
+        # body that never comes -- see server.py's do_GET catch-all 404 for
+        # the full explanation (same fix, same root cause, three call sites).
+        handler.send_header("Content-Length", "0")
         handler.end_headers()
         return
 
     target = _STATIC_DIR / filename
     if not target.is_file():
         handler.send_response(404)
+        # Reviewer-fairy catch on PR-2926 (2026-09-14): Content-Length: 0 is
+        # required so a keep-alive HTTP/1.1 client doesn't hang waiting for a
+        # body that never comes -- see server.py's do_GET catch-all 404 for
+        # the full explanation (same fix, same root cause, three call sites).
+        handler.send_header("Content-Length", "0")
         handler.end_headers()
         return
     # Belt-and-suspenders: confirm the resolved path is still directly
@@ -75,6 +85,11 @@ def serve_static(handler, filename: str) -> None:
     # don't see).
     if target.resolve().parent != _STATIC_DIR:
         handler.send_response(404)
+        # Reviewer-fairy catch on PR-2926 (2026-09-14): Content-Length: 0 is
+        # required so a keep-alive HTTP/1.1 client doesn't hang waiting for a
+        # body that never comes -- see server.py's do_GET catch-all 404 for
+        # the full explanation (same fix, same root cause, three call sites).
+        handler.send_header("Content-Length", "0")
         handler.end_headers()
         return
 

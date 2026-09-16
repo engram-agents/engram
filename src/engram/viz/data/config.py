@@ -33,6 +33,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +93,14 @@ except ImportError:
 # — this is safe as an ordinary module-level dict with no cross-module
 # attribute-access requirement; nothing outside this module reads it anyway.
 _CONFIG_WRITE_BACKUPS: dict = {}
+
+# Serializes write_config_key()'s read-modify-write-verify sequence.
+# ThreadingHTTPServer (server.py) gives one thread per connection, so two
+# concurrent PUT /api/config/<key> requests can otherwise interleave their
+# load-mutate-write-verify steps and silently lose one update or leave
+# config.json torn (engram-alpha#2926 round-1 review). Module-level so any
+# future in-process caller (e.g. workbench.py) inherits the same guarantee.
+_WRITE_LOCK = threading.Lock()
 
 
 def _schema_index() -> dict:
@@ -323,6 +332,12 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
     - In-place write (preserves config.json inode → owner + mode).
     - Read-after-write verify; rollback to backup on failure.
     - Per-agent isolation: only touches the config.json for agent_name.
+    - The load-mutate-write-verify sequence is serialized in-process by
+      ``_WRITE_LOCK``, so two concurrent PUTs handled by ThreadingHTTPServer
+      cannot interleave and lose an update or tear the file. This does NOT
+      cover a SEPARATE PROCESS editing config.json directly (e.g. a human
+      hand-editing the file, or a second server instance) — that path is
+      unserialized, as it always was.
     """
     # Resolve config path using the same function as the GET path.
     config_path = _resolve_config_path(agent_name)
@@ -341,90 +356,97 @@ def write_config_key(agent_name: str, key: str, raw_value) -> dict:
     row = index.get(key, {})
     restart_required = bool(row.get("restart_required", False))
 
-    # Load current config.
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"ok": False, "error": f"Failed to read config.json: {exc}"}
-
-    # Backup once per agent per session.
-    if agent_name not in _CONFIG_WRITE_BACKUPS:
-        ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup_path = f"{config_path}.bak.{ts}"
+    # Everything from here through the post-verify backup refresh touches
+    # shared on-disk state (config.json, _CONFIG_WRITE_BACKUPS) and must be
+    # serialized against concurrent callers (see _WRITE_LOCK's docstring).
+    with _WRITE_LOCK:
+        # Load current config.
         try:
-            shutil.copy2(config_path, backup_path)
-            _CONFIG_WRITE_BACKUPS[agent_name] = backup_path
-        except OSError as exc:
-            return {"ok": False, "error": f"Failed to create backup: {exc}"}
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": f"Failed to read config.json: {exc}"}
 
-    backup_path = _CONFIG_WRITE_BACKUPS[agent_name]
-
-    # Apply the new value.
-    _set_nested(config, key, validated_value)
-
-    # In-place write: copy validated content into config.json's EXISTING inode
-    # rather than os.rename(temp, config.json). os.rename swaps in the temp
-    # file's inode, which carries the temp's owner + mode (operator UID, 0600
-    # from mkstemp) — when the viz server runs as a different UID than the
-    # agent that owns config.json, that strips the agent's ownership and locks
-    # it out of its own config (GitHub #372). Building in a temp first keeps a
-    # serialization error from truncating the live file; the copy into the
-    # existing inode is not crash-atomic, so the backup + read-after-write
-    # verify + rollback below cover a torn write. Second tradeoff vs os.rename
-    # (which is atomic at the VFS layer): a concurrent reader can transiently
-    # observe a partially-written config.json and get a JSONDecodeError. The
-    # copy window is sub-millisecond for typical config sizes and config is
-    # read at startup, not continuously, so this is not a real-world concern.
-    config_dir = os.path.dirname(config_path)
-    try:
-        fd, tmp_path = _tempfile_in_dir(config_dir)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-                f.write("\n")
-            with open(tmp_path, "r", encoding="utf-8") as src, \
-                    open(config_path, "w", encoding="utf-8") as dst:
-                shutil.copyfileobj(src, dst)
-        finally:
+        # Backup once per agent per session.
+        if agent_name not in _CONFIG_WRITE_BACKUPS:
+            ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup_path = f"{config_path}.bak.{ts}"
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    except OSError as exc:
-        # In-place commit can leave config.json torn — restore from backup.
-        try:
-            shutil.copyfile(backup_path, config_path)
-        except OSError:
-            pass
-        return {"ok": False, "error": f"Write failed: {exc}"}
+                shutil.copy2(config_path, backup_path)
+                _CONFIG_WRITE_BACKUPS[agent_name] = backup_path
+            except OSError as exc:
+                return {"ok": False, "error": f"Failed to create backup: {exc}"}
 
-    # Read-after-write verify.
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            written = json.load(f)
-        written_val = _get_nested(written, key)
-        if isinstance(written_val, _Missing) or written_val != validated_value:
-            # Verify failed — rollback from backup.
+        backup_path = _CONFIG_WRITE_BACKUPS[agent_name]
+
+        # Apply the new value.
+        _set_nested(config, key, validated_value)
+
+        # In-place write: copy validated content into config.json's EXISTING
+        # inode rather than os.rename(temp, config.json). os.rename swaps in
+        # the temp file's inode, which carries the temp's owner + mode
+        # (operator UID, 0600 from mkstemp) — when the viz server runs as a
+        # different UID than the agent that owns config.json, that strips the
+        # agent's ownership and locks it out of its own config (GitHub #372).
+        # Building in a temp first keeps a serialization error from
+        # truncating the live file; the copy into the existing inode is not
+        # crash-atomic, so the backup + read-after-write verify + rollback
+        # below cover a torn write. Second tradeoff vs os.rename (which is
+        # atomic at the VFS layer): a concurrent reader can transiently
+        # observe a partially-written config.json and get a JSONDecodeError.
+        # The copy window is sub-millisecond for typical config sizes and
+        # config is read at startup, not continuously, so this is not a
+        # real-world concern.
+        config_dir = os.path.dirname(config_path)
+        try:
+            fd, tmp_path = _tempfile_in_dir(config_dir)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                with open(tmp_path, "r", encoding="utf-8") as src, \
+                        open(config_path, "w", encoding="utf-8") as dst:
+                    shutil.copyfileobj(src, dst)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except OSError as exc:
+            # In-place commit can leave config.json torn — restore from backup.
             try:
                 shutil.copyfile(backup_path, config_path)
             except OSError:
                 pass
-            return {"ok": False, "error": "write verify failed, rolled back"}
-    except (OSError, json.JSONDecodeError) as exc:
-        # Can't verify — rollback.
+            return {"ok": False, "error": f"Write failed: {exc}"}
+
+        # Read-after-write verify.
         try:
-            shutil.copyfile(backup_path, config_path)
+            with open(config_path, "r", encoding="utf-8") as f:
+                written = json.load(f)
+            written_val = _get_nested(written, key)
+            if isinstance(written_val, _Missing) or written_val != validated_value:
+                # Verify failed — rollback from backup.
+                try:
+                    shutil.copyfile(backup_path, config_path)
+                except OSError:
+                    pass
+                return {"ok": False, "error": "write verify failed, rolled back"}
+        except (OSError, json.JSONDecodeError) as exc:
+            # Can't verify — rollback.
+            try:
+                shutil.copyfile(backup_path, config_path)
+            except OSError:
+                pass
+            return {"ok": False, "error": f"write verify failed (read error: {exc}), rolled back"}
+
+        # After verify success: refresh backup so any later same-session
+        # rollback lands on last-good (this written value) rather than
+        # session-start.
+        try:
+            shutil.copyfile(config_path, backup_path)
         except OSError:
             pass
-        return {"ok": False, "error": f"write verify failed (read error: {exc}), rolled back"}
-
-    # After verify success: refresh backup so any later same-session rollback
-    # lands on last-good (this written value) rather than session-start.
-    try:
-        shutil.copyfile(config_path, backup_path)
-    except OSError:
-        pass
 
     return {
         "ok": True,

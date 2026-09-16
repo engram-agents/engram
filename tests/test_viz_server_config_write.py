@@ -25,7 +25,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from http.server import HTTPServer
+from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -645,6 +645,108 @@ class TestPutRouteHTTP(ConfigWriteBase):
             self.assertEqual(resp.status, 204)
         except HTTPError as e:
             self.fail(f"OPTIONS returned error: {e.code}")
+
+
+def _start_threading_test_server() -> tuple:
+    """Start viz_server on an ephemeral port using ThreadingHTTPServer (one
+    thread per connection -- matches what server.py's main() uses in
+    production as of this PR). The plain HTTPServer helper above
+    (_start_test_server) is single-threaded and cannot reproduce the
+    concurrent-PUT race this class exercises."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), viz_server.Handler)
+    port = server.server_address[1]
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    return server, port, t
+
+
+class TestWriteConfigKeyConcurrency(ConfigWriteBase):
+    """Regression test for Ariadne's round-1 review blocker on PR #2926:
+    ThreadingHTTPServer gives one thread per connection, and
+    write_config_key()'s read-modify-write-verify sequence was previously
+    unserialized -- concurrent PUTs to two different keys of the same agent
+    could silently lose one update (both clients see ok: true, but only one
+    value survives to disk) or leave config.json torn/unparseable.
+
+    Reproduces the reviewer's own repro against a REAL ThreadingHTTPServer +
+    Handler. n=30 pairs: the reviewer measured an 80% per-pair failure rate
+    pre-fix, so 30 clean pairs in a row would need to survive a ~1-in-30
+    chance of no failure at each pair -- well under 1-in-a-million overall --
+    if the race were still present.
+    """
+
+    N_ITERATIONS = 30
+    KEY_A = "cadence.drowsiness_caution_pct"  # int, schema range 0-100
+    KEY_B = "memory.tier2_max_nodes"          # int, schema range 100-100000
+
+    def setUp(self):
+        super().setUp()
+        self._server, self._port, self._thread = _start_threading_test_server()
+
+    def tearDown(self):
+        self._server.shutdown()
+        super().tearDown()
+
+    def _put(self, key: str, value, agent: str = "test") -> tuple:
+        """Send PUT request. Returns (status_code, parsed_json)."""
+        body = json.dumps({"value": value}).encode()
+        url = f"http://127.0.0.1:{self._port}/api/config/{key}?agent={agent}"
+        req = Request(url, data=body, method="PUT",
+                      headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        try:
+            resp = urlopen(req)
+            data = json.loads(resp.read())
+            return resp.status, data
+        except HTTPError as e:
+            data = json.loads(e.read())
+            return e.code, data
+
+    def test_concurrent_puts_to_different_keys_no_lost_update_no_torn_file(self):
+        """n=30 pairs of concurrent PUTs to two different keys of the SAME
+        agent, released simultaneously via a 2-party Barrier. After each
+        pair: config.json must parse (no torn/empty file) and both keys
+        must hold their expected final values (no lost update)."""
+        for i in range(self.N_ITERATIONS):
+            val_a = 1 + (i % 99)     # stays within KEY_A's 0-100 range
+            val_b = 200 + i          # stays within KEY_B's 100-100000 range
+            barrier = threading.Barrier(2)
+            results: dict = {}
+
+            def _do_put(name, key, value):
+                barrier.wait(timeout=5)
+                results[name] = self._put(key, value)
+
+            t1 = threading.Thread(target=_do_put, args=("a", self.KEY_A, val_a))
+            t2 = threading.Thread(target=_do_put, args=("b", self.KEY_B, val_b))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+
+            self.assertIn("a", results, f"iteration {i}: PUT A did not complete")
+            self.assertIn("b", results, f"iteration {i}: PUT B did not complete")
+            status_a, data_a = results["a"]
+            status_b, data_b = results["b"]
+            self.assertEqual(status_a, 200, f"iteration {i}: PUT A failed: {data_a}")
+            self.assertEqual(status_b, 200, f"iteration {i}: PUT B failed: {data_b}")
+
+            # config.json must be valid, parseable JSON -- not torn/empty.
+            try:
+                cfg = self._read_config()
+            except json.JSONDecodeError as exc:
+                self.fail(f"iteration {i}: config.json is not valid JSON (torn write): {exc}")
+
+            # Both keys must hold their expected final values -- no lost update,
+            # even though both clients above received ok: true.
+            self.assertEqual(
+                cfg["cadence"]["drowsiness_caution_pct"], val_a,
+                f"iteration {i}: lost update on {self.KEY_A} (expected {val_a})",
+            )
+            self.assertEqual(
+                cfg["memory"]["tier2_max_nodes"], val_b,
+                f"iteration {i}: lost update on {self.KEY_B} (expected {val_b})",
+            )
 
 
 class TestAutoSleepTimePatternValidation(ConfigWriteBase):

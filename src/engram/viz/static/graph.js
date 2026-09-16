@@ -99,6 +99,12 @@ let EDGE_STYLE = {};
 // ═══════════════════════════════════════════════════════════════════
 
 let rawData = { nodes: [], edges: [] };
+// In-flight guard for fetchGraph() (engram-alpha#2866 fix 3): without this,
+// a fetch that takes longer than the 10s auto-refresh interval leaves the
+// next scheduled tick free to start a second overlapping request against a
+// server that (pre-fix-2) served one request at a time, so requests piled
+// up unboundedly. A skip, not a queue -- the next tick just tries again.
+let _fetchGraphInFlight = false;
 // activeTypes is initialised from NODE_STYLE keys in fetchSchema() — after the
 // schema endpoint resolves and NODE_STYLE is populated, the full set of known
 // types (including cornerstone) is active by default.
@@ -1479,6 +1485,8 @@ async function loadAgents() {
 // ═══════════════════════════════════════════════════════════════════
 
 async function fetchGraph() {
+  if (_fetchGraphInFlight) return;
+  _fetchGraphInFlight = true;
   try {
     const res = await fetch(withAgent('/api/graph'));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1555,6 +1563,8 @@ async function fetchGraph() {
   } catch (err) {
     console.error('Fetch error:', err);
     document.getElementById('last-refresh').textContent = `Error: ${err.message}`;
+  } finally {
+    _fetchGraphInFlight = false;
   }
 }
 

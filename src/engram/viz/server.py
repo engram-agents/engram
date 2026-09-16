@@ -68,11 +68,12 @@ Deployment / restart model (operator-launched, not agent-managed):
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import time
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import agents as viz_agents
@@ -155,6 +156,17 @@ def _health_workbench_model_available() -> bool:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1 persistent connections -- required for ThreadingHTTPServer's
+    # concurrency to actually help a slow-client scenario (engram-alpha#2866
+    # fix 2): the default HTTP/1.0 closes the connection after every response
+    # regardless of threading. Every response MUST send an accurate
+    # Content-Length (or use chunked encoding) once this is set, or a client
+    # will hang waiting for data that never comes since the connection is no
+    # longer closed as an end-of-response signal -- see _json()/_html() below,
+    # both of which already compute Content-Length from the actual bytes
+    # written on the wire (post-gzip for _json(), per fix 1).
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt, *args):
         # R5.5: opt-in access log, off by default (unchanged behavior --
         # still suppresses BaseHTTPRequestHandler's own stderr access log
@@ -378,6 +390,15 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(resp)
         else:
             self.send_response(404)
+            # Reviewer-fairy catch on PR-2926 (2026-09-14): an empty body with
+            # no Content-Length was safe under the old HTTP/1.0 default-close
+            # behavior (the closed connection itself signalled end-of-response)
+            # but hangs a keep-alive HTTP/1.1 client indefinitely now that this
+            # file sets protocol_version = "HTTP/1.1" -- reproduced live, a
+            # real client's read timed out against this exact path pre-fix.
+            # Content-Length: 0 is correct either way and costs nothing under
+            # HTTP/1.0.
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
     def do_OPTIONS(self):
@@ -446,10 +467,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, data: dict, status: int = 200):
         """Send JSON response. status defaults to 200 (preserves the historical
-        no-status callsite shape); pass an explicit status for error responses."""
+        no-status callsite shape); pass an explicit status for error responses.
+
+        If the client sends `Accept-Encoding: gzip`, the body is gzip-compressed
+        and sent with `Content-Encoding: gzip` + the COMPRESSED Content-Length
+        (engram-alpha#2866 fix 1 -- /api/graph ships uncompressed and can run to
+        tens of MB on a large graph). A client that doesn't advertise gzip
+        support gets byte-identical behavior to before this fix."""
         body = json.dumps(data, default=str).encode()
+        accept_encoding = self.headers.get("Accept-Encoding", "")
+        gzip_ok = "gzip" in accept_encoding
+        if gzip_ok:
+            body = gzip.compress(body)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if gzip_ok:
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -509,9 +542,15 @@ def main():
     # not a local `global`).
     viz_agents.configure_agents_from_args(args)
 
-    HTTPServer.allow_reuse_address = True
+    # ThreadingHTTPServer (engram-alpha#2866 fix 2): plain HTTPServer is
+    # single-threaded, so one slow client blocks every other request behind
+    # it (measured: a 193-byte request delayed 58s behind a rate-limited
+    # competitor). One thread per connection removes that head-of-line
+    # block. Combined with Handler.protocol_version = "HTTP/1.1" above for
+    # keep-alive.
+    ThreadingHTTPServer.allow_reuse_address = True
     bind = args.bind or "127.0.0.1"
-    server = HTTPServer((bind, args.port), Handler)
+    server = ThreadingHTTPServer((bind, args.port), Handler)
     print(f"ENGRAM Visualizer →  http://localhost:{args.port}")
     print(f"Health Dashboard  →  http://localhost:{args.port}/health")
     print(f"Config tab        →  http://localhost:{args.port}/config")
