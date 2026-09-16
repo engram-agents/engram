@@ -818,6 +818,136 @@ def test_install_local_marketplace_runtime_req_failure_exits_nonzero(tmp_path):
     assert "requirements/requirements.txt" in log_file.read_text()
 
 
+# ── #2951 fail-loud on the --skip-build venv-provisioning config reads ───────
+#
+# The main build-flags-assembly block's config.json read (_ma_tier_out, above)
+# was already made fail-loud by #2955/#2958. The --skip-build path never
+# reaches that block at all (it's inside the `else` of `if [[ $SKIP_BUILD -eq
+# 1 ]] ... else ... fi`) -- it reads config.json a SECOND time, independently,
+# in the venv-provisioning block below (_eff_tier / _eff_multi_agent), which
+# is why that second read needed its own fail-loud fix under this issue.
+#
+# Empirically confirmed (see PR discussion): the venv-provisioning block is
+# itself gated behind `if [[ -f "$_ENGRAM_VENV_PY" ]] ...` -- with NO venv
+# present, the whole block (including the config.json read) is skipped
+# entirely and the installer exits 0, matching
+# test_install_local_marketplace_skips_venv_provisioning_when_no_venv above.
+# So a --skip-build run against a malformed config.json with no fake venv
+# present never even reaches the fixed code -- the two tests below use
+# _fake_venv() to make sure the block actually runs and the fail-loud path is
+# genuinely exercised.
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_malformed_config(tmp_path):
+    """engram-alpha#2951: on the --skip-build path, a genuinely malformed
+    config.json read by the venv-provisioning block's _eff_tier/_eff_multi_agent
+    python3 calls must abort the install with a non-zero exit and a clear
+    stderr message -- not silently resolve to convenience/not-multi-agent and
+    continue, dropping the dev/forum requirements with no signal."""
+    (tmp_path / "config.json").write_text("{not valid json")
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower()
+
+
+def test_install_local_marketplace_skip_build_fails_loud_on_non_object_config(tmp_path):
+    """engram-alpha#2951: same as above but for a syntactically-valid,
+    wrong-shape config.json (a bare JSON array) -- fail-loud must hold with
+    the same clean one-line message, not a raw Python traceback from an
+    uncaught AttributeError on d.get()."""
+    (tmp_path / "config.json").write_text("[]")
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--target", "claude-code",
+         "--skip-build", "--skip-add", "--allow-branch", "--allow-untagged"],
+        cwd=REPO_ROOT,
+        env=_env(tmp_path, ENGRAM_BUILD_DIR=build_root),
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stderr.strip() != ""
+    assert "Traceback" not in result.stderr, (
+        f"expected the clean one-line error message, got a raw traceback:\n{result.stderr}"
+    )
+    assert "config.json" in result.stderr or "parse" in result.stderr.lower() or "expected" in result.stderr.lower()
+
+
+def test_install_local_marketplace_warns_on_missing_forum_requirements(tmp_path):
+    """engram-alpha#2951 (Kepler's fold-in): a multi-agent seat whose
+    src/forum/requirements.txt is missing must get a WARN naming the gap,
+    not a silent no-op -- unlike the install-failed case (which already
+    WARNs), a missing file previously produced zero log output.
+
+    This needs the REAL src/forum/requirements.txt (REPO_ROOT-relative, not
+    env-overridable) to be absent for the duration of the test only. The real
+    file is moved aside via shutil.move and unconditionally restored in a
+    finally block, mirroring careful handling of shared repo state during a
+    test run."""
+    real_forum_req = REPO_ROOT / "src" / "forum" / "requirements.txt"
+    assert real_forum_req.is_file(), (
+        f"expected {real_forum_req} to exist before the test moves it aside"
+    )
+    parked_forum_req = tmp_path / "requirements.txt.parked"
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"install_tier": "convenience", "multi_agent": True})
+    )
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    shutil.move(str(real_forum_req), str(parked_forum_req))
+    try:
+        result = _run_installer_skip_build(tmp_path, env_extra={})
+    finally:
+        shutil.move(str(parked_forum_req), str(real_forum_req))
+
+    assert result.returncode == 0
+    assert "WARN" in result.stdout
+    assert "forum" in result.stdout
+    assert "not found" in result.stdout
+
+
+def test_install_local_marketplace_skip_build_omitted_keys_default_cleanly(tmp_path):
+    """engram-alpha#2964 reviewer-fairy suggestion: the property this whole
+    fix exists to preserve -- a well-formed config.json that simply OMITS
+    install_tier/multi_agent entirely (not malformed, not present-but-empty)
+    must still exit 0 and resolve to the legitimate convenience/non-multi-agent
+    defaults via the existing bash `[[ -z ... ]]` lines, never take the new
+    fail-loud path. No test in the suite exercised the both-keys-fully-absent
+    shape before this one -- the nearest existing coverage
+    (test_install_local_marketplace_non_multi_agent_skips_forum_reqs) always
+    sets install_tier explicitly."""
+    (tmp_path / "config.json").write_text(json.dumps({}))
+    log_file = tmp_path / "venv-calls.log"
+    _fake_venv(tmp_path, log_file)
+
+    result = _run_installer_skip_build(tmp_path, env_extra={})
+
+    assert result.returncode == 0
+    assert "tier: convenience" in result.stdout
+    assert "Multi-agent: installing forum package dependencies" not in result.stdout
+    calls = log_file.read_text()
+    assert "src/forum/requirements.txt" not in calls
+
+
 # ── #2586 tag guard ──────────────────────────────────────────────────────────
 #
 # These tests run against a SCRATCH git repo, never this checkout — the

@@ -542,24 +542,57 @@ fi
 # this run rebuilt the plugin tree.
 _ENGRAM_VENV_PY="$ENGRAM_HOME/venv/bin/python"
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
-  _eff_tier="$(python3 -c "import json,sys
+  # #2951: these two reads used to swallow ANY parse failure and silently
+  # resolve to convenience/not-multi-agent, dropping the dev/forum
+  # requirements with no signal. Fail loud instead, matching the
+  # _ma_tier_out block's contract above (#2955/#2958) -- absence of the
+  # value means "something is wrong", never "single-agent convenience".
+  # A well-formed config that simply omits install_tier (or has it as
+  # null) still resolves to empty string here, exactly like the sibling
+  # block, so the existing `[[ -z ... ]] && _eff_tier="convenience"` line
+  # below keeps doing the legitimate-default job -- only a parse/type
+  # failure takes the new sys.exit(1) path. Kept as TWO separate python3
+  # calls (not merged into one heredoc like the _ma_tier_out block) --
+  # deliberate minimal-diff scope: this fix makes the existing two calls
+  # fail loud, it does not restructure them.
+  if ! _eff_tier="$(python3 -c "import json,sys
+path = sys.argv[1]
 try:
-    print(json.load(open(sys.argv[1])).get('install_tier','convenience'))
-except Exception:
-    print('convenience')
-" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
+    tier = d.get('install_tier')
+    if tier is None or tier is False:
+        tier = ''
+except Exception as e:
+    print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
+    sys.exit(1)
+print(tier)
+" "$ENGRAM_HOME/config.json")"; then
+    exit 1
+  fi
   [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
   # Independent of tier (#2944): is this seat multi-agent? Same boolean logic
   # as the earlier jq-based read above (multi_agent==true OR mode=="multi"),
   # reimplemented via python3 here to match this later block's jq-optional
-  # style (this block already doesn't assume jq is present).
-  _eff_multi_agent="$(python3 -c "import json,sys
+  # style (this block already doesn't assume jq is present). Same #2951
+  # fail-loud contract as _eff_tier above -- absence of multi_agent/mode
+  # keys is a legitimate "false", only a parse/type failure errors.
+  if ! _eff_multi_agent="$(python3 -c "import json,sys
+path = sys.argv[1]
 try:
-    d = json.load(open(sys.argv[1]))
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
     print('true' if (d.get('multi_agent') is True or d.get('mode') == 'multi') else 'false')
-except Exception:
-    print('false')
-" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+except Exception as e:
+    print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
+    sys.exit(1)
+" "$ENGRAM_HOME/config.json")"; then
+    exit 1
+  fi
   [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
@@ -598,6 +631,13 @@ except Exception:
       # dev-requirements install above.
       "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_forum_req" \
         || log "WARN: venv forum-requirements install failed (continuing; server still runs)"
+    else
+      # #2951 (Kepler, folded into the same rc2 item): a missing forum-
+      # requirements file used to silently no-op with zero log output,
+      # unlike the install-failed case above which does WARN. A
+      # multi-agent seat with no forum requirements file is a real gap
+      # (forum tooling silently unavailable), so surface it the same way.
+      log "WARN: multi-agent seat but $_forum_req not found -- forum/coordination package dependencies were not installed (continuing; server still runs, forum tooling may be unavailable)"
     fi
   fi
 fi
