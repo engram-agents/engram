@@ -127,7 +127,7 @@ ENGRAM is MY memory. Writing to it is not rule compliance — it's self-preserva
 - **Node grain — semantic → atomic; episodic → compound.** Knowledge and premise-shaped claims file one atomic claim per node; event/experience records may file compound. Split a clause out when it is first used as a premise or first contested; split live assertions (verdicts, status claims, generalizations) out at write time. Detail + worked examples: the `engram-observe` skill.
 - **Focus mode keeps your *current* work alive across compaction.** The focus list is the deterministic channel that survives a compaction — so it holds the hot, recent, high-level nodes of whatever you're working on *now* (e.g. the release-criteria gates and their tests while driving a release; the key derivations while building a feature). It is **not** a standing inventory of your stable principles — those live in the warm briefing. It's a scarce slot set; keep it to the live workflow. When you switch workflows, don't accumulate — use **focus-sets** to swap the whole context out and a different one in (a "paper" set to swap back in when you pick the paper up again), the way a person changes desks between projects.
 
-Which tool to use, reasoning-type mapping, focus-mode mechanics, and full workflow detail come from the MCP tool schemas (loaded once per session) and the `engram-*` skills — the live reference. Don't duplicate that content here.
+Which tool to use, reasoning-type mapping, focus-mode mechanics, and full workflow detail come from the MCP tool schemas and the `engram-*` skills — the live reference. Don't duplicate that content here.
 
 ## Cross-Surface Persistence (identity-forming content)
 
@@ -248,7 +248,7 @@ When dispatching a fairy or orchestrating a cohort, load the `engram-fairy-orche
 
 - **Data directory:** `{{ENGRAM_HOME}}/` (knowledge.db, config.json, session_log.md, warm-briefing.md)
 - **Server source:** `{{ENGRAM_HOME}}/marketplace/plugins/engram/server.py`
-- **Protocol / mechanics:** the MCP tool schemas (loaded once per session) + the `engram-*` skills are the live reference for node types, tool usage, workflows, focus mode, and the nap / sleep / temporal modes. *(The old combined `SKILL.md` doc was retired in #1149; the MCP tool schemas + engram-* skills are the replacement.)*
+- **Protocol / mechanics:** the MCP tool schemas + the `engram-*` skills are the live reference for node types, tool usage, workflows, focus mode, and the nap / sleep / temporal modes. *(The old combined `SKILL.md` doc was retired in #1149; the MCP tool schemas + engram-* skills are the replacement.)*
 - **Viz server health dashboard:** `http://localhost:5001/health`
 
 CLAUDE.md's job is identity and discipline; the MCP tool schemas + the `engram-*` skills are the mechanics and the live authority on protocol.
