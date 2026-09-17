@@ -916,8 +916,8 @@ Agent(
     COHORT METADATA (reviewer-of-outliers cohort, #1952 PR3 — needs_tightening
     ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
     - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
-    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
-    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved". They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
+    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs TAKEN, out of <BACKFILL_TOTAL_MATCHED> MATCHED in the backlog query (before the 60 cap) — [engram-alpha#2981] state BOTH numbers here every night, not just L; L alone cannot distinguish "backlog genuinely empty" from "cap binding against a much bigger pool", and a cap that silently binds night after night is legible only if the matched count travels with the taken count.
+    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved" (<BACKFILL_TOTAL_MATCHED> settles this on its own: 0 means genuinely empty, >0 with L=0 would mean the query itself broke). They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)

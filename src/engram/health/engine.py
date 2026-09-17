@@ -1868,6 +1868,65 @@ def dream_projection_error_sentinel_is_stale(sentinel: dict, current_turn: int) 
     return sentinel.get("turn") != current_turn
 
 
+def dream_projection_metric_mismatch(
+    projection: dict, model: ScoringModel = MODEL
+) -> dict:
+    """Compare a dream projection's metric keys against ``model``'s declared
+    metric set (engram-alpha#2980). Returns ``{"missing": [...], "extra":
+    [...]}`` — sorted signal-name lists; both empty means clean.
+
+    ``missing`` = declared in ``model`` but absent from the projection
+    (``model`` knows about a metric the projection's WRITER did not).
+    ``extra`` = present in the projection but not declared in ``model``
+    (the writer emitted a metric ``model`` no longer declares).
+
+    This is the OUT-OF-PROCESS staleness check a bare ``turn`` comparison
+    (the existing precondition check, "The repair pass" → "Precondition" in
+    ``engram-dream-master.md``) cannot provide: ``turn`` can match while the
+    projection's CONTENT is still stale, because ``write_snapshot`` runs
+    inside the long-lived MCP server process, whose in-memory ``MODEL``
+    reflects whatever code it was STARTED with — a directory-source plugin
+    install updates the on-disk code in place without the running process
+    reloading (this repo's own ``CLAUDE.md``, "Plugin deploy" section).
+    ``model`` here defaults to the CALLER's own freshly-imported ``MODEL``,
+    so a caller running in a fresh process (the dream-master's repair pass,
+    a new agent session each night) genuinely compares against TODAY's
+    model, even when the projection was written by a stale process — the
+    exact gap that let `pending_premise_rate` go without a repair-record
+    row for 2+ cycles with the existing `turn`-only check reporting clean.
+
+    JUDGMENT CALL (reviewer-fairy suggestion, engram-alpha#2985, sharpened
+    in the delta round): why a content diff and not the projection's own
+    ``engine_version`` field, or ``health.version.MAJOR`` (explicitly
+    designed to bump "when a measurement is added, removed, or redefined"
+    — exactly this scenario, and mechanically hash-gated by
+    ``tests/test_health_version_gate.py`` against forgetting -- NOT the
+    purely memory-dependent proxy an earlier draft of this note called it).
+    The airtight reason is narrower and structural, not a discipline
+    argument: the dream-side projection (``_build_dream_projection``,
+    above) deliberately narrows what it forwards from the full snapshot to
+    ``turn``/``checkpoint_mode``/``engine_version``/``unscored_aspects``/
+    ``points_in_play``/``composed_coverage``/``metrics`` only -- it does
+    NOT carry ``health_version``/``MAJOR``/``MINOR`` at all. ``engine_version``
+    itself is the legacy hardcoded ``ENGINE_VERSION = "0.5.0"`` string this
+    module's own docstring says ``health.version`` exists to replace --
+    a dead comparand, not merely a weaker one. Using ``MAJOR`` here would
+    need a broader, out-of-scope schema change to the projection just to
+    have something to compare against. A content diff over the metric KEYS
+    THEMSELVES needs no such change and is self-verifying regardless -- the
+    same reasoning ``recall_summary_coverage``'s own docstring gives for
+    reading literal coverage instead of a lacking-fraction complement (this
+    module prefers reading real content over trusting a proxy field
+    wherever the two diverge).
+    """
+    declared = {m.signal for m in model.metrics}
+    present = set(projection.get("metrics", {}).keys())
+    return {
+        "missing": sorted(declared - present),
+        "extra": sorted(present - declared),
+    }
+
+
 def _read_previous_dream_projection() -> dict | None:
     """Best-effort read of whatever projection the PREVIOUS checkpoint left
     behind — ``None`` if it doesn't exist yet (first-ever write) or fails to
@@ -2375,6 +2434,39 @@ def repair_record_missing_metric_names(
         return sorted(declared)
     present = set(record["metrics"].keys())
     return sorted(declared - present)
+
+
+def validate_repair_record_full(record: dict, model: ScoringModel = MODEL) -> list[str]:
+    """Combined entry point: ``validate_repair_record(record)`` (structural
+    shape) PLUS ``repair_record_missing_metric_names(record, model)``
+    (completeness against ``model``), merged into one violation list.
+
+    Exists because those two checks disagreeing was a real, silent bug
+    (engram-alpha#2980): ``validate_repair_record`` alone returned ``[]``
+    on a record missing ``pending_premise_rate``'s entry for at least two
+    cycles, because completeness was never its job — but "the natural
+    single call" (a caller who wants to know "is this record OK?" and
+    reaches for the one function named ``validate_...``) had no way to
+    learn that a second, separately-named function existed to catch what
+    it didn't. Kept ``validate_repair_record`` and
+    ``repair_record_missing_metric_names`` themselves UNCHANGED, not merged
+    into each other — the schema-shape check has no reason to depend on a
+    live ``model`` object, and folding completeness into it would change
+    its signature and contract for every existing caller. This function is
+    purely additive: the new "I want the full picture" entry point, not a
+    replacement for either half.
+
+    A missing-metric violation is formatted the same shape as
+    ``repair_record_missing_metric_names``'s own return value, prefixed for
+    consistency with ``validate_repair_record``'s existing message style.
+    """
+    violations = list(validate_repair_record(record))
+    missing = repair_record_missing_metric_names(record, model)
+    if missing:
+        violations.append(
+            f"record is missing metric entries declared in model: {missing!r}"
+        )
+    return violations
 
 
 def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
