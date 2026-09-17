@@ -91,7 +91,20 @@ Working order — **batch-by-type pass** (PR-B):
 2. Read every dream-fairy report from disk in one pass — the list given in your spawn prompt, not a hardcoded category count.
 3. Call `bucket_findings(fairy_reports)` from `tools/dream_master_batch.py` to
    partition all findings into action-type buckets (single operation, no MCP
-   calls needed — snapshots are pre-packed in each finding).
+   calls needed — snapshots are pre-packed in each finding). **[alpha#2987]
+   When you construct each `fairy_report` dict from what you read on disk,
+   carry the report's own `category` (the number from the `(category, disk
+   path, TL;DR bullets)` triple in your spawn prompt) through as the
+   `"category"` key** — for Category 7/8/9 reports this is what routes their
+   findings correctly regardless of how you happen to phrase `suggestion`;
+   omitting it silently falls back to regex-over-prose, which is fragile.
+   Every enriched finding the call returns now carries a `_routed_via` key
+   (`"explicit"|"category"|"regex"|"unknown"`) — a finding you know is
+   Category 7/8/9 that comes back `_routed_via: "regex"` or `"unknown"`
+   means your own `fairy_reports` dict omitted or mis-typed `category`, a
+   contract violation on your own construction, not a genuinely
+   unclassifiable finding; fix the dict and re-run rather than logging it
+   as "unknown" in the dream record.
 4. Merge the bucketed agenda with `engram_reflect` items.
 5. Execute one bucket at a time in `ALL_BUCKET_NAMES` order
    (`tools/dream_master_batch.py` is canonical — reference it, don't retype the
@@ -120,7 +133,12 @@ Working order — **batch-by-type pass** (PR-B):
      returns OPEN or UNKNOWN: skip and log in the dream record as
      "stale-but-still-open: task_id #N".
    - **unknown bucket**: log all items in the dream record for the morning
-     review; do not execute them.
+     review; do not execute them. Log each item's `_routed_via` alongside it
+     — an `"unknown"` value on a finding whose source category is 7, 8, or 9
+     is the contract-violation shape from step 3 above (your own
+     `fairy_reports` dict is missing/wrong `category`, not a genuinely
+     unclassifiable finding); say so plainly rather than presenting it as an
+     "I don't know what this is."
 6. Write the dream record + call `engram_advance_turn` when completion checklist
    clears.
 
