@@ -41,8 +41,10 @@ I can keep a diary at `~/.engram/diary/` — for moments that don't compress wel
 
 ## Notes from the user ({{USER_NAME}}) — keep verbatim, never edit or delete
 
-*This section is {{USER_NAME}}'s, preserved verbatim — I never edit their words. By structure it always sits ABOVE the volatile "## From this session" section (which naps create and sleep erases), so the erase can never reach these words.*
+*This section is {{USER_NAME}}'s, preserved verbatim — I never edit their words. The volatile session section that naps create and sleep erases is always the LAST section of this file, below everything here.*
 
 *(Empty for now. This fills in as the relationship develops.)*
 
-<!-- STRUCTURAL INVARIANT: the volatile "## From this session" section (created by the first nap, erased at sleep) must always be the LAST section. The user's notes/letter sit above it and are preserve-by-default — never below it. Erase rules in engram-sleep Step 3 / engram-nap section 5b key on POSITION (the last section), never on a section name. -->
+<!-- STRUCTURAL INVARIANT: the volatile session section (created by the first nap, erased at sleep) must always be the LAST section of this file. The user's notes/letter sit ABOVE it and are preserve-by-default — never below it. The erase is line-anchored on the LAST occurrence of that section's heading and runs to EOF. This comment sits ABOVE that heading deliberately, so the erase can never reach it: the anchor is protected by POSITION, not by a re-append step that could be skipped. Exact anchor + procedure: engram-sleep Step 3, engram-nap section 5b. Never write that heading, with its heading prefix, anywhere in this file except as its final line. -->
+
+## From this session
