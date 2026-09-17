@@ -11,6 +11,33 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.1] - 2026-09-14
 
+### rc3 fix round — 2026-09-17 (found on the rc2 soak and the 09-16 dream cycle; tracking #2941)
+
+- **Warm-briefing erase landmine removed.** The template's protected region
+  carried two literal `## From this session` occurrences, so a sleep erase could
+  land inside the user's letter; the section now ships as an empty placeholder
+  as the file's final line with the structural-invariant comment above it, and
+  the sleep skill specifies the erase mechanically (last line-anchored match to
+  EOF, re-append the bare heading, post-condition: the file's last line is the
+  bare heading). The in-place-erase and remove-entirely dispositions are retired
+  (#2989).
+- **Dream-master routing keys on category, not suggestion prose.** Category 7/8/9
+  findings were routed by regex over the free-text `suggestion` field and fell
+  silently to the log-only bucket when phrased naturally (#2988).
+- **Dream projection staleness is now a signal.** A long-lived MCP server started
+  before the 0.5.0 metric consolidation kept emitting the old metric set with
+  nothing to say so; the dream-master runs an engine-version staleness check, the
+  repair-record validator covers the full row, and the nightly reports the
+  backfill-cap total it matched (#2985).
+- **Dream-fairy stale-scan spec**: the cornerstone exemption keys on the node's
+  own type instead of focus-list membership, which no longer holds stable
+  principles (#2984).
+- **CLAUDE.md templates**: the MCP-schema load-time parenthetical is deleted
+  rather than reverted, per the rule that CLAUDE.md carries key rules and their
+  explanation, never technical details that drift (#2991).
+- **CI**: the team-practice drift gate checkout no longer persists credentials
+  and its advisory message is fork-agnostic (#2975).
+
 ### rc2 fix round — 2026-09-16 (found on the rc1 soak; tracking #2941)
 
 - **Health score is single-sourced on health-v2.** The pre-v2 formula that
