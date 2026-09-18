@@ -287,7 +287,7 @@ Empty `candidates` list is the common case (most cycles) — no lesson has ever 
 
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
-`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md`, which captures consolidation output.
+`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
 
 **Walk the day's git log across agent-touched repos:**
 
