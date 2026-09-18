@@ -893,3 +893,40 @@ jobs:
           else
             echo "::warning::team-practice-drift-gate could not check out engram-agents/team-practice, and this is NOT a fork PR — that means the secret was deleted, renamed, or mis-scoped. CLAUDE.md's generated-region drift is NOT being checked on this run — see umwelt#811."
           fi
+
+  # ── macos-bash32-syntax (#2979) ─────────────────────────────────────────
+  # A separate job, not a step in pr-checks above, because it needs a
+  # DIFFERENT runner OS: `runs-on: macos-latest` ships the same frozen Apple
+  # bash 3.2.57 as a real macOS dev seat, which is the whole point — Linux's
+  # /bin/bash (what the pr-checks job above runs on) is a modern bash and
+  # structurally cannot exercise the #2979 bug class at all. Without this
+  # job, tests/test_install_local_marketplace.py's
+  # test_shipped_shell_scripts_parse_under_macos_bash32 would always SKIP in
+  # CI and only ever run for-real when a developer happens to run pytest by
+  # hand on an actual Mac — a permanent no-op for the exact regression this
+  # test exists to catch.
+  #
+  # Kept deliberately cheap per this repo's CI-cost model (CLAUDE.md "CI cost
+  # model" — dev PRs run only cheap static scrubs, not the full suite):
+  # installs pytest only (no requirements-dev.txt), and runs pytest scoped to
+  # just this one test function via -k, not the whole test file or repo.
+  #
+  # A SKIP is a valid, expected outcome in principle (e.g. if GitHub ever
+  # changes what macos-latest ships) and must not fail the job — pytest's own
+  # exit code already reflects this (0 on all-skip/all-pass, non-zero only on
+  # a real failure/error), so no extra handling is needed here for that case.
+  macos-bash32-syntax:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest (only — no full requirements.txt install)
+        run: pip install pytest
+
+      - name: Run the #2979 macOS bash-3.2 syntax regression test
+        run: python3 -m pytest tests/test_install_local_marketplace.py -k test_shipped_shell_scripts_parse_under_macos_bash32 -v

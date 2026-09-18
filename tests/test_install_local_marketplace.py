@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1724,3 +1725,139 @@ def test_run_scratch_installer_timeout_kwarg_bounds_a_genuine_hang(tmp_path):
     # the 9999s the fake ssh sleeps for.
     assert elapsed < 9999, f"took {elapsed:.1f}s — did not discriminate a real hang"
     assert elapsed < 15, f"took {elapsed:.1f}s — timeout= did not bound the wait"
+
+
+# ── #2979 — regression: shipped .sh scripts must parse under real bash 3.2 ──
+#
+# Root cause: bash 3.2 (macOS's frozen system bash) has a lexer quirk where a
+# heredoc with a QUOTED delimiter (<<'PY'), even though its body should be
+# 100% literal, still gets scanned by bash 3.2 for quote-balance when the
+# heredoc is nested inside a $(...) command substitution (bash needs the scan
+# to locate the substitution's closing paren). An ODD total count of literal
+# ' characters anywhere in that heredoc body -- including inside comments,
+# e.g. an English possessive apostrophe -- desyncs the scan and produces a
+# spurious syntax error many lines later at the next unrelated `(`.
+#
+# This shipped unnoticed into the tagged v0.5.1-rc2 release commit because no
+# CI lane ran any shipped .sh script under a REAL bash 3.2 interpreter --
+# Linux CI's /bin/bash is a modern bash and structurally can't exercise this
+# bug class. This section closes that gap: it locates the actual macOS system
+# bash at /bin/bash (never whatever `bash` resolves to on PATH, which could
+# be a newer Homebrew bash even on a Mac dev seat), confirms it is genuinely
+# 3.2.x, and if so runs `bash -n` against every .sh mechanism the tier
+# manifest (src/build/packaging/tiers.json) actually ships.
+
+
+def _find_macos_system_bash():
+    """Locate the real macOS system bash at /bin/bash specifically (never
+    whatever `bash` resolves to via PATH -- a dev seat may have a newer
+    Homebrew bash earlier on PATH, which would defeat the whole point of
+    this test) and confirm it is genuinely 3.2.x, the frozen Apple build
+    #2979's landmine is about.
+
+    Returns (bash_path, None) when a confirmed-3.2.x /bin/bash is found, or
+    (None, reason) when it should be skipped -- absent entirely (e.g. a
+    Linux CI runner with no /bin/bash at all is unusual but not impossible
+    to imagine) or present but not 3.2.x (a modern /bin/bash, whether a
+    Linux runner or some future macOS release)."""
+    system_bash = Path("/bin/bash")
+    if not system_bash.is_file():
+        return None, "/bin/bash does not exist on this host"
+    try:
+        result = subprocess.run(
+            [str(system_bash), "--version"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except OSError as exc:
+        return None, f"/bin/bash --version failed to run: {exc}"
+    match = re.search(r"version (\d+)\.(\d+)\.(\d+)", result.stdout)
+    if not match:
+        return None, f"could not parse /bin/bash --version output: {result.stdout!r}"
+    major, minor, patch = (int(part) for part in match.groups())
+    if (major, minor) != (3, 2):
+        return None, (
+            f"/bin/bash is {major}.{minor}.{patch}, not 3.2.x -- this host's "
+            "system bash isn't the frozen Apple build #2979 is about"
+        )
+    return system_bash, None
+
+
+def _shipped_shell_scripts():
+    """Resolve every shipped .sh mechanism from the tier manifest
+    (src/build/packaging/tiers.json) -- the living single source of truth
+    for what actually ships, per this repo's Install-tiers discipline
+    (project CLAUDE.md) -- rather than a hand-maintained list, so a
+    newly-tiered shell script is automatically covered here too.
+
+    Only entries in the top-level "mechanisms" array ship in some install
+    tier; "excluded" and "repo_only" entries are explicitly documented as
+    NEVER shipping (e.g. tools/test_migrate_to_plugin.sh is listed in
+    "excluded" -- "CI tooling only, never ships" -- so it is correctly
+    absent from the returned list, even though it is a .sh file that exists
+    on disk).
+
+    Resolution mirrors the manifest's own documented convention: a
+    "source" key (when present) is a path relative to the REPO ROOT --
+    used for real files that live outside src/engram/ (e.g.
+    tools/build-plugin.sh -> src/build/build-plugin.sh); otherwise "path"
+    is relative to the manifest's "source_root" (src/engram)."""
+    manifest = json.loads(
+        (REPO_ROOT / "src" / "build" / "packaging" / "tiers.json").read_text()
+    )
+    source_root = REPO_ROOT / manifest["source_root"]
+    scripts = []
+    for mechanism in manifest.get("mechanisms", []):
+        path = mechanism.get("path", "")
+        if not path.endswith(".sh"):
+            continue
+        if "source" in mechanism:
+            resolved = REPO_ROOT / mechanism["source"]
+        else:
+            resolved = source_root / path
+        scripts.append(resolved)
+    return scripts
+
+
+def test_shipped_shell_scripts_parse_under_macos_bash32():
+    """Regression test for #2979.
+
+    Skips cleanly (never fails, never vacuously passes) on any host where
+    /bin/bash isn't confirmed genuinely 3.2.x -- Linux CI runners (this
+    repo's pr-checks.yml / tests.yml both run ubuntu-latest) ship a modern
+    /bin/bash and structurally cannot exercise this bug class; a
+    macos-latest GitHub-hosted runner (or a real macOS dev seat) does, and
+    is where this test actually runs for-real.
+
+    On a confirmed 3.2.x host: runs `/bin/bash -n <script>` against every
+    .sh mechanism the tier manifest says this repo ships (see
+    _shipped_shell_scripts docstring), and asserts a clean parse for each --
+    exactly the check that would have caught #2979 before it ever reached a
+    tagged release."""
+    system_bash, skip_reason = _find_macos_system_bash()
+    if system_bash is None:
+        pytest.skip(f"real macOS system bash 3.2.x not available: {skip_reason}")
+
+    scripts = _shipped_shell_scripts()
+    assert scripts, (
+        "tier manifest resolved zero shipped .sh scripts -- the manifest "
+        "resolution logic in _shipped_shell_scripts() is likely broken"
+    )
+
+    failures = []
+    for script in scripts:
+        assert script.is_file(), f"manifest-resolved script does not exist on disk: {script}"
+        result = subprocess.run(
+            [str(system_bash), "-n", str(script)],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            failures.append((script, result.returncode, result.stderr))
+
+    if failures:
+        detail = "\n".join(
+            f"  {path} (exit {rc}):\n{stderr}" for path, rc, stderr in failures
+        )
+        pytest.fail(
+            f"{len(failures)} of {len(scripts)} shipped script(s) failed "
+            f"`bash -n` under macOS system bash 3.2.x:\n{detail}"
+        )

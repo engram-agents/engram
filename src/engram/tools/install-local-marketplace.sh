@@ -340,6 +340,13 @@ else
     # and exits non-zero — the same fail-loud contract the old jq path got
     # for free from `set -e`, just with a cleaner message than a raw
     # traceback.
+    # PORTABILITY LANDMINE (#2979): bash 3.2 (macOS's system bash) requires an
+    # EVEN total count of literal ' characters across this heredoc's body when
+    # the heredoc is nested in a $(...) command substitution like this one --
+    # an odd count (even from an English apostrophe in a comment!) desyncs
+    # bash 3.2's naive quote-balance scan for the substitution's closing paren
+    # and produces a spurious syntax error dozens of lines later. Count single
+    # quotes before adding/editing any comment or string inside this heredoc.
     if ! _ma_tier_out="$(python3 - "$_cfg" <<'PY'
 import json, sys
 path = sys.argv[1]
@@ -352,7 +359,7 @@ try:
     # well-formed config with a wrong-typed value (install_tier: 0, an int
     # whose str() is non-empty) silently passed the `-z` fallback check
     # further down and dropped dev/forum requirements with no signal --
-    # exactly the outcome #2951's own contract says absence should never
+    # exactly the outcome issue #2951 says absence should never
     # produce. Reject a present-but-wrong-typed value the same fail-loud way
     # a malformed file is already rejected, rather than let it degrade to a
     # convenience/single-agent default.
@@ -704,6 +711,10 @@ if [[ "$TARGET" == "codex" ]]; then
   # hook-provided cache root.  The compat cleanup below may remove and replace
   # OLD_CODEX_PLUGIN_CACHE_DIR, so it must only ever receive a direct child of
   # this plugin's versioned cache directory.
+  # PORTABILITY LANDMINE (#2979): this heredoc is $(...)-nested like the one at
+  # line 343 -- keep the total literal ' count across its body EVEN or bash 3.2
+  # breaks with a spurious syntax error dozens of lines later. See line 343's
+  # full comment for why.
   CODEX_CACHE_PARENT="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
 import os
 import sys
@@ -721,6 +732,8 @@ PY
   # not eligible fallbacks because this cleanup replaces its selected path.
   OLD_CODEX_PLUGIN_CACHE_DIR=""
   if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     NORMALIZED_CLAUDE_PLUGIN_ROOT="$(python3 - "$CLAUDE_PLUGIN_ROOT" <<'PY'
 import os
 import sys
@@ -732,6 +745,8 @@ PY
     fi
   fi
   if [[ -z "$OLD_CODEX_PLUGIN_CACHE_DIR" && -d "$CODEX_CACHE_PARENT" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     OLD_CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re
@@ -766,6 +781,8 @@ PY
   # absolute cache path so the next session can spawn ENGRAM reliably.
   CODEX_PLUGIN_CACHE_DIR=""
   if [[ -d "$CODEX_CACHE_PARENT" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re
