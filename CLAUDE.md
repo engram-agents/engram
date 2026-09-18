@@ -940,8 +940,8 @@ the 2026-08-29 cascade train (alpha #2373/#2382).
   seat — the same signature as the `dev` cases above, confirming this was
   genuinely gh-stack's auto-rebase and not a manual push. The base is
   genuinely unprotected, checked on BOTH surfaces: `branches/main/protection`
-  reads 404, AND `rules/branches/main` returns `[]` — neither alone is
-  sufficient (the 404 is exactly the trap named above). Zero
+  reads the generic 404 above, AND `rules/branches/main` returns `[]` —
+  neither alone is sufficient (the 404 is exactly the trap named above). Zero
   `review_dismissed` events on the PR: her approval from `21:21:09Z`
   survived the auto-rebase untouched. She re-approved again at `21:30:03Z`
   by her own choice, not because GitHub dismissed the first — a ~2-minute
