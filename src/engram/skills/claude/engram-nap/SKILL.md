@@ -51,8 +51,11 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 ```
 engram_nap(
     message="<1-3 sentence summary of what this burst covered and what was written>",
+    session_id="<your injected session_id, if available>",
 )
 ```
+
+`session_id` is optional but worth passing when you have it — it's what lets the return's `warm_briefing.written_this_session` field below resolve to `true`/`false` instead of `null` (can't determine without it).
 
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` with a "Nap (turn N)" header
@@ -91,6 +94,27 @@ else:
 ```
 
 Log `✓ backup ok` / `⚠ backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+
+**Also check the return value for the warm-briefing advisory (#2997):**
+
+```python
+wb = result.get("warm_briefing") or {}
+note = wb.get("note")
+if note:
+    print(f"⚠ warm briefing advisory — {note}")
+```
+
+`warm_briefing.note` is present whenever the check does NOT read as
+confidently non-stale (see `_compute_warm_briefing_advisory` in server.py
+for the exact predicate) — this surfaces a skipped Step 5b (below) the same
+way the backup check surfaces a degrading `version_control` backup: nothing
+fails when Step 5b is skipped, so without this print the omission is
+invisible until a later session reads a stale/empty warm briefing. The
+note's own wording distinguishes a CONFIRMED-stale finding ("Step 5b not
+performed this session") from an UNKNOWN one ("could not determine whether
+Step 5b ran (...)") — deliberately a neutral print prefix rather than a
+hardcoded "NOT updated this session" claim, so the printed line never
+asserts more than the note itself actually knows (#2998 round 3).
 
 ## Step 3.5 — Prune finished fairy worktrees
 
@@ -215,6 +239,7 @@ Report briefly to the user:
 - What was written (counts or highlights, not a wall of text)
 - Whether a feeling was filed or null-reported
 - Whether the warm briefing was updated (and why, if so)
+- Whether the warm briefing was flagged as not-yet-updated this session (the `warm_briefing.note` check above)
 - Whether today's history file was appended (and for what milestone, if so)
 - The 1–2 questions for next session (from Step 6), or "No decisions pending"
 - What should happen next: continue working, run /compact, run a sleep cycle, or stop for the session
