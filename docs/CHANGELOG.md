@@ -11,6 +11,35 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.1] - 2026-09-14
 
+### rc4 fix round — 2026-09-18 (found on the rc3 soak and the 09-18 nightly; tracking #2941)
+
+- **macOS install unblocked.** `install-local-marketplace.sh` carried a heredoc
+  apostrophe that Apple's bash 3.2 mis-parses, so a fresh rc2/rc3 install on a
+  Mac whose PATH resolves `bash` to `/bin/bash` failed; fixed with a regression
+  test and a `macos-bash32-syntax` CI job that runs the installer under bash 3.2
+  syntax rules (#3000, closes #2979).
+- **Nap advisory for a skipped warm-briefing rotation.** `engram_nap` returns a
+  `warm_briefing` block stating whether the "From this session" section moved
+  since the session started (optional `session_id`, `session_started_at` as the
+  comparison anchor), so a nap whose Step 5b rotation did not run is visible in
+  the return the agent already reads instead of only in the file's mtime
+  (#2998, closes #2997).
+- **Nightly no longer fails on its own fix.** The #2989 erase-safety control
+  read its "pre-fix template" from the live `dev` ref, so it was correct while
+  the PR was open and stale the moment it merged; the control is now a frozen
+  literal fixture (#2996, closes #2995).
+- **`persistent: true` is conditional on the Monitor schema.** The flag was
+  removed from Claude Code's Monitor tool between 2.1.267 and 2.1.273 and is
+  accepted-and-ignored on later versions; the collaborating-loop skill now
+  says to pass it where the schema lists it and otherwise to arm at the
+  1800000 ms effective cap and re-arm on expiry, reading the arm line rather
+  than the success response (#3006, part of #3005).
+- **CLAUDE.md gh-stack note**: approval dismissal on a stacked merge comes from
+  the base branch's `dismiss_stale_reviews_on_push` setting, not from the
+  auto-rebase itself, with five dated cases (#2999, closes #2838); the
+  generic-404 back-reference dropped by the earlier consistency fix is restored
+  (#3004).
+
 ### rc3 fix round — 2026-09-17 (found on the rc2 soak and the 09-16 dream cycle; tracking #2941)
 
 - **Warm-briefing erase landmine removed.** The template's protected region
