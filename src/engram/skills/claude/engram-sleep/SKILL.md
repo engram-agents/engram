@@ -193,9 +193,22 @@ Common missed-node types:
 
 At the end of sleep, the day is over. The warm-briefing's "From this session" section is per-context-window state managed by naps (see `engram-nap` §5b for the in-sync-with-current-CW rule). At sleep-end, the next day starts fresh — erase the section content. Next morning's first nap will create a new in-sync block.
 
-**Action:** open `~/.engram/warm-briefing.md` and identify the target by **position**: it is the **last section of the file** — the `## From this session` block that naps create. Everything ABOVE it (all agent-identity sections AND the user's letter/notes) is preserve-by-default; do not touch any of it.
+**Action:** open `~/.engram/warm-briefing.md` and locate the target **mechanically**, not by reading:
 
-**Skip entirely if the file contains no `## From this session` section at all** (fresh install, or no nap has run since install). There is nothing to erase — move on. (This is distinct from the drift-STOP below: absent section = normal, skip silently; present section with the user's words in or below it = drift, STOP loudly.)
+1. Find every line matching the anchored regex `^## From this session` — **line-anchored, never a substring search.** A mid-line or quoted occurrence is prose, not the heading, and must never match.
+2. Take the **LAST** such line. Not the first. If the file has drifted so the phrase appears more than once, the last one is the real section; an earlier one sits inside the user's preserved notes.
+3. Delete from that line through **EOF**.
+4. **Re-append** the bare `## From this session` heading as an empty stub for tomorrow's first nap — and nothing else. The `<!-- STRUCTURAL INVARIANT: ... -->` comment sits ABOVE that heading, so the delete never reaches it and it needs no restoration. That placement is deliberate: the anchor is protected by POSITION rather than by a re-append step a hurried sleep could skip.
+
+Steps 1 and 2 are the whole safety property. A substring match, or a first match, lands inside the user's letter and truncates it — that is exactly how a letter was destroyed before.
+
+**POST-CONDITION — check it on every path out of this step that COMPLETES, including the ones that erase nothing.** When Step 3 completes, the file's **final line is the bare `## From this session` heading**. If it is not, the step did not complete, whatever it did along the way.
+
+**The drift-STOP is the one deliberate non-completion, and it is NOT a violation of this.** When it fires, Step 3 halts on purpose and the file is left EXACTLY as found. **Do not append a heading to a drifted file to make this post-condition read green** — writing to a file whose structure you have just decided you do not trust is the failure this entire step exists to prevent, and it would be done in the name of the check.
+
+This is one assertion rather than a rule per branch, and that is the point: a missing heading is the precondition for the worst failure this step has. With no heading, the *next* sleep's last-anchored-match can be a line inside the user's own notes, and the erase runs from there to EOF. The drift-STOP below does catch that — but by its second condition and its user's-words clause, **not** by its first, which passes happily on a user's line because that line really is anchored. Every one of those is prose someone has to execute. The post-condition does not replace them; it makes the *precondition* visible at the moment it would be created rather than one sleep later, when the damage is already loaded.
+
+**If the file contains no `## From this session` section at all** (an upgraded pre-existing install, or a file left headingless by the retired remove-entirely disposition — **the shipped template now carries the placeholder, so a fresh install is no longer one of these cases**): there is nothing to erase, but **do not simply move on — append the bare heading as a stub** (ensure the file ends with a newline FIRST: without one the heading concatenates onto the last line, stops being line-anchored, and becomes invisible to the next erase — recreating this bug in the act of fixing it) so the file still ends in the invariant shape. Note what this dissolves: the clause cannot tell "never created" from "previously removed", and with this instruction it no longer needs to, because both want the same repair. (This is distinct from the drift-STOP below: absent section = normal, skip silently; present section with the user's words in or below it = drift, STOP loudly.)
 
 **Drift-STOP safety check — run BEFORE erasing.** Confirm that:
 1. The section you are about to erase genuinely begins with `## From this session`, AND
@@ -203,7 +216,7 @@ At the end of sleep, the day is over. The warm-briefing's "From this session" se
 
 If the user's letter heading or any prose that reads as the user's own words appears INSIDE or BELOW the section you are about to erase, **STOP** — the file structure has drifted from the template's invariant. Do NOT erase. Surface the situation to the user and wait for their direction.
 
-Once the safety check passes: erase the section content. **Default: leave the `## From this session` heading in place as a stub** (gives next morning's first nap a consistent rewrite target). Removing the section entirely is also acceptable if the file structure permits. The day's arc is preserved in the history file (Step 4); no information is lost.
+Once the safety check passes, run the four Action steps above and nothing else. **Two older dispositions are now WRONG and are named here so they are not re-derived from habit:** do not erase the section's content *in place* leaving the heading untouched, and do not remove the section entirely. Both were acceptable under the earlier position-only rule; neither is now, because the file's final line IS the bare heading and both the nap's rewrite target and the next erase's anchor depend on it being there. The procedure is idempotent by design — running it against a file whose section is already an empty stub reproduces that same file, which is why the **Skip if** clause below is an optimisation rather than a correctness requirement. The day's arc is preserved in the history file (Step 4); no information is lost.
 
 **Why erase, not rotate:** the maintainer's framing — "the day is over, tomorrow is a new day, no need for this section to patch through compactions". The day's relational + technical arc lives in history; the warm-briefing's session section is current-CW only.
 
@@ -916,8 +929,8 @@ Agent(
     COHORT METADATA (reviewer-of-outliers cohort, #1952 PR3 — needs_tightening
     ∪ recall_summary IS NULL, not "all nodes lacking a summary"):
     - Today's new-or-flagged outliers since prev sleep <PREV_SLEEP_TIMESTAMP>: <K> IDs
-    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs
-    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved". They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
+    - Backfill from the outlier backlog (legacy NULL-summary + older needs_tightening): <L> IDs TAKEN, out of <BACKFILL_TOTAL_MATCHED> MATCHED in the backlog query (before the 60 cap) — [engram-alpha#2981] state BOTH numbers here every night, not just L; L alone cannot distinguish "backlog genuinely empty" from "cap binding against a much bigger pool", and a cap that silently binds night after night is legible only if the matched count travels with the taken count.
+    - Total: <K+L>, split across <N> chunks of ≤15 each. K (fresh, since prev sleep) is UNCAPPED; L (older backfill) is capped at 60. If L came back 0, say WHICH zero it is: "backlog genuinely empty" or "backfill starved" (<BACKFILL_TOTAL_MATCHED> settles this on its own: 0 means genuinely empty, >0 with L=0 would mean the query itself broke). They are indistinguishable in the number alone, and a starved zero is the exact pre-fix failure this cap split removed — the old shared cap let a heavy fresh day consume the whole budget and leave the backlog untouched on a night that read as fully processed.
     - Batch-summary cohort dir: <COHORT_DIR>
     - Recall summaries already applied by parent in Step 7.5: X applied, Y failures deferred to next cycle
     - SSoT modules live at: <engram-alpha-repo-path>/tools/ (recall_summary_validator, recall_summary_payload)

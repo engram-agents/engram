@@ -46,6 +46,7 @@ from tools.dream_master_batch import (
     BUCKET_COVERAGE_GAPS,
     BUCKET_UNKNOWN,
     ALL_BUCKET_NAMES,
+    CATEGORY_TO_BUCKET,
     BatchResult,
     SnapshotDivergence,
     bucket_findings,
@@ -1130,6 +1131,161 @@ class TestRoutingRegressionTable:
 
     def test_unknown_still_falls_through(self):
         assert self._single("a completely novel action type no pattern knows") == BUCKET_UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# 23. Category→bucket routing tier (alpha#2987) — the decisive regression:
+#     a Category 7/8/9 finding written in PLAIN PROSE, with none of the
+#     regex table's anchor literals present, still routes correctly because
+#     the report's own `category` field is authoritative for these three
+#     categories. This is exactly what the pre-fix router could not do —
+#     the existing `test_real_category7_format_routes_to_edge_wiring` (above)
+#     only proves the regex path works when the suggestion text HAPPENS to
+#     contain "engram_add_edge"/"suggested_relation"; it cannot catch a
+#     regression here because its own fixture shares the router's
+#     assumption about the text's shape.
+# ---------------------------------------------------------------------------
+
+
+class TestCategoryToBucketRouting:
+    """Tier-2 (category-map) routing: findings without regex anchors."""
+
+    def _routed(self, suggestion: str, *, category: int, bucket_field: str | None = None):
+        """Run bucket_findings on one finding, return (bucket, _routed_via)."""
+        finding = _make_finding("ob_0001", suggestion)
+        if bucket_field is not None:
+            finding["bucket"] = bucket_field
+        report = _make_report([finding], category=category)
+        buckets = bucket_findings([report])
+        for name, items in buckets.items():
+            for item in items:
+                if item["node_id"] == "ob_0001":
+                    return name, item["_routed_via"]
+        return BUCKET_UNKNOWN, "unknown"
+
+    def test_category_map_has_exactly_the_single_purpose_categories(self):
+        """Only the architecturally 1:1 categories (7/8/9) are mapped."""
+        assert CATEGORY_TO_BUCKET == {
+            7: BUCKET_EDGE_WIRING,
+            8: BUCKET_TASK_CLOSURES,
+            9: BUCKET_COVERAGE_GAPS,
+        }
+
+    def test_category_7_plain_prose_routes_to_edge_wiring(self):
+        """The exact defect alpha#2987 reports: no 'engram_add_edge' or
+        'suggested_relation' literal anywhere in the suggestion text — the
+        docstring-documented 'human-readable action verb' shape, not the
+        fairy's fixed-format report line. Pre-fix this fell through to
+        BUCKET_UNKNOWN; the category map now catches it regardless of
+        phrasing."""
+        bucket, routed_via = self._routed(
+            "wire this observation to the goal it serves", category=7,
+        )
+        assert bucket == BUCKET_EDGE_WIRING
+        assert routed_via == "category"
+
+    def test_category_8_plain_prose_routes_to_task_closures(self):
+        bucket, routed_via = self._routed(
+            "this can be marked finished now, the upstream work is done", category=8,
+        )
+        assert bucket == BUCKET_TASK_CLOSURES
+        assert routed_via == "category"
+
+    def test_category_9_plain_prose_routes_to_coverage_gaps(self):
+        bucket, routed_via = self._routed(
+            "somebody should look at whether this is surfaced anywhere", category=9,
+        )
+        assert bucket == BUCKET_COVERAGE_GAPS
+        assert routed_via == "category"
+
+    def test_heterogeneous_category_still_uses_regex_fallback(self):
+        """Category 1 (open questions) is NOT in CATEGORY_TO_BUCKET — a
+        Category-1 finding with a resolution-shaped suggestion still routes
+        via tier 3 (regex), not a category default, and reports routed_via
+        accordingly."""
+        bucket, routed_via = self._routed("close as resolved", category=1)
+        assert bucket == BUCKET_RESOLUTIONS
+        assert routed_via == "regex"
+
+    def test_heterogeneous_category_with_unmatched_prose_is_genuinely_unknown(self):
+        """A heterogeneous category (no CATEGORY_TO_BUCKET entry) with prose
+        that matches nothing is a real BUCKET_UNKNOWN, routed_via 'unknown'
+        — distinct from the contract-violation shape covered below."""
+        bucket, routed_via = self._routed(
+            "a completely novel action type no pattern knows", category=1,
+        )
+        assert bucket == BUCKET_UNKNOWN
+        assert routed_via == "unknown"
+
+    def test_missing_category_on_a_would_be_edge_wiring_finding_with_plain_prose_is_unknown(self):
+        """No report-level `category` at all (None): tier 2 can't fire, and
+        plain prose (no regex anchor either) has nothing left to route on
+        — this is the exact contract-violation shape 'make the fallback
+        loud' names: `_routed_via: "unknown"` on what should have been a
+        Category-7 routing tells the dream-master its own report dict
+        omitted `category`, distinct from a genuinely unclassifiable
+        finding on a heterogeneous category."""
+        finding = _make_finding("ob_0001", "wire this observation to the goal it serves")
+        report = {"fairy_id": "fairy-7", "findings": [finding]}  # no "category" key
+        buckets = bucket_findings([report])
+        assert buckets[BUCKET_UNKNOWN][0]["_routed_via"] == "unknown"
+
+    def test_missing_category_on_a_would_be_edge_wiring_finding_falls_back_to_regex(self):
+        """Same missing-`category` contract violation, but the suggestion
+        text DOES still carry the old regex anchor — tier 3 catches it and
+        routes correctly, `_routed_via: "regex"` rather than "unknown". Both
+        this and the prose-only sibling above are contract violations (the
+        dream-master's own report omitted `category`); this one just
+        happens to be rescued by the fallback while the other isn't."""
+        finding = _make_finding("ob_0001", "wire via engram_add_edge to connect source to target")
+        report = {"fairy_id": "fairy-7", "findings": [finding]}  # no "category" key
+        buckets = bucket_findings([report])
+        assert buckets[BUCKET_EDGE_WIRING][0]["_routed_via"] == "regex"
+
+    def test_category_as_wrong_type_falls_back_to_regex(self):
+        """`category` present but not an int (e.g. `\"7\"` as a string — a
+        plausible LLM-transcription slip, not just an omission) is treated
+        the same as absent: the `isinstance(category, int)` guard in
+        `_route_finding` rejects it, tier 2 can't fire, and routing falls
+        to tier 3. Plain prose with no regex anchor is then genuinely
+        unknown — same contract-violation shape as the missing-key case."""
+        finding = _make_finding("ob_0001", "wire this observation to the goal it serves")
+        report = {"fairy_id": "fairy-7", "category": "7", "findings": [finding]}
+        buckets = bucket_findings([report])
+        assert buckets[BUCKET_UNKNOWN][0]["_routed_via"] == "unknown"
+
+    def test_explicit_bucket_field_wins_over_category_map(self):
+        """Tier 1 (explicit `finding['bucket']`) outranks tier 2. Future
+        fairy/dream-master contract; no fairy emits this yet, but a
+        dream-master that knows better than the category default (e.g. a
+        genuinely unresolvable Category-7 candidate its own review declined)
+        can say so explicitly."""
+        bucket, routed_via = self._routed(
+            "declined — below similarity gate", category=7, bucket_field=BUCKET_UNKNOWN,
+        )
+        assert bucket == BUCKET_UNKNOWN
+        assert routed_via == "explicit"
+
+    def test_explicit_bucket_field_invalid_value_falls_through_to_category(self):
+        """An explicit `bucket` field that isn't a real bucket name is
+        ignored, not trusted blindly — tier 2 still applies."""
+        bucket, routed_via = self._routed(
+            "wire this observation to the goal it serves",
+            category=7,
+            bucket_field="not_a_real_bucket",
+        )
+        assert bucket == BUCKET_EDGE_WIRING
+        assert routed_via == "category"
+
+    def test_routed_via_present_on_every_enriched_finding(self):
+        """_routed_via is always set, mirroring the existing _bucket
+        traceability key added in PR-B."""
+        finding = _make_finding("ob_0001", "close as resolved")
+        report = _make_report([finding], category=1)
+        buckets = bucket_findings([report])
+        item = buckets[BUCKET_RESOLUTIONS][0]
+        assert item["_routed_via"] == "regex"
+        assert "_bucket" in item
 
 
 if __name__ == "__main__":

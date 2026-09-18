@@ -135,7 +135,7 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
-**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
+**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
 ### 5b. "From this session" entry — sync with current context-window arc
 
@@ -162,7 +162,7 @@ The rule:
 
 ### 5c. User's letter/notes (every section ABOVE "## From this session")
 
-Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.)
+Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte.
 
 **Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)

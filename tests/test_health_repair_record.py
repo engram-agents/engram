@@ -52,6 +52,38 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from health import engine as he  # noqa: E402
+from health.curves import CurveSpec  # noqa: E402
+from health.model import AspectSpec, DetectorRef, MetricBinding, ScoringModel  # noqa: E402
+
+
+def _fake_model_two_metrics() -> ScoringModel:
+    """A minimal two-metric ScoringModel, independent of the real ``MODEL``'s
+    exact metric set — engram-alpha#2980's tests exercise metric-NAME-set
+    comparisons only (never scoring), so this needs no working ``signal_fn``
+    or curve math, just a stable ``{"metric_x", "metric_y"}`` to compare
+    against. Mirrors test_health_engine.py's own ``_fake_model`` shape."""
+    curve = CurveSpec(
+        name="fake", knots=((0.0, 1.0), (1.0, 0.0)),
+        input_domain=(0.0, 1.0), monotone_direction="decreasing",
+    )
+
+    def _sig(conn):
+        return 0.0
+
+    metric_x = MetricBinding(
+        signal="metric_x", aspect="a", curve="fake", importance=1.0,
+        detector=DetectorRef(name="reflect", population="pop"), repair="tool:resolve",
+    )
+    metric_y = MetricBinding(
+        signal="metric_y", aspect="a", curve="fake", importance=1.0,
+        detector=DetectorRef(name="reflect", population="pop"), repair="tool:resolve",
+    )
+    return ScoringModel(
+        curves={"fake": curve},
+        signals={"metric_x": _sig, "metric_y": _sig},
+        aspects=(AspectSpec(name="a", points=100.0),),
+        metrics=(metric_x, metric_y),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +486,126 @@ class TestDreamProjectionErrorSentinelStaleness:
         # so this falls out of the same comparison without special-casing.
         sentinel = {"written_at": "2026-09-04T00:00:00Z", "error": "boom"}
         assert he.dream_projection_error_sentinel_is_stale(sentinel, 42) is True
+
+
+# ---------------------------------------------------------------------------
+# 7. dream_projection_metric_mismatch — the out-of-process staleness check
+# (engram-alpha#2980): a bare `turn` match on the dream projection cannot
+# catch a projection written by a long-lived, stale-code process, because a
+# stale writer's own in-memory model agrees with itself. This compares a
+# projection's metric keys against the CALLER's model, so a caller running
+# in a fresh process (the nightly repair pass) can catch a writer that
+# wasn't.
+# ---------------------------------------------------------------------------
+
+
+class TestDreamProjectionMetricMismatch:
+    def test_matching_metric_sets_report_clean(self):
+        model = _fake_model_two_metrics()
+        projection = {"metrics": {"metric_x": {}, "metric_y": {}}}
+        assert he.dream_projection_metric_mismatch(projection, model) == {
+            "missing": [], "extra": [],
+        }
+
+    def test_model_metric_absent_from_projection_is_missing(self):
+        # The exact engram-alpha#2980 shape: the model declares a metric
+        # (e.g. pending_premise_rate) that a stale writer's projection never
+        # emitted, because the writer's own in-memory model predates it.
+        model = _fake_model_two_metrics()
+        projection = {"metrics": {"metric_x": {}}}
+        result = he.dream_projection_metric_mismatch(projection, model)
+        assert result == {"missing": ["metric_y"], "extra": []}
+
+    def test_projection_metric_absent_from_model_is_extra(self):
+        # The mirror case: a stale writer's projection carries a metric the
+        # CURRENT model no longer declares (e.g. a retired signal like the
+        # old taint_rate/stale_derivation_rate pair).
+        model = _fake_model_two_metrics()
+        projection = {"metrics": {"metric_x": {}, "metric_y": {}, "retired_metric": {}}}
+        result = he.dream_projection_metric_mismatch(projection, model)
+        assert result == {"missing": [], "extra": ["retired_metric"]}
+
+    def test_both_directions_can_fire_together(self):
+        model = _fake_model_two_metrics()
+        projection = {"metrics": {"metric_x": {}, "retired_metric": {}}}
+        result = he.dream_projection_metric_mismatch(projection, model)
+        assert result == {"missing": ["metric_y"], "extra": ["retired_metric"]}
+
+    def test_empty_projection_metrics_reports_every_model_metric_missing(self):
+        model = _fake_model_two_metrics()
+        result = he.dream_projection_metric_mismatch({"metrics": {}}, model)
+        assert result == {"missing": ["metric_x", "metric_y"], "extra": []}
+
+    def test_missing_metrics_key_treated_as_empty(self):
+        # A malformed/partial projection dict (no "metrics" key at all) must
+        # not raise -- .get("metrics", {}) degrades to the empty-projection
+        # case above, not a KeyError.
+        model = _fake_model_two_metrics()
+        result = he.dream_projection_metric_mismatch({}, model)
+        assert result == {"missing": ["metric_x", "metric_y"], "extra": []}
+
+    def test_against_the_real_live_model_reports_clean_on_a_complete_record(self):
+        # Integration check against he.MODEL itself (not the synthetic
+        # fixture) -- a projection built from every currently-declared
+        # signal must report clean against that same MODEL, confirming the
+        # function's default `model=MODEL` argument actually resolves.
+        projection = {"metrics": {m.signal: {} for m in he.MODEL.metrics}}
+        assert he.dream_projection_metric_mismatch(projection) == {
+            "missing": [], "extra": [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# 8. validate_repair_record_full — the combined structural + completeness
+# entry point (engram-alpha#2980): validate_repair_record's own `[]` on a
+# record missing a declared metric's entry was the actual bug (it and
+# repair_record_missing_metric_names can disagree, and nothing forced a
+# caller to run both). This is the new single call that can't be forgotten.
+# ---------------------------------------------------------------------------
+
+
+class TestValidateRepairRecordFull:
+    def test_complete_well_formed_record_is_clean(self):
+        rec = _record(metrics={m.signal: _metric_entry() for m in he.MODEL.metrics})
+        assert he.validate_repair_record_full(rec) == []
+
+    def test_missing_metric_entry_is_reported_even_though_validate_alone_misses_it(self):
+        # The exact engram-alpha#2980 regression: validate_repair_record
+        # alone returns [] here (the record is structurally well-formed --
+        # every entry present has the right shape), silently hiding that a
+        # whole model-declared metric has no entry at all.
+        all_but_one = {
+            m.signal: _metric_entry()
+            for m in he.MODEL.metrics
+            if m.signal != "pending_premise_rate"
+        }
+        rec = _record(metrics=all_but_one)
+        assert he.validate_repair_record(rec) == []  # the old, incomplete check
+        violations = he.validate_repair_record_full(rec)
+        assert len(violations) == 1
+        assert "pending_premise_rate" in violations[0]
+
+    def test_structural_violation_alone_is_still_reported(self):
+        rec = _record(status="not-a-real-status")
+        violations = he.validate_repair_record_full(rec)
+        assert any("status" in v for v in violations)
+
+    def test_structural_and_completeness_violations_both_reported_together(self):
+        all_but_one = {
+            m.signal: _metric_entry()
+            for m in he.MODEL.metrics
+            if m.signal != "pending_premise_rate"
+        }
+        rec = _record(status="not-a-real-status", metrics=all_but_one)
+        violations = he.validate_repair_record_full(rec)
+        assert len(violations) == 2
+        assert any("status" in v for v in violations)
+        assert any("pending_premise_rate" in v for v in violations)
+
+    def test_does_not_mutate_validate_repair_record_or_missing_metric_names(self):
+        # Non-goal check: validate_repair_record_full is purely additive --
+        # the two underlying functions keep their own independent contracts.
+        rec = _record(metrics={})
+        assert he.validate_repair_record(rec) == []  # schema-shape only, still clean
+        assert len(he.repair_record_missing_metric_names(rec)) > 0  # unchanged
+        assert len(he.validate_repair_record_full(rec)) == 1  # merges into one entry
