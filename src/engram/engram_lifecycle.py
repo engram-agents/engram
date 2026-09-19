@@ -12,8 +12,9 @@ Wave-3 structural note — diagnostic snapshot and calibration snapshot:
   ``_checkpoint_internal`` previously called ``engram_diagnose()`` (a server.py
   @mcp.tool) to store a diagnostic snapshot inside diagnostic_history.  Because
   family modules may not import server.py, that call has been lifted into the
-  server.py wrappers (``engram_nap`` / ``engram_advance_turn``), which add the
-  ``diagnostic_snapshot`` key to the result after calling the lifecycle impl.
+  server.py wrappers (``engram_checkpoint`` -- formerly ``engram_nap`` --
+  and ``engram_advance_turn``), which add the ``diagnostic_snapshot`` key to
+  the result after calling the lifecycle impl.
   Behaviour is preserved end-to-end; only the call site moves.
 
   Similarly, ``_reflect_impl`` previously called ``engram_stats()`` to append a
@@ -116,9 +117,10 @@ def _append_nap_to_history(message: str) -> dict:
 
     (b) Fail-soft, but NOT silent (Ariadne's colleague-pass suggestion,
     2026-08-15). A history-write failure (missing dir, unwritable disk,
-    lock failure, anything) must never fail the engram_nap call it's
-    attached to — nap's job is the checkpoint (session log, stats, snapshot
-    commit); this is a best-effort side effect layered on top. But
+    lock failure, anything) must never fail the engram_checkpoint (formerly
+    engram_nap) call it's attached to — nap's job is the checkpoint (session
+    log, stats, snapshot commit); this is a best-effort side effect layered
+    on top. But
     "guarantees that something concise lands for every nap" (clause (a))
     is not actually true if a failed attempt is indistinguishable from a
     successful one to the caller — a guaranteed side effect that can
@@ -222,7 +224,8 @@ def _append_nap_to_history(message: str) -> dict:
 
 
 def _checkpoint_internal(message: str, advance_turn: bool) -> str:
-    """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
+    """Internal checkpoint logic shared by engram_checkpoint (formerly
+    engram_nap) and engram_advance_turn.
 
     Computes graph stats, appends to session_log, snapshots + commits.
     If advance_turn is True, increments the global turn counter (subsequent
@@ -230,14 +233,15 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     importance_score). If False, leaves the turn counter alone (nap mode) and
     arms a nap_checkpoint feeling nudge.
 
-    The two public tools (engram_nap and engram_advance_turn) exist as
-    distinct MCP entry points so a missed kwarg cannot accidentally promote
-    a nap into a turn-advancing checkpoint — the prior single-tool design
-    was bug-prone under context pressure (brief automated sessions especially).
+    The two public tools (engram_checkpoint, formerly engram_nap, and
+    engram_advance_turn) exist as distinct MCP entry points so a missed kwarg
+    cannot accidentally promote a nap into a turn-advancing checkpoint — the
+    prior single-tool design was bug-prone under context pressure (brief
+    automated sessions especially).
 
     Note: the ``diagnostic_snapshot`` key is NOT in this function's return
-    value. The server.py wrappers (engram_nap / engram_advance_turn) append
-    it after calling this impl, using engram_diagnose() which lives in
+    value. The server.py wrappers (engram_checkpoint / engram_advance_turn)
+    append it after calling this impl, using engram_diagnose() which lives in
     server.py. See module docstring for the wave-3 structural note.
     """
     mode = "session" if advance_turn else "nap"
@@ -528,7 +532,9 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
 
 
 def _nap_impl(message: str) -> str:
-    """Impl for engram_nap — callable with named kwargs for in-server callers."""
+    """Impl for engram_checkpoint (formerly engram_nap; also used by the
+    engram_nap deprecated alias) — callable with named kwargs for in-server
+    callers."""
     return _checkpoint_internal(message, advance_turn=False)
 
 

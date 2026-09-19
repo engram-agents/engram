@@ -1,6 +1,6 @@
 ---
 name: engram-deep-research
-description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Uses engram_nap() as its session checkpoint.
+description: Depth-first research on a single big question. Unlike engram-curiosity (breadth-first, 2-4 threads), this focuses on one question and reasons deeply around it, registering intermediate questions and conjectures as waypoints. Designed for cross-compaction loop research where unregistered thoughts are permanently lost. Uses engram_checkpoint() (formerly engram_nap()) as its session checkpoint.
 user_invocable: true
 ---
 
@@ -103,7 +103,7 @@ Each derivation or observation may open new sub-questions. Follow them. This is 
 When wrapping up (context limit or natural stopping point):
 
 ```
-engram_nap(
+engram_checkpoint(
     message="<summary: question investigated, depth reached, sub-questions registered, key findings>",
 )
 ```

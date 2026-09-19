@@ -243,19 +243,19 @@ Table: `focus_sets(name PRIMARY KEY, node_ids TEXT JSON array, description, crea
 
 ## **12. Nap & Sleep / Turn Advancement**
 
-**what** — Two checkpoint mechanisms: `engram_nap()` persists context WITHOUT advancing the turn counter (used before compaction, end of work burst); `engram_advance_turn()` increments the global turn counter (used only at sleep/session end, triggers exponential memory decay). Both mechanisms snapshot the graph to git (graph_snapshot.md + SQL dump), append to session_log.md, and compute diagnostic metrics. Nap arms a "nap_checkpoint" feeling-report nudge (TTL 5 turns).
+**what** — Two checkpoint mechanisms: `engram_checkpoint()` (formerly `engram_nap()`; renamed in issue #3015 — `engram_nap` remains a deprecated alias for one release) persists context WITHOUT advancing the turn counter (used before compaction, end of work burst); `engram_advance_turn()` increments the global turn counter (used only at sleep/session end, triggers exponential memory decay). Both mechanisms snapshot the graph to git (graph_snapshot.md + SQL dump), append to session_log.md, and compute diagnostic metrics. Nap arms a "nap_checkpoint" feeling-report nudge (TTL 5 turns).
 
 **how** — `_checkpoint_internal()` (7620–7771) shared logic: collects stats, appends to LOG_PATH, calls `_commit_snapshot()`, stores diagnostic snapshot in diagnostic_history. Parameter `advance_turn` decides whether to increment the turn counter (`_set_current_turn(new_turn+1)`) or leave it alone.
 
 Entry points:
-- `engram_nap()` (7813–7856): calls _nap_impl with advance_turn=False
+- `engram_checkpoint()` (formerly `engram_nap()`; 7813–7856): calls _nap_impl with advance_turn=False
 - `engram_advance_turn()` (7903–7986): calls _advance_turn_impl with advance_turn=True
 
 Nap behavior: mode="nap", turn unchanged, feeling-nudge written via `_write_feeling_nudge()` in `engram_core.py:1775`. Sleep behavior: mode="session", turn incremented, no nudge.
 
 **status-candidate** — **prod-presumed** (daily-once sleep invariant; nap fires multiple times per day at compaction boundaries).
 
-**files** — `engram_lifecycle.py` (`_checkpoint_internal()` :79; `_nap_impl()` :218; `_advance_turn_impl()` :223). server.py (wrappers: `engram_nap` :1951; `engram_advance_turn` :2065).
+**files** — `engram_lifecycle.py` (`_checkpoint_internal()` :79; `_nap_impl()` :218; `_advance_turn_impl()` :223). server.py (wrappers: `engram_checkpoint`, formerly `engram_nap`, :1951; `engram_advance_turn` :2065).
 
 **key constants** — `FEELING_NUDGE_TTL_TURNS=5` (`engram_core.py:165`).
 

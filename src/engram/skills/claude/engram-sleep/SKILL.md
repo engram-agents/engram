@@ -21,7 +21,7 @@ Confirm ONE of the following is true before proceeding — each is sufficient on
 
 | You are... | Correct action |
 |---|---|
-| Drowsy (context-fill warning in banner) | `engram_nap` — per-burst compaction-boundary work, never sleep |
+| Drowsy (context-fill warning in banner) | the **engram-nap** skill — per-burst compaction-boundary work, never sleep |
 | Blocked-idle / nothing in queue | Hold for the user or pick from your work queue; never invoke sleep to fill the void |
 | Reading the clock / estimating the hour | Clock-reading is never a valid trigger — loop, hold, or ask the user |
 | Mid-task | Finish the task; nap if drowsy; sleep only after work wraps AND the user signals day-end (directly or via a commander-relayed order) |
@@ -287,7 +287,7 @@ Empty `candidates` list is the common case (most cycles) — no lesson has ever 
 
 ### Step 4 — Reconcile today's history file (awake-state milestone log)
 
-`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md`, which captures consolidation output.
+`~/.engram/history/YYYY-MM-DD.md` is the **awake-state milestone log** — PRs shipped, decisions made, features delivered, key conversations. Distinct from the dream-record file that the dream master writes at `~/.engram/history/dream/YYYY-MM-DD.md` (filename = the NYC-local date the record was WRITTEN, per that spec's own Output contract), which captures consolidation output.
 
 **Walk the day's git log across agent-touched repos:**
 

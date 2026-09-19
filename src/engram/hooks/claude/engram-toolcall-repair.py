@@ -97,6 +97,13 @@ PROTECTED_TOOLS = {
     "mcp__engram__engram_add_observation_batch": {
         "payload_json",
     },
+    # engram_checkpoint (issue #3015 rename) is the canonical tool name;
+    # engram_nap is its deprecated backward-compat alias (kept for one
+    # release, per Lei's 2026-09-19 ruling) — both entries mirror the same
+    # parameter-name set so the repair hook recognizes either tool-call name.
+    "mcp__engram__engram_checkpoint": {
+        "message",
+    },
     "mcp__engram__engram_nap": {
         "message",
     },

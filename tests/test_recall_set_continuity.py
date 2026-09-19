@@ -3,8 +3,9 @@
 Recall-Set Continuity = Jaccard similarity J(A,B) = |A∩B| / |A∪B| between the
 tier1+tier2 ("searchable") node-ID set at consecutive checkpoints (nap AND
 sleep/engram_advance_turn — see the cadence-decision note in
-_compute_recall_set_continuity's docstring). Computed in the engram_nap and
-engram_advance_turn wrappers (server.py) and persisted into the
+_compute_recall_set_continuity's docstring). Computed in the engram_checkpoint
+(formerly engram_nap) and engram_advance_turn wrappers (server.py) and
+persisted into the
 diagnostic_history table's metrics JSON blob, under the
 "recall_set_continuity" key. See _compute_recall_set_continuity in
 engram_core.py for the full design.
@@ -96,7 +97,7 @@ def test_jaccard_computed_correctly_across_two_naps():
     finally:
         conn.close()
 
-    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 1 — seed 10 nodes"})))
+    r1 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 1 — seed 10 nodes"})))
     assert "error" not in r1, f"nap1 returned error: {r1}"
     snap1 = r1.get("diagnostic_snapshot", {})
     assert snap1.get("stored") is True, f"nap1 diagnostic snapshot not stored: {snap1}"
@@ -119,7 +120,7 @@ def test_jaccard_computed_correctly_across_two_naps():
     finally:
         conn.close()
 
-    r2 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 2 — supersede 2, add 2"})))
+    r2 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 2 — supersede 2, add 2"})))
     assert "error" not in r2, f"nap2 returned error: {r2}"
     snap2 = r2.get("diagnostic_snapshot", {})
     assert snap2.get("stored") is True, f"nap2 diagnostic snapshot not stored: {snap2}"
@@ -149,7 +150,7 @@ def test_first_nap_jaccard_is_null_with_reason():
     fabricated 0.0 or 1.0.
     """
     server = fresh_server()
-    r = json.loads(server.engram_nap(payload_json=json.dumps({"message": "very first nap"})))
+    r = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "very first nap"})))
     assert "error" not in r, f"nap returned error: {r}"
     snap = r.get("diagnostic_snapshot", {})
     assert snap.get("stored") is True, f"diagnostic snapshot not stored: {snap}"
@@ -174,8 +175,9 @@ def test_first_nap_jaccard_is_null_with_reason():
 def test_adhoc_diagnose_does_not_carry_full_id_list():
     """engram_diagnose() is its own directly-callable MCP tool (per its
     docstring: "Use any time" — not nap-only). The Recall-Set Continuity
-    tier2_ids list must be injected ONLY by the engram_nap wrapper into the
-    stored diagnostic_history row, never into _diagnose_impl's own return
+    tier2_ids list must be injected ONLY by the engram_checkpoint (formerly
+    engram_nap) wrapper into the stored diagnostic_history row, never into
+    _diagnose_impl's own return
     value — otherwise every ad-hoc engram_diagnose() call would carry a
     tier2_max_nodes-sized (default 1000) node-ID list.
     """
@@ -196,7 +198,7 @@ def test_adhoc_diagnose_does_not_carry_full_id_list():
     )
 
     # Nap once, so diagnostic_history now has a row WITH recall_set_continuity.
-    nap_result = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap"})))
+    nap_result = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap"})))
     assert "error" not in nap_result, f"nap returned error: {nap_result}"
     assert nap_result["diagnostic_snapshot"]["recall_set_continuity"]["set_size"] == 5
 
@@ -237,7 +239,7 @@ def test_sleep_checkpoint_computes_and_tags_continuity():
     finally:
         conn.close()
 
-    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 1"})))
+    r1 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 1"})))
     assert "error" not in r1, f"nap1 returned error: {r1}"
     rsc1 = r1["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc1["checkpoint_mode"] == "nap", f"nap checkpoint_mode should be 'nap': {rsc1}"
@@ -261,7 +263,7 @@ def test_sleep_checkpoint_computes_and_tags_continuity():
     # No node changes between nap1 and sleep1 -> identical tier2 set -> J=1.0.
     assert rsc2["jaccard"] == 1.0, f"unchanged set across nap->sleep should be J=1.0: {rsc2}"
 
-    r3 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 2, post-sleep"})))
+    r3 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 2, post-sleep"})))
     assert "error" not in r3, f"nap2 returned error: {r3}"
     rsc3 = r3["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc3["checkpoint_mode"] == "nap", f"post-sleep nap checkpoint_mode should be 'nap': {rsc3}"
@@ -287,13 +289,13 @@ def test_zero_division_both_sets_empty_is_jaccard_one():
     nodes added between them.
     """
     server = fresh_server()
-    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 1, empty graph"})))
+    r1 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 1, empty graph"})))
     assert "error" not in r1, f"nap1 returned error: {r1}"
     rsc1 = r1["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc1["set_size"] == 0, f"empty graph should have set_size=0: {rsc1}"
     assert rsc1["jaccard"] is None, f"first nap has no prior row, jaccard must be None: {rsc1}"
 
-    r2 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 2, still empty"})))
+    r2 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 2, still empty"})))
     assert "error" not in r2, f"nap2 returned error: {r2}"
     rsc2 = r2["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc2["set_size"] == 0, f"still-empty graph should have set_size=0: {rsc2}"
@@ -314,7 +316,7 @@ def test_corrupt_prior_metrics_json_is_handled_gracefully():
     the other undefined cases.
     """
     server = fresh_server()
-    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 1"})))
+    r1 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 1"})))
     assert "error" not in r1, f"nap1 returned error: {r1}"
 
     conn = server._get_db()
@@ -328,7 +330,7 @@ def test_corrupt_prior_metrics_json_is_handled_gracefully():
     finally:
         conn.close()
 
-    r2 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 2, corrupt prior row"})))
+    r2 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 2, corrupt prior row"})))
     assert "error" not in r2, f"nap2 returned error despite corrupt prior row: {r2}"
     rsc2 = r2["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc2["jaccard"] is None, (
@@ -363,7 +365,7 @@ def test_prior_row_tier2_ids_pruned_after_diffing():
     finally:
         conn.close()
 
-    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 1"})))
+    r1 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 1"})))
     assert "error" not in r1, f"nap1 returned error: {r1}"
     turn1_id = None
     conn = server._get_db()
@@ -380,7 +382,7 @@ def test_prior_row_tier2_ids_pruned_after_diffing():
     finally:
         conn.close()
 
-    r2 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "nap 2"})))
+    r2 = json.loads(server.engram_checkpoint(payload_json=json.dumps({"message": "nap 2"})))
     assert "error" not in r2, f"nap2 returned error: {r2}"
     rsc2 = r2["diagnostic_snapshot"]["recall_set_continuity"]
     assert rsc2["jaccard"] is not None, f"nap2 should have a valid diff against nap1: {rsc2}"

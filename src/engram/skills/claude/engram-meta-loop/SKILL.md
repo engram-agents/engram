@@ -247,7 +247,7 @@ mv ~/.engram/loop-scratch.md ~/.engram/reports/scratch_$(date +%Y-%m-%d_%H%M%S).
 
 ### 5. Checkpoint
 ```
-engram_nap(
+engram_checkpoint(
     message="<meta-loop summary: goals, iterations, modalities used, key outputs>",
 )
 ```

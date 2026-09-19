@@ -51,6 +51,8 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import socket
+import subprocess
 import sys
 from pathlib import Path
 
@@ -385,6 +387,292 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
         assert matched == [target_pid, wrapper_pid], (
             f"expected only [{target_pid}, {wrapper_pid}] (target + wrapper), got {matched}"
         )
+
+
+class TestBootChargeAllPgrepInvocationsCarryTheCanonicalPattern:
+    """Checks that every inline-code span in the charge naming the forum
+    monitors and `pgrep` is one of the three known-good invocation spans,
+    and that the selected set matches that canonical set exactly. This is
+    EXACT SET MEMBERSHIP against a frozen, verbatim set of canonical spans
+    -- never a PARSE of shell grammar (flag order, quote style, flag
+    spelling, ...) and never mere substring CONTAINMENT. A parse-based
+    check always has an axis it doesn't model, and containment alone
+    misses garbage appended after the canonical text inside the same
+    quotes. Exact membership sidesteps both: a selected span either IS one
+    of the known strings or it is not. The set-equality half additionally
+    catches a DELETED invocation, which per-span membership alone cannot
+    see. See `_select_monitor_invocation_spans` below for what counts as a
+    selected span and why (prior round history: commit log, #3008)."""
+
+    _DEFAULT_MD = _AUTOSTART / "boot-charge-default-claude.md"
+    _QUIET_MD = _AUTOSTART / "boot-charge-quiet-claude.md"
+    _EXPECTED_MIN_COUNT = 3
+
+    # The complete, exact, canonical invocation spans -- the full
+    # inline-code span text for each of the three real pgrep
+    # invocations, copied verbatim from the charge as it stood at
+    # #3007's own commit (31fd8502). Frozen literals, not re-derived
+    # from the file at test time, so this check can never itself become
+    # a parser with its own blind spot. Membership is EXACT STRING
+    # EQUALITY -- no substring, no regex, no shell-grammar parse.
+    _CANONICAL_INVOCATION_SPANS = frozenset(
+        {
+            'pgrep -u "$USER" -af \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'',
+            'for pid in $(pgrep -u "$USER" -f \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'); do readlink /proc/$pid/fd/1; done',
+            'for pid in $(pgrep -u "$USER" -f \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'); do lsof -a -p "$pid" -d 1; done',
+        }
+    )
+
+    @staticmethod
+    def _extract_inline_code_spans(md_path: Path) -> list[str]:
+        text = md_path.read_text()
+        return re.findall(r"`([^`]*)`", text)
+
+    @classmethod
+    def _select_monitor_invocation_spans(cls, md_path: Path) -> list[str]:
+        """Select the inline-code spans that could plausibly be a real
+        pgrep invocation targeting the forum monitors -- keyed on the
+        MONITOR NAMES, never on pgrep's flag grammar, quote style, or
+        flag order. `pgrep` itself is required only to separate a
+        genuine invocation attempt from an unrelated mention of the
+        monitor names; in this file today that excludes:
+
+          - the two arm commands (`bash .../forum-updates-monitor*.sh`,
+            `bash .../forum-mention-monitor*.sh`) -- these invoke a
+            single script directly with no `pgrep` at all;
+          - the bare backticked `` `pgrep` `` mention with no pattern;
+          - the prose aside's bare backticked
+            `` `forum-(mention|updates)-monitor` `` fragment -- this
+            genuinely names both monitors (it is the illustration of
+            the UNANCHORED pre-#2028 form the prose warns against) but
+            carries no `pgrep` prefix, so it is correctly excluded
+            rather than incorrectly required to carry the canonical
+            (anchored) pattern.
+
+        This was verified against the file rather than assumed: see
+        this round's handoff for the concrete span list.
+        """
+        spans = cls._extract_inline_code_spans(md_path)
+        return [s for s in spans if "pgrep" in s.lower() and "monitor" in s.lower()]
+
+    def _selected_with_min_count(self, md_path: Path) -> list[str]:
+        selected = self._select_monitor_invocation_spans(md_path)
+        assert len(selected) >= self._EXPECTED_MIN_COUNT, (
+            f"{md_path.name}: expected at least {self._EXPECTED_MIN_COUNT} "
+            f"pgrep invocations naming the forum monitors (the standalone "
+            f"`-af` verify line plus the Linux and Darwin loop-embedded "
+            f"copies), found {len(selected)}: {selected!r} -- a lower count "
+            f"means a copy was silently dropped or no longer reads as a "
+            f"real invocation, not that fewer copies legitimately exist. "
+            f"If a legitimate edit intentionally removed a copy, update "
+            f"_EXPECTED_MIN_COUNT deliberately; a legitimate edit that adds "
+            f"a fourth copy is fine here -- this is a floor, not a ceiling."
+        )
+        return selected
+
+    def _assert_canonical(self, md_path: Path, label: str) -> None:
+        """Shared body for the default/quiet canonical-pattern tests below --
+        the two charge files differ only in which path to read and which
+        filename their failure messages should name, so `label` is threaded
+        through explicitly rather than derived from `md_path`."""
+        selected = self._selected_with_min_count(md_path)
+        for span in selected:
+            assert span in self._CANONICAL_INVOCATION_SPANS, (
+                f"{label}: a pgrep invocation naming "
+                f"the forum monitors is not one of the canonical invocation "
+                f"forms: {span!r} -- if this is a deliberate edit to a real "
+                f"invocation, update _CANONICAL_INVOCATION_SPANS in this "
+                f"test in the same commit."
+            )
+        assert set(selected) == self._CANONICAL_INVOCATION_SPANS, (
+            f"{label}: the set of selected pgrep "
+            f"invocations does not match the canonical set exactly -- a "
+            f"canonical invocation may have been DELETED from the file "
+            f"(present in _CANONICAL_INVOCATION_SPANS but not among the "
+            f"selected spans). Selected: {sorted(selected)!r}; canonical: "
+            f"{sorted(self._CANONICAL_INVOCATION_SPANS)!r}"
+        )
+
+    def test_default_charge_invocations_carry_the_canonical_pattern(self):
+        self._assert_canonical(self._DEFAULT_MD, "boot-charge-default-claude.md")
+
+    def test_quiet_charge_invocations_carry_the_canonical_pattern(self):
+        self._assert_canonical(self._QUIET_MD, "boot-charge-quiet-claude.md")
+
+    def test_both_charge_files_agree_on_monitor_invocation_spans(self):
+        default_selected = self._select_monitor_invocation_spans(self._DEFAULT_MD)
+        quiet_selected = self._select_monitor_invocation_spans(self._QUIET_MD)
+        assert default_selected == quiet_selected, (
+            "boot-charge-default-claude.md and boot-charge-quiet-claude.md "
+            f"must carry the IDENTICAL set of pgrep invocations naming the "
+            f"forum monitors, in the SAME order -- got {default_selected!r} "
+            f"vs {quiet_selected!r}"
+        )
+
+
+class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
+    """pgrep proves a process exists, not that its output reaches the
+    session -- a monitor armed via `nohup ... &` instead of through the
+    Monitor tool passes the pgrep check identically to a correctly-armed
+    one while its stdout goes to a file nothing reads (#3007). Both Claude
+    charge components' monitor-verify step must therefore also instruct the
+    booting agent to check the stdout target of each matched pid (Linux
+    `/proc/$pid/fd/1` via `readlink`, Darwin `lsof` since macOS has no
+    `/proc`).
+
+    This class does NOT stop at a presence check. Round 1 shipped exactly
+    that (asserting the paragraph's keywords were present) and a reviewer
+    proved it vacuous by gutting the paragraph down to a bag of those same
+    keywords with the runnable command removed -- the whole suite still
+    passed. The Linux test below instead EXTRACTS the real command out of
+    the charge markdown and RUNS it against two live processes whose stdout
+    targets are under the test's own control (one on a socket, one on a
+    regular file), asserting the command's output actually discriminates
+    between them -- the same discrimination the charge's instruction exists
+    to teach a booting agent to perform by hand."""
+
+    _DEFAULT_MD = _AUTOSTART / "boot-charge-default-claude.md"
+    _QUIET_MD = _AUTOSTART / "boot-charge-quiet-claude.md"
+
+    @staticmethod
+    def _extract_stdout_target_span(md_path: Path) -> str:
+        text = md_path.read_text()
+        m = re.search(
+            r"\*\*And pgrep is not sufficient.*?had no real-time forum delivery for six hours\.",
+            text,
+            re.S,
+        )
+        assert m, f"{md_path.name}: no stdout-target-check paragraph found"
+        return m.group(0)
+
+    @staticmethod
+    def _extract_linux_stdout_check_command(span: str) -> str:
+        """Locate the backticked span within the paragraph that contains
+        both `readlink` and `fd/1` -- the runnable Linux stdout-target
+        command. If a gutting edit removes the command (while leaving the
+        surrounding keyword prose intact), this extraction fails and the
+        test fails with it -- this is the assertion a gutted paragraph
+        trips."""
+        # The `for pid in` anchor is load-bearing, not cosmetic: without it,
+        # `[^`]*` happily spans the prose BETWEEN two unrelated inline-code
+        # spans, so a mutation that deletes the runnable command (leaving
+        # `readlink` and `fd/1` sitting in plain prose elsewhere in the
+        # paragraph) still "matches" -- and the test then fails at the wrong
+        # assertion downstream, reporting a reshaped loop instead of a
+        # deleted command. Measured 2026-09-18.
+        m = re.search(r"`(for pid in [^`]*readlink[^`]*fd/1[^`]*)`", span)
+        assert m, (
+            "no backticked command containing both `readlink` and `fd/1` found in "
+            "the stdout-target-check paragraph -- the charge no longer carries a "
+            "runnable Linux stdout-target command"
+        )
+        return m.group(1)
+
+    def test_both_charge_files_carry_the_identical_stdout_target_paragraph(self):
+        """A byte-identity check across the two files -- kept from round 1,
+        and still not sufficient on its own: gutting both files identically
+        preserves identity, which is exactly what the round-1 reviewer did.
+        It is a drift guard sitting BESIDE the functional test below, never
+        a substitute for it."""
+        default_span = self._extract_stdout_target_span(self._DEFAULT_MD)
+        quiet_span = self._extract_stdout_target_span(self._QUIET_MD)
+        assert default_span == quiet_span, (
+            "boot-charge-default-claude.md and boot-charge-quiet-claude.md must carry the "
+            "IDENTICAL stdout-target-check paragraph -- a hand-edit to one without "
+            "the other is exactly the drift this assertion exists to catch"
+        )
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/<pid>/fd is Linux-only")
+    def test_linux_command_discriminates_socket_stdout_from_file_stdout(self, tmp_path):
+        span = self._extract_stdout_target_span(self._DEFAULT_MD)
+        cmd = self._extract_linux_stdout_check_command(span)
+
+        sock_a, sock_b = socket.socketpair()
+        log_path = tmp_path / "fum.log"
+        proc_a = proc_b = None
+        try:
+            # pid_a: stdout on a socket -- what a correctly-armed monitor
+            # (via the Monitor tool) looks like.
+            proc_a = subprocess.Popen(["sleep", "30"], stdout=sock_a)
+            # pid_b: stdout on a regular file -- what a `nohup ... &`
+            # detached background process looks like (#3007's incident).
+            with open(log_path, "w") as f:
+                proc_b = subprocess.Popen(["sleep", "30"], stdout=f)
+
+            # Repoint the pid source only: substitute the $(pgrep ...)
+            # command-substitution with a literal list of the two pids just
+            # spawned. Everything else -- the readlink half under test --
+            # runs verbatim from the charge. Pid discovery for the
+            # standalone `-af` verify line is covered by the sibling class
+            # TestBootChargeMonitorVerifyPatternIsProcessNameAnchored; pid
+            # discovery for THIS loop's own embedded `-f` copy (and the
+            # Darwin loop's) is covered by
+            # TestBootChargeAllPgrepInvocationsCarryTheCanonicalPattern's
+            # content-keyed canonical-pattern assertion, not re-verified
+            # here -- running the real pgrep here would pick up this seat's
+            # own live monitors and make the test environment-dependent.
+            repointed = re.sub(
+                r"for pid in \$\(.*?\); do",
+                f"for pid in {proc_a.pid} {proc_b.pid}; do",
+                cmd,
+            )
+            assert repointed != cmd, (
+                "the pid-source substitution did not change the command -- the "
+                "charge's `for pid in $(...); do` loop is no longer the expected shape"
+            )
+
+            result = subprocess.run(
+                ["bash", "-c", repointed], capture_output=True, text=True, timeout=10
+            )
+        finally:
+            for proc in (proc_a, proc_b):
+                if proc is not None:
+                    proc.kill()
+                    proc.wait()
+            sock_a.close()
+            sock_b.close()
+
+        lines = result.stdout.splitlines()
+        assert len(lines) == 2, (
+            f"expected exactly 2 output lines (one per pid), got stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        socket_line, file_line = lines
+
+        # This IS the discrimination the charge's instruction exists to
+        # perform: a monitor whose stdout is a socket (correctly armed) vs
+        # one whose stdout is a file (silently a dead end).
+        assert socket_line.startswith("socket:"), (
+            "the socket-backed pid's stdout-target line must START WITH `socket:` "
+            "(the bracketed inode number varies per run, so this is a prefix check, "
+            f"not an equality check) -- got {socket_line!r}"
+        )
+        assert file_line == str(log_path) and not file_line.startswith("socket:"), (
+            "the file-backed pid's stdout-target line must be the log file's own "
+            f"path and must NOT start with `socket:` -- got {file_line!r}"
+        )
+
+    def test_default_charge_carries_the_darwin_branch(self):
+        """Darwin coverage is deliberately WEAK: CI is Linux-only, so this
+        is a presence/structural check, not a functional one -- the Darwin
+        `lsof` form has since been verified on two Darwin seats with both
+        controls. Assert something structural rather than prose: the
+        command must name `lsof` and `-d 1` (file descriptor 1 -- the
+        property that makes it the right instrument), so a gutting edit
+        that drops the `-d 1` is still caught even though the command
+        itself cannot be run here."""
+        span = self._extract_stdout_target_span(self._DEFAULT_MD)
+        assert "lsof" in span
+        assert "-d 1" in span
+        assert "macOS has no `/proc`" in span
+
+    def test_quiet_charge_carries_the_darwin_branch(self):
+        """See test_default_charge_carries_the_darwin_branch -- same
+        presence-only caveat applies here."""
+        span = self._extract_stdout_target_span(self._QUIET_MD)
+        assert "lsof" in span
+        assert "-d 1" in span
+        assert "macOS has no `/proc`" in span
 
 
 # ===========================================================================

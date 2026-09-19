@@ -11,6 +11,44 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [v0.5.1] - 2026-09-14
 
+### rc5 fix round — 2026-09-19 (found on the rc4 soak; tracking #2941)
+
+- **`engram_nap` renamed to `engram_checkpoint`; `engram_nap` kept as a
+  deprecated alias for one release.** The tool name collided with the
+  `engram-nap` SKILL name (the eight-step nap routine, of which calling the
+  tool is only one step), and drowsiness/nap-warning nudges that said "Run
+  engram_nap" read ambiguously as either "call the tool" or "run the skill"
+  — an agent that took it literally called only the tool and skipped the
+  skill's other steps (notably Step 5b, the warm-briefing rotation). The two
+  hook nudges (`context_tracker.py`, `engram-surface-hook.py`) now say to
+  load and run the `engram-nap` skill instead of naming the tool directly.
+  `engram_nap` delegates to `engram_checkpoint` with identical behavior and
+  output shape (#3018, closes #3015).
+- **Nap advisory re-anchored on the last checkpoint, not session start.**
+  `written_this_session` (renamed `written_since_last_nap`) satisfied itself
+  on one early write of `warm-briefing.md` and stayed silent for the rest of
+  a long session — across many subsequent naps and a compaction where Step
+  5b was actually skipped, measured live on two seats (a section stale by 4
+  naps / 10 hours, and a post-compaction section, both read as non-stale).
+  Every nap/sleep already appends a timestamped header to `session_log.md`;
+  the advisory now compares against the most recent one instead of the
+  per-session marker, re-arming after every nap and naturally covering the
+  compaction case (#3017, closes #3014).
+- **Boot charge's monitor-liveness check reads the monitor's stdout target,
+  not just process presence.** `pgrep` certifies a monitor process alive
+  even when its stdout was armed to a dead end (a detached `nohup … > file`
+  instead of through the Monitor tool) — measured live: nine real wake
+  events detected, none reached the session, silently, for six hours. The
+  charge now reads `readlink /proc/<pid>/fd/1` (Linux, a `socket:` target is
+  healthy) or `lsof -a -p <pid> -d 1`'s TYPE column (Darwin, no `/proc`)
+  (#3008, closes #3007).
+- **Dream-record filename pinned to the NYC-local write date.**
+  `~/.engram/history/dream/YYYY-MM-DD.md` never specified whether its date
+  is the day the record was written or the day it consolidates; the
+  sibling dream-report filename in the same skill was already pinned to
+  NYC-local, making this an oversight rather than deliberate latitude
+  (#3010, closes #2177).
+
 ### rc4 fix round — 2026-09-18 (found on the rc3 soak and the 09-18 nightly; tracking #2941)
 
 - **macOS install unblocked.** `install-local-marketplace.sh` carried a heredoc

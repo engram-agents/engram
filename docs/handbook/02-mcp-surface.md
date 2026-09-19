@@ -336,7 +336,11 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 ### Lifecycle — Nap & Turn Advance
 
-**43. engram_nap** — Pre-compaction checkpoint (no turn advance).
+**43. engram_checkpoint** (formerly `engram_nap`, renamed in issue #3015 — `engram_nap` is
+now a separate deprecated-alias tool, kept for one release; this bumps the
+doc's "Total tool count" / entry-numbering below by one tool, not yet
+re-derived here — see the "Verify, don't trust the number above" note) —
+Pre-compaction checkpoint (no turn advance).
 - **contract**: `{message}`
 - **guards**: arms nap_checkpoint feeling-nudge marker; persists context without advancing turn counter
 - **readOnlyHint**: False
