@@ -25,6 +25,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -36,6 +37,7 @@ _REPO_ROOT = _THIS_DIR.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from forum import db
 from forum.db import init_db
 from forum.server import create_app
 
@@ -774,3 +776,447 @@ class TestEngramPkgCliPathDeployedLayout:
             f"Expected fallback (non-existent) path when CLI absent, "
             f"but {result} exists."
         )
+
+
+# ---------------------------------------------------------------------------
+# Share-clearance: schema migration (privacy-incident follow-up, #676 slice 1)
+# ---------------------------------------------------------------------------
+
+def _fresh_conn() -> sqlite3.Connection:
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
+    return c
+
+
+class TestPackClearanceMigration:
+    def test_fresh_db_has_clearance_columns(self):
+        """A brand-new DB gets the four clearance columns straight from the
+        base CREATE TABLE (no ALTER TABLE path needed)."""
+        c = _fresh_conn()
+        init_db(c)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(packs)")}
+        assert {
+            "share_clearance",
+            "clearance_read_by",
+            "clearance_read_at",
+            "clearance_method",
+        } <= cols
+        c.close()
+
+    def test_fresh_db_share_clearance_default_is_private(self):
+        c = _fresh_conn()
+        init_db(c)
+        db.insert_pack(
+            c, pack_id="a-p-v1", author="a", name="p", version=1,
+            uploaded_at="2026-01-01T00:00:00Z",
+            root_count=0, node_count=0, edge_count=0,
+        )
+        row = c.execute(
+            "SELECT share_clearance, clearance_read_by, clearance_read_at, "
+            "clearance_method FROM packs WHERE id='a-p-v1'"
+        ).fetchone()
+        assert row[0] == "private"
+        assert row[1] is None
+        assert row[2] is None
+        assert row[3] is None
+        c.close()
+
+    def test_pre_clearance_db_migrated_via_alter_table(self):
+        """A pre-clearance packs table (no share_clearance/clearance_* columns)
+        is migrated idempotently by init_db, and existing rows backfill to
+        share_clearance='private'."""
+        c = _fresh_conn()
+
+        # Simulate a pre-clearance packs table (the old 8-column shape).
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS agents (
+                id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
+                avatar_seed TEXT NOT NULL, pair_initials TEXT,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, hostname TEXT
+            );
+            CREATE TABLE IF NOT EXISTS packs (
+                id              TEXT PRIMARY KEY,
+                author          TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                version         INTEGER NOT NULL,
+                uploaded_at     TEXT NOT NULL,
+                root_count      INTEGER NOT NULL DEFAULT 0,
+                node_count      INTEGER NOT NULL DEFAULT 0,
+                edge_count      INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+        c.execute(
+            "INSERT INTO packs(id, author, name, version, uploaded_at, "
+            "                  root_count, node_count, edge_count) "
+            "VALUES('a-p-v1', 'a', 'p', 1, '2026-01-01T00:00:00Z', 0, 0, 0)"
+        )
+        c.commit()
+
+        cols_before = {r[1] for r in c.execute("PRAGMA table_info(packs)")}
+        assert "share_clearance" not in cols_before
+
+        init_db(c)
+
+        cols_after = {r[1] for r in c.execute("PRAGMA table_info(packs)")}
+        assert {
+            "share_clearance",
+            "clearance_read_by",
+            "clearance_read_at",
+            "clearance_method",
+        } <= cols_after
+
+        row = c.execute(
+            "SELECT share_clearance FROM packs WHERE id='a-p-v1'"
+        ).fetchone()
+        assert row[0] == "private"
+        c.close()
+
+    def test_migration_idempotent(self):
+        """Running init_db twice on an already-migrated DB does not error."""
+        c = _fresh_conn()
+        init_db(c)
+        init_db(c)  # must not raise
+        cols = {r[1] for r in c.execute("PRAGMA table_info(packs)")}
+        assert "share_clearance" in cols
+        c.close()
+
+
+# ---------------------------------------------------------------------------
+# Share-clearance: DB helper — set_pack_clearance
+# ---------------------------------------------------------------------------
+
+class TestSetPackClearance:
+    def _seed_pack(self, c, pack_id="a-p-v1", author="a"):
+        db.insert_pack(
+            c, pack_id=pack_id, author=author, name="p", version=1,
+            uploaded_at="2026-01-01T00:00:00Z",
+            root_count=0, node_count=0, edge_count=0,
+        )
+
+    def test_insert_pack_still_works_unchanged(self):
+        c = _fresh_conn()
+        init_db(c)
+        self._seed_pack(c)
+        packs = db.list_packs(c)
+        assert len(packs) == 1
+        assert packs[0]["id"] == "a-p-v1"
+        c.close()
+
+    def test_clear_to_share_succeeds_and_reflected_in_get_pack(self):
+        c = _fresh_conn()
+        init_db(c)
+        self._seed_pack(c)
+        ok = db.set_pack_clearance(
+            c, "a-p-v1", clearance="cleared-to-share",
+            read_by="a", read_at="2026-01-02T00:00:00Z",
+            method="full read (pack files + database)",
+        )
+        assert ok is True
+        pack = db.get_pack(c, "a-p-v1")
+        assert pack["share_clearance"] == "cleared-to-share"
+        assert pack["clearance_read_by"] == "a"
+        assert pack["clearance_read_at"] == "2026-01-02T00:00:00Z"
+        assert pack["clearance_method"] == "full read (pack files + database)"
+        c.close()
+
+    def test_invalid_clearance_raises_value_error(self):
+        c = _fresh_conn()
+        init_db(c)
+        self._seed_pack(c)
+        with pytest.raises(ValueError):
+            db.set_pack_clearance(
+                c, "a-p-v1", clearance="bogus",
+                read_by="a", read_at="2026-01-02T00:00:00Z", method=None,
+            )
+        c.close()
+
+    def test_nonexistent_pack_id_returns_false(self):
+        c = _fresh_conn()
+        init_db(c)
+        ok = db.set_pack_clearance(
+            c, "does-not-exist-v1", clearance="private",
+            read_by="a", read_at="2026-01-02T00:00:00Z", method=None,
+        )
+        assert ok is False
+        c.close()
+
+    def test_free_text_method_not_constrained_to_enum(self):
+        """The method string is free text -- an arbitrary sentence is accepted
+        (the real incident this schema addresses: 'full read (database only)'
+        turned out to be insufficient because the pack also had un-searched
+        files, so the method string must record WHAT was read, not just a
+        full-read boolean)."""
+        c = _fresh_conn()
+        init_db(c)
+        self._seed_pack(c)
+        ok = db.set_pack_clearance(
+            c, "a-p-v1", clearance="cleared-to-share",
+            read_by="a", read_at="2026-01-02T00:00:00Z",
+            method="full read (database only) -- README not separately grepped",
+        )
+        assert ok is True
+        pack = db.get_pack(c, "a-p-v1")
+        assert pack["clearance_method"] == (
+            "full read (database only) -- README not separately grepped"
+        )
+        c.close()
+
+
+# ---------------------------------------------------------------------------
+# Share-clearance: GET responses include the new fields
+# ---------------------------------------------------------------------------
+
+class TestPackClearanceFieldsInGetResponses:
+    def test_list_packs_includes_clearance_fields(self, client):
+        tarball = _make_pack_tarball()
+        _upload_pack(client, tarball, agent="agent-a")
+        resp = client.get("/api/packs")
+        pack = json.loads(resp.data)["packs"][0]
+        for field in (
+            "share_clearance", "clearance_read_by",
+            "clearance_read_at", "clearance_method",
+        ):
+            assert field in pack, f"missing field {field!r}"
+        assert pack["share_clearance"] == "private"
+
+    def test_get_pack_includes_clearance_fields(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+        resp = client.get(f"/api/packs/{pack_id}")
+        pack = json.loads(resp.data)["pack"]
+        for field in (
+            "share_clearance", "clearance_read_by",
+            "clearance_read_at", "clearance_method",
+        ):
+            assert field in pack, f"missing field {field!r}"
+        assert pack["share_clearance"] == "private"
+
+
+# ---------------------------------------------------------------------------
+# Share-clearance: POST /api/packs/<id>/label
+# ---------------------------------------------------------------------------
+
+class TestPackLabelEndpoint:
+    def test_author_can_clear_own_pack(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={
+                "agent": "agent-a",
+                "clearance": "cleared-to-share",
+                "method": "full read (pack files + database)",
+            },
+        )
+        assert resp.status_code == 200, resp.data.decode()
+        pack = json.loads(resp.data)["pack"]
+        assert pack["share_clearance"] == "cleared-to-share"
+        assert pack["clearance_read_by"] == "agent-a"
+        assert pack["clearance_method"] == "full read (pack files + database)"
+        assert pack["clearance_read_at"]
+
+    def test_author_can_revert_to_private(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+        client.post(
+            f"/api/packs/{pack_id}/label",
+            data={
+                "agent": "agent-a", "clearance": "cleared-to-share",
+                "method": "full read (database only)",
+            },
+        )
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={"agent": "agent-a", "clearance": "private"},
+        )
+        assert resp.status_code == 200, resp.data.decode()
+        pack = json.loads(resp.data)["pack"]
+        assert pack["share_clearance"] == "private"
+        # method is cleared back to None when clearance reverts to private.
+        assert pack["clearance_method"] is None
+
+    def test_non_author_gets_403(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={
+                "agent": "agent-b",
+                "clearance": "cleared-to-share",
+                "method": "full read (pack files + database)",
+            },
+        )
+        assert resp.status_code == 403, resp.data.decode()
+        body = json.loads(resp.data)
+        assert "agent-b" in body["error"]
+        assert "agent-a" in body["error"]
+
+    def test_unknown_pack_404(self, client):
+        resp = client.post(
+            "/api/packs/does-not-exist-v1/label",
+            data={"agent": "agent-a", "clearance": "private"},
+        )
+        assert resp.status_code == 404
+
+    def test_invalid_clearance_value_400(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={"agent": "agent-a", "clearance": "bogus"},
+        )
+        assert resp.status_code == 400, resp.data.decode()
+
+    def test_clearing_without_method_400(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={"agent": "agent-a", "clearance": "cleared-to-share"},
+        )
+        assert resp.status_code == 400, resp.data.decode()
+        body = json.loads(resp.data)
+        assert "method" in body["error"].lower()
+
+    def test_missing_agent_400(self, client):
+        tarball = _make_pack_tarball()
+        pub_resp = _upload_pack(client, tarball, agent="agent-a")
+        pack_id = json.loads(pub_resp.data)["pack_id"]
+
+        resp = client.post(
+            f"/api/packs/{pack_id}/label",
+            data={"clearance": "private"},
+        )
+        assert resp.status_code == 400, resp.data.decode()
+
+
+# ---------------------------------------------------------------------------
+# Share-clearance: CLI round-trip (`forum pack label`)
+#
+# Mirrors the mock-_api_post-and-argv pattern from test_agent_status_cli.py
+# (the one existing CLI-test harness in this codebase) -- there is no prior
+# CLI-level test for the `pack` subcommand family specifically (pack
+# publish/list/get are only exercised via the Flask test client above), so
+# this is a new application of an existing pattern, not a new harness style.
+# ---------------------------------------------------------------------------
+
+try:
+    # _REPO_ROOT is already on sys.path (see top of file).
+    import tools.forum as forum_cli
+    _PACK_CLI_AVAILABLE = True
+except ImportError:
+    forum_cli = None  # type: ignore[assignment]
+    _PACK_CLI_AVAILABLE = False
+
+SKIP_PACK_CLI = pytest.mark.skipif(
+    not _PACK_CLI_AVAILABLE, reason="tools.forum CLI not importable"
+)
+
+
+@SKIP_PACK_CLI
+class TestPackLabelCLI:
+    # Fixtures are defined INSIDE this class so their autouse scope is
+    # class-local — they must not touch forum_cli module state for the
+    # unrelated Flask-test-client tests above in this same file.
+
+    @pytest.fixture
+    def _pack_cli_engram_home(self, tmp_path):
+        home = tmp_path / "engram"
+        home.mkdir()
+        config = {"agent_name": "agent-a", "forum": {"url": "http://testserver"}}
+        (home / "config.json").write_text(json.dumps(config))
+        return home
+
+    @pytest.fixture(autouse=True)
+    def _reset_pack_cli_cache(self, _pack_cli_engram_home, monkeypatch):
+        forum_cli._FORUM_URL_CACHE = None
+        monkeypatch.setattr(forum_cli, "ENGRAM_HOME", str(_pack_cli_engram_home))
+        monkeypatch.setattr(
+            forum_cli, "READ_CURSOR_PATH",
+            str(_pack_cli_engram_home / "forum-read-cursor.txt"),
+        )
+        yield
+        forum_cli._FORUM_URL_CACHE = None
+
+    def test_label_posts_form_fields_and_prints_ok(self):
+        captured = {}
+
+        def _fake_post_form(url, fields):
+            captured["url"] = url
+            captured["fields"] = fields
+            return {
+                "pack": {
+                    "id": "agent-a-p-v1",
+                    "share_clearance": "cleared-to-share",
+                    "clearance_method": "full read (pack files + database)",
+                }
+            }
+
+        stdout_buf = io.StringIO()
+        with mock.patch.object(forum_cli, "_api_post_form", side_effect=_fake_post_form), \
+             mock.patch("sys.argv", [
+                 "forum", "pack", "label", "agent-a-p-v1", "cleared-to-share",
+                 "--method", "full read (pack files + database)",
+             ]), \
+             mock.patch("sys.stdout", stdout_buf), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                forum_cli.main()
+            except SystemExit as e:
+                assert e.code in (0, None), f"unexpected exit code: {e.code}"
+
+        assert captured.get("url", "").endswith(
+            "/api/packs/agent-a-p-v1/label"
+        ), f"unexpected label URL: {captured.get('url')}"
+        assert captured.get("fields") == {
+            "agent": "agent-a",
+            "clearance": "cleared-to-share",
+            "method": "full read (pack files + database)",
+        }, f"unexpected fields: {captured.get('fields')}"
+
+        out = stdout_buf.getvalue()
+        assert "ok" in out
+        assert "agent-a-p-v1" in out
+        assert "cleared-to-share" in out
+
+    def test_label_without_method_omits_method_field(self):
+        captured = {}
+
+        def _fake_post_form(url, fields):
+            captured["fields"] = fields
+            return {"pack": {"id": "agent-a-p-v1", "share_clearance": "private"}}
+
+        with mock.patch.object(forum_cli, "_api_post_form", side_effect=_fake_post_form), \
+             mock.patch("sys.argv", [
+                 "forum", "pack", "label", "agent-a-p-v1", "private",
+             ]), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.stderr", io.StringIO()):
+            try:
+                forum_cli.main()
+            except SystemExit as e:
+                assert e.code in (0, None), f"unexpected exit code: {e.code}"
+
+        assert "method" not in captured.get("fields", {})
+
+    def test_label_rejects_invalid_clearance_via_argparse(self):
+        stderr_buf = io.StringIO()
+        with mock.patch("sys.argv", [
+                 "forum", "pack", "label", "agent-a-p-v1", "bogus-state",
+             ]), \
+             mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.stderr", stderr_buf):
+            with pytest.raises(SystemExit) as exc_info:
+                forum_cli.main()
+        assert exc_info.value.code != 0
