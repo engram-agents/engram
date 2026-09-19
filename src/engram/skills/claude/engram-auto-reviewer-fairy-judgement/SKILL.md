@@ -15,7 +15,15 @@ This heuristic governs only one decision: **an author's own dispatch choice on t
 
 So: first ask *whose diff is this, and which seat am I filling* — author or colleague. Only apply the heuristic below when the answer is "author, my own diff."
 
+## What this heuristic does NOT decide
+
+In multi-agent mode, CLAUDE.md's PR review convention makes the pre-peer reviewer-fairy round **mandatory with no size exception, applying in single-agent mode too**. This heuristic is written for a narrower question than that — it decides whether the round is worth the *dispatch overhead* (spawning an actual fairy vs. doing an equally-rigorous read myself), never whether the round itself is needed. Below the size/test threshold, "do the review directly" does NOT mean "my own self-review counts as the fairy round." It means: apply the same rigor, but the reviewer still has to be someone other than the context that wrote the code — dispatch a real reviewer-fairy (or, if truly solo with no counterpart, treat it as the "author's own second-layer eye" the multi-agent section names, which is still a deliberately *separate pass*, not folded into the original authoring turn).
+
+Concretely: for any PR that will go to a colleague (multi-agent mode), **always dispatch an actual reviewer-fairy**, regardless of size — the diff-size threshold below governs nothing about that decision. Caught live on engram-alpha PR #3023 (2026-09-19): a same-context self-review of a 2-file docs PR was returned by the colleague seat, correctly, because a same-context read cannot provide the fresh-eye function the round exists for. The size heuristic below is about *how much scrutiny the author's own pass needs before sending it out*, not a license to skip the independent round.
+
 ## Heuristic
+
+*(Read this section as "how much dispatch overhead does the round need" — the round itself is not optional; see "What this heuristic does NOT decide" above if you're skimming and landed here directly.)*
 
 Spawn a reviewer-fairy when ANY of the following conditions hold:
 
