@@ -635,15 +635,22 @@ def test_feeling_cannot_be_superseded():
 # ── Checkpoint nap arms marker ─────────────────────────────────────────
 
 def test_checkpoint_nap_arms_marker():
-    """engram_nap should arm a nap_checkpoint nudge marker.
+    """engram_checkpoint should arm a nap_checkpoint nudge marker.
 
-    Renamed from engram_checkpoint(mode='nap') in PR #10 — engram_nap is
-    now a dedicated tool that never advances the turn counter and arms
-    the nap_checkpoint feeling-report nudge.
+    Naming history (two unrelated renames, don't conflate them): originally
+    a parametrized engram_checkpoint(mode='nap') tool, renamed to a
+    dedicated engram_nap tool in PR #10 — engram_nap became the tool that
+    never advances the turn counter and arms the nap_checkpoint
+    feeling-report nudge. Issue #3015 later renamed engram_nap BACK to
+    engram_checkpoint (unrelated to the old pre-PR#10 mode-parametrized
+    tool — this engram_checkpoint takes no mode= param) because the
+    engram_nap tool name collided with the engram-nap SKILL name.
+    engram_nap now exists as a deprecated alias for one release, delegating
+    to engram_checkpoint with identical behavior.
     """
     client, server = fresh_client()
     assert not server.core.FEELING_NUDGE_MARKER.exists()
-    r = client.call("engram_nap", {
+    r = client.call("engram_checkpoint", {
         "message": "Test nap checkpoint",
     })
     # Return should include the nudge text.

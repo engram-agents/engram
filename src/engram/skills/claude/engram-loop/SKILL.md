@@ -688,7 +688,7 @@ With the marker present, the hook tells you the right thing; the discipline is:
   since May), so what crosses the boundary is whatever is already plain text
   in a file. **Anything left only in context is lost at the boundary, not
   deferred.**
-- **Then nap to checkpoint it** (`engram_nap`) — after the writes, not
+- **Then nap to checkpoint it** (`engram_checkpoint`, formerly `engram_nap`) — after the writes, not
   instead of them. A nap checkpoints what is *already* in the graph and
   commits a snapshot; napping with nothing newly written saves nothing.
   Repeated writes are the protection; repeated naps are not.

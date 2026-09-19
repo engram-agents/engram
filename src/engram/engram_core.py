@@ -1651,8 +1651,9 @@ def _init_git():
     environments where git resolution is broken — historically the Claude Desktop
     Windows app picked up the WSL git binary instead of the Windows one and the
     versioning layer had to be disabled. With ENGRAM_DISABLE_GIT=1, _git_available
-    stays False and engram_nap / engram_advance_turn silently skip committing
-    while still saving the session log and graph state to disk.
+    stays False and engram_checkpoint (formerly engram_nap) / engram_advance_turn
+    silently skip committing while still saving the session log and graph state
+    to disk.
 
     Also ensures a canonical .gitignore that excludes binary files, transient
     SQLite files, and other junk that must never be tracked. Idempotent —
@@ -4812,8 +4813,9 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     "tier1+tier2 membership" reduces to just the tier2-threshold set; no
     separate tier1 query or literal set-union is needed.
 
-    Called from BOTH the engram_nap wrapper AND the engram_advance_turn
-    (sleep) wrapper (server.py), at every diagnostic_history checkpoint —
+    Called from BOTH the engram_checkpoint wrapper (formerly engram_nap) AND
+    the engram_advance_turn (sleep) wrapper (server.py), at every
+    diagnostic_history checkpoint —
     NOT from engram_diagnose() itself. engram_diagnose() is its own
     directly-callable MCP tool ("Use any time" per its docstring), not
     checkpoint-only, so computing and injecting this here (rather than

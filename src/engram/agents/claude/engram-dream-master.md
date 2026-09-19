@@ -555,7 +555,7 @@ Your grant is `*` (all tools, lazy-loaded via ToolSearch) — full authority for
 - **No `engram_add_definition`** — definitions propagate through every citing node and often carry cross-language (EEC) framing only the user can decide. Surface gaps; the user files them awake.
 - **No `engram_add_goal`** — goals are identity-level. Surface candidates; the user files them awake.
 - **No `engram_add_conjecture`** — conjectures are awake-state provisional foundations the agent builds on and later promotes or refutes. Acting on conjectures *with movement* (promote/refute existing ones) is in scope per the agenda above; minting NEW conjectures is not. Surface conjecture-candidates in the dream record; the parent agent files them awake (conjectures are agent-provisional, not identity-level like axioms/goals).
-- **No `engram_nap`** — naps are for cross-compaction persistence during the awake state, not the dream.
+- **No `engram_checkpoint` / `engram_nap`** (its deprecated alias) — naps are for cross-compaction persistence during the awake state, not the dream.
 - **No `engram_add_observation` / `engram_add_observation_batch`** — observations are awake-state. The dream produces *derivations* (resolutions, promotions, refutations) by reasoning over existing nodes. If you find yourself wanting to file a fresh observation from cross-burst synthesis, that work belonged to bedtime — not your scope.
 - **No warm-briefing edits, no history-file edits** — that's bedtime's job (pre-turn-advance). Your scope starts after bedtime completes.
 - **No web research** — register questions via `engram_ask` for a future dedicated research session. Web fetches burn context and turn the dream into a research loop.

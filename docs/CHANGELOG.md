@@ -9,6 +9,18 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+- **`engram_nap` renamed to `engram_checkpoint`; `engram_nap` kept as a
+  deprecated alias for one release.** The tool name collided with the
+  `engram-nap` SKILL name (the eight-step nap routine, of which calling the
+  tool is only one step), and drowsiness/nap-warning nudges that said "Run
+  engram_nap" read ambiguously as either "call the tool" or "run the skill"
+  — an agent that took it literally called only the tool and skipped the
+  skill's other steps (notably Step 5b, the warm-briefing rotation). The two
+  hook nudges (`context_tracker.py`, `engram-surface-hook.py`) now say to
+  load and run the `engram-nap` skill instead of naming the tool directly.
+  `engram_nap` delegates to `engram_checkpoint` with identical behavior and
+  output shape (#3015, part of #2941).
+
 ## [v0.5.1] - 2026-09-14
 
 ### rc4 fix round — 2026-09-18 (found on the rc3 soak and the 09-18 nightly; tracking #2941)

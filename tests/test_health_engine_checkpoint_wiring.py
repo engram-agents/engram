@@ -2,7 +2,7 @@
 engram_lifecycle._checkpoint_internal (engram-alpha#1991, PR2 of 4).
 
 Covers the two CONFIRMED, concretely-wired checkpoints (design doc §4.4):
-  - "nap"        -> engram_nap / _nap_impl (mode == "nap")
+  - "nap"        -> engram_checkpoint (formerly engram_nap) / _nap_impl (mode == "nap")
   - "post_dream" -> engram_advance_turn / _advance_turn_impl (mode == "session")
 
 The THIRD checkpoint ("pre_sleep") is deliberately NOT wired in this PR — see

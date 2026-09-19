@@ -257,6 +257,13 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "register_exemplar",
     "link_about",
     "set_recall_summaries",
+    # engram_checkpoint (issue #3015 rename) is the canonical write tool;
+    # engram_nap is its deprecated backward-compat alias (kept for one
+    # release) — both are separately @mcp.tool()-registered and write-
+    # capable, so both verbs must be present here (test_stop_hook_write_
+    # verbs_ssot.py asserts strict equality against server.py's real
+    # write-capable set).
+    "checkpoint",
     "nap",
     "advance_turn",
     "outgrow_cornerstone",

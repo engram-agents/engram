@@ -1,7 +1,7 @@
 """Tests for the engram-nap SKILL.md backup-health check (engram-alpha#2680).
 
 The skill's Step 3 prescribes a small snippet the agent runs by hand after
-calling engram_nap() to surface a degrading backup instead of burying it in
+calling engram_checkpoint() (formerly engram_nap()) to surface a degrading backup instead of burying it in
 the return dict. That snippet is prose, not imported code -- there is
 nothing for pytest to exercise directly. This file pins down the CORRECT
 predicate as a real, testable function (_backup_health_ok, mirroring the
@@ -190,7 +190,7 @@ def test_regression_old_predicate_misreported_a_healthy_skip_as_failed(tmp_path)
     core._write_binary_backup(src_db, backup_dir)
     real_db_backup = core._write_binary_backup(src_db, backup_dir)  # same-day skip
 
-    # Shape exactly as engram_nap() actually returns it: nested under version_control.
+    # Shape exactly as engram_checkpoint() (formerly engram_nap()) actually returns it: nested under version_control.
     real_result = {"version_control": {"db_backup": real_db_backup, "binary_backup": {}}}
 
     assert _buggy_pre_fix_check(real_result) is True, (

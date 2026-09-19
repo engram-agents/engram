@@ -1,4 +1,5 @@
-"""Tests for the engram_nap payload_json wrapper (migrate/session-cluster-payload-json).
+"""Tests for the engram_checkpoint (formerly engram_nap) payload_json wrapper
+(migrate/session-cluster-payload-json).
 
 Coverage:
   1. Invalid JSON rejection — non-parseable payload_json string returns {"error": ...}
@@ -45,7 +46,7 @@ def fresh_server():
 def test_invalid_json_rejected():
     """A payload_json string that isn't valid JSON returns an error dict."""
     server = fresh_server()
-    r = json.loads(server.engram_nap(payload_json='{"message": "x", not valid json'))
+    r = json.loads(server.engram_checkpoint(payload_json='{"message": "x", not valid json'))
     assert "error" in r, f"Expected error key, got: {r}"
     assert "Invalid JSON" in r["error"], (
         f"Expected 'Invalid JSON' in error message, got: {r['error']}"
@@ -59,7 +60,7 @@ def test_invalid_json_rejected():
 def test_non_object_payload_rejected():
     """A valid-JSON but non-object payload (e.g. a list) returns an error dict."""
     server = fresh_server()
-    r = json.loads(server.engram_nap(payload_json=json.dumps([1, 2, 3])))
+    r = json.loads(server.engram_checkpoint(payload_json=json.dumps([1, 2, 3])))
     assert "error" in r, f"Expected error key, got: {r}"
     assert "must be a JSON object" in r["error"], (
         f"Expected 'must be a JSON object' in error, got: {r['error']}"
@@ -73,7 +74,7 @@ def test_non_object_payload_rejected():
 def test_unknown_field_rejected():
     """Payload containing an unrecognised field returns an error dict."""
     server = fresh_server()
-    r = json.loads(server.engram_nap(payload_json=json.dumps({
+    r = json.loads(server.engram_checkpoint(payload_json=json.dumps({
         "message": "test nap message",
         "bogus_field": "should be rejected",
     })))
@@ -93,7 +94,7 @@ def test_unknown_field_rejected():
 def test_missing_required_message_rejected():
     """A payload with no 'message' returns an error dict."""
     server = fresh_server()
-    r = json.loads(server.engram_nap(payload_json=json.dumps({})))
+    r = json.loads(server.engram_checkpoint(payload_json=json.dumps({})))
     assert "error" in r, f"Expected error key, got: {r}"
     assert "message" in r["error"], (
         f"Expected required-field 'message' in error, got: {r['error']}"

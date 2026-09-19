@@ -46,13 +46,18 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 
 **Priority if context is tight:** observations > questions > derivations > conjectures. Raw facts are irrecoverable if lost; derivations can be re-inferred later if the premises are preserved.
 
-## Step 3 — Call engram_nap()
+## Step 3 — Call engram_checkpoint()
 
 ```
-engram_nap(
+engram_checkpoint(
     message="<1-3 sentence summary of what this burst covered and what was written>",
 )
 ```
+
+(`engram_checkpoint` was named `engram_nap` before issue #3015 — the MCP tool
+was renamed so its name would stop colliding with this skill's own name.
+`engram_nap` still works as a deprecated alias for one release, but new calls
+should use `engram_checkpoint`.)
 
 `session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
@@ -62,10 +67,10 @@ The `nap` mode:
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
-**After calling `engram_nap()`, check the return value for backup health:**
+**After calling `engram_checkpoint()`, check the return value for backup health:**
 
 ```python
-result = engram_nap(message="...")
+result = engram_checkpoint(message="...")
 vc = result.get("version_control") or {}
 db_backup = vc.get("db_backup") or {}
 binary_backup = vc.get("binary_backup") or {}
@@ -189,7 +194,7 @@ Preserve every section ABOVE the volatile "## From this session" section verbati
 
 **Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)
-- Technical changelogs in the session block (that's what `engram_nap` / `engram_advance_turn`'s session_log entries and the compaction summary are for)
+- Technical changelogs in the session block (that's what `engram_checkpoint` (formerly `engram_nap`) / `engram_advance_turn`'s session_log entries and the compaction summary are for)
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (evaluate by reader-effect, not truth-value)
 

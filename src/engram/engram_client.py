@@ -293,14 +293,20 @@ TOOL_SCHEMAS = {
             },
         },
     },
+    "engram_checkpoint": {
+        "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused. Single-payload signature — pass all fields as one JSON object string in payload_json. (Formerly named engram_nap — see engram_nap below for the deprecated alias.)",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with nap fields. Required: message (summary of what was learned/changed in this work-burst).", "required": True},
+        },
+    },
     "engram_nap": {
-        "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused. Single-payload signature — pass all fields as one JSON object string in payload_json.",
+        "description": "DEPRECATED ALIAS for engram_checkpoint, kept for one release. Identical behavior — migrate callers to engram_checkpoint. Single-payload signature — pass all fields as one JSON object string in payload_json.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with nap fields. Required: message (summary of what was learned/changed in this work-burst).", "required": True},
         },
     },
     "engram_advance_turn": {
-        "description": "[Sleep cycle / first session only — DO NOT call awake.] End-of-day session checkpoint that advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. For pre-compaction / end-of-burst persistence in awake state, use engram_nap instead. Single-payload signature — pass all fields as one JSON object string in payload_json.",
+        "description": "[Sleep cycle / first session only — DO NOT call awake.] End-of-day session checkpoint that advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. For pre-compaction / end-of-burst persistence in awake state, use engram_checkpoint instead. Single-payload signature — pass all fields as one JSON object string in payload_json.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with advance_turn fields. Required: message (summary of what was learned/changed across the cohort being closed by this turn advance).", "required": True},
         },

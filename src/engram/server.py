@@ -321,7 +321,7 @@ def _attach_walguard_banner(json_response: str) -> str:
     response when the degraded marker is present, else return it unchanged.
 
     Reuses _walguard_degraded_banner() — the same banner text the read/stat
-    surfaces already attach at engram_surface/engram_nap/engram_advance_turn
+    surfaces already attach at engram_surface/engram_checkpoint/engram_advance_turn
     (and engram_stats._surface_stats_impl / _diagnose_impl). This is the
     write-tool counterpart (#1947 slice E): without it, a write made during a
     split-brain WAL-index window returns an ordinary success payload with no
@@ -2767,15 +2767,16 @@ def engram_cascade_resolve(payload_json: str) -> str:
 # in #872 wave 3. Compat forwarders below; wrappers delegate via _lifecycle_mod.
 
 
-# Set of legitimate field names for the engram_nap payload.
-_NAP_FIELDS = frozenset({
+# Set of legitimate field names for the engram_checkpoint payload (also used
+# by the engram_nap deprecated alias below — same fields, same handler).
+_CHECKPOINT_FIELDS = frozenset({
     "message",
     "session_id",
 })
 
 
-# DESIGN INTENT — engram_nap
-# --------------------------
+# DESIGN INTENT — engram_checkpoint (formerly engram_nap)
+# ---------------------------------------------------------
 # Shallow consolidation: persist context to ENGRAM without advancing the turn
 # counter. The safe-anytime checkpoint — pre-compaction, end-of-burst, any
 # moment the agent wants to preserve session knowledge without triggering
@@ -2798,21 +2799,21 @@ _NAP_FIELDS = frozenset({
 # must be FULLY IN SYNC with the current-CW arc at every nap — see
 # engram-nap skill §5b.
 @mcp.tool(
-    name="engram_nap",
+    name="engram_checkpoint",
     capability=(
         "Lossless checkpoint usable ANY time — no turn advance, no forgetting-curve "
         "effect. Use engram_advance_turn for the once-daily irreversible sleep "
         "checkpoint."
     ),
     annotations={
-        "title": "Pre-compaction Nap (no turn advance)",
+        "title": "Pre-compaction Checkpoint (no turn advance)",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
     },
 )
-def engram_nap(payload_json: str) -> str:
+def engram_checkpoint(payload_json: str) -> str:
     """Persist context to ENGRAM without advancing the turn counter.
 
     Use BEFORE compaction, at end of a work-burst, or whenever you want
@@ -2851,7 +2852,7 @@ def engram_nap(payload_json: str) -> str:
         prior_checkpoint_mode} plus a `reason` key when jaccard is null (no
         prior checkpoint to compare, or the prior snapshot predates this
         metric). Computed at EVERY diagnostic_history checkpoint — both
-        engram_nap and engram_advance_turn (sleep) — per the metric
+        engram_checkpoint (formerly engram_nap) and engram_advance_turn (sleep) — per the metric
         designer's call: the sleep boundary is the most meaningful
         measurement point (consolidation reshaping), so excluding it would
         blind the metric to its own primary use case. NOT computed by
@@ -2891,11 +2892,11 @@ def engram_nap(payload_json: str) -> str:
     params, err = _parse_payload(payload_json)
     if err:
         return err
-    unknown = set(params.keys()) - _NAP_FIELDS
+    unknown = set(params.keys()) - _CHECKPOINT_FIELDS
     if unknown:
         return json.dumps({
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
-                     f"Allowed: {sorted(_NAP_FIELDS)}"
+                     f"Allowed: {sorted(_CHECKPOINT_FIELDS)}"
         })
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
@@ -2980,8 +2981,51 @@ def engram_nap(payload_json: str) -> str:
     return json.dumps(result_dict)
 
 
+# DEPRECATED ALIAS — engram_nap (issue #3015)
+# --------------------------------------------
+# engram_nap was the original tool name. It collided with the engram-nap
+# SKILL name (the eight-step nap routine, of which calling this tool is only
+# one step — see engram-nap SKILL.md), and a nudge that told the agent to
+# invoke this bare tool name read ambiguously as either "call the tool" or
+# "run the skill" -- agents that took it literally called only the tool and
+# skipped the skill's other steps (notably Step 5b, the warm-briefing
+# rotation). The tool itself is renamed to engram_checkpoint so "nap"
+# unambiguously means the skill. This alias is kept for exactly one release
+# (per Lei's 2026-09-19 ruling) so in-flight callers don't break; it
+# delegates to engram_checkpoint verbatim -- same fields, same behavior,
+# same output shape. New callers should use engram_checkpoint directly.
+@mcp.tool(
+    name="engram_nap",
+    capability=(
+        "DEPRECATED ALIAS for engram_checkpoint (kept for one release — "
+        "migrate callers to engram_checkpoint). Identical behavior: lossless "
+        "checkpoint usable ANY time, no turn advance."
+    ),
+    annotations={
+        "title": "[DEPRECATED — use engram_checkpoint] Pre-compaction Nap (no turn advance)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_nap(payload_json: str) -> str:
+    """DEPRECATED ALIAS for engram_checkpoint — kept for exactly one release.
+
+    Identical behavior to engram_checkpoint (same payload_json fields, same
+    return shape) -- this wrapper delegates directly to engram_checkpoint's
+    implementation. Migrate callers to engram_checkpoint; this alias name
+    will be removed in a future release.
+
+    See engram_checkpoint's own docstring for the full field/return-shape
+    reference.
+    """
+    return engram_checkpoint(payload_json)
+
+
 def _nap_impl(message: str) -> str:
-    """Impl for engram_nap — delegates to engram_lifecycle (wave 3)."""
+    """Impl for engram_checkpoint (formerly engram_nap; also used by the
+    engram_nap deprecated alias) — delegates to engram_lifecycle (wave 3)."""
     return _lifecycle_mod._nap_impl(message=message)
 
 
@@ -3261,9 +3305,9 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # over-inflates the forgetting curve irreversibly. No self-guard — caller is
 # the safety mechanism (engram-sleep skill + nap-vs-sleep discipline).
 #
-# nap (engram_nap) is the safe-anytime alternative: lossless persistence with
-# NO turn-advance. Compaction-boundary checkpoints + background roles always
-# use nap, never advance_turn.
+# nap (engram_checkpoint, formerly engram_nap) is the safe-anytime alternative:
+# lossless persistence with NO turn-advance. Compaction-boundary checkpoints +
+# background roles always use nap, never advance_turn.
 #
 # Pairs with sleep-success marker (~/.engram/sessions/last-sleep-success.json)
 # for the auto-sleep cron idempotency — caller checks "did we already consolidate
@@ -3273,7 +3317,7 @@ _ADVANCE_TURN_FIELDS = frozenset({
     capability=(
         "[Sleep/first-session only] IRREVERSIBLE turn-advance checkpoint — at most "
         "once/24h, no self-guard against double-call. Mid-session saves should use "
-        "engram_nap instead."
+        "engram_checkpoint instead."
     ),
     annotations={
         "title": "[Sleep cycle / first session only — DO NOT call awake.] Session Checkpoint with Turn Advance (irreversible)",
@@ -3293,7 +3337,7 @@ def engram_advance_turn(payload_json: str) -> str:
     repeat calls — caller-responsibility.
 
     For non-end-of-day checkpoints (pre-compaction, mid-burst, background
-    roles): use engram_nap instead — same lossless persistence, no turn-advance.
+    roles): use engram_checkpoint instead — same lossless persistence, no turn-advance.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -3305,7 +3349,7 @@ def engram_advance_turn(payload_json: str) -> str:
         tiers.
         `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
         Continuity metric (v1, #1630) — same shape and semantics as
-        engram_nap's (see that tool's docstring + engram_core's
+        engram_checkpoint's (see that tool's docstring + engram_core's
         _compute_recall_set_continuity docstring). Computed here too, not
         just at nap: the sleep boundary's forgetting + consolidation makes
         it the single most meaningful measurement point for this metric.
@@ -3723,7 +3767,7 @@ def engram_diagnose() -> str:
 #     for the honesty axiom: every retraction + supersede is recorded; the
 #     graph can't quietly rewrite its own past.
 #   diagnostics — "show me the trend" — health-score snapshots taken at each
-#     checkpoint (engram_nap / engram_advance_turn). Lets the agent track
+#     checkpoint (engram_checkpoint / engram_advance_turn). Lets the agent track
 #     graph-health drift across days.
 #
 # Limit cap (max 200): keeps response bounded; for full-history dives, page
@@ -8091,7 +8135,7 @@ if __name__ == "__main__":
     _ensure_data_dir()
     # Initialize ~/.engram/.git for the durable version-controlled snapshot.
     # Best-effort: if git is missing or init fails, core._git_available stays False
-    # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
+    # and engram_checkpoint / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
 
     # #1673: start the async snapshot worker and REPLAY any snapshot-commit jobs

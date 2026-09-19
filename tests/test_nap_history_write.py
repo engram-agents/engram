@@ -1,5 +1,5 @@
-"""Tests for engram_nap appending a milestone line to today's history file
-(engram-alpha#2026 WS3).
+"""Tests for engram_checkpoint (formerly engram_nap) appending a milestone
+line to today's history file (engram-alpha#2026 WS3).
 
 Coverage (per the WS3 build spec):
   1. Calling nap (mode="nap") with a real message appends exactly one new
@@ -15,7 +15,7 @@ Coverage (per the WS3 build spec):
      history file at all — asserted via file non-existence after a
      sleep-mode call on a fresh TEST_DIR.
   5. Fail-soft: if the history file's directory is made unwritable,
-     engram_nap itself still returns its normal success result — the
+     engram_checkpoint itself still returns its normal success result — the
      checkpoint must not fail because the history write failed.
   6. Atomicity: simulate a failure mid-write (os.replace raising) and assert
      (a) no .tmp file is left behind, (b) the original file's content is
@@ -23,7 +23,7 @@ Coverage (per the WS3 build spec):
   7. Two consecutive nap calls in the same test (same day) append TWO
      separate bullets, in order, neither overwriting the other.
 
-No existing test file covered `_checkpoint_internal`/`engram_nap`'s history-
+No existing test file covered `_checkpoint_internal`/`engram_checkpoint`'s history-
 write side effect before this PR (searched tests/ for `_nap_impl` and
 `_checkpoint_internal`; the two payload_json tests found —
 test_nap_payload.py, test_advance_turn_payload.py — cover payload validation
@@ -140,7 +140,7 @@ def test_advance_turn_does_not_touch_history_file():
 
 
 # ---------------------------------------------------------------------------
-# 5. Fail-soft: unwritable history directory does not fail engram_nap
+# 5. Fail-soft: unwritable history directory does not fail engram_checkpoint
 # ---------------------------------------------------------------------------
 
 def test_nap_fail_soft_when_history_dir_unwritable():

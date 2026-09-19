@@ -939,17 +939,17 @@ class TestBannerPlacement:
             f"Unexpected warning text: {parsed['_walguard_warning']!r}"
         )
 
-    def test_engram_nap_warning_in_json(self):
-        """engram_nap with degraded marker: result is valid JSON with _walguard_warning."""
+    def test_engram_checkpoint_warning_in_json(self):
+        """engram_checkpoint (formerly engram_nap) with degraded marker: result is valid JSON with _walguard_warning."""
         import json as _json
         self._make_minimal_db()
         self._write_degraded_marker()
 
         with mock.patch.object(self.server.core, "_git", side_effect=self._mock_git):
-            raw = self.server.engram_nap('{"message": "banner test nap"}')
+            raw = self.server.engram_checkpoint('{"message": "banner test nap"}')
         parsed = _json.loads(raw)  # must not raise JSONDecodeError
         assert "_walguard_warning" in parsed, (
-            f"_walguard_warning key missing from engram_nap response; keys={list(parsed)}"
+            f"_walguard_warning key missing from engram_checkpoint response; keys={list(parsed)}"
         )
         assert "SUBSTRATE DEGRADED" in parsed["_walguard_warning"], (
             f"Unexpected warning text: {parsed['_walguard_warning']!r}"
