@@ -51,11 +51,10 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 ```
 engram_nap(
     message="<1-3 sentence summary of what this burst covered and what was written>",
-    session_id="<your injected session_id, if available>",
 )
 ```
 
-`session_id` is optional but worth passing when you have it — it's what lets the return's `warm_briefing.written_this_session` field below resolve to `true`/`false` instead of `null` (can't determine without it).
+`session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` with a "Nap (turn N)" header

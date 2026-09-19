@@ -2830,17 +2830,16 @@ def engram_nap(payload_json: str) -> str:
                 in this work-burst.
             session_id (str, optional): The current session's id (as
                 injected at session start — same value passed to
-                engram_add_observation's own session_id field). Used ONLY
-                to resolve `warm_briefing.written_this_session` below via
-                the per-session marker at
-                `<data dir>/sessions/<session_id>.json`'s
-                `session_started_at` field — never read from an env var
-                (deliberately: this repo has two different env-var
-                conventions in use elsewhere and neither is guaranteed to
-                match the live harness's actual variable name, so an
-                explicit payload field is the only reliable source). When
-                omitted, `written_this_session` is `null` (can't
-                determine) rather than guessed.
+                engram_add_observation's own session_id field). Accepted
+                for backward compatibility with existing callers, but as
+                of #3014 it is NOT used to compute the `warm_briefing`
+                advisory below — that advisory now anchors on the most
+                recent nap/sleep checkpoint already in session_log.md
+                (via `_last_checkpoint_timestamp`), independent of session
+                identity, which correctly re-arms after every nap and
+                covers the post-compaction case too (see
+                `_compute_warm_briefing_advisory`'s docstring for why the
+                anchor changed from session-start).
 
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
@@ -2858,29 +2857,32 @@ def engram_nap(payload_json: str) -> str:
         blind the metric to its own primary use case. NOT computed by
         ad-hoc engram_diagnose() calls — see _compute_recall_set_continuity
         docstring.
-        `warm_briefing` (#2997) surfaces when the engram-nap skill's Step 5b
-        (warm-briefing "From this session" sync) was NOT performed this
-        session — that step is agent-executed prose, not code, so nothing
-        fails when it's skipped and the omission is otherwise invisible
-        until the next session reads a stale/empty briefing. Shape:
+        `warm_briefing` (#2997, anchor fixed in #3014) surfaces when the
+        engram-nap skill's Step 5b (warm-briefing "From this session" sync)
+        was NOT performed since the last nap/sleep checkpoint — that step
+        is agent-executed prose, not code, so nothing fails when it's
+        skipped and the omission is otherwise invisible until a later
+        checkpoint reads a stale/empty briefing. Shape:
         {mtime: <ISO8601 'Z' string of warm-briefing.md's last write, or
-        null if the file is missing>, written_this_session: <true if mtime
-        is at/after this session's session_started_at, false if before,
-        null if session_id was omitted or its marker is unresolvable>,
-        session_section_empty: <true if nothing follows the LAST
-        `^## From this session` heading (EOF immediately after), false if
-        content follows, null if the file has no such heading at all>,
-        note: present whenever the block is NOT confidently non-stale (i.e.
-        absent only when written_this_session is `true` AND
-        session_section_empty is `false`); its wording distinguishes a
-        CONFIRMED-stale finding (written_this_session is `false` OR
-        session_section_empty is `true`) from an UNKNOWN one (neither
-        signal confirms staleness, but at least one is `null`) — a `null`
-        signal is never rendered as a definite claim (#2998 round 3).
-        Advisory only, exactly like the version_control backup fields —
-        never blocks the nap; any internal failure degrades the whole
-        block to `null` rather than raising. See
-        _compute_warm_briefing_advisory for the full predicate.
+        null if the file is missing>, written_since_last_nap: <true if
+        mtime is at/after the last nap/sleep checkpoint already recorded
+        in session_log.md, false if before, null if there was no prior
+        checkpoint yet (e.g. this is the first-ever nap) or its timestamp
+        could not be parsed>, session_section_empty: <true if nothing
+        follows the LAST `^## From this session` heading (EOF immediately
+        after), false if content follows, null if the file has no such
+        heading at all>, note: present whenever the block is NOT
+        confidently non-stale (i.e. absent only when
+        written_since_last_nap is `true` AND session_section_empty is
+        `false`); its wording distinguishes a CONFIRMED-stale finding
+        (written_since_last_nap is `false` OR session_section_empty is
+        `true`) from an UNKNOWN one (neither signal confirms staleness,
+        but at least one is `null`) — a `null` signal is never rendered
+        as a definite claim (#2998 round 3). Advisory only, exactly like
+        the version_control backup fields — never blocks the nap; any
+        internal failure degrades the whole block to `null` rather than
+        raising. See _compute_warm_briefing_advisory for the full
+        predicate.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _nap_impl for full semantics — kept callable with named kwargs for
@@ -2899,7 +2901,19 @@ def engram_nap(payload_json: str) -> str:
         return json.dumps({"error": "payload_json must include required field 'message'"})
     # session_id is consumed here (advisory-only, #2997) — _nap_impl's own
     # signature doesn't accept it, so it must not reach **params below.
+    # As of #3014, session_id is accepted-but-unused: the warm_briefing
+    # advisory no longer depends on session identity (see
+    # _compute_warm_briefing_advisory) — the pop is kept only so existing
+    # callers that still pass session_id don't hit an "unknown field" error.
     session_id = params.pop("session_id", None)
+    # Snapshot the last checkpoint's timestamp BEFORE _nap_impl runs.
+    # _nap_impl -> _checkpoint_internal appends THIS nap's OWN header to
+    # session_log.md, so capturing this AFTER _nap_impl would compare
+    # warm-briefing's mtime against the checkpoint this very call is about
+    # to write, instead of the PREVIOUS one — structurally always
+    # "non-stale" and defeating the #3014 fix. Do not move this call below
+    # _nap_impl.
+    last_checkpoint_at = _last_checkpoint_timestamp(core.LOG_PATH)
     result_dict = json.loads(_nap_impl(**params))
     # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
     # lives in server.py; the lifecycle impl cannot call it directly (acyclic
@@ -2956,7 +2970,7 @@ def engram_nap(payload_json: str) -> str:
     # it rides alongside).
     try:
         result_dict["warm_briefing"] = _compute_warm_briefing_advisory(
-            core.DATA_DIR / "warm-briefing.md", session_id
+            core.DATA_DIR / "warm-briefing.md", last_checkpoint_at
         )
     except Exception:
         result_dict["warm_briefing"] = None
@@ -2971,6 +2985,47 @@ def _nap_impl(message: str) -> str:
     return _lifecycle_mod._nap_impl(message=message)
 
 
+# Matches the checkpoint headers _checkpoint_internal (engram_lifecycle.py)
+# appends to session_log.md on EVERY nap AND every sleep/advance_turn --
+# "## Nap (turn N) — <ts>" for a nap, "## Turn N — <ts>" for a sleep. Both
+# are valid "last checkpoint" anchors for the warm-briefing advisory below
+# (#3014): a sleep also legitimately rotates/erases the "From this session"
+# section (engram-sleep skill), so it counts as a checkpoint just as much
+# as a nap does. <ts> is core._now()[:19] -- a naive-looking but always-UTC
+# string (e.g. "2026-09-19T12:16:00", no offset suffix).
+_CHECKPOINT_HEADER_RE = re.compile(
+    r"^## (?:Nap \(turn \d+\)|Turn \d+) — (\S+)", re.MULTILINE
+)
+
+
+def _last_checkpoint_timestamp(log_path: Path) -> str | None:
+    """Returns the timestamp string from the MOST RECENT nap-or-sleep
+    checkpoint header already present in session_log.md (both `_checkpoint_internal`
+    modes write one — "## Nap (turn N) — <ts>" for a nap, "## Turn N — <ts>"
+    for a sleep/advance_turn), or None if the file doesn't exist, can't be
+    read, or contains no such header yet (e.g. a brand-new install).
+
+    NEVER RAISES -- advisory-only, same philosophy as
+    _compute_warm_briefing_advisory itself.
+
+    Callers MUST call this BEFORE triggering a new checkpoint write (i.e.
+    before _nap_impl / _checkpoint_internal runs) -- _checkpoint_internal
+    appends its OWN header to this same file, so calling this helper
+    afterward would return the checkpoint's own timestamp instead of the
+    PREVIOUS one, making every advisory computation compare a nap against
+    itself (always non-stale, defeating the whole fix).
+    """
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        matches = list(_CHECKPOINT_HEADER_RE.finditer(content))
+        if matches:
+            return matches[-1].group(1)
+    except Exception:
+        pass
+    return None
+
+
 # Anchored, line-start-only match for the warm-briefing "From this session"
 # heading -- mirrors the erase logic's own rule exactly (engram-sleep
 # SKILL.md Step 3 / engram-nap SKILL.md 5b/5c): "line-anchored, never a
@@ -2980,49 +3035,48 @@ def _nap_impl(message: str) -> str:
 _WARM_BRIEFING_SESSION_HEADING_RE = re.compile(r"^## From this session", re.MULTILINE)
 
 
-def _compute_warm_briefing_advisory(warm_briefing_path: Path, session_id: str | None) -> dict:
-    """Advisory-only check (#2997): surface when the engram-nap skill's Step
-    5b (warm-briefing "From this session" sync with the current
-    context-window arc) was skipped this session.
+def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at: str | None) -> dict:
+    """Advisory-only check (#2997, anchor fixed in #3014): surface when the
+    engram-nap skill's Step 5b (warm-briefing "From this session" sync with
+    the current context-window arc) was skipped since the last checkpoint.
 
     Step 5b is agent-executed prose, not code -- there is no write to fail,
-    so a skipped step produces no error and no log line. This computes
-    three independent signals from the warm-briefing file + (optionally)
-    the current session's marker, and folds them into a single `note` the
+    so a skipped step produces no error and no log line. This computes two
+    independent signals from the warm-briefing file + the last-known
+    checkpoint timestamp, and folds them into a single `note` the
     engram-nap skill's Step 3 can print, the same way the pre-existing
     backup-health check surfaces a degrading `version_control` backup.
 
-    NEVER RAISES. Every internal failure (missing file, corrupt/missing
-    session marker, unparseable timestamp, ...) degrades the affected
-    signal to `None` rather than propagating -- advisory-only, exactly
-    like the backup-health check this mirrors. The caller (engram_nap)
-    additionally wraps this call in its own try/except as defense in
-    depth, but this function is itself already safe to call directly.
+    NEVER RAISES. Every internal failure (missing file, unparseable
+    timestamp, ...) degrades the affected signal to `None` rather than
+    propagating -- advisory-only, exactly like the backup-health check this
+    mirrors. The caller (engram_nap) additionally wraps this call in its
+    own try/except as defense in depth, but this function is itself already
+    safe to call directly.
 
     Args:
         warm_briefing_path: path to ~/.engram/warm-briefing.md (or the
             configured data dir's copy).
-        session_id: the CURRENT session's id, as explicitly passed via
-            engram_nap's payload_json `session_id` field -- deliberately
-            NOT read from an environment variable. (Investigated at
-            design time: server.py already reads
-            CLAUDE_SESSION_ID/ANTHROPIC_SESSION_ID elsewhere, but the
-            live harness that ran this investigation carried
-            CLAUDE_CODE_SESSION_ID instead -- a third, different name --
-            so neither existing env-var convention is a reliable source
-            of "the current session" and this function must not guess
-            from one.) `None` when the caller omitted it, in which case
-            `written_this_session` degrades to `None` (can't determine)
+        last_checkpoint_at: the timestamp string of the MOST RECENT
+            nap-or-sleep checkpoint already present in session_log.md,
+            snapshotted via `_last_checkpoint_timestamp` BEFORE the
+            current checkpoint's own header is appended (see that
+            function's docstring for why the ordering matters -- calling
+            it after _nap_impl/_checkpoint_internal runs would return the
+            CURRENT checkpoint's own timestamp instead of the PREVIOUS
+            one, making this signal structurally always non-stale).
+            `None` when there is no prior checkpoint in session_log.md at
+            all (e.g. a fresh install's first-ever nap), in which case
+            `written_since_last_nap` degrades to `None` (can't determine)
             rather than being guessed.
 
     Returns:
         {"mtime": <ISO8601 '...Z' string of warm_briefing_path's last
             write, or None if the file doesn't exist / isn't stat-able>,
-         "written_this_session": <True if mtime is at/after the resolved
-            session's session_started_at, False if strictly before, None
-            if session_id was omitted, fails the path-traversal allowlist,
-            has no resolvable marker, or the marker lacks a usable
-            timestamp>,
+         "written_since_last_nap": <True if mtime is at/after
+            last_checkpoint_at, False if strictly before, None if
+            last_checkpoint_at was None (no prior checkpoint yet) or its
+            timestamp could not be parsed>,
          "session_section_empty": <True if nothing but whitespace follows
             the LAST `^## From this session` heading through EOF, False
             if real content follows, None if the file has no such heading
@@ -3036,50 +3090,53 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, session_id: str | 
     Three-way, not binary -- staying silent still requires two independent
     positive confirmations, but an unconfirmed signal is no longer rendered
     as a confirmed one (#2998 round 3 -- the colleague review's blocker: a
-    `None` written_this_session, e.g. because session_id was omitted, used
-    to produce the exact same note text as a CONFIRMED-stale
-    written_this_session=False, asserting a fact the code had explicitly
-    declined to determine):
+    `None` written_since_last_nap, e.g. because there's no prior checkpoint
+    yet, used to produce the exact same note text as a CONFIRMED-stale
+    written_since_last_nap=False, asserting a fact the code had explicitly
+    declined to determine -- the same invariant carries forward under the
+    #3014 anchor change below):
 
-    - SILENT (no `note` key at all): written_this_session is True AND
+    - SILENT (no `note` key at all): written_since_last_nap is True AND
       session_section_empty is False -- both confidently non-stale.
     - CONFIRMED-stale (`note` = "Step 5b not performed this session", the
-      original text, unchanged): written_this_session is False OR
+      original text, unchanged): written_since_last_nap is False OR
       session_section_empty is True -- at least one signal is a definite
       negative/positive-for-staleness. This takes PRECEDENCE over the
       unknown case below when both are simultaneously present (e.g.
-      written_this_session=False and session_section_empty=None) -- a
+      written_since_last_nap=False and session_section_empty=None) -- a
       confirmed problem is more actionable than "can't tell," and a
       genuinely-confirmed defect should not be diluted into uncertainty
       language just because a separate, independent signal happens to be
       undetermined.
     - UNKNOWN (`note` states what specifically couldn't be determined,
-      e.g. "could not determine whether Step 5b ran (no session_id
-      passed)"): everything else -- neither signal confirms staleness, but
-      at least one is None. written_this_session and session_section_empty
-      can each independently be None for different reasons (no session_id
-      passed / an unresolvable session marker, vs. no `## From this
-      session` heading found at all), so the message is composed from
-      whichever signal(s) are actually None rather than a single hardcoded
-      reason.
+      e.g. "could not determine whether Step 5b ran (no prior checkpoint
+      found in session_log.md)"): everything else -- neither signal
+      confirms staleness, but at least one is None. written_since_last_nap
+      and session_section_empty can each independently be None for
+      different reasons (no prior checkpoint / an unparseable timestamp,
+      vs. no `## From this session` heading found at all), so the message
+      is composed from whichever signal(s) are actually None rather than a
+      single hardcoded reason.
+
+    #3014 -- why the anchor changed from session-start to last-checkpoint:
+    a session can run for many hours across many naps and a compaction, and
+    the OLD anchor (session_started_at, read from a per-session marker
+    file) never changed across any of that -- so ONE early write of
+    warm-briefing.md satisfied "written this session" for the rest of a
+    long session, even when Step 5b was skipped on every subsequent nap,
+    and compaction (which does not change session_id) never reset it
+    either. The NEW anchor -- the timestamp of the last nap-or-sleep
+    checkpoint already in session_log.md -- is per-checkpoint rather than
+    per-session, so the advisory correctly re-arms after every nap and
+    naturally covers the compaction case too (a post-compaction nap still
+    compares against the PRIOR nap's timestamp, not session start).
     """
     result: dict = {
         "mtime": None,
-        "written_this_session": None,
+        "written_since_last_nap": None,
         "session_section_empty": None,
     }
     try:
-        # session_id is documented as str | None, but nothing upstream
-        # enforces that at the JSON-payload boundary -- a caller could pass
-        # any JSON value (int, list, dict, bool, ...) through engram_nap's
-        # payload_json session_id field, and _SESSION_ID_RE.fullmatch()
-        # below raises TypeError on a non-str input. Treat anything that
-        # isn't a string identically to "session_id omitted" (None) --
-        # matches this function's own "prefer null over guessing"
-        # philosophy (#2998 review round 1).
-        if not isinstance(session_id, str):
-            session_id = None
-
         mtime_epoch = None
         try:
             mtime_epoch = os.path.getmtime(warm_briefing_path)
@@ -3090,50 +3147,40 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, session_id: str | 
         except OSError:
             pass
 
-        # written_this_session: needs BOTH a real mtime and a resolvable
-        # session_started_at for this session_id. Any missing piece leaves
-        # this None (can't determine) rather than guessed. Independently
-        # wrapped (own try/except, beyond the narrower inner ones below for
-        # its own known failure modes) so that ANY failure here -- known or
-        # not -- degrades only this one signal and can never skip the
-        # structurally-independent session_section_empty computation or the
-        # note assignment below (#2998 review round 1).
+        # written_since_last_nap: needs BOTH a real mtime and a parseable
+        # last_checkpoint_at. Any missing piece leaves this None (can't
+        # determine) rather than guessed. Independently wrapped so that ANY
+        # failure here -- known or not -- degrades only this one signal and
+        # can never skip the structurally-independent session_section_empty
+        # computation or the note assignment below (#2998 review round 1;
+        # carried forward under the #3014 anchor change).
         try:
-            if session_id and mtime_epoch is not None:
-                session_started_at = None
+            if last_checkpoint_at and mtime_epoch is not None:
                 try:
-                    # Same path-traversal allowlist gate _resolve_session_transcript
-                    # uses (engram_observation.py) -- session_id is untrusted input
-                    # used to build a filesystem path, so this MUST run before any
-                    # access, not merely rely on the marker file not existing.
-                    if _observation_mod._SESSION_ID_RE.fullmatch(session_id):
-                        marker_path = core.DATA_DIR / "sessions" / f"{session_id}.json"
-                        with open(marker_path, "r", encoding="utf-8") as f:
-                            marker = json.load(f)
-                        if isinstance(marker, dict):
-                            session_started_at = marker.get("session_started_at")
-                except (OSError, json.JSONDecodeError):
-                    session_started_at = None
-
-                if session_started_at:
-                    try:
-                        started_dt = datetime.fromisoformat(
-                            session_started_at.replace("Z", "+00:00")
-                        )
-                        result["written_this_session"] = mtime_epoch >= started_dt.timestamp()
-                    except (ValueError, AttributeError, TypeError):
-                        pass  # unparseable timestamp -- stays None
+                    last_dt = datetime.fromisoformat(last_checkpoint_at)
+                    if last_dt.tzinfo is None:
+                        # _checkpoint_internal writes a naive-looking string
+                        # (core._now()[:19] drops the offset suffix) that
+                        # IS UTC -- attach tzinfo explicitly before calling
+                        # .timestamp(), or a naive datetime is treated as
+                        # LOCAL time and silently produces the wrong epoch
+                        # on any non-UTC TZ (#3014).
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    result["written_since_last_nap"] = mtime_epoch >= last_dt.timestamp()
+                except (ValueError, AttributeError, TypeError):
+                    pass  # unparseable timestamp -- stays None
         except Exception:
-            # Unanticipated failure computing written_this_session --
+            # Unanticipated failure computing written_since_last_nap --
             # degrade this signal to None only; session_section_empty and
             # the note assignment below must still run.
             pass
 
         # session_section_empty: last-anchored-match, never a substring
         # search or a first-match -- mirrors the erase logic exactly.
-        # Independently wrapped for the same reason as written_this_session
-        # above -- this signal has nothing to do with session_id and must
-        # always get a chance to run regardless of what happened above.
+        # Independently wrapped for the same reason as
+        # written_since_last_nap above -- this signal has nothing to do
+        # with the checkpoint anchor and must always get a chance to run
+        # regardless of what happened above.
         try:
             with open(warm_briefing_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -3151,11 +3198,11 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, session_id: str | 
         # either signal computation above raised, not merely reachable when
         # nothing upstream raised. See the docstring's "`note` condition"
         # section above for the full three-way reasoning.
-        wts = result["written_this_session"]
+        wsn = result["written_since_last_nap"]
         sse = result["session_section_empty"]
-        if wts is True and sse is False:
+        if wsn is True and sse is False:
             pass  # both confidently non-stale -- stay silent, no `note` key
-        elif wts is False or sse is True:
+        elif wsn is False or sse is True:
             # At least one signal is a CONFIRMED negative (or positive-for-
             # staleness) -- definite evidence Step 5b was skipped (or the
             # session section reads empty). Takes precedence over the
@@ -3168,13 +3215,13 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, session_id: str | 
             # signal is None (undetermined) and neither is a confirmed
             # negative. State what's actually unknown rather than asserting
             # a false definite claim (#2998 round 3 -- a None
-            # written_this_session used to render identically to a
+            # written_since_last_nap used to render identically to a
             # confirmed False here).
             unknown_parts = []
-            if wts is None:
+            if wsn is None:
                 unknown_parts.append(
-                    "no session_id passed" if session_id is None
-                    else "this session's start time could not be resolved"
+                    "no prior checkpoint found in session_log.md" if last_checkpoint_at is None
+                    else "the last checkpoint's timestamp could not be parsed"
                 )
             if sse is None:
                 unknown_parts.append("no '## From this session' heading found")
