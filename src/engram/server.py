@@ -3142,8 +3142,9 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
 
     - SILENT (no `note` key at all): written_since_last_nap is True AND
       session_section_empty is False -- both confidently non-stale.
-    - CONFIRMED-stale (`note` = "Step 5b not performed this session", the
-      original text, unchanged): written_since_last_nap is False OR
+    - CONFIRMED-stale (`note` = "Step 5b not performed since the last
+      checkpoint" -- wording tracks the #3014 checkpoint anchor, see below):
+      written_since_last_nap is False OR
       session_section_empty is True -- at least one signal is a definite
       negative/positive-for-staleness. This takes PRECEDENCE over the
       unknown case below when both are simultaneously present (e.g.
@@ -3253,7 +3254,7 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
             # unknown branch below even when the OTHER signal is also
             # None: a confirmed problem is real regardless of what a
             # separate, independent signal couldn't determine.
-            result["note"] = "Step 5b not performed this session"
+            result["note"] = "Step 5b not performed since the last checkpoint"
         else:
             # Neither confidently-clear nor confirmed-stale -- at least one
             # signal is None (undetermined) and neither is a confirmed

@@ -59,8 +59,8 @@ two are derived from, not a third independent staleness signal.)
 #3014 anchor): silent (no `note` key) requires BOTH signals to be
 confidently non-stale (written_since_last_nap is True AND
 session_section_empty is False); a CONFIRMED-stale note ("Step 5b not
-performed this session") fires when written_since_last_nap is False OR
-session_section_empty is True; an UNKNOWN note (states which signal(s)
+performed since the last checkpoint") fires when written_since_last_nap
+is False OR session_section_empty is True; an UNKNOWN note (states which signal(s)
 couldn't be determined, e.g. "could not determine whether Step 5b ran (no
 prior checkpoint found in session_log.md)") fires for everything else --
 i.e. when neither signal confirms staleness but at least one is None.
@@ -542,7 +542,7 @@ def test_note_present_when_written_since_last_nap_false(tmp_path):
     result = server._compute_warm_briefing_advisory(wb_path, _ts(last_checkpoint))
     assert result["written_since_last_nap"] is False, result
     assert result["session_section_empty"] is False, result
-    assert result.get("note") == "Step 5b not performed this session", result
+    assert result.get("note") == "Step 5b not performed since the last checkpoint", result
 
 
 def test_note_present_when_session_section_empty_true(tmp_path):
@@ -556,7 +556,7 @@ def test_note_present_when_session_section_empty_true(tmp_path):
     result = server._compute_warm_briefing_advisory(wb_path, _ts(last_checkpoint))
     assert result["written_since_last_nap"] is True, result
     assert result["session_section_empty"] is True, result
-    assert result.get("note") == "Step 5b not performed this session", result
+    assert result.get("note") == "Step 5b not performed since the last checkpoint", result
 
 
 def test_note_present_when_both_signals_unknown():
@@ -586,10 +586,10 @@ def test_note_omitted_last_checkpoint_on_genuinely_updated_file_is_unknown_not_s
     checkpoint yet (written_since_last_nap -> None, can't determine --
     e.g. this is the very first nap ever) must NOT read as confirmed-stale
     -- nothing here has been confirmed stale; the honest note is "can't
-    tell", not "Step 5b not performed this session". Pre-fix (under the
-    OLD session-start anchor), the analogous case rendered byte-identically
-    to a confirmed False; the same invariant is pinned here for the new
-    anchor."""
+    tell", not "Step 5b not performed since the last checkpoint". Pre-fix
+    (under the OLD session-start anchor), the analogous case rendered
+    byte-identically to a confirmed False; the same invariant is pinned
+    here for the new anchor."""
     server = fresh_server()
     wb_path = Path(tempfile.mkdtemp()) / "warm-briefing.md"
     wb_path.write_text(
@@ -603,7 +603,7 @@ def test_note_omitted_last_checkpoint_on_genuinely_updated_file_is_unknown_not_s
     assert "note" in result, (
         f"unknown must still emit SOME note -- never a silent 'all clear'; got {result}"
     )
-    assert result["note"] != "Step 5b not performed this session", (
+    assert result["note"] != "Step 5b not performed since the last checkpoint", (
         f"REGRESSION: an undetermined written_since_last_nap must not render "
         f"as the confirmed-stale claim; got {result}"
     )
@@ -754,7 +754,7 @@ def test_two_nap_falsifier_second_nap_detects_stale_section_left_untouched():
         f"checkpoint, so nap #2 must read written_since_last_nap=False -- "
         f"pre-fix, this stayed silently True (session-start anchor); got {wb2}"
     )
-    assert wb2.get("note") == "Step 5b not performed this session", (
+    assert wb2.get("note") == "Step 5b not performed since the last checkpoint", (
         f"THE bug this issue exists to fix: the SECOND nap must not stay "
         f"silent just because Step 5b ran (or didn't) earlier in the same "
         f"session -- got {wb2}"
@@ -803,4 +803,99 @@ def test_two_nap_falsifier_positive_control_second_nap_stays_silent_on_real_upda
     assert "note" not in wb2, (
         f"both signals are confidently non-stale -- note must be ABSENT "
         f"(silent success), not present; got {wb2}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3030 regression: the note wording, in the ONE case that makes it
+# observable. Neither the unit tests above (no session concept at all,
+# post-#3014) nor the two-nap falsifier/positive-control pair just above
+# (both force warm-briefing's mtime an hour into the past -- stale from
+# BEFORE the session as well as before the checkpoint) exercise this case.
+# ---------------------------------------------------------------------------
+
+def test_three_nap_regression_note_wording_true_under_both_anchors():
+    """#3030: warm-briefing rotated ONCE, mid-session, then a further nap
+    happens with no further rotation -- the ordinary steady state in real
+    use, and the one region this file's existing tests never reach.
+
+    Sequence (modeled on
+    test_two_nap_falsifier_second_nap_detects_stale_section_left_untouched
+    above, but instead of forcing mtime an hour into the past before ANY
+    checkpoint, the rotation happens strictly AFTER the first checkpoint):
+    nap #1 -> rotate warm-briefing (mtime just after nap #1's own
+    checkpoint) -> nap #2 -> touch nothing -> nap #3.
+
+    At nap #3, warm-briefing.md's mtime is AFTER nap #1's checkpoint (so
+    the file genuinely WAS written "this session") but BEFORE nap #2's
+    checkpoint (the LAST one) -- so written_since_last_nap must read
+    False. This is precisely the case where the two candidate note strings
+    diverge: "Step 5b not performed this session" is FALSE (it manifestly
+    was performed, right after nap #1), while "Step 5b not performed since
+    the last checkpoint" is true. Pre-#3030, the code emitted the former
+    unconditionally on this branch; this test pins the corrected string
+    and, via the note below, documents why the old one would have failed
+    here."""
+    server = fresh_server()
+    wb_path = server.core.DATA_DIR / "warm-briefing.md"
+    wb_path.write_text(
+        "# Warm Briefing\n\n## From this session\n\nPre-session stale content.\n",
+        encoding="utf-8",
+    )
+    _touch_at(wb_path, datetime.now(timezone.utc) - timedelta(hours=1))
+
+    # --- Nap #1: no prior checkpoint yet. ---
+    r1 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "first nap"})))
+    assert "error" not in r1, f"nap #1 returned an error: {r1}"
+
+    # --- Step 5b performed once, immediately after nap #1 (mtime = real
+    #     "now", which postdates nap #1's own just-written checkpoint). A
+    #     real (not simulated) sleep follows, crossing at least one whole
+    #     second boundary -- checkpoint timestamps truncate to whole
+    #     seconds (core._now()[:19]), so nap #2's checkpoint must be
+    #     forced to land in a LATER second than this write, or nap #2's
+    #     real-time checkpoint could tie or precede it and defeat the
+    #     ordering this test depends on. ---
+    wb_path.write_text(
+        "# Warm Briefing\n\n## From this session\n\nRotated once, right after nap #1.\n",
+        encoding="utf-8",
+    )
+    time.sleep(1.1)
+
+    # --- Nap #2: sanity check -- the rotation above must register as
+    #     written-since-nap-#1 (confirms the fixture is set up correctly
+    #     before we move on to the actual discriminating nap). ---
+    r2 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "second nap"})))
+    assert "error" not in r2, f"nap #2 returned an error: {r2}"
+    wb2 = r2["warm_briefing"]
+    assert wb2["written_since_last_nap"] is True, (
+        f"warm-briefing was rotated after nap #1's checkpoint -- nap #2 "
+        f"must read written_since_last_nap=True; got {wb2}"
+    )
+    assert "note" not in wb2, (
+        f"nap #2 sees a genuine post-checkpoint rotation -- must stay "
+        f"silent; got {wb2}"
+    )
+
+    # --- warm-briefing.md is deliberately left untouched between nap #2
+    #     and nap #3 (Step 5b skipped after nap #2). ---
+
+    # --- Nap #3: THE discriminating case. warm-briefing's mtime is after
+    #     nap #1's checkpoint (written "this session") but before nap #2's
+    #     checkpoint (the LAST one) -- the increment #3014's anchor change
+    #     added, and the one place the pre-#3030 note text was false. ---
+    r3 = json.loads(server.engram_nap(payload_json=json.dumps({"message": "third nap"})))
+    assert "error" not in r3, f"nap #3 returned an error: {r3}"
+    wb3 = r3["warm_briefing"]
+    assert wb3["written_since_last_nap"] is False, (
+        f"warm-briefing's mtime predates nap #2's checkpoint (the LAST "
+        f"one) even though it postdates nap #1's -- nap #3 must read "
+        f"written_since_last_nap=False; got {wb3}"
+    )
+    assert wb3.get("note") == "Step 5b not performed since the last checkpoint", (
+        f"#3030 REGRESSION: the pre-fix string 'Step 5b not performed "
+        f"this session' would have been FALSE in exactly this case -- the "
+        f"file WAS written this session (right after nap #1); it merely "
+        f"predates the LAST checkpoint (nap #2's). The corrected wording "
+        f"must be true under both anchors; got {wb3}"
     )

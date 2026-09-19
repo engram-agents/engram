@@ -34,6 +34,14 @@ with an `-alpha` suffix during the alpha phase.
   the advisory now compares against the most recent one instead of the
   per-session marker, re-arming after every nap and naturally covering the
   compaction case (#3017, closes #3014).
+- **Nap advisory's CONFIRMED-stale note text updated to match the #3014
+  anchor.** #3014 moved the anchor from session-start to last-checkpoint
+  and renamed the field (`written_this_session` → `written_since_last_nap`),
+  but left the emitted note string reading "Step 5b not performed this
+  session" — false on exactly the cases #3014 newly catches (written since
+  session start, but before the last checkpoint). Now reads "Step 5b not
+  performed since the last checkpoint," true under both anchors (closes
+  #3030).
 - **Boot charge's monitor-liveness check reads the monitor's stdout target,
   not just process presence.** `pgrep` certifies a monitor process alive
   even when its stdout was armed to a dead end (a detached `nohup … > file`
