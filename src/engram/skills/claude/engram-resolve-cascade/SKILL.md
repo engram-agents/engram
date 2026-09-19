@@ -146,6 +146,31 @@ and the derivation walk never reaches them any other way. **This means the
 frontier can grow underneath you across a resolution** — re-read the frontier
 after each call in a sweep rather than assuming one pass drains it.
 
+**Citation count is never a reason to hesitate on a frontier node — say this
+plainly, because agents (and the dream-master) have hesitated on exactly this
+basis in practice.** (Scoped to ordinary claim-bearing citers, i.e. the usual
+case this paragraph is about — a different, disjoint class from the
+contradiction-cascade exception just above: that one concerns non-claim-bearing
+contradiction nodes reached by a dedicated event, and is unaffected by
+anything below.) A frontier node's entire downstream-reachable set was
+already marked pending by the SAME root event that put the node itself on the
+frontier, at the moment that event first fired — not incrementally, one hop
+at a time, as each frontier node gets resolved later. The sentence above
+("the derivation cascade does NOT re-fire on resolution") is not just a
+mechanical footnote — it is the reason a frontier node's citation count is
+irrelevant to the cost of resolving it. A node with 20 citers costs exactly
+the same to resolve as one with none: nothing downstream can acquire a
+*second* marker from your `engram_cascade_resolve` call, ever, by
+construction. If a thought along the lines of *"this node is heavily cited —
+let me register-and-defer rather than resolve it now, to avoid triggering a
+big blast radius"* shows up, that thought is factually wrong, not prudent —
+treat it as a bug to correct, not a caution to honor. (Confirmed in practice,
+not just by design: a session that hesitated on a heavily-cited frontier node
+for precisely this reason resolved it anyway and confirmed 0 new markers —
+the citers were already covered by the original root event, as they always
+are. The maintainer's ruling on the incident: the hesitation itself was "the
+real friction showing up in practice," not a signal to heed.)
+
 A node not on the frontier is refused, naming its blocking ancestors — its
 eligible shapes are a function of how ALL its premises resolve, so they
 aren't knowable until the ancestors resolve first.
@@ -298,9 +323,13 @@ not diligence.
 Three dispositions, in order of preference:
 
 1. **Resolve** — the overwhelming default. Given enough evidence to judge,
-   adjudicate — including high-confidence, load-bearing nodes. That a
-   derivation is load-bearing is a reason to resolve it *carefully*, not a
-   reason to outsource the call.
+   adjudicate — including high-confidence, load-bearing, or heavily-cited
+   nodes. That a derivation is load-bearing or widely cited is a reason to
+   resolve it *carefully*, not a reason to defer it or outsource the call —
+   see the blast-radius callout in Adjudication above: resolving a frontier
+   node never costs more markers no matter how many nodes cite it, so
+   citation count is not a legitimate input to this disposition choice at
+   all.
 
 2. **Leave open** — when the evidence genuinely doesn't settle it. A pending
    marker is honest state, not a failure: more evidence arrives, and the

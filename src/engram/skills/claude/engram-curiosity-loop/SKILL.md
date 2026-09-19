@@ -111,7 +111,7 @@ At the end of each iteration, honestly assess:
 ### 5. Record and iterate
 
 - File a feeling report if any moment produced a distinct internal state
-- If stopping: run a nap checkpoint (`engram_nap()`) and report results
+- If stopping: run a nap checkpoint (`engram_checkpoint()`) and report results
 - If continuing: briefly note what the next iteration will investigate, then continue
 
 ---

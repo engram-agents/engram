@@ -640,13 +640,15 @@ hand-edit; *(restart)* = takes effect after a Claude Code restart.
 
 ## Viewing the graph
 
-A stdlib-only D3 visualizer ships at the plugin root,
-`~/.engram/marketplace/plugins/engram/viz_server.py`:
+A stdlib-only D3 visualizer ships as the `viz/` package at the plugin
+root, `~/.engram/marketplace/plugins/engram/viz/`. It uses relative
+imports, so run it as a module with that directory as your working
+directory (not as a direct script path):
 
 ```bash
-VIZ=~/.engram/marketplace/plugins/engram/viz_server.py
-python3 "$VIZ"                       # default port 5001
-python3 "$VIZ" --port 8080 --db /path/to/knowledge.db
+cd ~/.engram/marketplace/plugins/engram
+python3 -m viz.server                       # default port 5001
+python3 -m viz.server --port 8080 --db /path/to/knowledge.db
 ```
 
 Open `http://localhost:5001` (graph) or `/health` (dashboard). Leave it running in a

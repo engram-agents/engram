@@ -47,7 +47,13 @@ class ProjectAlreadyExists(Exception):
 
 
 class NotAParticipant(Exception):
-    """Raised by ``add_participant`` when ``agent`` is not a current participant.
+    """Raised when ``agent`` lacks the standing a write-fn requires.
+
+    ``add_participant`` raises it when ``agent`` is not a current participant.
+    ``set_colleague`` (#2764) raises it under the slightly wider test "neither
+    a current participant NOR the current turn holder" — each write-fn's own
+    docstring states its exact test; this exception is the shared signal, not
+    the shared authorization rule.
 
     Server-side authorization guard — LOAD-BEARING, unlike the validation in
     every other write-fn in this module (documented there as "the caller's
@@ -665,6 +671,126 @@ def add_participant(
     return seq, True
 
 
+def set_colleague(
+    store: CoordinationStore,
+    allocator: SeqAllocator,
+    project_id: str,
+    *,
+    agent: str,
+    colleague: str,
+    ts: Optional[str] = None,
+) -> tuple[int, bool]:
+    """Set (or change) the ``colleague:`` field on a project baton; return ``(seq, participant_added)``.
+
+    Pure write body of ``baton cmd_set_colleague`` (#2764). Persists
+    ``colleague:`` in frontmatter — visible via ``baton show`` from this call
+    onward, closing the "set-once and invisible" gap ``--colleague`` at init
+    time had (that flag only ever influenced ``participants`` and a
+    client-side print; nothing was stored server-side, so nothing could ever
+    be read back). Also adds ``colleague`` to ``participants`` (dedup) in the
+    SAME atomic write, exactly the behavior ``--colleague`` already has at
+    init — this is what actually closes the friction #2764 was filed for
+    (a colleague assigned post-init had no way in: ``add_participant``
+    requires the CALLER to already be a participant, so the newly-named
+    colleague couldn't add themselves, and the baton's actual holder had no
+    verb to do it for them). After this call the colleague is already a
+    participant, so nobody needs to self-add.
+
+    Server-side authorization (LOAD-BEARING, same shape as
+    ``add_participant``'s ``NotAParticipant``): ``agent`` must be EITHER a
+    current participant OR the current turn holder (``fields["turn"]``) —
+    the OR-holder half matters because a PR baton's turn can legitimately be
+    the pool sentinel without the sentinel being a listed participant (that
+    is exactly the "ready for the maintainer" state a flip-to-sentinel
+    produces), and the maintainer must be able to set/confirm the colleague
+    from that seat. This check lives HERE, not in the CLI, for the same
+    reason ``add_participant``'s does: a CLI-only check is bypassable by a
+    direct API call.
+
+    Always writes (unlike ``add_participant``'s dedup no-op): re-asserting
+    the same colleague value is still a real, logged event — the caller may
+    be intentionally re-confirming after some doubt about who the gate
+    targets. Mirrors ``anchor()``'s always-write, set-vs-updated log shape.
+
+    Scope note (documented here so it isn't re-litigated at the flip site):
+    this does NOT change the flip-time colleague-gate's own computation
+    (``_colleague_participants`` in ``tools/baton.py``, "any participant who
+    is neither the current holder nor the sentinel") — that stays a
+    participants-derived heuristic. #2764 is about making the colleague
+    identity settable and visible after init, not about changing how
+    flip decides whether a colleague review is required.
+
+    Decided-and-documented (#2764's third ask): a colleague named only in a
+    flip reason's free text, or informally by the merge seat in a comment,
+    does NOT get authorized to ``add_participant`` themselves — free text is
+    not structured data the server can act on, and widening self-add
+    authority to cover it would be a much larger, fuzzier authorization
+    change than this feature calls for. The fix for the friction is this
+    function: the baton's holder (or an existing participant) calls
+    ``set_colleague``, which mechanically grants access in one atomic step.
+    There is no supported "just add yourself because someone mentioned you"
+    path, before or after #2764.
+
+    Log format: ``- {ts} {agent} set colleague → {colleague}`` (first set) or
+    ``- {ts} {agent} changed colleague from "{old}" to "{new}"`` (update) —
+    same two-case shape as ``anchor()``.
+
+    Args:
+        agent: the agent performing the set; must already be a participant
+            or the current turn holder.
+        colleague: the agent name to set as colleague (normalised to
+            lowercase).
+        ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
+
+    Returns:
+        ``(seq, participant_added)`` — ``seq`` is the seq of this mutation;
+        ``participant_added`` is ``True`` iff ``colleague`` was newly added
+        to ``participants`` by this call.
+
+    Raises:
+        ProjectNotFound: if ``project_id`` has no existing baton file.
+        NotAParticipant: if ``agent`` is neither a current participant nor
+            the current turn holder of the baton.
+    """
+    content = store.read_project(project_id)
+    if content is None:
+        raise ProjectNotFound(project_id)
+
+    fields, _ = md.parse_frontmatter(content)
+    current_turn = fields.get("turn", "").strip().lower()
+    current_participants = _parse_participants(fields.get("participants", ""))
+
+    agent_n = agent.strip().lower()
+    if agent_n != current_turn and agent_n not in current_participants:
+        raise NotAParticipant(agent_n)
+
+    colleague_n = colleague.strip().lower()
+    old_colleague = fields.get("colleague", "").strip()
+
+    updates = {"colleague": colleague_n}
+    participant_added = colleague_n not in current_participants
+    if participant_added:
+        new_participants = list(current_participants) + [colleague_n]
+        updates["participants"] = _format_participants(new_participants)
+
+    now = ts or md.now_iso()
+    updated = md.update_frontmatter(content, updates)
+    _, body = md.parse_frontmatter(updated)
+    if old_colleague:
+        log_entry = (
+            f'- {now} {agent_n} changed colleague from "{old_colleague}" '
+            f'to "{colleague_n}"'
+        )
+    else:
+        log_entry = f"- {now} {agent_n} set colleague → {colleague_n}"
+    body = md.append_turn_log(body, log_entry)
+    final = md.reattach_frontmatter(updated, body)
+
+    with allocator.allocate() as seq:
+        store.write_project(project_id, final, seq=seq)
+    return seq, participant_added
+
+
 def init(
     store: CoordinationStore,
     allocator: SeqAllocator,
@@ -677,6 +803,8 @@ def init(
     turn_reason: str,
     by_agent: str = "",
     github: Optional[str] = None,
+    colleague: Optional[str] = None,
+    author: Optional[str] = None,
     ts: Optional[str] = None,
 ) -> int:
     """Create a new project baton from scratch; return the assigned seq.
@@ -689,7 +817,7 @@ def init(
     title constraints) is the caller's job.
 
     Frontmatter field order mirrors ``baton cmd_init``:
-      project / title / status / turn / turn_since / turn_reason / turn_by / participants / github (optional)
+      project / title / status / turn / turn_since / turn_reason / turn_by / participants / github (optional) / colleague (optional) / author (optional)
 
     Log format: ``- {ts} initialized → {turn}: {turn_reason}``
 
@@ -698,12 +826,45 @@ def init(
         status: initial status (e.g. ``"in-progress"``, ``"planning"``).
         turn: initial turn holder (lowercase, already validated by caller).
         participants: list of participant names (lowercase, already validated).
+            When ``colleague`` names an agent not already in this list, the
+            CLI is responsible for having added it before calling (mirrors
+            ``add_participant``'s split: this fn persists, the caller dedups).
         turn_reason: human-readable reason for initial turn assignment.
         by_agent: the agent performing the init (normalised to lowercase) —
             the initor, NOT necessarily the same as ``turn`` (one agent may
             init a baton with the turn assigned to someone else). Defaults to
             ``""`` (actor unknown) for back-compat with pre-existing callers.
         github: optional GitHub anchor (e.g. ``"pr/490"`` or ``"project/4"``).
+        colleague: optional expected-colleague-reviewer name (#2764). Persisted
+            verbatim (lowercased/stripped) as the ``colleague:`` frontmatter
+            field, so it is visible on ``baton show`` from creation onward —
+            pre-#2764, ``--colleague`` at init only influenced ``participants``
+            and a client-side print; nothing was ever stored server-side, which
+            is why ``baton show`` could never render it. Purely descriptive:
+            does NOT change the flip-time colleague-gate, which still computes
+            "is there a non-author, non-sentinel participant" from
+            ``participants`` alone (unchanged scope — #2764 is about
+            visibility/settability of the colleague identity, not
+            enforcement).
+        author: optional PR-author identity (#2961), persisted verbatim
+            (lowercased/stripped) as the ``author:`` frontmatter field and
+            never touched again by ``flip``/``claim``/``release`` (unlike
+            ``turn_by``, which is overwritten on every turn-change to record
+            the ACTOR, not the original author — the exact reason ``turn_by``
+            cannot serve as an author proxy past the first flip). Consumed by
+            ``_is_maintainer_flip`` to exempt a colleague's "send it back to
+            the author after a blocker" flip from the merge-presentation gate
+            — that flip target matches neither the self-flip nor the
+            flip-to-colleague exemption, so without this field it was
+            misclassified as presenting-for-merge and demanded an approval
+            that cannot exist (the colleague is the one objecting). The
+            caller (``cmd_init``) is responsible for supplying the right
+            value — the established convention is the initial ``turn``
+            holder, since a PR baton is normally initialized by its own
+            author with ``turn`` pointing at themselves. Omitted (``None`` /
+            falsy) on an existing baton created before this field existed —
+            ``_is_maintainer_flip`` treats a missing author as "no exemption
+            available," identical to pre-#2961 behavior, not as an error.
         ts: timestamp override (for tests / replay); defaults to ``now_iso()``.
 
     Returns:
@@ -736,6 +897,10 @@ def init(
     ]
     if github:
         fm_lines.append(f"github: {github}")
+    if colleague:
+        fm_lines.append(f"colleague: {colleague.strip().lower()}")
+    if author:
+        fm_lines.append(f"author: {author.strip().lower()}")
     fm_lines.append("---")
     fm_lines.append("")
 

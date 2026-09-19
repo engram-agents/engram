@@ -25,8 +25,25 @@ Bucket names match the dream-master's action categories:
   task_closures       — engram_update_task calls (Category 8 stale-task-ref closures)
   coverage_gaps       — Category 9 cornerstone auto-load surface gaps (human-action items)
 
-Suggestion-string → bucket routing uses the SUGGESTION_ROUTING table below;
-add new entries when the dream-fairy spec adds new suggestion types.
+Routing (alpha#2987): a finding's bucket is decided in three tiers, most
+authoritative first —
+
+  1. An explicit per-finding ``bucket`` field, when present and a valid
+     bucket name (future-proofing for a structured fairy/dream-master
+     contract; no fairy emits this yet).
+  2. The finding's REPORT-level ``category`` (1-12), via CATEGORY_TO_BUCKET,
+     for categories whose dream-fairy definition is inherently single-purpose
+     (7/8/9 today — a Category-7 finding is *always* an edge-wiring
+     suggestion by definition of the category, independent of how the
+     dream-master happens to phrase it in ``suggestion`` text).
+  3. SUGGESTION_ROUTING below — regex over ``finding["suggestion"]`` prose.
+     Kept as the fallback for heterogeneous categories (1/2/3/4/5/6, which
+     can each produce more than one action type) and for any finding whose
+     report omits ``category``.
+
+Add new SUGGESTION_ROUTING entries when the dream-fairy spec adds new
+suggestion types; add a CATEGORY_TO_BUCKET entry only when a category is
+architecturally 1:1 with a single bucket, never as a probabilistic default.
 """
 
 from __future__ import annotations
@@ -65,7 +82,29 @@ ALL_BUCKET_NAMES = (
 )
 
 # ---------------------------------------------------------------------------
-# Suggestion-string → bucket routing table
+# Category → bucket map (alpha#2987) — tier 2 of the three-tier routing above.
+# ---------------------------------------------------------------------------
+# Only categories that are ARCHITECTURALLY 1:1 with a single bucket belong
+# here — i.e. every finding the category's dream-fairy definition can
+# produce maps to the same action, regardless of suggestion phrasing.
+# Categories 1/2/3/4/5/6 are heterogeneous (a Category-1 open-question
+# finding may resolve, or may recommend no action at all) and are
+# deliberately NOT listed — they stay on the SUGGESTION_ROUTING fallback.
+# Categories 11/12 are ALSO deliberately excluded, for a different reason:
+# both require per-finding multi-way adjudication (Category 11: rewire /
+# leave-unanchored / retract; Category 12: no bulk path by design — the
+# generalization direction is a judgment call the bucket-loop can't express)
+# and are handled entirely outside bucket_findings()/ALL_BUCKET_NAMES — see
+# engram-dream-master.md's "What's in your domain" section, not this map.
+
+CATEGORY_TO_BUCKET: dict[int, str] = {
+    7: BUCKET_EDGE_WIRING,       # missing principle-edges — always engram_add_edge
+    8: BUCKET_TASK_CLOSURES,     # stale external task refs — always engram_update_task
+    9: BUCKET_COVERAGE_GAPS,     # coverage-gap flags — always a human-action item
+}
+
+# ---------------------------------------------------------------------------
+# Suggestion-string → bucket routing table (tier 3, fallback)
 # ---------------------------------------------------------------------------
 # Each entry: (regex_pattern, bucket_name).
 # Patterns are matched case-insensitively against finding["suggestion"].
@@ -130,7 +169,17 @@ _COMPILED_ROUTING: list[tuple[re.Pattern[str], str]] = [
 
 
 def _route_suggestion(suggestion: str) -> str:
-    """Map a suggestion string to a bucket name.
+    """Tier-3 fallback: map a suggestion STRING to a bucket by regex.
+
+    Only reached when tiers 1 (explicit ``finding["bucket"]``) and 2
+    (``CATEGORY_TO_BUCKET`` on the report's ``category``) didn't resolve it —
+    see the module docstring and ``_route_finding`` below. Matches
+    case-insensitively against the literal ``suggestion`` text, so it is only
+    as reliable as that text happens to be (alpha#2987: real dream-master
+    findings have so far carried the fairy's fixed-format prose line rather
+    than a bare verb, which is what makes this tier work in practice today —
+    but nothing enforces that, which is why tier 2 exists for the categories
+    where it doesn't have to be relied on at all).
 
     Returns BUCKET_UNKNOWN if no pattern matches.  Dream-master must log
     unknown-bucket findings in the dream record so Lei can decide.
@@ -143,6 +192,30 @@ def _route_suggestion(suggestion: str) -> str:
     return BUCKET_UNKNOWN
 
 
+def _route_finding(finding: dict, category: Any) -> tuple[str, str]:
+    """Route one finding to a bucket, three tiers, most authoritative first.
+
+    Returns ``(bucket, routed_via)`` where ``routed_via`` is one of
+    ``"explicit"`` (tier 1), ``"category"`` (tier 2), ``"regex"`` (tier 3
+    matched something), or ``"unknown"`` (nothing matched — BUCKET_UNKNOWN).
+    """
+    explicit = finding.get("bucket")
+    if isinstance(explicit, str) and explicit in ALL_BUCKET_NAMES:
+        return explicit, "explicit"
+    # [reviewer-fairy suggestion, PR-2988] An explicit `bucket` that is a
+    # string but NOT a valid name (e.g. a typo once a fairy/dream-master
+    # starts emitting this field for real) falls through silently to tier
+    # 2/3 here — indistinguishable from the field being absent. Fine today
+    # (no producer exists yet), but worth a real validation error once one
+    # does.
+
+    if isinstance(category, int) and category in CATEGORY_TO_BUCKET:
+        return CATEGORY_TO_BUCKET[category], "category"
+
+    bucket = _route_suggestion(finding.get("suggestion", ""))
+    return bucket, ("regex" if bucket != BUCKET_UNKNOWN else "unknown")
+
+
 def bucket_findings(fairy_reports: list[dict]) -> dict[str, list[dict]]:
     """Partition findings from all fairy reports into action-type buckets.
 
@@ -150,13 +223,19 @@ def bucket_findings(fairy_reports: list[dict]) -> dict[str, list[dict]]:
         fairy_reports: list of report dicts.  Each report has shape::
 
             {
-              "category": int,        # 1–6, optional
+              "category": int,        # 1–12, optional but drives tier-2 routing
               "fairy_id": str,        # optional label
               "findings": [           # the core list
                 {
                   "node_id": str,
                   "node_snapshot": dict,        # pre-packed inspection state
-                  "suggestion": str,            # human-readable action verb
+                  "bucket": str,                 # optional — see routing tier 1
+                  "suggestion": str,            # human-readable suggestion text
+                                                 # (alpha#2987: NOT guaranteed to
+                                                 # be a bare verb — real findings
+                                                 # so far carry the fairy's full
+                                                 # report-line prose; see the
+                                                 # module docstring's tier 3)
                   "rationale": str,             # human-readable audit trail
                   "verification_state": str,    # optional ISO timestamp + notes
                   ...                           # category-specific extra fields
@@ -169,13 +248,23 @@ def bucket_findings(fairy_reports: list[dict]) -> dict[str, list[dict]]:
         dict mapping each bucket name to a list of finding dicts.
         Every finding carries an added ``_source_fairy`` key (value =
         ``fairy_report.get("fairy_id")`` or ``fairy_report.get("category")``),
-        and an added ``_bucket`` key for traceability.  Original finding dicts
-        are not mutated; copies are used.
+        an added ``_bucket`` key for traceability, and an added
+        ``_routed_via`` key (``"explicit"|"category"|"regex"|"unknown"`` —
+        see ``_route_finding``) so the dream-master can tell a genuinely
+        unclassifiable finding (regex fallback found nothing, on a
+        heterogeneous category) apart from a finding that landed in
+        BUCKET_UNKNOWN despite belonging to a category CATEGORY_TO_BUCKET
+        already covers — the latter means the report's own ``category``
+        field was missing or malformed, a contract violation worth
+        surfacing loudly rather than silently logging as "I don't know
+        what this is." Original finding dicts are not mutated; copies are
+        used.
     """
     buckets: dict[str, list[dict]] = {name: [] for name in ALL_BUCKET_NAMES}
 
     for report in fairy_reports:
         fairy_label = report.get("fairy_id") or report.get("category") or "unknown"
+        category = report.get("category")
         findings = report.get("findings", [])
         if not isinstance(findings, list):
             continue
@@ -184,12 +273,12 @@ def bucket_findings(fairy_reports: list[dict]) -> dict[str, list[dict]]:
             if not isinstance(finding, dict):
                 continue
 
-            suggestion = finding.get("suggestion", "")
-            bucket = _route_suggestion(suggestion)
+            bucket, routed_via = _route_finding(finding, category)
 
             enriched = dict(finding)
             enriched["_source_fairy"] = fairy_label
             enriched["_bucket"] = bucket
+            enriched["_routed_via"] = routed_via
             buckets[bucket].append(enriched)
 
     return buckets

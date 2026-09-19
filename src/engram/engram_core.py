@@ -564,6 +564,30 @@ INSTANTIATES_TARGET_TYPES = {
 }
 
 
+# Allowed (source_type, target_type) endpoint pairs for `generalizes`
+# (#2753 epic D1, WS1). Direction: general -> specific — source is the MORE
+# general node, target is the MORE specific one it generalizes.
+#
+# NOT for concrete nodes: incident -> lesson stays `exemplifies`, obs ->
+# cornerstone stays `instantiates` — those are the example anchors a
+# generalization_chain walk starts FROM (see generalization_chain below),
+# never a `generalizes` endpoint themselves.
+GENERALIZES_ALLOWED_PAIRS = frozenset({
+    ("lesson", "lesson"),            # meta-lesson
+    ("cornerstone", "lesson"),
+    ("cornerstone", "cornerstone"),
+    ("axiom", "cornerstone"),
+    ("goal", "cornerstone"),
+})
+
+# The node types that can participate in `generalizes` at all (either side
+# of GENERALIZES_ALLOWED_PAIRS) — the "principle family". Derived, not
+# hand-listed twice, so a future pair addition can't silently desync the two.
+GENERALIZES_PRINCIPLE_TYPES = frozenset(
+    t for pair in GENERALIZES_ALLOWED_PAIRS for t in pair
+)
+
+
 VALID_RELATIONS = {
     "cites",
     "supported_by",
@@ -628,6 +652,26 @@ VALID_RELATIONS = {
                      # Deliberately backwards in creation time (see its
                      # EDGE_CLASSIFICATIONS entry) — never hand-addable; minted
                      # by the cascade-resolution machinery once #2349 lands.
+    "generalizes",  # #2753 epic, WS1: general -> specific abstraction edge
+                     # (source is the more general node, target the more
+                     # specific one it generalizes). Allowed endpoints:
+                     # lesson->lesson (meta-lesson), cornerstone->lesson,
+                     # cornerstone->cornerstone, axiom->cornerstone,
+                     # goal->cornerstone — see GENERALIZES_ALLOWED_PAIRS.
+                     # Concrete nodes keep `exemplifies` (incident->lesson) /
+                     # `instantiates` (claim->principle); those are the
+                     # example anchors a generalization_chain walk starts
+                     # FROM, never a `generalizes` endpoint. Classification
+                     # tier: no confidence, no cascade — a pure routing edge
+                     # that COEXISTS with `supported_by` (never replaces it).
+                     # Whitelisted in engram_add_edge/engram_remove_edge
+                     # (addable_after_creation/removable both True). Also
+                     # writable at mint time via `generalized_by` on
+                     # engram_add_lesson/engram_add_cornerstone.
+                     # dag=True (real structural acyclicity — see its
+                     # EDGE_CLASSIFICATIONS entry) and CYCLE-GUARDED AT
+                     # WRITE TIME (see _generalizes_cycle_path below), not
+                     # merely audited after the fact.
 }
 
 
@@ -718,6 +762,35 @@ EDGE_CLASSIFICATIONS = {
         "addable_after_creation": True,
         "provenance": False,
     },
+    "generalizes": {
+        # #2753 epic, WS1 (D1). Lei's ruling: semantically a membership/
+        # abstraction edge (classification tier — see EDGE_TIERS below), no
+        # confidence, no cascade, a routing edge coexisting with
+        # `supported_by` (never a replacement for it). temporal_causal=False
+        # is deliberate: a later concrete cornerstone can still generalize
+        # to an older principle — the edge is allowed to point backwards in
+        # time, same shape as `instantiates`/`serves`.
+        #
+        # dag=True is the flag that matters here (wording fix on #2753,
+        # 2026-09-08 16:3xZ): real structural acyclicity — a cycle in
+        # generalization/exemplification makes no sense, so `generalizes`
+        # joins the relation set `engram_dag_conformance` walks (see
+        # DAG_RELATIONS below) AND is cycle-guarded at WRITE time (see
+        # _generalizes_cycle_path) — conformance is the after-the-fact
+        # audit, the write guard is what stops a cycle landing.
+        #
+        # classification-tier + dag=True is a combination present nowhere
+        # else in this table (every classification-tier relation today —
+        # instantiates/serves/exemplifies — is dag=False); this is an
+        # INTENTIONAL divergence from the tier's usual dag pattern,
+        # acknowledged in EDGE_TIER_DIVERGENCE_ACK below.
+        "cascade": False,
+        "temporal_causal": False,
+        "dag": True,
+        "removable": True,
+        "addable_after_creation": True,
+        "provenance": False,
+    },
     "instantiates": {
         "cascade": False,      # pure relevance marker — no confidence propagation
         "temporal_causal": False,    # realization is not a temporal dependency (see VALID_RELATIONS note)
@@ -756,9 +829,11 @@ EDGE_CLASSIFICATIONS = {
                                 # wrong node, not a dependency on it — its source exists BECAUSE
                                 # the target was found wrong. The retract-with-replacement path in
                                 # `_retract_impl` (engram_revision.py) inserts
-                                # `replacement —retracts→ retracted_node`; walking this relation
-                                # would make a retract cascade's first taint target the
-                                # replacement that same retract just created.
+                                # `replacement —retracts→ retracted_node` (#2612: the replacement
+                                # node itself is created by the caller beforehand, via its own
+                                # canonical creation tool — _retract_impl only inserts the edge);
+                                # walking this relation would make a retract cascade's first
+                                # taint target the very node that is correcting it.
         "temporal_causal": True,
         "dag": True,
         "removable": False,
@@ -995,6 +1070,14 @@ EDGE_TIERS: dict[str, str] = {
     "instantiates": "classification",
     "serves":       "classification",
     "exemplifies":  "classification",
+    "generalizes":  "classification",  # #2753 epic, WS1: membership/
+                                    # abstraction edge, temporal_causal=False
+                                    # (matches this tier's expectation — the
+                                    # INTENTIONAL divergence here is on the
+                                    # `dag` flag, not `temporal_causal`; see
+                                    # EDGE_TIER_DIVERGENCE_ACK below and the
+                                    # hard-failing test in
+                                    # test_edge_tier_audit.py that checks it).
 }
 
 # Intentional-divergence acknowledgment table.
@@ -1002,12 +1085,30 @@ EDGE_TIERS: dict[str, str] = {
 # expectation, add it here with a short reason string. The audit test
 # (test_edge_tier_audit.py) skips emitting a warning for acknowledged entries,
 # preserving the ability to intentionally diverge without noisy CI output.
+#
+# #2753 WS1 widening: also the home for an intentional `dag`/tier divergence
+# (distinct from the temporal_causal divergence above — see `generalizes`
+# below, the first relation where the two kinds differ). The soft warn in
+# test_edge_tier_audit.py checks temporal_causal only and would NOT catch a
+# `dag`-only divergence's absence here; test_edge_tier_audit.py also carries
+# a HARD-FAILING test for exactly that gap (added alongside this entry).
 EDGE_TIER_DIVERGENCE_ACK: dict[str, str] = {
     "acknowledged_derives_from": (
         "#2357: deliberately backwards in creation time — the acknowledging "
         "node necessarily predates the replacement it acknowledges. Real "
         "acyclicity is still enforced via dag=True, checked by an edge walk "
         "rather than the temporal_causal timestamp comparison."
+    ),
+    "generalizes": (
+        "#2753 epic WS1, R1 (Lei's ruling, 2026-09-08 16:28Z): classification "
+        "tier, but dag=True — every other classification-tier relation today "
+        "(instantiates/serves/exemplifies) is dag=False. Real structural "
+        "acyclicity genuinely matters here (a cycle in generalization/"
+        "exemplification makes no sense), so this is an intentional "
+        "divergence on the `dag` flag, not `temporal_causal` (which matches "
+        "its tier's expectation at False, unremarkable on its own). Cycle "
+        "prevention is enforced at WRITE time (see _generalizes_cycle_path) "
+        "as well as by the batch conformance walk (DAG_RELATIONS)."
     ),
 }
 
@@ -1027,6 +1128,417 @@ DAG_EXEMPT_RELATIONS = frozenset(
 # purely to bound the cycle-detection walk — see
 # engram_dag_conformance.check_dag_conformance.
 DAG_RELATIONS = frozenset(r for r, c in EDGE_CLASSIFICATIONS.items() if c["dag"])
+
+
+# ---------------------------------------------------------------------------
+# `generalizes` substrate (#2753 epic, WS1).
+# ---------------------------------------------------------------------------
+
+def _generalizes_cycle_path(
+    conn: sqlite3.Connection, source_id: str, target_id: str
+) -> "list[str] | None":
+    """Would inserting ``source_id --generalizes--> target_id`` close a
+    cycle among LIVE ``generalizes`` edges? Returns the cycle (list of node
+    ids, first == last) if so, else None.
+
+    #2753 epic WS1 (D1): the write-time cycle guard — refuse the edge and
+    return the cycle path in the error. Conformance
+    (``engram_dag_conformance.check_dag_conformance``) is the after-the-fact
+    BATCH audit; this is the TARGETED check that stops a cycle landing in
+    the first place, called from every ``generalizes``-writing path (the
+    generic ``engram_add_edge``, and the ``generalized_by`` mint-time wiring
+    on ``engram_add_lesson``/``engram_add_cornerstone``).
+
+    Scoped to the ``generalizes`` relation ONLY, not the full
+    ``DAG_RELATIONS`` set — ``generalizes`` is a distinct specialization/
+    abstraction hierarchy from e.g. ``cites``/``derives_from``/
+    ``subtask_of``, and folding unrelated dag-bearing relations into one
+    targeted write-time check would conflate independent hierarchies that
+    happen to share the ``dag: True`` flag for unrelated reasons. (The
+    full-graph, all-``DAG_RELATIONS`` batch walk is what
+    ``engram_dag_conformance`` already does, separately.)
+
+    BFS from ``target_id`` over existing LIVE ``generalizes`` edges
+    (source->target, i.e. general->specific): if ``source_id`` is reachable
+    FROM ``target_id``, the candidate edge would close
+    ``target_id -> ... -> source_id -> target_id``. CURRENT-only
+    (``is_current = 1`` nodes/edges), same convention as
+    ``check_dag_conformance``.
+    """
+    if source_id == target_id:
+        return [source_id, target_id]
+
+    # Walk the RESOLVED generalizes graph -- every edge's endpoints put
+    # through _resolve_to_current, exactly as generalization_chain resolves
+    # them on the read side.
+    #
+    # The earlier shape filtered on `s.is_current = 1 AND t.is_current = 1`
+    # instead, and that was a real hole (found in #2812 review). An edge
+    # whose endpoint is superseded through the GENERIC engram_supersede --
+    # which carries no generalizes edges, and is the ONLY supersede path
+    # that exists for lesson/axiom/goal, engram_outgrow_cornerstone being
+    # cornerstone-only -- became invisible HERE while the read-side walk
+    # still traversed it via resolution. So the guard would pass an edge
+    # that generalization_chain then rendered as a live cycle, and rendered
+    # it as `heads: []` + `truncated: False`, which is indistinguishable
+    # from a clean complete walk. Guard and walk must see the same graph or
+    # one can admit exactly what the other reports.
+    _resolved: "dict[str, str | None]" = {}
+
+    def _res(nid: str) -> "str | None":
+        if nid not in _resolved:
+            _resolved[nid] = _resolve_to_current(conn, nid)
+        return _resolved[nid]
+
+    adjacency: "dict[str, set]" = {}
+    for row in conn.execute(
+        "SELECT source_id, target_id FROM edges WHERE relation = 'generalizes'"
+    ):
+        r_src = _res(row["source_id"])
+        r_tgt = _res(row["target_id"])
+        if r_src is None or r_tgt is None:
+            continue  # dead-ended chain: no live node to attribute the edge to
+        adjacency.setdefault(r_src, set()).add(r_tgt)
+
+    start = _res(target_id) or target_id
+    goal = _res(source_id) or source_id
+    if start == goal:
+        # target resolves onto source itself -- a self-cycle once written
+        return [source_id, target_id]
+
+    parent: "dict[str, str | None]" = {start: None}
+    queue = [start]
+    while queue:
+        current = queue.pop(0)
+        if current == goal:
+            path = []
+            node = current
+            while node is not None:
+                path.append(node)
+                node = parent[node]
+            path.reverse()  # (resolved) target -> ... -> source
+            return [source_id] + path
+        for nxt in sorted(adjacency.get(current, ())):
+            if nxt not in parent:
+                parent[nxt] = current
+                queue.append(nxt)
+    return None
+
+
+def _resolve_to_current(conn: sqlite3.Connection, node_id: str) -> "str | None":
+    """Resolve ``node_id`` to its CURRENT version via the supersedes chain.
+
+    Returns ``node_id`` itself if it is already current, the current
+    successor (via ``_current_successor``) if not, or None if ``node_id``
+    doesn't exist or its chain dead-ends without reaching a current node
+    (e.g. a retracted node with no replacement).
+
+    #2753 epic WS1: shared by ``generalization_chain`` ("every rung
+    resolves through supersedes to its CURRENT version" — the #1195
+    508-vs-162-vs-143 hazard this fixes at read time) and by the
+    ``generalizes`` edge-carry path (``engram_outgrow_cornerstone``).
+    """
+    row = conn.execute(
+        "SELECT is_current FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not row:
+        return None
+    if row["is_current"] == 1:
+        return node_id
+    return _current_successor(conn, node_id)
+
+
+def generalization_chain(
+    conn: sqlite3.Connection, node_id: str, max_depth: int = 4
+) -> dict:
+    """The generalization chain for ``node_id`` — #2753 epic WS1 (D2).
+
+    For a PRINCIPLE node P (type in ``GENERALIZES_PRINCIPLE_TYPES`` — lesson/
+    cornerstone/axiom/goal): P (resolved to its current version), then every
+    node that ``generalizes`` P, transitively, to the HEADS (nodes with no
+    incoming ``generalizes`` edge). Multiple parents allowed — a lesson may
+    sit under two cornerstones; the walk is a small DAG, not a strict linear
+    chain, and a node with >1 incoming ``generalizes`` edge appears once
+    with multiple entries in its ``parents`` list.
+
+    For a CONCRETE node C (e.g. observation/derivation, anything outside
+    ``GENERALIZES_PRINCIPLE_TYPES``): its principles are the (resolved)
+    targets of C's own ``exemplifies``/``instantiates`` edges; the walk
+    starts from each of those roots instead of from C itself.
+
+    Every rung resolves through ``supersedes`` to its CURRENT version
+    (``_resolve_to_current``) before being walked further — a chain must
+    never surface retired text (the #1195 508-vs-162-vs-143 hazard the
+    epic's design section names).
+
+    Depth-capped at ``max_depth`` rungs from the roots (root = depth 0, its
+    parents = depth 1, ...) — a malformed cyclic graph (which the write-time
+    guard, ``_generalizes_cycle_path``, should make unreachable in practice,
+    but conformance is a batch audit that runs later, not a live guarantee
+    at read time) must still terminate; the cap does that structurally
+    (bounded iteration, not recursion, and each node is expanded at most
+    once) even when the underlying data violates the DAG invariant.
+
+    Returns a dict:
+        {
+            "start_id": node_id,               # the id the caller passed in
+            "start_resolved_id": str | None,   # start's CURRENT version, or
+                                                # None if it doesn't resolve
+                                                # to one (missing / dead-end
+                                                # supersede chain)
+            "roots": [str, ...],   # the immediate principle id(s) the walk
+                                    # began from (resolved-current) — the
+                                    # (resolved) start itself for a
+                                    # principle node, or the (resolved)
+                                    # exemplifies/instantiates targets for a
+                                    # concrete node
+            "nodes": {
+                resolved_id: {
+                    "original_id": str,    # the id actually pointed at by
+                                            # the generalizes/exemplifies/
+                                            # instantiates edge, PRE-resolve
+                    "parents": [resolved_id, ...],  # nodes this one is
+                                            # directly generalized BY (one
+                                            # rung up, resolved-current);
+                                            # [] for a head or a node whose
+                                            # expansion was cut off by
+                                            # max_depth
+                    "depth": int,           # rungs from the nearest root
+                                            # this node was first reached at
+                                            # (0 = a root)
+                    "recall_summary": str | None,   # hydrated for EVERY
+                                            # reached node — bounded (<=140)
+                                            # and what D3 renders per rung.
+                                            # None if the node carries none.
+                    "claim": str | None,    # HEADS ONLY — present on entries
+                                            # whose id is in "heads", absent
+                                            # on middle rungs by design:
+                                            # claim is unbounded and D3 wants
+                                            # it for the head alone. Use
+                                            # .get("claim") rather than [].
+                },
+                ...  # one entry per node reached, keyed by its CURRENT
+                     # (resolved) id — deduped, so a node reached via two
+                     # branches appears once with both parents recorded
+            },
+            "heads": [resolved_id, ...],   # resolved-current ids with NO
+                                            # incoming generalizes edge —
+                                            # rendered last per the epic's D3
+            "truncated": bool,  # True if max_depth was hit while nodes were
+                                 # still pending expansion (their "parents"
+                                 # were never queried, so they are NOT
+                                 # necessarily heads)
+            "cycle_detected": bool,  # True if the walk completed (not
+                                 # truncated) over a non-empty node set and
+                                 # found NO head -- structurally impossible
+                                 # in a valid DAG, so it means the resolved
+                                 # graph contains a cycle. Distinct from
+                                 # `truncated`: without this field the two
+                                 # states are indistinguishable to a caller
+                                 # and an empty `heads` reads as benign.
+        }
+
+    Public helper — WS2 (render) consumes this directly; keep the return
+    shape stable across a signature change (add fields, don't repurpose
+    existing ones) once WS2 branches off this tip.
+    """
+    start_row = conn.execute(
+        "SELECT id, type FROM nodes WHERE id = ?", (node_id,)
+    ).fetchone()
+    if not start_row:
+        return {
+            "start_id": node_id,
+            "start_resolved_id": None,
+            "roots": [],
+            "nodes": {},
+            "heads": [],
+            "truncated": False,
+        }
+
+    start_resolved = _resolve_to_current(conn, node_id)
+
+    roots_raw: "list[str]" = []
+    if start_row["type"] in GENERALIZES_PRINCIPLE_TYPES:
+        if start_resolved is not None:
+            roots_raw = [start_resolved]
+    else:
+        rows = conn.execute(
+            """SELECT target_id FROM edges
+               WHERE source_id = ? AND relation IN ('exemplifies', 'instantiates')""",
+            (node_id,),
+        ).fetchall()
+        roots_raw = [r["target_id"] for r in rows]
+
+    nodes: dict = {}
+    heads: "list[str]" = []
+    roots: "list[str]" = []
+    frontier: "list[str]" = []
+
+    for raw in roots_raw:
+        resolved = _resolve_to_current(conn, raw)
+        if resolved is None:
+            continue
+        if resolved not in nodes:
+            nodes[resolved] = {"original_id": raw, "parents": [], "depth": 0}
+            frontier.append(resolved)
+            roots.append(resolved)
+
+    depth = 0
+    while frontier and depth < max_depth:
+        next_frontier: "list[str]" = []
+        for current in frontier:
+            parent_edges = conn.execute(
+                "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+                (current,),
+            ).fetchall()
+            if not parent_edges:
+                if current not in heads:
+                    heads.append(current)
+                continue
+            # A head is a node with no LIVE parent -- not merely one with no
+            # parent-edge ROWS. A node whose every generalizes parent
+            # dead-ends (retracted with no replacement, so
+            # _resolve_to_current returns None) has no live parent and is a
+            # head by the same definition, reached by a different route.
+            # Before #2812 round 2 such a node was neither appended to heads
+            # nor connected to anything: the walk fell out of both branches
+            # silently, and the cycle_detected inference added in that round
+            # then fired on it -- a false positive on a graph with no cycle.
+            resolved_any_parent = False
+            for pe in parent_edges:
+                raw_parent = pe["source_id"]
+                resolved_parent = _resolve_to_current(conn, raw_parent)
+                if resolved_parent is None:
+                    continue
+                resolved_any_parent = True
+                if resolved_parent not in nodes[current]["parents"]:
+                    nodes[current]["parents"].append(resolved_parent)
+                if resolved_parent not in nodes:
+                    nodes[resolved_parent] = {
+                        "original_id": raw_parent,
+                        "parents": [],
+                        "depth": depth + 1,
+                    }
+                    next_frontier.append(resolved_parent)
+            if not resolved_any_parent and current not in heads:
+                heads.append(current)
+        frontier = next_frontier
+        depth += 1
+
+    truncated = bool(frontier)
+
+    # Does the REACHED subgraph contain a cycle? Answered by walking it,
+    # not inferred from a summary property of it.
+    #
+    # This started as `not heads and not truncated` -- the reasoning being
+    # that a finite walk must terminate at a head unless the cap cut it off.
+    # That inference is GLOBAL, and `generalization_chain` is explicitly
+    # multi-parent ("a lesson may sit under two cornerstones"), so a single
+    # genuine head on ANY branch keeps `heads` non-empty and silences the
+    # signal while a different branch loops. Found in #2812 colleague review
+    # with a real repro: X with two parents, one resolving to a head and one
+    # into a live 2-cycle, reported cycle_detected=False with the cycle
+    # sitting in the returned `nodes`. That is a false NEGATIVE, which is the
+    # direction that matters -- WS2 is told it can depend on this field.
+    #
+    # Two earlier attempts at this field were both summary-property
+    # inferences and both were wrong (a false positive on a dead-ended
+    # parent, then this false negative). So this is a direct DFS over the
+    # already-materialized parents adjacency instead: iterative, colour-
+    # marked, back-edge = cycle. It needs no `truncated` special case --
+    # a depth-capped node simply has an empty `parents` list and terminates
+    # its branch -- so a cycle inside a truncated walk is now caught too,
+    # which the old form could not do by construction.
+    WHITE, GREY, BLACK = 0, 1, 2
+    _colour: "dict[str, int]" = {nid: WHITE for nid in nodes}
+    cycle_detected = False
+    for _root in nodes:
+        if _colour[_root] != WHITE:
+            continue
+        # (node, parents-iterator) stack; GREY == on the current DFS path.
+        _stack = [(_root, iter(nodes[_root]["parents"]))]
+        _colour[_root] = GREY
+        while _stack:
+            _node, _it = _stack[-1]
+            _advanced = False
+            for _parent in _it:
+                if _parent not in _colour:
+                    continue  # defensive: parent outside the reached set
+                if _colour[_parent] == GREY:
+                    cycle_detected = True  # back-edge onto the active path
+                    _stack = []
+                    break
+                if _colour[_parent] == WHITE:
+                    _colour[_parent] = GREY
+                    _stack.append((_parent, iter(nodes[_parent]["parents"])))
+                    _advanced = True
+                    break
+            if cycle_detected:
+                break
+            if not _advanced and _stack:
+                _done, _ = _stack.pop()
+                _colour[_done] = BLACK
+        if cycle_detected:
+            break
+
+    # ---- text hydration (#2753 WS1; contract settled on forum #407) --------
+    # The walk above deliberately keeps _resolve_to_current's ONE-column
+    # ``SELECT is_current`` — there is no row already in hand to widen, so
+    # adding text there would take a 1-column PER-RUNG query to 3 on the
+    # PreToolUse path (the hottest surface in the system). Hydrate ONCE here
+    # instead, now that the reached set is known: TWO queries total,
+    # independent of chain size, and no N+1 for the render side (WS2).
+    #
+    # The two fields are NOT one decision:
+    #   recall_summary — bounded (<=140 by construction) and rendered per rung
+    #                    by D3, so every reached node carries it.
+    #   claim          — UNBOUNDED, and D3 wants it for the HEAD only ("the
+    #                    head's claim in full, middle rungs as one-liners"),
+    #                    so it never touches a middle rung.
+    #
+    # COUPLING, named rather than coded around: the IN-list's parameter count
+    # scales with the REACHED SET -- and ``max_depth`` bounds only that set's
+    # DEPTH. Its BREADTH is bounded by nothing here: a node may be generalized
+    # by several parents, so each rung can widen, and the only real ceiling is
+    # the graph's population of principle nodes (each is expanded at most
+    # once). At the default depth 4, on a graph whose lesson/cornerstone/
+    # axiom/goal count is in the hundreds, the list is trivially small. So the
+    # knob that would bite first is principle-node GROWTH or a raised
+    # max_depth -- not chain length -- against SQLite's build-dependent
+    # variable limit (999 on pre-3.32 builds, 32766 since). Chunk the IN-list
+    # if either ever approaches it.
+    if nodes:
+        _ph = ",".join("?" * len(nodes))
+        for _row in conn.execute(
+            f"SELECT id, recall_summary FROM nodes WHERE id IN ({_ph})",
+            tuple(nodes),
+        ):
+            if _row[0] in nodes:
+                nodes[_row[0]]["recall_summary"] = _row[1]
+    for _nid in nodes:
+        nodes[_nid].setdefault("recall_summary", None)
+
+    if heads:
+        _ph = ",".join("?" * len(heads))
+        for _row in conn.execute(
+            f"SELECT id, claim FROM nodes WHERE id IN ({_ph})",
+            tuple(heads),
+        ):
+            if _row[0] in nodes:
+                nodes[_row[0]]["claim"] = _row[1]
+    for _hid in heads:
+        if _hid in nodes:
+            nodes[_hid].setdefault("claim", None)
+
+    return {
+        "start_id": node_id,
+        "start_resolved_id": start_resolved,
+        "roots": roots,
+        "nodes": nodes,
+        "heads": heads,
+        "truncated": truncated,
+        "cycle_detected": cycle_detected,
+    }
 
 
 _ADDABLE_AFTER_CREATION_RELATIONS = frozenset(
@@ -1139,8 +1651,9 @@ def _init_git():
     environments where git resolution is broken — historically the Claude Desktop
     Windows app picked up the WSL git binary instead of the Windows one and the
     versioning layer had to be disabled. With ENGRAM_DISABLE_GIT=1, _git_available
-    stays False and engram_nap / engram_advance_turn silently skip committing
-    while still saving the session log and graph state to disk.
+    stays False and engram_checkpoint (formerly engram_nap) / engram_advance_turn
+    silently skip committing while still saving the session log and graph state
+    to disk.
 
     Also ensures a canonical .gitignore that excludes binary files, transient
     SQLite files, and other junk that must never be tracked. Idempotent —
@@ -1728,30 +2241,66 @@ def _walguard_startup_clear(conn: sqlite3.Connection) -> None:
     """First-init check: clear a stale degraded marker if the DB is now healthy.
 
     Called once per server lifetime (guarded by _walguard_startup_done flag).
-    If a degraded marker exists AND detect_shm_displacement() returns None AND
+    If a degraded marker exists AND detect_shm_displacement() returns None
+    (GENUINELY confirmed healthy, not merely unavailable -- #2651) AND
     PRAGMA integrity_check returns 'ok', the marker is removed and a log line
     is emitted.  If integrity_check fails, the marker is left in place and a
     loud error is logged.
+
+    #2651: detection unavailable (e.g. no /proc on this platform, or no shm
+    fd held by this process yet) must NOT read as healthy here -- this is
+    the conjunct doing the safety work, since integrity_check alone does
+    not test write durability (the failure mode this guard exists to
+    catch, per #1947/#786). A loud one-time startup line fires whenever
+    detection is unavailable, whether or not a stale marker exists, so a
+    seat knows which guard it's running without, even on a clean start
+    with nothing to clear.
 
     Never raises — any internal failure is logged and swallowed.
     """
     import sys
     try:
         import engram_walguard as _wg
-        marker = _wg.read_degraded_marker(DATA_DIR)
-        if marker is None:
-            return  # no stale marker; nothing to do
         detection = _wg.detect_shm_displacement(str(DB_PATH))
-        if detection is not None:
-            # Still displaced — leave the marker and log loudly
+        if detection is not None and detection.get("reason") == "detection_unavailable":
+            # Deliberately no "on this platform" here: the "why" field's
+            # cause may be platform-permanent (no /proc) or merely
+            # connection-timing (no shm fd held yet) -- see
+            # detect_shm_displacement's own docstring for the distinction.
+            # Naming the platform unconditionally would misdescribe the
+            # latter case.
             print(
-                f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
-                f"(reason={detection.get('reason')}); leaving marker in place. "
-                f"Do not run a hard checkpoint. {_wg.recovery_banner_text()}",
+                f"[walguard] displacement detection unavailable "
+                f"({detection.get('why')}); this guard cannot confirm WAL/shm "
+                f"displacement is absent right now. (#2651)",
                 file=sys.stderr,
             )
+        marker = _wg.read_degraded_marker(DATA_DIR)
+        if marker is None:
+            return  # no stale marker; nothing further to do
+        if detection is not None:
+            if detection.get("reason") == "detection_unavailable":
+                # #2651: cannot confirm displacement is absent -- treat the
+                # same as "still displaced" for the purpose of NOT clearing,
+                # but say so honestly rather than claiming confirmed displacement.
+                print(
+                    f"[walguard] CRITICAL: stale degraded marker present AND "
+                    f"displacement detection is unavailable ({detection.get('why')}); "
+                    f"cannot confirm displacement is absent -- leaving marker in "
+                    f"place as a precaution. Do not run a hard checkpoint. "
+                    f"{_wg.recovery_banner_text()}",
+                    file=sys.stderr,
+                )
+            else:
+                # Still displaced — leave the marker and log loudly
+                print(
+                    f"[walguard] CRITICAL: stale degraded marker present AND shm still displaced "
+                    f"(reason={detection.get('reason')}); leaving marker in place. "
+                    f"Do not run a hard checkpoint. {_wg.recovery_banner_text()}",
+                    file=sys.stderr,
+                )
             return
-        # Displacement gone — verify integrity before clearing
+        # detection is genuinely None (confirmed healthy) — verify integrity before clearing
         try:
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             ic_ok = len(rows) == 1 and rows[0][0] == "ok"
@@ -1802,10 +2351,17 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
 
     No-ops unless ≥30 s have elapsed since the last check (keeps per-call cost
     near zero — two stat() calls plus a listdir that is amortised over the
-    interval).  On detection: logs loudly, writes the degraded marker, attempts
-    an emergency dump (checkpoint skipped — checkpointing under a split-brain
-    WAL-index is the corruption vector, #786), and updates the marker's dump
-    fields.
+    interval).  On a GENUINE displacement reason: logs loudly, writes the
+    degraded marker, attempts an emergency dump (checkpoint skipped —
+    checkpointing under a split-brain WAL-index is the corruption vector,
+    #786), and updates the marker's dump fields.
+
+    #2651: "detection_unavailable" (can't judge, e.g. no /proc or no shm fd
+    held yet) is NOT a genuine displacement reason and is a quiet no-op here,
+    same as bare None (confirmed healthy) -- without this carve-out, an
+    unresolvable "unavailable" state would falsely re-fire the logging/
+    marker-write/dump path above every throttle window, permanently, on
+    every affected seat.
 
     Storm-gate (#786): displacement is a persistent condition.  To avoid firing
     a full SQL dump + git commit on every 30-second throttle window for the
@@ -1829,6 +2385,14 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
         detection = _wg.detect_shm_displacement(str(DB_PATH))
         if detection is None:
             return  # healthy
+        if detection.get("reason") == "detection_unavailable":
+            # #2651: can't judge (platform, or fd not held yet) -- not a
+            # displacement. Quiet no-op, unlike a genuine reason below: an
+            # unresolvable "unavailable" state on a non-Linux seat would
+            # otherwise re-fire this CRITICAL branch, write a degraded
+            # marker, and attempt an emergency dump every throttle window
+            # for the life of the process, on every affected seat.
+            return
 
         import sys
 
@@ -1877,12 +2441,35 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
                 file=sys.stderr,
             )
 
+        # Forensic capture (#2635): AT DETECTION TIME, BEFORE the dump, while
+        # the state that produced the detection is still live.  Never allowed
+        # to raise (capture_forensics() has its own top-level guard), but
+        # defense-in-depth here too — a broken capture must never block the
+        # marker write or the dump.
+        #
+        # On an hourly-refresh of an ONGOING incident (original_detected_at
+        # is not None), reuse the marker's EXISTING forensics rather than
+        # re-capturing fresh ones — a fresh capture at refresh time reflects
+        # state hours after detection, not the state that produced it, and
+        # would silently overwrite the one snapshot answering "who held it
+        # at the moment of detection" (reviewer-fairy finding, PR #2653).
+        # Same preservation the original_detected_at timestamp already gets.
+        forensics = None
+        if original_detected_at is not None and existing_marker is not None:
+            forensics = (existing_marker.get("details") or {}).get("forensics")
+        if forensics is None:
+            try:
+                forensics = _wg.capture_forensics(str(DB_PATH))
+            except Exception as fe:
+                forensics = {"status": "unavailable", "why": f"capture_forensics call raised: {fe!r}"}
+
         # Write initial/refreshed marker (dump_committed=False until dump completes).
         # Pass detected_at to preserve the original timestamp on re-dumps.
         try:
             _wg.write_degraded_marker(
                 DATA_DIR, detection, dump_info=None,
                 detected_at=original_detected_at,
+                forensics=forensics,
             )
         except Exception as me:
             print(f"[walguard] marker write failed: {me!r} (#786)", file=sys.stderr)
@@ -1900,11 +2487,14 @@ def _run_walguard_check(conn: sqlite3.Connection) -> None:
             print(f"[walguard] emergency dump raised: {de!r} (#786)", file=sys.stderr)
             dump_info = {"git_committed": False, "error": str(de)}
 
-        # Update marker with dump result; preserve original detected_at.
+        # Update marker with dump result; preserve original detected_at and
+        # the same forensics snapshot captured before the dump (#2635) — the
+        # dump itself doesn't change what was live at detection time.
         try:
             _wg.write_degraded_marker(
                 DATA_DIR, detection, dump_info=dump_info,
                 detected_at=original_detected_at,
+                forensics=forensics,
             )
         except Exception as me2:
             print(f"[walguard] marker update after dump failed: {me2!r} (#786)", file=sys.stderr)
@@ -1939,7 +2529,7 @@ def _walguard_degraded_banner() -> str:
         return ""
 
 
-# The four nodes_fts sync-trigger names, single-sourced so
+# The five nodes_fts sync-trigger names, single-sourced so
 # _recreate_fts_sync_triggers and any standalone DROP-before-rebuild step
 # (migration rung 4, below) can't drift apart on the name list itself.
 _FTS_SYNC_TRIGGER_NAMES = (
@@ -1947,23 +2537,25 @@ _FTS_SYNC_TRIGGER_NAMES = (
     "nodes_fts_delete",
     "nodes_retract_remove_from_fts",
     "nodes_fts_supersede_remove",
+    "nodes_fts_rewrite_resync",
 )
 
 
 def _recreate_fts_sync_triggers(
     conn: sqlite3.Connection, cols: list[str], drop_first: bool
 ) -> None:
-    """Build and (re)create the four nodes_fts sync triggers for `cols`.
+    """Build and (re)create the five nodes_fts sync triggers for `cols`.
 
     Shared by two call sites that used to carry independently-written copies
-    of these four CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
-    reviewer-flagged duplication):
+    of these five CREATE TRIGGER bodies ~370 lines apart (round-3 fix,
+    reviewer-flagged duplication; grew from four to five with #2742's
+    nodes_fts_rewrite_resync):
 
       - the always-run setup block above (`drop_first=False` — no DROP here;
         uses `CREATE TRIGGER IF NOT EXISTS` so a trigger already created by a
         prior call/process is left alone rather than being blindly recreated).
       - migration rung 4 below (`drop_first=True` — the caller has ALREADY
-        dropped the four triggers via `_FTS_SYNC_TRIGGER_NAMES` before
+        dropped the five triggers via `_FTS_SYNC_TRIGGER_NAMES` before
         delegating to `engram_backup.rebuild_fts_index` — see the ordering
         comment at that call site for why the drop must happen before, not
         during, this function's own call, which runs only after the FTS
@@ -2026,6 +2618,53 @@ def _recreate_fts_sync_triggers(
         BEGIN
             INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
             VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+        END
+        """,
+        # Rewrite-resync trigger (#2742, forum #398 2026-09-07) — none of
+        # the four triggers above fire on a plain content edit (a recall-
+        # summary tightening pass, a claim correction, etc.): insert syncs
+        # a brand-new row, delete/retract/supersede remove a row leaving
+        # the graph, but nothing re-syncs a row whose TEXT changed while it
+        # stayed current. External-content FTS5 (content='nodes') then
+        # carries stale postings for whatever the edit dropped — the row's
+        # rowid is still indexed, so INSERT/DELETE-shaped checks (a plain
+        # MATCH, PRAGMA quick_check, even FTS5's own plain 'integrity-check'
+        # special command) all read clean; only ranking a dropped token
+        # (MATCH ... ORDER BY rank, which _similar_existing_matches's dedup
+        # gate and engram_query both use) touches the stale postings and
+        # raises SQLITE_CORRUPT_VTAB. This is the root cause behind the
+        # fleet-wide corruption engram-alpha#2678's detector surfaced (4 of
+        # 5 measured seats affected, forum #398) — a rewrite-in-place (most
+        # commonly a recall_summary/recall_keywords tightening pass, which
+        # can drop tokens the original claim carried) silently orphans
+        # whatever text the edit removed, with no trigger ever correcting it.
+        #
+        # WHEN clause composition (mirrors nodes_fts_supersede_remove's own
+        # COALESCE(NEW.status,'')!='retracted' guard against retract's
+        # combined status+is_current UPDATE): fires ONLY on a "pure" content
+        # rewrite where the row stays current and stays non-retracted
+        # THROUGH this exact statement. NEW.is_current=1 excludes a
+        # supersede sharing this UPDATE (nodes_fts_supersede_remove already
+        # owns that removal); NEW.status!='retracted' excludes a retract
+        # sharing this UPDATE (nodes_retract_remove_from_fts already owns
+        # that removal) — for any column NOT named in a given UPDATE's SET
+        # clause, SQLite's NEW.<col> already equals OLD.<col>, so a pure
+        # text-only edit naturally satisfies both without needing is_current/
+        # status to be re-stated. Not currently reachable via _supersede_impl
+        # or _retract_impl (neither touches text columns in the same
+        # UPDATE as today's code stands) but guarded defensively per spec,
+        # matching the existing supersede trigger's own defensive posture
+        # against a composition no current caller actually produces.
+        f"""
+        {create_clause} nodes_fts_rewrite_resync
+        AFTER UPDATE OF {trig_cols_sql} ON nodes
+        WHEN OLD.is_current = 1 AND NEW.is_current = 1
+          AND COALESCE(NEW.status, '') != 'retracted'
+        BEGIN
+            INSERT INTO nodes_fts(nodes_fts, rowid, {trig_cols_sql})
+            VALUES ('delete', OLD.rowid, {old_coalesce_sql});
+            INSERT INTO nodes_fts(rowid, {trig_cols_sql})
+            VALUES (NEW.rowid, {new_vals_sql});
         END
         """,
     ]
@@ -2401,6 +3040,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(type);
         CREATE INDEX IF NOT EXISTS idx_nodes_current ON nodes(is_current);
         CREATE INDEX IF NOT EXISTS idx_nodes_evidence_id ON nodes(evidence_id);
+        -- #2559: the health dangling-evidence NOT EXISTS query (health/
+        -- measurements.py:m_evidence_uncited) correlates on evidence_id AND
+        -- filters on is_current in the same subquery. Without planner
+        -- statistics (no shipped code path runs ANALYZE), SQLite has no
+        -- cardinality info to choose between the two single-column indexes
+        -- above and picks idx_nodes_current -- nearly the whole table --
+        -- making the subquery O(N) per outer row, O(N^2) overall. This
+        -- covering index makes the correct plan deterministic regardless
+        -- of statistics freshness (measured: 758x on a 4,597-node graph,
+        -- Ariadne/forum#390; 105x->0.9ms on Kepler's 1,940-node graph).
+        CREATE INDEX IF NOT EXISTS idx_nodes_evidence_current ON nodes(evidence_id, is_current);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_node ON cascade_markers(node_id);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_node_status ON cascade_markers(node_id, status);
         CREATE INDEX IF NOT EXISTS idx_cascade_markers_event ON cascade_markers(cascade_event);
@@ -2722,7 +3372,14 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass  # creation failed — fall back to Python cosine
 
-    # Rebuild FTS triggers — safe to run multiple times
+    # Rebuild FTS triggers — safe to run multiple times, and this always-run
+    # (non-version-gated) block is why a NEW graph, or an existing graph on
+    # any prior version, picks up nodes_fts_rewrite_resync (#2742) on its
+    # very next server start even before migration rung 6 below runs — rung
+    # 6 exists for the version-bump bookkeeping itself (this codebase's
+    # convention: schema-shape additions get a numbered rung even when, as
+    # here, the mechanical CREATE TRIGGER IF NOT EXISTS already happened
+    # here moments earlier in the same startup).
     #
     # Column list is single-sourced from engram_backup.NODES_FTS_COLUMNS
     # (#2077), same as the CREATE VIRTUAL TABLE block above — reuses the
@@ -2749,7 +3406,36 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # drop_first=False here: no DROP precedes this call, so CREATE TRIGGER
     # IF NOT EXISTS is used, matching this block's pre-existing idempotent,
     # safe-to-run-every-startup behavior.
-    _fts_trig_cols = [c.strip() for c in _fts_cols_sql.split(",")]
+    #
+    # #2742 fix: build the trigger set from whatever nodes_fts ACTUALLY
+    # has, not unconditionally the canonical target -- the self-heal block
+    # just above already computed this same "existing vs canonical"
+    # comparison and, for an in-memory/unattached-temp connection whose
+    # nodes_fts is stale, DELIBERATELY skips repairing the table itself
+    # (#2186's own documented reasoning: nothing on-disk to persist-repair).
+    # This trigger-creation step ran unconditionally against the canonical
+    # list regardless, so on that specific (narrow but real -- a mid-
+    # migration retry state, not just a test artifact) path, IF NOT EXISTS
+    # would create a trigger referencing columns the live table doesn't
+    # have, raising the moment it fires. Caught by
+    # test_2181_pre_migration_backup_skips_for_in_memory_connection's
+    # SECOND _run_db_one_time_setup call after adding nodes_fts_
+    # rewrite_resync -- not by any test named in #2742's own spec, and
+    # not unique to that new trigger: nodes_fts_supersede_remove already
+    # carried the identical latent exposure, just never exercised by a
+    # test whose repro touches is_current/status rather than claim.
+    # Re-derived independently here (own try/except) rather than reusing
+    # the self-heal block's _existing_fts_cols, which may be unbound if
+    # that block's own try raised before assigning it.
+    try:
+        _live_fts_cols = engram_backup._existing_fts_columns(conn)
+    except Exception:
+        _live_fts_cols = None
+    _fts_trig_cols = (
+        _live_fts_cols
+        if _live_fts_cols is not None
+        else [c.strip() for c in _fts_cols_sql.split(",")]
+    )
     _recreate_fts_sync_triggers(conn, _fts_trig_cols, drop_first=False)
 
     # One-shot migration (#274): remove existing retracted nodes from the FTS
@@ -2771,17 +3457,17 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     current_user_version = conn.execute("PRAGMA user_version").fetchone()[0]
 
     # _PRE_MIGRATION_LATEST_VERSION tracks the highest rung's target version
-    # below (currently rung 5 -> PRAGMA user_version = 5). No single named
+    # below (currently rung 6 -> PRAGMA user_version = 6). No single named
     # constant exists elsewhere in this function for "the latest schema
     # version" — each rung below hardcodes its own target inline — so this
     # local mirrors that existing convention rather than inventing a new
     # module-level constant this PR would be the only user of. Bump this
-    # alongside adding any future rung 6. (Mechanically checked against the
+    # alongside adding any future rung 7. (Mechanically checked against the
     # rungs' own PRAGMA user_version = N literals by
     # test_2181_pre_migration_latest_version_constant_matches_max_rung_target
     # — forgetting the bump fails loudly at test time instead of silently
     # skipping the new rung's backup.)
-    _PRE_MIGRATION_LATEST_VERSION = 5
+    _PRE_MIGRATION_LATEST_VERSION = 6
 
     # See _take_pre_migration_backup_if_pending's docstring for the full
     # contract (what True/False mean, why the failure posture is inverted
@@ -2833,9 +3519,29 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
             conn.execute("DROP TABLE IF EXISTS nodes_fts_vocab")
             conn.execute("DROP TABLE IF EXISTS nodes_fts")
             # Drop old triggers so they can be recreated with new column list.
-            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_insert")
-            conn.execute("DROP TRIGGER IF EXISTS nodes_fts_delete")
-            conn.execute("DROP TRIGGER IF EXISTS nodes_retract_remove_from_fts")
+            # Iterate the CURRENT full _FTS_SYNC_TRIGGER_NAMES tuple, not a
+            # hardcoded 3-name list frozen at this rung's original authoring
+            # (#2742 fix): the always-run setup block above (which runs
+            # BEFORE any migration rung, on every startup including this
+            # DB's very first) already created every trigger in that tuple
+            # against nodes_fts's CURRENT canonical column shape. This rung
+            # then drops+recreates nodes_fts with an OLDER, narrower,
+            # historically-frozen 5-column shape below (deliberately never
+            # touched — see that CREATE VIRTUAL TABLE's own "do not touch"
+            # scope note) -- but a trigger this rung doesn't know to drop
+            # survives pointing at columns the new table doesn't have. Real
+            # bug, not hypothetical: nodes_fts_rewrite_resync (added after
+            # this rung was written) fires on rung 4's own claim-backfill
+            # UPDATE, which runs in the window between this rung's narrower
+            # rebuild and rung 4's own drop-and-full-rebuild, raising
+            # "table nodes_fts has no column named recall_summary" and
+            # failing this whole migration -- caught by running the full
+            # test suite after adding that trigger, not by any test named
+            # in #2742's own spec. Only the DROP-list is widened here; the
+            # CREATE VIRTUAL TABLE column set two statements below is
+            # unchanged, preserving this rung's frozen historical shape.
+            for _rung2_trig in _FTS_SYNC_TRIGGER_NAMES:
+                conn.execute(f"DROP TRIGGER IF EXISTS {_rung2_trig}")
             # Recreate FTS table with 5-column schema.
             conn.execute(
                 """
@@ -2962,12 +3668,19 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
     # Three pieces, in dependency order — NOTE the order is claim-backfill
     # THEN fts-reindex THEN re-embed, not the "a/b/c" issue-numbering order
     # above: nodes_fts is an external-content FTS5 table (content='nodes')
-    # kept in sync only by the four sync triggers below, and NONE of them
-    # fire on a plain UPDATE OF claim — so if the FTS reindex below ran
-    # BEFORE the claim backfill, it would index the OLD (still-truncated)
-    # claim text and there is no later trigger to re-sync it. Caught by this
-    # rung's own migration-check script during implementation (see PR
-    # handoff), not by any pre-existing test.
+    # kept in sync only by the sync triggers below, and at the time this rung
+    # was written NONE of them fired on a plain UPDATE OF claim — so if the
+    # FTS reindex below ran BEFORE the claim backfill, it would index the OLD
+    # (still-truncated) claim text and there was no later trigger to re-sync
+    # it. Caught by this rung's own migration-check script during
+    # implementation (see PR handoff), not by any pre-existing test.
+    # (#2742: a fifth trigger, nodes_fts_rewrite_resync, now DOES fire on
+    # UPDATE OF claim — but it doesn't change this rung's own ordering
+    # requirement, because it isn't live yet at this exact point: rung 2
+    # above dropped it along with the other four, and step 2 immediately
+    # below is what recreates all five against this rung's own drop-and-
+    # rebuild `cols`. So the claim-backfill-first ordering this comment
+    # explains is still exactly right, for the same reason it always was.)
     #   1. Claim backfill (#1875) — recompute claim for every feeling_report
     #      node from its (still-present, deliberately-kept — see #1952 PR2's
     #      PR description) reported_state column: full text + hedge prefix,
@@ -3431,6 +4144,45 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> None:
                 "[_run_db_one_time_setup] migration 5 (#2324 cascade-marker "
                 "backfill) FAILED, will retry on next startup: "
                 f"{_migration5_err!r}",
+                file=sys.stderr,
+            )
+
+    # Migration version 6 (#2742, forum #398 2026-09-07): version-bump
+    # bookkeeping for nodes_fts_rewrite_resync. The trigger itself is
+    # already live by this point in every startup (the always-run block
+    # above creates it via CREATE TRIGGER IF NOT EXISTS, unconditionally —
+    # see that block's own comment) — this rung's only job is the
+    # PRAGMA user_version bump, matching this codebase's convention that
+    # every schema-shape addition is versioned, not just mechanically
+    # applied. No backfill here: deliberately NOT rebuilding nodes_fts to
+    # repair rows already orphaned by a pre-existing rewrite (Kepler's
+    # explicit instruction, forum #398).
+    #
+    # Sequencing note, corrected before the colleague pass (Kepler's PR
+    # comment): the four seats known-damaged as of this PR (forum #398) were
+    # ALREADY per-seat rebuilt under Lei's emergency go (18:04-18:22Z),
+    # BEFORE this trigger existed and before this PR was opened — so the
+    # sequence for those seats is not "trigger, then rebuild" but the
+    # reverse: rebuilt-but-untriggered seats re-damage on their very next
+    # tighten-then-supersede, until this trigger reaches them on their next
+    # server start after the plugin upgrade carrying this migration. A
+    # SECOND per-seat rebuild is then needed — to clear whatever accumulated
+    # in the gap between the emergency rebuild and the trigger's arrival,
+    # and (once #2746's rebuild_fts_index contract fix lands) to move the
+    # seat onto the trigger's own contract, which currently disagrees with
+    # rebuild_fts_index about whether a superseded row belongs in the index.
+    # A graph landing on this rung may still carry orphaned postings from
+    # edits made before the trigger reached it; this rung only guarantees no
+    # NEW orphan is created going forward.
+    if _rung_ready(conn, 6, _pre_migration_backup_ok):
+        try:
+            conn.execute("PRAGMA user_version = 6")
+            conn.commit()
+        except sqlite3.DatabaseError as _migration6_err:
+            print(
+                "[_run_db_one_time_setup] migration 6 (#2742 rewrite-resync "
+                "trigger version bump) FAILED, will retry on next startup: "
+                f"{_migration6_err!r}",
                 file=sys.stderr,
             )
 
@@ -4061,8 +4813,9 @@ def _compute_recall_set_continuity(conn: sqlite3.Connection, checkpoint_mode: st
     "tier1+tier2 membership" reduces to just the tier2-threshold set; no
     separate tier1 query or literal set-union is needed.
 
-    Called from BOTH the engram_nap wrapper AND the engram_advance_turn
-    (sleep) wrapper (server.py), at every diagnostic_history checkpoint —
+    Called from BOTH the engram_checkpoint wrapper (formerly engram_nap) AND
+    the engram_advance_turn (sleep) wrapper (server.py), at every
+    diagnostic_history checkpoint —
     NOT from engram_diagnose() itself. engram_diagnose() is its own
     directly-callable MCP tool ("Use any time" per its docstring), not
     checkpoint-only, so computing and injecting this here (rather than
@@ -5056,9 +5809,25 @@ def _generate_snapshot(conn: sqlite3.Connection) -> str:
             elif ntype in ("derivation", "theory"):
                 lines.append(f"### {n['id']} [{conf_str}] [{status_tag}]")
                 lines.append(f"Claim: {n['claim']}")
+                # #2657 (fourth sibling of #2624): the old literal
+                # ('derives_from', 'cites') predates acknowledged_derives_from
+                # and silently dropped a premise reached only via that
+                # relation from a label ("Derives from:") that asserts
+                # completeness. CITATION_SUPPORT_RELATIONS (derives_from,
+                # supported_by, acknowledged_derives_from) is the one-hop
+                # premise set #2618/#2624 established -- but this site's
+                # OLD query also included 'cites', which is NOT a premise
+                # relation and is not in that constant. Keeping 'cites'
+                # unioned in preserves today's rendered shape (nothing
+                # already shown disappears) while adding the missing
+                # premise relation -- the smallest change consistent with
+                # the "Derives from:" label as written, per the issue's own
+                # stated preference among its three options.
+                _snapshot_support_rels = sorted(CITATION_SUPPORT_RELATIONS | {"cites"})
                 edges = conn.execute(
-                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN ('derives_from', 'cites')",
-                    (n["id"],),
+                    "SELECT target_id, relation FROM edges WHERE source_id = ? AND relation IN "
+                    f"({','.join('?' for _ in _snapshot_support_rels)})",
+                    (n["id"], *_snapshot_support_rels),
                 ).fetchall()
                 support_ids = [e["target_id"] for e in edges]
                 if support_ids:
@@ -5948,20 +6717,64 @@ def _current_successor(conn, node_id: str) -> "str | None":
 # ---------------------------------------------------------------------------
 # Reflect-family helpers promoted for engram_lifecycle use.
 # ---------------------------------------------------------------------------
+# Both are DISPLAY-ONLY bounds applied by _reflect_rs_or_claim below; neither
+# validates or rejects anything on write. Public (no leading underscore) so
+# tests can import them instead of re-hardcoding the numbers -- same
+# convention engram_query.py's LIST_CLAIM_SUMMARY_DISPLAY_CAP /
+# LIST_CLAIM_FALLBACK_DISPLAY_CAP already use for _list_impl's analogous pair
+# (#2721).
 
-def _reflect_rs_or_claim(row, claim_field: str = "claim", max_len: int = 160) -> str:
-    """Return recall_summary (capped at 200) or claim truncated to max_len.
+# Display truncation for a populated recall_summary, in engram_reflect's
+# output. Deliberately its OWN constant, not an import/alias of
+# engram_query.LIST_CLAIM_SUMMARY_DISPLAY_CAP, even though both are 200 today
+# -- from PR #2721's round-6 review (the fallback-cap follow-up, #2773):
+# "Not LIST_CLAIM_SUMMARY_DISPLAY_CAP -- different module, different tool,
+# different consumer. Binding them makes an engram_list triage-display change
+# silently alter engram_reflect output." Also NOT the same bound as
+# engram_lifecycle._REFLECT_FIELD_MAX (also 200, also on the reflect path --
+# the tempting misbinding): that function trims to MAX-1 content chars plus a
+# ONE-char ellipsis (exactly 200 out), while this one appends a THREE-char
+# "..." past its own 200-char slice (203 out) -- "a bound that produces a
+# value three chars past _REFLECT_FIELD_MAX and is then trimmed BY
+# _REFLECT_FIELD_MAX cannot BE _REFLECT_FIELD_MAX. They compose; they do not
+# coincide." Its equality with LIST_CLAIM_SUMMARY_DISPLAY_CAP is a numeric
+# convention, not a dependency -- same relationship #2721 already documented
+# between that constant and RECALL_SUMMARY_HARD_CAP.
+REFLECT_SUMMARY_DISPLAY_CAP = 200
+
+# Display truncation for the raw `claim` fallback, used only when a row has
+# no recall_summary yet. Deliberately NOT named (or valued) the same as
+# engram_query.LIST_CLAIM_FALLBACK_DISPLAY_CAP (130) -- #2721's round-6 review
+# measured these as genuinely different computations, not two names for one
+# bound: "the claim fallbacks differ (160 vs 130), and _reflect_rs_or_claim
+# emits rs[:200] + '...' unconditionally past its cap while _list_impl's
+# at-cap branch returns the value as-is -- so the two produce different
+# lengths on the same input. A shared helper would assert a binding that does
+# not exist." Confirmed at #2773 filing: all 11 call sites of this function
+# (10 in engram_lifecycle.py, 1 in server.py's forwarder) rely on the 160
+# default -- none overrides max_len.
+REFLECT_CLAIM_FALLBACK_DISPLAY_CAP = 160
+
+
+def _reflect_rs_or_claim(
+    row, claim_field: str = "claim", max_len: int = REFLECT_CLAIM_FALLBACK_DISPLAY_CAP,
+) -> str:
+    """Return recall_summary (capped at REFLECT_SUMMARY_DISPLAY_CAP) or claim
+    truncated to max_len.
 
     Used by engram_reflect's low-volume source-swap and high-volume Tier-1
     claim rendering. Row must have recall_summary and the named claim_field.
-    Safety bound: recall_summary > 200 chars → truncated to 200 + "..."
-    (matches Wave D round-2 convention).
+    Safety bound: recall_summary > REFLECT_SUMMARY_DISPLAY_CAP chars →
+    truncated to REFLECT_SUMMARY_DISPLAY_CAP + "..." (matches Wave D round-2
+    convention). See the module-level constants just above for why this cap
+    and the claim-fallback default are each their own named constant rather
+    than sharing a name with engram_query.py's analogous (but distinct) pair.
     """
     rs = row["recall_summary"] if "recall_summary" in row.keys() else None
     rs = (rs or "").strip()
     if rs:
-        if len(rs) > 200:
-            rs = rs[:200] + "..."
+        if len(rs) > REFLECT_SUMMARY_DISPLAY_CAP:
+            rs = rs[:REFLECT_SUMMARY_DISPLAY_CAP] + "..."
         return rs
     raw = row[claim_field] or ""
     return (raw[:max_len] + "...") if len(raw) > max_len else raw
@@ -7071,8 +7884,19 @@ def _classify_pending_markers(conn: sqlite3.Connection, node_id: str) -> tuple:
 # (#1952 PR1). Distinct from RECALL_SUMMARY_HARD_CAP (200) in
 # tools/recall_summary_validator.py, which governs the OLDER
 # engram_set_recall_summaries batch tool on a separate path — the two are
-# deliberately not unified (see #1952 comment 5-6). Target: agents should aim
-# for ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
+# deliberately not unified. Lei's ruling (#1952, the "Design addendum — Lei's
+# four answers folded in" comment, 2026-08-19 evening): "280 = filing-time
+# hard gate ... 200 = post-tightening hard gate applied code-side to the
+# fairy's output". Cite by distinctive title text, not an ordinal into the
+# comment list or a dev-repo permalink (this file ships publicly; a
+# dev-repo URL here trips scan-leaks) — an earlier version of this comment
+# cited "comment 5-6" and was wrong from the moment it was written: the
+# ruling is comment 7 by any measured timestamp, and a reader following the
+# stale ordinal lands on the (superseded) two-threshold draft the ruling
+# explicitly replaced, concluding this citation is empty and unifying the
+# two constants (found by Ariadne, forum #398, 2026-09-07, while confirming
+# for Borges that 200 vs 280 IS deliberate). Target: agents should aim for
+# ≤140 chars; soft-accept (needs_tightening=1) up to 279; hard-reject at
 # 280+.
 RECALL_SUMMARY_TARGET = 140
 RECALL_SUMMARY_HARD_REJECT_AT = 280

@@ -32,70 +32,15 @@ def _resolve_engram_home() -> str:
     )
 
 
-def _resolve_runtime_dir(engram_home: str) -> str:
-    """Locate where engram_client.py lives for import.
-
-    Priority:
-      1. $ENGRAM_RUNTIME_DIR if set explicitly.
-      2. Plugin root: hook lives at <plugin_root>/hooks/hook.py (flat layout —
-         tools/build-plugin.sh copies hooks into <plugin_root>/hooks/ without
-         a platform subdir), so the plugin root is two dirname() levels up
-         from __file__. engram_client.py lives at <plugin_root>/. The plugin
-         bundle is the canonical runtime; when present it MUST win so a stale
-         data-dir snapshot can never shadow it (fixes #1152: scatter cleanup
-         can leave ~/.engram/engram_client.py that does `import server` against
-         a removed ~/.engram/server.py, crash-looping the daemon).
-      3. $ENGRAM_HOME if it bundles a snapshot (scatter-install fallback only —
-         reached only when there is no plugin bundle; covers scatter installs
-         that copy engram_client.py into the data dir).
-      4. Walk parents from __file__ for the nearest ancestor whose own
-         src/engram/ actually contains engram_client.py, instead of guessing a
-         fixed absolute path (#1712: the fixed guess resolves to the WRONG
-         checkout when this process is running from a git worktree nested
-         under the guessed path, e.g. .claude/worktrees/<id>/ under
-         ~/engram-alpha -- silently shadowing the actually-running copy with
-         a sibling one).
-      5. ~/engram-alpha (live-source fallback for dev installs, last-ditch,
-         unchanged).
-    """
-    explicit = os.environ.get("ENGRAM_RUNTIME_DIR")
-    if explicit:
-        return explicit
-    plugin_root = os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))
-    )
-    if os.path.exists(os.path.join(plugin_root, "engram_client.py")):
-        return plugin_root
-    if os.path.exists(os.path.join(engram_home, "engram_client.py")):
-        return engram_home
-    # Reviewer-fairy blocker (PR #1727): this function is called at bare
-    # module-import time below (`PROJECT_DIR = _resolve_runtime_dir(...)`,
-    # unguarded), so the walk itself must never raise. Path.exists() --
-    # unlike os.path.exists() used at every other rung above -- raises
-    # PermissionError on an unreadable ancestor instead of returning False;
-    # an unhandled exception here would crash the whole hook process at
-    # import time. Same precedent as _hooklib.resolve_tools_dir's own
-    # docstring ("the caller's own import should be wrapped... and degrade
-    # to a silent no-op on failure") -- wrapped here instead of at the call
-    # site so this function keeps its existing never-raises contract.
-    try:
-        for parent in Path(__file__).resolve().parents:
-            candidate = parent / "src" / "engram"
-            if (candidate / "engram_client.py").exists():
-                return str(candidate)
-    except OSError:
-        pass
-    return os.path.expanduser("~/engram-alpha")  # last-ditch, unchanged
-
-
 ENGRAM_HOME = _resolve_engram_home()
-PROJECT_DIR = _resolve_runtime_dir(ENGRAM_HOME)
 
 # Bridge for downstream callers: ensure ENGRAM_HOME is set so any sibling process inherits it.
 os.environ.setdefault("ENGRAM_HOME", ENGRAM_HOME)
 
 if HOOK_DIR not in sys.path:
     sys.path.insert(0, HOOK_DIR)
+from _hooklib import resolve_runtime_dir, emit_context
+from _harness import detect_harness, get_harness_budgets
 try:
     from _hooklib import (
         is_own_server_py_running as _is_own_server_py_running_impl,
@@ -104,6 +49,49 @@ try:
     _HOOKLIB_OK = True
 except Exception:
     _HOOKLIB_OK = False
+
+# Locate where engram_client.py lives for import (gh#2570: local
+# _resolve_runtime_dir hoisted to _hooklib.resolve_runtime_dir; this hook's
+# own sentinel, engram_client.py, is preserved unchanged -- used by
+# _should_prepend / query_fts_fallback below).
+PROJECT_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_client.py")
+
+# Separate, dedicated resolve+insert for the emitter (gh#2570 §1/§4): the
+# three sys.path.insert(0, ENGRAM_HOME) calls at the emit sites below used
+# to rely entirely on this hook's plugin root having been left on sys.path
+# by two UNRELATED function bodies (_should_prepend's engram_idf import,
+# query_fts_fallback's engram_client import) -- accidental, and only
+# reached at all on the code paths that call those two functions. An import
+# of the emitter must probe for the emitter, not piggyback on a directory
+# some other import incidentally added to sys.path. Module scope,
+# unconditional, so every emit site can rely on it regardless of which
+# branch ran earlier in this request.
+_EMITTER_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _EMITTER_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _EMITTER_RUNTIME_DIR)
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line. All
+# three of this file's emit sites share this one `main` dispatch target
+# (docs/2574-telemetry-design.md §1: "engram-surface-hook.py's three sites
+# share main, so one reached covers all three").
+_MAIN_MANIFEST_ID = "hooks/claude/engram-surface-hook.py:main"
+_SURFACE_FIRE_SITE = "surface-hook.surface_fire"
+_TRIGGER_FIRE_SITE = "surface-hook.trigger_fire"
+_RENDER_SIZE_SITE = "surface-hook.render_size"
 
 
 def _check_db_liveness(db_path: str) -> tuple[bool, str]:
@@ -1277,6 +1265,170 @@ def _dormant_focus_set_candidates(rendered_ids: set) -> tuple[list[dict], int]:
     return candidates, sets_checked
 
 
+# ---------------------------------------------------------------------------
+# #2753 epic WS2 — generalization-chain render at prompt-time recall (D3
+# point 2). ADDITIVE, after Specials + Top claims are fully built: for every
+# node id that actually rendered in either section this prompt, check
+# whether it has a principle chain (generalization_chain(), WS1) and render
+# ONE "Triggered principles" section, heads deduped across the whole
+# recalled set for this one prompt (Case 1 in the issue's D3 -- same rule
+# the tripwire hook applies per-fire). Matched nodes in Specials/Top claims
+# are unchanged; this is a pure addition after them.
+# ---------------------------------------------------------------------------
+
+_TRIGGERED_PRINCIPLES_FULL_CAP = 2
+
+
+def _import_generalization_chain():
+    """Lazily import generalization_chain from engram_core (#2753 WS1) --
+    never raises; resolved via the shared _hooklib.resolve_runtime_dir
+    already imported at module scope (one call per module actually
+    imported, per that helper's own docstring)."""
+    try:
+        runtime_dir = resolve_runtime_dir(ENGRAM_HOME, "engram_core.py")
+        if runtime_dir not in sys.path:
+            sys.path.insert(0, runtime_dir)
+        from engram_core import generalization_chain
+        return generalization_chain
+    except Exception:
+        return None
+
+
+def _render_triggered_principles_section(ordered_ids: list, db_path: "str | None" = None) -> str:
+    """#2753 epic WS2, D3 point 2: for every node id that actually rendered
+    in Specials or Top claims this prompt (`ordered_ids`, in render-priority
+    order -- the caller passes Specials before Top claims, matching the
+    order they were built in above), check whether it has a principle chain
+    and render ONE additive "Triggered principles" section, heads deduped
+    across the WHOLE recalled set for this one prompt (Case 1 in the
+    issue's D3 -- same dedupe rule the tripwire hook applies per-fire; Case
+    2, the existing per-node suppression/cooldown machinery, is untouched
+    and not this function's concern).
+
+    Per DISTINCT head (first-seen order across ordered_ids): a FULL line
+    "↑ principle: <head_id> — <head recall_summary>", capped at
+    _TRIGGERED_PRINCIPLES_FULL_CAP (2) heads per prompt -- any further
+    distinct head renders as a BARE id line ("↑ principle: <head_id>", no
+    summary) instead, per the issue's D3 point 2 budget ("at most 2 full
+    chain blocks per prompt; the rest as IDs"). Matched nodes in
+    Specials/Top claims are unchanged -- this function only ever returns a
+    block to be APPENDED after them.
+
+    Returns "" on: no candidate ids, no importable generalization_chain,
+    any DB/walk failure, or no candidate producing a real chain and no
+    candidate reporting cycle_detected (i.e. every candidate is already a
+    head with nothing above it). Never raises.
+
+    #2753 WS2 round 2 -- `cycle_detected` (WS1's cycle-guard fix, 5e14f83b):
+    a candidate whose chain comes back with `cycle_detected: True` has NO
+    valid head to render (structurally impossible in a valid DAG). It
+    renders its own standalone malformed-data line instead of the normal
+    "↑ principle: ..." line and is excluded from the head-dedupe/cap
+    machinery above -- see the sibling tripwire-hook function's docstring
+    for the full rationale (identical here; not restated).
+
+    #2753 WS2 round 3 -- `truncated` (present since WS1's original commit,
+    read here for the first time): a candidate whose chain reports
+    `heads: []`, `cycle_detected: False`, and `truncated: True` has real
+    partial ancestry -- `max_depth` was hit before a head was reached, not
+    a malformed graph. Falling into the same silent skip as the
+    no-ancestor case would misreport "no chain exists"; it renders its own
+    one-line "chain truncated" notice instead (no rungs shown, `…` marker
+    rather than `⚠`, to read as incomplete-but-honest rather than corrupt)
+    and is excluded from the head-dedupe/cap machinery, same as a
+    cycle-detected candidate -- see the sibling tripwire-hook function's
+    docstring for the full rationale (identical here; not restated).
+    `cycle_detected` and `truncated` are mutually exclusive by
+    generalization_chain's own contract, so the two checks never both fire
+    on the same candidate.
+
+    db_path defaults to None (resolved to the module-level KNOWLEDGE_DB_PATH
+    INSIDE the function body, not as a mutable default-argument value) so a
+    test that monkeypatches KNOWLEDGE_DB_PATH after import is honored on the
+    no-arg call path — see the sibling tripwire-hook function's docstring
+    for the same footgun this avoids.
+    """
+    if not ordered_ids:
+        return ""
+    if db_path is None:
+        db_path = KNOWLEDGE_DB_PATH
+    generalization_chain = _import_generalization_chain()
+    if generalization_chain is None:
+        return ""
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        head_order: list = []
+        head_summaries: dict = {}  # head_id -> recall_summary (from its own chain entry)
+        # #2753 WS2 round 2 -- candidate ids whose own chain() call reported
+        # cycle_detected: True. See render_triggered_principles's sibling
+        # comment in the tripwire hook -- same rationale, same exclusion
+        # from head_order/head_summaries above (cycle_detected implies
+        # heads == [], so there is nothing to merge into).
+        cycle_detected_ids: list = []
+        # #2753 WS2 round 3 -- candidate ids whose own chain() call reported
+        # heads == [] with truncated: True (real ancestry exists, the walk
+        # was just cut off before reaching a head). Kept separate from
+        # cycle_detected_ids -- the two states are mutually exclusive and
+        # read differently to a human -- same rationale as the sibling
+        # tripwire-hook function.
+        truncated_ids: list = []
+        for nid in ordered_ids:
+            chain = generalization_chain(conn, nid)
+            nodes = chain.get("nodes") or {}
+            start_resolved = chain.get("start_resolved_id")
+            heads = chain.get("heads") or []
+            if chain.get("cycle_detected"):
+                if nid not in cycle_detected_ids:
+                    cycle_detected_ids.append(nid)
+                continue
+            if not heads and chain.get("truncated"):
+                if nid not in truncated_ids:
+                    truncated_ids.append(nid)
+                continue
+            # No generalizes ancestor at all -- already a head with nothing
+            # above it. Nothing to render for this candidate.
+            if not heads or (len(nodes) <= 1 and start_resolved in nodes):
+                continue
+            for head_id in heads:
+                if head_id not in head_summaries:
+                    head_entry = nodes.get(head_id, {})
+                    head_summaries[head_id] = head_entry.get("recall_summary") or ""
+                    head_order.append(head_id)
+    except Exception:
+        return ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if not head_order and not cycle_detected_ids and not truncated_ids:
+        return ""
+
+    lines = ["  Triggered principles:"]
+    for nid in cycle_detected_ids:
+        lines.append(
+            f"    ⚠ principle-chain data malformed for {nid} (a cycle was "
+            "detected in the resolved generalizes graph); chain not shown"
+        )
+    for nid in truncated_ids:
+        lines.append(
+            f"    … principle chain truncated for {nid} (max depth reached "
+            "before a head was found); further ancestry likely exists but "
+            "is not shown"
+        )
+    for i, head_id in enumerate(head_order):
+        if i < _TRIGGERED_PRINCIPLES_FULL_CAP and head_summaries[head_id]:
+            lines.append(f"    ↑ principle: {head_id} — {head_summaries[head_id]}")
+        else:
+            lines.append(f"    ↑ principle: {head_id}")
+    return "\n".join(lines)
+
+
 def _get_attached_packs() -> list[dict]:
     """Read attached_packs from $ENGRAM_HOME/config.json.
 
@@ -1446,6 +1598,58 @@ def _read_prev_assistant_tail(transcript_path: str | None, tail_chars: int) -> s
     return ""
 
 
+# Wrapper-line shape emitted by loop_prompt.format_loop_prompt()'s optional
+# machine-readable second line, e.g. `<loop-meta {"kind":"heartbeat"}>`.
+# Mirrors loop_prompt._META_PREFIX / _META_SUFFIX (not imported — see
+# _strip_loop_meta_lines docstring for why loop_prompt.py itself stays
+# untouched).
+_LOOP_META_LINE_PREFIX = "<loop-meta "
+_LOOP_META_LINE_SUFFIX = ">"
+
+
+def _strip_loop_meta_lines(prompt: str) -> str:
+    """Strip machine-readable ``<loop-meta ...>`` wrapper lines from prompt.
+
+    ``format_loop_prompt()`` (loop_prompt.py) emits an optional second line
+    carrying JSON-encoded meta kwargs (e.g. ``kind="heartbeat"``, ``seq=3``)
+    when a loop-wake prompt is armed with them. That line is machine-readable
+    wrapper metadata, not agent-authored content — the self-anchoring gate in
+    ``_should_prepend`` asks "does this prompt self-anchor?", and the wrapper
+    is not part of what a wake is *about*, whatever keys/values it happens to
+    carry (see #2482).
+
+    Measured on two seats, the wrapper's tokens ("meta", "kind", "heartbeat",
+    "seq", ...) trip the IDF-keyword self-anchoring rule on one seat's
+    vocabulary and not the other's, and the *specific* token that trips it
+    differs seat to seat — so no fixed stopword list can cover every seat.
+    Excluding the whole wrapper line from the gate's input is the only fix
+    that generalizes across vocabularies.
+
+    Only whole lines matching the wrapper's exact shape are removed: a line
+    whose stripped form starts with ``<loop-meta `` and ends with ``>``. A
+    malformed/unclosed wrapper line (no closing ``>``) is left alone —
+    treated as ordinary content, never over-stripped. Lines that don't match
+    (including the plain ``<loop-wake>`` marker line, which carries no
+    parenthetical metadata) are kept as-is. The span between the delimiters
+    is never validated as JSON (or anything else) before the line is
+    dropped — a deliberate choice, not an oversight: this is a scoring-input
+    filter, not a parser, and the real ``prompt`` (below) is never touched,
+    so an over-broad match can only shift the prepend-gate verdict, never
+    corrupt content.
+
+    This is used ONLY to decide whether to prepend the prev-response tail —
+    the raw ``prompt`` used everywhere else (the FTS query, the
+    ``embed_query`` concatenation, etc.) is untouched.
+    """
+    kept = []
+    for line in prompt.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith(_LOOP_META_LINE_PREFIX) and stripped.endswith(_LOOP_META_LINE_SUFFIX):
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
     """IDF-based prepending gate. Returns True if prev_response_tail should be
     prepended to the embedding query.
@@ -1457,12 +1661,22 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         the legacy char-length heuristic. Preserves previous behavior on infra
         failure.
 
+    Before either rule runs, any ``<loop-meta ...>`` wrapper lines (see
+    ``_strip_loop_meta_lines``) are stripped from the prompt for scoring
+    purposes only — machine-readable loop-wake metadata is not content the
+    gate should judge self-anchoring on (#2482). ``prompt`` itself (the
+    caller's copy) is never mutated; only the local copy used for scoring is
+    affected, so this has no effect on any use of ``prompt`` outside this
+    function.
+
     Note: only called when cfg["idf_gate_enabled"] is True. The feature-flag
     check lives in the call site (main()), not here, so the function contract
     is clean for tests.
     """
+    scored_prompt = _strip_loop_meta_lines(prompt)
+
     # Rule 1: very short prompts can't self-anchor — always prepend.
-    if len(prompt) < cfg["idf_gate_short_prompt_floor_chars"]:
+    if len(scored_prompt) < cfg["idf_gate_short_prompt_floor_chars"]:
         return True
 
     # Rule 2: if prompt has high-IDF non-stopword tokens, it self-anchors — skip.
@@ -1479,7 +1693,7 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         from engram_idf import extract_keywords
         keywords = extract_keywords(
             conn,
-            prompt,
+            scored_prompt,
             min_idf=cfg["idf_gate_min_idf"],
             top_k=5,
         )
@@ -1490,7 +1704,7 @@ def _should_prepend(prompt: str, conn: sqlite3.Connection, cfg: dict) -> bool:
         # Fallback to legacy char-length heuristic if engram_idf unavailable
         # (ImportError) or any DB error occurs (vocab table missing, mode=ro
         # conflict, etc). Preserves previous behavior on infra failure.
-        return len(prompt) < cfg["short_prompt_threshold_chars"]
+        return len(scored_prompt) < cfg["short_prompt_threshold_chars"]
 
 
 def query_daemon(prompt: str, top_k: int = 10, embed_query: str | None = None) -> dict | None:
@@ -2006,6 +2220,30 @@ def format_nudge(
     # Others/reservation lines".
     specials_and_topclaims_ids = set(rendered_ids_this_prompt)
 
+    # #2753 epic WS2 (D3 point 2) — generalization-chain render, ADDITIVE
+    # after both "Specials:" and "Top claims:" are fully built and BEFORE
+    # the not-recalled slot-reservation logic below (which depends on
+    # rendered_ids_this_prompt bookkeeping this section does not touch).
+    # Reuses specials_and_topclaims_ids (just captured above) as the
+    # membership test, per spec — not rebuilt. `special`/`top_claims` (the
+    # same local lists the loops above already built from, read-only here)
+    # supply a stable Specials-before-Top-claims priority ORDER for which
+    # candidates are considered first for the 2-full-chain-block cap; the
+    # membership set itself is untouched. Independently guarded: a failure
+    # here must never affect Specials/Top claims, which already rendered
+    # above.
+    try:
+        _principle_candidate_order: list = []
+        for _cand in list(special[:3] if special else []) + list(top_claims[:3] if top_claims else []):
+            _cid = _cand.get("id")
+            if _cid in specials_and_topclaims_ids and _cid not in _principle_candidate_order:
+                _principle_candidate_order.append(_cid)
+        _principles_block = _render_triggered_principles_section(_principle_candidate_order)
+    except Exception:
+        _principles_block = ""
+    if _principles_block:
+        lines.append(_principles_block)
+
     matched_meta = result.get("matched_meta") or []
 
     # --- Not-recalled slot reservation (recall-triggering blueprint §3-P1,
@@ -2371,8 +2609,8 @@ def check_feeling_nudge_marker() -> str:
     additionalContext. Does NOT clear the marker — only
     engram_report_feeling clears it (read-and-clear is the single owner).
     Skips marker types other than post_compact (those are surfaced via
-    tool-return channels in engram_nap / engram_reflect, not via
-    UserPromptSubmit).
+    tool-return channels in engram_checkpoint (formerly engram_nap) /
+    engram_reflect, not via UserPromptSubmit).
     """
     try:
         with open(FEELING_NUDGE_MARKER, "r") as f:
@@ -2383,7 +2621,7 @@ def check_feeling_nudge_marker() -> str:
     source = marker.get("source")
     if source != "post_compact":
         # nap_checkpoint and dream_review nudges are delivered via the tool
-        # return JSON of engram_nap / engram_reflect, not here.
+        # return JSON of engram_checkpoint (formerly engram_nap) / engram_reflect, not here.
         return ""
 
     return (
@@ -2888,7 +3126,7 @@ def format_nap_warning(count: int) -> str:
             f"[ENGRAM Nap URGENT: {count} prompts since last compaction — context loss is imminent]\n"
             "  STOP current work and consolidate to ENGRAM NOW:\n"
             "  1. Record key decisions, observations, and derivations from recent work\n"
-            "  2. Run engram_nap to persist (engram_advance_turn only if user explicitly invokes the sleep skill)\n"
+            "  2. Load and run the engram-nap skill to persist (engram_advance_turn only if user explicitly invokes the sleep skill)\n"
             "  3. Tell the user you're ready to compact, then user types /compact"
         )
     elif count >= NAP_WARN_THRESHOLD:
@@ -2900,7 +3138,63 @@ def format_nap_warning(count: int) -> str:
     return ""
 
 
+def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
+    """Build the UserPromptSubmit response dict from this prompt's fired
+    head/body blocks, routed through the shared bounded renderer
+    `_hooklib.emit_context()` (engram-alpha#2863 WS2).
+
+    `head_blocks` / `body_blocks` are the lists of already-rendered,
+    non-empty block strings `main()` collected this prompt (see the
+    "# Build context parts" section below) -- this function does no
+    filtering of its own beyond the "did anything fire at all" check. Split
+    out from `main()` purely for testability (exercising this logic needs
+    no stdin plumbing); `main()`'s own behavior is otherwise unchanged.
+
+    Returns `{}` when nothing fired this prompt (mirrors the pre-migration
+    `if not parts:` early exit) -- `emit_context()` is never called with
+    two empty inputs. Otherwise returns the full
+    `{"hookSpecificOutput": {...}}` response dict, ready for `json.dumps()`.
+    """
+    head = "\n\n".join(head_blocks)
+    body = list(body_blocks)
+    if not head and not body:
+        return {}
+
+    harness = detect_harness()
+    budgets = get_harness_budgets(harness)
+    rendered = emit_context(
+        head,
+        body,
+        budget=budgets["budget"],
+        # Deliberate, not head_budget (engram-alpha#2863 WS2 spec): this
+        # hook's content (principle triggers, recall nudges) is already
+        # what the agent receives in full every prompt today, so the soft
+        # ceiling IS the hard ceiling here -- render should use everything
+        # up to the hard budget before cutting anything.
+        target=budgets["budget"],
+        # Protects principle_triggers, the largest body item, in the rare
+        # combined-outage case where head is also non-trivial.
+        allow_single_overflow=True,
+        # No shared overflow-persistence helper exists yet in _hooklib.py
+        # (only the tripwire hook's own bespoke, hook-specific writer) --
+        # cut content is dropped with a "M cut" count and no "-- see
+        # <path>" pointer. A shared overflow-writer helper is a clean
+        # fast-follow, not built here.
+        overflow_writer=None,
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": rendered,
+        }
+    }
+
+
 def main():
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return/exit in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     try:
         hook_input = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError):
@@ -2970,15 +3264,29 @@ def main():
     # See alpha #175.
     # Failure-mode contract: emitter.emit NEVER raises; if init fails or
     # the import itself fails, we degrade silently to a no-op.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5) -- the matched-ids extraction below is data prep, not
+    # construction, so it sits outside the narrowed try.
+    _emitter = None
     try:
-        sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=hook_input.get("session_id", "unknown"),
             transcript_path=hook_input.get("transcript_path", ""),
         )
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_SURFACE_FIRE_SITE,
+            event_type="engram.surface.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
         _surface_matched = result.get("matched_ids", []) if result else []
-        _emitter.emit(
+        _uid = _emitter.emit(
             event_type="engram.surface.fire",
             level=1,
             data={
@@ -2992,13 +3300,23 @@ def main():
                 # composite scores, etc.) require server.py-side instrumentation
                 # — Phase 3 fairy F1 scope per DESIGN.md §4.1.
             },
+            site="surface-hook.surface_fire",
         )
-    except Exception:
-        # Emitter failures must not break the hook — drop silently.
-        pass
+        write_telemetry_record(
+            manifest_id=_SURFACE_FIRE_SITE,
+            event_type="engram.surface.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
-    # Build context parts
-    parts = []
+    # Build context parts (engram-alpha#2863 WS2: split into head_blocks
+    # (short, urgent, joined "\n\n") and body_blocks (ordered,
+    # priority-first) so _assemble_response() below can route them through
+    # emit_context() for a combined-budget bound -- see that function's
+    # docstring and the WS2 spec's mapping table for which block goes
+    # where. Preserves the exact existing if/elif branching for what fires
+    # this prompt; only WHERE the resulting string goes has changed.
+    head_blocks: list = []
+    body_blocks: list = []
 
     # Unified principle-trigger check (#1698 slice 2) — one registry, four
     # kinds (lesson/cornerstone/axiom/goal), replacing the separate
@@ -3015,7 +3333,7 @@ def main():
         principle_triggers = check_error_patterns(prompt)
         _principle_rendered = []  # keyword fallback has no registry firing to emit telemetry for
     if principle_triggers:
-        parts.append(principle_triggers)
+        body_blocks.append(principle_triggers)
 
     # #1698 slice 3 §1.3 — engram.trigger.fire telemetry, one emission per
     # rendered principle firing. Call-site placement (spec's preferred
@@ -3025,15 +3343,38 @@ def main():
     # (matched_ids, prompt_count) -> (text, rendered) function with no
     # hook_input/session_id threading of its own.
     if _principle_rendered:
+        # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
+        # to its own try/except so an INIT_FAILED outcome is recordable and
+        # distinct from an ordinary DROPPED emit
+        # (docs/2574-telemetry-design.md §1/§5). This is the decisive case
+        # §1 names: the `for _kind, _pid, _entry, _mid in _principle_rendered`
+        # unpack used to sit INSIDE the same wide try as construction, so an
+        # unpack ValueError after a successful emit reported INIT-FAILED for
+        # a site that was actually delivering. The loop now sits outside the
+        # narrowed try; each iteration's emit is its own outcome row.
+        _emitter3 = None
         try:
-            sys.path.insert(0, ENGRAM_HOME)
             from engram_log_emitter import Emitter
             _emitter3 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),
                 transcript_path=hook_input.get("transcript_path", ""),
             )
+        except Exception:
+            write_telemetry_record(
+                manifest_id=_TRIGGER_FIRE_SITE,
+                event_type="engram.trigger.fire",
+                fields={"outcome": "init_failed"},
+            )
+
+        if _emitter3 is not None:
+            # This loop is now outside the narrowed construction-try (WS3):
+            # a malformed `_principle_rendered` entry (a producer bug, not a
+            # telemetry failure) will raise uncaught here rather than being
+            # silently swallowed as before -- see the PR body's own note on
+            # this behavior change. `_principle_rendered` is currently always
+            # well-formed 4-tuples from `check_principle_triggers_full`.
             for _kind, _pid, _entry, _mid in _principle_rendered:
-                _emitter3.emit(
+                _uid = _emitter3.emit(
                     event_type="engram.trigger.fire",
                     level=1,
                     data={
@@ -3042,10 +3383,13 @@ def main():
                         "trigger_id": _mid,
                         "prompt_seq": counter["prompts_since_compaction"],
                     },
+                    site="surface-hook.trigger_fire",
                 )
-        except Exception:
-            # Emitter failures must not break the hook — drop silently.
-            pass
+                write_telemetry_record(
+                    manifest_id=_TRIGGER_FIRE_SITE,
+                    event_type="engram.trigger.fire",
+                    fields={"outcome": "delivered" if _uid is not None else "dropped"},
+                )
 
     # Warn if daemon is down (semantic search degraded).
     # Distinguish a cold-start warmup (recent launch attempt) from a
@@ -3076,7 +3420,7 @@ def main():
         except Exception:
             warming_up = False   # fail-safe: when in doubt, the louder CRITICAL
         if warming_up:
-            parts.append(
+            head_blocks.append(
                 f"[ENGRAM: surface daemon warming up (cold model load) — "
                 f"semantic recall resumes in a few seconds; ranking is "
                 f"lexical-only meanwhile. No action needed unless this "
@@ -3096,14 +3440,14 @@ def main():
             except Exception:
                 pass
             if _is_idle_shutdown:
-                parts.append(
+                head_blocks.append(
                     f"[ENGRAM: surface daemon was idle-shutdown (idle timeout) — "
                     f"restarting automatically, semantic recall resumes in a few "
                     f"seconds. No action needed unless this persists past the next "
                     f"prompt. Recovery if it persists: bash {daemon_script}]"
                 )
             else:
-                parts.append(
+                head_blocks.append(
                     f"[⚠️ ENGRAM CRITICAL — surface daemon offline; semantic recall "
                     f"DISABLED, ranking degraded to lexical-only. Notify {user_name} "
                     f"immediately — recall quality is severely impaired. "
@@ -3126,7 +3470,7 @@ def main():
     # possibilities and point at a reality-test rather than alarming unconditionally.
     write_ok, write_reason = _check_mcp_write_tool_marker(ENGRAM_HOME)
     if not write_ok:
-        parts.append(
+        head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  MCP write-tool liveness: UNCONFIRMED ({write_reason})\n"
             f"  → Marker PID is dead and no live server.py was found for this seat. "
@@ -3143,7 +3487,7 @@ def main():
         # PR #1839's colleague review: a suppressed condition must
         # still surface informationally or the next real incident goes
         # unnoticed the way #1772 almost did.
-        parts.append(
+        head_blocks.append(
             f"ℹ️  ENGRAM substrate health: MCP write-tool liveness OK ({write_reason})."
         )
 
@@ -3152,7 +3496,7 @@ def main():
     # (WAL failure, disk I/O error, corruption). See #1218 / #786.
     db_ok, db_reason = _check_db_liveness(KNOWLEDGE_DB_PATH)
     if not db_ok:
-        parts.append(
+        head_blocks.append(
             f"⚠️  ENGRAM substrate health:\n"
             f"  DB liveness: FAILED ({db_reason})\n"
             f"  → MCP tool calls will fail. Surface nodes above may be stale pre-failure cache.\n"
@@ -3180,7 +3524,7 @@ def main():
             stats=_render_stats,
         )
         if nudge:
-            parts.append(nudge)
+            body_blocks.append(nudge)
         elif pack_results:
             # Own-graph returned 0 matches (match_count=0) but we have pack hits
             # — surface them as a standalone mini-nudge.
@@ -3196,7 +3540,7 @@ def main():
             pack_lines.append(
                 "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
             )
-            parts.append("\n".join(pack_lines))
+            body_blocks.append("\n".join(pack_lines))
     elif pack_results:
         # Own-graph query failed entirely (result is None) but we have pack hits.
         pack_lines = ["[ENGRAM Recall: own-graph unavailable; attached libraries:"]
@@ -3211,7 +3555,7 @@ def main():
         pack_lines.append(
             "  Deep-read pack nodes: engram-pkg --pkg <pack-path> inspect <node-id> (pack-scoped recall lands in a later slice).]"
         )
-        parts.append("\n".join(pack_lines))
+        body_blocks.append("\n".join(pack_lines))
 
     # Emit engram.surface.render_size event for the structured event log
     # (recall-triggering blueprint §3-P4, issue #1692). Mirrors the
@@ -3220,44 +3564,59 @@ def main():
     # fires when format_nudge actually ran (_render_stats non-empty) — see
     # its out-parameter docstring for why an untouched {} means "skipped".
     if _render_stats:
+        # alpha #2574 WS3: construction (import + Emitter.init) is narrowed
+        # to its own try/except so an INIT_FAILED outcome is recordable and
+        # distinct from an ordinary DROPPED emit
+        # (docs/2574-telemetry-design.md §1/§5).
+        _emitter2 = None
         try:
-            sys.path.insert(0, ENGRAM_HOME)  # ~/.engram/ contains the emitter
             from engram_log_emitter import Emitter
             _emitter2 = Emitter.init(
                 session_id=hook_input.get("session_id", "unknown"),
                 transcript_path=hook_input.get("transcript_path", ""),
             )
-            _emitter2.emit(
+        except Exception:
+            write_telemetry_record(
+                manifest_id=_RENDER_SIZE_SITE,
+                event_type="engram.surface.render_size",
+                fields={"outcome": "init_failed"},
+            )
+
+        if _emitter2 is not None:
+            _uid = _emitter2.emit(
                 event_type="engram.surface.render_size",
                 level=1,
                 data=dict(_render_stats),
+                site="surface-hook.render_size",
             )
-        except Exception:
-            # Emitter failures must not break the hook — drop silently.
-            pass
+            write_telemetry_record(
+                manifest_id=_RENDER_SIZE_SITE,
+                event_type="engram.surface.render_size",
+                fields={"outcome": "delivered" if _uid is not None else "dropped"},
+            )
 
     # Write reminder (from Stop hook)
     write_reminder = check_write_reminder()
     if write_reminder:
-        parts.append(write_reminder)
+        body_blocks.append(write_reminder)
 
     # Tool-call repair notification (from PreToolUse repair hook)
     repair_notice = check_repair_marker()
     if repair_notice:
-        parts.append(repair_notice)
+        body_blocks.append(repair_notice)
 
     # Feeling-nudge (post-compact wake-up). Read-only — does NOT clear the
     # marker; only engram_report_feeling clears it.
     feeling_nudge = check_feeling_nudge_marker()
     if feeling_nudge:
-        parts.append(feeling_nudge)
+        body_blocks.append(feeling_nudge)
 
     # Warm-restart briefing pointer (first prompt after compaction only).
     # Delivered as a pointer, not full injection — the agent discovers and
     # chooses to read the note, like Lucy finding Henry's journal.
     warm_briefing = check_warm_briefing(counter["prompts_since_compaction"])
     if warm_briefing:
-        parts.append(warm_briefing)
+        body_blocks.append(warm_briefing)
 
     # Nap warning (if approaching compaction) — uses JSONL-based context tracker
     try:
@@ -3273,23 +3632,18 @@ def main():
         if usage:
             nap_warning = format_drowsiness(usage)
             if nap_warning:
-                parts.append(nap_warning)
+                body_blocks.append(nap_warning)
     except ImportError:
         # Fallback to prompt count if context tracker not available
         nap_warning = format_nap_warning(counter["prompts_since_compaction"])
         if nap_warning:
-            parts.append(nap_warning)
+            body_blocks.append(nap_warning)
 
-    if not parts:
+    response = _assemble_response(head_blocks, body_blocks)
+    if not response:
         print(json.dumps({}))
         sys.exit(0)
 
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": "\n".join(parts),
-        }
-    }
     print(json.dumps(response))
     sys.exit(0)
 

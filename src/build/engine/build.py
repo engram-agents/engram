@@ -51,6 +51,23 @@ path for the .mcp.json source — this is an artifact of how the bash script
 tracks source paths, not destination paths.  We replicate this in
 shipped_paths of the build manifest.
 
+Amendment 4 addition (engram-alpha#2537, part of #1991)
+---------------------------------------------------------
+The former root-files / tools/ / templates/ sections (three near-identical
+copies of the same src/dst-resolution logic, each claiming one hardcoded
+path prefix with no catch-all) are replaced by ONE generic loop over
+``_copy_manifest_entry()`` — see that function's own docstring. Confirmed
+by a real build (not just by reading the old filters) that the prefix
+approach silently dropped any manifest entry under an unclaimed folder;
+the fix is that the generic loop has no prefix list to fall through at
+all. hooks/skills/agents/output-styles keep their own copy sections below
+(they carry real per-section processing — hooks.json filtering/
+substitution, the codex .md->.toml conversion — that stays code, not
+data) but their flatten targets (``*/claude/*`` -> ``*/*``) are now read
+from each entry's own ``dest`` field rather than hardcoded inline, via the
+same ``_copy_manifest_entry`` primitive / the same field the generic loop
+reads.
+
 Phase 3 additions
 -----------------
   - Platform profiles (src/build/packaging/platforms/): loaded at build time and baked
@@ -87,6 +104,19 @@ HOOK_REF_RE = re.compile(r'\bhooks/([A-Za-z0-9_\-]+\.(?:py|sh))\b')
 
 PYTHON_SUBSTITUTION_TARGET = "{{PYTHON}}"
 PYTHON_SUBSTITUTION_VALUE = "$HOME/.engram/venv/bin/python3"
+
+# The four manifest-path prefixes with their OWN copy section below (hooks.json
+# filtering + substitution, the skills/agents/output-styles tree copies, the
+# codex .md->.toml agent conversion) — every OTHER shipped entry goes through
+# the generic manifest-driven loop (engram-alpha#2537 amendment 4). Declared
+# once, here, so the generic loop's exclusion and the special sections' own
+# entry lookups can't drift apart into two different definitions of "special."
+SPECIAL_COPY_PREFIXES = (
+    "hooks/claude/",
+    "skills/claude/",
+    "agents/claude/",
+    "output-styles/claude/",
+)
 
 # Patterns that must not appear in a foreign bundle.
 # These catch PERSONAL IDENTITY strings — the builder's specific home path and
@@ -728,6 +758,76 @@ def _ships(ship_set: set[str], path: str) -> bool:
     return path in ship_set
 
 
+def _entries_by_path(shipped_entries: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Return a ``path -> entry`` lookup, for the copy sections that need the
+    full manifest entry (its ``dest``/``source`` overrides), not just a
+    membership test. Built once per build (mirrors ``_build_ship_set``'s own
+    "build the index once, not per lookup" shape)."""
+    return {e["path"]: e for e in shipped_entries}
+
+
+def _copy_manifest_entry(
+    entry: dict[str, Any],
+    repo_root: str,
+    source_root: str,
+    plugin_root: str,
+) -> str:
+    """Copy ONE shipped manifest entry from its resolved source to its
+    resolved destination, creating parent directories as needed. Returns
+    the destination path actually used (``entry["dest"]`` if declared, else
+    ``entry["path"]``), for logging.
+
+    THE generic copy primitive (engram-alpha#2537 amendment 4): every copy
+    section — root files, ``tools/``, ``templates/``, and now any future
+    top-level folder — should go through this ONE
+    function rather than each section re-deriving src/dst logic inline.
+    Two independent overrides, symmetric by design:
+
+    - ``source`` (pre-existing field, 13 entries as of this PR) overrides
+      where the file is READ FROM — for shippables living outside
+      ``source_root`` (e.g. ``src/build/engine`` -> bundled as
+      ``tools/engine``).
+    - ``dest`` (this PR's addition) overrides where the file is WRITTEN
+      TO — for shippables whose bundled location differs from their
+      manifest ``path`` (today: the four ``*/claude/*`` -> ``*/*``
+      flatteners hooks/skills/agents/output-styles require; tomorrow:
+      whatever a future folder move needs, declared as data instead of a
+      new hardcoded build.py section).
+
+    Without ``dest``, a shippable's bundled location is exactly its
+    manifest ``path`` — this is what makes the loop generic: a brand-new
+    top-level folder in the manifest ships correctly with ZERO build.py
+    changes, because ``os.path.dirname(dst)`` is derived from the path
+    itself, not from a hardcoded prefix list (the defect amendment 4
+    diagnoses: six hardcoded prefix sections, no catch-all, so a
+    ``health/``-prefixed entry matched none of them and was silently
+    dropped — confirmed by a real build, not just by reading the filters).
+    """
+    p = entry["path"]
+    if "source" in entry:
+        src = os.path.join(repo_root, entry["source"])
+    else:
+        src = os.path.join(repo_root, source_root, p)
+    if not os.path.exists(src):
+        _die(f"Manifest entry {p!r} does not exist at {src}")
+
+    dest_path = entry.get("dest", p)
+    dst = os.path.join(plugin_root, dest_path)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+    if os.path.isdir(src):
+        # cp -r/-a src/. dest/ — copy CONTENTS into dest, not the dir itself
+        # (matches the pre-existing tools/ and templates/ sections' semantics
+        # — see module docstring's REPLICATION NOTES).
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    else:
+        shutil.copy2(src, dst)
+
+    return dest_path
+
+
 # ---------------------------------------------------------------------------
 # filter_hooks_json — step 3a (pure transform, testable independently)
 # ---------------------------------------------------------------------------
@@ -947,6 +1047,7 @@ def build_plugin(
     # Build shipping set (with identity axis filtering)
     shipped_entries = select_shippables_with_identity(manifest, tier, multi_agent, identity)
     ship_set = _build_ship_set(shipped_entries)
+    entries_by_path = _entries_by_path(shipped_entries)
 
     # ── Clean and create plugin root ─────────────────────────────────────────
 
@@ -957,80 +1058,38 @@ def build_plugin(
 
     copied_paths: list[str] = []
 
-    # ── 1. Root-level files — manifest-derived ───────────────────────────────
-    # Derive from shipped_entries (path contains no '/') so new root files
-    # added to tiers.json ship automatically — no hardcoded list to maintain.
-    # Previously this section hardcoded ["server.py", "bootstrap.py", "SKILL.md",
-    # "launch-engram-server.sh"] + an engram_*.py glob; a convenience-tier root
-    # file (viz_server.py) was silently omitted.  Fixes #666.
-
-    _log("Copying root-level files → plugin root (manifest-derived)")
-    root_entries = [e for e in shipped_entries if "/" not in e["path"]]
-    if not any(e["path"] == "server.py" for e in root_entries):
-        _die("server.py not in shipped root entries — manifest may be misconfigured")
-    for entry in root_entries:
+    # ── 1. Generic manifest-driven copy — root files, tools/, templates/, and
+    # ANY OTHER top-level folder ──────────────────────────────────────────────
+    # engram-alpha#2537 amendment 4: replaces the three former hardcoded
+    # sections (root-level files, "tools/"-prefix, "templates/"-prefix —
+    # each its own copy of the same src/dst-resolution logic) with ONE
+    # loop over every shipped entry that
+    # isn't claimed by a SPECIAL_COPY_PREFIXES section below. This is the fix
+    # for the defect amendment 4 diagnosed and confirmed with a real build:
+    # the OLD sections were a fixed, hardcoded set of path prefixes with no
+    # catch-all, so a manifest entry under any OTHER folder (e.g. a future
+    # "health/" package) matched none of them and was silently dropped from
+    # the bundle — a green build that shipped an incomplete plugin. A brand
+    # new top-level folder now ships correctly with ZERO changes to this
+    # file: os.path.dirname(dest) is derived from the manifest path itself
+    # (or the entry's own "dest" override), never from a prefix this loop
+    # has to already know about.
+    _log("Copying manifest-driven files → plugin bundle (generic loop)")
+    generic_entries = [
+        e for e in shipped_entries if not e["path"].startswith(SPECIAL_COPY_PREFIXES)
+    ]
+    if not any(e["path"] == "server.py" for e in generic_entries):
+        _die("server.py not in shipped entries — manifest may be misconfigured")
+    for entry in generic_entries:
         p = entry["path"]
-        src = os.path.join(repo_root, source_root, p)
-        if not os.path.exists(src):
-            _die(f"Manifest root entry {p!r} does not exist at {src}")
-        dst = os.path.join(plugin_root, p)
-        shutil.copy2(src, dst)
+        dest_path = _copy_manifest_entry(entry, repo_root, source_root, plugin_root)
         copied_paths.append(p)
-        _log(f"  {p}")
+        _log(f"  {p}" + (f" -> {dest_path}" if dest_path != p else ""))
 
     # Ensure launch-engram-server.sh is executable after copy
     launch_sh = os.path.join(plugin_root, "launch-engram-server.sh")
     if os.path.isfile(launch_sh):
         os.chmod(launch_sh, os.stat(launch_sh).st_mode | 0o111)
-
-    # ── 1b. tools/ — manifest-driven filtering ───────────────────────────────
-
-    _log("Copying tools/ → plugin tools/ (manifest-filtered)")
-    os.makedirs(os.path.join(plugin_root, "tools"), exist_ok=True)
-
-    # Iterate SHIPPED_PATHS that match '^tools/'
-    for entry in [e for e in shipped_entries if e["path"].startswith("tools/")]:
-        p = entry["path"]
-        # Per-mechanism "source" field: repo-root-relative override for entries
-        # whose source lives outside source_root (e.g. src/build/engine → bundle tools/engine).
-        if "source" in entry:
-            src = os.path.join(repo_root, entry["source"])
-        else:
-            src = os.path.join(repo_root, source_root, p)
-        if not os.path.exists(src):
-            _die(f"Manifest entry {p!r} does not exist at {src}")
-        dst = os.path.join(plugin_root, p)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if os.path.isdir(src):
-            # cp -r src/. dest/ — copy contents into dest
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        else:
-            shutil.copy2(src, dst)
-        copied_paths.append(p)
-        _log(f"  {p}")
-
-    # ── 1c. templates/ — manifest-filtered ───────────────────────────────────
-
-    _log("Copying templates → plugin templates/")
-    os.makedirs(os.path.join(plugin_root, "templates"), exist_ok=True)
-
-    for p in [e["path"] for e in shipped_entries if e["path"].startswith("templates/")]:
-        src = os.path.join(repo_root, source_root, p)
-        if not os.path.exists(src):
-            _die(f"Manifest entry {p} does not exist at {src}")
-        dst = os.path.join(plugin_root, p)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        if os.path.isdir(src):
-            # cp -a src/. dest/ — copy contents (archive mode in bash; copytree here)
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-        else:
-            shutil.copy2(src, dst)
-        copied_paths.append(p)
-        _log(f"  {p}")
 
     # ── 2. Manifests ─────────────────────────────────────────────────────────
 
@@ -1128,9 +1187,15 @@ def build_plugin(
         fname = os.path.basename(src)
         manifest_key = f"hooks/claude/{fname}"
         if _ships(ship_set, manifest_key):
-            shutil.copy2(src, os.path.join(plugin_root, "hooks", fname))
+            # dest is manifest-declared data (defaults to "hooks/<fname>" —
+            # every hooks/claude/* entry carries one, see tiers.json), not a
+            # hardcoded flatten computed here.
+            dest_path = entries_by_path[manifest_key].get(
+                "dest", f"hooks/{fname}"
+            )
+            shutil.copy2(src, os.path.join(plugin_root, dest_path))
             copied_paths.append(manifest_key)
-            _log(f"  {manifest_key}")
+            _log(f"  {manifest_key} -> {dest_path}")
         else:
             _log(f"  (tier-filtered) {manifest_key}")
 
@@ -1165,13 +1230,17 @@ def build_plugin(
     for skill_name in skill_dirs:
         manifest_key = f"skills/claude/{skill_name}"
         if _ships(ship_set, manifest_key):
+            dest_path = entries_by_path[manifest_key].get(
+                "dest", f"skills/{skill_name}"
+            )
             src = os.path.join(skills_dir, skill_name)
-            dst = os.path.join(plugin_root, "skills", skill_name)
+            dst = os.path.join(plugin_root, dest_path)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
             if os.path.exists(dst):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             copied_paths.append(manifest_key)
-            _log(f"  {manifest_key}")
+            _log(f"  {manifest_key} -> {dest_path}")
         else:
             _log(f"  (tier-filtered) {manifest_key}")
 
@@ -1196,6 +1265,10 @@ def build_plugin(
         manifest_key = f"agents/claude/{fname}"
         if _ships(ship_set, manifest_key):
             if target == "codex":
+                # Codex's own agent-format conversion (.md -> .toml) is
+                # independent of the claude-code dest flatten — it always
+                # writes under plugin_root/agents/, matching the loader's
+                # own expectation for that target.
                 dest_name = os.path.splitext(fname)[0] + ".toml"
                 _emit_codex_agent_toml(
                     src,
@@ -1205,8 +1278,11 @@ def build_plugin(
                 )
                 _log(f"  {manifest_key} -> agents/{dest_name}")
             else:
-                shutil.copy2(src, os.path.join(plugin_root, "agents", fname))
-                _log(f"  {manifest_key}")
+                dest_path = entries_by_path[manifest_key].get(
+                    "dest", f"agents/{fname}"
+                )
+                shutil.copy2(src, os.path.join(plugin_root, dest_path))
+                _log(f"  {manifest_key} -> {dest_path}")
             copied_paths.append(manifest_key)
         else:
             _log(f"  (tier-filtered) {manifest_key}")
@@ -1227,9 +1303,12 @@ def build_plugin(
             continue
         manifest_key = f"output-styles/claude/{fname}"
         if _ships(ship_set, manifest_key):
-            shutil.copy2(src, os.path.join(plugin_root, "output-styles", fname))
+            dest_path = entries_by_path[manifest_key].get(
+                "dest", f"output-styles/{fname}"
+            )
+            shutil.copy2(src, os.path.join(plugin_root, dest_path))
             copied_paths.append(manifest_key)
-            _log(f"  {manifest_key}")
+            _log(f"  {manifest_key} -> {dest_path}")
         else:
             _log(f"  (tier-filtered) {manifest_key}")
 
@@ -1272,6 +1351,34 @@ def build_plugin(
     _log(
         f"hooks.json ↔ shipped-files: OK ({n_referenced} referenced, all present)"
     )
+
+    # ── 6c. Declared-vs-copied reconciliation gate ───────────────────────────
+    # Historically (#1962), every one of the seven copy sections dispatched by
+    # literal path prefix with no catch-all, so a manifest entry matching none
+    # of them was silently never copied: no error, no warning, no skip line.
+    # engram-alpha#2547 closed most of that gap with a generic manifest-driven
+    # loop (see SPECIAL_COPY_PREFIXES above) that now dies loudly on its own
+    # for any entry it can't find on disk — but the four SPECIAL_COPY_PREFIXES
+    # sections (hooks/, skills/, agents/, output-styles/) still enumerate their
+    # source directory via os.scandir/os.listdir and silently skip a declared
+    # entry whose real file/dir is absent, so this gate remains the only thing
+    # that catches THAT residual shape. copied_paths legitimately contains
+    # MORE than ship_set (plugin.json, hooks/hooks.json, packaging/mcp.json /
+    # .mcp.json / .codex-plugin/plugin.json, platform.json are build-generated
+    # meta files, never manifest-tracked), so this is a one-directional check
+    # — only "declared but never copied" is an error.
+    missing_from_copy = ship_set - set(copied_paths)
+    if missing_from_copy:
+        _die(
+            f"Manifest declares {sorted(missing_from_copy)} but no copy section "
+            f"handled them. The four SPECIAL_COPY_PREFIXES sections (hooks/, "
+            f"skills/, agents/, output-styles/) each enumerate their own source "
+            f"directory and silently skip an entry whose real file/dir is "
+            f"absent — check that the declared path actually exists on disk, "
+            f"or that its prefix is genuinely one of the four special sections "
+            f"(everything else goes through the generic loop, which dies loudly "
+            f"on its own)."
+        )
 
     # ── 7. Build manifest ─────────────────────────────────────────────────────
 

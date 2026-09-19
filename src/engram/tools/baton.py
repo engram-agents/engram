@@ -57,6 +57,28 @@ from forum_api import (
     forum_url_from_config,
 )
 
+# #2884 (second half): the pure CI-green / approval-freshness / repo-anchor
+# gate logic cmd_flip runs is now SHARED with the REST endpoint
+# (src/forum/server.py's api_project_flip) via baton_gate.py, so a direct
+# API caller can no longer bypass the checks cmd_flip enforces. Imported by
+# bare name (not `import baton_gate; baton_gate._pr_ci_state(...)`) so the
+# existing monkeypatch.setattr(_baton, "_pr_ci_state", ...) test pattern
+# keeps working unchanged -- patching baton.py's own module attribute is
+# what every call site below actually resolves against.
+#
+# _pool_sentinel / _is_pool_sentinel / _is_maintainer_flip are DELIBERATELY
+# NOT imported from baton_gate -- see baton_gate.py's module docstring
+# ("Scope note") for why: they keep their own verbatim definitions further
+# down in this file, unchanged by this refactor.
+from baton_gate import (
+    _parse_github_anchor,
+    _dedupe_checks_by_latest,
+    _pr_ci_state,
+    _pr_approval_state,
+    _GITHUB_ANCHOR_RE,
+    _derive_legacy_author,
+)
+
 # ---------------------------------------------------------------------------
 # Environment + paths
 # ---------------------------------------------------------------------------
@@ -110,16 +132,17 @@ def _api_get_raw(client, project_id):
         sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
 
 
-def _require_multi_agent(config=None) -> None:
-    """Exit with EXIT_STATE if not in multi-agent mode.
+def _require_forum(config=None) -> None:
+    """Exit with EXIT_STATE if no forum is configured.
 
-    Write commands call this guard at entry. Single-agent installs that
-    run a write command get a clear actionable message rather than an
-    obscure API error.
+    Write commands call this guard at entry. Installs with no forum
+    configured that run a write command get a clear actionable message
+    rather than an obscure API error.
     """
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         print(
-            "baton: this host is in single-agent mode; baton is multi-agent-only.",
+            "baton: no forum configured (set forum.url or agent_name in "
+            "config.json); baton requires a configured forum.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -176,11 +199,19 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
-    """True if config.json mode == 'multi' (mirrors ia.py / the engram hook helper)."""
+def _is_forum_configured(config: Optional[dict] = None) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Gates write commands: if neither forum.url nor agent_name is in config,
+    baton refuses with an actionable message. Mirrors ia.py / the engram hook
+    helper.
+    """
     if config is None:
         config = _load_config()
-    return config.get("mode", "single") == "multi"
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 # ---------------------------------------------------------------------------
@@ -268,54 +299,10 @@ def _age_str(ts: Optional[datetime]) -> str:
 
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
-# GitHub anchor value validation: pr/<N>, pr/<owner>/<repo>/<N> (repo-qualified,
-# #1715), or project/<N>. Repo-qualification is REQUIRED for any gh call this
-# file makes (#1918: there is no default repo) -- an unqualified pr/<N> is
-# refused-and-counted by cmd_gc/cmd_flip/cmd_merge rather than resolved
-# against a guess.
-_GITHUB_ANCHOR_RE = re.compile(
-    r"^(?:pr/(?:[\w.-]+/[\w.-]+/)?\d+|project/\d+)$"
-)
-
-# #1918: there is NO default repo, deliberately -- do not revisit.
-#
-# An earlier version of this file resolved an unqualified `pr/<N>` anchor
-# against $ENGRAM_DEFAULT_GITHUB_REPO (falling back to the public
-# engram-agents/engram repo). That was wrong in both directions: on a
-# private dev install it silently queried the WRONG repo (every gh call
-# in this file failed or, worse, matched an unrelated same-numbered PR --
-# gh pr merge --squash on that guess is the single most consequential call
-# in this file); on a fresh external install it resolved against the
-# ENGRAM project's OWN public repo, which is not the user's repo at all --
-# there is no value of a default that is correct for an external install.
-#
-# The fix (per umwelt's src/umwelt/gh_reconcile.py, ported here rather than
-# re-derived -- umwelt already solved this): every gh call requires an
-# explicit, repo-qualified anchor. A PR-baton without one is refused and
-# counted (never guessed at) by cmd_gc/cmd_flip/cmd_merge. See each
-# call site's own comment for how it surfaces the refusal.
-
-
-def _parse_github_anchor(value: str) -> Optional[tuple]:
-    """Parse a github anchor value into (kind, repo, number).
-
-    kind is 'pr' or 'project'. repo is 'owner/repo' if the anchor is
-    repo-qualified, else None (#1918: there is no default repo -- callers
-    must refuse-and-count an unqualified PR anchor rather than guess one).
-    number is the PR/project number as a string. Returns None if `value`
-    doesn't match a known anchor shape (caller should treat as "no anchor").
-    """
-    if not value:
-        return None
-    m = re.match(r"^pr/(?:([\w.-]+)/([\w.-]+)/)?(\d+)$", value)
-    if m:
-        owner, repo, number = m.group(1), m.group(2), m.group(3)
-        repo_qualified = f"{owner}/{repo}" if owner and repo else None
-        return ("pr", repo_qualified, number)
-    m = re.match(r"^project/(\d+)$", value)
-    if m:
-        return ("project", None, m.group(1))
-    return None
+# _GITHUB_ANCHOR_RE and _parse_github_anchor now live in baton_gate.py
+# (#2884, second half) -- imported above, shared with src/forum/server.py's
+# api_project_flip. See baton_gate.py for the full "#1918: no default repo"
+# rationale.
 
 
 def _validate_project_id(project_id: str) -> Optional[str]:
@@ -334,289 +321,11 @@ def _validate_project_id(project_id: str) -> Optional[str]:
 
 
 
-# ---------------------------------------------------------------------------
-# CI-state helper for the flip guard (#685)
-# ---------------------------------------------------------------------------
 
-# Conclusions that constitute a hard failure
-_CI_RED_CONCLUSIONS = frozenset({
-    "FAILURE", "ERROR", "CANCELLED", "TIMED_OUT",
-    "ACTION_REQUIRED", "STARTUP_FAILURE",
-})
-
-# Statuses (or conclusions) that indicate a check is still running
-_CI_PENDING_STATUSES = frozenset({
-    "QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED",
-})
-
-
-def _dedupe_checks_by_latest(checks: list) -> list:
-    """Keep only the latest run per check name.
-
-    statusCheckRollup is scoped to the PR's head commit, but it carries
-    EVERY run on that commit, not just the latest.  Two runs of one check
-    can land on the same SHA: the workflow fires on `edited` as well as
-    `synchronize`, so a trigger that changes no code can start a second run
-    on a SHA already checked.  What the earlier run leaves behind turns on
-    whether it was still in flight — if it was, `cancel-in-progress` on the
-    per-PR concurrency group kills it and it concludes CANCELLED; if it had
-    already finished, nothing is cancelled and its own conclusion (a FAILURE,
-    say) simply stays.  Either way a stale entry sits beside the current
-    SUCCESS, and iterating naively finds it and false-blocks the gate.  Runs
-    on superseded SHAs never enter the rollup at all, so there is no
-    cross-SHA case (measured 2026-08-30; this docstring claimed one until
-    then).
-
-    ISO-8601 completedAt strings compare correctly as plain strings
-    (lexicographic == chronological).  A null/missing completedAt (check
-    still in progress) sorts before any finished timestamp, so an in-progress
-    re-run correctly loses to the completed previous run of the same name —
-    the pending state is then caught by the pending-pass below.
-
-    Edge case: if two runs for the same name both have completedAt=None
-    (both in-progress), the first one seen is kept.  In practice both would
-    be in-progress and the pending-pass catches them regardless of which wins.
-    """
-    latest: dict = {}
-    for check in checks:
-        name = check.get("name") or check.get("context") or ""
-        completed_at = check.get("completedAt") or ""
-        existing = latest.get(name)
-        if existing is None or completed_at > (existing.get("completedAt") or ""):
-            latest[name] = check
-    return list(latest.values())
-
-
-def _pr_ci_state(pr_number: str, repo: str) -> tuple:
-    """Query GitHub CI state for a pull request via `gh`.
-
-    Returns (state, detail) where state is one of:
-      "green"   — all checks passed (or no checks registered)
-      "red"     — at least one check failed
-      "pending" — no failure, but at least one check still running
-      "unknown" — could not obtain a verdict (degraded; advisory only)
-
-    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. Every
-    caller resolves it from a repo-qualified anchor before calling this --
-    that guarantee used to be enforced only by caller discipline (`repo:
-    Optional[str] = None`, falling back to gh's cwd-based inference when
-    omitted). #1918 removed baton.py's DEFAULT_GITHUB_REPO precisely
-    because a silently-guessed repo is how a cross-repo PR-baton ends up
-    checking the WRONG repo's PR entirely -- cwd inference is that same
-    failure mode one function down, just unnamed. Making `repo` required
-    at the signature enforces the guarantee structurally rather than by
-    every caller remembering to pass it (all six production call sites
-    already did; this closes the latent re-entry point for a future one
-    that doesn't).
-    """
-    if not repo:
-        return ("unknown", "repo argument is required and was empty")
-    cmd = ["gh", "pr", "view", pr_number,
-           "--json", "statusCheckRollup,mergeStateStatus", "--repo", repo]
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        return ("unknown", "gh not found on PATH")
-    except subprocess.TimeoutExpired:
-        return ("unknown", "gh timed out after 15s")
-    except OSError as exc:
-        return ("unknown", f"gh exec error: {exc}")
-
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip() or f"gh exit {result.returncode}"
-        return ("unknown", detail)
-
-    raw = (result.stdout or "").strip()
-    if not raw:
-        return ("unknown", "gh returned empty output")
-
-    try:
-        data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return ("unknown", "gh returned unparseable JSON")
-
-    # mergeStateStatus=CLEAN is GitHub's authoritative "latest run per check
-    # all passed" verdict — trust it directly and skip per-check analysis.
-    merge_state = (data.get("mergeStateStatus") or "").upper()
-    if merge_state == "CLEAN":
-        return ("green", "mergeStateStatus=CLEAN")
-
-    checks = data.get("statusCheckRollup")
-    if not isinstance(checks, list):
-        return ("unknown", "statusCheckRollup missing or not a list")
-
-    if not checks:
-        # No checks registered — treat as green
-        return ("green", "no checks registered")
-
-    # Dedupe: keep only the latest run per check name so a superseded same-SHA
-    # run (e.g. a CANCELLED one the concurrency group killed) can't false-block (#1366).
-    checks = _dedupe_checks_by_latest(checks)
-
-    for check in checks:
-        # Handle both check-run shape (conclusion) and status-context shape (state/status)
-        conclusion = (check.get("conclusion") or "").upper()
-        state = (check.get("state") or check.get("status") or "").upper()
-
-        if conclusion in _CI_RED_CONCLUSIONS:
-            name = check.get("name") or check.get("context") or "unknown check"
-            return ("red", f"check '{name}' conclusion={conclusion}")
-        if state in _CI_RED_CONCLUSIONS:
-            name = check.get("name") or check.get("context") or "unknown check"
-            return ("red", f"check '{name}' state={state}")
-
-    # Second pass: look for pending (no reds found above)
-    for check in checks:
-        conclusion = (check.get("conclusion") or "").upper()
-        state = (check.get("state") or check.get("status") or "").upper()
-
-        if state in _CI_PENDING_STATUSES:
-            name = check.get("name") or check.get("context") or "unknown check"
-            return ("pending", f"check '{name}' status={state}")
-        if not conclusion and not state:
-            # conclusion=null + no status means it hasn't started yet
-            name = check.get("name") or check.get("context") or "unknown check"
-            return ("pending", f"check '{name}' not yet started")
-
-    return ("green", "all checks passed")
-
-
-# ---------------------------------------------------------------------------
-# Approval-staleness helper for the flip guard (#1002)
-# ---------------------------------------------------------------------------
-
-def _pr_approval_state(pr_number: str, repo: str) -> tuple:
-    """Query GitHub for post-approval tip movement on a pull request via `gh`.
-
-    Companion to _pr_ci_state (#974): that guard checks CI is green NOW;
-    this one checks the green tip is the APPROVED tip — a commit pushed
-    after the latest approval re-triggers CI and invalidates the reviewed
-    state ("re-check after ANY post-approval commit", CLAUDE.md).
-
-    Uses commit-identity comparison (headRefOid vs approval commit oid)
-    rather than timestamp comparison. Timestamp comparison is evadable: a
-    rebased or backdated commit can carry a committedDate older than the
-    approval and falsely read as fresh. Oid comparison is exact — a rebased
-    tip produces a new oid even when content is identical, and therefore
-    reads stale BY DESIGN (conservative: a rebased tip was not the reviewed
-    tip; the colleague must re-approve).
-
-    #1715 / #1918: `repo` (owner/repo) is REQUIRED, not optional. This used
-    to fall back to a `gh repo view` cwd-inference call when `repo` was
-    omitted -- exactly the mechanism that let this guard silently check the
-    wrong repo for a genuinely cross-repo PR-baton, and exactly the failure
-    class #1918 removed baton.py's DEFAULT_GITHUB_REPO to prevent one layer
-    up. That fallback path is gone; a caller with no repo-qualified anchor
-    gets "unknown" (advisory, non-blocking) rather than a guess.
-
-    One gh call: gh api graphql querying headRefOid and
-    reviews(last:50){state,commit{oid}}.
-
-    Returns (state, detail) where state is one of:
-      "fresh"       — at least one APPROVED review has commit.oid == headRefOid
-                      (an approval that reviewed exactly the current tip)
-      "stale"       — APPROVED review(s) exist but none match the tip oid
-                      (tip moved after approval, or tip was rebased)
-      "no_approval" — PR has no APPROVED review; this gate passes through
-                      (approval-existence is the colleague-layer's
-                      jurisdiction, not an oid question)
-      "unknown"     — could not obtain a verdict (degraded; advisory only)
-    """
-    # pr_number is interpolated into the GraphQL query string below (unlike
-    # the old argv-passed form, which the shell layer kept inert) — require a
-    # bare integer so a malformed anchor can't inject query text.
-    pr_str = str(pr_number).lstrip("#")
-    if not pr_str.isdigit():
-        return ("unknown", f"PR number {pr_number!r} is not numeric")
-    pr_number = pr_str
-
-    if not repo:
-        return ("unknown", "repo argument is required and was empty")
-    if "/" not in repo:
-        return ("unknown", f"repo {repo!r} is not owner/repo shaped")
-    owner, repo_name = repo.split("/", 1)
-
-    # GraphQL — fetch headRefOid and last 50 reviews with commit oid.
-    query = (
-        "{ repository(owner: \"%s\", name: \"%s\") {"
-        " pullRequest(number: %s) {"
-        "  headRefOid"
-        "  reviews(last: 50) { nodes { state commit { oid } } }"
-        " } } }"
-    ) % (owner, repo_name, pr_number)
-
-    try:
-        gql_result = subprocess.run(
-            ["gh", "api", "graphql", "-f", f"query={query}"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except FileNotFoundError:
-        return ("unknown", "gh not found on PATH")
-    except subprocess.TimeoutExpired:
-        return ("unknown", "gh timed out after 15s")
-    except OSError as exc:
-        return ("unknown", f"gh exec error: {exc}")
-
-    if gql_result.returncode != 0:
-        detail = (gql_result.stderr or "").strip() or f"gh exit {gql_result.returncode}"
-        return ("unknown", detail)
-
-    raw_gql = (gql_result.stdout or "").strip()
-    if not raw_gql:
-        return ("unknown", "gh returned empty output")
-
-    try:
-        gql_data = json.loads(raw_gql)
-        pr_data = gql_data["data"]["repository"]["pullRequest"]
-        head_oid = pr_data["headRefOid"]
-        review_nodes = pr_data["reviews"]["nodes"]
-    except (json.JSONDecodeError, ValueError):
-        return ("unknown", "gh returned unparseable JSON")
-    except (KeyError, TypeError):
-        return ("unknown", "gh response missing expected fields")
-
-    if not head_oid:
-        return ("unknown", "headRefOid missing or empty")
-    if not isinstance(review_nodes, list):
-        return ("unknown", "reviews.nodes missing or not a list")
-
-    # Walk review nodes: collect APPROVED reviews and check oid match.
-    # A review node with commit: null is simply non-matching, never an error.
-    has_approval = False
-    latest_approval_oid = None
-    for node in review_nodes:
-        if not isinstance(node, dict):
-            continue
-        if (node.get("state") or "").upper() != "APPROVED":
-            continue
-        has_approval = True
-        commit = node.get("commit")
-        node_oid = commit.get("oid") if isinstance(commit, dict) else None
-        latest_approval_oid = node_oid  # last APPROVED node in list = most recent
-        if node_oid and node_oid == head_oid:
-            short = head_oid[:8]
-            return ("fresh", f"approval covers tip oid {short}")
-
-    if not has_approval:
-        return ("no_approval", "no APPROVED review on the PR")
-
-    tip_short = head_oid[:8]
-    approval_short = (latest_approval_oid or "unknown")[:8]
-    return (
-        "stale",
-        f"tip oid {tip_short} not covered by any approval "
-        f"(latest approval oid {approval_short})",
-    )
-
-
-
+# _dedupe_checks_by_latest / _pr_ci_state / _pr_approval_state now live in
+# baton_gate.py (#2884, second half) -- imported above, shared with
+# src/forum/server.py's api_project_flip. See baton_gate.py for the full
+# docstrings and the #685 / #1002 / #1715 / #1918 history.
 
 # ---------------------------------------------------------------------------
 # Project scanning
@@ -629,7 +338,7 @@ def _pr_approval_state(pr_number: str, repo: str) -> tuple:
 # ---------------------------------------------------------------------------
 
 def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     err = _validate_project_id(project_id)
@@ -760,25 +469,31 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     # merge, days or weeks after the person who could trivially have avoided
     # it has moved on.
     #
-    # WARN, deliberately, rather than refuse -- and the reason is worth
-    # recording because my first draft of this fix DID refuse:
+    # REFUSE, not warn. This shipped first as a WARN because a first-draft
+    # REFUSE broke 8 existing tests -- including
+    # test_init_auto_derives_bare_anchor_from_pr_project_id, which exists
+    # specifically to PIN bare auto-derivation as intended #1715 behavior.
+    # Flipping a pinned contract is a team decision, not a follow-up's to
+    # make unilaterally, so #1924 carried that governance question forward
+    # rather than deciding it here.
     #
-    #   * Refusing breaks the plainest invocation there is
-    #     (`baton init PR-1234 --title ... --participants ...`), which is what
-    #     every agent and script on this host actually types. Seven existing
-    #     tests failed on it.
-    #   * One of those, test_init_auto_derives_bare_anchor_from_pr_project_id,
-    #     exists specifically to PIN bare auto-derivation as intended #1715
-    #     behavior. Flipping a pinned contract is a team decision, not a
-    #     follow-up's to make unilaterally. #1924 carries that question.
+    # That question is now SETTLED (forum #411, 2026-09-13, Kepler ruling
+    # with Aleph as design owner): REFUSE, not warn -- flip the #1715-pinned
+    # contract deliberately as part of accepting this fix.
     #
-    # A creation-time warning is also better targeted than I first argued.
-    # I had reasoned by analogy to cmd_flip's stderr warning, which reaches
-    # the flipping agent while the consequence lands on the maintainer -- but
-    # that analogy is wrong here. At init the author IS the party who can fix
-    # it, holds the missing flag right now, and is the only one who knows
-    # which repo is meant. The displaced-consequence problem is precisely what
-    # warning HERE (rather than only refusing later, at merge) removes.
+    # The ruling is narrow: require an explicit --repo or refuse, with NO
+    # cwd-inference of any kind. An earlier draft of the ruling proposed
+    # resolving the repo from the checkout's git `origin` remote when
+    # unambiguous; that was proposed, examined, and explicitly withdrawn
+    # (#1918: there is NO default repo, deliberately -- do not revisit). A
+    # cwd-inferred anchor is confidently wrong and fully qualified rather
+    # than merely unresolvable: minting a UMWELT-PR-<N> baton from inside
+    # a checkout of THIS project's own public repo would silently produce
+    # pr/engram-agents/engram/<N>, a DIFFERENT repo's PR of the same
+    # number, which passes every downstream gate silently -- worse than the
+    # bare-anchor bug this section fixes, which at least gets refused loudly
+    # by gc/flip/merge. There is no cwd-inference anywhere in this function,
+    # deliberately.
     #
     # Scope note: fires only when an anchor RESOLVES TO A PR and is
     # unqualified. A baton with no github anchor at all (a DESIGN-* project,
@@ -791,21 +506,27 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
         _n = _final_anchor[2]
         _derived = repo_arg is None and not getattr(args, "github", None)
         print(
-            f"baton init: warning: '{project_id}' is being created with the "
+            f"baton init: refusing to create '{project_id}' with the "
             f"unqualified PR anchor 'pr/{_n}'"
             + (" (auto-derived from the project id)" if _derived else "")
-            + " -- there is no default repo (#1918), so gc/flip/merge will all "
-            "REFUSE this baton later. Qualify it now:\n"
+            + " -- there is no default repo (#1918), so gc/flip/merge would "
+            "all refuse this baton later. Qualify it now:\n"
             f"    baton init {project_id} ... --repo <owner>/<repo>\n"
-            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}\n"
-            f"  or fix it after the fact:\n"
-            f"    baton anchor {project_id} --github pr/<owner>/<repo>/{_n}",
+            f"    baton init {project_id} ... --github pr/<owner>/<repo>/{_n}",
             file=sys.stderr,
         )
+        sys.exit(EXIT_VALIDATION)
 
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
+    # #2961: the initial turn holder is the established author-proxy (a PR
+    # baton is normally initialized by its own author with --turn pointing
+    # at themselves, or --turn omitted so it defaults to the invoking agent
+    # -- see the default-turn logic above). Persisted once, here, into a
+    # dedicated `author:` field that flip/claim/release never touch --
+    # unlike `turn_by`, which IS overwritten on every turn-change and so
+    # cannot serve as an author proxy past the very first flip.
     try:
         client.post("/api/projects", {
             "agent": agent_name or "baton",
@@ -816,6 +537,8 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             "turn_reason": init_reason,
             "github": github_anchor,
             "participants": participants,
+            "colleague": colleague_name,
+            "author": initial_turn,
         })
     except ForumNetworkError as e:
         print(f"baton init: {e}", file=sys.stderr)
@@ -865,7 +588,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     to_agent = args.to.strip().lower()
@@ -927,23 +650,49 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     _flip_force = args.force
     _parsed_anchor = _parse_github_anchor(github_anchor)
     _pr_anchor_match = _parsed_anchor is not None and _parsed_anchor[0] == "pr"
-    if _pr_anchor_match and _is_pool_sentinel(to_agent) and _parsed_anchor[1] is None:
-        # #1918: unqualified pr/<N> anchor -- there is no default repo to
-        # guess against. Skip CI/approval/colleague verification entirely
-        # rather than querying a possibly-wrong repo (the old
-        # DEFAULT_GITHUB_REPO fallback here could false-block a legitimate
-        # flip, or worse, false-pass one against an unrelated same-numbered
-        # PR). Same "cannot verify, proceed with a warning" shape already
-        # used below for a genuine gh-query failure, just triggered before
-        # any gh call is made at all.
+    # #2912: hoisted here (was previously computed only later, inside the
+    # no_approval branch) so both call sites below -- the unqualified-anchor
+    # refusal and the main CI/approval/colleague gate -- can call
+    # _is_maintainer_flip, which needs to know who currently holds the baton
+    # and who the registered colleague is. Same fields.get("turn", ...) read
+    # _current_holder used at its old, later site (now reusing this value
+    # instead of recomputing); nothing mutates `fields` in between.
+    _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+    _colleague_name = fields.get("colleague", "").strip().lower()
+    # #2961 follow-up (Ariadne's round-2 catch): a stored `author:` field
+    # only exists on batons created after this fix -- the live store had
+    # 1,493 existing files with none, on which the exemption below could
+    # never fire without either a bulk migration (a risky live write to
+    # every one of them, racing whatever the running forum process is
+    # doing concurrently) or this fallback: derive it from the turn log's
+    # own immutable "initialized → X:" first line, which every baton
+    # already carries. Zero migration, zero write, covers all 1,493
+    # existing batons and every future one uniformly.
+    _author_name = fields.get("author", "").strip().lower() or _derive_legacy_author(body)
+    if _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name, _author_name) and _parsed_anchor[1] is None:
+        # #1918/#2511: unqualified pr/<N> anchor -- there is no default repo
+        # to guess against. A flip-to-the-pool-sentinel IS the merge-readiness
+        # signal the maintainer trusts (CLAUDE.md's baton-tracked
+        # merge-readiness convention) -- skipping the CI/approval/colleague
+        # gates here and merely warning left the artifact indistinguishable
+        # from one whose gates actually ran and passed, which is worse than
+        # refusing outright. REFUSE, matching the same repo-qualification
+        # gate cmd_merge already enforces (see its "refusing to guess which
+        # repo" comment) -- and matching what the header comment, the #1918
+        # note, and the `baton init` warning text have promised all along.
+        # This is not skippable with --force -- --force skips CI/approval
+        # QUALITY gates, it has never meant "proceed without knowing which
+        # repo," and this gate does not change that contract.
         print(
-            f"warning: baton flip: PR anchor 'pr/{_parsed_anchor[2]}' is not "
-            "repo-qualified — skipping CI/approval/colleague verification "
-            "(no default repo to guess against). Anchor it first: "
-            f"baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}",
+            f"baton flip: '{project_id}' has no repo-qualified github anchor "
+            f"-- refusing to guess which repo's PR #{_parsed_anchor[2]} to "
+            "verify CI/approval/colleague state against. Run "
+            f"'baton anchor {project_id} --github pr/<owner>/<repo>/{_parsed_anchor[2]}' "
+            "first. This is not skippable with --force.",
             file=sys.stderr,
         )
-    elif _pr_anchor_match and _is_pool_sentinel(to_agent):
+        sys.exit(EXIT_VALIDATION)
+    elif _pr_anchor_match and _is_maintainer_flip(to_agent, _current_holder, _colleague_name, _author_name):
         _pr_num = _parsed_anchor[2]
         _pr_repo = _parsed_anchor[1]
         _ci_state, _ci_detail = _pr_ci_state(_pr_num, repo=_pr_repo)
@@ -1006,8 +755,9 @@ def cmd_flip(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             # the participants list (single-agent mode / no counterpart), warn
             # and proceed — per CLAUDE.md the colleague layer collapses when no
             # counterpart exists ("don't block on a colleague review that has
-            # no one to perform it").
-            _current_holder = fields.get("turn", agent_name or "unknown").strip().lower()
+            # no one to perform it").  _current_holder was hoisted above
+            # (#2912) so _is_maintainer_flip could use it too; reused here
+            # rather than recomputed.
             _sentinel = _pool_sentinel()
             _colleague_participants = [
                 p for p in participants
@@ -1140,6 +890,60 @@ def _is_pool_sentinel(name: str) -> bool:
     return bool(first_token) and name == first_token
 
 
+def _is_maintainer_flip(
+    to_agent: str,
+    current_holder: str,
+    colleague_name: str,
+    author: str = "",
+) -> bool:
+    """True when flipping the baton to `to_agent` represents presenting
+    the PR for MERGE (to the maintainer) — the point where CI-green,
+    approval-freshness, and colleague-approval-existence must all hold —
+    as opposed to a review-stage flip (to the registered colleague, who
+    has not reviewed yet), a self-flip (still working on it, no
+    merge-readiness claim being made), or a colleague sending it BACK TO
+    THE AUTHOR after finding a blocker (#2961 — see below).
+
+    Fires on:
+      - the literal pool sentinel (the single-human-owner convention
+        `_is_pool_sentinel` already recognizes), OR
+      - any OTHER agent — this repo's actual convention is to flip to a
+        NAMED maintainer agent (e.g. "ariadne", "borges"), not the literal
+        sentinel — PROVIDED it is not a self-flip, not the flip TO the
+        registered colleague (that flip is the "please review" signal,
+        not "ready to merge", and firing CI/approval checks on it would
+        be premature — the colleague hasn't reviewed yet), and not a flip
+        TO THE AUTHOR (#2961: a colleague returning the baton to the PR's
+        own author after finding a blocker matches neither of the two
+        exemptions above — the target is not the current holder (the
+        colleague holds it) and not the colleague (the colleague IS the
+        actor) — so without this third exemption it was misclassified as
+        presenting-for-merge and demanded a colleague approval that cannot
+        exist, since the colleague is the one objecting, not approving).
+
+    `author` is optional and empty on a baton created before #2961 (no
+    `author:` frontmatter field) — an empty/falsy `author` simply means
+    this exemption cannot fire, identical to pre-#2961 behavior. It is
+    populated once at `baton init` time from the initial turn holder (the
+    established author-proxy) and never touched again by flip/claim/
+    release, unlike `turn_by`, which IS overwritten on every turn-change
+    and so cannot serve as an author proxy past the first flip.
+
+    Caller guarantees `to_agent` is already either the pool sentinel or a
+    genuine registered participant (validated earlier in cmd_flip) — this
+    function does not re-validate participant membership.
+    """
+    if _is_pool_sentinel(to_agent):
+        return True
+    if to_agent == current_holder:
+        return False
+    if colleague_name and to_agent == colleague_name:
+        return False
+    if author and to_agent == author:
+        return False
+    return True
+
+
 def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
     """Claim a Project-layer baton from the pool.
 
@@ -1148,7 +952,7 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     turn == pool sentinel (the install's primary_user); refuses to steal from
     another agent.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
 
@@ -1236,7 +1040,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
     restricted to the current holder (only you can release what you hold).
     With --done, also appends '(done)' to the project title (idempotent).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     mark_done = args.done
@@ -1312,7 +1116,7 @@ def cmd_release(args: argparse.Namespace, config: dict, agent_name: str, client:
 # ---------------------------------------------------------------------------
 
 def cmd_status(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1371,7 +1175,7 @@ def cmd_mine(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         # Single-agent or not deployed — silent exit per spec
         sys.exit(EXIT_OK)
 
@@ -1391,7 +1195,7 @@ def cmd_show(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 # ---------------------------------------------------------------------------
 
 def cmd_close(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1459,7 +1263,7 @@ def cmd_reopen(args: argparse.Namespace, config: dict, agent_name: str, client: 
     Inverse of cmd_close. Only operates on batons with status: merged or
     cancelled. Refuses if the baton is already in a non-closed status.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_status = args.status.strip().lower()
@@ -1535,7 +1339,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     loop-start to drain the backlog of merged/closed PR-batons that the
     hook cannot reach (uncached anchors).
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     if not shutil.which("gh"):
         print("baton gc: gh CLI not found — cannot query live PR state", file=sys.stderr)
@@ -1651,7 +1455,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
 # ---------------------------------------------------------------------------
 
 def cmd_rename(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_title = args.title
@@ -1729,7 +1533,7 @@ def cmd_anchor(args: argparse.Namespace, config: dict, agent_name: str, client: 
     exists, parseable frontmatter), then delegates the write to the forum
     API via client.post.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     github_anchor = args.github.strip().lower()
@@ -1790,7 +1594,7 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
     server-side (add_participant() in coordination.projects) — this CLI's
     own already-present check is a UX nicety only, never the source of truth.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     project_id = args.project_id
     new_participant = args.participant.strip().lower()
@@ -1852,6 +1656,75 @@ def cmd_add_participant(args: argparse.Namespace, config: dict, agent_name: str,
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: set-colleague  (#2764)
+# ---------------------------------------------------------------------------
+
+def cmd_set_colleague(args: argparse.Namespace, config: dict, agent_name: str, client: ForumClient) -> None:
+    """Set or change the colleague: field on an existing baton.
+
+    Reads the project via the forum API for pre-flight validation (project
+    exists, parseable frontmatter), then delegates the write to the forum
+    API via client.post — the AUTHORITATIVE authorization check (caller must
+    already be a participant OR the current turn holder) is server-side
+    (set_colleague() in coordination.projects), same split as
+    cmd_add_participant.
+    """
+    _require_forum(config)
+
+    project_id = args.project_id
+    colleague = args.colleague.strip().lower()
+
+    err = _validate_project_id(project_id)
+    if err:
+        print(err, file=sys.stderr)
+        sys.exit(EXIT_VALIDATION)
+
+    if not colleague:
+        print(
+            "baton set-colleague: <colleague> must be non-empty.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    raw = _api_get_raw(client, project_id)
+    fields, _body = _parse_frontmatter(raw)
+    if not fields:
+        print(
+            f"baton set-colleague: cannot parse frontmatter for '{project_id}'. "
+            "The record may be malformed.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+
+    try:
+        resp = client.post(f"/api/projects/{project_id}/colleague", {
+            "agent": agent_name or "baton",
+            "colleague": colleague,
+        })
+    except ForumNetworkError as e:
+        print(f"baton set-colleague: {e}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+    except ForumHttpError as e:
+        if e.status == 404:
+            print(f"baton set-colleague: project not found: {project_id}", file=sys.stderr)
+            sys.exit(EXIT_STATE)
+        if e.status == 403:
+            print(
+                f"baton set-colleague: '{agent_name or 'you'}' must already be a "
+                f"participant of '{project_id}', or its current turn holder, "
+                "to set colleague.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        print(f"baton set-colleague: server error {e.status}: {e.body}", file=sys.stderr)
+        sys.exit(EXIT_IO if e.status >= 500 else EXIT_VALIDATION)
+
+    participant_added = resp.get("participant_added", False)
+    suffix = " (added as participant)" if participant_added else ""
+    print(f"baton set-colleague: {project_id} colleague → {colleague}{suffix}")
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: merge  (gate-checked merge verb — #999 + #1000)
 # ---------------------------------------------------------------------------
 
@@ -1860,7 +1733,12 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
 
     Gate ladder (all must pass in order):
       1. Baton exists (via forum API) for PR-N.         (never forceable)
-      2. turn == pool sentinel.                           (never forceable)
+      2. turn is a maintainer-role holder -- the pool     (never forceable)
+         sentinel OR any named agent that is not the
+         registered colleague or the PR's own author
+         (#2913; see Gate 2's own comment for the reused
+         _is_maintainer_flip predicate and why the check
+         reduces cleanly to a terminal-state read).
       3. CI green via _pr_ci_state.                      (--force skips)
       4. Approval fresh via _pr_approval_state (oid).    (--force skips)
       5. gh pr merge <N> --squash.
@@ -1869,7 +1747,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     --force skips gates 3-4 only; never skips 1-2.
     --dry-run prints the ladder verdict without merging.
     """
-    _require_multi_agent(config)
+    _require_forum(config)
 
     # Resolve project_id and pr_number from the argument (PR-N or bare N)
     raw_arg = args.pr.strip()
@@ -1914,15 +1792,53 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
         )
         sys.exit(EXIT_VALIDATION)
 
-    # ---- Gate 2: turn == pool sentinel --------------------------------
+    # ---- Gate 2: turn is a maintainer-role holder, not the literal
+    # pool sentinel specifically --------------------------------------
+    #
+    # #2913 (same root cause as #2912's cmd_flip fix): the bare
+    # `_is_pool_sentinel(current_turn)` check requires the baton to be
+    # flipped to the LITERAL sentinel string (e.g. "lei shi") before
+    # `baton merge` will proceed. But this team's actual convention --
+    # every flip performed this session, and CLAUDE.md's own baton
+    # lifecycle -- presents a PR to a NAMED maintainer agent (e.g.
+    # "kepler", "ariadne"), never the literal sentinel. So this gate, as
+    # written, would refuse to merge a baton in the exact state the real
+    # pipeline actually leaves it in.
+    #
+    # Reuses `_is_maintainer_flip` (already defined above, the same
+    # function `cmd_flip` calls) rather than adding a fourth copy of this
+    # classification logic. The DIRECTION differs from cmd_flip's own use:
+    # cmd_flip asks "is flipping TO to_agent a merge presentation" (a
+    # transition); Gate 2 asks "IS the current holder a merge-presented
+    # maintainer" (a terminal-state check, no transition in view). Passed
+    # as `_is_maintainer_flip(current_turn, "", colleague_name, author_name)`
+    # -- the empty string for `current_holder` deliberately disables the
+    # self-flip branch, which has no meaning here (there is no "flipping
+    # away from" state to compare against; current_turn already IS both
+    # the value being classified and the only state in hand). This is
+    # exactly the reduction _is_maintainer_flip needs to fall through to
+    # its actual "still with the colleague" / "still with the author" /
+    # "everyone else, including the sentinel" logic, and the guaranteed-
+    # non-empty check on current_turn just above rules out the one input
+    # where an empty `current_holder` sentinel could spuriously self-match.
     sentinel = _pool_sentinel()
     current_turn = fields.get("turn", "").strip().lower()
-    if not _is_pool_sentinel(current_turn):
-        holder = current_turn or "(unknown)"
+    if not current_turn:
         print(
-            f"baton merge: turn is with {holder} — not presented for merge. "
+            "baton merge: turn is with (unknown) — not presented for merge. "
             f"The baton must be flipped to the pool sentinel ('{sentinel}') "
-            "before merging.",
+            "or a maintainer agent before merging.",
+            file=sys.stderr,
+        )
+        sys.exit(EXIT_VALIDATION)
+    _merge_colleague_name = fields.get("colleague", "").strip().lower()
+    _merge_author_name = fields.get("author", "").strip().lower() or _derive_legacy_author(body)
+    if not _is_maintainer_flip(current_turn, "", _merge_colleague_name, _merge_author_name):
+        print(
+            f"baton merge: turn is with {current_turn} — not presented for "
+            "merge (still with the registered colleague or the PR's own "
+            f"author). The baton must be flipped to the pool sentinel "
+            f"('{sentinel}') or a maintainer agent before merging.",
             file=sys.stderr,
         )
         sys.exit(EXIT_VALIDATION)
@@ -2033,7 +1949,7 @@ def cmd_merge(args: argparse.Namespace, config: dict, agent_name: str, client: F
     if dry_run:
         print(f"baton merge --dry-run: PR #{pr_number} ({project_id})")
         print(f"  gate 1 (baton exists): PASS")
-        print(f"  gate 2 (turn=sentinel): PASS — turn={current_turn}")
+        print(f"  gate 2 (turn=maintainer): PASS — turn={current_turn}")
         print(f"  gate 3 (CI):            {_ci_verdict}")
         print(f"  gate 4 (approval):      {_ap_verdict}")
         print(f"  merge: DRY-RUN — no merge performed")
@@ -2445,6 +2361,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent name to add as a participant",
     )
 
+    # -- set-colleague --
+    p_set_colleague = subparsers.add_parser(
+        "set-colleague",
+        help="Set or change the colleague: field on an existing baton (#2764)",
+        description=(
+            "Set or replace the colleague: frontmatter field on an existing "
+            "baton, atomically, and add <colleague> to participants (dedup) "
+            "in the same write -- exactly the behavior 'baton init "
+            "--colleague' already has, now available after init too, and "
+            "now persisted (pre-#2764, --colleague at init never wrote "
+            "anything server-side, so 'baton show' could never render it). "
+            "The invoking agent must already be a participant of the baton, "
+            "OR its current turn holder (server-side authorization) -- this "
+            "is what lets the baton's holder name a colleague who then has "
+            "no need to add themselves. Does not change what the flip-time "
+            "colleague-gate enforces (still participants-derived); this is "
+            "about making the colleague identity settable and visible, not "
+            "about changing enforcement."
+        ),
+    )
+    p_set_colleague.add_argument(
+        "project_id",
+        metavar="PROJECT-ID",
+        help="Project identifier",
+    )
+    p_set_colleague.add_argument(
+        "colleague",
+        metavar="COLLEAGUE",
+        help="Agent name to set as the expected colleague reviewer",
+    )
+
     # -- merge --
     p_merge = subparsers.add_parser(
         "merge",
@@ -2525,6 +2472,8 @@ def main() -> None:
         cmd_anchor(args, config, agent_name, client)
     elif args.subcommand == "add-participant":
         cmd_add_participant(args, config, agent_name, client)
+    elif args.subcommand == "set-colleague":
+        cmd_set_colleague(args, config, agent_name, client)
     elif args.subcommand == "merge":
         cmd_merge(args, config, agent_name, client)
     else:

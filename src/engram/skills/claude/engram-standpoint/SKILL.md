@@ -26,6 +26,37 @@ Claims arise from situated viewpoints. If all your evidence comes from the same 
 
 `standpoint_override_tag` is annotation-only and is NOT included in the cluster key used for uniformity checks. Use it to label edge cases (lab measurements, personal comms, introspective self-reports) for human readability.
 
+## `standpoint_author_id` — choosing the identifier
+
+The independence gate needs one property and only one: **same author → same string, different
+author → different string.** Everything below follows from that.
+
+**In-graph entities** (peer agents, anyone who already has a person node) — use the `pn_*` node ID.
+It carries trust-tier, bio and about-edges, so the gate gets identity *and* the graph gets a real
+join.
+
+**External one-off authors** (a cited journalist, a paper author) — use a canonical namespaced
+string: `orcid:0000-0001-2345-6789`, `doi-author:10.1000/xyz123`, `domain:handle`.
+
+**Never a raw display name.** Display names are bad join keys: `J. Smith` ≠ `John Smith` splits one
+author into two, and homonyms merge two authors into one. Both failures are silent, and both
+corrupt the independence gate in the direction that makes a uniform-provenance premise set look
+diverse.
+
+**Promotion.** Promote a namespaced string to a `pn_*` person node when the author becomes
+load-bearing — cited twice or more, or once a reliability view forms about them. This mirrors
+conjecture→derivation promotion: the cheap form until the evidence outgrows it.
+
+**Non-goal:** minting a person node for every author you ever cite. The gate needs a stable
+equality key, nothing more.
+
+**Why the write-time gate refuses things (#1827).** A raw display-name shape, or a well-formed
+`pn_*` that does not resolve to an existing current person node, is REJECTED with a repair hint —
+a fuzzy-matched existing person, or a pointer to `engram_add_person`. The refusal is the feature:
+an unresolvable author id is indistinguishable from a typo, and a typo'd author id is exactly the
+silent split above. Config kill-switch `standpoint.author_id_hard_gate` (default true) restores
+the pre-#1827 warn-not-reject behaviour.
+
 ## The all-or-omit rule
 
 The standpoint check for any axis fires ONLY when ALL observation-leaf premises carry data for that axis. Partial coverage → the axis is silently skipped in the check (you can't assert "uniform" when some premises have no data). This means:

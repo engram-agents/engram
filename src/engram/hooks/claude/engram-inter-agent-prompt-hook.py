@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: surface unread DM messages to the agent.
 
-On every prompt, in multi-agent mode, queries the forum DM update feed
-(GET /api/updates?agent=<me>&kinds=dm) for unread DMs and injects a
+On every prompt, when a forum is configured, queries the forum DM update
+feed (GET /api/updates?agent=<me>&kinds=dm) for unread DMs and injects a
 summary into the session context.
 
 Two int (as_of) cursors:
@@ -24,8 +24,11 @@ Token budget cap: if "new since last prompt" exceeds LIST_CAP messages,
 group-summarize with a "+ N older from <senders>" line.
 
 Anti-patterns guarded:
-  - Mode gate is the first check — single-agent installs
-    see exactly zero behavior change.
+  - Forum-configured gate is the first check (#2857 step 1) — installs with
+    no forum.url/agent_name set see exactly zero behavior change.
+    (Previously gated on config.json mode == 'multi' — the DM feed is
+    symmetric for any agent once a forum is configured, regardless of host
+    topology.)
   - Read cursor is NEVER advanced here; only surfaced cursor advances.
   - No LLM calls, no local-FS letter reads — one forum API call only.
     Fail-open on unreachable: injects a brief warning banner, never crashes.
@@ -134,11 +137,18 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return _get_agent_name_impl(config, ENGRAM_HOME)
 
 
-def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
-    """True if config.json mode == 'multi'. Mirrors engram_client helper."""
+def _is_forum_configured(config: Optional[dict] = None) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
+    the hook to avoid noise on non-forum installs.
+    """
     if config is None:
         config = _load_config()
-    return config.get("mode", "single") == "multi"
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 # ---------------------------------------------------------------------------
@@ -284,10 +294,10 @@ def main() -> None:
     # ── Config (single load) ──────────────────────────────────────────────────
     config = _load_config()
 
-    # ── Mode gate (FIRST check) ───────────────────────────────────────────────
-    # Single-agent installs (or forum_api import failure) see zero output and
+    # ── Forum-configured gate (FIRST check) ───────────────────────────────────
+    # No forum configured (or forum_api import failure) see zero output and
     # zero state mutation.
-    if not _FORUM_API_OK or not _is_multi_agent_mode(config):
+    if not _FORUM_API_OK or not _is_forum_configured(config):
         sys.exit(0)
 
     # ── Read cursors ──────────────────────────────────────────────────────────

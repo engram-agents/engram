@@ -1,0 +1,217 @@
+<!--
+  Curve Workbench (engram-alpha#2727) -- developer-tier viz page for picking
+  health-v2 curve knots and per-metric importance against real history, with
+  live client-side recompute. Ported from the fixture demo Lei approved on
+  09-04 (style + live-recompute feel: /home/agent-kepler/.engram/artifacts/
+  curve-workbench-demo-2026-09-04.html) -- same CSS/layout vocabulary
+  (composed-score header + band mark, aspect tiles, one row per signal), but
+  wired to REAL /api/health/v2 + /api/health/v2/series + /api/health/v2/model
+  payloads instead of the demo's inline fixture data, and reshaped into the
+  issue's explicit three-column contract (LEFT today / MIDDLE history+
+  distribution / RIGHT curve+decisions) per signal row.
+
+  Two-phase bake-then-splice, same convention as the other four viz pages
+  (see shell.py's module docstring): everything below except the literal
+  <!--NAV_PLACEHOLDER--> / <!--FOOTER_PLACEHOLDER--> sentinels is served
+  as-is. As of engram-alpha#2754 this page is served from its own
+  standalone viz.workbench module (its own :5021 entry point, not a route
+  on server.py's :5001) -- viz.workbench's own page-serving function
+  splices those two placeholders at request time.
+
+  Dropped from the fixture (deliberate, not an oversight -- flagged in the
+  coder-fairy's report): the Google Fonts <link> (an external network
+  fetch a dev tool shouldn't depend on to render at all) -- this page uses
+  the same system-font stack the other four viz pages already use.
+
+  Round 2 (engram-alpha#2738, Lei's first-use feedback on PR #2730):
+  1) the top nav bar is REMOVED from this page -- "useless" on a dev tool
+     that stands alone (the FOOTER_PLACEHOLDER splice below is untouched;
+     only the NAV_PLACEHOLDER sentinel that _serve_workbench_page's
+     .replace() call used to fill is dropped from this template -- a
+     template-only change, since a dropped sentinel makes that .replace()
+     a no-op rather than requiring a server.py change);
+  2) value checks at edit-enter time (importance (0,+inf) with 0 reserved
+     for the hold-out/read-only state; knot x/y bounds mirroring
+     health/curves.py's CurveSpec.__post_init__) live in
+     health-workbench-curve.js's validateImportance/validateKnots and are
+     wired up in health-workbench.js;
+  3) a per-curve "reset this curve" button, distinct from "Reset all
+     edits" below;
+  4) a `.changed` highlight on any editable field that differs from the
+     model as served at page load;
+  5) the stored (version-loaded) curve overlaid dashed/muted under the
+     edited curve in the curve plot, shown only when that curve differs
+     from what was served.
+-->
+<title>Curve Workbench</title>
+<style>
+  :root{
+    --bg:#1a1a2e; --panel:#16213e; --panel2:#0f3460; --rule:#1f3f70;
+    --text:#e0e0e0; --muted:#8a9bb5; --accent:#00d4ff; --accent2:#7ecfff;
+    --good:#5ee0a0; --warn:#ffb74d; --bad:#ff6b6b; --held:#7a8aa0;
+  }
+  body{background:var(--bg);color:var(--text);font-family:system-ui,'Segoe UI',sans-serif;font-size:14px;line-height:1.45;padding:0 0 48px;margin:0}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  main{max-width:1280px;margin:0 auto;padding:20px 24px;display:grid;gap:22px}
+  h1{font-size:20px;font-weight:600;margin:0}
+  h2{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent2);margin:0 0 8px;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;max-width:80ch}
+  .mono,.num,td.num,.knots input{font-family:ui-monospace,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums}
+  .workbench-link{font-weight:600}
+  /* summary strip */
+  .strip{display:grid;grid-template-columns:220px 1fr;gap:18px;align-items:stretch}
+  .score{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 16px}
+  .score .big{font-family:ui-monospace,monospace;font-size:40px;line-height:1;color:var(--accent);font-weight:500}
+  .score .of{color:var(--muted);font-size:12px}
+  .band{margin-top:10px;height:10px;border-radius:5px;background:linear-gradient(90deg,#3a1f2a 0 60%,#3a3a1f 60% 85%,#1f3a2a 85% 100%);position:relative}
+  .band i{position:absolute;top:-4px;width:2px;height:18px;background:var(--accent)}
+  .band-label{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px}
+  .meaning{background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:12px 16px;font-size:12px;color:var(--muted)}
+  /* aspect + signal rows */
+  .aspect{border-top:1px solid var(--rule);padding-top:14px}
+  .aspect-head{display:grid;grid-template-columns:auto 1fr auto;gap:16px;align-items:center;margin-bottom:12px}
+  .atile{display:flex;align-items:baseline;gap:10px;background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:8px 14px}
+  .atile .big{font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:26px;color:var(--accent);line-height:1}
+  .atile .pts{font-family:ui-monospace,monospace;font-size:13px}
+  .atile .how{font-size:11px;color:var(--muted)}
+  .signal{display:grid;grid-template-columns:1.05fr 1.1fr 1.25fr;gap:16px;background:var(--panel);border:1px solid var(--rule);border-radius:6px;padding:14px 16px;margin-bottom:12px}
+  .signal.held{opacity:.85}
+  .sig-name{font-family:ui-monospace,monospace;font-size:14px;color:var(--accent);font-weight:500}
+  .def{color:var(--text);margin:6px 0 4px}
+  .frac{display:inline-grid;text-align:center;font-family:ui-monospace,monospace;font-size:12px;vertical-align:middle;margin:0 4px}
+  .frac span:first-child{border-bottom:1px solid var(--muted);padding:0 4px}
+  .frac span:last-child{padding:0 4px;color:var(--muted)}
+  table{border-collapse:collapse;width:100%;font-size:12px;margin-top:8px}
+  th{text-align:left;color:var(--muted);font-weight:500;padding:3px 6px 3px 0;border-bottom:1px solid var(--rule)}
+  td{padding:3px 6px 3px 0;border-bottom:1px solid #16233f}
+  td.num{text-align:right}
+  tr.sel td{color:var(--accent2)}
+  /* engram-alpha#2870 fix 1: seat rows in the per-signal comparison table
+     are clickable -- switches the whole page to that seat. */
+  .seat-row{cursor:pointer}
+  .seat-row:hover td{background:var(--panel2)}
+  .lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px}
+  svg{display:block;width:100%;height:auto}
+  .legend{display:flex;gap:12px;font-size:11px;color:var(--muted);margin-top:4px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:middle}
+  .knots{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+  .knots label{font-size:11px;color:var(--muted)}
+  .knots input{width:56px;background:var(--bg);color:var(--text);border:1px solid var(--rule);border-radius:3px;padding:2px 4px;font-size:11px}
+  .rec{margin-top:8px;font-size:12px;display:grid;grid-template-columns:auto 1fr;gap:3px 10px}
+  .rec .k{color:var(--muted)}
+  .verdict{margin-top:8px;padding:8px 10px;border-radius:4px;background:var(--bg);border:1px solid var(--rule);font-size:12px}
+  .pill{display:inline-block;border-radius:10px;padding:1px 8px;font-size:11px;font-family:ui-monospace,monospace;border:1px solid var(--rule);color:var(--muted)}
+  .pill.good{color:var(--good);border-color:#2a5a40} .pill.bad{color:var(--bad);border-color:#5a2a2a} .pill.warn{color:var(--warn);border-color:#5a4a20} .pill.held{color:var(--held)}
+  .focus{margin-top:12px;background:var(--bg);border:1px solid var(--rule);border-radius:6px;padding:10px 12px;display:grid;grid-template-columns:1fr auto;gap:6px 16px;align-items:end}
+  .focus .who{grid-column:1/-1;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent2)}
+  .focus .raw{font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:22px;line-height:1.1}
+  .focus .raw small{font-size:12px;color:var(--muted);display:block;margin-top:3px;font-family:system-ui,sans-serif}
+  .focus .sc{font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:34px;line-height:1;color:var(--accent);text-align:right}
+  .focus .sc small{display:block;font-size:11px;color:var(--muted);font-family:system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;margin-bottom:2px}
+  .imp input{width:52px;background:var(--bg);color:var(--text);border:1px solid var(--rule);border-radius:3px;padding:2px 4px;font-family:ui-monospace,monospace;font-size:12px}
+  .kbtn{background:var(--bg);color:var(--muted);border:1px solid var(--rule);border-radius:3px;font-size:11px;padding:1px 6px;cursor:pointer;font-family:ui-monospace,monospace}
+  .kbtn:hover:not(:disabled){color:var(--accent);border-color:var(--accent)} .kbtn:disabled{opacity:.4;cursor:default}
+  .kbtn.add{color:var(--accent2)}
+  .seg{display:inline-flex;border:1px solid var(--rule);border-radius:4px;overflow:hidden}
+  .seg button{background:var(--bg);color:var(--muted);border:0;border-right:1px solid var(--rule);font:inherit;font-size:11px;padding:2px 8px;cursor:pointer}
+  .seg button:last-child{border-right:0} .seg button.on{background:var(--panel2);color:var(--accent)}
+  .statst{margin-top:4px;border:1px solid var(--rule);border-collapse:collapse}
+  .statst th,.statst td{font-size:11px;padding:3px 6px;border:1px solid var(--rule);text-align:right}
+  .statst th:first-child,.statst td:first-child{text-align:left;color:var(--accent2)}
+  .statst thead th{background:var(--panel2);color:var(--muted)}
+  .decisions{margin-top:12px;background:var(--bg);border:1px solid var(--rule);border-radius:6px;padding:10px}
+  .decisions textarea{width:100%;box-sizing:border-box;min-height:120px;background:#0e1730;color:var(--text);border:1px solid var(--rule);border-radius:4px;font-family:ui-monospace,monospace;font-size:11px;padding:6px;margin-top:6px}
+  .decisions .btnrow{display:flex;gap:8px;margin-top:6px}
+  .decisions button{background:var(--panel2);color:var(--text);border:1px solid var(--rule);border-radius:4px;padding:4px 10px;font:inherit;cursor:pointer}
+  .empty-state{text-align:center;padding:40px;color:var(--muted)}
+  input.changed,.knots label.changed input{outline:2px solid var(--warn);background:rgba(255,183,77,.14)}
+  .imp input.changed{outline:2px solid var(--warn);background:rgba(255,183,77,.14)}
+  .imp input:disabled{opacity:.55;cursor:not-allowed}
+  .hold-lock{color:var(--held);font-size:11px;margin-left:6px}
+  .warn-msg{color:var(--bad);font-size:11px;margin-top:6px}
+  /* engram-alpha#2870 fix 2: an unloaded localStorage draft is surfaced
+     here rather than silently applied -- same warning/attention token
+     (--warn) as the .changed highlighting above, so a stale draft reads
+     visually consistent with the rest of this page's warning language. */
+  .draft-banner{margin:6px 0;padding:6px 8px;border-radius:4px;border:1px solid var(--warn);background:rgba(255,183,77,.14);color:var(--warn);font-size:11px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .resetcurve{margin-top:8px}
+  /* R5.1: the "how stale is this checkpoint" suffix on the latest-checkpoint
+     label (#wb-status and each signal row's focus "who" line). */
+  .chkpt-age{color:var(--muted)}
+  /* R5.3: the per-metric "set as reference" control + the aspect-header
+     "reset aspect" button, and the .changed highlight on the aspect
+     header's own reference-line text (mirrors input.changed above, since
+     this target is a <span>, not an <input>). */
+  .refctl{margin-top:6px;font-size:11px;color:var(--held)}
+  .aspect-head .sub-wrap{display:flex;align-items:center;gap:8px;min-width:0}
+  span.sub.changed{color:var(--warn)}
+  /* R1 axis ticks / R2 focus marker (engram-alpha#2738 round 3) */
+  .axis-label{fill:var(--muted);font-size:9px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .focus-guide{stroke:var(--accent2);stroke-width:1;stroke-dasharray:2 2}
+  .focus-dot{fill:var(--accent);stroke:#1a1a2e;stroke-width:1}
+  .unavailable-marker{opacity:.85}
+  /* R5.4: the collapsed-UNAVAILABLE-run band on a history plot's baseline
+     (replaces the old per-point .unavailable-marker circle). */
+  .unavailable-band{opacity:.85}
+  svg[aria-label]{cursor:crosshair}
+  /* Round 4 (engram-alpha#2738 round 4, R2b/c/d): every plot lives in a
+     `.plot-container` so its `.focus-readout` (now an HTML overlay, not
+     SVG text -- see health-workbench.js's updateFocusReadout) can be
+     absolutely positioned over it without being clipped by the SVG's own
+     viewBox. `fitViewBox()` resizes the svg's viewBox to its own
+     content, so `svg{...height:auto}` above grows the plot to fit any
+     tilted label rather than clipping it. */
+  .plot-container{position:relative}
+  .focus-readout{position:absolute;pointer-events:none;background:rgba(15,52,96,.92);border:1px solid var(--rule);border-radius:4px;padding:3px 6px;color:var(--text);font-size:10px;line-height:1.35;font-family:ui-monospace,Menlo,Consolas,monospace;white-space:normal;z-index:2}
+  @media (max-width:1000px){.signal{grid-template-columns:1fr}.strip{grid-template-columns:1fr}}
+</style>
+<body>
+<main>
+  <section>
+    <h1>Curve Workbench: what the score sees, and why</h1>
+    <p class="sub">One row per raw signal, read from the shipped scoring model and this seat's real health-v2 history. LEFT: what it literally counts and where every seat sits today. MIDDLE: its history and distribution over the recorded checkpoints. RIGHT: the curve that turns the raw value into a 0&ndash;1 score, editable, with live recompute. This page reads the model; it never writes it -- use &ldquo;Export decisions&rdquo; to hand a proposal to a real PR.</p>
+    <div style="display:flex;gap:12px;align-items:center;margin-top:8px">
+      <label style="font-size:12px;color:var(--accent2)">Seat: <select id="wb-agent"></select></label>
+      <span id="wb-status" class="mono" style="color:var(--muted);font-size:12px"></span>
+    </div>
+  </section>
+
+  <section class="strip" id="wb-strip" style="display:none">
+    <div class="score">
+      <div class="lbl">Composed score, selected seat</div>
+      <div><span class="big" id="wb-composed">&mdash;</span> <span class="of">/ 100 &middot; <span id="wb-pip">&mdash;</span> points in play</span></div>
+      <div class="band" aria-hidden="true"><i id="wb-bandmark" style="left:0"></i></div>
+      <div class="band-label"><span>needs repair</span><span>attention</span><span>well kept</span></div>
+    </div>
+    <div class="meaning">
+      This is the same importance-weighted-mean / points-weighted composition
+      <code>health.engine._score_aspect</code> / <code>compose_aspect_scores</code>
+      use, recomputed here in JS from the CURRENT edited knots/importance
+      (see <code>/static/health-workbench-curve.js</code>) &mdash; not a call to
+      the real engine. Nothing on this page writes the substrate, the model,
+      or any file on disk.
+    </div>
+  </section>
+
+  <div id="wb-empty" class="empty-state">Loading Curve Workbench data&hellip;</div>
+  <div id="wb-aspects"></div>
+
+  <section id="wb-export-section" style="display:none">
+    <h2>Export decisions</h2>
+    <div class="decisions">
+      <div class="sub">JSON proposal for every signal whose knots or importance differ from the shipped model &mdash; <code>{signal: {knots, importance}}</code>. Copy it into a PR, or download it below. This page never writes it anywhere itself.</div>
+      <textarea id="wb-export-json" readonly></textarea>
+      <div class="btnrow">
+        <button type="button" id="wb-export-refresh">Refresh</button>
+        <button type="button" id="wb-export-download">Download JSON</button>
+        <button type="button" id="wb-export-copy">Copy to clipboard</button>
+        <button type="button" id="wb-export-reset">Reset all edits</button>
+      </div>
+    </div>
+  </section>
+</main>
+<!--FOOTER_PLACEHOLDER-->
+<script src="/static/health-detail-math.js"></script>
+<script src="/static/health-workbench-curve.js"></script>
+<script src="/static/health-workbench.js"></script>
+</body>

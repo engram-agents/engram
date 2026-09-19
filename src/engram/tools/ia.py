@@ -111,40 +111,46 @@ def _get_agent_name(config: Optional[dict] = None) -> str:
     return ""
 
 
-def _is_multi_agent_mode(config: Optional[dict] = None) -> bool:
-    """True if config.json mode == 'multi'. Mirrors engram hook helper."""
+def _is_forum_configured(config: Optional[dict] = None) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
+    the hook to avoid noise on non-forum installs. Mirrors engram hook helper.
+    """
     if config is None:
         config = _load_config()
-    return config.get("mode", "single") == "multi"
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 # ---------------------------------------------------------------------------
-# Mode gate  (DM commands require multi-agent mode)
+# Forum gate  (DM commands require a configured forum)
 # ---------------------------------------------------------------------------
 
 
-def _check_multi_agent_mode(config: Optional[dict] = None) -> None:
-    """Exit with code 3 and actionable message if mode != 'multi'."""
+def _check_forum_configured(config: Optional[dict] = None) -> None:
+    """Exit with code 3 and actionable message if no forum is configured."""
     if config is None:
         config = _load_config()
-    if not _is_multi_agent_mode(config):
+    if not _is_forum_configured(config):
         config_path = Path(ENGRAM_HOME) / "config.json"
         if not config_path.exists():
-            mode_detail = "(config.json missing)"
+            forum_detail = "(config.json missing)"
         else:
             try:
                 json.loads(config_path.read_text())
-                mode_val = config.get("mode", "unset")
-                mode_detail = f"(config.json mode='{mode_val}')"
+                forum_detail = "(no forum.url or agent_name set in config.json)"
             except (json.JSONDecodeError, OSError):
-                mode_detail = "(config.json invalid — failed to parse)"
+                forum_detail = "(config.json invalid — failed to parse)"
         print(
-            f"ia: this host is in single-agent mode {mode_detail}; "
-            "ia is multi-agent-only.",
+            f"ia: no forum configured {forum_detail}; "
+            "ia requires a configured forum.",
             file=sys.stderr,
         )
         print(
-            "To enable: set mode='multi' in config.json and restart MCP.",
+            "To enable: set forum.url or agent_name in config.json and restart MCP.",
             file=sys.stderr,
         )
         print(
@@ -624,7 +630,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "All DM commands require multi-agent mode (mode='multi' in config.json).\n"
+            "All DM commands require a configured forum (forum.url or agent_name in config.json).\n"
             "Forum API must be reachable for DM commands; `status` is graceful if unreachable.\n"
         ),
     )
@@ -806,11 +812,11 @@ def main() -> None:
 
     config = _load_config()
 
-    # All DM commands require multi-agent mode.
+    # All DM commands require a configured forum.
     # status is exempt: it's a diagnostic utility that shows current mode.
-    _MODE_GATE_EXEMPT = {"status"}
-    if args.subcommand not in _MODE_GATE_EXEMPT:
-        _check_multi_agent_mode(config)
+    _FORUM_GATE_EXEMPT = {"status"}
+    if args.subcommand not in _FORUM_GATE_EXEMPT:
+        _check_forum_configured(config)
 
     agent_name = _get_agent_name(config)
 
@@ -824,7 +830,7 @@ def main() -> None:
     # NOTE: match the alias too. argparse sets `subcommand` to the string the
     # user typed, NOT the canonical name, so a registered alias falls through
     # to the else-branch and prints top-level help — whose epilog says DM
-    # commands need multi-agent mode, naming a cause that is false.
+    # commands need a configured forum, naming a cause that is false.
     elif args.subcommand in ("mark-read", "mr"):
         cmd_mark_read(args, config, agent_name)
     elif args.subcommand == "cursor":

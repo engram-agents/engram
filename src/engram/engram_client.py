@@ -58,6 +58,20 @@ def is_multi_agent_mode() -> bool:
     return config.get("mode", "single") == "multi"
 
 
+def is_forum_configured() -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Baton/letter/forum are symmetric for any agent, alone on its host or not,
+    once a forum is configured — this is the check that actually gates them,
+    independent of the (separate, topology-only) mode field above.
+    """
+    config = _load_engram_config()
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
+
+
 def get_counterparts() -> list[str]:
     """List of peer agent names on this host. Empty in single mode."""
     config = _load_engram_config()
@@ -234,9 +248,9 @@ TOOL_SCHEMAS = {
         },
     },
     "engram_retract": {
-        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Retracting an observation_predictive also TERMINALLY RETRACTS (not merely taints) any prediction whose sole live evidential basis it was (#2281) — a destructive side-effect distinct from the taint the docstring describes elsewhere. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason. Note: the OUTER param is payload_json; there is also an INNER field replacement_json inside the payload — don't confuse them.",
+        "description": "Retract an erroneous node and flag downstream dependents as tainted. Unlike engram_supersede (opinion evolved due to new evidence), engram_retract is for ERROR CORRECTION — the node was never valid. Retracting an observation_predictive also TERMINALLY RETRACTS (not merely taints) any prediction whose sole live evidential basis it was (#2281) — a destructive side-effect distinct from the taint the docstring describes elsewhere. Single-payload signature — pass all fields as one JSON object string in payload_json. Required: node_id, error_type, reason.",
         "parameters": {
-            "payload_json": {"type": "string", "description": "JSON object (as a string) with retract fields. Required: node_id (the node to retract), error_type (one of fabricated_quote/wrong_citation/wrong_evidence/hallucinated_claim/duplicate/other), reason (human-readable explanation). Optional: replacement_json (inner JSON object string with replacement observation fields {quoted_text, interpretation, claim, quote_type, source_class}; cites the same evidence as the retracted node).", "required": True},
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with retract fields. Required: node_id (the node to retract), error_type (one of fabricated_quote/wrong_citation/wrong_evidence/hallucinated_claim/duplicate/other), reason (human-readable explanation). Optional: replacement_id (the replacement node's id, already created via its type's canonical creation tool — e.g. engram_add_observation for observations — before calling engram_retract; purely relational, does NOT create a new node).", "required": True},
         },
     },
     "engram_reflect": {
@@ -260,7 +274,7 @@ TOOL_SCHEMAS = {
         "parameters": {},
     },
     "engram_list": {
-        "description": "List nodes in compact triage format. No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
+        "description": "List nodes in compact triage format. The `claim` key carries recall_summary when populated (truncated to 200 chars with an ellipsis if longer), falling back to the claim truncated to 130 chars. No neighbor data, no memory refresh. Supports structured filters via filters_json (recursive AND/OR/NOT with contains/starts_with/ends_with operators). Default scans current-revision only; set include_superseded=True to scan the historical layer (text-layer leak audits).",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with list fields. All optional: node_type (str — filter by node type, e.g. 'question', 'observation_factual'; empty = all types; conflicts with 'type' field in filters_json), status (str — filter by status, e.g. 'open', 'resolved', 'active'; conflicts with 'status' field in filters_json), sort_by (str — sort order: 'id' (default), 'created' (newest first), 'importance' (highest first), 'recalls' (most recalled first)), limit (int — max results, default 100; set 0 for metadata-only; ignored if unlimited=True; hard ceiling 500 in single-field mode), filters_json (str — JSON-encoded recursive condition tree with AND/OR/NOT logic and eq/ne/gt/gte/lt/lte/in/not_in/between/contains/starts_with/ends_with/is_null/is_not_null operators; empty string = use single-field mode), fields_json (str — JSON-encoded list of column names to project; empty = default compact triage shape), unlimited (bool — if True, return all matched rows regardless of limit), include_superseded (bool — if True, scan non-current/superseded nodes too; default False).", "required": True},
         },
@@ -279,14 +293,20 @@ TOOL_SCHEMAS = {
             },
         },
     },
+    "engram_checkpoint": {
+        "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused. Single-payload signature — pass all fields as one JSON object string in payload_json. (Formerly named engram_nap — see engram_nap below for the deprecated alias.)",
+        "parameters": {
+            "payload_json": {"type": "string", "description": "JSON object (as a string) with nap fields. Required: message (summary of what was learned/changed in this work-burst).", "required": True},
+        },
+    },
     "engram_nap": {
-        "description": "Persist context to ENGRAM without advancing the turn counter. Use BEFORE compaction or at end of work-burst to save knowledge; arms a nap_checkpoint feeling-report nudge. Forgetting stays paused. Single-payload signature — pass all fields as one JSON object string in payload_json.",
+        "description": "DEPRECATED ALIAS for engram_checkpoint, kept for one release. Identical behavior — migrate callers to engram_checkpoint. Single-payload signature — pass all fields as one JSON object string in payload_json.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with nap fields. Required: message (summary of what was learned/changed in this work-burst).", "required": True},
         },
     },
     "engram_advance_turn": {
-        "description": "[Sleep cycle / first session only — DO NOT call awake.] End-of-day session checkpoint that advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. For pre-compaction / end-of-burst persistence in awake state, use engram_nap instead. Single-payload signature — pass all fields as one JSON object string in payload_json.",
+        "description": "[Sleep cycle / first session only — DO NOT call awake.] End-of-day session checkpoint that advances the global turn counter (drives forgetting) and logs the session summary. IRREVERSIBLE — turn advances cannot be undone without direct DB intervention. For pre-compaction / end-of-burst persistence in awake state, use engram_checkpoint instead. Single-payload signature — pass all fields as one JSON object string in payload_json.",
         "parameters": {
             "payload_json": {"type": "string", "description": "JSON object (as a string) with advance_turn fields. Required: message (summary of what was learned/changed across the cohort being closed by this turn advance).", "required": True},
         },

@@ -212,6 +212,239 @@ def _existing_fts_columns(conn: sqlite3.Connection) -> list | None:
     return [row[1] for row in conn.execute("PRAGMA table_info(nodes_fts)").fetchall()]
 
 
+def check_fts_integrity(conn: sqlite3.Connection, probe_k: int | None = None) -> dict:
+    """Probe ``nodes_fts`` for ranking-path corruption and report a distinct,
+    structured result -- never a silent pass (engram-alpha#2678, forum #398).
+
+    ``nodes_fts`` is an external-content FTS5 table (``content='nodes'``):
+    the index stores only tokens/positions, and ranking a match (``ORDER BY
+    rank``, which invokes ``bm25()``) reads auxiliary data to score it. If
+    that auxiliary data has drifted out of sync for a given term's postings
+    (SQLite's own ``SQLITE_CORRUPT_VTAB``), ranking raises "database disk
+    image is malformed" for THAT TERM while ``PRAGMA quick_check`` still
+    reports "ok", plain ``MATCH`` (no ``ORDER BY rank``) still succeeds, and
+    every OTHER term ranks fine -- so the desync is invisible to every check
+    ENGRAM already runs and silent until a real query happens to rank the
+    one bad term. See Consumers below for what goes dark before that day.
+
+    DESIGN HISTORY -- read before changing the vocab traversal; three designs
+    were tried, in order, each falsified by the next real measurement against
+    Lei's fleet's ONLY known instance of the real bug (forum #398,
+    2026-09-07). This is not a hypothetical caution -- every one of the first
+    three shipped or nearly shipped before the next measurement corrected it:
+
+    1. Plain FTS5 ``INSERT INTO nodes_fts(nodes_fts) VALUES('integrity-check')``.
+       Tolerates ENGRAM's by-design retracted-row exclusion (a retracted node
+       is deleted from the index while remaining present in ``nodes`` --
+       deliberate, see ``rebuild_fts_index``'s docstring and #781), chosen
+       for exactly that reason -- but reported CLEAN against a byte-copy of
+       the one graph that actually had the bug. False negative, fairy-
+       approved, pulled back before merge.
+    2. ``rank=1`` (the "more thorough" content-verifying variant). Correctly
+       caught that same real corruption, but false-positives on ANY graph
+       with even one correctly-retracted node -- confirmed on a scratch DB
+       with exactly one retracted row and nothing else wrong. Also confirmed
+       NOT fixable by healing the mismatch after the fact: genuinely deleting
+       the retracted rows from ``nodes`` in a scratch copy (so content and
+       index agree retraction happened on both sides) did not clear the
+       failure -- whatever it inspects survives content-table cleanup.
+    3. A differential probe (plain ``MATCH`` vs ``MATCH ... ORDER BY rank``
+       per term, retraction-immune by construction since retracted rows
+       never enter a ``MATCH`` result set) over the top-k highest-document-
+       frequency terms from ``nodes_fts_vocab``. Validated at k=30 against a
+       fresh copy of the real corrupted graph -- caught the one poisoned
+       term known at the time ("by", document-frequency rank 18 of 30).
+       Shipped, fresh review round dispatched. THEN a full-vocabulary sweep
+       of that same graph (all 26,745 terms, 1.5s) found 24 poisoned terms,
+       not 1 -- "by" was the ONLY one in the top-30 by frequency; the other
+       23 span mid/low frequency and bare numerals, uncorrelated with rank.
+       No k a person would pick catches more than one of twenty-four, and a
+       detector that fires and under-reports by 24x is worse than one that
+       stays silent, because the count reads as a real measurement.
+
+    So this function sweeps the FULL vocabulary, not a top-k sample --
+    Kepler's ruling, and the measurement that forced it: full-vocab cost is
+    negligible (1.5s over 26,745 terms on the largest known seat; 0.53s over
+    13,805 terms and 33 retracted nodes on a second, healthy seat, zero false
+    positives -- see the PR body for both). ``probe_k`` is kept as an escape
+    hatch (``None`` = sweep everything, the default and the only mode that
+    has been shown honest) for a future graph where full-vocab cost turns out
+    not to be negligible -- do not lower it as a default without a fresh
+    cost measurement on a graph at least as large as the ones above.
+
+    Consumers put at risk by an undetected mismatch (deployed tree, recursive
+    grep, 3 rows -- per #2678): ``engram_core._similar_existing_matches``
+    (~line 6247, the check-before-derive dedup gate for ``add_observation``
+    and lesson minting -- a ``DatabaseError`` here escapes its inner
+    ``OperationalError`` catch to the outer ``except Exception`` and returns
+    ``[]``, not a degraded result); ``hooks/engram-surface-hook.py``'s
+    ``_query_attached_packs`` (ranks each attached pack's own db, fails open
+    per pack by its own docstring); and the viz server's graph endpoint.
+    This function only detects; it does not repair and does not touch
+    ``_similar_existing_matches``'s exception handling -- both are separate,
+    write-path-adjacent work (#2678 items 2/3), out of scope here.
+
+    Returns one of FOUR statuses -- kept distinct rather than collapsed,
+    because a caller must be able to tell "I found damage" from "I could
+    not look" from "I never checked at all" (Ariadne's #2731 colleague-
+    review refinement, forum #398, raised on top of her own earlier
+    "never a silent pass" finding, before the same status value quietly
+    swallowed the distinction one layer up from where her original
+    finding fixed it):
+
+      {"status": "unavailable", "reason": <str>} -- no ``nodes_fts`` or
+          ``nodes_fts_vocab`` table to probe, or the probe itself could not
+          run at all (any unexpected ``sqlite3.Error`` before any term was
+          examined).
+      {"status": "mismatch", "problems": [...], "unprobed": [...]}
+          -- CONFIRMED ranking-path corruption: at least one term's plain
+          MATCH succeeded but its ranked query raised
+          ({"term", "error", "stage": "ranked_match"}). ``unprobed`` may
+          also be present alongside (not classified further; see below) but
+          never changes this status once ``problems`` is non-empty. The
+          full list, not a boolean or a truncated sample (per Kepler's
+          ruling: "report the count and the list, never a boolean" --
+          design 3's top-k sample under-reported real damage by 24x, and a
+          truncated list would repeat that mistake one level down). A real,
+          actionable finding: consider ``rebuild_fts_index`` (own-substrate
+          authority; snapshot first) -- though note its repair effectiveness
+          against either failure class is unverified; re-run this check
+          after to confirm.
+      {"status": "partial", "unprobed": [...], "probed_terms": <int>}
+          -- an UNKNOWN, not confirmed damage: every term that WAS fully
+          probed (plain-matched AND ranked) came back clean, but at least
+          one term's PLAIN (unranked) query itself raised ({"term", "error",
+          "stage": "plain_match"}), so it was never reached by the ranked
+          check at all. NOTE: ``probed_terms`` here is ``len(terms)`` -- the
+          size of the full sweep, INCLUDING the unprobed term(s) -- not a
+          count of how many were successfully checked; a caller wanting the
+          latter must compute ``probed_terms - len(unprobed)``. Deliberately NOT
+          classified as syntax-error-vs-corruption -- the error text is the
+          same generic SQLITE_CORRUPT_VTAB message either way, and text-
+          matching it would reintroduce the brittleness this design escaped
+          -- just never silently dropped. On the default tokenizer no
+          legitimate vocab term produces this (verified: embedded quotes,
+          boolean operators, wildcards, punctuation, bare numerals all
+          plain-match cleanly), so any entry here is itself worth
+          investigating; damage bad enough to break even the unranked path
+          would be worse than a "mismatch" entry, IF it turns out to be
+          corruption rather than an untested tokenizer's real syntax
+          restriction (bound: default tokenizer only -- see the exception
+          handler's own comment). This status exists so that possibility
+          is never silently reported as either "ok" (would hide a real
+          unknown) or "mismatch" (would falsely confirm damage that was
+          never actually observed, on a graph whose only sin might be a
+          custom tokenizer this design hasn't been tested against).
+      {"status": "ok", "probed_terms": <int>} -- every vocabulary term both
+          plain-matched AND ranked clean, with nothing left unprobed at all;
+          here (and only here) ``probed_terms`` equals the count that came
+          back fully clean, since none were skipped (full sweep by default
+          -- see ``probe_k`` above for when this is instead a sample).
+
+    Never raises: every SQL call is guarded, and unlike the special-command
+    designs this replaced, none of these are write-shaped -- no implicit
+    transaction is opened, so there is nothing to roll back and no reason
+    this needs write access at all (confirmed: works against a read-only
+    connection, unlike the first design -- Ariadne's #2731 review caught
+    that "never raises" was NOT actually true of that design, on exactly the
+    paths that mattered most; fixed here by construction, not by narrowing
+    the claim).
+    """
+    try:
+        if _existing_fts_columns(conn) is None:
+            return {"status": "unavailable", "reason": "nodes_fts table does not exist"}
+        has_vocab = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes_fts_vocab'"
+        ).fetchone()
+        if not has_vocab:
+            return {"status": "unavailable", "reason": "nodes_fts_vocab table does not exist"}
+
+        if probe_k is None:
+            terms = [row[0] for row in conn.execute("SELECT term FROM nodes_fts_vocab").fetchall()]
+        else:
+            terms = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT term FROM nodes_fts_vocab ORDER BY doc DESC LIMIT ?", (probe_k,)
+                ).fetchall()
+            ]
+
+        problems = []
+        unprobed = []
+        for term in terms:
+            # Double-quoted so FTS5 treats the term as a literal phrase, not
+            # query syntax -- a vocab term could itself collide with an FTS5
+            # operator (e.g. "or", "not") if passed unquoted.
+            quoted = f'"{term}"'
+            try:
+                plain_rows = conn.execute(
+                    "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?", (quoted,)
+                ).fetchall()
+            except sqlite3.Error as e:
+                # Ariadne's colleague-review finding (#2731, forum #398):
+                # this branch does NOT mean "term doesn't plain-match" in
+                # general -- it's ANY error on the plain query, and on the
+                # default tokenizer there is no legitimate occupant (tested:
+                # embedded quotes, AND/OR/NOT/NEAR, *, colons, hyphens,
+                # parens, bare numerals -- zero vocab terms raise on a quoted
+                # plain MATCH). A term whose UNRANKED match itself raises is
+                # corruption strictly worse than what "mismatch" reports
+                # (bad enough to break even the simple path), and silently
+                # `continue`-ing here made it byte-identical to a clean
+                # sweep -- exactly the silent pass this function exists to
+                # prevent. Recorded, never dropped. Deliberately NOT
+                # classified by matching the error text against known
+                # syntax-error strings -- SQLITE_CORRUPT_VTAB surfaces as
+                # the same generic message this whole design has been
+                # navigating, and text-matching it would reintroduce the
+                # exact brittleness three prior designs were built to
+                # escape. Bound: default tokenizer only: a custom or
+                # trigram tokenizer is untested and may have a real
+                # syntax-error case this branch would then also swallow the
+                # WAY it did before.
+                unprobed.append({"term": term, "error": str(e), "stage": "plain_match"})
+                continue
+            if not plain_rows:
+                continue
+            try:
+                conn.execute(
+                    "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY rank",
+                    (quoted,),
+                ).fetchall()
+            except sqlite3.Error as e:
+                problems.append({"term": term, "error": str(e), "stage": "ranked_match"})
+
+        # Ariadne's #2731 forum #398 refinement, raised before her colleague
+        # read on 4e4436d converged: an unprobed term is an UNKNOWN, not a
+        # confirmed problem -- collapsing both into "mismatch" would (on an
+        # untested custom/trigram tokenizer, where a legitimate plain-match
+        # syntax error might exist) reintroduce the false-positive shape
+        # that killed design 2, one layer up in the reporting rather than
+        # the probe. "mismatch" means confirmed damage found (problems is
+        # non-empty); "partial" means everything probed came back clean but
+        # something could not be checked at all (unprobed non-empty,
+        # problems empty) -- a caller must be able to tell "I found damage"
+        # from "I could not look", and only a distinct status value keeps
+        # that true even for a caller who checks status alone rather than
+        # reading the whole dict.
+        if problems:
+            status = "mismatch"
+        elif unprobed:
+            status = "partial"
+        else:
+            status = "ok"
+        result = {"status": status}
+        if problems:
+            result["problems"] = problems
+        if unprobed:
+            result["unprobed"] = unprobed
+        if status in ("ok", "partial"):
+            result["probed_terms"] = len(terms)
+        return result
+    except sqlite3.Error as e:
+        return {"status": "unavailable", "reason": str(e)}
+
+
 def rebuild_fts_index(db_path: str) -> bool:
     """Rebuild the FTS5 index from the current rows of ``nodes`` (post-restore).
 

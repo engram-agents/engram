@@ -35,9 +35,27 @@ from fastmcp import FastMCP
 # silent no-op when the singleton has not been initialized, which is the
 # normal state for server.py: it runs as a long-lived MCP process serving
 # multiple Claude sessions and has no single session_id to bind to.
-# Phase 4 will add a separate init path for server-side events.
+# alpha #2574 WS5 is Phase 4 -- see the Emitter.init() call in
+# `if __name__ == "__main__":` below.
 # See alpha #175 (two-level logging architecture) for the spec.
-from engram_log_emitter import emit_if_initialized  # noqa: E402
+from engram_log_emitter import Emitter, emit_if_initialized  # noqa: E402
+
+# alpha #2574 WS5: engram_telemetry_store.py ships at tier=convenience
+# (WS1's own tiering judgment call -- src/build/packaging/tiers.json), while
+# server.py ships at tier=essential. A plain top-level import here would
+# make an essential-tier module hard-depend on a convenience-tier one,
+# breaking an Essential-only build
+# (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces
+# exactly this). Guarded import + no-op stub keeps every MCP tool call
+# gating-nothing-T1 (docs/2574-telemetry-design.md §8) even if the store
+# ships without it -- same pattern as the four engram_*.py impl modules
+# this workstream also touches (engram_derive.py, engram_observation.py,
+# engram_query.py, engram_revision.py).
+try:
+    from engram_telemetry_store import write_telemetry_record  # noqa: E402
+except Exception:  # pragma: no cover -- import-failure fallback
+    def write_telemetry_record(manifest_id, event_type, fields=None):
+        return False
 
 # sqlite-vec (optional): SIMD-accelerated KNN over embeddings, replaces the
 # O(N) pure-Python cosine loop in _semantic_search. If the extension fails to
@@ -303,7 +321,7 @@ def _attach_walguard_banner(json_response: str) -> str:
     response when the degraded marker is present, else return it unchanged.
 
     Reuses _walguard_degraded_banner() — the same banner text the read/stat
-    surfaces already attach at engram_surface/engram_nap/engram_advance_turn
+    surfaces already attach at engram_surface/engram_checkpoint/engram_advance_turn
     (and engram_stats._surface_stats_impl / _diagnose_impl). This is the
     write-tool counterpart (#1947 slice E): without it, a write made during a
     split-brain WAL-index window returns an ordinary success payload with no
@@ -612,8 +630,6 @@ def _graph_lineage_count(*args, **kwargs):
 # Impls + cascade helpers moved to engram_revision.py (family E).
 # Constants VALID_ERROR_TYPES and _THRESHOLD_GATE_DISCIPLINE_HINT also moved;
 # aliased here so server-level references and tests continue to resolve.
-# _retract_impl injects _add_observation_impl to preserve the optional
-# replacement path (acyclic: family modules may not import server.py).
 VALID_ERROR_TYPES = _revision_mod.VALID_ERROR_TYPES
 _THRESHOLD_GATE_DISCIPLINE_HINT = _revision_mod._THRESHOLD_GATE_DISCIPLINE_HINT
 
@@ -630,14 +646,11 @@ def _supersede_impl(*args, **kwargs):
     return _revision_mod._supersede_impl(*args, **kwargs)
 
 def _retract_impl(*args, **kwargs):
-    # NOTE: do not pass _obs_creator through this forwarder — it is wired here
-    # (composition root); a caller-supplied value would raise TypeError
-    # ("multiple values for keyword argument").
-    # Wave 9: updated wiring from the server-resident compat forwarder name to
-    # the module source of truth (_observation_mod._add_observation_impl).
-    # This is the one-line change PR #918 predicted — composition root now
-    # references the canonical implementation, not the forwarder chain.
-    return _revision_mod._retract_impl(*args, _obs_creator=_observation_mod._add_observation_impl, **kwargs)
+    # #2612 retired the mint-inside-retraction path — no more callable
+    # injection across the module boundary here. The replacement node (if
+    # any) is created by the caller via its own canonical creation tool,
+    # before calling engram_retract, and named by replacement_id.
+    return _revision_mod._retract_impl(*args, **kwargs)
 # ---- end #872 wave-6 compat forwarders --------------------------------
 
 # ---- engram_cascade_frontier (engram-alpha#2013 slice 3) --------------
@@ -1281,8 +1294,9 @@ def _record_tool_timing(tool_name: str, duration_ms: int, status: str) -> None:
 # Keys that contain long free-text content (user-authored claims, quoted text,
 # reasoning chains) are excluded from the data JSON stored in index.db so the
 # stats dashboard never surfaces L2-equivalent content through an L1 path.
-# Per viz_server.py:2617 privacy note ("L2 events are indexed but never
-# surfaced through this dashboard"). Only non-sensitive metadata is kept:
+# Per viz/templates/stats.html's privacy note ("L2 (content) events are
+# indexed but never surfaced through this dashboard"). Only non-sensitive
+# metadata is kept:
 # node/evidence IDs, shape descriptors, counts, filter parameters, etc.
 # ---------------------------------------------------------------------------
 _PAYLOAD_PRIVATE_KEYS = frozenset({
@@ -1580,6 +1594,17 @@ def _parse_payload(payload_json):
     non-string payload returns the standard error envelope instead of an uncaught
     exception (issue #1683). Error strings are byte-identical to the prior inline
     blocks — this is behavior-preserving except that TypeError is now caught.
+
+    alpha#1944 — pops "override_lesson" before returning, if present. It is a
+    reserved field: engram-lesson-tripwire-hook.py's PreToolUse deny gate reads
+    it directly off the RAW tool_input (before the server ever sees the call)
+    to let a single overridden call through a "blocking" lesson. By the time
+    _parse_payload runs, the hook has already made its allow/deny decision —
+    the field has done its job and would otherwise fail every tool's own
+    unknown-field check (each tool's allowlist has no reason to know this
+    name). Stripped here, centrally, rather than added to every tool's
+    allowlist: one choke point instead of a per-tool list nobody keeps
+    current. No-op for the vast majority of calls, which never carry it.
     """
     try:
         params = json.loads(payload_json)
@@ -1587,6 +1612,7 @@ def _parse_payload(payload_json):
         return None, json.dumps({"error": f"Invalid JSON in payload_json: {e}"})
     if not isinstance(params, dict):
         return None, json.dumps({"error": "payload_json must be a JSON object"})
+    params.pop("override_lesson", None)
     return params, None
 
 
@@ -1673,6 +1699,8 @@ _ADD_OBSERVATION_FIELDS = frozenset({
     "session_id",
     "recall_summary",
     "recall_keywords",
+    "evidence_type",
+    "original_url",
 })
 
 
@@ -1717,81 +1745,34 @@ def engram_add_observation(payload_json: str) -> str:
 
     Pass all fields as one JSON object string in payload_json.
 
-    Source identification: provide EITHER url+title (evidence node auto-created
-    or reused) OR evidence_id (cite an existing evidence node) OR session_id
-    (cite the current chat — the server resolves the transcript for you).
-    evidence_id takes precedence over url when both are given (pre-existing
-    behavior); session_id may not be combined with url or evidence_id —
-    passing it alongside either is an error.
+    Source identification — exactly one of:
+        url + title   evidence node auto-created or reused
+        evidence_id   cite an existing evidence node
+        session_id    cite the current chat (server resolves the transcript)
+    evidence_id takes precedence over url when both are given; session_id may
+    NOT be combined with either — passing it alongside url or evidence_id is an
+    error.
+
+    The quote must be a VERBATIM substring of the source. This is checked
+    server-side on every path, session_id included, and fails loud.
+
+    Ephemeral sources (forum threads, web pages, local files not committed to a
+    repo) must be archived with engram-snapshot first and cited by the file://
+    URL it emits. Raw forum/localhost URLs are rejected by the evidence-URL
+    guard, an uncommitted file is rejected as unverifiable, and a synthetic
+    conversation:// scheme is rejected.
 
     If is_predictive=true, also creates or links a Prediction node for the
     forward-looking claim. Pass predicted_event to name the target.
 
-    Advisory predictive_hint (#2252 Stage 1.4): when is_predictive is falsy,
-    the result may carry a "predictive_hint" key because
-    predicted_event/resolution_timeframe were passed without is_predictive.
-    This is advisory only: it never blocks or alters node creation, and is
-    suppressed whenever is_predictive is true. It exists because the
-    pairing invariant (a claim-bearing predictive observation paired with a
-    non-claim-bearing prediction node) protects nothing if nobody is
-    prompted to use it. (A claim-text keyword/regex trigger was evaluated
-    and removed pre-merge on measured zero precision; redesign tracked in
-    #2264.)
-
-    Simplest — citing the CURRENT chat (pass your injected session_id; the
-    server resolves the transcript, defaults quote_type=personal_communication
-    + source_class=user_stated; a wrong or stale session_id fails loud via the
-    same server-side verbatim-quote check used by every other filing path —
-    no separate verify step needed, but the quote must still be an exact
-    substring of the transcript):
+    Minimal call, citing the current chat:
         {"quoted_text": "...", "interpretation": "...", "claim": "...",
-         "session_id": "<the session id injected at session start / shown in your banner>"}
+         "session_id": "<the session id injected at session start>"}
 
-    Common usage — citing the user's chat log as evidence
-    (the most common friction point for new sessions; verbatim-quote check is
-    enforced server-side and WILL fail loudly if you skip step 2):
-
-        Step 1 — Identify the current session JSONL transcript:
-            ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl
-            The path is also available via the active session's env or by
-            sorting ~/.claude/projects/<encoded-cwd>/ by mtime descending.
-
-        Step 2 — Verify the quote is VERBATIM in the transcript BEFORE filing:
-            ~/.engram/tools/verify_quote.py <jsonl-path> "<exact quote>"
-            On match → proceed to step 3.
-            On miss → DIAGNOSE, don't retry. Likely the JSONL hasn't flushed
-            yet (the user's most recent line may lag by seconds). Re-reading
-            the file after a brief wait usually surfaces it. Blind retries of
-            engram_add_observation will loop on the same verbatim mismatch.
-
-        Step 3 — Call engram_add_observation with the JSONL path as the
-            file:// URL (NOT a synthetic conversation:// scheme — that's
-            rejected; the substrate classifies file:///.claude/projects/...jsonl
-            as a "conversation" source automatically):
-            {"quoted_text": "<the verified quote>",
-             "interpretation": "<what this means in context>",
-             "claim": "<the atomic falsifiable claim>",
-             "quote_type": "personal_communication",
-             "url": "file:///home/<agent>/.claude/projects/<encoded-cwd>/<session-id>.jsonl",
-             "title": "Chat log <YYYY-MM-DD>",
-             "source_class": "user_stated"}
-
-    Common usage — citing forum threads, transcript spans, or any ephemeral source:
-        Ephemeral sources (LAN forum threads, session transcript spans, web pages,
-        local files that aren't committed to a repo) MUST be archived first.
-        Raw forum/localhost URLs are rejected by the evidence-URL guard (no stable
-        domain — that's intentional). Use engram-snapshot, which content-addresses
-        the content and emits a file:// URL designed to feed this tool directly:
-
-            engram-snapshot forum:<thread_id>        # archive a forum thread
-            engram-snapshot jsonl:<session-id>       # archive a session transcript span
-            engram-snapshot jsonl:                   # bare — current session (most common)
-            engram-snapshot file:<path>              # archive a local file
-
-        Then cite the returned "file_url" as the url field here. The resulting
-        evidence node is content-hash-pinned + verbatim-checkable even if the
-        original source changes or disappears. For web pages: fetch the page
-        (WebFetch / curl), save to a file, then use engram-snapshot file:<path>.
+    Worked examples, the quote-verification workflow, quote_type/source_class
+    selection, node-grain guidance, and the advisory response keys: the
+    engram-observe skill. Identifier conventions for standpoint_author_id: the
+    engram-standpoint skill.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -1818,23 +1799,12 @@ def engram_add_observation(payload_json: str) -> str:
             content_hash (str, optional): SHA-256 hash of file content (for file-based evidence).
             git_sha (str, optional): Git commit SHA when the file was read (for file-based evidence).
             standpoint_author_id (str, optional): Persistent cross-session entity ID for who
-                produced the source claim (the "who observes" axis). Used for provenance-uniformity
-                detection. Tiered convention: for in-graph entities (peer agents, anyone already a
-                person node) use the pn_* node ID — it carries trust-tier, bio, and about edges, and
-                MUST resolve to an existing, current person node. For external one-off authors (a
-                cited journalist, paper author) use a canonical namespaced string such as
-                orcid:0000-0001-2345-6789, doi-author:10.1000/xyz123, or domain:handle — NOT a raw
-                display name; the independence gate needs same-author → same-string and
-                different-author → different-string, and display names are bad join keys ('J. Smith'
-                ≠ 'John Smith'; homonym collisions). Promote a namespaced string to a pn_* node when
-                the author becomes load-bearing (cited ≥2 times or a reliability view forms) —
-                mirrors conjecture→derivation promotion. Non-goal: minting a person node for every
-                author; the independence gate needs only a stable equality key. Write-time hard gate
-                (#1827): a raw display-name shape, or a well-formed pn_* id that does not resolve to
-                an existing current person node, is REJECTED with a repair hint (a fuzzy-matched
-                existing person, or a mint-one pointer to engram_add_person). Config kill-switch
-                `standpoint.author_id_hard_gate` (default true) restores the pre-#1827 warn-not-reject
-                behavior when set false.
+                produced the source claim (the "who observes" axis). Use the pn_* node ID for an
+                in-graph entity — it MUST resolve to an existing, current person node. Use a
+                canonical namespaced string (orcid:..., doi-author:..., domain:handle) for an
+                external one-off author. A raw display name is REJECTED at write time, as is a
+                pn_* that does not resolve; the error carries a repair hint. Conventions,
+                promotion policy and the config kill-switch: the engram-standpoint skill.
             standpoint_collection_id (str, optional): Corpus or work identity for the source ("vantage" axis). Independent axis in per-axis standpoint cluster key.
             standpoint_override_tag (str, optional): Free-form standpoint label for when the computed cluster key is insufficient (lab measurements, personal comms, introspective self-reports).
             standpoint_lineage (str, optional): Training lineage of the source claim's producer, format "provider:family" (e.g. "anthropic:opus"). The most load-bearing bias axis for AI-agent premises; format-validated, rejected with a redirecting error if malformed. Marks the EVIDENCE SOURCE that produced the claim, not who authored this node — you always author your own nodes, including your interpretation; lineage differs only when you're citing another agent's or a human's evidence.
@@ -1842,13 +1812,20 @@ def engram_add_observation(payload_json: str) -> str:
             fs_class (str, optional): Falsification-sensitivity class — "re-executable" (Class 1: claim can be re-tested by re-running the measurement) or "frozen" (Class 2: claim records a past event that cannot be re-executed). Omit or pass null to let the Phase-1 proxy (derived from quote_type) apply. When provided, takes priority over the proxy and the FALSIFICATION line drops the "(proxy:quote_type)" label. When the class is ambiguous (e.g. a re-readable file that records past state), omit and let the proxy apply — hesitation is the correct signal to omit.
             source_repo (str, optional): Absolute path to an alternative git repository to use for git operations. When omitted, the git repo is auto-detected from the file:// URL's directory. Use this for cross-repo citations where the cited file lives outside the target repo (e.g. a plugin file deployed to ~/.engram/ that is committed in the plugin source tree ~/engram-alpha/).
             repo_path (str, optional): Relative path within source_repo where the committed copy of the cited file lives (e.g. "src/engram/server.py"). Required when source_repo is provided and the cited file:// URL path is outside source_repo — used for git status and cat-file checks instead of the auto-derived path. Without repo_path, the path is derived from the file URL relative to the source_repo root, which fails when the file lives outside source_repo. Example: cite file:///home/user/.engram/marketplace/plugins/engram/server.py with source_repo="/home/user/engram-alpha" and repo_path="src/engram/server.py".
-            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. The summary is recall-scent, not content preservation: the full claim renders on inspect, so lossy compression is correct. For a multi-fact claim, name the load-bearing fact, or consider filing separate observations instead. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
+            recall_summary (str, optional, always provide when you can): Compress your interpretation/claim into a ≤140-char recall-scent string shown to agents on future recall — don't start from a blank line. Omitting it clean-accepts but is flagged summary_missing (distinct from needs_tightening — a fail-loud-surface flag for the backfill sweep, not an error); a provided summary over 140 chars is soft-accepted (flagged needs_tightening for later cleanup); an excessively long summary is hard-rejected with no node created.
             recall_keywords (array of str, optional, always provide when you can): 3-6 short keyword strings for structural recognition cues. Never rejected regardless of count — normalized (trimmed, deduped case-sensitively, capped at 6).
+            evidence_type (str, optional): What engram-snapshot (or you) captured, from a closed vocabulary: forum_thread, session_transcript, local_file, web_page, pdf. Stored on the evidence node's metadata at capture time. First-capture-wins on an evidence node that already carries a value: your value is never silently overwritten, and a DIFFERING value surfaces as evidence_type_conflict in the response instead of being dropped or applied. Not inferred from content or fs_class — pass exactly what engram-snapshot's own output emitted (its evidence_type key), or omit.
+            original_url (str, optional): The pre-archive source URL/path engram-snapshot resolved (its own original_url output field) — e.g. the live forum thread URL or web page URL that was archived into the file:// evidence you're citing here. Stored on the evidence node's metadata. Same first-capture-wins semantics as evidence_type (a differing value surfaces as original_url_conflict, never silently overwrites). Omit for evidence that was never snapshotted — it must not appear on such nodes.
 
     Returns:
         JSON with the new observation ID, confidence, evidence ID, and any prediction node created.
         On payload-parsing failure, returns {"error": "..."} with no node created.
     """
+    # alpha #2574 WS5: `reached` -- unconditional, before any argument
+    # validation/guard/early-return, per docs/2574-telemetry-design.md §1's
+    # TRIGGER ENTRY / NEGATIVE EVIDENCE. write_telemetry_record() never
+    # raises (WS1's contract) so this needs no protective try.
+    write_telemetry_record(manifest_id="server.py:engram_add_observation", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -1889,10 +1866,10 @@ _ADD_OBSERVATION_BATCH_FIELDS = frozenset({
 # source_class confidence determination. Same substrate guards as singleton
 # add_observation — the bulk is purely a transaction-shape optimization.
 #
-# Nested-encoding pattern (matches engram_retract's replacement_json): inner
-# field `observations_json` is itself a stringified JSON array. The outer
-# wrapper is the payload_json contract; the inner is the per-observation list.
-# Don't confuse the two levels.
+# Nested-encoding pattern (same shape as engram_set_recall_summaries'
+# `summaries` field): inner field `observations_json` is itself a
+# stringified JSON array. The outer wrapper is the payload_json contract;
+# the inner is the per-observation list. Don't confuse the two levels.
 #
 # Single-payload signature (Wave 3 of the antml-prefix swallow risk / #99) — antml-prefix swallow
 # protection same as singleton add_observation.
@@ -1976,6 +1953,10 @@ def engram_add_observation_batch(payload_json: str) -> str:
     See _add_observation_batch_impl for full per-observation semantics + the
     evidence-resolution logic.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale (identical shape at every one of this workstream's 9
+    # dispatch targets).
+    write_telemetry_record(manifest_id="server.py:engram_add_observation_batch", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2340,6 +2321,9 @@ def engram_query(payload_json: str) -> str:
     See _query_impl for full semantics — kept callable with named kwargs for
     in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2759,6 +2743,13 @@ def engram_cascade_resolve(payload_json: str) -> str:
 
     See _cascade_resolve_impl (engram_revision.py) for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is one of the 3 FAN-IN targets: it is
+    # itself reached from TWO sites (engram_revision.py:2543 via
+    # _supersede_impl, and :3281 via _retract_impl) -- both land on this
+    # SAME manifest_id, which is exactly the union-over-targets semantics
+    # this workstream's spec calls for; no special-casing needed here.
+    write_telemetry_record(manifest_id="server.py:engram_cascade_resolve", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -2776,14 +2767,16 @@ def engram_cascade_resolve(payload_json: str) -> str:
 # in #872 wave 3. Compat forwarders below; wrappers delegate via _lifecycle_mod.
 
 
-# Set of legitimate field names for the engram_nap payload.
-_NAP_FIELDS = frozenset({
+# Set of legitimate field names for the engram_checkpoint payload (also used
+# by the engram_nap deprecated alias below — same fields, same handler).
+_CHECKPOINT_FIELDS = frozenset({
     "message",
+    "session_id",
 })
 
 
-# DESIGN INTENT — engram_nap
-# --------------------------
+# DESIGN INTENT — engram_checkpoint (formerly engram_nap)
+# ---------------------------------------------------------
 # Shallow consolidation: persist context to ENGRAM without advancing the turn
 # counter. The safe-anytime checkpoint — pre-compaction, end-of-burst, any
 # moment the agent wants to preserve session knowledge without triggering
@@ -2806,21 +2799,21 @@ _NAP_FIELDS = frozenset({
 # must be FULLY IN SYNC with the current-CW arc at every nap — see
 # engram-nap skill §5b.
 @mcp.tool(
-    name="engram_nap",
+    name="engram_checkpoint",
     capability=(
         "Lossless checkpoint usable ANY time — no turn advance, no forgetting-curve "
         "effect. Use engram_advance_turn for the once-daily irreversible sleep "
         "checkpoint."
     ),
     annotations={
-        "title": "Pre-compaction Nap (no turn advance)",
+        "title": "Pre-compaction Checkpoint (no turn advance)",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
     },
 )
-def engram_nap(payload_json: str) -> str:
+def engram_checkpoint(payload_json: str) -> str:
     """Persist context to ENGRAM without advancing the turn counter.
 
     Use BEFORE compaction, at end of a work-burst, or whenever you want
@@ -2836,6 +2829,18 @@ def engram_nap(payload_json: str) -> str:
         payload_json: JSON object (as a string) with these fields:
             message (str, required): Summary of what was learned/changed
                 in this work-burst.
+            session_id (str, optional): The current session's id (as
+                injected at session start — same value passed to
+                engram_add_observation's own session_id field). Accepted
+                for backward compatibility with existing callers, but as
+                of #3014 it is NOT used to compute the `warm_briefing`
+                advisory below — that advisory now anchors on the most
+                recent nap/sleep checkpoint already in session_log.md
+                (via `_last_checkpoint_timestamp`), independent of session
+                identity, which correctly re-arms after every nap and
+                covers the post-compaction case too (see
+                `_compute_warm_briefing_advisory`'s docstring for why the
+                anchor changed from session-start).
 
     Returns:
         JSON with previous_turn (unchanged from current_turn since no
@@ -2847,12 +2852,38 @@ def engram_nap(payload_json: str) -> str:
         prior_checkpoint_mode} plus a `reason` key when jaccard is null (no
         prior checkpoint to compare, or the prior snapshot predates this
         metric). Computed at EVERY diagnostic_history checkpoint — both
-        engram_nap and engram_advance_turn (sleep) — per the metric
+        engram_checkpoint (formerly engram_nap) and engram_advance_turn (sleep) — per the metric
         designer's call: the sleep boundary is the most meaningful
         measurement point (consolidation reshaping), so excluding it would
         blind the metric to its own primary use case. NOT computed by
         ad-hoc engram_diagnose() calls — see _compute_recall_set_continuity
         docstring.
+        `warm_briefing` (#2997, anchor fixed in #3014) surfaces when the
+        engram-nap skill's Step 5b (warm-briefing "From this session" sync)
+        was NOT performed since the last nap/sleep checkpoint — that step
+        is agent-executed prose, not code, so nothing fails when it's
+        skipped and the omission is otherwise invisible until a later
+        checkpoint reads a stale/empty briefing. Shape:
+        {mtime: <ISO8601 'Z' string of warm-briefing.md's last write, or
+        null if the file is missing>, written_since_last_nap: <true if
+        mtime is at/after the last nap/sleep checkpoint already recorded
+        in session_log.md, false if before, null if there was no prior
+        checkpoint yet (e.g. this is the first-ever nap) or its timestamp
+        could not be parsed>, session_section_empty: <true if nothing
+        follows the LAST `^## From this session` heading (EOF immediately
+        after), false if content follows, null if the file has no such
+        heading at all>, note: present whenever the block is NOT
+        confidently non-stale (i.e. absent only when
+        written_since_last_nap is `true` AND session_section_empty is
+        `false`); its wording distinguishes a CONFIRMED-stale finding
+        (written_since_last_nap is `false` OR session_section_empty is
+        `true`) from an UNKNOWN one (neither signal confirms staleness,
+        but at least one is `null`) — a `null` signal is never rendered
+        as a definite claim (#2998 round 3). Advisory only, exactly like
+        the version_control backup fields — never blocks the nap; any
+        internal failure degrades the whole block to `null` rather than
+        raising. See _compute_warm_briefing_advisory for the full
+        predicate.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _nap_impl for full semantics — kept callable with named kwargs for
@@ -2861,14 +2892,29 @@ def engram_nap(payload_json: str) -> str:
     params, err = _parse_payload(payload_json)
     if err:
         return err
-    unknown = set(params.keys()) - _NAP_FIELDS
+    unknown = set(params.keys()) - _CHECKPOINT_FIELDS
     if unknown:
         return json.dumps({
             "error": f"Unknown fields in payload_json: {sorted(unknown)}. "
-                     f"Allowed: {sorted(_NAP_FIELDS)}"
+                     f"Allowed: {sorted(_CHECKPOINT_FIELDS)}"
         })
     if "message" not in params:
         return json.dumps({"error": "payload_json must include required field 'message'"})
+    # session_id is consumed here (advisory-only, #2997) — _nap_impl's own
+    # signature doesn't accept it, so it must not reach **params below.
+    # As of #3014, session_id is accepted-but-unused: the warm_briefing
+    # advisory no longer depends on session identity (see
+    # _compute_warm_briefing_advisory) — the pop is kept only so existing
+    # callers that still pass session_id don't hit an "unknown field" error.
+    session_id = params.pop("session_id", None)
+    # Snapshot the last checkpoint's timestamp BEFORE _nap_impl runs.
+    # _nap_impl -> _checkpoint_internal appends THIS nap's OWN header to
+    # session_log.md, so capturing this AFTER _nap_impl would compare
+    # warm-briefing's mtime against the checkpoint this very call is about
+    # to write, instead of the PREVIOUS one — structurally always
+    # "non-stale" and defeating the #3014 fix. Do not move this call below
+    # _nap_impl.
+    last_checkpoint_at = _last_checkpoint_timestamp(core.LOG_PATH)
     result_dict = json.loads(_nap_impl(**params))
     # Diagnostic snapshot (best-effort, never blocks checkpoint). engram_diagnose
     # lives in server.py; the lifecycle impl cannot call it directly (acyclic
@@ -2918,15 +2964,323 @@ def engram_nap(payload_json: str) -> str:
             conn2.close()
     except Exception:
         result_dict["diagnostic_snapshot"] = {"stored": False, "reason": "diagnostic computation failed"}
+    # Warm-briefing advisory (#2997, best-effort — never blocks the nap).
+    # _compute_warm_briefing_advisory already never raises internally; this
+    # outer try/except is defense-in-depth, matching the diagnostic_snapshot
+    # block above (an advisory computation must never break the checkpoint
+    # it rides alongside).
+    try:
+        result_dict["warm_briefing"] = _compute_warm_briefing_advisory(
+            core.DATA_DIR / "warm-briefing.md", last_checkpoint_at
+        )
+    except Exception:
+        result_dict["warm_briefing"] = None
     banner = _walguard_degraded_banner()
     if banner:
         result_dict["_walguard_warning"] = banner
     return json.dumps(result_dict)
 
 
+# DEPRECATED ALIAS — engram_nap (issue #3015)
+# --------------------------------------------
+# engram_nap was the original tool name. It collided with the engram-nap
+# SKILL name (the eight-step nap routine, of which calling this tool is only
+# one step — see engram-nap SKILL.md), and a nudge that told the agent to
+# invoke this bare tool name read ambiguously as either "call the tool" or
+# "run the skill" -- agents that took it literally called only the tool and
+# skipped the skill's other steps (notably Step 5b, the warm-briefing
+# rotation). The tool itself is renamed to engram_checkpoint so "nap"
+# unambiguously means the skill. This alias is kept for exactly one release
+# (per Lei's 2026-09-19 ruling) so in-flight callers don't break; it
+# delegates to engram_checkpoint verbatim -- same fields, same behavior,
+# same output shape. New callers should use engram_checkpoint directly.
+@mcp.tool(
+    name="engram_nap",
+    capability=(
+        "DEPRECATED ALIAS for engram_checkpoint (kept for one release — "
+        "migrate callers to engram_checkpoint). Identical behavior: lossless "
+        "checkpoint usable ANY time, no turn advance."
+    ),
+    annotations={
+        "title": "[DEPRECATED — use engram_checkpoint] Pre-compaction Nap (no turn advance)",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+def engram_nap(payload_json: str) -> str:
+    """DEPRECATED ALIAS for engram_checkpoint — kept for exactly one release.
+
+    Identical behavior to engram_checkpoint (same payload_json fields, same
+    return shape) -- this wrapper delegates directly to engram_checkpoint's
+    implementation. Migrate callers to engram_checkpoint; this alias name
+    will be removed in a future release.
+
+    See engram_checkpoint's own docstring for the full field/return-shape
+    reference.
+    """
+    return engram_checkpoint(payload_json)
+
+
 def _nap_impl(message: str) -> str:
-    """Impl for engram_nap — delegates to engram_lifecycle (wave 3)."""
+    """Impl for engram_checkpoint (formerly engram_nap; also used by the
+    engram_nap deprecated alias) — delegates to engram_lifecycle (wave 3)."""
     return _lifecycle_mod._nap_impl(message=message)
+
+
+# Matches the checkpoint headers _checkpoint_internal (engram_lifecycle.py)
+# appends to session_log.md on EVERY nap AND every sleep/advance_turn --
+# "## Nap (turn N) — <ts>" for a nap, "## Turn N — <ts>" for a sleep. Both
+# are valid "last checkpoint" anchors for the warm-briefing advisory below
+# (#3014): a sleep also legitimately rotates/erases the "From this session"
+# section (engram-sleep skill), so it counts as a checkpoint just as much
+# as a nap does. <ts> is core._now()[:19] -- a naive-looking but always-UTC
+# string (e.g. "2026-09-19T12:16:00", no offset suffix).
+_CHECKPOINT_HEADER_RE = re.compile(
+    r"^## (?:Nap \(turn \d+\)|Turn \d+) — (\S+)", re.MULTILINE
+)
+
+
+def _last_checkpoint_timestamp(log_path: Path) -> str | None:
+    """Returns the timestamp string from the MOST RECENT nap-or-sleep
+    checkpoint header already present in session_log.md (both `_checkpoint_internal`
+    modes write one — "## Nap (turn N) — <ts>" for a nap, "## Turn N — <ts>"
+    for a sleep/advance_turn), or None if the file doesn't exist, can't be
+    read, or contains no such header yet (e.g. a brand-new install).
+
+    NEVER RAISES -- advisory-only, same philosophy as
+    _compute_warm_briefing_advisory itself.
+
+    Callers MUST call this BEFORE triggering a new checkpoint write (i.e.
+    before _nap_impl / _checkpoint_internal runs) -- _checkpoint_internal
+    appends its OWN header to this same file, so calling this helper
+    afterward would return the checkpoint's own timestamp instead of the
+    PREVIOUS one, making every advisory computation compare a nap against
+    itself (always non-stale, defeating the whole fix).
+    """
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        matches = list(_CHECKPOINT_HEADER_RE.finditer(content))
+        if matches:
+            return matches[-1].group(1)
+    except Exception:
+        pass
+    return None
+
+
+# Anchored, line-start-only match for the warm-briefing "From this session"
+# heading -- mirrors the erase logic's own rule exactly (engram-sleep
+# SKILL.md Step 3 / engram-nap SKILL.md 5b/5c): "line-anchored, never a
+# substring search" -- a mid-line or quoted occurrence of the phrase is
+# prose, not the heading, and must never match. MULTILINE makes `^` match
+# at every line start, not just string start.
+_WARM_BRIEFING_SESSION_HEADING_RE = re.compile(r"^## From this session", re.MULTILINE)
+
+
+def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at: str | None) -> dict:
+    """Advisory-only check (#2997, anchor fixed in #3014): surface when the
+    engram-nap skill's Step 5b (warm-briefing "From this session" sync with
+    the current context-window arc) was skipped since the last checkpoint.
+
+    Step 5b is agent-executed prose, not code -- there is no write to fail,
+    so a skipped step produces no error and no log line. This computes two
+    independent signals from the warm-briefing file + the last-known
+    checkpoint timestamp, and folds them into a single `note` the
+    engram-nap skill's Step 3 can print, the same way the pre-existing
+    backup-health check surfaces a degrading `version_control` backup.
+
+    NEVER RAISES. Every internal failure (missing file, unparseable
+    timestamp, ...) degrades the affected signal to `None` rather than
+    propagating -- advisory-only, exactly like the backup-health check this
+    mirrors. The caller (engram_nap) additionally wraps this call in its
+    own try/except as defense in depth, but this function is itself already
+    safe to call directly.
+
+    Args:
+        warm_briefing_path: path to ~/.engram/warm-briefing.md (or the
+            configured data dir's copy).
+        last_checkpoint_at: the timestamp string of the MOST RECENT
+            nap-or-sleep checkpoint already present in session_log.md,
+            snapshotted via `_last_checkpoint_timestamp` BEFORE the
+            current checkpoint's own header is appended (see that
+            function's docstring for why the ordering matters -- calling
+            it after _nap_impl/_checkpoint_internal runs would return the
+            CURRENT checkpoint's own timestamp instead of the PREVIOUS
+            one, making this signal structurally always non-stale).
+            `None` when there is no prior checkpoint in session_log.md at
+            all (e.g. a fresh install's first-ever nap), in which case
+            `written_since_last_nap` degrades to `None` (can't determine)
+            rather than being guessed.
+
+    Returns:
+        {"mtime": <ISO8601 '...Z' string of warm_briefing_path's last
+            write, or None if the file doesn't exist / isn't stat-able>,
+         "written_since_last_nap": <True if mtime is at/after
+            last_checkpoint_at, False if strictly before, None if
+            last_checkpoint_at was None (no prior checkpoint yet) or its
+            timestamp could not be parsed>,
+         "session_section_empty": <True if nothing but whitespace follows
+            the LAST `^## From this session` heading through EOF, False
+            if real content follows, None if the file has no such heading
+            at all -- a structural invariant should prevent this, but it
+            is not assumed here>,
+         "note": <str, present ONLY when the block reads as stale or
+            unknown>}
+
+    `note` condition (issue #2997 leaves the exact predicate to the
+    implementer; documented here since it's a load-bearing judgment call).
+    Three-way, not binary -- staying silent still requires two independent
+    positive confirmations, but an unconfirmed signal is no longer rendered
+    as a confirmed one (#2998 round 3 -- the colleague review's blocker: a
+    `None` written_since_last_nap, e.g. because there's no prior checkpoint
+    yet, used to produce the exact same note text as a CONFIRMED-stale
+    written_since_last_nap=False, asserting a fact the code had explicitly
+    declined to determine -- the same invariant carries forward under the
+    #3014 anchor change below):
+
+    - SILENT (no `note` key at all): written_since_last_nap is True AND
+      session_section_empty is False -- both confidently non-stale.
+    - CONFIRMED-stale (`note` = "Step 5b not performed this session", the
+      original text, unchanged): written_since_last_nap is False OR
+      session_section_empty is True -- at least one signal is a definite
+      negative/positive-for-staleness. This takes PRECEDENCE over the
+      unknown case below when both are simultaneously present (e.g.
+      written_since_last_nap=False and session_section_empty=None) -- a
+      confirmed problem is more actionable than "can't tell," and a
+      genuinely-confirmed defect should not be diluted into uncertainty
+      language just because a separate, independent signal happens to be
+      undetermined.
+    - UNKNOWN (`note` states what specifically couldn't be determined,
+      e.g. "could not determine whether Step 5b ran (no prior checkpoint
+      found in session_log.md)"): everything else -- neither signal
+      confirms staleness, but at least one is None. written_since_last_nap
+      and session_section_empty can each independently be None for
+      different reasons (no prior checkpoint / an unparseable timestamp,
+      vs. no `## From this session` heading found at all), so the message
+      is composed from whichever signal(s) are actually None rather than a
+      single hardcoded reason.
+
+    #3014 -- why the anchor changed from session-start to last-checkpoint:
+    a session can run for many hours across many naps and a compaction, and
+    the OLD anchor (session_started_at, read from a per-session marker
+    file) never changed across any of that -- so ONE early write of
+    warm-briefing.md satisfied "written this session" for the rest of a
+    long session, even when Step 5b was skipped on every subsequent nap,
+    and compaction (which does not change session_id) never reset it
+    either. The NEW anchor -- the timestamp of the last nap-or-sleep
+    checkpoint already in session_log.md -- is per-checkpoint rather than
+    per-session, so the advisory correctly re-arms after every nap and
+    naturally covers the compaction case too (a post-compaction nap still
+    compares against the PRIOR nap's timestamp, not session start).
+    """
+    result: dict = {
+        "mtime": None,
+        "written_since_last_nap": None,
+        "session_section_empty": None,
+    }
+    try:
+        mtime_epoch = None
+        try:
+            mtime_epoch = os.path.getmtime(warm_briefing_path)
+            result["mtime"] = (
+                datetime.fromtimestamp(mtime_epoch, tz=timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+        except OSError:
+            pass
+
+        # written_since_last_nap: needs BOTH a real mtime and a parseable
+        # last_checkpoint_at. Any missing piece leaves this None (can't
+        # determine) rather than guessed. Independently wrapped so that ANY
+        # failure here -- known or not -- degrades only this one signal and
+        # can never skip the structurally-independent session_section_empty
+        # computation or the note assignment below (#2998 review round 1;
+        # carried forward under the #3014 anchor change).
+        try:
+            if last_checkpoint_at and mtime_epoch is not None:
+                try:
+                    last_dt = datetime.fromisoformat(last_checkpoint_at)
+                    if last_dt.tzinfo is None:
+                        # _checkpoint_internal writes a naive-looking string
+                        # (core._now()[:19] drops the offset suffix) that
+                        # IS UTC -- attach tzinfo explicitly before calling
+                        # .timestamp(), or a naive datetime is treated as
+                        # LOCAL time and silently produces the wrong epoch
+                        # on any non-UTC TZ (#3014).
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    result["written_since_last_nap"] = mtime_epoch >= last_dt.timestamp()
+                except (ValueError, AttributeError, TypeError):
+                    pass  # unparseable timestamp -- stays None
+        except Exception:
+            # Unanticipated failure computing written_since_last_nap --
+            # degrade this signal to None only; session_section_empty and
+            # the note assignment below must still run.
+            pass
+
+        # session_section_empty: last-anchored-match, never a substring
+        # search or a first-match -- mirrors the erase logic exactly.
+        # Independently wrapped for the same reason as
+        # written_since_last_nap above -- this signal has nothing to do
+        # with the checkpoint anchor and must always get a chance to run
+        # regardless of what happened above.
+        try:
+            with open(warm_briefing_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            matches = list(_WARM_BRIEFING_SESSION_HEADING_RE.finditer(content))
+            if matches:
+                last_match = matches[-1]
+                remainder = content[last_match.end():]
+                result["session_section_empty"] = not remainder.strip()
+            # else: no heading at all -- stays None, not guessed either way.
+        except Exception:
+            pass
+
+        # note assignment runs unconditionally on whatever partial `result`
+        # was actually gathered above -- reachable regardless of whether
+        # either signal computation above raised, not merely reachable when
+        # nothing upstream raised. See the docstring's "`note` condition"
+        # section above for the full three-way reasoning.
+        wsn = result["written_since_last_nap"]
+        sse = result["session_section_empty"]
+        if wsn is True and sse is False:
+            pass  # both confidently non-stale -- stay silent, no `note` key
+        elif wsn is False or sse is True:
+            # At least one signal is a CONFIRMED negative (or positive-for-
+            # staleness) -- definite evidence Step 5b was skipped (or the
+            # session section reads empty). Takes precedence over the
+            # unknown branch below even when the OTHER signal is also
+            # None: a confirmed problem is real regardless of what a
+            # separate, independent signal couldn't determine.
+            result["note"] = "Step 5b not performed this session"
+        else:
+            # Neither confidently-clear nor confirmed-stale -- at least one
+            # signal is None (undetermined) and neither is a confirmed
+            # negative. State what's actually unknown rather than asserting
+            # a false definite claim (#2998 round 3 -- a None
+            # written_since_last_nap used to render identically to a
+            # confirmed False here).
+            unknown_parts = []
+            if wsn is None:
+                unknown_parts.append(
+                    "no prior checkpoint found in session_log.md" if last_checkpoint_at is None
+                    else "the last checkpoint's timestamp could not be parsed"
+                )
+            if sse is None:
+                unknown_parts.append("no '## From this session' heading found")
+            result["note"] = (
+                "could not determine whether Step 5b ran ("
+                + "; ".join(unknown_parts) + ")"
+            )
+    except Exception:
+        # Final defense-in-depth backstop only (matches engram_nap()'s own
+        # wrapper around this call) -- NOT the only thing standing between
+        # an unanticipated exception and a silently note-less result: each
+        # signal computation above is already independently wrapped, so
+        # this outer catch should rarely fire in practice.
+        pass
+    return result
 
 
 # Set of legitimate field names for the engram_advance_turn payload.
@@ -2951,9 +3305,9 @@ _ADVANCE_TURN_FIELDS = frozenset({
 # over-inflates the forgetting curve irreversibly. No self-guard — caller is
 # the safety mechanism (engram-sleep skill + nap-vs-sleep discipline).
 #
-# nap (engram_nap) is the safe-anytime alternative: lossless persistence with
-# NO turn-advance. Compaction-boundary checkpoints + background roles always
-# use nap, never advance_turn.
+# nap (engram_checkpoint, formerly engram_nap) is the safe-anytime alternative:
+# lossless persistence with NO turn-advance. Compaction-boundary checkpoints +
+# background roles always use nap, never advance_turn.
 #
 # Pairs with sleep-success marker (~/.engram/sessions/last-sleep-success.json)
 # for the auto-sleep cron idempotency — caller checks "did we already consolidate
@@ -2963,7 +3317,7 @@ _ADVANCE_TURN_FIELDS = frozenset({
     capability=(
         "[Sleep/first-session only] IRREVERSIBLE turn-advance checkpoint — at most "
         "once/24h, no self-guard against double-call. Mid-session saves should use "
-        "engram_nap instead."
+        "engram_checkpoint instead."
     ),
     annotations={
         "title": "[Sleep cycle / first session only — DO NOT call awake.] Session Checkpoint with Turn Advance (irreversible)",
@@ -2983,7 +3337,7 @@ def engram_advance_turn(payload_json: str) -> str:
     repeat calls — caller-responsibility.
 
     For non-end-of-day checkpoints (pre-compaction, mid-burst, background
-    roles): use engram_nap instead — same lossless persistence, no turn-advance.
+    roles): use engram_checkpoint instead — same lossless persistence, no turn-advance.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -2995,7 +3349,7 @@ def engram_advance_turn(payload_json: str) -> str:
         tiers.
         `diagnostic_snapshot.recall_set_continuity` carries the Recall-Set
         Continuity metric (v1, #1630) — same shape and semantics as
-        engram_nap's (see that tool's docstring + engram_core's
+        engram_checkpoint's (see that tool's docstring + engram_core's
         _compute_recall_set_continuity docstring). Computed here too, not
         just at nap: the sleep boundary's forgetting + consolidation makes
         it the single most meaningful measurement point for this metric.
@@ -3261,6 +3615,12 @@ def engram_stats(payload_json: str = "{}") -> str:
                 open_predictions, reasoning_breakdown, weakest_nodes,
                 health_score, memory, version. Default (omitted or null): all
                 sections. Unknown names are ignored with a logged warning.
+                health_score is sourced from the latest health-v2 checkpoint
+                (health.engine.read_latest_composed_summary(); see the
+                Returns section below) -- it is not itself live-computed.
+                health_score_detail is not a selectable section name; it
+                rides alongside health_score automatically whenever that
+                section is included.
 
     Returns:
         JSON with comprehensive graph statistics. Top-level keys (all sections):
@@ -3295,9 +3655,12 @@ def engram_stats(payload_json: str = "{}") -> str:
         })
 
     # Section name validation is handled inside _stats_impl (engram_stats.py).
-    # "health_score" is a recognized name but engram_stats doesn't compute
-    # it (that's engram_diagnose's domain); including it in sections is a
-    # no-op that doesn't error.
+    # engram-alpha#2940: engram_stats DOES compute "health_score" (plus a
+    # sibling "health_score_detail" object) when that section is requested,
+    # reading the latest health-v2 checkpoint via
+    # health.engine.read_latest_composed_summary() -- the same source
+    # engram_diagnose uses. health_score is None when no checkpoint has
+    # ever been written (never a fabricated live number).
     if sections_param is not None:
         if not isinstance(sections_param, list):
             return json.dumps({"error": "sections must be a list of strings"})
@@ -3323,11 +3686,18 @@ def engram_stats(payload_json: str = "{}") -> str:
 # confidence-distribution shape per type/quote_type/reasoning_type/source_class) +
 # read-tool contention (flagged session buckets where recall tools may compete).
 #
-# Health score: composite 0-100 with documented penalty/bonus rules — DAG
-# violations / tainted / stale / orphans / low embedding coverage / high
-# retraction rate / uncited-observation overflow penalize; active resolution
-# work (>50% questions resolved) bonuses. Numbers tuned the dream-mode context-hunger observation to prevent
-# doc-config drift.
+# Health score: engram-alpha#2940 retired the old hand-rolled penalty
+# formula. health_score (composite 0-100) is now sourced from health-v2's
+# own composed score, read back from the latest checkpoint via
+# health.engine.read_latest_composed_summary() -- see health/engine.py's
+# own module docstring for the composition formula (single source of
+# truth; not re-described here to avoid a second copy that drifts).
+# health_score_detail rides alongside it with points_in_play,
+# unscored_aspects, snapshot_id, checkpoint_mode, written_at, and
+# composed_coverage -- provenance for which checkpoint the number came
+# from. There is NO live-compute path for v2 (it is per-checkpoint only);
+# health_score is null when no checkpoint has ever run (fresh install, no
+# nap/sleep yet) -- never a fabricated number.
 #
 # Config summary block surfaces the runtime tunables (memory tiers, decay
 # base, utility scoring α/β, etc.) so the diagnose snapshot doubles as an
@@ -3358,7 +3728,12 @@ def engram_diagnose() -> str:
     Returns:
         JSON with metrics grouped into: structure, epistemic, memory,
         provenance, experience, calibration, and a top-level health_score
-        (0-100).
+        (0-100), sourced from the latest health-v2 checkpoint (see
+        health.engine.read_latest_composed_summary()) -- null when no
+        checkpoint has ever run. A sibling health_score_detail object
+        rides alongside it with points_in_play, unscored_aspects,
+        snapshot_id, checkpoint_mode, written_at, and composed_coverage
+        (or {"error": <reason>} when health_score is null).
 
         - calibration (new, weight=0 in health_score):
           - corpus: confidence distribution from _compute_confidence_distribution (no time filter) —
@@ -3392,7 +3767,7 @@ def engram_diagnose() -> str:
 #     for the honesty axiom: every retraction + supersede is recorded; the
 #     graph can't quietly rewrite its own past.
 #   diagnostics — "show me the trend" — health-score snapshots taken at each
-#     checkpoint (engram_nap / engram_advance_turn). Lets the agent track
+#     checkpoint (engram_checkpoint / engram_advance_turn). Lets the agent track
 #     graph-health drift across days.
 #
 # Limit cap (max 200): keeps response bounded; for full-history dives, page
@@ -4469,7 +4844,7 @@ def engram_add_trust_signal(payload_json: str) -> str:
 
 _ADD_CORNERSTONE_FIELDS = frozenset({
     "tag", "title", "new_frame",
-    "prior_frame", "triggering_experience", "supporting_ids",
+    "prior_frame", "triggering_experience", "supporting_ids", "generalized_by",
 })
 
 
@@ -4526,6 +4901,13 @@ def engram_add_cornerstone(payload_json: str) -> str:
             prior_frame (str, optional): What I operated under before.
             triggering_experience (str, optional): Narrative of the experience that caused the reframe.
             supporting_ids (str, optional): Comma-separated IDs of supporting nodes.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this cornerstone (#2753 epic WS1, D4).
+                Must be current nodes of type cornerstone, axiom, or goal.
+                Writes `<parent> generalizes <new cornerstone>` edges at
+                mint time, cycle-guarded. Strict: an invalid parent
+                (missing, non-current, or wrong-type pair) refuses the
+                whole call.
 
     Returns:
         JSON with the new cornerstone node ID and linked supporting nodes.
@@ -4782,8 +5164,8 @@ _REMOVE_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_remove_edge",
     capability=(
         "Deletes ONLY a whitelisted non-cascade edge (about, tensions, subtask_of, "
-        "serves, exemplifies, instantiates). Cascade/provenance edges blocked — use "
-        "engram-surgical."
+        "serves, exemplifies, instantiates, generalizes). Cascade/provenance edges "
+        "blocked — use engram-surgical."
     ),
     annotations={
         "title": "Remove a Non-Cascade Edge Between Nodes",
@@ -4840,8 +5222,9 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
 # adding non-cascade relational edges (e.g. relevance-marker edges, subtask
 # groupings) previously required engram-surgical or an engram_supersede call.
 #
-# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions.
-# All are non-cascade, non-structural-commitment, non-provenance relations.
+# Whitelist (safe to add): about, exemplifies, serves, subtask_of, tensions,
+# generalizes. All are non-cascade, non-structural-commitment, non-provenance
+# relations.
 #
 # BLOCKED (require node-add-time payload or dedicated mutation tool):
 #   - Provenance-bearing: every relation with `provenance: True` in
@@ -4885,7 +5268,8 @@ _ADD_EDGE_FIELDS = frozenset({"source_id", "target_id", "relation"})
     name="engram_add_edge",
     capability=(
         "Adds ONLY a whitelisted non-cascade edge between EXISTING nodes (about, "
-        "exemplifies, serves, subtask_of, tensions, instantiates). Idempotent."
+        "exemplifies, serves, subtask_of, tensions, instantiates, generalizes). "
+        "Idempotent."
     ),
     annotations={
         "title": "Add a Non-Cascade Edge Between Nodes",
@@ -4899,12 +5283,12 @@ def engram_add_edge(payload_json: str) -> str:
     """Add a non-cascade edge between two existing nodes.
 
     Whitelist-scoped (about, exemplifies, instantiates, serves, subtask_of,
-    tensions). Cascade / structural / provenance edges blocked — those must
-    be created at node-add time (via the source node's payload) or via the
-    dedicated mutation tool (supersede / retract). Generic add-edge is only
-    for non-claim-bearing topological edges.
+    tensions, generalizes). Cascade / structural / provenance edges blocked
+    — those must be created at node-add time (via the source node's
+    payload) or via the dedicated mutation tool (supersede / retract).
+    Generic add-edge is only for non-claim-bearing topological edges.
 
-    Relation boundaries (the three-way split):
+    Relation boundaries (the four-way split):
       exemplifies  — this incident is an instance of this lesson's
                      error/success pattern (incident → lesson ONLY; feeds
                      the tripwire engine).
@@ -4916,6 +5300,14 @@ def engram_add_edge(payload_json: str) -> str:
                      pointer to exemplifies). The post-hoc wiring tool for
                      goal realizations and axiom grounding from practice
                      observations.
+      generalizes  — this principle IS THE MORE GENERAL FORM of that
+                     principle (#2753 epic WS1; general → specific;
+                     lesson→lesson, cornerstone→lesson,
+                     cornerstone→cornerstone, axiom→cornerstone, or
+                     goal→cornerstone ONLY — concrete nodes stay on
+                     exemplifies/instantiates). Cycle-guarded at write
+                     time. Coexists with `supported_by` — never a
+                     replacement for it.
 
     Idempotent: no_op_already_exists is a successful return.
 
@@ -5121,7 +5513,7 @@ def engram_goal_tension(payload_json: str) -> str:
 _ADD_LESSON_FIELDS = frozenset({
     "claim", "incident_ids", "scaffolding_nudge", "logical_chain",
     "reasoning_type", "context_ids", "situation_pattern", "bypass_prose_check",
-    "recall_summary", "recall_keywords",
+    "prevention_type", "recall_summary", "recall_keywords", "generalized_by",
 })
 
 
@@ -5210,6 +5602,15 @@ def engram_add_lesson(payload_json: str) -> str:
                 bypass_prose_check: true so the graph can audit how often this
                 override was actually exercised. Has no effect when situation_pattern
                 doesn't look like prose, or is empty.
+            prevention_type (str, optional): One of "advisory" (default) or "shadow"
+                (alpha#1944). "advisory" only ever injects the nudge, same as every
+                lesson before this field existed. "shadow" is a candidate for
+                blocking: still always allows the call, but the PreToolUse tripwire
+                hook logs every would-have-blocked fire so a promotion gate can
+                measure precision. "blocking" is REFUSED at creation — a lesson
+                earns blocking only via engram_update_lesson, after a real shadow
+                window with measured zero false positives; nothing can mint straight
+                to blocking.
             recall_summary (str, optional, always provide when you can): Compress
                 the corrective pattern into a ≤140-char recall-scent string — don't
                 start from a blank line. Not content preservation (the full claim
@@ -5220,6 +5621,12 @@ def engram_add_lesson(payload_json: str) -> str:
                 node created.
             recall_keywords (array of str, optional, always provide when you can):
                 3-6 short keyword strings. Never rejected regardless of count.
+            generalized_by (str, optional): Comma-separated IDs of principle
+                nodes that generalize this lesson (#2753 epic WS1, D4). Must
+                be current nodes of type lesson (meta-lesson) or cornerstone.
+                Writes `<parent> generalizes <new lesson>` edges at mint
+                time, cycle-guarded. Strict: an invalid parent (missing,
+                non-current, or wrong-type pair) refuses the whole call.
 
     Returns:
         JSON with lesson ID, confidence, linked incidents, and similar
@@ -5411,10 +5818,11 @@ def engram_update_lesson(payload_json: str) -> str:
     (action="lesson_field_updated") — an in-place update still shows up as
     a graph-mutation event, distinct from creating a new node.
 
-    Mutable fields (#1826, widened 2026-08-03): situation_pattern and
-    scaffolding_nudge — mechanical retrieval/actionability metadata you can
-    refine from real firing experience, never the lesson's epistemic content
-    (claim, logical_chain, confidence, reasoning_type stay supersede-only).
+    Mutable fields (#1826, widened 2026-08-03; #1944 widened again for
+    prevention_type): situation_pattern, scaffolding_nudge, prevention_type
+    — mechanical retrieval/actionability metadata you can refine from real
+    firing experience, never the lesson's epistemic content (claim,
+    logical_chain, confidence, reasoning_type stay supersede-only).
 
     situation_pattern, set to a non-empty value, runs the SAME #1864
     prose-shape gate engram_add_lesson runs at creation time — must compile
@@ -5426,13 +5834,19 @@ def engram_update_lesson(payload_json: str) -> str:
     failure mode to guard against. No approval gate on either field: neither
     carries trust/security weight (#1826's own scoping call).
 
+    prevention_type must be one of "advisory", "shadow", "blocking"
+    (#1944) — unlike engram_add_lesson, which REFUSES "blocking" outright,
+    this tool MAY promote a lesson to "blocking": that promotion is exactly
+    what an update is for, earned after a real shadow window (measured
+    zero false positives), never re-litigated by this validation.
+
     Args:
         payload_json: JSON object (as a string) with these fields:
             node_id (str, required): Lesson node ID (ls_NNNN). Must be
                 type='lesson' and is_current=1.
             updates (dict, required): Map of field → new_value. Mutable
-                fields: situation_pattern, scaffolding_nudge. Attempting to
-                update any other field returns an error.
+                fields: situation_pattern, scaffolding_nudge, prevention_type.
+                Attempting to update any other field returns an error.
             reason (str, optional): Human-readable explanation for the change.
             bypass_prose_check (bool, optional): Default False. Same
                 override semantics as engram_add_lesson's field of the same
@@ -5938,6 +6352,12 @@ def engram_derive(payload_json: str) -> str:
     See _derive_impl for full reasoning-type list, confidence-computation
     semantics, and structural-validation details.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale. This target is reached from BOTH of engram_derive.py's
+    # _derive_impl sites (:283 blocked-path, :365 success-path -- see
+    # docs/2574-telemetry-design.md §1's OUTCOME/dispatch-target paragraph);
+    # this single `reached` write covers both.
+    write_telemetry_record(manifest_id="server.py:engram_derive", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6019,6 +6439,9 @@ def engram_contradict(payload_json: str) -> str:
 
     See _contradict_impl for full semantics.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_contradict", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6300,6 +6723,9 @@ def engram_supersede(payload_json: str) -> str:
 
     See _supersede_impl for full semantics + workflow + validation rules.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_supersede", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -6334,7 +6760,7 @@ def engram_supersede(payload_json: str) -> str:
 # Compat forwarder above in wave-6 compat block.
 # Set of legitimate field names for the engram_retract payload.
 _RETRACT_FIELDS = frozenset({
-    "node_id", "error_type", "reason", "replacement_json",
+    "node_id", "error_type", "reason", "replacement_id",
     "initiation", "initiation_gate",
 })
 
@@ -6355,13 +6781,13 @@ _RETRACT_FIELDS = frozenset({
 # hallucinated_claim, duplicate, other. These name the failure modes — agents
 # can later scan-by-error-type to learn which kinds of errors they make.
 #
-# Optional replacement (replacement_json field): the retract can be paired with
-# a corrected observation that cites the same evidence. This is the typical
-# pattern — retract WITH a fix, not just retract-and-leave-empty.
-#
-# Naming caution: the outer param is payload_json; the INNER field is
-# replacement_json. They're distinct — outer is wrapper-protocol JSON; inner
-# is the replacement-observation JSON.
+# Optional replacement (replacement_id field): the retract can be paired with
+# a corrected node, named by id. #2612 retired the earlier mint-inside-
+# retraction path (a nested replacement_json field that minted the
+# replacement inline) — this is a purely relational operation, like
+# engram_supersede's new_node_id: the caller creates the replacement first,
+# via its own canonical creation tool (engram_add_observation for
+# observations), then names it here.
 #
 # Single-payload signature (Wave 2b of the antml-prefix swallow risk / #55).
 @mcp.tool(
@@ -6395,9 +6821,7 @@ def engram_retract(payload_json: str) -> str:
     resolution_kind='retracted'). A retract resolved that way is a partial
     resolution of the existing cascade event, not a new one.
 
-    Pass all fields as one JSON object string in payload_json. Note: the
-    outer wrapper parameter is `payload_json` and there is also an INNER
-    field named `replacement_json` — distinct things.
+    Pass all fields as one JSON object string in payload_json.
 
     Args:
         payload_json: JSON object (as a string) with these fields:
@@ -6405,10 +6829,14 @@ def engram_retract(payload_json: str) -> str:
             error_type (str, required): One of: fabricated_quote, wrong_citation,
                 wrong_evidence, hallucinated_claim, duplicate, other.
             reason (str, required): Human-readable explanation of the error.
-            replacement_json (str, optional): JSON object string with replacement
-                observation fields {quoted_text, interpretation, claim,
-                quote_type, source_class}. The replacement cites the same
-                evidence.
+            replacement_id (str, optional): The replacement node's id, already
+                created via its type's canonical creation tool
+                (engram_add_observation, for observations) BEFORE calling
+                engram_retract — a purely relational operation, it does NOT
+                create a new node (matches engram_supersede's new_node_id
+                convention). Must name a node that exists, is_current=1,
+                differs from node_id, and is not older than node_id (the
+                retracts edge it lands on is temporal_causal=True).
             initiation (str, optional): Who initiated the retraction. One of:
                 user_prompted, gate_prompted, unprompted.
             initiation_gate (str, optional): Which gate triggered the
@@ -6421,9 +6849,23 @@ def engram_retract(payload_json: str) -> str:
 
     See _retract_impl for full semantics + error-type catalog.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_retract", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
+
+    # #2612 migration error: replacement_json was retired — targeted message,
+    # not the generic unknown-field rejection below.
+    if "replacement_json" in params:
+        return json.dumps({
+            "error": "replacement_json was retired (#2612) — engram_retract no "
+                     "longer mints a replacement inline. Create the replacement "
+                     "first via its own canonical creation tool "
+                     "(engram_add_observation for observations), then pass its "
+                     "id as replacement_id."
+        })
 
     unknown = set(params.keys()) - _RETRACT_FIELDS
     if unknown:
@@ -6441,7 +6883,7 @@ def engram_retract(payload_json: str) -> str:
 
 
 # _retract_impl body moved to engram_revision.py (family E) in #872 wave 6.
-# Compat forwarder above in wave-6 compat block (injects _obs_creator=_add_observation_impl).
+# Compat forwarder above in wave-6 compat block.
 # ---------------------------------------------------------------------------
 # Focus mode — family G (engram_focus.py)
 # ---------------------------------------------------------------------------
@@ -6869,7 +7311,8 @@ def engram_focus_delete_set(payload_json: str) -> str:
     name="engram_set_recall_summaries",
     capability=(
         "Batch-writes recall_summary + recall_keywords onto EXISTING nodes — best-effort, "
-        "partial failures don't roll back the batch."
+        "partial failures don't roll back the batch. Accepts either inline 'summaries' or "
+        "an absolute-path 'summaries_file' pointing at a JSON file of the same shape."
     ),
     annotations={
         "title": "Batch-Set Recall Summaries and Keywords",
@@ -6887,20 +7330,33 @@ def engram_set_recall_summaries(payload_json: str) -> str:
     backfill operations.
 
     Args:
-        payload_json: JSON object string with required key:
+        payload_json: JSON object string with EXACTLY ONE of:
             summaries (list): list of entry objects, each with:
                 node_id (str): target node. Must exist + is_current=1.
                 recall_summary (str): curated summary. Authoring target ≤120
                     chars; hard cap 200 chars (defensive guard).
                 recall_keywords (list[str]): 3–5 strings, each ≤30 chars,
                     no duplicates (case-sensitive).
+            summaries_file (str): ABSOLUTE path to a JSON file on disk with
+                the same {"summaries": [...], "failures": [...]} shape as
+                above (the shape cohort_dispatch's "validate" subcommand
+                writes to final_payload.json, and PayloadBuilder.to_json()
+                emits). Use this for large batches instead of re-typing the
+                whole payload inline — the sleep cycle's cohort dispatch
+                already writes this file; pass its path instead of its
+                contents. MUST be absolute: the MCP server is a long-lived
+                process whose cwd is not guaranteed to track the calling
+                agent's own. Relative paths are rejected. Providing BOTH
+                "summaries" and "summaries_file" is a loud error (ambiguous
+                input, nothing applied); providing NEITHER is also an error.
 
     Returns:
         JSON: {
             "ok": [{"node_id": "..."}, ...],
             "errors": [{"node_id": "...", "error": "...", ...}, ...],
             "applied": N,
-            "failed": M
+            "failed": M,
+            "summaries_file": "<path>"  # present only when summaries_file was used
         }
     """
     return _attach_walguard_banner(_recall_summaries_mod._set_recall_summaries_impl(payload_json))
@@ -6919,7 +7375,9 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 #
 # Two modes, mutually exclusive:
 #   Single-field mode (backward compat): node_type and/or status as plain
-#     strings. Compact triage shape with claim truncated to 130 chars.
+#     strings. Compact triage shape; `claim` carries recall_summary
+#     (truncated to 200 chars with an ellipsis if longer) when populated,
+#     else the claim truncated to 130 chars.
 #   Structured-filter mode (issue #81): filters_json with recursive condition
 #     tree. AND/OR/NOT composition, text contains, ID-range, date-range,
 #     NULL handling, cross-table cites/cited_by virtual fields. fields_json
@@ -6962,8 +7420,10 @@ def engram_list(payload_json: str = "{}") -> str:
     Two modes, mutually exclusive:
 
     Single-field mode (default, backward compat): pass node_type and/or
-    status as plain strings. Returns the compact triage shape with claim
-    truncated to 130 chars.
+    status as plain strings. Returns the compact triage shape; the `claim`
+    key carries `recall_summary` when populated — truncated to 200 chars
+    with an ellipsis if longer — falling back to the claim truncated to
+    130 chars.
 
     Structured-filter mode (issue #81): pass filters_json with a recursive
     condition tree. Supports multi-field AND/OR/NOT composition, text
@@ -7163,6 +7623,9 @@ def engram_query_pattern(payload_json: str) -> str:
     See _query_pattern_impl for full semantics — kept callable with named
     kwargs for in-server callers.
     """
+    # alpha #2574 WS5: `reached` -- see engram_add_observation above for the
+    # full rationale.
+    write_telemetry_record(manifest_id="server.py:engram_query_pattern", event_type="engram.telemetry.reached", fields={})
     params, err = _parse_payload(payload_json)
     if err:
         return err
@@ -7335,42 +7798,309 @@ def engram_embedding_cluster(payload_json: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _prewarm_embeddings(model_name: str) -> None:
-    """Pre-warm the embedding model from the HuggingFace local cache.
+def _embedding_cache_status(model_name: str) -> bool:
+    """Cheap, synchronous filesystem check: is `model_name` in the local
+    HuggingFace cache?
 
-    Called on a daemon thread at startup (#276). If the model is not cached,
-    semantic search is disabled for the session without blocking mcp.run().
-    If the model IS cached, it is loaded in the background so the first
-    engram_query call hits a warm model rather than paying the load cost.
+    #345: embeddings are mandatory, so this check now runs on the MAIN
+    thread, before mcp.run() — a cache miss must fail startup loudly rather
+    than let the server come up and silently file nodes with NULL
+    embeddings (permanently excluded from semantic recall). It is safe to
+    run synchronously precisely because it is a `try_to_load_from_cache`
+    filesystem lookup, NOT a model load — the expensive part (the actual
+    model load) stays on the daemon thread in `_prewarm_embeddings` below,
+    per the #276 constraint (synchronous pre-warm can exceed Claude Code's
+    30s MCP connection timeout).
+
+    #2835: mirrors all THREE clauses of `SentenceTransformer.__init__`'s
+    name-resolution branch (sentence_transformers 5.3.0,
+    `SentenceTransformer.py:301-308`), not just the org-prefix rule -- a
+    partial mirror let a local absolute path (the documented workaround for
+    a network where the Hub is blocked) raise `HFValidationError` out of
+    this gate instead of returning a clean verdict.
+    """
+    from huggingface_hub import try_to_load_from_cache
+
+    # Clause 1 -- the loader tests os.path.exists FIRST. If the name is a path
+    # that exists, it is a local model and the Hub is never consulted. That is
+    # the documented workaround where the Hub is blocked at the network edge:
+    # download the model elsewhere, point embedding.model at the directory.
+    # The local analogue of the hub arm's config.json probe is to require one
+    # of the two files the loader will actually read: modules.json (a
+    # sentence-transformers export -> _load_sbert_model) or config.json (a
+    # plain transformer dir -> _load_auto_model). An existing-but-EMPTY
+    # directory must still fail the gate, or #345's hole reopens for
+    # local-path installs -- the server would boot and file NULL embeddings.
+    # Deliberately no expanduser(): the loader does not expand "~" either, so
+    # mirroring means "~/models/x" is correctly refused (with the path-shaped
+    # remedy message from the caller), not silently resolved.
+    #
+    # Disclosed gap (#2841 round 1): a PEFT/LoRA adapter directory carrying
+    # only adapter_config.json has NEITHER of these files, and the loader
+    # does accept it -- Transformer._load_config calls
+    # find_adapter_config_file unconditionally on any local path, ahead of
+    # any config.json requirement. So this gate refuses a layout the loader
+    # would load. That is deliberate, not an oversight: an adapter directory
+    # names a BASE model it does not contain, and resolving that base is
+    # exactly what reaches the Hub. Accepting adapter_config.json here would
+    # pass the gate and then fail the base-model fetch on the background
+    # thread -- a silent degrade to NULL embeddings, in precisely the
+    # Hub-blocked network this fix exists to serve. A loud refusal is the
+    # right error for that case; real adapter support needs the base model
+    # local too, which is a larger change than a filename.
+    #
+    # Boundary, stated because "a false PASS is the severe failure" is this
+    # gate's whole premise: the check is presence-only, not content. A
+    # directory holding an empty or malformed modules.json passes here and
+    # fails later on the background thread, which degrades rather than
+    # exits. That is the loader's own precondition strength
+    # (is_sentence_transformer_model also only tests existence) and the same
+    # tradeoff clause 3 already makes (a cached config.json does not prove
+    # the weights are cached). What is new is the POPULATION: before this
+    # change every local path raised, so no local directory could reach that
+    # tradeoff at all.
+    if os.path.exists(model_name):
+        return any(
+            os.path.isfile(os.path.join(model_name, f))
+            for f in ("modules.json", "config.json")
+        )
+
+    # Clause 2 -- not a path, and a shape the loader refuses outright with
+    # FileNotFoundError. A cache lookup here is meaningless, and it is what
+    # raised HFValidationError out of this gate (#2835). Refuse cleanly.
+    if "\\" in model_name or model_name.count("/") > 1:
+        return False
+
+    # Clause 3 -- a hub repo id. The loader prepends the org prefix only when
+    # the name contains no "/" AND is not one of the 68 legacy no-org names in
+    # `basic_transformer_models`. That list is a FUNCTION-LOCAL variable inside
+    # SentenceTransformer.__init__ (5.3.0, line 230) -- not importable, so an
+    # exact mirror would mean copying 68 literals here and drifting silently
+    # from upstream. Probe BOTH candidate repo ids instead: the prefixed form
+    # (the common case) then the bare form (the legacy case). This can never
+    # produce a false cache-MISS, which is the failure that refuses to boot a
+    # correctly-configured server. The residual imprecision is a false HIT only
+    # if a legacy bare name is cached ONLY under a "sentence-transformers/"
+    # -prefixed repo id that does not exist upstream.
+    candidates = [model_name]
+    if "/" not in model_name:
+        candidates.insert(0, f"sentence-transformers/{model_name}")
+
+    for repo_id in candidates:
+        try:
+            if try_to_load_from_cache(repo_id, "config.json") is not None:
+                return True
+        except ValueError:
+            # HFValidationError subclasses ValueError. A repo id this gate
+            # built and the hub rejects is a clean negative here, never a
+            # traceback out of a startup gate.
+            #
+            # Not widened to `except Exception` on purpose (#2841 round 1).
+            # Traced against huggingface_hub 1.8.0: the only ValueError
+            # reachable at this call site is HFValidationError from the
+            # repo-id validator; a genuinely corrupted cache raises OSError
+            # from the os.path/os.listdir calls inside, and that still
+            # propagates. Swallowing it would turn "your cache is broken"
+            # into "your model is not cached", and send the operator to
+            # pre-warm a cache that is present and unreadable. A loud
+            # traceback is the better error there: the goal is no traceback
+            # for a CONFIGURATION mistake, not no traceback ever.
+            continue
+    return False
+
+
+def _looks_like_local_model_path(model_name: str) -> bool:
+    """True when the configured embedding model name is path-shaped.
+
+    Deliberately does NOT treat a single "/" as path evidence:
+    "BAAI/bge-small-en" is an org-qualified hub repo id, not a path. Used only
+    to choose which recovery message the startup gate prints (#2835) -- the
+    pre-warm one-liner is wrong advice for a path.
+    """
+    return (
+        os.path.isabs(model_name)
+        or model_name.startswith(("~", "./", "../", ".\\", "..\\"))
+        or "\\" in model_name
+        or model_name.count("/") > 1
+    )
+
+
+def _prewarm_embeddings(model_name: str) -> None:
+    """Load the embedding model in the background (daemon thread).
+
+    Called on a daemon thread at startup (#276), AFTER the synchronous
+    startup gate in __main__ has already confirmed (via
+    `_embedding_cache_status`) that the model is available locally -- either
+    present in the local HuggingFace cache, or (since #2835) an on-disk model
+    directory that was never in that cache at all — so a cache miss can no longer reach this function.
+    This function does only the expensive part (the actual model load), off
+    the main thread so mcp.run() can start serving connections immediately
+    rather than blocking on it.
+
+    A failure here (the gate already passed) is genuinely unexpected and
+    must be visible: it is logged to stderr, never swallowed silently. This
+    runs on a daemon thread, so it must NOT exit the process — a fatal
+    embedding failure can only be enforced from the main thread's
+    synchronous gate, before this thread is ever started.
     """
     import sys
 
     try:
-        from huggingface_hub import try_to_load_from_cache
-        cached = try_to_load_from_cache(
-            f"sentence-transformers/{model_name}", "config.json"
-        )
-        if cached is None:
+        _embedder._load_model(model_name)
+        if _embedder._model is not None:
             print(
-                f"[engram] Embedding model '{model_name}' not cached locally. "
-                f"Disabling semantic search for this session.\n"
-                f"  To enable: run this in PowerShell first:\n"
-                f"  python -c \"from sentence_transformers import SentenceTransformer; "
-                f"SentenceTransformer('{model_name}')\"",
+                f"[engram] Embedding model '{model_name}' loaded (background).",
                 file=sys.stderr,
             )
-            _embedder._failed_models.add(model_name)
         else:
-            _embedder._load_model(model_name)
-            if _embedder._model is not None:
-                print(
-                    f"[engram] Embedding model '{model_name}' loaded (background).",
-                    file=sys.stderr,
-                )
-    except ImportError:
-        pass  # huggingface_hub not available, let it try normally
-    except Exception:
+            # _load_model() already logs its own ImportError/Exception cases
+            # to stderr (engram_core.py). This branch covers the residual
+            # case where it returns cleanly with the model still unset, so
+            # that outcome is never silent either.
+            print(
+                f"[engram] Embedding model '{model_name}' failed to load on "
+                f"the background thread, after the startup cache check had "
+                f"already passed. Semantic search is disabled for this "
+                f"session.",
+                file=sys.stderr,
+            )
+    except Exception as e:
+        print(
+            f"[engram] Unexpected error loading embedding model "
+            f"'{model_name}' on background thread: {e!r}",
+            file=sys.stderr,
+        )
         _embedder._failed_models.add(model_name)
+
+
+def _embedding_startup_gate() -> None:
+    """Fail-loud startup gate for the embedding model (#345).
+
+    Embeddings are mandatory: a node with a NULL embedding is excluded from
+    the semantic-recall candidate set entirely (both the sqlite-vec path and
+    the pure-Python cosine fallback filter `embedding IS NOT NULL`), at any
+    threshold, for any query. So unlike a normal degrade-and-continue guard,
+    an unavailable or uncached model here must fail startup loudly (print an
+    actionable message to stderr + `sys.exit(1)`) rather than let the server
+    come up and silently file permanently-unrecallable nodes.
+
+    The gate is split in two on purpose:
+      - the cache-presence check (`_embedding_cache_status`) is a cheap
+        filesystem lookup and runs HERE, synchronously — blocking startup on
+        it is fine.
+      - the actual model LOAD stays on the daemon thread
+        (`_prewarm_embeddings`, started at the end of this function) per the
+        #276 constraint: synchronous pre-warm can exceed Claude Code's 30s
+        MCP connection timeout and leave every engram_* tool unavailable for
+        the session. Do NOT collapse that split — it is load-bearing.
+
+    `ENGRAM_NO_EMBEDDINGS=1` bypasses this entire gate. It is documented test
+    scaffolding (release_gates.py, dump_mcp_schema.py) and the escape hatch
+    for an operator who must start deliberately degraded.
+
+    `embedding.enabled: false` also bypasses this gate — see the comment at
+    that check below for why this is deliberately NOT also-fatal.
+    """
+    import sys
+
+    if os.environ.get("ENGRAM_NO_EMBEDDINGS"):
+        return
+
+    # config["embedding"]["enabled"] (default True) is a real, still-active,
+    # documented toggle (README-AGENT.md, viz UI affordance) honored by 5
+    # call sites in engram_core.py / engram_query.py. Retiring it entirely is
+    # a *separate* slice of #345 (not landed here). Bypass rather than
+    # also-fatal is deliberate, not an oversight: an operator who has
+    # deliberately set `enabled: false` -- plausibly because they never
+    # installed the ~500MB sentence_transformers dependency -- previously
+    # got a clean boot with semantic search cleanly disabled at every query
+    # site. Making this fatal would change a documented, currently-honored
+    # configuration's behavior without the documentation, migration note, or
+    # release-note that the toggle's eventual retirement will carry. This
+    # gate closes the *unintentional* hole (a missing or uncached model);
+    # the *deliberate* opt-out keeps working as documented until it is
+    # retired on purpose. Checked before is_available() so an operator who
+    # disabled embeddings never sees a fatal about sentence_transformers.
+    emb_config = _get_embedding_config()
+    if not emb_config.get("enabled", True):
+        return
+
+    if not _embedder.is_available():
+        print(
+            "[engram] FATAL: embeddings are mandatory (#345) and "
+            "sentence_transformers is not importable. Starting anyway would "
+            "file nodes with NULL embeddings, permanently excluded from "
+            "semantic recall at any threshold, for any query.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        print("  Run Phase 0 setup:", file=sys.stderr)
+        print("    python3 -m venv ~/.engram/venv", file=sys.stderr)
+        print("    source ~/.engram/venv/bin/activate", file=sys.stderr)
+        print("    pip install -r requirements/requirements.txt", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    import threading
+
+    model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
+
+    if not _embedding_cache_status(model_name):
+        if _looks_like_local_model_path(model_name):
+            # #2835: a path-shaped name that failed the gate is not a cache
+            # miss -- the pre-warm one-liner below is wrong advice for it
+            # (SentenceTransformer('/opt/models/x') fails the same way, Hub
+            # never consulted). Point at the directory contract instead.
+            print(
+                f"[engram] FATAL: embedding model directory '{model_name}' "
+                f"is not usable. Embeddings are mandatory (#345) — starting "
+                f"anyway would file nodes with NULL embeddings, permanently "
+                f"excluded from semantic recall at any threshold, for any "
+                f"query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print(
+                "  To fix, check that the directory exists and contains "
+                "modules.json (a sentence-transformers export) or "
+                "config.json (a plain transformer directory). Note: \"~\" "
+                "is not expanded here -- use an absolute path.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[engram] FATAL: embedding model '{model_name}' is not cached "
+                f"locally. Embeddings are mandatory (#345) — starting anyway "
+                f"would file nodes with NULL embeddings, permanently excluded "
+                f"from semantic recall at any threshold, for any query.",
+                file=sys.stderr,
+            )
+            print("", file=sys.stderr)
+            print("  To fix, pre-warm the cache once:", file=sys.stderr)
+            print(
+                f"  python -c \"from sentence_transformers import "
+                f"SentenceTransformer; SentenceTransformer('{model_name}')\"",
+                file=sys.stderr,
+            )
+        print("", file=sys.stderr)
+        print(
+            "  To start deliberately degraded (test/dev only): "
+            "ENGRAM_NO_EMBEDDINGS=1",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    threading.Thread(
+        target=_prewarm_embeddings,
+        args=(model_name,),
+        daemon=True,
+        name="engram-prewarm",
+    ).start()
 
 
 def _write_mcp_ready_marker() -> None:
@@ -7405,7 +8135,7 @@ if __name__ == "__main__":
     _ensure_data_dir()
     # Initialize ~/.engram/.git for the durable version-controlled snapshot.
     # Best-effort: if git is missing or init fails, core._git_available stays False
-    # and engram_nap / engram_advance_turn will report version_control.git_committed=False.
+    # and engram_checkpoint / engram_advance_turn will report version_control.git_committed=False.
     _init_git()
 
     # #1673: start the async snapshot worker and REPLAY any snapshot-commit jobs
@@ -7425,24 +8155,44 @@ if __name__ == "__main__":
             file=_sys.stderr,
         )
 
+    # alpha #2574 WS5 (Phase 4 the engram_log_emitter.py header comment
+    # deferred to): initialize the server-side telemetry emitter singleton,
+    # so the 9 engram.tool.engram_call emit_if_initialized() sites in
+    # engram_derive.py/engram_observation.py/engram_query.py/engram_revision.py
+    # stop being permanently NO_EMITTER (docs/2574-telemetry-design.md §0.1).
+    # Best-effort, same shape as the snapshot worker start above and the
+    # embedding gate below: a failure here must never block server boot
+    # (§8 "telemetry gates nothing T1" -- server.py is the literal T1 MCP
+    # server every engram_* tool call goes through).
+    #
+    # session_id/transcript_path judgment call (flagged for review, per this
+    # workstream's spec): there is no real per-session identity for this
+    # long-lived, multi-session server process -- exactly why the design
+    # doc's §1 WINDOW/SCOPE explicitly does NOT require session_id at the
+    # record level, and §11.1 rules session_id out of scope for a "real
+    # per-request" fix. "server"/"" are literal sentinels that read
+    # unambiguously as "this is the server process, not a session" rather
+    # than a real session id; the design doc does not specify the exact
+    # sentinel string.
+    try:
+        Emitter.init(session_id="server", transcript_path="")
+    except Exception as _em_e:
+        import sys as _sys
+        print(
+            f"[engram] telemetry emitter init failed (server-side telemetry "
+            f"stays NO_EMITTER for this process): {_em_e}",
+            file=_sys.stderr,
+        )
+
     # Pre-warm embedding model on a daemon thread so mcp.run() can start
-    # serving connections immediately. On cold caches under concurrent system
-    # load, synchronous pre-warm can exceed Claude Code's 30s MCP connection
-    # timeout and leave all engram_* tools unavailable for the session (#276).
-    # If a query arrives during pre-warm, _load_model() handles the late-bind
-    # path via the existing lazy code path.
-    if _embedder.is_available():
-        import sys, threading
+    # serving connections immediately (or exit non-zero first -- see
+    # _embedding_startup_gate). On cold caches under concurrent system load,
+    # synchronous pre-warm can exceed Claude Code's 30s MCP connection
+    # timeout and leave all engram_* tools unavailable for the session
+    # (#276). If a query arrives during pre-warm, _load_model() handles the
+    # late-bind path via the existing lazy code path.
+    _embedding_startup_gate()
 
-        emb_config = _get_embedding_config()
-        model_name = emb_config.get("model", DEFAULT_EMBEDDING_MODEL)
-
-        threading.Thread(
-            target=_prewarm_embeddings,
-            args=(model_name,),
-            daemon=True,
-            name="engram-prewarm",
-        ).start()
 
     _write_mcp_ready_marker()   # two-signal liveness: written after init, before serve
     mcp.run()

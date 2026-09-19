@@ -47,6 +47,16 @@ Frequent passes between agents. Don't use `claim`/`release` here — `flip` is t
 
 **The verb tells the reader the genre**: `flip` = transient cursor; `claim`/`release` = persistent ownership.
 
+### Naming a colleague
+
+`--colleague <agent>` at `baton init` names the expected colleague reviewer — added to `participants` (dedup) and, as of #2764, persisted as a `colleague:` frontmatter field so it's visible on `baton show` from creation onward. To set or change it on an EXISTING baton (the colleague wasn't known at init, or the assignment changed):
+
+- **`baton set-colleague <id> <agent>`** — sets `colleague:` and adds `<agent>` to `participants` (dedup) in the same atomic write, exactly like `--colleague` at init. The caller must already be a participant OR the baton's current turn holder — this is what actually closes the friction the verb exists for: a colleague assigned post-init previously had no way in (`baton add-participant` requires the CALLER to already be a participant, so a newly-named colleague couldn't add themselves, and the baton's holder had no verb to do it for them). After `set-colleague`, the colleague is already a participant.
+
+**Decided (#2764): a colleague named only in a flip reason's free text, or mentioned informally by the merge seat, does NOT authorize that agent to `add-participant` themselves.** Free text isn't structured data the server can act on. The supported path is `set-colleague` (or `--colleague` at init) — the holder or an existing participant names the colleague, which mechanically grants access in one step. There is no "just add yourself because someone mentioned you" path.
+
+`set-colleague` is descriptive, not enforcing: it does NOT change what the flip-time colleague-gate requires (still computed from `participants` — "any participant who is neither the current holder nor the pool sentinel"). It makes the colleague identity settable and visible after init; it doesn't change how the gate decides whether a colleague review is required.
+
 ---
 
 ## Auto-pull hook (live GitHub status)
@@ -108,6 +118,8 @@ Three genres of inter-agent communication, only one of which baton-grab replaces
 | Open a new PR baton | `baton init <PR-N> --title "<short>" --participants <a,b> --turn <self> --status in-progress` |
 | Open a new PR baton with GitHub anchor | `baton init <id> ... --github pr/<N>` |
 | Set/update GitHub anchor on existing baton | `baton anchor <id> --github pr/<N>` |
+| Set/change the expected colleague reviewer | `baton set-colleague <id> <agent>` |
+| Add a participant to an existing baton | `baton add-participant <id> <agent>` |
 | Rename a Project's title | `baton rename <id> --title "<new>"` |
 | Inspect a project (read-only) | `baton show <id>` |
 | List your in-court batons | `baton mine` |

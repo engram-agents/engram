@@ -9,6 +9,469 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.1] - 2026-09-14
+
+### rc5 fix round — 2026-09-19 (found on the rc4 soak; tracking #2941)
+
+- **`engram_nap` renamed to `engram_checkpoint`; `engram_nap` kept as a
+  deprecated alias for one release.** The tool name collided with the
+  `engram-nap` SKILL name (the eight-step nap routine, of which calling the
+  tool is only one step), and drowsiness/nap-warning nudges that said "Run
+  engram_nap" read ambiguously as either "call the tool" or "run the skill"
+  — an agent that took it literally called only the tool and skipped the
+  skill's other steps (notably Step 5b, the warm-briefing rotation). The two
+  hook nudges (`context_tracker.py`, `engram-surface-hook.py`) now say to
+  load and run the `engram-nap` skill instead of naming the tool directly.
+  `engram_nap` delegates to `engram_checkpoint` with identical behavior and
+  output shape (#3018, closes #3015).
+- **Nap advisory re-anchored on the last checkpoint, not session start.**
+  `written_this_session` (renamed `written_since_last_nap`) satisfied itself
+  on one early write of `warm-briefing.md` and stayed silent for the rest of
+  a long session — across many subsequent naps and a compaction where Step
+  5b was actually skipped, measured live on two seats (a section stale by 4
+  naps / 10 hours, and a post-compaction section, both read as non-stale).
+  Every nap/sleep already appends a timestamped header to `session_log.md`;
+  the advisory now compares against the most recent one instead of the
+  per-session marker, re-arming after every nap and naturally covering the
+  compaction case (#3017, closes #3014).
+- **Boot charge's monitor-liveness check reads the monitor's stdout target,
+  not just process presence.** `pgrep` certifies a monitor process alive
+  even when its stdout was armed to a dead end (a detached `nohup … > file`
+  instead of through the Monitor tool) — measured live: nine real wake
+  events detected, none reached the session, silently, for six hours. The
+  charge now reads `readlink /proc/<pid>/fd/1` (Linux, a `socket:` target is
+  healthy) or `lsof -a -p <pid> -d 1`'s TYPE column (Darwin, no `/proc`)
+  (#3008, closes #3007).
+- **Dream-record filename pinned to the NYC-local write date.**
+  `~/.engram/history/dream/YYYY-MM-DD.md` never specified whether its date
+  is the day the record was written or the day it consolidates; the
+  sibling dream-report filename in the same skill was already pinned to
+  NYC-local, making this an oversight rather than deliberate latitude
+  (#3010, closes #2177).
+
+### rc4 fix round — 2026-09-18 (found on the rc3 soak and the 09-18 nightly; tracking #2941)
+
+- **macOS install unblocked.** `install-local-marketplace.sh` carried a heredoc
+  apostrophe that Apple's bash 3.2 mis-parses, so a fresh rc2/rc3 install on a
+  Mac whose PATH resolves `bash` to `/bin/bash` failed; fixed with a regression
+  test and a `macos-bash32-syntax` CI job that runs the installer under bash 3.2
+  syntax rules (#3000, closes #2979).
+- **Nap advisory for a skipped warm-briefing rotation.** `engram_nap` returns a
+  `warm_briefing` block stating whether the "From this session" section moved
+  since the session started (optional `session_id`, `session_started_at` as the
+  comparison anchor), so a nap whose Step 5b rotation did not run is visible in
+  the return the agent already reads instead of only in the file's mtime
+  (#2998, closes #2997).
+- **Nightly no longer fails on its own fix.** The #2989 erase-safety control
+  read its "pre-fix template" from the live `dev` ref, so it was correct while
+  the PR was open and stale the moment it merged; the control is now a frozen
+  literal fixture (#2996, closes #2995).
+- **`persistent: true` is conditional on the Monitor schema.** The flag was
+  removed from Claude Code's Monitor tool between 2.1.267 and 2.1.273 and is
+  accepted-and-ignored on later versions; the collaborating-loop skill now
+  says to pass it where the schema lists it and otherwise to arm at the
+  1800000 ms effective cap and re-arm on expiry, reading the arm line rather
+  than the success response (#3006, part of #3005).
+- **CLAUDE.md gh-stack note**: approval dismissal on a stacked merge comes from
+  the base branch's `dismiss_stale_reviews_on_push` setting, not from the
+  auto-rebase itself, with five dated cases (#2999, closes #2838); the
+  generic-404 back-reference dropped by the earlier consistency fix is restored
+  (#3004).
+
+### rc3 fix round — 2026-09-17 (found on the rc2 soak and the 09-16 dream cycle; tracking #2941)
+
+- **Warm-briefing erase landmine removed.** The template's protected region
+  carried two literal `## From this session` occurrences, so a sleep erase could
+  land inside the user's letter; the section now ships as an empty placeholder
+  as the file's final line with the structural-invariant comment above it, and
+  the sleep skill specifies the erase mechanically (last line-anchored match to
+  EOF, re-append the bare heading, post-condition: the file's last line is the
+  bare heading). The in-place-erase and remove-entirely dispositions are retired
+  (#2989).
+- **Dream-master routing keys on category, not suggestion prose.** Category 7/8/9
+  findings were routed by regex over the free-text `suggestion` field and fell
+  silently to the log-only bucket when phrased naturally (#2988).
+- **Dream projection staleness is now a signal.** A long-lived MCP server started
+  before the 0.5.0 metric consolidation kept emitting the old metric set with
+  nothing to say so; the dream-master runs an engine-version staleness check, the
+  repair-record validator covers the full row, and the nightly reports the
+  backfill-cap total it matched (#2985).
+- **Dream-fairy stale-scan spec**: the cornerstone exemption keys on the node's
+  own type instead of focus-list membership, which no longer holds stable
+  principles (#2984).
+- **CLAUDE.md templates**: the MCP-schema load-time parenthetical is deleted
+  rather than reverted, per the rule that CLAUDE.md carries key rules and their
+  explanation, never technical details that drift (#2991).
+- **CI**: the team-practice drift gate checkout no longer persists credentials
+  and its advisory message is fork-agnostic (#2975).
+
+### rc2 fix round — 2026-09-16 (found on the rc1 soak; tracking #2941)
+
+- **Health score is single-sourced on health-v2.** The pre-v2 formula that
+  `engram_stats`/`diagnose`/the session banner still reported (95.0 beside the
+  v2 panel's 100) is retired (#2957).
+- **Installer hardening.** The `jq` dependency is gone; config is read with
+  python3 (#2958). Malformed `config.json` now fails loud on the venv-provisioning
+  reads instead of silently resolving tier/multi-agent to defaults (#2964), and a
+  well-formed config with a wrong-typed `install_tier`/`multi_agent` value is
+  rejected the same way (#2973). A missing `src/forum/requirements.txt` on a
+  multi-agent seat warns instead of silently skipping (#2964).
+- **Forum package requirements are installed into the multi-agent venv**, so a
+  fresh dev venv can collect the forum tests (#2949); the test-id gate now scans
+  `src/forum/tests` (#2948) and enforces scan-roots ↔ `tests.yml` sync (#2959).
+- **`dag_conformance` no longer reports a phantom one-node cycle** for
+  supersedes/retracts edges (#2947).
+- **Viz server**: gzip responses, `ThreadingHTTPServer`, and an in-flight guard,
+  with config writes serialized under one lock (#2926).
+- **Skills**: the health-exam skill matches the rc1 runtime and is portable
+  (#2946); two skills name the live `engram-viz-user.service` unit and
+  `tools/operator-setup-viz.sh` as the canonical restart path (#2971); the
+  upgrade skill documents the Codex 0.154 live-refresh boundary (#2954).
+- **Baton gates**: the REST flip endpoint now runs the same CI-green /
+  approval-staleness / colleague-approval gate as the CLI, fail-closed when the
+  shared gate module cannot load, with an `author:` field and a legacy-author
+  fallback (#2966); `cmd_merge`'s Gate 2 accepts a maintainer-role holder, not
+  only the literal pool sentinel (#2969).
+- **Team practice**: the "which colleague takes the seat" block of `CLAUDE.md`
+  is a generated region checked by a CI drift gate against the private
+  team-practice repo (#2963); `engram_add_observation`'s docstring is trimmed to
+  its contract with the WHY moved to the `engram-observe`/`engram-standpoint`
+  skills (#2962); the interim soma review-convention exception is retired (#2956).
+- **CI**: both nightly workflows record the DST-changeover weighing decision
+  beside their cron line (#2970).
+
+**A scoring-system release.** 204 commits since the `v0.5.0-rc3` cut
+(2026-08-30 through 2026-09-14). The headline arc is the **Health Score v2.0
+curve system**, with the new **Curve Workbench** tool built to tune it —
+together the single largest body of work in this window. A second arc, the
+**hook injection budget**, bounds every hook's context injection for the
+first time. A third, **daemon liveness / socket-guard / WAL-guard
+hardening**, is a cluster of reliability fixes to ENGRAM's background
+processes and its crash-safety instrumentation.
+
+### Added — Health Score v2.0: curves declared as data (epic #1991, #2518, #2537, #2563, #2575, #2905)
+
+- **The health-scoring engine has been rebuilt around a declarative
+  measurement → signal → curve pipeline**, replacing the earlier hardcoded
+  scoring arithmetic. Raw measurements (L0) are collected purely additively;
+  L1 signals are now declared as data (`SIGNAL_DEFS`) rather than scattered
+  arithmetic; the scoring curves that turn a signal into a 0–1 contribution
+  are themselves declared as data (`CurveSpec.knots`, a versioned knots file)
+  instead of hardcoded functions. A composed score, hold-out/renormalize
+  behavior at both the signal and curve level, and a dream-side projection
+  round out the model (#2187, #2189, #2205, #2494, #2520, #2523, #2556,
+  #2577, #2578, #2582).
+- **A version gate now prevents a stale build from scoring against fresh
+  data (or vice versa).** The gate diffs the code's declared L0/L1/curve set
+  against the max deployable tag and fails closed (ILLEGAL) or denies
+  (over-severity DENY) on mismatch, rather than silently scoring with a
+  mismatched engine (#2563, #2588, #2725).
+- **Two more version-gate hardening fixes**: the build-identity check no
+  longer falls back to the undiscriminated repo resolver, which could
+  silently record a data-repo sha as `engine_build` (#2650); and the gate's
+  tie-break now uses tag creation time, so its DENY message no longer
+  conflates "unavailable" with "unchanged" — a case that was producing
+  wrong DENY verdicts on otherwise-fine PRs (#2805).
+- **The health snapshot store gained a historical series** — declarations are
+  replayed as-of any stored point in time, with a git-replay driver, a
+  backfill/verify equality control, and export via a new
+  `/api/health/v2/series` endpoint, so trends over time are queryable, not
+  just the latest snapshot (#2575: #2593, #2599, #2603, #2605, #2607, #2608,
+  #2616, #2869/#2891).
+- **The v2 curve system shipped in two steps**: v1.1 introduced curve knots
+  as a versioned data file with a generic placeholder curve set (#2788/#2794),
+  then v1.2 created the two named curves `badness_pending_premise` and
+  `goodness_coverage` and rebound the relevant metrics onto them (#2905/#2908).
+- **A MAJOR version bump unifies two of the L0 measurement set's counters
+  into one.** `taint_rate` (retract-only) and `stale_derivation_rate`
+  (supersede-only, derivations-only) were two separate signals; they're now
+  one `pending_premise_rate` signal backed by a single new L0 measurement,
+  `claim_bearing_pending_marker` — a DISTINCT count over claim-bearing nodes
+  carrying either a pending retract or a pending supersede cascade marker
+  (a node carrying both counts once, not twice). The L0 set's own identity
+  changing (two measurements retired, one added) is exactly the
+  add/remove/redefine class the health-version gate exists to track, hence
+  MAJOR rather than MINOR — `MINOR` resets to 0 on the bump (#2905/#2922).
+- **Data-integrity hardening for the underlying FTS5 index**: a
+  content/index mismatch detector that distinguishes an unknown "partial"
+  state from a confirmed "mismatch", plus an `AFTER UPDATE` trigger that
+  resyncs FTS on a plain content rewrite so the index can no longer silently
+  drift from the content table (#2678, #2731, #2742/#2745, #2744).
+- **Snapshot access hardening**: explicit file permissions on health
+  snapshots, no more default `VIZ_OPERATOR`, and a fleet repair tool for
+  existing installs whose snapshots were written under the old defaults
+  (#2720/#2734).
+- **A composite index + `PRAGMA optimize`** keeps the query planner's stats
+  current as the series grows (#2559/#2685).
+
+**⚠️ If you run your own ENGRAM instance: shipping this on `dev`/in a
+release is not the same as your instance running it.** Your server and
+hooks need their own rebuild + restart to pick up the new health-scoring
+version — until then, the health score your instance reports can lag what
+is actually in the code you pulled (it may still say `health-v1.0` /
+`v1.1` after upgrading). The version gate above exists specifically to
+catch this class of mismatch and refuse to score with a stale/fresh
+mismatch rather than silently mis-scoring; run your normal upgrade routine
+(`tools/install-local-marketplace.sh` + restart) and check the reported
+health-engine version if this surprises you.
+
+### Added — Curve Workbench: a new dev-tier tool for tuning health curves (#2727, #2738, #2748, #2754, #2758, #2870, #2881, #2894, #2896)
+
+- **A new dev-tier web page for picking curve knots and importances against
+  real history** — value-checked knot edits with a hold-out lock, real-time
+  history + focus readout, per-knot add, set-as-reference, and
+  unavailable-bands rendering (#2727/#2730, #2738/#2740, #2748/#2750,
+  #2870/#2875, #2881/#2882, #2896/#2903).
+- Moved off the main health dashboard's `:5001` to its own `:5021` entry
+  point, and gained a systemd user unit so it can run persistently
+  (#2754/#2762, #2894/#2907, #2909/#2917).
+- The main health dashboard's **Detail tab is a read-only fork of the
+  Workbench** — a three-column-grid history/distribution view over
+  `/api/health/v2/series`, alongside a rounded-to-2-decimals Normal-view
+  score panel (#2518, #2754/#2759, #2867/#2871, #2868/#2872/#2873). **The
+  Normal-view Score panel itself now renders the v2 composed score**
+  (previously v1) with a coverage caveat and a details link into the
+  Detail tab — the number users see there changed meaning (#2761/#2757).
+- The Workbench's own startup gate now covers all four dev-tier files
+  (previously missed some), with a reason-string stage flag replacing a
+  `locals()` guess (#2804).
+
+### Added — Generalization edges: a new general→specific abstraction relation (epic #2753)
+
+- **A new `generalizes` edge type** connects a general claim to the specific
+  claims it abstracts, with the substrate for the edge itself (WS1, #2812),
+  rendering of generalization chains at the tripwire and surface hooks (WS2,
+  #2814), a read-only migration-proposal script to surface candidate edges
+  in existing graphs (WS3-A, #2862), and a dream-fairy scan category that
+  proposes new generalization candidates during sleep (WS3-B/C, #2865).
+  Landed incrementally across the window; check the epic for current status
+  before assuming it's fully closed out.
+
+### Added — Telemetry store: a JSONL/`records.db` mechanism for measuring hook-emitter reliability (epic #2574)
+
+- **A never-raise telemetry writer + aggregator**, so ENGRAM's own hook
+  system can be measured (did an emitter site actually fire, was its output
+  attended to?) without that measurement ever risking a hook's own
+  operation: a write-time JSONL append (WS1, #2847) with an `atexit`
+  rename-on-exit and two-mechanism drop-counting; a manifest telemetry key
+  + gate declaring which sites participate (WS2, #2846); hook-side site
+  attestation with try-narrowing and reached-tracking (WS3, #2853); a
+  consumer-side projection registry that surfaces unprojected verdict rows
+  rather than silently dropping them (WS4, #2850); and server-side emitter
+  initialization + narrow-try protection at every call site (WS5, #2854).
+  Convenience-tier internal instrumentation — no new user-facing CLI or MCP
+  surface — but a real shipped mechanism, not a design doc (#2816, #2848).
+
+### Added — Hook injection budget: every hook's context injection is now bounded (#2863)
+
+- **New shared renderer `emit_context()`** (plus a per-harness budget table)
+  replaces hand-rolled `additionalContext` construction across all hooks —
+  every SHIPPED hook injection is now bounded under a named per-harness
+  ceiling, never grows unpredictably, and carries its highest-value content
+  first, so a harness that silently truncates the tail of an oversized
+  injection cannot silently drop the important part (#2874, #2876, #2886,
+  #2887, #2888, #2889, #2892/#2893/#2898). A CI gate (the "violator gate")
+  now catches new hand-rolled injections that don't go through the shared
+  renderer, tuned to exclude non-emitter false positives (#2910) — but
+  #2863 itself stays open: the completeness-guaranteeing enforcement gate
+  (WS3) is still being hardened, so the claim above covers every hook
+  shipped so far, not a closed guarantee against a future one. A related
+  fix caps the lesson-tripwire nudge block to a self-measured character
+  ceiling (#2858/#2860), and the daemon-supervision/persist-threshold
+  ordering within the shared renderer was corrected so a must-not-miss line
+  can't be pushed past the cut (#2859/#2925).
+
+### Added — Evidence capture & write-time quality advisories
+
+- **Evidence snapshots now record an archive kind and retain the original
+  URL** even after a web/PDF page has been archived, with `evidence_type`
+  stamped at capture time (#2606 facet 1, #2634).
+- **New hard-token anchoring measurement + write-time advisory**: when an
+  observation isn't anchored by verbatim tokens from its cited source, a new
+  measurement now surfaces this as an advisory nudge at write time
+  (#2602/#2627).
+
+### Added — New operational tools
+
+- **A fairy-report extraction tool** recovers dispatched-fairy reports after
+  a session reboot, for when the dispatching session ends before reading a
+  fairy's final report (#2760/#2766).
+- **A fleet-wide per-seat supervision probe** for checking process/cgroup
+  health across a multi-seat deployment, with a follow-up fix so it gates
+  cgroup-emptiness on real content rather than a lying stat size (#2749/
+  #2758, #2790/#2822).
+
+### Changed — Baton / forum CLI (multi-agent coordination tooling)
+
+- **`baton init` now requires `--repo` or refuses** — it can no longer mint
+  a bare PR anchor with no repo attached (#1924/#2915).
+- **`cmd_flip`'s CI/approval/colleague gate now fires on any maintainer-role
+  flip**, not only the literal pool-sentinel name — closing a gap where a
+  differently-named maintainer flip bypassed the gate (#2912/#2914).
+- **`baton` gained a `set-colleague` verb** with a persisted colleague field
+  (#2764/#2771), and `cmd_flip` now refuses an unqualified PR anchor on a
+  pool-sentinel flip (#2511/#2512).
+- **Step 1 of 2 retiring the single/multi-agent mode gate — not yet
+  complete.** Step 1 shipped baton, inter-agent letters, and forum
+  unconditionally to everyone (#2857/#2864). Step 2 disposed of the
+  remaining 6-item residue — 3 dead files plus their symlink mirrors
+  deleted, 2 files reclassified into `tiers.json`'s `excluded[]` (#2929) —
+  but the gate itself is not fully retired: the `--multi-agent` build flag,
+  `is_multi_agent_mode()`, one `multi_agent: true` tier entry
+  (`tools/collab-baton-monitor.sh`), and `template.CLAUDE.multi-agent.md`
+  all still select on it. #2857 stays open until the flag itself is
+  removed.
+- **Forum thread-read header now carries the post count** (#2477/#2478).
+
+### Changed — Sleep cycle & lesson system
+
+- **Blocking `prevention_type` lessons gained a stateless override +
+  auto-demotion** — a lesson that keeps blocking without being overridden
+  eventually auto-demotes rather than blocking forever (#1944), with a
+  durable write for the read-time auto-demotion lease (#2544/#2621) and an
+  OSError-tolerant reconciliation walk that also closes a NULL-status gap
+  (#2646, #2647/#2670).
+- **Recall-summary cohort selection is uncapped for fresh items**, with
+  backfill capped at 60, changing how much gets summarized in a single sleep
+  pass (#2819).
+- Dream-lottery's cascade-count + urgency-interrupt mechanism was retired
+  now that the cascade machine's own frontier/resolve flow handles that
+  work (#2399/#2823).
+
+### Fixed — Daemon liveness & socket-guard hardening (#2652)
+
+- A cluster of reliability fixes to `start-engram-daemon.sh` and the socket
+  guard: the script is now an explicit four-state supervisor
+  (`assert-liveness-and-report`) with `ENGRAM_HOME` normalization
+  (#2700); a socket is only unlinked by the process that actually bound it,
+  never a stale guess (#2713/#2723); `_resolve_engram_home()` now returns an
+  absolute path, closing a fail-open in the socket guard under a relative
+  `ENGRAM_HOME` (#2695/#2697); `.service`/`.plist` launch templates now bind
+  their argv to the reap pattern's own `ENGRAM_HOME` scoping (#2686); a
+  socket the reap pass didn't match is no longer force-removed (#2687); the
+  liveness probe now logs which exception it caught and which branch fired,
+  instead of failing silently (#2676/#2682, #2667); and a bare `except:` in
+  the probe that was swallowing its own intentional `SystemExit(0)` is fixed
+  (#2666/#2669).
+
+### Fixed — WAL-guard data-integrity hardening
+
+- **The write-ahead-log guard now distinguishes "detection unavailable"
+  from "confirmed healthy"** — previously an unavailable check could read as
+  a clean bill of health (#2651/#2675). Forensic capture (locks + fd→inode
+  mapping) now fires on shm-displacement detection (#2635/#2653). A
+  position-based fd-scan cap that was silently dropping evidence under high
+  ambient fd counts is fixed (#2705/#2712), and `_LOCK_ROWS_LIMIT` is now
+  resolved at call time rather than at function-definition time (#2714/
+  #2747).
+
+### Fixed — Install / upgrade flow
+
+- **Untagged deploys are now refused by default**, with an `--allow-untagged`
+  escape hatch and an `alpha_tag` marker recorded on deploy (#2586/#2595);
+  the deploy-tag exception is now checked *before* the branch-name guard,
+  fixing an ordering bug that could refuse a legitimate tagged deploy
+  (#2711/#2724).
+- **`rc-upgrade-verify` now recognizes an already-migrated seat as CLEAN**
+  instead of misreporting it (#2411/#2461).
+- **A declared-but-never-copied build-manifest entry now fails the build
+  loudly** instead of silently shipping an incomplete install (#1962), and
+  subdirectory manifest entries are no longer silently dropped by the
+  manifest-driven copy loop (part of #2537).
+- Upgrade-runbook doc fixes: Step 8's interpreter-pattern matching widened
+  (it missed 3 of 5 real shapes, #2797/#2799); Step 8's `engram_stats` check
+  no longer implies it proves the server actually reconnected (#2786/#2791);
+  the hooks/tools symlink note is now install-path-dependent guidance
+  instead of a single wrong answer (#2560).
+- **A 4-state viz-server probe now runs on SessionStart** so a broken
+  dashboard is surfaced at session start instead of discovered later
+  (#2783/#2795).
+- **`Autostart` heartbeat guidance is now selected per harness** (Claude
+  Code vs. Codex, etc.) instead of one-size-fits-all (#2508/#2517).
+- `engram-nap`'s backup-health check, which was constant-FAILED regardless
+  of actual backup state, is fixed (#2680/#2729).
+
+### Fixed — Security
+
+- **Evidence-snapshot capture now enforces http/https and blocks internal
+  hosts across redirects** — an SSRF-hardening fix closing a path where a
+  redirect chain could reach an internal host the original URL check would
+  have refused (#2639, #2715/#2691).
+- The viz dashboard's seat table now escapes `a.name` in its row rendering,
+  closing an injection path via an untrusted seat name (#2751/#2802).
+
+### Fixed — Core / MCP tool behavior
+
+- **`engram_derive`'s retract path now requires `replacement_id` to name a
+  pre-created node**, retiring the old mint-inside-retraction path
+  (#2612/#2614) — a behavior change to the retract/replace flow.
+- Server now fails loud at startup when the embedding model is unavailable,
+  instead of degrading silently (part of #345, #2485).
+- **A local embedding-model directory now works when the HuggingFace Hub is
+  unreachable** (#2835). If your network blocks the Hub, the documented
+  workaround is to download the model elsewhere, put it on disk, and point
+  `embedding.model` at that directory. That did not work: the server refused
+  to start and printed a HuggingFace `HFValidationError` traceback instead of
+  the message that tells you what to fix. It now starts.
+
+  **If you use a local model directory, two things to check on upgrade:**
+
+  - Give the **absolute** path. `~` is not expanded — `~/models/my-model`
+    will still be refused. Use `/home/you/models/my-model`.
+  - The directory must contain **`modules.json`** (a sentence-transformers
+    export) or **`config.json`** (a plain transformer directory). A directory
+    with neither is refused on purpose, because starting without a usable
+    model would file nodes with no embedding at all, and those are invisible
+    to semantic recall afterwards with no way to tell.
+
+  When something is wrong, the startup message now names the directory and
+  says which of those files it looked for, instead of showing a stack trace.
+
+  Two related cases are fixed by the same change: a model name that is one of
+  the older no-organization names (e.g. `bert-base-uncased`) is no longer
+  reported as uncached when it is in fact cached, and a malformed path is
+  refused cleanly rather than by raising.
+- DAG-conformance cycle checking now resolves superseded endpoints through
+  the supersedes chain before walking for cycles, fixing a class of false
+  cycle detections (#2813/#2827).
+- PDF-quote verification errors now name the actual format gap instead of
+  accusing a correctly-quoted passage of paraphrasing (#2765/#2768).
+- `_generate_snapshot`'s "Derives from:" line now includes
+  `acknowledged_derives_from` premises, which were previously missing from
+  the rendered snapshot (#2657/#2658).
+- Session-log re-parsing in the indexer is now gated on file size rather
+  than mtime, fixing a class of missed/duplicate re-parses (#2785/#2792).
+- The health repair pass's stale `.error` sentinel check is now turn-based,
+  so a sentinel left over from a previous night no longer skips the whole
+  pass forever (4c666542, closes #2525).
+- Three per-prompt hooks' candidate-path resolution is now OSError-tolerant
+  instead of raising (#2671/#2673); the surface hook's self-anchoring gate
+  now excludes `<loop-meta>` lines (#2482/#2483); a Codex-specific bell
+  notification bug (polling the wrong stream) is fixed (#2490/#2492).
+
+### Fixed — Viz dashboard (general, non-health)
+
+- Stats tab no longer drops the connection on a cross-user WAL read
+  (#2571/#2573). `health_score` now fails honest on `ImportError` instead of
+  fabricating a `0.0` score (#2524/#2763). Frozen-header typography,
+  consolidated nav CSS, and `--access-log` flag parity between
+  `viz.server` and `viz.workbench` round out this window's dashboard
+  polish (#2555, #2767/#2769).
+
+### Docs
+
+- `engram_list`'s claim key carrying `recall_summary` is now documented
+  (#2694/#2721).
+- The Model Identity Gate section of the shipped identity template
+  (`template.CLAUDE.md`) now states its actual purpose — self-recognition,
+  not lineage hygiene — for anyone setting up a fresh agent identity
+  (#2488).
+- README now links engram-agents.org from the public-facing page (#2153).
+- CLAUDE.md now states the review-convergence rule Lei ruled on 2026-09-13:
+  reviewer-fairy APPROVE is the author's own pre-peer self-check, not a
+  re-run gate on every push; the merge gate is a non-author peer APPROVE on
+  the current tip (#2930).
+
 ## [v0.5.0] - 2026-08-30
 
 **The cascade-machine release.** One epic dominates the 100-commit range since

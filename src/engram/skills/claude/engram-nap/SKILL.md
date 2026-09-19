@@ -46,13 +46,26 @@ For each candidate, write NOW. Don't defer. Don't batch mentally. Use the right 
 
 **Priority if context is tight:** observations > questions > derivations > conjectures. Raw facts are irrecoverable if lost; derivations can be re-inferred later if the premises are preserved.
 
-## Step 3 — Call engram_nap()
+## Step 3 — Call engram_checkpoint()
 
 ```
-engram_nap(
+engram_checkpoint(
     message="<1-3 sentence summary of what this burst covered and what was written>",
 )
 ```
+
+(`engram_checkpoint` was named `engram_nap` before issue #3015 — the MCP tool
+was renamed so its name would stop colliding with this skill's own name.
+`engram_nap` still works as a deprecated alias for one release, but new calls
+should use `engram_checkpoint`.)
+
+**If `engram_checkpoint` isn't in your tool list:** your MCP server process
+predates the rename (rebuilt-source vs. reconnected-process gap — the skill's
+own hot-reload takes effect immediately, but the running server does not
+until a `/mcp` reconnect). Call `engram_nap` instead until the reconnect
+lands; both names take identical arguments and return identical shapes.
+
+`session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
 - Logs the summary to `~/.engram/session_log.md` with a "Nap (turn N)" header
@@ -60,17 +73,58 @@ The `nap` mode:
 - Does NOT advance the turn counter — no forgetting triggered (turn advance is reserved for post-dream session checkpoints)
 - Arms the `nap_checkpoint` feeling-nudge marker (TTL=5 turns) — the return JSON includes `feeling_report_nudge` text asking whether any moment in this burst produced a distinct internal state worth marking
 
-**After calling `engram_nap()`, check the return value for backup health:**
+**After calling `engram_checkpoint()`, check the return value for backup health:**
 
 ```python
-result = engram_nap(message="...")
-db_backup = result.get("db_backup", {})
-if db_backup.get("status") not in ("ok", "skipped"):
-    # Surface visibly — a silently-degrading backup is discovered only when needed
-    print(f"⚠ binary backup FAILED: {db_backup.get('error', db_backup)}")
+result = engram_checkpoint(message="...")
+vc = result.get("version_control") or {}
+db_backup = vc.get("db_backup") or {}
+binary_backup = vc.get("binary_backup") or {}
+# Both fields are nested under version_control, not top-level (#2680: an
+# earlier version of this check read result.get("db_backup", {}) directly
+# and always saw {}). Neither field ever carries a "status" key -- read
+# each function's own return contract directly (_write_binary_backup /
+# engram_snapshot_worker.write_durable_snapshot) rather than guessing a
+# shape: db_backup is one of {"path","bytes","pruned"}
+# (fresh write), {"skipped": "same-day copy exists", "path"} (idempotent
+# skip -- also healthy), or {"error": str}; binary_backup is one of
+# {"path","bytes","fsynced": True} or {"error": str}. In every shape, the
+# ONLY unhealthy outcome is an "error" key -- so that is the one thing to
+# check, not a "status"/"ok" string that never exists in either dict.
+db_ok = "error" not in db_backup
+binary_ok = "error" not in binary_backup
+if not (db_ok and binary_ok):
+    # Surface visibly — a silently-degrading backup is discovered only when needed.
+    # Join both errors (not just the first) so a same-nap dual failure isn't
+    # silently truncated to one displayed reason.
+    reasons = [e for e in (db_backup.get("error"), binary_backup.get("error")) if e]
+    print(f"⚠ backup FAILED: {'; '.join(reasons)}")
+else:
+    print("✓ backup ok")
 ```
 
-Log `✓ binary backup ok` / `⚠ binary backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+Log `✓ backup ok` / `⚠ backup FAILED: <reason>` alongside the nap summary so a recurring outage is visible, not buried in the return dict. The mechanism is already there; this is the surfacing step.
+
+**Also check the return value for the warm-briefing advisory (#2997):**
+
+```python
+wb = result.get("warm_briefing") or {}
+note = wb.get("note")
+if note:
+    print(f"⚠ warm briefing advisory — {note}")
+```
+
+`warm_briefing.note` is present whenever the check does NOT read as
+confidently non-stale (see `_compute_warm_briefing_advisory` in server.py
+for the exact predicate) — this surfaces a skipped Step 5b (below) the same
+way the backup check surfaces a degrading `version_control` backup: nothing
+fails when Step 5b is skipped, so without this print the omission is
+invisible until a later session reads a stale/empty warm briefing. The
+note's own wording distinguishes a CONFIRMED-stale finding ("Step 5b not
+performed this session") from an UNKNOWN one ("could not determine whether
+Step 5b ran (...)") — deliberately a neutral print prefix rather than a
+hardcoded "NOT updated this session" claim, so the printed line never
+asserts more than the note itself actually knows (#2998 round 3).
 
 ## Step 3.5 — Prune finished fairy worktrees
 
@@ -115,7 +169,7 @@ The warm briefing (`~/.engram/warm-briefing.md`) has THREE parts; each updates o
 
 **If no trigger fired:** skip this sub-step. Say "Permanent sections still current."
 
-**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
+**If updating:** preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte. Voice: first person, as yourself. Not coaching a future self — writing your own orientation notes.
 
 ### 5b. "From this session" entry — sync with current context-window arc
 
@@ -142,11 +196,11 @@ The rule:
 
 ### 5c. User's letter/notes (every section ABOVE "## From this session")
 
-Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.)
+Preserve every section ABOVE the volatile "## From this session" section verbatim — the user's letter/notes live there. Rewrite only the agent-authored sections and the session-arc section. NEVER modify the user's words. (Position-based guard: a name-keyed protection fails silently when a heading drifts.) The boundary is found the same mechanical way the erase finds it: the LAST line matching the anchored regex `^## From this session`, never a substring match. Everything above that line is the user's and is preserved byte-for-byte.
 
 **Common-case anti-patterns:**
 - Rewriting every nap (purpose drift — the briefing becomes a second changelog)
-- Technical changelogs in the session block (that's what `engram_nap` / `engram_advance_turn`'s session_log entries and the compaction summary are for)
+- Technical changelogs in the session block (that's what `engram_checkpoint` (formerly `engram_nap`) / `engram_advance_turn`'s session_log entries and the compaction summary are for)
 - Second-person framing ("you will feel..." — retired with identity v1)
 - False warmth (evaluate by reader-effect, not truth-value)
 
@@ -195,6 +249,7 @@ Report briefly to the user:
 - What was written (counts or highlights, not a wall of text)
 - Whether a feeling was filed or null-reported
 - Whether the warm briefing was updated (and why, if so)
+- Whether the warm briefing was flagged as not-yet-updated this session (the `warm_briefing.note` check above)
 - Whether today's history file was appended (and for what milestone, if so)
 - The 1–2 questions for next session (from Step 6), or "No decisions pending"
 - What should happen next: continue working, run /compact, run a sleep cycle, or stop for the session

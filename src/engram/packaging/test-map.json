@@ -18,9 +18,34 @@
         "tests/test_inter_agent_hook.py",
         "tests/test_forum_hook.py",
         "tests/test_tiers_manifest.py",
-        "tests/test_run_touched_tests.py"
+        "tests/test_run_touched_tests.py",
+        "tests/test_hook_injection_bounds.py",
+        "tests/test_surface_hook_injection_bounds.py",
+        "tests/test_stale_tree_pull_hook_injection_bounds.py",
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_toolcall_repair_injection_bounds.py",
+        "tests/test_deference_detector_injection_bounds.py",
+        "tests/test_forum_hook_injection_bounds.py"
       ],
-      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete."
+      "note": "gh#1657 SSoT for tools/-resolution shared by the baton/inter-agent/forum prompt hooks. Each hook dynamically imports it via a runtime sys.path insert (not a static `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping. Consumed by all three hooks as of slice 3 (baton, inter-agent, forum) -- gh#1657 complete. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it drives engram-surface-hook.py's emit_context() call end-to-end (same dynamic-load invisibility as the other consumers here). engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- it drives engram-stale-tree-pull-hook.py's emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- it drives engram-user-identity-hook.py's own emit_context() call end-to-end, same dynamic-load invisibility. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own emit_context() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they drive engram-toolcall-repair.py's and engram-deference-detector-prompt.py's own emit_context() calls end-to-end (same dynamic-load invisibility as the other consumers here). WS2 forum-hook migration: test_forum_hook_injection_bounds.py added -- same dynamic-load invisibility, driving engram-forum-prompt-hook.py's own emit_context() call end-to-end."
+    },
+    {
+      "path_prefix_or_glob": "hooks/claude/_harness.py",
+      "test_globs": [
+        "tests/test_hook_injection_bounds.py",
+        "tests/test_tiers_manifest.py",
+        "tests/test_run_touched_tests.py",
+        "tests/test_surface_hook_injection_bounds.py",
+        "tests/test_stale_tree_pull_hook_injection_bounds.py",
+        "tests/test_user_identity_hook_injection_bounds.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_toolcall_repair_injection_bounds.py",
+        "tests/test_deference_detector_injection_bounds.py",
+        "tests/test_forum_hook_injection_bounds.py",
+        "tests/test_forum_hook.py"
+      ],
+      "note": "engram-alpha#2863 WS1 -- per-harness budget/floor table for the bounded hook-injection helper (_hooklib.emit_context()). Loaded by tests via importlib.util.spec_from_file_location (same dynamic-load convention as _hooklib.py above, mirrored here since this is the same pattern of a module a hook would import via a runtime sys.path insert, not a static top-level `import` statement), so it is invisible to the layer-1 AST import-graph and needs this layer-2 convention mapping, same _hooklib.py precedent above. engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- it exercises get_harness_budgets()/detect_harness() via engram-surface-hook.py's own call site. engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- same reasoning, via engram-stale-tree-pull-hook.py's call site. engram-alpha#2863 WS2 batch A: test_user_identity_hook_injection_bounds.py added -- exercises get_harness_budgets()/detect_harness() via engram-user-identity-hook.py's own call site. engram-alpha#2863 WS2 (lesson-tripwire fold): test_lesson_tripwire_injection_bounds.py added -- same reasoning, for engram-lesson-tripwire-hook.py's own detect_harness()/get_harness_budgets() call site. engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py and test_deference_detector_injection_bounds.py added -- they exercise get_harness_budgets()/detect_harness() via those two hooks' own call sites. WS2 forum-hook migration: test_forum_hook_injection_bounds.py added (same reasoning, forum hook's own call site); test_forum_hook.py added because its test_tools_resolution_in_flattened_deployed_topology recreates the deployed flattened layout and now needs _harness.py present as a sibling for the forum hook's unconditional import to resolve."
     },
     {
       "path_prefix_or_glob": "hooks/claude/_prompthooklib.py",
@@ -30,6 +55,7 @@
         "tests/test_inter_agent_hook.py",
         "tests/test_forum_hook.py",
         "tests/test_forum_hook_publish.py",
+        "tests/test_forum_hook_injection_bounds.py",
         "tests/test_tiers_manifest.py",
         "tests/test_run_touched_tests.py"
       ],
@@ -84,8 +110,10 @@
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-prompt.py",
       "test_globs": [
         "tests/test_deference_detector_scope_gate.py",
-        "tests/test_engine_unit.py"
-      ]
+        "tests/test_engine_unit.py",
+        "tests/test_deference_detector_injection_bounds.py"
+      ],
+      "note": "engram-alpha#2863 WS2 batch C: test_deference_detector_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end via importlib.util.spec_from_file_location (hyphenated filename, invisible to the layer-1 AST import graph, same reasoning as test_deference_detector_prompt.py's own existing pattern for this hook)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-deference-detector-stop.py",
@@ -105,6 +133,7 @@
       "path_prefix_or_glob": "hooks/claude/engram-forum-prompt-hook.py",
       "test_globs": [
         "tests/test_forum_hook.py",
+        "tests/test_forum_hook_injection_bounds.py",
         "tests/test_engine_phase3.py",
         "tests/test_tiers_manifest.py"
       ]
@@ -125,9 +154,11 @@
       "test_globs": [
         "tests/test_lesson_tripwire.py",
         "tests/test_in_turn_recall.py",
-        "tests/test_principle_triggers_registry.py"
+        "tests/test_principle_triggers_registry.py",
+        "tests/test_lesson_tripwire_injection_bounds.py",
+        "tests/test_resolve_runtime_dir_plugin.py"
       ],
-      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
+      "note": "PreToolUse hook that surfaces lesson tripwires on Bash and MCP tool calls (issues #1203 + #1297). test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §6) already documented covering this hook's PreToolUse _QUERY broadening, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 (lesson-tripwire fold onto _hooklib.emit_context()): test_lesson_tripwire_injection_bounds.py added (bound/head/ordering coverage for the new emit_context() call site). test_resolve_runtime_dir_plugin.py added too -- it dynamically loads this hook file's own no-argument _resolve_runtime_dir (a different helper from the shared _hooklib one) via importlib against a synthetic worktree-nested copy, and this migration added a second module-scope dependency (`_harness`) that fixture now has to satisfy alongside the pre-existing `_hooklib` one."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-postcompact-hook.py",
@@ -158,9 +189,10 @@
       "test_globs": [
         "tests/test_stale_tree_hooks.py",
         "tests/test_build_plugin_hooks_consistency.py",
-        "tests/test_hooks_json_stdout_audit.py"
+        "tests/test_hooks_json_stdout_audit.py",
+        "tests/test_stale_tree_pull_hook_injection_bounds.py"
       ],
-      "note": "#1203 stale-tree tripwire, Layer 1 (SessionStart auto-pull, PREVENTION). Tests it dynamically via importlib.util (hyphenated filename, not a static import), so invisible to the layer-1 AST import graph -- needs this layer-2 mapping, same pattern as the other hyphenated hook files above."
+      "note": "#1203 stale-tree tripwire, Layer 1 (SessionStart auto-pull, PREVENTION). Tests it dynamically via importlib.util (hyphenated filename, not a static import), so invisible to the layer-1 AST import graph -- needs this layer-2 mapping, same pattern as the other hyphenated hook files above. engram-alpha#2863 WS2 batch B: test_stale_tree_pull_hook_injection_bounds.py added -- exercises this hook's post-migration emit_context() call end-to-end (main()'s warnings/successes split + _assemble_response())."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-stale-tree-warn-hook.py",
@@ -199,9 +231,10 @@
         "tests/test_tier_build_filter.py",
         "tests/test_tiers_manifest.py",
         "tests/test_recall_injection_budget.py",
-        "tests/test_principle_triggers_registry.py"
+        "tests/test_principle_triggers_registry.py",
+        "tests/test_surface_hook_injection_bounds.py"
       ],
-      "note": "test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §5) already documented covering this hook's unified check_principle_triggers consumer, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap)."
+      "note": "test_principle_triggers_registry.py added #1731 -- its own docstring (Coverage §5) already documented covering this hook's unified check_principle_triggers consumer, but it was missing from this glob (found while fixing #1731, same completeness-gap class as this morning's tools/perf/*.py <-> test_in_turn_recall.py gap). engram-alpha#2863 WS2 review round 1: test_surface_hook_injection_bounds.py added -- reviewer-fairy found it exercises this hook's main() end-to-end but was invisible to run_touched_tests.py's selection (dynamic importlib load, same reasoning as the other entries here)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-time-bar-hook.py",
@@ -214,15 +247,18 @@
     {
       "path_prefix_or_glob": "hooks/claude/engram-toolcall-repair.py",
       "test_globs": [
-        "tests/test_add_observation_payload.py"
+        "tests/test_add_observation_payload.py",
+        "tests/test_toolcall_repair_injection_bounds.py"
       ],
-      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path)"
+      "note": "toolcall-repair is exercised in test_add_observation_payload (antml repair path). engram-alpha#2863 WS2 batch C: test_toolcall_repair_injection_bounds.py added -- drives this hook's new emit_context() migration end-to-end (same dynamic-load invisibility as this file's existing entry)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-user-identity-hook.py",
       "test_globs": [
-        "tests/test_codex_hook_envelopes.py"
-      ]
+        "tests/test_codex_hook_envelopes.py",
+        "tests/test_user_identity_hook_injection_bounds.py"
+      ],
+      "note": "engram-alpha#2863 WS2 batch A: migrated onto _hooklib.emit_context(); test_user_identity_hook_injection_bounds.py added as this hook's own injection-bounds gate (worst-case oversized Role/Profile metadata, common-case sanity, nothing-fires)."
     },
     {
       "path_prefix_or_glob": "hooks/claude/engram-utility-credit-mention-stop.py",
@@ -257,6 +293,14 @@
         "tests/test_baton_autopull.py",
         "tests/test_baton_hook.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/baton_gate.py",
+      "test_globs": [
+        "tests/test_baton_gate.py",
+        "tests/test_baton.py"
+      ],
+      "note": "#2884 (second half): CI-green / post-approval-freshness / colleague-approval gate helpers shared between tools/baton.py's cmd_flip and src/forum/server.py's api_project_flip. tests/test_baton_gate.py covers the module directly (including the TestSentinelPredicateParity anti-drift check); tests/test_baton.py exercises _parse_github_anchor/_pr_ci_state/_pr_approval_state/_dedupe_checks_by_latest indirectly via tools/baton.py's own import of them. The server-side endpoint tests live in src/forum/tests/test_projects_api.py, outside this test-map's src/engram-scoped surface."
     },
     {
       "path_prefix_or_glob": "tools/check-claude-md-drift.py",
@@ -382,10 +426,31 @@
       "note": "The checker reports an ABSENCE (no bash-4-only constructs in shipped shell scripts), and an absence-reporting tool is trustworthy only if its detector demonstrably fires on a positive. The mapped suite therefore weights the detector's falsifiability — every pattern matches a known-positive AND rejects the portable bash-3.2 equivalent — over its plumbing. The hyphenated filename means it is loaded by path, not imported, so it has no import-graph edge and would otherwise be layer-1-unreachable."
     },
     {
+      "path_prefix_or_glob": "tools/telemetry_manifest_gate.py",
+      "test_globs": [
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "The §4a telemetry-manifest gate (engram-alpha#2574 WS2): AST-extracts the declared/emitted site-id sets and the backward call-graph walk deriving each site's dispatch-target set, plus the dynamic-dispatch static scan. Mapped to test_tiers_manifest.py, which carries this module's own tests (participation/static test, manifest-key-required test, and the dynamic-dispatch discriminating control) alongside the pre-existing tag-once manifest gate tests. The real module lives at src/engram/tools/telemetry_manifest_gate.py; this path is the dual-copy symlink per #2782's convention, so it has no import-graph edge of its own and would otherwise be layer-1-unreachable, same shape as tools/os-harness-check.py above."
+    },
+    {
       "path_prefix_or_glob": "tools/release-cutover.py",
       "test_globs": [
         "tests/test_release_cutover.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "tools/reconcile_lesson_demotions.py",
+      "test_globs": [
+        "tests/test_reconcile_lesson_demotions.py"
+      ],
+      "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
+    },
+    {
+      "path_prefix_or_glob": "tools/grant_viz_operator_acl.py",
+      "test_globs": [
+        "tests/test_grant_viz_operator_acl.py"
+      ],
+      "note": "engram-alpha#2720. test_grant_viz_operator_acl.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as tools/reconcile_lesson_demotions.py's own mapping above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
       "path_prefix_or_glob": "tools/worktree-gc.py",
@@ -429,11 +494,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/collab-letter-monitor.sh",
-      "full_suite_fallback": true,
-      "note": "No test file found for collab-letter-monitor.sh"
-    },
-    {
       "path_prefix_or_glob": "tools/collab-baton-monitor.sh",
       "test_globs": [
         "tests/test_baton_monitor.py"
@@ -461,6 +521,26 @@
       "test_globs": [
         "tests/test_codex_umwelt_wake.py"
       ]
+    },
+    {
+      "path_prefix_or_glob": "deploy/autostart/",
+      "test_globs": [
+        "tests/test_agent_session_run.py",
+        "tests/test_boot_charge_template_glob.py",
+        "tests/test_pgrep_liveness_reap_patterns.py",
+        "tests/test_tool_policy_sync.py"
+      ],
+      "note": "Autostart charge composition is selected at runtime after platform detection; these subprocess and source-template tests pin its harness separation and Claude monitor safety text."
+    },
+    {
+      "path_prefix_or_glob": "skills/claude/engram-loop/SKILL.md",
+      "test_globs": [
+        "tests/test_loop_skill_harness_selection.py",
+        "tests/test_skill_frontmatter_lint.py",
+        "tests/test_skill_server_sync.py",
+        "tests/test_tiers_manifest.py"
+      ],
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
@@ -521,6 +601,27 @@
         "tests/test_verify_quote_exit_codes.py"
       ],
       "note": "exit-code contract (#1990); subprocess-tested against the real entrypoint"
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_engine.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: the ordering regression only manifests across a pytest session shared with a fresh_server()-clearing sibling file (test_health_engine_checkpoint_wiring.py, test_health_series_hook.py) -- layer-1's static import graph can't see that cross-file interaction since the regression test itself only subprocess-invokes pytest, it doesn't statically import health.engine. A change to this file (e.g. narrowing _resync_health_modules_before_reload) needs the ordering regression re-run, not just this file's own direct tests."
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_engine_checkpoint_wiring.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: same reasoning as the test_health_engine.py entry above -- this file's fresh_server() is the OTHER half of the cross-file ordering interaction the regression test pins."
+    },
+    {
+      "path_prefix_or_glob": "tests/test_health_series_hook.py",
+      "test_globs": [
+        "tests/test_health_engine_fresh_server_order.py"
+      ],
+      "note": "engram-alpha#2609: carries the identical health.* sys.modules-clearing fresh_server() pattern as test_health_engine_checkpoint_wiring.py -- the same ordering regression class applies to this file too."
     }
   ],
   "unmapped": [
@@ -535,10 +636,6 @@
     {
       "path": "tools/_common.py",
       "reason": "Internal helper with no dedicated test file; tested indirectly through tools that use it"
-    },
-    {
-      "path": "tools/_session_context.py",
-      "reason": "Internal session context helper with no dedicated test file"
     },
     {
       "path": "tools/antml_repair_baseline.py",
@@ -581,10 +678,6 @@
       "reason": "No dedicated test file found"
     },
     {
-      "path": "tools/session.py",
-      "reason": "No dedicated test file found"
-    },
-    {
       "path": "tools/write_sleep_marker.py",
       "reason": "No dedicated test file found"
     },
@@ -595,6 +688,10 @@
     {
       "path": "tools/pre-dispatch-check.sh",
       "reason": "Shell pre-dispatch guard; no dedicated test file. Tested manually as part of the dispatch workflow."
+    },
+    {
+      "path": "tools/coverage-diff.sh",
+      "reason": "Local diff-coverage helper (#2774); no dedicated test file. Verified manually: run against a real branch diff, output inspected by hand (see PR body)."
     },
     {
       "path": "tools/uninstall-local-marketplace.sh",
@@ -611,6 +708,7 @@
   ],
   "server_import_allowlist": [
     "test_engram_core_seam.py",
-    "test_inductive_enumeration_and_timing.py"
+    "test_inductive_enumeration_and_timing.py",
+    "test_ws5_telemetry_protection.py"
   ]
 }

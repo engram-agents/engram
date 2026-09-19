@@ -6,10 +6,21 @@
     <key>Label</key>
     <string>com.engram.surface-daemon</string>
 
+    <!-- #2652 phase-0 unit 3: the trailing ENGRAM_HOME argv is unused by
+         the script itself (ENGRAM_HOME is still resolved from
+         EnvironmentVariables below); it exists solely so
+         start-engram-daemon.sh's `pgrep -f`-based reap pattern
+         (end-anchored on ENGRAM_HOME) can see and scope on it.
+         EnvironmentVariables is an env var, invisible to `pgrep -f` (it
+         matches argv/cmdline only), so without this trailing argv a
+         daemon launched by this LaunchAgent was un-reapable by that
+         pattern. Mirrors start-engram-daemon.sh's own launch line's argv
+         shape exactly. -->
     <key>ProgramArguments</key>
     <array>
         <string>{{PYTHON}}</string>
         <string>{{ENGRAM_HOOKS_DIR}}/engram-surface-daemon.py</string>
+        <string>{{ENGRAM_HOME}}</string>
     </array>
 
     <key>EnvironmentVariables</key>

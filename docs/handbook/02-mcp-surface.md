@@ -135,7 +135,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: test_cascade_semantics.py, test_cascade_derived_sets.py
 
 **9. engram_retract** — Mark claim as erroneous.
-- **contract**: `{node_id, error_type, reason, [replacement_json]}`
+- **contract**: `{node_id, error_type, reason, [replacement_id]}`
 - **guards**: taint-cascade to derivation dependents; contradiction nodes touching retracted node also flagged tainted; retraction is permanent (no undo)
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED
@@ -328,7 +328,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 ### Metadata & Cleanup
 
 **42. engram_set_recall_summaries** — Batch-write recall_summary + keywords.
-- **contract**: `{summaries: [{node_id, recall_summary, recall_keywords}, ...]}` (nested-encoding); per-entry validation: summary ≤200 chars (target ≤120), keywords 3–5 items ≤30 chars each
+- **contract**: EXACTLY ONE of `{summaries: [{node_id, recall_summary, recall_keywords}, ...]}` (nested-encoding, inline) or `{summaries_file: "<absolute path>"}` (reads + parses a JSON file of the same shape — for large batches; relative path rejected); per-entry validation: summary ≤200 chars (target ≤120), keywords 3–5 items ≤30 chars each; file-path calls echo back `summaries_file` in the response
 - **guards**: best-effort batch (valid entries applied, per-item errors, no rollback); idempotent
 - **readOnlyHint**: False
 - **status-candidate**: PROD-VERIFIED (sleep-cycle cohort writes + backfill)
@@ -336,7 +336,11 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 
 ### Lifecycle — Nap & Turn Advance
 
-**43. engram_nap** — Pre-compaction checkpoint (no turn advance).
+**43. engram_checkpoint** (formerly `engram_nap`, renamed in issue #3015 — `engram_nap` is
+now a separate deprecated-alias tool, kept for one release; this bumps the
+doc's "Total tool count" / entry-numbering below by one tool, not yet
+re-derived here — see the "Verify, don't trust the number above" note) —
+Pre-compaction checkpoint (no turn advance).
 - **contract**: `{message}`
 - **guards**: arms nap_checkpoint feeling-nudge marker; persists context without advancing turn counter
 - **readOnlyHint**: False

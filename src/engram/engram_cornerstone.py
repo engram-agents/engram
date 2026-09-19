@@ -40,6 +40,7 @@ def _add_cornerstone_impl(
     prior_frame: str = "",
     triggering_experience: str = "",
     supporting_ids: str = "",
+    generalized_by: str = "",
 ) -> str:
     """Internal implementation — see engram_add_cornerstone MCP tool for the
     public payload schema. Kept callable with named kwargs for in-server callers.
@@ -81,9 +82,23 @@ def _add_cornerstone_impl(
         supporting_ids: Comma-separated IDs of supporting nodes (feeling
                         reports, observations, derivations, prior cornerstones).
                         Creates `supported_by` edges from cornerstone → supporting.
+        generalized_by: Comma-separated IDs of principle nodes that
+                        generalize this cornerstone (#2753 epic WS1, D4).
+                        Must be current nodes of type cornerstone, axiom, or
+                        goal (a cornerstone->cornerstone,
+                        axiom->cornerstone, or goal->cornerstone pair — see
+                        GENERALIZES_ALLOWED_PAIRS). Writes
+                        `<parent> generalizes <new cornerstone>` edges at
+                        mint time, cycle-guarded. Strict: an invalid parent
+                        (missing, non-current, or wrong-type pair) refuses
+                        the whole call before anything is created —
+                        `generalizes` establishes structural taxonomy, so
+                        unlike `supporting_ids` this is not a best-effort
+                        skip-and-report field.
 
     Returns:
-        JSON with the new cornerstone node ID and linked supporting nodes.
+        JSON with the new cornerstone node ID, linked supporting nodes, and
+        (if generalized_by was given) the generalizing parent nodes.
     """
     if not tag or not tag.strip():
         return json.dumps({"error": "tag is required and cannot be empty."})
@@ -94,6 +109,48 @@ def _add_cornerstone_impl(
 
     conn = core._get_db()
     try:
+        # `generalized_by` validation (#2753 epic WS1, D4) — STRICT,
+        # fail-before-insert: unlike `supporting_ids` below (best-effort
+        # skip-and-report), a `generalizes` parent establishes structural
+        # taxonomy, and a mechanically-enforced endpoint gate already exists
+        # everywhere else this relation is written (_add_edge_impl) —
+        # silently skipping an invalid parent here would leave a
+        # cornerstone dangling out of its intended abstraction hierarchy
+        # with no signal that happened.
+        generalized_by_ids = list(dict.fromkeys(
+            s.strip() for s in core._as_csv(generalized_by).split(",") if s.strip()
+        ))
+        for pid in generalized_by_ids:
+            prow = conn.execute(
+                "SELECT id, type, is_current FROM nodes WHERE id = ?", (pid,)
+            ).fetchone()
+            if not prow:
+                return json.dumps({
+                    "error": f"generalized_by parent '{pid}' not found."
+                })
+            if not prow["is_current"]:
+                return json.dumps({
+                    "error": (
+                        f"generalized_by parent '{pid}' is not current "
+                        f"(retracted or superseded). Use "
+                        f"engram_inspect('{pid}') to find the current "
+                        f"successor."
+                    )
+                })
+            pair = (prow["type"], "cornerstone")
+            if pair not in core.GENERALIZES_ALLOWED_PAIRS:
+                allowed_sources = sorted(
+                    t for t, tgt in core.GENERALIZES_ALLOWED_PAIRS if tgt == "cornerstone"
+                )
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' does not accept a "
+                        f"{prow['type']} -> cornerstone pair (parent "
+                        f"'{pid}'). Allowed source types for a cornerstone "
+                        f"target: {allowed_sources}."
+                    )
+                })
+
         node_id = core._next_id(conn, "cornerstone")
         now = core._now()
 
@@ -132,6 +189,31 @@ def _add_cornerstone_impl(
                     linked.append(sid)
                 except sqlite3.IntegrityError:
                     pass
+
+        # `generalized_by` edge writes (#2753 epic WS1, D4): `<parent>
+        # generalizes <new cornerstone>`, cycle-guarded. Structurally
+        # unreachable for a brand-new node (it carries no prior generalizes
+        # edges of its own), but checked anyway — every `generalizes`
+        # write path goes through the same guard (core._generalizes_cycle_path),
+        # so the invariant is uniform and grep-able rather than "trust the
+        # caller can't construct a cycle here."
+        generalizing_parents = []
+        for pid in generalized_by_ids:
+            cycle_path = core._generalizes_cycle_path(conn, pid, node_id)
+            if cycle_path is not None:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' edge {pid} -> {node_id} would "
+                        f"close a cycle among live `generalizes` edges: "
+                        f"{' -> '.join(cycle_path)}. Refused — see #2753 "
+                        f"epic D1 (write-time cycle guard)."
+                    )
+                })
+            conn.execute(
+                "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'generalizes', ?)",
+                (pid, node_id, now),
+            )
+            generalizing_parents.append(pid)
 
         # Cornerstones are importance-anchored at a fixed value (2.0) rather
         # than derived from confidence/surprise — identity structures are as
@@ -190,6 +272,8 @@ def _add_cornerstone_impl(
         }
         if non_current:
             result["non_current_supporting_ids"] = non_current
+        if generalizing_parents:
+            result["generalized_by"] = generalizing_parents
         return json.dumps(result)
     finally:
         conn.close()
@@ -234,6 +318,13 @@ def _outgrow_cornerstone_impl(
                             cornerstones). Added on top of inherited supports.
         new_title: Optional new title. If empty, reuses the predecessor's title.
                    Tag is always inherited (outgrowth stays on the same axis).
+
+    Also carries the predecessor's `generalizes` edges to the successor
+    (#2753 epic WS1, item 10): both directions — nodes that generalize the
+    predecessor now also generalize the successor, and nodes the
+    predecessor generalizes are now generalized by the successor. The
+    predecessor's own edges are left intact (same "add a copy, don't
+    delete the old" convention as supported_by/about above).
 
     Returns:
         JSON with old + new cornerstone IDs and the rolled frame shape.
@@ -296,6 +387,27 @@ def _outgrow_cornerstone_impl(
         inherited_support_ids = [r["target_id"] for r in inherited_supports]
         inherited_about_ids = [r["target_id"] for r in inherited_about]
 
+        # Carry the predecessor's `generalizes` edges to the successor
+        # (#2753 epic WS1, item 10): the successor occupies the
+        # predecessor's SAME position in the generalization hierarchy —
+        # both directions. Nodes that generalize `old_cornerstone_id`
+        # (its parents — "old is generalized BY these") now also
+        # generalize `new_id`; nodes `old_cornerstone_id` itself
+        # generalizes (its children) are now generalized BY `new_id`.
+        # Historical edges on the predecessor are left intact (same
+        # convention as supported_by/about above — this ADDS copies on the
+        # new node, it does not delete the old node's edges).
+        inherited_generalizes_parents = conn.execute(
+            "SELECT source_id FROM edges WHERE target_id = ? AND relation = 'generalizes'",
+            (old_cornerstone_id,),
+        ).fetchall()
+        inherited_generalizes_children = conn.execute(
+            "SELECT target_id FROM edges WHERE source_id = ? AND relation = 'generalizes'",
+            (old_cornerstone_id,),
+        ).fetchall()
+        inherited_generalizes_parent_ids = [r["source_id"] for r in inherited_generalizes_parents]
+        inherited_generalizes_child_ids = [r["target_id"] for r in inherited_generalizes_children]
+
         extra_support_ids = [s.strip() for s in core._as_csv(new_supporting_ids).split(",") if s.strip()]
         all_support_ids = list(dict.fromkeys(inherited_support_ids + extra_support_ids))
 
@@ -340,6 +452,52 @@ def _outgrow_cornerstone_impl(
                     (new_id, pid, now),
                 )
                 linked_abouts.append(pid)
+            except sqlite3.IntegrityError:
+                pass
+
+        # Write the carried `generalizes` edges (both directions). Cycle
+        # guard called on every write for the same uniformity reason as
+        # engram_add_cornerstone's generalized_by loop — provably
+        # unreachable here too (new_id is a brand-new node with no prior
+        # generalizes edges of its own, and the copies are isomorphic to
+        # the predecessor's already-acyclic ones), but checked anyway.
+        linked_generalizes_parents = []
+        for pid in inherited_generalizes_parent_ids:
+            cycle_path = core._generalizes_cycle_path(conn, pid, new_id)
+            if cycle_path is not None:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' edge {pid} -> {new_id} (carried "
+                        f"from predecessor '{old_cornerstone_id}') would "
+                        f"close a cycle: {' -> '.join(cycle_path)}. Refused."
+                    )
+                })
+            try:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'generalizes', ?)",
+                    (pid, new_id, now),
+                )
+                linked_generalizes_parents.append(pid)
+            except sqlite3.IntegrityError:
+                pass
+
+        linked_generalizes_children = []
+        for cid in inherited_generalizes_child_ids:
+            cycle_path = core._generalizes_cycle_path(conn, new_id, cid)
+            if cycle_path is not None:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' edge {new_id} -> {cid} (carried "
+                        f"from predecessor '{old_cornerstone_id}') would "
+                        f"close a cycle: {' -> '.join(cycle_path)}. Refused."
+                    )
+                })
+            try:
+                conn.execute(
+                    "INSERT INTO edges (source_id, target_id, relation, created_at) VALUES (?, ?, 'generalizes', ?)",
+                    (new_id, cid, now),
+                )
+                linked_generalizes_children.append(cid)
             except sqlite3.IntegrityError:
                 pass
 
@@ -421,6 +579,8 @@ def _outgrow_cornerstone_impl(
             "supporting_nodes_linked": linked_supports,
             "missing_supporting_ids": missing_supports,
             "preserved_about_edges": linked_abouts,
+            "preserved_generalizes_parents": linked_generalizes_parents,
+            "preserved_generalizes_children": linked_generalizes_children,
             **({"non_current_supporting_ids": non_current_supports} if non_current_supports else {}),
             **({"non_current_about_ids": non_current_about_ids} if non_current_about_ids else {}),
             **({"missing_about_ids": missing_about_ids} if missing_about_ids else {}),
@@ -781,6 +941,37 @@ def _add_edge_impl(
                     )
                 })
 
+        # `generalizes` boundary gates (#2753 epic, WS1, D1): endpoint-pair
+        # gate + write-time cycle guard, mechanically enforced here — not
+        # just documented — same discipline as the `instantiates` gate
+        # above (#530).
+        if relation == "generalizes":
+            pair = (source["type"], target["type"])
+            if pair not in core.GENERALIZES_ALLOWED_PAIRS:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' does not accept a "
+                        f"{source['type']} -> {target['type']} pair. "
+                        f"Allowed: {sorted(core.GENERALIZES_ALLOWED_PAIRS)}. "
+                        f"Concrete nodes keep `exemplifies` (incident -> "
+                        f"lesson) / `instantiates` (claim -> principle) — "
+                        f"`generalizes` is reserved for principle -> "
+                        f"principle abstraction (source '{source_id}' is "
+                        f"type '{source['type']}', target '{target_id}' is "
+                        f"type '{target['type']}')."
+                    )
+                })
+            cycle_path = core._generalizes_cycle_path(conn, source_id, target_id)
+            if cycle_path is not None:
+                return json.dumps({
+                    "error": (
+                        f"'generalizes' edge {source_id} -> {target_id} "
+                        f"would close a cycle among live `generalizes` "
+                        f"edges: {' -> '.join(cycle_path)}. Refused — see "
+                        f"#2753 epic D1 (write-time cycle guard)."
+                    )
+                })
+
         # Temporal-causal guard (#2357 renamed dag_check -> temporal_causal;
         # semantics unchanged): among addable-after-creation relations, only
         # `subtask_of` has temporal_causal=True today. `serves` and `tensions`
@@ -791,14 +982,18 @@ def _add_edge_impl(
         # a violation is source.created_at < target.created_at — i.e. the source
         # is OLDER than the target. Valid edges have source newer-or-equal.
         #
-        # TODO(#2349): a `dag: True` relation also needs a real reachability
-        # check here (would this edge close a cycle?), independent of the
-        # temporal check above. No addable-after-creation relation carries
-        # dag=True and temporal_causal=False today (acknowledged_derives_from,
-        # the one relation where they diverge, is never addable via this
-        # generic tool — see its EDGE_CLASSIFICATIONS entry), so there is no
-        # live gap yet. Wire in once #2349's reachability walker merges to
-        # dev; do not duplicate it here in the meantime (#2357 design thread).
+        # UPDATE (#2753 epic, WS1): the gap this TODO named is now live.
+        # `generalizes` is the first addable-after-creation relation with
+        # dag=True and temporal_causal=False (acknowledged_derives_from has
+        # the same profile but is never addable via this generic tool — see
+        # its EDGE_CLASSIFICATIONS entry). Its real reachability check is
+        # the `generalizes`-specific cycle guard ABOVE
+        # (`core._generalizes_cycle_path`) — deliberately scoped to the
+        # `generalizes` relation only, not a general `dag: True`
+        # reachability check for every relation reaching this generic tool
+        # (see that helper's docstring for why). A future second
+        # dag=True/temporal_causal=False addable relation would need its
+        # own equivalent guard here, following this one's shape.
         classification = core.EDGE_CLASSIFICATIONS.get(relation, {})
         if classification.get("temporal_causal", False):
             if source["created_at"] < target["created_at"]:

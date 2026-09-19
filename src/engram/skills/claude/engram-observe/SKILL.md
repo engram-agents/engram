@@ -74,6 +74,22 @@ For web pages: fetch the page first (WebFetch / curl), save to a file, then
 content-hash-pinned and verbatim-checkable even if the original source
 changes or disappears later.
 
+If you pass `original_url` (the pre-archive source URL/path `engram-snapshot`
+resolved) when filing the observation, know what it is for: traceability
+only. It is **not** a re-fetch pointer — nothing in ENGRAM reads it back to
+refetch the source. Treat the archived evidence as the permanent record and
+re-snapshot manually if the live source changes; don't assume `original_url`
+keeps the evidence current on its own.
+
+**PDFs are the one source shape where a quote can never verify against the
+raw file.** `engram-snapshot`'s `pdf:<url>`/`file:<path.pdf>` archives raw
+PDF bytes; a quote copied from the document's *extracted text* is never a
+substring of those bytes, so the verbatim-quote check always fails —
+correctly, since it genuinely cannot read a PDF, not because the quote is
+wrong. Extract to text first (`pdftotext <f> <f>.txt`), then
+`engram-snapshot file:<f>.txt` and cite the `.txt` archive — that quote can
+verify. (#2765)
+
 **Citing the current session directly (no snapshot needed for the simple
 case)**: pass your injected `session_id`. A wrong or stale `session_id`
 fails loud via the same server-side verbatim-quote check used by every other
@@ -253,6 +269,12 @@ Filing compound episode nodes is not free just because it's licensed:
   detail by compressing it further or spends a disproportionate share of the
   summary budget on one node.
 
+**Why lossy compression is correct.** `recall_summary` is recall-scent, not
+content preservation — the full claim renders on inspect, so compressing it
+lossily into ≤140 chars is the intended trade, not a defect. For a
+multi-fact claim, name the load-bearing fact, or consider filing separate
+observations instead.
+
 Lazy atomization is the mitigation, not a fix that makes the cost disappear:
 once a clause is pulled out and reused, the extract gets clean dedup/summary
 behavior going forward, but the original compound node still carries the
@@ -277,3 +299,18 @@ cost for any of its other clauses that stay unextracted.
   by the episodic license — that license covers ONE event or experience, not
   a batch of otherwise-independent claims that happened to arrive together.
   If it's several unrelated pieces of knowledge, they're several nodes.
+
+## 6. Response keys that carry their own remedy
+
+Two keys come back on every `engram_add_observation` response and need nothing from you at call
+time — which is why they are documented here and not in the tool description:
+
+- **`anchoring_advisory`** — measures how many of the claim's hard facts (node ids, issue/PR refs,
+  hex shas, 3+-digit numbers, dates/times) are literal substrings of `quoted_text`. When
+  `quote_type=hard_data` has unanchored tokens the response itself sets a `hint` telling you to
+  widen the quote, move the fact to `interpretation`, or downgrade the quote type. Advisory only —
+  it never refuses a write or changes a confidence. This is advisory-only **until #2602 facet 3**;
+  facet 3 (the refusal behavior) is still out of scope for what's shipped today, so treat this as
+  conditional rather than a permanent guarantee.
+- **`predictive_hint`** — appears when `predicted_event`/`resolution_timeframe` were passed without
+  `is_predictive`. Advisory only; suppressed whenever `is_predictive` is true.

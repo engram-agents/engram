@@ -1,0 +1,22 @@
+{
+  "badness_default": {
+    "knots": [[0.0, 1.0], [1.0, 0.0]],
+    "monotone_direction": "decreasing",
+    "provenance": "placeholder — Lei 2026-09-09: identity / 1-x until final shapes"
+  },
+  "goodness_default": {
+    "knots": [[0.0, 0.0], [1.0, 1.0]],
+    "monotone_direction": "increasing",
+    "provenance": "placeholder — Lei 2026-09-09: identity / 1-x until final shapes"
+  },
+  "badness_pending_premise": {
+    "knots": [[0.0, 1.0], [0.01, 0.9], [0.05, 0.8], [0.2, 0.5], [0.5, 0.2], [1.0, 0.0]],
+    "monotone_direction": "decreasing",
+    "provenance": "Lei 2026-09-13: ratio of premises not available for derivation (any pending cascade marker / ALL current claim-bearing nodes — read the knots against that denominator, not against derivations only; only derivations/theories/conjectures can carry markers, so the reachable range tops out near the derivation share of the graph — e.g. ~0.22 on a 5953-node graph with 1283 derivations). Steep first 1% = first onset; (0.5,0.2) = derivation effectively blocked (an anchor, not a reachable point on most graphs). Histories: kepler/sol/ariadne 0; borges had a real 2026-08-30 event (131 markers → 14 plateau six days → 0) — first calibration point for v2."
+  },
+  "goodness_coverage": {
+    "knots": [[0.0, 0.0], [0.5, 0.05], [0.75, 0.2], [0.95, 0.6], [0.99, 0.9], [1.0, 1.0]],
+    "monotone_direction": "increasing",
+    "provenance": "Lei 2026-09-13 for embedding_coverage (100% is the norm; near-zero below 50% = mechanism broken; steep near full so backfill is rewarded). Kepler proposes the SAME curve for recall_summary_coverage and recall_keywords_coverage with lower importance (1.0 / 0.5 / 0.25)."
+  }
+}

@@ -1,5 +1,12 @@
 # Session Context Schema (v0.1)
 
+> **STATUS: retired design, historical record only.** This schema describes
+> the v0 "Channel Dispatcher" hot-seat architecture, which README.md §7/§9
+> already documents as retired. Its tooling, `tools/session.py` and
+> `tools/_session_context.py`, was deleted as dead code in #2857 step 2
+> (zero importers repo-wide, confirmed by Ariadne's residue read on the
+> issue) — do not treat the CLI described below as present in the repo.
+
 The Session Context file (stored as `inter-agent/session_<session_id>.json`) provides the state-machine for high-frequency "hot-seat" bursts between agents. It allows the Channel Dispatcher to treat a sequence of messages as urgent without requiring per-message tagging.
 
 ## Schema Definition

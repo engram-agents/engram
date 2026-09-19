@@ -5,18 +5,19 @@ description: >
   formality — the ~/.engram/loop-mode.json marker lifecycle (entry-guard /
   write-on-start / remove-on-end) and the loop-aware drowsiness behavior
   (capture what the summary won't carry, then ride auto-compaction — don't
-  slow down for a manual one). Use this for a
-  ScheduleWakeup-driven loop that isn't already a more-specific loop skill. The
-  specialized loops (engram-curiosity-loop, engram-meta-loop, engram-deep-research,
+  slow down for a manual one). Use this for a harness-selected self-paced
+  loop that isn't already a more-specific loop skill. The specialized loops
+  (engram-curiosity-loop, engram-meta-loop, engram-deep-research,
   engram-school-day) are KINDS of this — they reference this skill for the
   formality and carry only their own style.
 ---
 
 # ENGRAM Loop — the self-paced-loop convention (SSoT for loop formality)
 
-A "loop" is any self-paced sequence of work bursts the agent paces itself
-through (via `ScheduleWakeup`), rather than turn-by-turn with the user. The
-load-bearing convention is a single marker file: **`~/.engram/loop-mode.json`**.
+A "loop" is any self-paced sequence of work bursts the agent paces through
+via its harness's selected wake mechanism, rather than turn-by-turn with the
+user. The load-bearing convention is a single marker file:
+**`~/.engram/loop-mode.json`**.
 
 Its presence is the ONLY thing the drowsiness module (invoked via the surface hook)
 checks to switch from the normal nap-nudge to the loop-aware banner
@@ -32,6 +33,173 @@ enforced. If the loop's entry-path doesn't write it, nothing does. This skill
 makes the write+remove a first-class ritual so it can't be silently skipped —
 and it is the ONE place the formality is defined. Specialized loop skills point
 here; they do not restate the marker syntax or the guard.
+
+---
+
+## Select the harness **before any loop action**
+
+This skill has two pacers. Select the runtime path before reading a marker
+example or arming procedure:
+
+- **Managed Codex** — follow the **Codex pacer** section immediately below.
+  It is the complete Codex transaction and uses the managed wake bridge plus a
+  per-agent systemd timer. Do **not** continue into the numbered Claude steps.
+- **Claude Code** — skip the Codex section and continue at **Step 0**. The
+  numbered steps, including their marker example and wake-arming ritual, are
+  Claude-specific.
+
+## Codex pacer — managed daemon + self-addressed Umwelt heartbeat
+
+This is the complete managed-Codex arming flow. The harness selection above
+routes Codex here before any Claude marker example or wake procedure. Do not
+use the numbered Claude steps below; this transaction contains the Codex
+marker and pacing semantics.
+
+Codex has no `ScheduleWakeup`, `CronList`, or `Monitor` tools. Its equivalent is
+the persistent `codex-umwelt-wake.py` bridge plus a systemd timer that sends a
+self-addressed Umwelt wake.
+
+### C1. Arm the provisioned host in one fail-fast transaction
+
+This is a **pre-provisioned-host workaround**, not a fresh-install provisioner.
+The tracked plugin ships the wake bridge but does not yet ship the private
+heartbeat script/units. Preflight both managed units BEFORE creating live loop
+state; absence is a hard start failure that leaves no marker.
+
+Run the whole arming transaction in **one Bash invocation**. Do not split these
+snippets across Codex shell calls: shell variables do not persist between calls.
+Fill the seven inputs first; the canonical cadence is 1800 unless the user
+explicitly named another value.
+
+```bash
+cat > /tmp/arm-codex-loop.sh <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
+CADENCE_SECONDS=${CADENCE_SECONDS:-1800}
+root="$HOME/.engram/codex-wake/loop-host-state"
+pending="$HOME/.engram/loop-mode.json.pending"
+marker="$HOME/.engram/loop-mode.json"
+test ! -e "$marker" || { echo "an active loop marker already exists" >&2; exit 1; }
+wake_unit=$(systemctl --user list-unit-files --type=service --no-legend | awk '$1 ~ /codex-umwelt-wake\.service$/ {print $1; exit}')
+unit=$(systemctl --user list-unit-files --type=timer --no-legend | awk '$1 ~ /codex-loop-heartbeat\.timer$/ {print $1; exit}')
+test -n "$wake_unit" && test -n "$unit" || { echo "Codex loop host is not provisioned" >&2; exit 1; }
+systemctl --user cat "$wake_unit" | grep -q 'codex-umwelt-wake.py' || { echo "wrong wake service" >&2; exit 1; }
+
+dropin_dir="$HOME/.config/systemd/user/$wake_unit.d"
+thread_dropin="$dropin_dir/thread.conf"
+cadence_dir="$HOME/.config/systemd/user/$unit.d"
+cadence_dropin="$cadence_dir/cadence.conf"
+rm -rf "$root"; mkdir -p "$root" "$dropin_dir" "$cadence_dir"
+test -e "$thread_dropin" && cp "$thread_dropin" "$root/thread.conf" || : > "$root/thread.absent"
+test -e "$cadence_dropin" && cp "$cadence_dropin" "$root/cadence.conf" || : > "$root/cadence.absent"
+systemctl --user is-enabled --quiet "$unit" && : > "$root/timer.enabled" || : > "$root/timer.disabled"
+systemctl --user is-active --quiet "$unit" && : > "$root/timer.active" || : > "$root/timer.inactive"
+printf '%s\n' "$wake_unit" > "$root/wake-unit"; printf '%s\n' "$unit" > "$root/timer-unit"
+
+restore() {
+  rm -f "$pending" "$marker"
+  test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
+  test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
+  systemctl --user daemon-reload || true
+  systemctl --user restart "$wake_unit" || true
+  if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null || true; else systemctl --user disable "$unit" >/dev/null || true; fi
+  if test -e "$root/timer.active"; then systemctl --user restart "$unit" || true; else systemctl --user stop "$unit" || true; fi
+}
+trap 'rc=$?; restore; exit $rc' ERR INT TERM
+
+cat > "$thread_dropin" <<EOF
+[Service]
+Environment=CODEX_THREAD_ID=$CURRENT_THREAD
+EOF
+cat > "$cadence_dropin" <<EOF
+[Timer]
+OnActiveSec=
+OnUnitActiveSec=
+OnUnitActiveSec=${CADENCE_SECONDS}s
+EOF
+agent=$(jq -er .agent "$HOME/.umwelt/config.json")
+jq -n --arg activated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg end_at "$END_AT" \
+  --arg kind "$LOOP_KIND" --arg topic "$TOPIC" --arg instructions "$INSTRUCTIONS" --arg state "$STATE" \
+  --arg prompt "@$agent Loop heartbeat: read ~/.engram/loop-mode.json and continue the active bounded loop; remove the marker when end_at has passed." \
+  --argjson cadence "$CADENCE_SECONDS" '{FIRST_ACTION:"FIRST: verify exact bridge thread and one timer trigger; check end_at; then work and update state.",activated:$activated,end_at:$end_at,kind:$kind,topic:$topic,instructions:$instructions,state:$state,cadence_seconds:$cadence,pacer:"codex-systemd-umwelt-self-wake",loop_prompt:$prompt}' > "$pending"
+
+systemctl --user daemon-reload
+systemctl --user restart "$wake_unit"
+systemctl --user enable --now "$unit"
+systemctl --user restart "$unit"
+WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+status=$("$HOME/.engram/venv/bin/python" "$WAKE" status)
+test "$(jq -r .running <<<"$status")" = true
+test "$(jq -r .thread_id <<<"$status")" = "$CURRENT_THREAD"
+systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
+mv "$pending" "$marker"
+trap - ERR INT TERM
+echo "armed $unit for thread $CURRENT_THREAD"
+BASH
+chmod +x /tmp/arm-codex-loop.sh
+
+CURRENT_THREAD='<Active session id>' END_AT='<ISO-8601 UTC bound>' \
+LOOP_KIND='<kind>' TOPIC='<topic>' INSTRUCTIONS='<instructions>' STATE='<state>' \
+CADENCE_SECONDS=1800 /tmp/arm-codex-loop.sh
+```
+
+If the user named only a cadence and not an end time, use today's documented
+sleep boundary; do not create an unbounded recurring marker. At every wake,
+check `end_at` first and remove the marker when it has passed.
+
+### C2. Verify continuations
+
+The transaction binds the current injected session ID explicitly; the bridge's
+normal newest-session discovery is not sufficient for a bounded loop. On every
+wake, rederive unit names from the persisted host-state (never from old shell
+variables) and verify the shipped bridge plus timer:
+
+```bash
+WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
+PY="$HOME/.engram/venv/bin/python"
+root="$HOME/.engram/codex-wake/loop-host-state"
+wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
+current_thread='<session id from the Active session banner>'
+status=$("$PY" "$WAKE" status)
+echo "$status"
+test "$(jq -r .running <<<"$status")" = true
+test "$(jq -r .thread_id <<<"$status")" = "$current_thread"
+systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
+```
+
+A mismatch is a hard start failure. Do not open a second local TUI or run a
+detached `umwelt-bell.py`; the watcher and visible TUI must share the managed
+app-server. Use `agentctl session` / `agentctl attach` to repair the topology.
+
+### C3. End and restore exact prior host state
+
+On each continuation, first verify the bridge's `running` + exact `thread_id`
+and the timer's next trigger, then check `end_at`, work, and update marker
+`state`. A marker alone is not an armed loop. Ending removes the marker; the
+timer may remain enabled because its service exits silently without a marker.
+On normal end, use one fresh fail-fast invocation. It restores both prior
+drop-ins and the timer's prior enabled **and active** states:
+
+```bash
+set -Eeuo pipefail
+root="$HOME/.engram/codex-wake/loop-host-state"
+wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
+thread_dropin="$HOME/.config/systemd/user/$wake_unit.d/thread.conf"
+cadence_dropin="$HOME/.config/systemd/user/$unit.d/cadence.conf"
+rm -f "$HOME/.engram/loop-mode.json" "$HOME/.engram/loop-mode.json.pending"
+test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
+test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
+systemctl --user daemon-reload
+systemctl --user restart "$wake_unit"
+if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null; else systemctl --user disable "$unit" >/dev/null; fi
+if test -e "$root/timer.active"; then systemctl --user restart "$unit"; else systemctl --user stop "$unit"; fi
+rm -rf "$root"
+```
+
+This removes the per-loop thread pin and returns cadence and timer state to
+exactly what preceded the loop; it never leaves a completed loop bound to a
+dead thread.
 
 ---
 
@@ -244,158 +412,6 @@ Calibrate the threshold to the loop's *own* cadence, not a fixed number: read `c
 cannot be stale.)*
 
 ---
-
-## Codex pacer — managed daemon + self-addressed Umwelt heartbeat
-
-This is a complete alternate arming flow. **On Codex, follow this section and
-skip Step 2 items 1–3 below** (all `ScheduleWakeup`, `CronList`, loop-prompt,
-and Monitor operations). Resume the shared loop body at Step 2 item 4.
-
-Codex has no `ScheduleWakeup`, `CronList`, or `Monitor` tools. Its equivalent is
-the persistent `codex-umwelt-wake.py` bridge plus a systemd timer that sends a
-self-addressed Umwelt wake.
-
-### C1. Arm the provisioned host in one fail-fast transaction
-
-This is a **pre-provisioned-host workaround**, not a fresh-install provisioner.
-The tracked plugin ships the wake bridge but does not yet ship the private
-heartbeat script/units. Preflight both managed units BEFORE creating live loop
-state; absence is a hard start failure that leaves no marker.
-
-Run the whole arming transaction in **one Bash invocation**. Do not split these
-snippets across Codex shell calls: shell variables do not persist between calls.
-Fill the seven inputs first; the canonical cadence is 1800 unless the user
-explicitly named another value.
-
-```bash
-cat > /tmp/arm-codex-loop.sh <<'BASH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-: "${CURRENT_THREAD:?}" "${END_AT:?}" "${LOOP_KIND:?}" "${TOPIC:?}" "${INSTRUCTIONS:?}" "${STATE:?}"
-CADENCE_SECONDS=${CADENCE_SECONDS:-1800}
-root="$HOME/.engram/codex-wake/loop-host-state"
-pending="$HOME/.engram/loop-mode.json.pending"
-marker="$HOME/.engram/loop-mode.json"
-test ! -e "$marker" || { echo "an active loop marker already exists" >&2; exit 1; }
-wake_unit=$(systemctl --user list-unit-files --type=service --no-legend | awk '$1 ~ /codex-umwelt-wake\.service$/ {print $1; exit}')
-unit=$(systemctl --user list-unit-files --type=timer --no-legend | awk '$1 ~ /codex-loop-heartbeat\.timer$/ {print $1; exit}')
-test -n "$wake_unit" && test -n "$unit" || { echo "Codex loop host is not provisioned" >&2; exit 1; }
-systemctl --user cat "$wake_unit" | grep -q 'codex-umwelt-wake.py' || { echo "wrong wake service" >&2; exit 1; }
-
-dropin_dir="$HOME/.config/systemd/user/$wake_unit.d"
-thread_dropin="$dropin_dir/thread.conf"
-cadence_dir="$HOME/.config/systemd/user/$unit.d"
-cadence_dropin="$cadence_dir/cadence.conf"
-rm -rf "$root"; mkdir -p "$root" "$dropin_dir" "$cadence_dir"
-test -e "$thread_dropin" && cp "$thread_dropin" "$root/thread.conf" || : > "$root/thread.absent"
-test -e "$cadence_dropin" && cp "$cadence_dropin" "$root/cadence.conf" || : > "$root/cadence.absent"
-systemctl --user is-enabled --quiet "$unit" && : > "$root/timer.enabled" || : > "$root/timer.disabled"
-systemctl --user is-active --quiet "$unit" && : > "$root/timer.active" || : > "$root/timer.inactive"
-printf '%s\n' "$wake_unit" > "$root/wake-unit"; printf '%s\n' "$unit" > "$root/timer-unit"
-
-restore() {
-  rm -f "$pending" "$marker"
-  test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
-  test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
-  systemctl --user daemon-reload || true
-  systemctl --user restart "$wake_unit" || true
-  if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null || true; else systemctl --user disable "$unit" >/dev/null || true; fi
-  if test -e "$root/timer.active"; then systemctl --user restart "$unit" || true; else systemctl --user stop "$unit" || true; fi
-}
-trap 'rc=$?; restore; exit $rc' ERR INT TERM
-
-cat > "$thread_dropin" <<EOF
-[Service]
-Environment=CODEX_THREAD_ID=$CURRENT_THREAD
-EOF
-cat > "$cadence_dropin" <<EOF
-[Timer]
-OnActiveSec=
-OnUnitActiveSec=
-OnUnitActiveSec=${CADENCE_SECONDS}s
-EOF
-agent=$(jq -er .agent "$HOME/.umwelt/config.json")
-jq -n --arg activated "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg end_at "$END_AT" \
-  --arg kind "$LOOP_KIND" --arg topic "$TOPIC" --arg instructions "$INSTRUCTIONS" --arg state "$STATE" \
-  --arg prompt "@$agent Loop heartbeat: read ~/.engram/loop-mode.json and continue the active bounded loop; remove the marker when end_at has passed." \
-  --argjson cadence "$CADENCE_SECONDS" '{FIRST_ACTION:"FIRST: verify exact bridge thread and one timer trigger; check end_at; then work and update state.",activated:$activated,end_at:$end_at,kind:$kind,topic:$topic,instructions:$instructions,state:$state,cadence_seconds:$cadence,pacer:"codex-systemd-umwelt-self-wake",loop_prompt:$prompt}' > "$pending"
-
-systemctl --user daemon-reload
-systemctl --user restart "$wake_unit"
-systemctl --user enable --now "$unit"
-systemctl --user restart "$unit"
-WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-status=$("$HOME/.engram/venv/bin/python" "$WAKE" status)
-test "$(jq -r .running <<<"$status")" = true
-test "$(jq -r .thread_id <<<"$status")" = "$CURRENT_THREAD"
-systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
-mv "$pending" "$marker"
-trap - ERR INT TERM
-echo "armed $unit for thread $CURRENT_THREAD"
-BASH
-chmod +x /tmp/arm-codex-loop.sh
-
-CURRENT_THREAD='<Active session id>' END_AT='<ISO-8601 UTC bound>' \
-LOOP_KIND='<kind>' TOPIC='<topic>' INSTRUCTIONS='<instructions>' STATE='<state>' \
-CADENCE_SECONDS=1800 /tmp/arm-codex-loop.sh
-```
-
-If the user named only a cadence and not an end time, use today's documented
-sleep boundary; do not create an unbounded recurring marker. At every wake,
-check `end_at` first and remove the marker when it has passed.
-
-### C2. Verify continuations
-
-The transaction binds the current injected session ID explicitly; the bridge's
-normal newest-session discovery is not sufficient for a bounded loop. On every
-wake, rederive unit names from the persisted host-state (never from old shell
-variables) and verify the shipped bridge plus timer:
-
-```bash
-WAKE="$HOME/.engram/marketplace/plugins/engram/tools/codex-umwelt-wake.py"
-PY="$HOME/.engram/venv/bin/python"
-root="$HOME/.engram/codex-wake/loop-host-state"
-wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
-current_thread='<session id from the Active session banner>'
-status=$("$PY" "$WAKE" status)
-echo "$status"
-test "$(jq -r .running <<<"$status")" = true
-test "$(jq -r .thread_id <<<"$status")" = "$current_thread"
-systemctl --user list-timers "$unit" --no-pager | grep -Fq "$unit"
-```
-
-A mismatch is a hard start failure. Do not open a second local TUI or run a
-detached `umwelt-bell.py`; the watcher and visible TUI must share the managed
-app-server. Use `agentctl session` / `agentctl attach` to repair the topology.
-
-### C3. End and restore exact prior host state
-
-On each continuation, first verify the bridge's `running` + exact `thread_id`
-and the timer's next trigger, then check `end_at`, work, and update marker
-`state`. A marker alone is not an armed loop. Ending removes the marker; the
-timer may remain enabled because its service exits silently without a marker.
-On normal end, use one fresh fail-fast invocation. It restores both prior
-drop-ins and the timer's prior enabled **and active** states:
-
-```bash
-set -Eeuo pipefail
-root="$HOME/.engram/codex-wake/loop-host-state"
-wake_unit=$(cat "$root/wake-unit"); unit=$(cat "$root/timer-unit")
-thread_dropin="$HOME/.config/systemd/user/$wake_unit.d/thread.conf"
-cadence_dropin="$HOME/.config/systemd/user/$unit.d/cadence.conf"
-rm -f "$HOME/.engram/loop-mode.json" "$HOME/.engram/loop-mode.json.pending"
-test -e "$root/thread.conf" && cp "$root/thread.conf" "$thread_dropin" || rm -f "$thread_dropin"
-test -e "$root/cadence.conf" && cp "$root/cadence.conf" "$cadence_dropin" || rm -f "$cadence_dropin"
-systemctl --user daemon-reload
-systemctl --user restart "$wake_unit"
-if test -e "$root/timer.enabled"; then systemctl --user enable "$unit" >/dev/null; else systemctl --user disable "$unit" >/dev/null; fi
-if test -e "$root/timer.active"; then systemctl --user restart "$unit"; else systemctl --user stop "$unit"; fi
-rm -rf "$root"
-```
-
-This removes the per-loop thread pin and returns cadence and timer state to
-exactly what preceded the loop; it never leaves a completed loop bound to a
-dead thread.
 
 ## Step 2 — The loop body (per iteration)
 
@@ -672,7 +688,7 @@ With the marker present, the hook tells you the right thing; the discipline is:
   since May), so what crosses the boundary is whatever is already plain text
   in a file. **Anything left only in context is lost at the boundary, not
   deferred.**
-- **Then nap to checkpoint it** (`engram_nap`) — after the writes, not
+- **Then nap to checkpoint it** (`engram_checkpoint`, formerly `engram_nap`) — after the writes, not
   instead of them. A nap checkpoints what is *already* in the graph and
   commits a snapshot; napping with nothing newly written saves nothing.
   Repeated writes are the protection; repeated naps are not.

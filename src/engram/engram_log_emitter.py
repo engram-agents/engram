@@ -141,13 +141,27 @@ class Emitter:
         data: dict[str, Any],
         tool_use_id: Optional[str] = None,
         parent_uuid: Optional[str] = None,
+        site: Optional[str] = None,
     ) -> Optional[str]:
         """Emit one event. Returns the generated uuid for child-event linking, or None on failure.
 
         NEVER raises — caller code is never disrupted by emitter errors.
+
+        ``site`` (alpha #2574 WS3): an optional literal call-site id, e.g.
+        ``site="surface-hook.trigger_fire"``. Purely additive — default
+        ``None``, no behavior change for any existing caller that omits it.
+        It exists so ``tools/telemetry_manifest_gate.py``'s AST scan (which
+        looks for a ``site="..."`` keyword literal at `emit`/
+        `emit_if_initialized` call sites, per docs/2574-telemetry-design.md
+        §1/§4a) can find it directly at the call. It is NOT threaded into
+        this module's own L1/L2 session-log JSONL schema (a different, older
+        system — see this module's own docstring); a caller that wants the
+        site attested in the telemetry store records it separately via
+        ``engram_telemetry_store.write_telemetry_record(manifest_id=site,
+        ...)``, which is WS3's job, not this module's.
         """
         try:
-            return self._emit_inner(event_type, level, data, tool_use_id, parent_uuid)
+            return self._emit_inner(event_type, level, data, tool_use_id, parent_uuid, site)
         except Exception as exc:
             self._stderr(f"emit({event_type}) FAILED: {exc!r}; event dropped")
             return None
@@ -159,7 +173,14 @@ class Emitter:
         data: dict[str, Any],
         tool_use_id: Optional[str],
         parent_uuid: Optional[str],
+        site: Optional[str] = None,
     ) -> Optional[str]:
+        # `site` is accepted-and-currently-unused by this method's actual
+        # write path (see `emit`'s own docstring for why) -- it exists on
+        # this signature only so the parameter threads cleanly from `emit`
+        # without needing a second private method shape. Referenced here
+        # (a no-op) purely so linters don't flag it as unused.
+        del site
         # Validate
         if not _is_valid_event_type(event_type):
             self._stderr(f"invalid event_type {event_type!r}; must be engram.<domain>.<action>")
@@ -253,8 +274,14 @@ def emit_if_initialized(
     data: dict[str, Any],
     tool_use_id: Optional[str] = None,
     parent_uuid: Optional[str] = None,
+    site: Optional[str] = None,
 ) -> Optional[str]:
+    # alpha #2574 WS5: `site` is purely additive (default None, same shape as
+    # WS3's addition to Emitter.emit()/_emit_inner() -- see that method's own
+    # docstring) so tools/telemetry_manifest_gate.py's AST scan can find a
+    # `site="..."` keyword literal directly at THIS call, not only at
+    # Emitter.emit() itself. No other behavior change.
     emitter = Emitter.get()
     if emitter is None:
         return None
-    return emitter.emit(event_type, level, data, tool_use_id=tool_use_id, parent_uuid=parent_uuid)
+    return emitter.emit(event_type, level, data, tool_use_id=tool_use_id, parent_uuid=parent_uuid, site=site)

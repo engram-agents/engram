@@ -70,7 +70,13 @@ import re
 import sqlite3
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# append (not insert(0)) -- #2565: putting src/engram at sys.path
+# POSITION 0 outranks the repo-root tools/ package for the rest of the
+# process, silently poisoning any test file collected afterward that
+# needs the real tools.engine (the tools/-package-name-clash class,
+# #2063/PR#2564's own shape, just reached via a tool script's own
+# top-level import rather than a test file's).
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import engram_backup  # noqa: E402
 
 

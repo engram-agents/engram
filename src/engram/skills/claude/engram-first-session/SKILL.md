@@ -383,13 +383,13 @@ On accept: run the installer:
 bash "$VIZ_SETUP"
 ```
 
-Surface its output plainly. If the script exits non-zero (`systemctl` absent, or systemd-user bus inactive), tell the user: "The persistent viz service couldn't be installed — your system either doesn't have systemd or the user session bus isn't active. You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`." This is not fatal; continue.
+Surface its output plainly. If the script exits non-zero (`systemctl` absent, or systemd-user bus inactive), tell the user: "The persistent viz service couldn't be installed — your system either doesn't have systemd or the user session bus isn't active. You can start the viz server manually any time: `cd ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram} && python3 -m viz.server &`." This is not fatal; continue.
 
-On decline: tell the user: "No problem. You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`. It serves the dashboard at `http://localhost:5001`."
+On decline: tell the user: "No problem. You can start the viz server manually any time: `cd ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram} && python3 -m viz.server &`. It serves the dashboard at `http://localhost:5001`."
 
 **On non-Linux / macOS (`OS_TYPE != Linux`):** tell the user:
 
-"The viz service installer is Linux-only (systemd — macOS is not supported). You can start the viz server manually any time: `python3 ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram}/viz_server.py &`. It will be available at `http://localhost:5001` until you close the terminal." Continue.
+"The viz service installer is Linux-only (systemd — macOS is not supported). You can start the viz server manually any time: `cd ${CLAUDE_PLUGIN_ROOT:-~/.claude/plugins/cache/engram} && python3 -m viz.server &`. It will be available at `http://localhost:5001` until you close the terminal." Continue.
 
 **Defer the `enable-linger` hint if your name isn't finalized yet** (Linux accept path only) — same reason as Step 5.5: the script prints a `sudo loginctl enable-linger <user>` suggestion; if you're still on `agent-newborn-*`, defer until after finalize-name (Step 7). (If the username is already final — no rename pending — the hint is fine as-is.)
 
@@ -476,7 +476,7 @@ The codex file set is different. Bootstrap wrote identity surfaces across four f
 
 ## Step 7 — Tell the user what's next
 
-What you tell the user here depends on whether this install is single-agent or multi-agent. Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
+What you tell the user here depends on whether this install is single-agent or multi-agent — a *topology* question (is this a newly-spawned co-resident agent that still needs its Linux-uid substrate rename?), separate from whether a forum is configured (which gates baton/letter/forum use, per #2857 step 1, but says nothing about uid finalization — a genuinely single-host agent can have a forum configured for cross-host LAN coordination without ever needing `finalize-name`). Check via `engram_client.is_multi_agent_mode()` (or read your `~/.engram/config.json` `mode` field if you don't have the helper in scope).
 
 ### Multi-agent mode
 

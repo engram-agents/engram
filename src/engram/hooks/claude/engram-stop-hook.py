@@ -161,7 +161,34 @@ ENGRAM_HOME = (
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, resolve_runtime_dir
+
+# Module-scope emitter resolve+insert (gh#2570 §1/§3): this hook previously
+# had no resolver at all -- its emit site did a bare
+# sys.path.insert(0, ENGRAM_HOME), which shadows the plugin's live copy of
+# engram_log_emitter.py whenever a stale scatter copy sits in ENGRAM_HOME.
+_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_log_emitter.py")
+if _RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _RUNTIME_DIR)
+
+# alpha #2574 WS3: separate resolver for engram_telemetry_store.py -- per
+# _hooklib.resolve_runtime_dir's own docstring, "one call per module you
+# actually import; do not collapse two different imports onto one sentinel
+# just because they happen to live in the same directory today" (gh#2570).
+_TELEMETRY_RUNTIME_DIR = resolve_runtime_dir(ENGRAM_HOME, "engram_telemetry_store.py")
+if _TELEMETRY_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TELEMETRY_RUNTIME_DIR)
+try:
+    from engram_telemetry_store import write_telemetry_record
+except Exception:
+    def write_telemetry_record(manifest_id, event_type, fields=None):  # pragma: no cover -- import-failure fallback
+        return False
+
+# alpha #2574 WS3: this hook's TRIGGER-ENTRY site literal (participation
+# manifest_id) for engram.telemetry.reached -- see main()'s first line.
+_MAIN_MANIFEST_ID = "hooks/claude/engram-stop-hook.py:main"
+_HOOK_FIRE_SITE = "stop-hook.hook_fire"
+
 try:
     from _stophooklib import (
         read_offset_state as _read_offset_state,
@@ -230,6 +257,13 @@ _ENGRAM_WRITE_VERBS = frozenset({
     "register_exemplar",
     "link_about",
     "set_recall_summaries",
+    # engram_checkpoint (issue #3015 rename) is the canonical write tool;
+    # engram_nap is its deprecated backward-compat alias (kept for one
+    # release) — both are separately @mcp.tool()-registered and write-
+    # capable, so both verbs must be present here (test_stop_hook_write_
+    # verbs_ssot.py asserts strict equality against server.py's real
+    # write-capable set).
+    "checkpoint",
     "nap",
     "advance_turn",
     "outgrow_cornerstone",
@@ -579,6 +613,10 @@ def _update_state(transcript_path: str) -> None:
 
 
 def main() -> None:
+    # alpha #2574 WS3: `reached` -- unconditional, before any guard/early
+    # return in this function.
+    write_telemetry_record(manifest_id=_MAIN_MANIFEST_ID, event_type="engram.telemetry.reached", fields={})
+
     _t0 = time.perf_counter()
 
     # Read stdin for session_id and transcript_path (Stop hook protocol).
@@ -644,14 +682,27 @@ def main() -> None:
     _duration_ms = int((time.perf_counter() - _t0) * 1000)
 
     # Emit engram.hook.fire event. Failure must not break the hook.
+    #
+    # alpha #2574 WS3: construction (import + Emitter.init) is narrowed to
+    # its own try/except so an INIT_FAILED outcome is recordable and
+    # distinct from an ordinary DROPPED emit (docs/2574-telemetry-design.md
+    # §1/§5).
+    _emitter = None
     try:
-        sys.path.insert(0, ENGRAM_HOME)
         from engram_log_emitter import Emitter
         _emitter = Emitter.init(
             session_id=session_id,
             transcript_path=transcript_path,
         )
-        _emitter.emit(
+    except Exception:
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "init_failed"},
+        )
+
+    if _emitter is not None:
+        _uid = _emitter.emit(
             event_type="engram.hook.fire",
             level=1,
             data={
@@ -662,9 +713,13 @@ def main() -> None:
                 "stdout_bytes": len(output.encode("utf-8")),
                 "stderr_bytes": 0,
             },
+            site="stop-hook.hook_fire",
         )
-    except Exception:
-        pass
+        write_telemetry_record(
+            manifest_id=_HOOK_FIRE_SITE,
+            event_type="engram.hook.fire",
+            fields={"outcome": "delivered" if _uid is not None else "dropped"},
+        )
 
 
 if __name__ == "__main__":

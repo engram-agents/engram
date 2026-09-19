@@ -10,6 +10,34 @@
   },
   "default_tier": "convenience",
   "source_root": "src/engram",
+  "telemetry": {
+    "degraded_threshold": 0.5,
+    "dynamic_dispatch_exclusions": [
+      {
+        "file": "engram_client.py",
+        "line": 473,
+        "reason": "Test/SDK harness (ClientHarness.call) invokes already-terminal @mcp.tool dispatch targets by name via a dict built from getattr(server, name); walk correctness is unaffected because dispatch targets are the walk's own stopping point, not an intermediate hop toward one."
+      },
+      {
+        "file": "tools/release_gates.py",
+        "line": 795,
+        "reason": "Release-scorecard gate-runner dispatch table (local lambdas closing over run_G2/etc.); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
+        "zero_emit_file": true
+      },
+      {
+        "file": "tools/release_gates.py",
+        "line": 797,
+        "reason": "Same dispatch table as :795 (list-comprehension form); same exclusion rationale.",
+        "zero_emit_file": true
+      },
+      {
+        "file": "tools/codex-umwelt-wake.py",
+        "line": 515,
+        "reason": "Codex RPC notification-drain dispatch (getattr(rpc, 'drain_buffered_notifications', None)); this file contains zero emit()/emit_if_initialized() calls and is not on any site's backward-walk path.",
+        "zero_emit_file": true
+      }
+    ]
+  },
   "mechanisms": [
     {
       "path": "server.py",
@@ -69,7 +97,12 @@
     },
     {
       "path": "engram_derive.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": [
+        {"site": "server.engram_derive.blocked", "trigger": "MCP tool body"},
+        {"site": "server.engram_derive.created", "trigger": "MCP tool body"},
+        {"site": "server.engram_contradict", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_tasks.py",
@@ -77,7 +110,11 @@
     },
     {
       "path": "engram_revision.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": [
+        {"site": "server.engram_supersede", "trigger": "MCP tool body"},
+        {"site": "server.engram_retract", "trigger": "MCP tool body"}
+      ]
     },
     {
       "path": "engram_stats.py",
@@ -92,11 +129,59 @@
       "tier": "essential"
     },
     {
-      "path": "engram_query.py",
+      "path": "health/config.py",
       "tier": "essential"
     },
     {
+      "path": "health/engine.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/series.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/metrics.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/curves.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/curves.json",
+      "tier": "essential"
+    },
+    {
+      "path": "health/model.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/measurements.py",
+      "tier": "essential"
+    },
+    {
+      "path": "health/version.py",
+      "tier": "essential"
+    },
+    {
+      "path": "engram_query.py",
+      "tier": "essential",
+      "telemetry": [
+        {"site": "server.engram_query", "trigger": "MCP tool body"},
+        {"site": "server.engram_query_pattern", "trigger": "MCP tool body"}
+      ]
+    },
+    {
       "path": "engram_observation.py",
+      "tier": "essential",
+      "telemetry": [
+        {"site": "server.engram_add_observation", "trigger": "MCP tool body"},
+        {"site": "server.engram_add_observation_batch", "trigger": "MCP tool body"}
+      ]
+    },
+    {
+      "path": "engram_anchoring.py",
       "tier": "essential"
     },
     {
@@ -125,14 +210,163 @@
     },
     {
       "path": "engram_log_emitter.py",
-      "tier": "essential"
+      "tier": "essential",
+      "telemetry": [],
+      "note": "telemetry: [] is correct, not merely default: this file's own emit_if_initialized() call at :281 (line drifted from :260 by WS3's additive `site` param on emit()/_emit_inner() -- see telemetry_manifest_gate.py's TRANSPORT_EXCLUSION_LINENO) IS the transport (`return emitter.emit(...)`), excluded from the section-4a declarable population as a consumer of itself, per docs/2574-telemetry-design.md section 1 DECLARED."
+    },
+    {
+      "path": "engram_telemetry_store.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2574 WS1 (epic #2013's telemetry redesign): the per-process JSONL writer (write_telemetry_record) + records.db aggregator (open_store/ingest). Tiered convenience (T2), not essential, per this PR's own judgment call (the WS1 spec left the exact tier to the implementer, flagged for review): this is observability/participation tooling -- which hooks/tools actually fired, not the core write/read/consolidation path. Removing it degrades UX (loses the telemetry participation signal) but breaks nothing epistemic-identity-critical, matching CLAUDE.md's Install-tiers T2 definition. Sits alongside the T1-tagged engram_log_emitter.py (a different, older system -- the two-level session event log, load-bearing for the drowsiness meter/continuity) without inheriting its tier. UPDATED by WS5 (server-side wiring): five T1/essential files (server.py, engram_derive.py, engram_observation.py, engram_query.py, engram_revision.py) now import this module -- but each does so via a guarded `try/except ImportError`-style import with a no-op stub fallback (`write_telemetry_record(...) -> False`), never a plain top-level import, specifically so this file's own T2 tier is preserved without those five files silently breaking on an Essential-only build that excludes it (tests/test_tiers_manifest.py::test_import_dep_tier_consistency enforces the absence of a HARD dependency; the guarded-import shape is what keeps the dependency soft). This is the concrete mechanism behind docs/2574-telemetry-design.md §8's 'telemetry gates nothing T1.'"
     },
     {
       "path": "engram_log_indexer.py",
       "tier": "essential"
     },
     {
-      "path": "viz_server.py",
+      "path": "viz/__init__.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/agents.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/shell.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/routes.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/urls.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: url_for() -- new module, same tier as its viz/ package siblings."
+    },
+    {
+      "path": "viz/footer.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1, requirement 4: the shared page footer -- new module, same tier as its viz/ package siblings."
+    },
+    {
+      "path": "viz/static_serve.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR B: shared /static/<filename> file-serving logic, extracted out of viz/server.py's original _serve_static/_STATIC_DIR/etc so both viz.server (:5001) and the new dev-tier viz.workbench (:5021) serve the same flat viz/static/ directory through one code path. Ships at 'convenience' (not 'dev') even though viz.workbench -- a dev-tier module -- also imports it: dev is cumulative over convenience (Essential ⊂ Convenience ⊂ Dev), so a convenience-tier build (viz.server's own tier) still ships this file, and a dev-tier build ships it too via the cumulative inclusion. Tagging it 'dev' instead would break viz.server's own import on a convenience-tier build."
+    },
+    {
+      "path": "viz/server.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR A folder move: relocated from root-level viz_server.py into the viz/ package. Same tier the single-file original carried."
+    },
+    {
+      "path": "viz/workbench.py",
+      "tier": "dev",
+      "note": "engram-alpha#2754 PR B: standalone Curve Workbench entry point (python -m viz.workbench, :5021 by default) -- the editable dev-tool page moved off the shared :5001 viz.server process onto its own port per the issue's own ruling ('Port, not file'). Dev tier because it top-level-imports viz/data/health_workbench.py (also dev tier) and viz/templates/health_workbench.html (also dev tier) -- both already dev-tier-only per their own manifest entries below -- and fails loud at import time if either is missing from the install, rather than gating per-request the way the old, now-removed viz.server._workbench_available() had to (this module's own invocation IS the gate; see its module docstring's JUDGMENT CALL 1 for the full reasoning)."
+    },
+    {
+      "path": "viz/data/__init__.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR A folder move: PEP 420 makes this non-load-bearing, kept as an explicit package marker matching the health/__init__.py and tools/__init__.py precedents."
+    },
+    {
+      "path": "viz/data/schema.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/calibration.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/graph.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/health.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/health_v2.py",
+      "tier": "convenience",
+      "note": "engram-alpha#2518: health-v2 SSoT loader for /api/health/v2 -- same tier as its v1 sibling health.py and the rest of the viz dashboard."
+    },
+    {
+      "path": "viz/data/health_workbench.py",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench backend loader (shipped-model curves/importance) -- developer tier only, per the issue's own tier ruling. As of engram-alpha#2754, viz/workbench.py top-level-imports this module (its own invocation is now the tier gate, per its module docstring); viz/server.py still references it via a LAZY, function-scoped import (see server.py's _health_workbench_model_available(), scoped only to the surviving /api/health/v2/model endpoint) so it stays invisible to the tier-closure static checker on a convenience/essential build, where this file is never copied."
+    },
+    {
+      "path": "viz/data/stats.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/data/config.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/static/base.css",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <link>, no longer baked into Python string constants."
+    },
+    {
+      "path": "viz/static/nav.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
+    },
+    {
+      "path": "viz/templates/graph.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/static/graph.css",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <link>."
+    },
+    {
+      "path": "viz/static/graph.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
+    },
+    {
+      "path": "viz/static/graph-agent-select.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2555 PR B amendment-1: moved from viz/templates/ -- served from a real /static/ route now, referenced via <script src>."
+    },
+    {
+      "path": "viz/templates/health.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/health_workbench.html",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench page shell -- developer tier only. As of engram-alpha#2754 this page is served by the standalone viz/workbench.py module (its own :5021 entry point) rather than a route on server.py's :5001 -- server.py no longer references this file at all; viz/workbench.py's own module-import-time check fails loud if it's missing from a convenience/essential build."
+    },
+    {
+      "path": "viz/static/health-detail-math.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2518 detail-view slice: pure distribution/histogram math for the history strip, served via <script src>, same tier as its sibling health.html and the rest of the viz dashboard."
+    },
+    {
+      "path": "viz/static/health-workbench-curve.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR A RETAG (was \"dev\"): this pure scoring math (piecewiseLinear/aspectScore/composeScore, ported line-for-line from health/curves.py + health/engine.py) is now a genuinely shared library -- health.html's convenience-tier Detail tab (health-detail.js) loads it via <script src> unconditionally, same as the developer-tier Curve Workbench (health-workbench.js) still does. Leaving this tagged \"dev\" would 404 that <script> tag on every convenience-tier (the DEFAULT tier) build, silently breaking the Detail tab with a ReferenceError the moment health-detail.js calls piecewiseLinear/aspectScore/etc. Retagging the shared library, not duplicating it, per the issue's own \"it is a library, not a page\" instruction."
+    },
+    {
+      "path": "viz/static/health-workbench.js",
+      "tier": "dev",
+      "note": "engram-alpha#2727: Curve Workbench page DOM/fetch logic -- developer tier only, same gate as its sibling health_workbench.html/health_workbench.py."
+    },
+    {
+      "path": "viz/static/health-detail.js",
+      "tier": "convenience",
+      "note": "engram-alpha#2754 PR A: read-only fork of the Curve Workbench (health-workbench.js) for the health dashboard's user-facing Detail tab -- convenience tier per the issue's own tier ruling, same tier as health.html and the rest of the viz dashboard. Enrichment (aspect grouping, curve plot, reference/hold-out markers) degrades gracefully when /api/health/v2/model 404s on a build that didn't ship the dev-tier health_workbench.py/.html (this file never touches that gate itself)."
+    },
+    {
+      "path": "viz/templates/stats.html",
+      "tier": "convenience"
+    },
+    {
+      "path": "viz/templates/config.html",
       "tier": "convenience"
     },
     {
@@ -176,6 +410,10 @@
       "tier": "essential"
     },
     {
+      "path": "tools/anchoring_report.py",
+      "tier": "convenience"
+    },
+    {
       "path": "tools/backup_knowledge_db.py",
       "tier": "convenience"
     },
@@ -212,6 +450,18 @@
       "note": "cascade-marker migration verification for the rc1->rc2 upgrade cycle (#2411). Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/rc-upgrade-verify.py) would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above)."
     },
     {
+      "path": "tools/coverage-diff.sh",
+      "tier": "dev",
+      "source": "tools/coverage-diff.sh",
+      "note": "Local diff-coverage helper (#2774) -- reports coverage of only the lines the current branch changes vs origin/dev, via diff-cover fed a coverage.xml from an affected-tests run. Dev tooling (T3): a developer convenience for local PR iteration, not part of any install path a shipped agent relies on. Real file directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/coverage-diff.sh) would wrongly flag this as dangling (same pattern as tools/rc-upgrade-verify.py's entry above)."
+    },
+    {
+      "path": "tools/recall_harness",
+      "tier": "dev",
+      "source": "tools/recall_harness",
+      "note": "Recall-measurement harness package, ported from the per-seat borges-desk scratch project (code only -- the golden set and any snapshot .db are per-seat private artifacts and are never copied here). Dev tooling (T3): scores ENGRAM's retrieval against a curated golden set; cannot run end-to-end in this repo without a golden set supplied via ENGRAM_RECALL_GOLDEN_DIR + ENGRAM_RECALL_SNAPSHOT, which is intentional. Real directory directly under repo-root tools/ (not mirrored under src/engram/tools/), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution (src/engram/tools/recall_harness) would wrongly flag this as dangling (same pattern as tools/coverage-diff.sh's entry above)."
+    },
+    {
       "path": "tools/engram-regenerate-embeddings.py",
       "tier": "essential"
     },
@@ -240,22 +490,12 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/session.py",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "tools/compute_task_time.py",
       "tier": "convenience"
     },
     {
       "path": "tools/_common.py",
       "tier": "convenience"
-    },
-    {
-      "path": "tools/_session_context.py",
-      "tier": "convenience",
-      "multi_agent": true
     },
     {
       "path": "tools/engram-pkg",
@@ -266,29 +506,21 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/collab-letter-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "tools/collab-baton-monitor.sh",
       "tier": "convenience",
       "multi_agent": true
     },
     {
       "path": "tools/forum-mention-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/forum-updates-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/_proc_identity.py",
       "tier": "convenience",
-      "multi_agent": true,
       "reason": "shared process-identity verification (#2321), extracted from forum-mention-monitor.sh/forum-updates-monitor.sh -- ships alongside both, same tier"
     },
     {
@@ -297,8 +529,7 @@
     },
     {
       "path": "tools/ia.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/dump_mcp_schema.py",
@@ -306,13 +537,11 @@
     },
     {
       "path": "tools/baton.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
-      "path": "tools/_channel.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "path": "tools/baton_gate.py",
+      "tier": "convenience"
     },
     {
       "path": "tools/forum.py",
@@ -324,8 +553,7 @@
     },
     {
       "path": "tools/forum_api.py",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
       "path": "tools/_status_derive.py",
@@ -352,8 +580,12 @@
       "tier": "convenience"
     },
     {
-      "path": ".githooks/pre-push",
-      "tier": "dev"
+      "path": "tools/reconcile_lesson_demotions.py",
+      "tier": "convenience"
+    },
+    {
+      "path": "tools/grant_viz_operator_acl.py",
+      "tier": "convenience"
     },
     {
       "path": "tools/scan-leaks.py",
@@ -361,6 +593,14 @@
     },
     {
       "path": "tools/os-harness-check.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/supervision_probe.py",
+      "tier": "dev"
+    },
+    {
+      "path": "tools/fairy_report.py",
       "tier": "dev"
     },
     {
@@ -418,273 +658,358 @@
       "tier": "dev"
     },
     {
-      "path": "packaging/test-map.json",
-      "tier": "dev"
-    },
-    {
       "path": "tools/release_gates.py",
       "tier": "dev"
     },
     {
-      "path": "packaging/release-gates.json",
+      "path": "tools/telemetry_manifest_gate.py",
       "tier": "dev"
     },
     {
       "path": "hooks/claude/start-engram-daemon.sh",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/start-engram-daemon.sh"
     },
     {
       "path": "hooks/claude/engram-surface-daemon.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-surface-daemon.py"
     },
     {
       "path": "hooks/claude/engram-surface-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-surface-hook.py",
+      "telemetry": [
+        {"site": "surface-hook.surface_fire", "trigger": "UserPromptSubmit hook main()"},
+        {"site": "surface-hook.trigger_fire", "trigger": "UserPromptSubmit hook main()"},
+        {"site": "surface-hook.render_size", "trigger": "UserPromptSubmit hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-session-start-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-session-start-hook.py",
+      "telemetry": [
+        {"site": "session-start-hook.hook_fire", "trigger": "SessionStart hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-stale-tree-pull-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stale-tree-pull-hook.py"
     },
     {
       "path": "hooks/claude/engram-stale-tree-warn-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stale-tree-warn-hook.py"
     },
     {
       "path": "hooks/claude/_stale_tree_hooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_stale_tree_hooklib.py"
     },
     {
       "path": "hooks/claude/engram-postcompact-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-postcompact-hook.py",
+      "telemetry": [
+        {"site": "postcompact-hook.hook_fire", "trigger": "PostCompact hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-toolcall-repair.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-toolcall-repair.py"
     },
     {
       "path": "hooks/claude/engram-user-identity-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-user-identity-hook.py"
     },
     {
       "path": "hooks/claude/engram-stop-hook.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/engram-stop-hook.py",
+      "telemetry": [
+        {"site": "stop-hook.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/_stophooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_stophooklib.py"
     },
     {
       "path": "hooks/claude/context_tracker.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/context_tracker.py"
     },
     {
       "path": "hooks/claude/engram-deference-detector-prompt.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-deference-detector-prompt.py",
+      "telemetry": [
+        {"site": "deference-detector-prompt.hook_fire", "trigger": "UserPromptSubmit hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-deference-detector-stop.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-deference-detector-stop.py",
+      "telemetry": [
+        {"site": "deference-detector-stop.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-end-of-day-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-end-of-day-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/_hooklib.py",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "hooks/_hooklib.py"
+    },
+    {
+      "path": "hooks/claude/_harness.py",
+      "tier": "essential",
+      "dest": "hooks/_harness.py"
     },
     {
       "path": "hooks/claude/_prompthooklib.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/_prompthooklib.py"
     },
     {
       "path": "hooks/claude/engram-inter-agent-prompt-hook.py",
       "tier": "convenience",
-      "multi_agent": true,
+      "dest": "hooks/engram-inter-agent-prompt-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-baton-prompt-hook.py",
       "tier": "convenience",
-      "multi_agent": true,
+      "dest": "hooks/engram-baton-prompt-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-forum-prompt-hook.py",
       "tier": "convenience",
+      "dest": "hooks/engram-forum-prompt-hook.py",
       "identity_coupled": true
     },
     {
       "path": "hooks/claude/engram-time-bar-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-time-bar-hook.py"
     },
     {
       "path": "hooks/claude/engram-utility-credit-mention-stop.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-utility-credit-mention-stop.py",
+      "telemetry": [
+        {"site": "utility-credit-mention-stop.enactment", "trigger": "Stop hook main()"},
+        {"site": "utility-credit-mention-stop.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-loop-arm-stop-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-loop-arm-stop-hook.py",
+      "telemetry": [
+        {"site": "loop-arm-stop-hook.hook_fire", "trigger": "Stop hook main()"}
+      ]
     },
     {
       "path": "hooks/claude/engram-bash-pipe-exit-warn.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-bash-pipe-exit-warn.py"
     },
     {
       "path": "hooks/claude/engram-lesson-tripwire-hook.py",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "hooks/engram-lesson-tripwire-hook.py"
     },
     {
       "path": "skills/claude/engram-first-session",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-first-session"
     },
     {
       "path": "skills/claude/engram-sleep",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-sleep"
     },
     {
       "path": "skills/claude/engram-nap",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-nap"
     },
     {
       "path": "skills/claude/engram-observe",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-observe"
     },
     {
       "path": "skills/claude/engram-revise",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-revise"
     },
     {
       "path": "skills/claude/engram-resolve-cascade",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-resolve-cascade"
     },
     {
       "path": "skills/claude/engram-support-lost",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-support-lost"
     },
     {
       "path": "skills/claude/engram-contradiction-resolution",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-contradiction-resolution"
     },
     {
       "path": "skills/claude/engram-learn-from-error",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-learn-from-error"
     },
     {
       "path": "skills/claude/engram-trust-tier",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/engram-trust-tier"
     },
     {
       "path": "skills/claude/internal-external-decision",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "skills/internal-external-decision"
     },
     {
       "path": "skills/claude/engram-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-loop"
     },
     {
       "path": "skills/claude/engram-curiosity-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-curiosity-loop"
     },
     {
       "path": "skills/claude/engram-meta-loop",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-meta-loop"
     },
     {
       "path": "skills/claude/engram-deep-research",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-deep-research"
     },
     {
       "path": "skills/claude/engram-school-day",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-school-day"
     },
     {
       "path": "skills/claude/engram-research-report",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-research-report"
     },
     {
       "path": "skills/claude/engram-fairy-orchestration",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-fairy-orchestration"
     },
     {
       "path": "skills/claude/engram-auto-coder-fairy-judgement",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-auto-coder-fairy-judgement"
     },
     {
       "path": "skills/claude/engram-auto-reviewer-fairy-judgement",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-auto-reviewer-fairy-judgement"
     },
     {
       "path": "skills/claude/engram-upgrade",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-upgrade"
     },
     {
       "path": "skills/claude/engram-health-exam",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-health-exam"
     },
     {
       "path": "skills/claude/engram-loop-diagnose",
-      "tier": "dev"
+      "tier": "dev",
+      "dest": "skills/engram-loop-diagnose"
     },
     {
       "path": "skills/claude/engram-letter",
       "tier": "convenience",
-      "multi_agent": true
+      "dest": "skills/engram-letter"
     },
     {
       "path": "skills/claude/engram-baton",
       "tier": "convenience",
-      "multi_agent": true
+      "dest": "skills/engram-baton"
     },
     {
       "path": "skills/claude/engram-forum",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-forum"
     },
     {
       "path": "skills/claude/engram-standpoint",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "skills/engram-standpoint"
     },
     {
       "path": "skills/claude/engram-collaborating-loop",
       "tier": "convenience",
-      "multi_agent": true
+      "dest": "skills/engram-collaborating-loop"
     },
     {
       "path": "skills/claude/engram-self-improve",
-      "tier": "dev"
+      "tier": "dev",
+      "dest": "skills/engram-self-improve"
     },
     {
       "path": "agents/claude/engram-dream-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-dream-fairy.md"
     },
     {
       "path": "agents/claude/engram-dream-master.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-dream-master.md"
     },
     {
       "path": "agents/claude/engram-batch-summary-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-batch-summary-fairy.md"
     },
     {
       "path": "agents/claude/engram-person-node-fairy.md",
-      "tier": "essential"
+      "tier": "essential",
+      "dest": "agents/engram-person-node-fairy.md"
     },
     {
       "path": "agents/claude/engram-coder-fairy.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "agents/engram-coder-fairy.md"
     },
     {
       "path": "agents/claude/engram-pr-reviewer.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "agents/engram-pr-reviewer.md"
     },
     {
       "path": "output-styles/claude/proactive-with-carveouts.md",
-      "tier": "convenience"
+      "tier": "convenience",
+      "dest": "output-styles/proactive-with-carveouts.md"
     },
     {
       "path": "templates/template.CLAUDE.md",
@@ -727,66 +1052,36 @@
       "tier": "convenience"
     },
     {
+      "path": "templates/engram-workbench-user.service.template",
+      "tier": "dev",
+      "note": "engram-alpha#2894: systemd user unit for the Curve Workbench (:5021), same shape as engram-viz-user.service.template but 'dev' tier -- matches viz/workbench.py and viz/data/health_workbench.py, both 'dev' above, which this unit's ExecStart launches. tools/operator-setup-viz.sh (still 'convenience') gates its own install of this unit at runtime via a separate, non-fatal `import viz.workbench` check (see that script's WORKBENCH_GATE_OK), so a convenience/essential-tier build never attempts to render or enable it -- see the PR body for why the installer script itself stays 'convenience' rather than being retagged 'dev'."
+    },
+    {
       "path": "templates/engram-viz-server.plist.template",
       "tier": "convenience"
     },
     {
       "path": "templates/template.CLAUDE.multi-agent.md",
-      "tier": "convenience",
-      "multi_agent": true
+      "tier": "convenience"
     },
     {
-      "path": "templates/agents.json.example",
-      "tier": "convenience",
-      "multi_agent": true
+      "path": "health/__init__.py",
+      "tier": "essential",
+      "note": "engram-alpha#2537 amendment 3 folder move: PEP 420 makes this non-load-bearing (Luria measured both import styles resolve without it), kept as an explicit package marker matching the tools/ package precedent."
     },
     {
-      "path": "src/build/instruction_manifestation/__init__.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/__init__.py",
-      "note": "instruction-manifestation engine PR2 (#2140): package init. Lives directly under src/build/ (not source_root=src/engram), so 'source' is set explicitly -- without it the manifest's default source_root-relative resolution would wrongly flag this as dangling (same pattern as tools/recall_repetition_analysis.py's entry above). Developer (T3): a build-time schema/lint/generator system for authoring instruction templates, not something that runs at agent session time -- removing it doesn't break epistemic identity or continuity."
-    },
-    {
-      "path": "src/build/instruction_manifestation/schema.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/schema.py",
-      "note": "instruction-manifestation engine PR2 (#2140): component-file + harness-contract schema parsing and validator. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/builder.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/builder.py",
-      "note": "instruction-manifestation engine PR2 (#2140): flat-composition render/build logic. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/lints.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/lints.py",
-      "note": "instruction-manifestation engine PR2 (#2140): the three PR2-scope build-time lints (base-never-names-a-tool, unresolved-variable, extension_required coverage). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/generate_tool_policy_component.py",
-      "note": "instruction-manifestation engine PR2 (#2140): generator for the GENERATED tool-policy pilot component, sourced from deploy/tool_policy_facts.py. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
-    },
-    {
-      "path": "src/build/instruction_manifestation/components",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/components",
-      "note": "instruction-manifestation engine PR2 (#2140): the two new-schema pilot components (identity-self-reference-example, tool-policy + its claude extension) in a fresh location, entirely separate from and additive to #2145's untouched src/engram/templates/components/ (different schema, different directory). Directory-level entry, same granularity precedent as the templates/components entry above. Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3): build-time authoring content, not shipped/consumed at session time."
-    },
-    {
-      "path": "src/build/instruction_manifestation/harnesses",
-      "tier": "dev",
-      "source": "src/build/instruction_manifestation/harnesses",
-      "note": "instruction-manifestation engine PR2 (#2140): harness-contract directory (claude.yaml pilot only -- codex/dsh contracts are PR3's job). Not under source_root -- 'source' set explicitly (see __init__.py's entry note). Developer (T3), same reasoning."
+      "path": "health/signals.py",
+      "tier": "essential"
     }
   ],
   "excluded": [
     {
       "path": "tools/engram-generate-tool-capability-index.py",
       "reason": "maintainer/CI-time regeneration tool for the #1958 tool-capability index: reads server.py's real TOOL_CAPABILITIES dict + FastMCP's registered tool set and writes the checked-in tool_capability_index.txt artifact (root-level, not a generated/ subdirectory). No install ever needs to run it — it's invoked by repo contributors when a tool's capability line changes or a new tool is added, and by the drift-guard test in CI. Same shape as tools/engram-backfill-special-moment-edges.py's excluded[] entry: idempotent, safe to re-run, but not a recurring shipped mechanism."
+    },
+    {
+      "path": "tools/propose-generalizes-migration.py",
+      "reason": "one-shot adjudicated migration proposer for the `generalizes` relation (epic #2753, decision D5): opens the graph READ-ONLY and emits a candidate report that an agent adjudicates row by row via engram_add_edge, so it writes nothing itself and is run once per graph when the relation is introduced. Maintainer/migration tooling rather than a recurring shipped mechanism — same shape as the migrate_*/backfill one-shots already listed here (migrate_stranded_supported_by.py, migrate_prediction_pairing_edges.py, migrate_person_nodes.py, engram-backfill-special-moment-edges.py)."
     },
     {
       "path": "tools/selftest.py",
@@ -931,6 +1226,42 @@
     {
       "path": "tools/engram-backfill-special-moment-edges.py",
       "reason": "one-shot data-integrity repair: creates the missing 'about' edges every special_moments[].node_id should have had, for nodes written before this backfill existed (issue #1948); idempotent and safe to re-run, but not a recurring shipped mechanism any install needs to run regularly"
+    },
+    {
+      "path": "src/build/instruction_manifestation/__init__.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/schema.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/builder.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/lints.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/generate_tool_policy_component.py",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/components",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "src/build/instruction_manifestation/harnesses",
+      "reason": "engram-alpha#2547 colleague review (Ariadne): build-time-only tooling for authoring instruction-template components (PR2 of #2140) -- generates checked-in files during repo development, never invoked at agent session time or by an installed plugin. Same shape as tools/engram-generate-tool-capability-index.py above: a maintainer/dev-time regeneration tool, not a recurring shipped mechanism. Was tagged in mechanisms (dev tier) with a 'Developer (T3)' note that itself said 'not something that runs at agent session time' -- moved here to match what its own tier note already said. Nobody had decided to ship it; it landed in mechanisms because that path satisfies the tag-once gate with less friction than excluded's required reason line."
+    },
+    {
+      "path": "tools/_channel.py",
+      "reason": "#2857 step 2: its only live importer is tools/telegram_bot.py, already excluded above as persona-specific integration not part of generic ENGRAM install. Shipping _channel.py as a mechanism ships a module whose sole live consumer is never installed; kept in the repo (not deleted) because telegram_bot.py still uses it."
+    },
+    {
+      "path": "templates/agents.json.example",
+      "reason": "#2857 step 2: Lei's ruling (relayed by Kepler, 2026-09-14) -- exclude from public release. Local multi-agent support (this file's viz-server multi-agent config example) has no clean guideline/tooling story yet, and every current external user runs single-agent-per-machine, so there's no reason to ship a multi-agent topology example to them now."
     }
   ],
   "repo_only": [
@@ -945,6 +1276,30 @@
     {
       "path": "tests/test_cascade_playbox.py",
       "reason": "pytest suite for the cascade playbox harness (#2356) — same dev-tier (T3) rationale and blanket-coverage note as tests/cascade_playbox.py above."
+    },
+    {
+      "path": "tests/test_hook_emitter_path_resolution.py",
+      "reason": "regression test for gh#2570 (emitter path-resolution propagation) — dev-tier (T3) pytest suite, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_cascade_playbox.py precedent above."
+    },
+    {
+      "path": "tests/test_health_version_gate.py",
+      "reason": "engram-alpha#2563 Gap 3 — the health-version tag-diff gate's pytest suite (well-formedness + adequacy checks, falsifier suite against scratch git repos). Dev-tier (T3): a CI-only invariant-checks test, never a standalone shippable mechanism, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_hook_emitter_path_resolution.py precedent above."
+    },
+    {
+      "path": "tests/test_health_series.py",
+      "reason": "engram-alpha#2575 PR A — the health-score series store's pytest suite (schema, snapshot_files regex, old-format refusal, anchor resolution per design doc D1, ingest idempotence, the declarations gate per D4.1, rebuild's ordered-dump compare, detect_engine_build ordering, and the CLI-as-script check). Dev-tier (T3): a CI-only test suite for health/series.py, never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_health_version_gate.py precedent above."
+    },
+    {
+      "path": "tests/test_supervision_probe.py",
+      "reason": "engram-alpha#2749 — the fleet-wide per-seat supervision probe's pytest suite (cgroup grep exit-code discipline incl. Ariadne's empty-file open question, zero/many pid resolution, /proc/<pid>/stat field-22 parsing, systemd LoadState/ActiveState/timing, launchd registration verdicts). Dev-tier (T3): a CI-only test suite for tools/supervision_probe.py (itself dev-tier, see the mechanisms[] entry above), never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_health_series.py precedent above."
+    },
+    {
+      "path": "tests/test_fairy_report.py",
+      "reason": "engram-alpha#2760 — the fairy-report-durability tool's pytest suite (task-notification envelope extraction across queue-operation/attachment record shapes, latest-wins on duplicate/re-fired notifications, malformed-line resilience, CLI --task/--grep contracts). Dev-tier (T3): a CI-only test suite for tools/fairy_report.py (itself dev-tier, see the mechanisms[] entry above), never a standalone shippable mechanism itself, so it has no plugin-install path of its own. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_supervision_probe.py precedent above."
+    },
+    {
+      "path": "tests/test_reflect_rs_or_claim_constants.py",
+      "reason": "engram-alpha#2773 — the fallback-cap naming follow-up from PR #2721: pytest suite for engram_core._reflect_rs_or_claim's REFLECT_SUMMARY_DISPLAY_CAP / REFLECT_CLAIM_FALLBACK_DISPLAY_CAP named constants (value/name checks, the deliberate 160-vs-130 divergence from engram_query's analogous pair, a static source-grep guarding against an accidental engram_query import, boundary tests derived from the constants themselves). Dev-tier (T3): a CI-only pytest suite, never a standalone shippable mechanism itself — this holds regardless of engram_core.py's own tier (T1-Essential), since no test file ships in any install tier. Already covered by the blanket tests/ entry above; listed explicitly here to record the tier decision in the manifest rather than only in the PR/commit history (\"the manifest is a transcription, not a re-derivation\"), matching the tests/test_fairy_report.py precedent above."
     },
     {
       "path": ".github/",
@@ -985,6 +1340,10 @@
     {
       "path": "pytest.ini",
       "reason": "pytest configuration — dev test config, never shipped"
+    },
+    {
+      "path": ".coveragerc",
+      "reason": "coverage.py configuration for the #2774 coverage instrumentation (nightly.yml's --cov flags + tools/coverage-diff.sh) — dev/CI test config, never shipped"
     },
     {
       "path": "requirements/",
@@ -1037,6 +1396,18 @@
     {
       "path": "deploy/tool_policy_facts.py",
       "reason": "canonical TOOL POLICY fact table consumed only by tests/test_tool_policy_sync.py (the three-surface drift guard) — CI-only, never shipped in any install tier"
+    },
+    {
+      "path": ".githooks/pre-push",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, sharpened on inspection): a per-clone git pre-push hook (activated via 'git config core.hooksPath .githooks' in a contributor's own checkout) that checks PR-body close-keywords before push -- issue #1001. Meaningful only inside a real git clone of this repo; an installed plugin bundle has no .git directory and nothing ever activates core.hooksPath for it. Same shape as tests/, docs/, .github/ above -- repo development workflow, never shipped."
+    },
+    {
+      "path": "packaging/test-map.json",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, second pass): the manifest-can-run-from-plugin bar applied consistently means neither packaging json belongs shipped either. tools/release_gates.py load_config() and tools/run_touched_tests.py _load_test_map()/TEST_MAP_PATH both resolve the config path as repo_root-relative src/engram/packaging/<file>.json (release_gates.py:79; run_touched_tests.py:51,61) -- never plugin_root/packaging/<file>.json, which is where the manifest ships them. Verified further: run_touched_tests.py._find_repo_root() requires pytest.ini + tests/ as ancestor markers, both absent from an installed plugin bundle, so it cannot even resolve a repo_root there -- confirmed via source, not assumption. Both tools are themselves dev-tier-shipped but already non-functional from an installed bundle (repo-checkout-only tools) -- a pre-existing, separate issue, out of scope here. Their config companions were never a live recovery: moved to repo_only alongside the source at src/engram/packaging/."
+    },
+    {
+      "path": "packaging/release-gates.json",
+      "reason": "engram-alpha#2547 colleague review (Ariadne, second pass): the manifest-can-run-from-plugin bar applied consistently means neither packaging json belongs shipped either. tools/release_gates.py load_config() and tools/run_touched_tests.py _load_test_map()/TEST_MAP_PATH both resolve the config path as repo_root-relative src/engram/packaging/<file>.json (release_gates.py:79; run_touched_tests.py:51,61) -- never plugin_root/packaging/<file>.json, which is where the manifest ships them. Verified further: run_touched_tests.py._find_repo_root() requires pytest.ini + tests/ as ancestor markers, both absent from an installed plugin bundle, so it cannot even resolve a repo_root there -- confirmed via source, not assumption. Both tools are themselves dev-tier-shipped but already non-functional from an installed bundle (repo-checkout-only tools) -- a pre-existing, separate issue, out of scope here. Their config companions were never a live recovery: moved to repo_only alongside the source at src/engram/packaging/."
     }
   ],
   "build_inputs": [

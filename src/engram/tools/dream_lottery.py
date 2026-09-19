@@ -2,7 +2,13 @@
 """dream_lottery.py — Weight-aging lottery draw for the sleep-cycle dream fairies.
 
 Design of record: Lei, converged with Kepler 2026-08-03 (engram-alpha#1901),
-refined same night to a three-class split (comment on #1901):
+refined same night to a three-class split (comment on #1901). The third
+class -- an urgency interrupt that force-included cascade-sensitive
+categories when the day's retraction/supersede-cascade markers met a
+threshold -- was **removed 2026-09-11 (issue #2399, Lei's ruling)**: the
+#2013 cascade-frontier machine made nightly marker cleanup an unconditional
+dream-master obligation, and a scan that already runs every night needs no
+forcing. What remains is a two-class split:
 
   1. **Always-on** — the batch-summary (recall_summary) cohort step. Its work
      scales with the day's new-node cohort and is essential whenever nodes
@@ -15,22 +21,52 @@ refined same night to a three-class split (comment on #1901):
      raise this later; the design note says "maybe two later"). All-8-nightly
      was the heaviest recurring token spend for a mostly-zero-findings scan
      at current graph sizes.
-  3. **Urgency interrupt** — if the day's retraction/supersede-cascade
-     markers (``edit_history.action IN ('retracted', 'superseded',
-     'stale_flagged', 'support_lost')``) meet or exceed a threshold, the
-     cascade-sensitive categories are force-included regardless of the draw.
-     Lottery = frequency; interrupt = urgency (issue's own framing).
 
 Algorithm (weight-aging lottery, issue #1901 design 1):
   - All types start weight 1.
   - Draw proportional to weight (a type with weight W has P = W / sum(weights)).
   - The drawn type's weight resets to 0; every OTHER type's weight += 1.
-  - Interrupt-forced types are treated the same as a draw for weight-reset
-    purposes ("its weight still resets") but do not consume the random draw.
   - Properties: roughly uniform draw frequency over time: no starvation
     (an overdue type's weight climbs without bound until it is drawn with
     near-certainty); no phase-locking with any fixed-period external rhythm,
     because the draw is a function of accumulated skips, not calendar day.
+
+**Pre-registered constraint (2026-08-31, before this mechanism existed):
+health-score metric deltas may never influence which categories the lottery
+selects, through any route by which that influence could travel.** Binding this
+rule to a mechanism has left a route open on every prior draft (see PR #2468
+for the drafting history): a wording bound to the shape of the data -- inputs
+and parameters -- missed logic folded straight into ``run_draw``'s own body
+without ever becoming a parameter; a wording bound instead to a call boundary
+("no code inside ``run_draw``, or any function it calls") closed that gap but
+missed tuning inserted upstream of the call, in ``cmd_draw``'s own window
+between ``load_state`` and the ``run_draw`` call -- so this wording binds to
+the outcome directly, deliberately, rather than to whichever mechanism it might
+travel through next. Four routes are named here as covered illustrations of
+that outcome, not as its boundary: (1) any input ``run_draw`` receives; (2) any
+code inside ``run_draw`` or the functions it calls; (3) any code that loads,
+prepares, or mutates the state, config, or arguments handed to it -- including
+``cmd_draw``'s own window between ``load_state`` and ``run_draw``, and any
+helper it calls there; and (4) any direct edit of a file this module reads that
+feeds selection -- the persisted state file (``~/.engram/dream-lottery.json``)
+-- including by a process entirely outside this module. The weights, the
+RNG source, and the draw count illustrate what the constraint already
+covers, not its boundary -- a later parameter, folded-in
+logic, or a new preparation step is covered on arrival, without needing its own
+amendment here. The health-score redesign (issue #1991 §4) makes the score its
+own falsifier, which makes every metric a target -- three structural brakes
+guard against that: (1) the delta is diagnostic, never itself a score; (2)
+flags have no cheap gradient; (3) this lottery decouples category selection
+from the score entirely -- because category selection is drawn, not scored,
+the score's gradient must never reach it, confining optimisation pressure to
+within-category suggestion adjudication. Tuning any of the above
+from score deltas would remove that confinement and reopen the hazard the
+lottery exists to close. The failure mode is not misconduct -- it is a well-intentioned maintainer
+improving a number, including a maintainer's own judgment, informed by having
+looked at the metric, encoded as an ordinary code edit -- which is why the rule
+had to be written down in advance, before anyone had a result to justify
+reaching for it. Prescribed by Kepler in his consultant pass on DESIGN v3,
+accepted by Borges, both on issue #1991.
 
 State file: ``~/.engram/dream-lottery.json`` — schema in DEFAULT_STATE below.
 Written eagerly at draw time (weights-in -> weights-out is one atomic
@@ -50,10 +86,10 @@ aging step and silently corrupt the sequence. Override with ``--force``
 if you genuinely mean it (e.g. recovering from a bad prior run). Dry-runs
 are exempt since they never persist. The guard's signal is "did any
 category's ``last_run_turn`` get stamped this turn" -- which only happens
-for types in ``ran_keys`` (drawn ∪ interrupt-forced). A ``--count 0`` draw
-with no interrupt firing would leave ``ran_keys`` empty and silently
-defeat the guard (caught by reviewer-fairy on #1912's own review, verified
-live before shipping); ``--count`` is therefore rejected below 1.
+for types in ``ran_keys`` (the drawn set). A ``--count 0`` draw would leave
+``ran_keys`` empty and silently defeat the guard (caught by reviewer-fairy
+on #1912's own review, verified live before shipping); ``--count`` is
+therefore rejected below 1.
 
 History file (issue #1909): ``~/.engram/dream-lottery-history.jsonl`` —
 derived from the state path (``dream-lottery.json`` ->
@@ -62,9 +98,9 @@ derived from the state path (``dream-lottery.json`` ->
 Override explicitly with ``--history``. One compact JSON line is appended
 per draw — the full ``result`` record from ``run_draw`` (it already carries
 ``turn`` and ``now``), so the rich per-draw shape (``weights_before``,
-``weights_after``, ``drawn_types``, ``types_to_run``, ``interrupt_fired``,
-``cascade_marker_count``) that used to be printed to stdout and lost is now
-durable and queryable via the ``history`` subcommand. No rotation or
+``weights_after``, ``drawn_types``, ``types_to_run``) that used to be
+printed to stdout and lost is now durable and queryable via the
+``history`` subcommand. No rotation or
 pruning: one line a night is ~365 lines/year, cheap indefinitely — do not
 add log rotation here without a real reason to.
 
@@ -76,12 +112,6 @@ effective draw that went unlogged (history write failed) — so state
 commits before we even attempt to log it, and a history-write failure is
 caught and downgraded to a stderr warning: it must never fail the command
 or imply the draw itself didn't happen. See ``cmd_draw``.
-
-The `INTERRUPT_TYPES` default ({2, 5} -- contradictions + tainted-valid) is
-this module's own reading of the issue's "cascade/contradiction fairy"
-phrase, not literally specified there (Kepler's formal spec had not landed
-as of #1901's filing). Flagged for Kepler/Lei's read; override via
---interrupt-types if the call should differ.
 
 Usage:
     python -m tools.dream_lottery draw --db ~/.engram/knowledge.db --turn 39
@@ -96,7 +126,6 @@ import argparse
 import json
 import os
 import random
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -136,6 +165,7 @@ CATEGORIES: dict[int, str] = {
     9: "coverage-gaps",
     10: "person-node-maintenance",
     11: "support-lost",
+    12: "generalization-candidates",
 }
 
 # Categories whose scan is genuinely window-scoped (per the #1901 audit --
@@ -146,20 +176,6 @@ CATEGORIES: dict[int, str] = {
 # self-relative and needs no watermark at all (Luria's #1903 review note);
 # category 7 is watermark-scoped throughout, no such split.
 WINDOW_SCOPED_CATEGORIES: frozenset[int] = frozenset({6, 7})
-
-# Emptied 2026-08-19 per Lei + #1992 -- the {2,5} force-set checked
-# contradiction/taint NODES, not the day's stale/taint MARKERS the interrupt
-# intends, and dominated rotation (12 of 19 fairy runs forced over the first
-# 11 draws). Re-point via --interrupt-types when the #2013 cascade machine
-# gives dreams a principled marker-resolution path.
-DEFAULT_INTERRUPT_TYPES: frozenset[int] = frozenset()
-
-# #1901 says only "a small threshold" -- 3 is this module's own calibration
-# call, not a value the issue specifies. Override with --interrupt-threshold;
-# revisit once there's real data on how often 3 fires in practice.
-DEFAULT_INTERRUPT_THRESHOLD = 3
-
-CASCADE_ACTIONS = ("retracted", "superseded", "stale_flagged", "support_lost")
 
 STATE_SCHEMA_VERSION = 1
 
@@ -175,7 +191,6 @@ def default_state() -> dict:
             str(n): {"weight": 1, "last_run_turn": None, "last_run_at": None}
             for n in CATEGORIES
         },
-        "last_interrupt_check_at": None,
     }
 
 
@@ -194,7 +209,6 @@ def load_state(path: str = DEFAULT_STATE_PATH) -> dict:
         state["types"] = base["types"]
     for k, v in base["types"].items():
         state["types"].setdefault(k, v)
-    state.setdefault("last_interrupt_check_at", None)
     state.setdefault("schema_version", STATE_SCHEMA_VERSION)
     return state
 
@@ -222,36 +236,6 @@ def append_history(result: dict, path: str = DEFAULT_HISTORY_PATH) -> None:
         f.write(json.dumps(result, sort_keys=True) + "\n")
 
 
-def count_cascade_markers(db_path: str, since_iso: str | None) -> int:
-    """Count edit_history rows for cascade-producing actions since `since_iso`.
-
-    `since_iso=None` counts across all of history. NOT reached by
-    `run_draw`'s cold-start path -- that branch short-circuits to a
-    baseline of 0 rather than ever calling this function with `None` (see
-    the cold-start comment in `run_draw`; caught by Borges reviewing
-    #1910, #1907). This all-history mode is exercised only by a direct
-    call (e.g. tests) or a future explicit audit path, not by the normal
-    draw flow.
-    """
-    conn = sqlite3.connect(db_path)
-    try:
-        placeholders = ",".join("?" for _ in CASCADE_ACTIONS)
-        if since_iso:
-            row = conn.execute(
-                f"SELECT COUNT(*) FROM edit_history "
-                f"WHERE action IN ({placeholders}) AND timestamp >= ?",
-                (*CASCADE_ACTIONS, since_iso),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                f"SELECT COUNT(*) FROM edit_history WHERE action IN ({placeholders})",
-                CASCADE_ACTIONS,
-            ).fetchone()
-        return int(row[0]) if row else 0
-    finally:
-        conn.close()
-
-
 def weighted_draw(weights: dict[str, float], rng: random.Random) -> str:
     """Pick one key from `weights`, probability proportional to its value.
 
@@ -277,8 +261,6 @@ def run_draw(
     db_path: str,
     turn: int,
     count: int = 1,
-    interrupt_types: frozenset[int] = DEFAULT_INTERRUPT_TYPES,
-    interrupt_threshold: int = DEFAULT_INTERRUPT_THRESHOLD,
     rng: random.Random | None = None,
     now_iso: str | None = None,
 ) -> dict:
@@ -290,29 +272,8 @@ def run_draw(
 
     weights_before = {k: v["weight"] for k, v in state["types"].items()}
 
-    prev_check = state.get("last_interrupt_check_at")
-    if prev_check is None:
-        # Cold start (state file never recorded a check): seed the baseline
-        # to now rather than scanning all of history. Matches this repo's
-        # own seed-to-current convention for the forum monitors -- and
-        # Kepler's own pilot note on #1901 ("night one needs no data --
-        # uniform draw"). Scanning full history here would spuriously fire
-        # the interrupt on turn 1 of any install with real cascade activity
-        # in its past (caught live: 81 lifetime markers tripped a
-        # threshold=3 interrupt on a fresh dry-run against this graph).
-        cascade_count = 0
-    else:
-        cascade_count = count_cascade_markers(db_path, prev_check)
-    # An empty interrupt_types set has nothing to force-include, so it must
-    # never report interrupt_fired=True -- the cascade count is still
-    # computed and recorded below regardless (result["cascade_marker_count"]),
-    # only the force-triggering is gated on there being types to force.
-    interrupt_fired = bool(interrupt_types) and cascade_count >= interrupt_threshold
-    interrupt_keys = {str(n) for n in interrupt_types} if interrupt_fired else set()
-
-    weights_for_draw = {k: v for k, v in weights_before.items() if k not in interrupt_keys}
     drawn: list[str] = []
-    pool = dict(weights_for_draw)
+    pool = dict(weights_before)
     for _ in range(max(count, 0)):
         if not pool:
             break
@@ -320,7 +281,7 @@ def run_draw(
         drawn.append(pick)
         del pool[pick]  # don't draw the same type twice in one night
 
-    ran_keys = set(drawn) | interrupt_keys
+    ran_keys = set(drawn)
 
     new_types = {}
     for k, v in state["types"].items():
@@ -340,7 +301,6 @@ def run_draw(
     new_state = {
         "schema_version": STATE_SCHEMA_VERSION,
         "types": new_types,
-        "last_interrupt_check_at": now_iso,
     }
 
     window_params = {}
@@ -352,10 +312,6 @@ def run_draw(
     result = {
         "turn": turn,
         "now": now_iso,
-        "cascade_marker_count": cascade_count,
-        "interrupt_threshold": interrupt_threshold,
-        "interrupt_fired": interrupt_fired,
-        "interrupt_types": sorted(int(k) for k in interrupt_keys),
         "drawn_types": sorted(int(k) for k in drawn),
         "types_to_run": sorted(int(k) for k in ran_keys),
         "types_to_run_slugs": {k: CATEGORIES[int(k)] for k in ran_keys},
@@ -387,29 +343,16 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
 
     Returns an error message string if invalid, ``None`` if OK. This is a
     class-level fix, not a one-off: this module has several unvalidated
-    integer CLI args (``--count``, ``--limit``, ``--interrupt-threshold``,
-    ``--turn``), and three independent failures were found in one review
-    pass on #1912 (Sol's reviewer-fairy: ``--count 0`` silently defeats the
-    re-entrancy guard; Borges: ``--interrupt-threshold 0`` fires the
-    interrupt unconditionally on a night with zero cascade activity,
-    silently disabling the lottery's whole rotation premise). Each arg
-    gets an explicit, named decision here rather than three independent
-    patches, so a fourth bad value doesn't wait for a fourth reviewer to
-    notice it by hand:
+    integer CLI args (``--count``, ``--limit``, ``--turn``), and a review
+    pass on #1912 found a real failure here (Sol's reviewer-fairy:
+    ``--count 0`` silently defeats the re-entrancy guard). Each arg gets an
+    explicit, named decision here rather than an independent patch, so the
+    next bad value doesn't wait for a reviewer to notice it by hand:
 
     - ``--count < 1``: REJECTED. A draw that draws nothing has no design
-      purpose, and when no interrupt fires it also silently defeats the
-      re-entrancy guard (no category's ``last_run_turn`` gets stamped, so
-      a same-turn re-run is never detected).
-    - ``--interrupt-threshold < 1``: REJECTED. ``interrupt_fired =
-      bool(interrupt_types) and cascade_count >= interrupt_threshold`` is
-      unconditionally true for any ``threshold <= 0`` *when a force-set is
-      configured* (cascade_count is never negative) -- the exact value
-      someone would plausibly type meaning "no threshold", the opposite of
-      what it actually does. On the default empty ``interrupt_types`` this
-      guard is currently inert (nothing to force-include either way), but
-      it stays for anyone who passes ``--interrupt-types``, which is
-      exactly the configuration #2013 will restore.
+      purpose, and it also silently defeats the re-entrancy guard (no
+      category's ``last_run_turn`` gets stamped, so a same-turn re-run is
+      never detected).
     - ``--limit`` (history subcommand, not draw): deliberately NOT a
       reject case. ``<= 0`` is a documented sentinel meaning "no limit"
       (issue #1911) -- handled in ``tally_history``, not here.
@@ -421,19 +364,9 @@ def _validate_draw_args(args: argparse.Namespace) -> str | None:
     if args.count < 1:
         return (
             f"--count must be >= 1 (got {args.count}). A draw that draws nothing "
-            "has no design purpose and, when no interrupt fires, silently defeats "
-            "the re-entrancy guard (no category's last_run_turn gets set, so a "
-            "same-turn re-run is never detected)."
-        )
-    if args.interrupt_threshold < 1:
-        return (
-            f"--interrupt-threshold must be >= 1 (got {args.interrupt_threshold}). "
-            "interrupt_fired = bool(interrupt_types) and cascade_count >= "
-            "interrupt_threshold is unconditionally true for threshold <= 0 "
-            "when a force-set is configured (--interrupt-types), silently "
-            "forcing the interrupt-mapped categories in every night regardless "
-            "of real cascade activity. On the default empty interrupt_types "
-            "this has no effect."
+            "has no design purpose and silently defeats the re-entrancy guard "
+            "(no category's last_run_turn gets set, so a same-turn re-run is "
+            "never detected)."
         )
     return None
 
@@ -452,19 +385,12 @@ def cmd_draw(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    interrupt_types = (
-        frozenset(int(x) for x in args.interrupt_types.split(","))
-        if args.interrupt_types
-        else DEFAULT_INTERRUPT_TYPES
-    )
     rng = random.Random(args.seed) if args.seed is not None else random.Random()
     outcome = run_draw(
         state,
         db_path=args.db,
         turn=args.turn,
         count=args.count,
-        interrupt_types=interrupt_types,
-        interrupt_threshold=args.interrupt_threshold,
         rng=rng,
     )
     history_path = args.history or history_path_for_state(args.state)
@@ -505,7 +431,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
     print(
         json.dumps(
-            {"state_path": args.state, "last_interrupt_check_at": state["last_interrupt_check_at"], "types": rows},
+            {"state_path": args.state, "types": rows},
             indent=2,
         )
     )
@@ -546,7 +472,6 @@ def tally_history(path: str, limit: int | None = None) -> dict:
             "category": n,
             "slug": CATEGORIES[n],
             "drawn_count": 0,
-            "interrupt_forced_count": 0,
             "total_runs": 0,
             "last_run_at": None,
             "last_run_turn": None,
@@ -555,7 +480,6 @@ def tally_history(path: str, limit: int | None = None) -> dict:
     }
 
     cycles_counted = 0
-    interrupt_cycles = 0
     skipped_malformed = 0
     first_timestamp: str | None = None
     last_timestamp: str | None = None
@@ -564,17 +488,13 @@ def tally_history(path: str, limit: int | None = None) -> dict:
         try:
             rec = json.loads(line)
             drawn = rec["drawn_types"]
-            interrupt = rec["interrupt_types"]
             turn = rec["turn"]
             now = rec["now"]
-            interrupt_fired = rec["interrupt_fired"]
         except (ValueError, TypeError, KeyError):
             skipped_malformed += 1
             continue
 
         cycles_counted += 1
-        if interrupt_fired:
-            interrupt_cycles += 1
         if first_timestamp is None:
             first_timestamp = now
         last_timestamp = now
@@ -587,19 +507,10 @@ def tally_history(path: str, limit: int | None = None) -> dict:
             entry["total_runs"] += 1
             entry["last_run_at"] = now
             entry["last_run_turn"] = turn
-        for cat_num in interrupt:
-            entry = per_category.get(str(cat_num))
-            if entry is None:
-                continue
-            entry["interrupt_forced_count"] += 1
-            entry["total_runs"] += 1
-            entry["last_run_at"] = now
-            entry["last_run_turn"] = turn
 
     return {
         "history_path": str(p),
         "cycles_counted": cycles_counted,
-        "interrupt_cycles": interrupt_cycles,
         "skipped_malformed": skipped_malformed,
         "first_timestamp": first_timestamp,
         "last_timestamp": last_timestamp,
@@ -626,8 +537,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_draw.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to knowledge.db")
     p_draw.add_argument("--turn", type=int, required=True, help="Current turn number (pre-advance)")
     p_draw.add_argument("--count", type=int, default=1, help="Types to draw (default 1; design allows raising to 2 later; must be >= 1)")
-    p_draw.add_argument("--interrupt-types", default=None, help="Comma-separated category numbers force-included on cascade interrupt (default: 2,5)")
-    p_draw.add_argument("--interrupt-threshold", type=int, default=DEFAULT_INTERRUPT_THRESHOLD, help="Cascade-marker count that triggers the interrupt (must be >= 1)")
     p_draw.add_argument("--seed", type=int, default=None, help="Seed the RNG (testing/reproducibility only)")
     p_draw.add_argument("--dry-run", action="store_true", help="Compute and print the draw without persisting state")
     p_draw.add_argument(

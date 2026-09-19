@@ -205,7 +205,7 @@ If the friction recurs or the fix introduced new friction — record that as a n
 ### 5c. Nap checkpoint
 
 ```
-engram_nap(payload_json=json.dumps({"message": "<summary: gap addressed, change made, principles followed, tests passed>"}))
+engram_checkpoint(payload_json=json.dumps({"message": "<summary: gap addressed, change made, principles followed, tests passed>"}))
 ```
 
 ---

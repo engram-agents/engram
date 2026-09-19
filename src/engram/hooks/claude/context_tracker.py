@@ -511,7 +511,7 @@ def format_drowsiness(usage: dict) -> str:
             "  You're close to compaction. Stop current work and consolidate:\n"
             f"  1. Write key observations and derivations to ENGRAM\n"
             f"  2. Update your warm briefing ({WARM_BRIEFING_PATH})\n"
-            "  3. Run engram_nap\n"
+            "  3. Load and run the engram-nap skill\n"
             "  Tell the user: \"I'm very drowsy — let me take a nap to consolidate.\""
         )
     # Dispatch on threshold, not on the level word, so partial-config setups

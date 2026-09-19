@@ -10,6 +10,7 @@ HOUSE RULES (mirror engram_core.py § HOUSE RULES):
 """
 
 import json
+import os
 
 import engram_core as core
 from tools.recall_summary_validator import validate_summary_entry
@@ -42,6 +43,23 @@ from tools.recall_summary_validator import validate_summary_entry
 # Idempotent: re-writing the same node with the same summary is a no-op.
 # Constants + per-entry validation live in tools/recall_summary_validator.py
 # (single source of truth — used both here and by the batch-summary-fairy).
+#
+# File-based input (payload_json["summaries_file"]): an alternative to inline
+# "summaries" for large batches (the sleep cycle's cohort-dispatch workflow
+# writes its output to final_payload.json on disk — with the cohort cap
+# removed this can run 40KB+, and re-typing that verbatim through the model
+# to pass it inline is pure transcription waste with a silent failure mode).
+# When "summaries_file" is given, this reads that path, parses it as JSON,
+# and expects the SAME {"summaries": [...], "failures": [...]} shape that
+# tools/recall_summary_payload.PayloadBuilder.to_json() emits (also what
+# cohort_dispatch's "validate" subcommand writes to final_payload.json) —
+# then proceeds down the identical apply path as the inline case. The path
+# MUST be absolute: the MCP server is a long-lived process whose working
+# directory is fixed at launch and is not guaranteed to track the calling
+# agent's own (mutable, per-call) cwd — a relative path could silently
+# resolve to an unrelated file. "summaries" and "summaries_file" together is
+# a loud, ambiguous-input error; neither present is the existing
+# missing-"summaries" error.
 def _set_recall_summaries_impl(payload_json: str) -> str:
     """Impl for engram_set_recall_summaries — takes raw payload_json string."""
     # -- Parse payload --
@@ -53,7 +71,68 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
             "got": str(payload_json)[:100],
         })
 
-    if not isinstance(payload, dict) or not isinstance(payload.get("summaries"), list):
+    if not isinstance(payload, dict):
+        return json.dumps({"error": "payload_json must have 'summaries' as a list"})
+
+    has_inline = "summaries" in payload
+    has_file = "summaries_file" in payload
+
+    if has_inline and has_file:
+        return json.dumps({
+            "error": (
+                "payload_json must not include both 'summaries' and "
+                "'summaries_file' — ambiguous input, applying nothing"
+            ),
+        })
+
+    summaries_file_path = None
+
+    if has_file:
+        raw_path = payload["summaries_file"]
+        if not isinstance(raw_path, str) or not raw_path:
+            return json.dumps({
+                "error": "'summaries_file' must be a non-empty string path",
+                "got": raw_path,
+            })
+        if not os.path.isabs(raw_path):
+            return json.dumps({
+                "error": (
+                    "'summaries_file' must be an absolute path — the MCP server "
+                    "runs as its own long-lived process whose working directory "
+                    "is not guaranteed to match the calling agent's cwd, so a "
+                    "relative path could silently resolve to the wrong file"
+                ),
+                "got": raw_path,
+            })
+        if not os.path.exists(raw_path):
+            return json.dumps({"error": f"summaries_file not found: {raw_path}"})
+        if not os.path.isfile(raw_path):
+            return json.dumps({"error": f"summaries_file is not a regular file: {raw_path}"})
+        try:
+            with open(raw_path, "r", encoding="utf-8") as fh:
+                file_text = fh.read()
+        except PermissionError as exc:
+            return json.dumps({"error": f"summaries_file is not readable: {raw_path} ({exc})"})
+        except OSError as exc:
+            return json.dumps({"error": f"could not read summaries_file {raw_path}: {exc}"})
+        try:
+            file_payload = json.loads(file_text)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"error": f"summaries_file is not valid JSON: {raw_path} ({exc})"})
+        if not isinstance(file_payload, dict) or not isinstance(file_payload.get("summaries"), list):
+            return json.dumps({
+                "error": (
+                    f"summaries_file must be a JSON object with 'summaries' as a "
+                    f"list (the shape cohort_dispatch validate / PayloadBuilder "
+                    f"emit): {raw_path}"
+                ),
+            })
+        payload = file_payload
+        summaries_file_path = raw_path
+    elif not has_inline:
+        return json.dumps({"error": "payload_json must have 'summaries' as a list"})
+
+    if not isinstance(payload.get("summaries"), list):
         return json.dumps({"error": "payload_json must have 'summaries' as a list"})
 
     summaries = payload["summaries"]
@@ -123,10 +202,18 @@ def _set_recall_summaries_impl(payload_json: str) -> str:
     finally:
         conn.close()
 
-    return json.dumps({
+    result = {
         "ok": ok,
         "errors": errors,
         "applied": len(ok),
         "failed": len(errors),
         "pre_flight_failures": pre_flight_failures,
-    })
+    }
+    # File-based responses always echo the resolved path, even when applied=0 —
+    # so a genuinely-empty final_payload.json ("nothing to summarize tonight")
+    # is distinguishable in the response from a misread/empty file, and never
+    # silently indistinguishable from an inline no-op call (which carries no
+    # such field, unchanged from before this feature).
+    if summaries_file_path is not None:
+        result["summaries_file"] = summaries_file_path
+    return json.dumps(result)

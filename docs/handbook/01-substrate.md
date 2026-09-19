@@ -243,19 +243,19 @@ Table: `focus_sets(name PRIMARY KEY, node_ids TEXT JSON array, description, crea
 
 ## **12. Nap & Sleep / Turn Advancement**
 
-**what** — Two checkpoint mechanisms: `engram_nap()` persists context WITHOUT advancing the turn counter (used before compaction, end of work burst); `engram_advance_turn()` increments the global turn counter (used only at sleep/session end, triggers exponential memory decay). Both mechanisms snapshot the graph to git (graph_snapshot.md + SQL dump), append to session_log.md, and compute diagnostic metrics. Nap arms a "nap_checkpoint" feeling-report nudge (TTL 5 turns).
+**what** — Two checkpoint mechanisms: `engram_checkpoint()` (formerly `engram_nap()`; renamed in issue #3015 — `engram_nap` remains a deprecated alias for one release) persists context WITHOUT advancing the turn counter (used before compaction, end of work burst); `engram_advance_turn()` increments the global turn counter (used only at sleep/session end, triggers exponential memory decay). Both mechanisms snapshot the graph to git (graph_snapshot.md + SQL dump), append to session_log.md, and compute diagnostic metrics. Nap arms a "nap_checkpoint" feeling-report nudge (TTL 5 turns).
 
 **how** — `_checkpoint_internal()` (7620–7771) shared logic: collects stats, appends to LOG_PATH, calls `_commit_snapshot()`, stores diagnostic snapshot in diagnostic_history. Parameter `advance_turn` decides whether to increment the turn counter (`_set_current_turn(new_turn+1)`) or leave it alone.
 
 Entry points:
-- `engram_nap()` (7813–7856): calls _nap_impl with advance_turn=False
+- `engram_checkpoint()` (formerly `engram_nap()`; 7813–7856): calls _nap_impl with advance_turn=False
 - `engram_advance_turn()` (7903–7986): calls _advance_turn_impl with advance_turn=True
 
 Nap behavior: mode="nap", turn unchanged, feeling-nudge written via `_write_feeling_nudge()` in `engram_core.py:1775`. Sleep behavior: mode="session", turn incremented, no nudge.
 
 **status-candidate** — **prod-presumed** (daily-once sleep invariant; nap fires multiple times per day at compaction boundaries).
 
-**files** — `engram_lifecycle.py` (`_checkpoint_internal()` :79; `_nap_impl()` :218; `_advance_turn_impl()` :223). server.py (wrappers: `engram_nap` :1951; `engram_advance_turn` :2065).
+**files** — `engram_lifecycle.py` (`_checkpoint_internal()` :79; `_nap_impl()` :218; `_advance_turn_impl()` :223). server.py (wrappers: `engram_checkpoint`, formerly `engram_nap`, :1951; `engram_advance_turn` :2065).
 
 **key constants** — `FEELING_NUDGE_TTL_TURNS=5` (`engram_core.py:165`).
 
@@ -388,11 +388,11 @@ Entry points:
 
 **how** — Columns (added via migration in `engram_core.py` DB init): recall_summary (TEXT), recall_keywords (TEXT JSON array). Fetch in `_build_inspect_recall_view()` in `engram_query.py:704` and tiered result rendering in `_build_tiered_results()` in `engram_query.py:1601`.
 
-Tool: `engram_set_recall_summaries()` (16872–16965) batch-applies valid entries, returns per-item errors. Validation via `tools/recall_summary_validator.py` (single source of truth for both this tool and summary-fairy).
+Tool: `engram_set_recall_summaries()` (`engram_recall_summaries.py:63–219`) batch-applies valid entries, returns per-item errors. Accepts EXACTLY ONE of inline `summaries` or an absolute-path `summaries_file` (reads + parses that JSON file, same `{"summaries": [...], "failures": [...]}` shape — for large batches, e.g. the sleep cycle's cohort-dispatch output; a relative path is rejected; the response echoes `summaries_file` back on the file-path call). Validation via `tools/recall_summary_validator.py` (single source of truth for both this tool and summary-fairy).
 
 **status-candidate** — **prod-presumed** (infrastructure active; backfill depends on sleep-cycle execution).
 
-**files** — `engram_core.py` (column migrations in DB init). `engram_query.py` (`_build_inspect_recall_view()` :704; `_build_tiered_results()` :1601). `engram_recall_summaries.py` (batch-write impl). server.py (wrapper `engram_set_recall_summaries` :5097). `tools/recall_summary_validator.py` (validation constants).
+**files** — `engram_core.py` (column migrations in DB init). `engram_query.py` (`_build_inspect_recall_view()` :704; `_build_tiered_results()` :1601). `engram_recall_summaries.py` (batch-write impl). server.py (wrapper `engram_set_recall_summaries` :6933). `tools/recall_summary_validator.py` (validation constants).
 
 **key constants** — Max 120 chars (soft), 200 chars (hard cap: `RECALL_SUMMARY_HARD_CAP` in `tools/recall_summary_validator.py:19`).
 

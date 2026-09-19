@@ -8,7 +8,11 @@ Type=simple
 # belong to the `agents` group (or have direct DB read access) so it can
 # reach peer-agent knowledge.db files.
 WorkingDirectory={{PLUGIN_ENGRAM_DIR}}
-ExecStart={{PYTHON}} {{PLUGIN_ENGRAM_DIR}}/viz_server.py --bind 127.0.0.1 --port 5001 --config /etc/engram-viz/agents.json
+# -m viz.server (not a direct viz/server.py script path): viz/server.py uses
+# relative imports to reach its sibling modules, which only resolve when run
+# as part of the viz package -- WorkingDirectory above puts PLUGIN_ENGRAM_DIR
+# on sys.path so `viz` resolves (engram-alpha#2555).
+ExecStart={{PYTHON}} -m viz.server --bind 127.0.0.1 --port 5001 --config /etc/engram-viz/agents.json
 
 Restart=on-failure
 RestartSec=5s

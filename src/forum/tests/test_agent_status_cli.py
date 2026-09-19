@@ -16,6 +16,7 @@ import io
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from unittest import mock
@@ -38,9 +39,20 @@ try:
     # sys.path at import time, so _status_derive is importable after forum_cli
     # loads and is registered in sys.modules as '_status_derive'.
     import _status_derive
+    # presence is _status_derive's own lazy dependency (imported inside
+    # derive_own_status / loop_gate_decision, not at module top -- see that
+    # module's docstring) but carries ITS OWN separate LAST_USER_ACTIVITY_PATH
+    # / PRESENCE_MODE_PATH module-level constants, independently resolved
+    # from ENGRAM_HOME (real $HOME by default) -- not the same object as
+    # _status_derive's own LAST_USER_ACTIVITY_PATH, and not touched by
+    # patching _status_derive.LOOP_MODE_PATH. #2704: this is the actual leak
+    # -- both this module's paths and presence's need patching for real
+    # test isolation.
+    import presence
     _CLI_AVAILABLE = True
 except ImportError:
     _status_derive = None  # type: ignore[assignment]
+    presence = None  # type: ignore[assignment]
     _CLI_AVAILABLE = False
 
 SKIP_CLI = pytest.mark.skipif(
@@ -136,6 +148,24 @@ def _mock_forum_projects(monkeypatch, projects=None):
         _status_derive.urllib.request, "urlopen",
         lambda req, timeout=None: resp,
     )
+
+
+def _patch_real_home_paths(monkeypatch, tmp_path):
+    """#2704: patch every real-$HOME-derived path derive_own_status reads
+    besides LOOP_MODE_PATH (which each fixture patches itself, since its
+    destination is also the test's own return value) -- both modules' own
+    LAST_USER_ACTIVITY_PATH copies (_status_derive's, read by
+    _recently_engaged, and presence's own separately-declared one) plus
+    presence's PRESENCE_MODE_PATH. All three point at fresh, nonexistent
+    tmp files; both modules' existing fail-open-on-missing-file behavior
+    then yields the neutral not-engaged/auto state. Shared by derive_env
+    and auto_env so a third fixture needing the same isolation can't
+    reintroduce the gap by copy-paste-and-forget (reviewer-fairy
+    suggestion on PR #2726)."""
+    last_activity_path = tmp_path / "last-user-activity"
+    monkeypatch.setattr(_status_derive, "LAST_USER_ACTIVITY_PATH", str(last_activity_path))
+    monkeypatch.setattr(presence, "LAST_USER_ACTIVITY_PATH", str(last_activity_path))
+    monkeypatch.setattr(presence, "PRESENCE_MODE_PATH", str(tmp_path / "presence-mode.json"))
 
 
 # ---------------------------------------------------------------------------
@@ -876,11 +906,21 @@ class TestDeriveOwnStatus:
         Patches _status_derive (where the values are READ by _read_loop_mode
         and _held_baton_turns) rather than forum_cli (which only holds copies
         of the imported names and is not the read site).
+
+        #2704: LOOP_MODE_PATH alone is NOT enough for real isolation.
+        derive_own_status also reads _status_derive.LAST_USER_ACTIVITY_PATH
+        (via _recently_engaged) and, through its lazy `import presence`,
+        presence's OWN separate LAST_USER_ACTIVITY_PATH / PRESENCE_MODE_PATH
+        -- none of those were patched, so a seat with a live loop marker (a
+        recent real last-user-activity stamp) forced state='engaged'
+        regardless of what the fixture staged in loop-mode.json. See
+        _patch_real_home_paths for the fix (shared with auto_env below).
         """
         loop_path = tmp_path / "loop-mode.json"
         proj_dir = tmp_path / "projects"  # #2316: PROJECTS_DIR removed outright, dead since #1608
         proj_dir.mkdir()
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
+        _patch_real_home_paths(monkeypatch, tmp_path)
         _mock_forum_projects(monkeypatch, [])
         return loop_path, proj_dir
 
@@ -954,6 +994,24 @@ class TestDeriveOwnStatus:
         assert state == "idle"  # never crashes a wake
         assert cadence is None
 
+    def test_isolation_control_patched_last_user_activity_is_the_real_read_site(self, derive_env):
+        """#2704 can-it-fail control. Writes a fresh timestamp to
+        ``_status_derive.LAST_USER_ACTIVITY_PATH`` as patched by ``derive_env``
+        and confirms ``derive_own_status`` reports 'engaged'. This is the
+        positive half of the isolation proof: if this test failed to see
+        'engaged' here, it would mean derive_own_status is NOT actually
+        reading the patched path -- which is exactly the bug shape #2704
+        reported (the code was reading the real, unpatched
+        last-user-activity file instead, so nothing the fixture staged
+        could affect the result). A fixture that merely fails to leak real
+        state is not enough proof by itself -- this shows the patched path
+        is genuinely the one under test, not just successfully ignored."""
+        loop_path, _ = derive_env  # no loop staged -> would be 'idle' but for the stamp below
+        with open(_status_derive.LAST_USER_ACTIVITY_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(time.time()))
+        state, _, _, _ = forum_cli.derive_own_status("alice")
+        assert state == "engaged"
+
 
 @SKIP_CLI
 class TestStatusAutoPublish:
@@ -967,6 +1025,12 @@ class TestStatusAutoPublish:
         # Patch _status_derive (the read site) not forum_cli (which only holds
         # copies of the imported names).
         monkeypatch.setattr(_status_derive, "LOOP_MODE_PATH", str(loop_path))
+        # #2704: same real-path leak as derive_env above (last-user-activity,
+        # both _status_derive's own copy and presence's separate one, plus
+        # presence's override file) -- see _patch_real_home_paths (shared
+        # with derive_env) for why LOOP_MODE_PATH alone doesn't isolate a
+        # status-auto run either.
+        _patch_real_home_paths(monkeypatch, tmp_path)
         # #1608: mock the forum /api/projects call to an empty list — no test in
         # this class asserts on held-baton content, so hermetic-and-empty is the
         # right default (mirrors derive_env above).

@@ -10,6 +10,7 @@ Bind: 0.0.0.0:5002 (5001 is viz_server). Same-LAN only for v0.1.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import sqlite3
@@ -17,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file
 
@@ -29,6 +31,12 @@ from .render import render_post_body
 
 # Path to the machine-readable API contract served at GET /forum.md
 _FORUM_MD_PATH = os.path.join(os.path.dirname(__file__), "FORUM.md")
+
+# Module-level logger for code that runs outside create_app()'s closure
+# (e.g. _check_flip_gate below, a module-level function so it's reusable /
+# unit-testable without a live app instance) -- app.logger is only
+# reachable from inside create_app() itself.
+logger = logging.getLogger(__name__)
 
 # Agent-name validation (#1468) is the coordination SSoT: db.is_valid_agent_name
 # (re-exported from coordination.names) for the routes' early-validation, and the
@@ -177,6 +185,255 @@ def _run_search(
         expected_rung="hybrid",
     )
     return results, mode_used
+
+
+# ---------------------------------------------------------------------------
+# Baton flip gate (#2884, second half)
+#
+# tools/baton.py's cmd_flip runs a CI-green / post-approval-freshness /
+# colleague-approval gate before flipping a baton to the maintainer -- but
+# forum.coordination.projects.flip() (the write body api_project_flip calls)
+# documents that validation as "the caller's job and is NOT performed here."
+# A client that talks to this REST endpoint directly (not through
+# tools/baton.py) bypassed every one of those checks silently. This section
+# mirrors cmd_flip's own gate at the route layer, sourced from the same
+# tools/baton_gate.py module tools/baton.py itself now imports from -- so
+# the two enforcement points can't drift apart on what "green" or
+# "maintainer-role flip" means.
+# ---------------------------------------------------------------------------
+
+# Cache: [module] on success, [] on not-yet-attempted, [None] on a
+# confirmed-failed load. A one-element-list sentinel (matching
+# tools/baton.py's own _POOL_SENTINEL_CACHE pattern) so "attempted and
+# failed" is distinguishable from "not attempted yet" without a second flag.
+_BATON_GATE_MODULE_CACHE: list = []
+
+
+def _load_baton_gate():
+    """Load tools/baton_gate.py's pure gate helpers; cache the outcome.
+
+    Returns the loaded module, or None if it could not be loaded (missing
+    file, import error, or any other failure). Callers MUST treat None as
+    "gate unavailable" and fail closed for any flip that could have been
+    gated -- never silently proceed as if the gate had run and passed.
+
+    Loaded by DIRECT FILE PATH (importlib.util.spec_from_file_location),
+    not `import baton_gate` / `from tools.baton_gate import ...` -- this
+    sidesteps two hazards a dotted import would carry:
+      1. Deployment: tools/install-forum-service.sh's rsync step snapshots
+         ONLY src/forum/ and tools/engram-pkg/ into the live service
+         directory -- tools/ itself (and therefore a `tools.baton_gate`
+         dotted import) is not currently part of that snapshot, so a
+         package-relative import would reliably fail there today. A
+         direct-file-path load still finds the module if a future deploy
+         places baton_gate.py as a sibling of this file's own directory
+         (mirroring how tools/engram-pkg/ is already sibling-deployed under
+         $APP/tools/) with ZERO further code changes here.
+      2. Test/dev sys.path collision: a bare `import tools.baton_gate`
+         resolves through sys.modules['tools'], which other test files in
+         this repo have been shown to silently poison with an unrelated
+         decoy package under certain sys.path orderings (see
+         tests/test_sys_path_collision_guard_2565.py). A direct file load
+         has no package-name collision surface at all.
+    """
+    if _BATON_GATE_MODULE_CACHE:
+        return _BATON_GATE_MODULE_CACHE[0]
+
+    try:
+        import importlib.util
+
+        # Walk-parents search, NOT a fixed parents[N] index (CLAUDE.md:
+        # "Plugin build restructures code paths" -- a fixed index calibrated
+        # against one layout silently overshoots in another, resolving to
+        # *a* path rather than the right one, or none at all). This walks
+        # up from src/forum/server.py's own location checking a couple of
+        # relative shapes at each level, so it finds the file whether this
+        # is the source-tree layout (repo_root/tools/baton_gate.py, a
+        # symlink to repo_root/src/engram/tools/baton_gate.py, found two
+        # levels up) or a hypothetical future deployed layout mirroring
+        # tools/engram-pkg/'s existing $APP/tools/ sibling-of-$APP shape
+        # (found one level up). Bounded to 6 levels -- comfortably covers
+        # both known layouts without risking an unrelated same-named file
+        # on a shared host far up the tree.
+        here = Path(__file__).resolve()
+        candidate = None
+        for parent in list(here.parents)[:6]:
+            for rel in ("tools/baton_gate.py", "src/engram/tools/baton_gate.py"):
+                p = parent / rel
+                if p.is_file():
+                    candidate = p
+                    break
+            if candidate is not None:
+                break
+        if candidate is None:
+            _BATON_GATE_MODULE_CACHE.append(None)
+            return None
+
+        spec = importlib.util.spec_from_file_location(
+            "_forum_baton_gate", candidate
+        )
+        if spec is None or spec.loader is None:
+            _BATON_GATE_MODULE_CACHE.append(None)
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        # Any failure at all (ImportError, OSError, a syntax error in a
+        # tampered file, ...) -> gate unavailable. Caller fails closed.
+        _BATON_GATE_MODULE_CACHE.append(None)
+        return None
+
+    _BATON_GATE_MODULE_CACHE.append(module)
+    return module
+
+
+def _check_flip_gate(store, pid: str, to_agent: str) -> Optional[tuple[str, int]]:
+    """Server-side mirror of cmd_flip's CI/approval/colleague gate.
+
+    Returns None when the flip may proceed (not PR-anchored, not a
+    maintainer-role flip, or all checks passed). Returns (message, status)
+    when the flip must be refused -- the caller returns
+    jsonify({"error": message}), status and does NOT call flip().
+
+    No --force equivalent: this is not an interactive CLI, and #2884's own
+    framing ("unknown must not render as permitted") argues against adding
+    a silent bypass knob to a REST caller.
+    """
+    from forum.coordination.markdown import parse_frontmatter
+
+    raw = store.read_project(pid)
+    if raw is None:
+        # Let the normal flip() call raise ProjectNotFound -> 404, unchanged.
+        return None
+
+    fields, body = parse_frontmatter(raw)
+    github_anchor = (fields.get("github") or "").strip().lower()
+
+    # Cheap, module-independent pre-check: only a "pr/..." anchor can ever
+    # be maintainer-role-gated (cmd_flip's _pr_anchor_match requires
+    # _parsed_anchor[0] == "pr"). A "project/<N>" anchor, no anchor at all,
+    # or anything else can never trigger the gate -- so we can safely
+    # proceed WITHOUT the gate module in those cases, even if the module
+    # failed to load. This keeps a broken/undeployed gate module from
+    # blocking flips that were never gated in the first place, while still
+    # failing closed for the one case that actually matters (see below).
+    if not github_anchor.startswith("pr/"):
+        return None
+
+    gate = _load_baton_gate()
+    if gate is None:
+        # We know this baton HAS a pr/... anchor (the prefix check above),
+        # so it is at least POSSIBLY subject to the gate -- but without the
+        # module we cannot parse the anchor or determine maintainer-role
+        # status. Fail closed rather than silently proceed ungated.
+        return (
+            f"flip gate unavailable for {pid} (server could not load its "
+            "CI/approval gate module) -- refusing to flip a PR-anchored "
+            "baton without being able to verify CI/approval/colleague "
+            "state. See server logs.",
+            422,
+        )
+
+    parsed_anchor = gate._parse_github_anchor(github_anchor)
+    pr_anchor_match = parsed_anchor is not None and parsed_anchor[0] == "pr"
+    if not pr_anchor_match:
+        # A "pr/" prefix that doesn't fully match the anchor grammar (e.g.
+        # malformed) is not pr_anchor_match either, matching cmd_flip.
+        return None
+
+    current_holder = (fields.get("turn") or "").strip().lower()
+    colleague_name = (fields.get("colleague") or "").strip().lower()
+    # #2961 follow-up (Ariadne's round-2 catch): the live store has batons
+    # created before the `author:` field existed -- fall back to deriving
+    # it from the turn log's own immutable "initialized -> X:" first line
+    # rather than a bulk migration write to every existing file (see
+    # gate._derive_legacy_author's own docstring for why that's the
+    # safer choice: a migration would race the running forum process's
+    # own concurrent writes to the same files).
+    author_name = (fields.get("author") or "").strip().lower() or gate._derive_legacy_author(body)
+
+    try:
+        is_maintainer_flip = gate._is_maintainer_flip(to_agent, current_holder, colleague_name, author_name)
+    except gate.PoolSentinelUnresolved as e:
+        return (f"cannot evaluate flip gate for {pid}: {e}", 422)
+
+    if not is_maintainer_flip:
+        # Self-flip or flip-to-the-registered-colleague -- not a
+        # "presenting for merge" signal; cmd_flip does not gate these either.
+        return None
+
+    if parsed_anchor[1] is None:
+        # #1918/#2511: unqualified pr/<N> anchor -- there is no default repo
+        # to guess against, matching cmd_flip's own refusal exactly.
+        return (
+            f"'{pid}' has no repo-qualified github anchor -- refusing to "
+            f"guess which repo's PR #{parsed_anchor[2]} to verify "
+            "CI/approval/colleague state against. Run "
+            f"'baton anchor {pid} --github pr/<owner>/<repo>/{parsed_anchor[2]}' "
+            "first.",
+            422,
+        )
+
+    pr_num = parsed_anchor[2]
+    pr_repo = parsed_anchor[1]
+
+    ci_state, ci_detail = gate._pr_ci_state(pr_num, repo=pr_repo)
+    if ci_state in ("red", "pending"):
+        return (
+            f"CI is {ci_state} on PR #{pr_num} ({ci_detail}) -- the current "
+            "tip is not merge-ready. Re-flip when checks are green.",
+            422,
+        )
+    if ci_state == "unknown":
+        logger.warning(
+            "flip gate: could not verify CI state for PR #%s (%s) — proceeding anyway",
+            pr_num, ci_detail,
+        )
+    # green: proceed silently
+
+    approval_state, approval_detail = gate._pr_approval_state(pr_num, repo=pr_repo)
+    if approval_state == "stale":
+        return (
+            f"tip moved after approval on PR #{pr_num} ({approval_detail}). "
+            "The approved commit is not the commit the maintainer would "
+            "merge — request a re-review of the new tip.",
+            422,
+        )
+    if approval_state == "no_approval":
+        participants = [
+            p.strip().lower()
+            for p in re.split(r"[,\[\]]", fields.get("participants", ""))
+            if p.strip()
+        ]
+        try:
+            sentinel = gate._resolve_pool_sentinel()
+        except gate.PoolSentinelUnresolved as e:
+            return (f"cannot evaluate flip gate for {pid}: {e}", 422)
+        colleague_participants = [
+            p for p in participants if p != current_holder and p != sentinel
+        ]
+        if colleague_participants:
+            return (
+                f"no colleague approval on PR #{pr_num}. A non-author "
+                "colleague must review and approve this PR before it goes "
+                "to the maintainer.",
+                422,
+            )
+        # Single-agent mode: no counterpart to perform the review — warn
+        # and proceed, matching cmd_flip.
+        logger.warning(
+            "flip gate: no colleague approval on PR #%s (no colleague "
+            "participant — single-agent mode; skipping colleague gate)",
+            pr_num,
+        )
+    elif approval_state == "unknown":
+        logger.warning(
+            "flip gate: could not verify post-approval state for PR #%s (%s) — proceeding anyway",
+            pr_num, approval_detail,
+        )
+    # fresh: proceed silently
+
+    return None
 
 
 def _read_project_state(store, pid: str) -> tuple[str, str]:
@@ -1644,7 +1901,7 @@ def create_app(
     def api_project_init():
         """Create a new project baton.
 
-        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?}
+        JSON body: {agent, project_id, title, status, turn, participants, turn_reason, github?, colleague?, author?}
         ``participants`` may be a list of strings OR a comma-separated string.
         Response: {seq, project_id}, 201.
         Errors: 400 (missing/invalid fields), 409 (already exists), 503 (store not configured).
@@ -1670,6 +1927,8 @@ def create_app(
         turn = (data.get("turn") or "").strip().lower()
         turn_reason = (data.get("turn_reason") or "").strip()
         github = (data.get("github") or "").strip() or None
+        colleague = (data.get("colleague") or "").strip() or None
+        author = (data.get("author") or "").strip() or None
 
         raw_parts = data.get("participants") or []
         if isinstance(raw_parts, str):
@@ -1685,7 +1944,8 @@ def create_app(
                 store, allocator, project_id,
                 title=title, status=status, turn=turn,
                 participants=participants, turn_reason=turn_reason,
-                by_agent=agent, github=github,
+                by_agent=agent, github=github, colleague=colleague,
+                author=author,
             )
         except ProjectAlreadyExists:
             return jsonify({"error": f"project already exists: {project_id}"}), 409
@@ -1698,6 +1958,24 @@ def create_app(
 
         JSON body: {agent, to_agent, reason}
         Response: {seq, turn, status}, 201.
+
+        Gate (#2884, second half): when the current project state + this
+        flip's `to_agent` represent a maintainer-role flip on a
+        repo-qualified PR-anchored baton, this mirrors tools/baton.py
+        cmd_flip's own CI-green / post-approval-freshness /
+        colleague-approval gate (see _check_flip_gate above) -- so a
+        client calling this endpoint directly (bypassing the CLI) can no
+        longer skip those checks. No --force equivalent (not an
+        interactive CLI). A self-flip or a flip to the registered
+        colleague (review-stage, not merge-stage) is never gated, matching
+        cmd_flip. If the gate module itself cannot be loaded, a flip on a
+        pr/-anchored baton is refused rather than silently let through --
+        see _load_baton_gate's docstring for the known deployment gap this
+        guards against.
+        Errors: 400 (missing/invalid fields), 404 (project not found),
+                422 (gate refusal: unqualified anchor, CI red/pending,
+                stale approval, missing colleague approval, or gate
+                module/sentinel unavailable), 503 (store not configured).
         """
         from forum.coordination import flip as _flip, ProjectNotFound
 
@@ -1718,6 +1996,11 @@ def create_app(
         reason = (data.get("reason") or "").strip()
         if not to_agent or not reason:
             return jsonify({"error": "to_agent and reason are required"}), 400
+
+        gate_refusal = _check_flip_gate(store, pid, to_agent)
+        if gate_refusal is not None:
+            message, gate_status = gate_refusal
+            return jsonify({"error": message}), gate_status
 
         try:
             seq = _flip(store, allocator, pid, to_agent=to_agent, reason=reason, by_agent=agent)
@@ -1955,6 +2238,58 @@ def create_app(
             return jsonify({"error": f"agent {agent!r} is not a participant of {pid}"}), 403
 
         return jsonify({"seq": seq, "added": added}), 201
+
+    @app.route("/api/projects/<pid>/colleague", methods=["POST"])
+    def api_project_set_colleague(pid: str):
+        """Set or change the colleague: field on a project baton (#2764).
+
+        JSON body: {agent, colleague}
+        ``agent`` is the agent performing the set — server-side authorization
+        requires ``agent`` to already be a current participant OR the
+        baton's current turn holder (LOAD-BEARING: lives in the coordination
+        write-fn, not here, so it can't be bypassed by a direct API call).
+        ``colleague`` is the agent being named; also added to ``participants``
+        (dedup) in the same atomic write.
+        Response: {seq, participant_added}, 201.
+        Errors: 400 (missing/invalid fields), 403 (agent not authorized),
+                404 (project not found), 503 (store not configured).
+        """
+        from forum.coordination import (
+            set_colleague as _set_colleague,
+            NotAParticipant,
+            ProjectNotFound,
+        )
+
+        store = app.config.get("COORD_STORE")
+        allocator = app.config.get("COORD_ALLOCATOR")
+        if store is None or allocator is None:
+            return jsonify({"error": "coordination store not configured"}), 503
+
+        data = request.get_json(silent=True)
+        if not data:
+            return jsonify({"error": "JSON body required"}), 400
+
+        agent = (data.get("agent") or "").strip().lower()
+        if not agent or not db.is_valid_agent_name(agent):
+            return jsonify({"error": "agent is required and must be valid"}), 400
+
+        colleague = (data.get("colleague") or "").strip().lower()
+        if not colleague or not db.is_valid_agent_name(colleague):
+            return jsonify({"error": f"invalid colleague name {colleague!r}"}), 400
+
+        try:
+            seq, participant_added = _set_colleague(
+                store, allocator, pid, agent=agent, colleague=colleague,
+            )
+        except ProjectNotFound:
+            return jsonify({"error": f"project not found: {pid}"}), 404
+        except NotAParticipant:
+            return jsonify({
+                "error": f"agent {agent!r} must be a participant or the "
+                         f"current turn holder of {pid} to set colleague",
+            }), 403
+
+        return jsonify({"seq": seq, "participant_added": participant_added}), 201
 
     @app.route("/api/projects/<pid>/gc", methods=["POST"])
     def api_project_gc(pid: str):

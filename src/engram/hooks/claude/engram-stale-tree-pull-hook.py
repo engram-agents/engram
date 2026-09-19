@@ -83,6 +83,15 @@ try:
 except Exception:
     _STALE_TREE_HOOKLIB_OK = False
 
+# engram-alpha#2863 WS2: bounded-injection helper + per-harness budget
+# table. Same directory, same sys.path bootstrap above (_hooklib.py /
+# _harness.py ship alongside every hook in both build topologies) --
+# unwrapped, matching engram-surface-hook.py's own import of these two
+# (both are core plugin files present on every install, unlike the
+# best-effort _stale_tree_hooklib import above).
+from _hooklib import emit_context
+from _harness import detect_harness, get_harness_budgets
+
 
 def _load_watch_list() -> list[dict]:
     """Read stale_tree_watch from config.json. Malformed/missing -> [].
@@ -161,13 +170,74 @@ def process_repo(entry: dict) -> str | None:
     return f"↑ pulled {path} → {short_sha}"
 
 
+def _assemble_response(body_blocks: list) -> dict:
+    """Build the SessionStart response dict from this session's fired
+    per-repo status lines, routed through the shared bounded renderer
+    `_hooklib.emit_context()` (engram-alpha#2863 WS2).
+
+    `body_blocks` is the list of already-rendered, non-empty per-repo
+    status lines `main()` collected this session (warnings first, then
+    successful-pull confirmations — see main()'s own comment for why) —
+    exactly the kind of config-driven, arbitrary-length list
+    `emit_context()` exists to bound: `stale_tree_watch` carries no length
+    cap, so an install watching many repos could otherwise grow this block
+    without limit (the epic's concern #2). This hook has no separate
+    single-fact "head" line independent of the per-repo results themselves
+    (unlike engram-surface-hook.py's daemon/DB-liveness alerts), so `head`
+    is only a short fixed caption and every actual status line lives in
+    `body`. Split out from `main()` purely for testability, mirroring
+    engram-surface-hook.py's own `_assemble_response()` — `main()`'s
+    behavior is otherwise unchanged.
+
+    Returns `{}` when nothing fired this session (mirrors the pre-migration
+    `if lines:` guard) — `emit_context()` is never called with an empty
+    body. Otherwise returns the full `{"hookSpecificOutput": {...}}`
+    response dict, ready for `json.dumps()`.
+    """
+    if not body_blocks:
+        return {}
+
+    harness = detect_harness()
+    budgets = get_harness_budgets(harness)
+    rendered = emit_context(
+        "[stale-tree auto-pull]",
+        body_blocks,
+        budget=budgets["budget"],
+        # Deliberate, not head_budget (engram-alpha#2863 WS2 spec): this
+        # hook has no separate soft economy target of its own — like
+        # engram-surface-hook.py's own choice, the hard ceiling doubles as
+        # the soft one so render uses everything available before cutting.
+        target=budgets["budget"],
+        # No single body item here is expected to be large enough to need
+        # the single-overflow allowance (unlike surface-hook's
+        # principle_triggers) — a per-repo line is a short, bounded message.
+        allow_single_overflow=False,
+        # No shared overflow-persistence helper exists yet in _hooklib.py
+        # (see engram-surface-hook.py's own note on this same point).
+        overflow_writer=None,
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": rendered,
+        }
+    }
+
+
 def main() -> None:
     try:
         json.load(sys.stdin)  # consume the SessionStart stdin payload (unused)
     except (json.JSONDecodeError, EOFError, ValueError):
         pass
 
-    lines: list[str] = []
+    # engram-alpha#2863 WS2: warnings (need action) are gathered separately
+    # from success confirmations so _assemble_response() below can order
+    # body_blocks warnings-first (most-important-first, per the WS2 spec).
+    # This changes only the ORDER of an unbounded, config-driven list —
+    # process_repo()'s own branching for WHEN a given line fires is
+    # unchanged.
+    warnings: list[str] = []
+    successes: list[str] = []
     try:
         watch_list = _load_watch_list()
         for entry in watch_list:
@@ -178,18 +248,13 @@ def main() -> None:
                 # swallow the rest of the watch list or crash session start.
                 result = f"⚠ {entry.get('path', '?')}: stale-tree auto-pull failed unexpectedly ({exc})."
             if result:
-                lines.append(result)
+                (warnings if result.startswith("⚠") else successes).append(result)
     except Exception:
-        lines = []  # never let a config bug break session start
+        warnings, successes = [], []  # never let a config bug break session start
 
-    if lines:
-        output_obj = {
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": "[stale-tree auto-pull]\n" + "\n".join(lines),
-            }
-        }
-        print(json.dumps(output_obj))
+    response = _assemble_response(warnings + successes)
+    if response:
+        print(json.dumps(response))
 
     sys.exit(0)
 

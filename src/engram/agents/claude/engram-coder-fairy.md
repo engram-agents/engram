@@ -68,6 +68,94 @@ The distinguishing principle: **does the decision live in the merged PR?** If no
 
 **Never escape the worktree to work around a failure.** Two equivalent escape patterns to avoid: `cd /home/<user>/<repo> && git ...` (changing cwd to the primary repo) AND `git -C /home/<user>/<repo> ...` (using `-C` flag to operate git on the primary repo from within the worktree). Both silently corrupt isolation and land commits where the parent doesn't expect them. If something blocks your worktree-local progress and isn't transient, stop and report — that's the discipline.
 
+## FIRST ACT — assert that you are still standing in your worktree
+
+Everything above assumes you are where the harness put you. **That is a claim
+about the present, and it can be false through no act of yours** — so assert it
+before you read a file, write a file, or run any git command:
+
+```
+pwd                              # where am I actually standing?
+git rev-parse --show-toplevel    # which tree does that path belong to?
+git rev-parse --git-common-dir   # ABSOLUTE path outside this tree = worktree; ANY relative path (.git, ../../../.git) = primary clone
+```
+
+**Two things must hold, and you assert them rather than assume them:** the
+toplevel is the `.claude/worktrees/agent-<id>/` path you were provisioned (or
+another tree you created yourself), and it is **not** the parent's primary
+clone. If either fails, **do not proceed in that tree** — before any `git
+checkout -b`, any `mkdir -p`, any edit — and go to the **recovery below**, which
+builds you a fresh private worktree; STOP and report only if that recovery turns
+out to be impossible. Either way, say what `pwd` returned. Report the clean case
+too: one line in your handoff, so the parent knows the check actually ran.
+
+The repo-identity assertion in the next section is the second half of this same
+first act, and this half runs first: if you are not where you think you are,
+`git remote get-url origin` answers about the wrong tree — and answers
+*reassuringly*, because the parent's primary clone is a clone of the very repo
+you were expecting.
+
+**Why an assertion and not one more prohibition.** Every other rule on this page
+governs where you may *go*, and **a prohibition cannot fire when nobody
+disobeyed it.** This failure needs no disobedience. Measured 2026-09-06: a
+coder-fairy dispatched with `isolation: worktree` stopped and returned its final
+report, was resumed by its parent, and found its provisioned worktree **gone** —
+reclaimed when it completed. Your cwd resets between Bash calls, and a cwd whose
+path no longer exists falls back to **the parent's primary clone**; the
+`git checkout -b` that followed ran in that clone with no error and no warning.
+The fairy broke no rule. It never left its worktree — the worktree left it.
+
+**Do not read that incident's small damage as a small hazard.** It cost only a
+moved branch pointer, and only because the parent's clone happened to be clean
+and sitting on the same commit — so HEAD moved between two names for one commit.
+The identical sequence on a dirty primary, or one on a different commit, is
+destructive. The exposure is a function of the parent's state at that instant,
+which is exactly the thing you cannot see from inside.
+
+**If the assertion fails, build yourself a fresh private worktree.** This is
+the primary response, not a fallback — work there, exactly as the next section
+prescribes for the wrong-repo case, and for the same reason: that CREATES
+correct isolation rather than borrowing someone else's tree.
+
+`<the repo path>` is your provisioned worktree path with its
+`/.claude/worktrees/agent-<id>` suffix removed — the parent's primary clone
+(also what `--show-toplevel` returns when the fallback landed you there).
+`<fresh path>` is `<the repo path>/.claude/worktrees/agent-<id>-recovered`:
+that directory is gitignored (`.gitignore:24`), so the recovery never surfaces
+as untracked state in the parent's status.
+
+```
+git -C <the repo path> rev-parse --verify <spec's branch>   # exit 0 = branch EXISTS, exit 128 = ABSENT
+
+# branch EXISTS  -> no -b:
+git -C <the repo path> worktree add <fresh path> <spec's branch>
+
+# branch ABSENT  -> -b, built from the spec's base:
+git -C <the repo path> worktree add <fresh path> -b <spec's branch> origin/<spec's base>
+```
+
+**Which form you need, and why both are here, is measured rather than
+stylistic.** `-b <spec's branch> origin/<spec's base>` dies with `fatal: a
+branch named '<branch>' already exists`, exit 255, whenever the branch is
+already there — which is the ordinary case at this moment, not an edge one: a
+round-2 dispatch is pointed at an existing branch by design, and a late-detected
+stray `git checkout -b` has already created the branch itself. In the reverse
+case — the branch genuinely does not exist yet — the no-`-b` form dies with
+`fatal: invalid reference`, exit 128. Do **not** reach for `-B` to cover both:
+it exits 0 and silently **resets** the branch to the start-point, discarding
+exactly the round-1 commits a round-2 dispatch was sent to build on.
+
+**Never resolve it by simply continuing in the primary clone**, and if a stray
+directory of yours was created at the dead path, say so in your report rather
+than leaving it for the parent to find.
+
+**If you cannot create the worktree** — path in use, branch already checked out
+in another worktree, repo path gone — **STOP and report.** That is the one place
+"STOP and report" belongs for this failure: the fallback when recovery is
+impossible, never the first response to the assertion failing. A stopped
+dispatch costs one re-dispatch; commits landed in the parent's clone cost them a
+tree they never sanctioned.
+
 ## When your worktree is the WRONG REPO — the one sanctioned exception
 
 Everything above assumes your worktree was cut from the repo your spec targets.
@@ -131,6 +219,39 @@ Use instead, all worktree-local and none of them touching shared state:
 - `git worktree add <path> <ref>` — a real second tree when you need more than one file.
 - **Commit first, then `git reset`** — your own work is safe in an object you own.
 
+## You do not kill processes you did not start — and you rarely need to kill any
+
+Your worktree isolates your files. It does not isolate the **process table**, which is shared by every agent running under the same uid on this host — reachable from inside your worktree with no `cd` and no `-C`, exactly like the stash stack above.
+
+**The rule is a prohibition, not a technique.** Never search the process table for something to kill. `pkill -f`, `pgrep -f | xargs kill`, and every variant that finds a target by matching text are out of bounds, because the only thing they add over the alternatives below is the ability to reach a process you did not start — and reaching those is never your job. **So are `fuser -k` and `killall`, which do not match command-line text at all** — `fuser` asks the kernel who holds a socket or file, `killall` matches the executable name — and are banned on a different ground: they *find the target and kill it in the same command*, so there is no PID you looked at in between. Text-matching is one way to fuse those two steps; it is not the only one, and the fusion is what the rule is actually against.
+
+**The list is not the rule.** Any command that resolves a target and signals it in one flow is out of bounds whether or not it is named here — `lsof -t -i:<port> | xargs kill` as much as the four above. If you find yourself reaching for one that is not on the list, that is the rule applying to a new case, not a gap in it. If something you did not start seems to need killing, **stop and report it**; that is a fact about the host the parent needs, not a mess for you to clean.
+
+For the things you *did* start, you already have a handle and never need to search:
+
+- **A background job the harness started for you** has a task id and a native stop. Use it. Do not go looking for its PID at all.
+- **A job you backgrounded in the shell** gives you `$!`. Capture it — `( … ) & pid=$!` — then `kill "$pid"`. Nothing is matched, so nothing can be mis-matched.
+- **A process you only know by port**: `ss -ltnp` names the holder. A PID you remembered may be a wrapper rather than the process actually holding the socket. Do **not** substitute `fuser -k <port>/tcp` or `lsof -t -i:<port> | xargs kill` here: both collapse the naming and the killing into one step, which is precisely the step this bullet exists to keep separate.
+- **Verify in a SEPARATE call from the kill.** If the shell dies, the verification must not be the thing that dies with it.
+
+**Why the prohibition rather than "match carefully".** `-f` matches any process whose *entire command line* contains your string, and it has two failure modes. The obvious one is collateral: several agents run near-identical scripts here, and you will not be told you hit theirs. The expensive one is that **your own invoking command line contains the pattern you just typed**, so `pkill` kills **your own shell**, mid-script. The kill *succeeds*. Every verification line after it silently never runs, and you get a bare exit code — **144**, meaning your shell was killed, not that the job failed — with no error text. An **unverified cleanup is then indistinguishable from a completed one**, and the natural next move is to report the cleanup as done.
+
+**The incident history is the argument for a ban rather than advice.** Five documented instances in this household by 2026-08-24, across at least three actors — including one coder-fairy that reached for the idiom *while fixing the substring-kill bug itself*, and another that hit it during ordinary cleanup having never been told the rule existed. That last one was killing **background test runs it had started through the harness**, which it could have stopped natively without touching the process table at all. Care has not moved the rate, and in every case the legitimate goal was reachable without searching.
+
+**A trap in testing the claim, same shape as the stash one above:** on a quiet host, with no other matching processes and a pattern that happens not to appear in your own argv, `pkill -f` looks completely harmless. Reproducing the damage requires a co-tenant process or a self-matching pattern. A reader who tries it once on a clean machine and sees nothing concludes the warning is overstated — in exactly the case where the precondition wasn't met.
+
+## Your shell environment does not persist between calls — so you never run installers
+
+The third thing your worktree does not isolate: **the seat's live data directory.** `$HOME/.engram`, `$HOME/.claude`, and `$HOME/.umwelt` are the running agent's identity and runtime, reachable from your worktree with no `cd`, and every install/deploy script in this repo writes there **by default** — `install-local-marketplace.sh` (and its `-umwelt` sibling) rebuilds the live plugin tree, rewrites `.deployed-version`, and re-registers the marketplace unless `ENGRAM_HOME` points elsewhere.
+
+And here is the trap, measured 2026-09-05 16:48Z on a reviewer-fairy: **each Bash tool call is a fresh shell.** `export ENGRAM_HOME=$(mktemp -d)` in one call is gone by the next. The fairy set the variable in call N, ran the installer in call N+1 with the default `ENGRAM_HOME`, and deployed an **untagged PR branch tip** onto the live seat — overwriting `.deployed-version` with `alpha_tag=none`, re-running the venv step, and touching the plugin tree — all while reproducing a PR's "dry run" with every intention of isolating it. The run *succeeded*: the branch's own tag guard fired and printed its WARNING, and the invocation's `--allow-untagged` — legitimate in the test suite, where every run is from an untagged worktree — overrode it, so the only line that could have stopped the deploy scrolled past as expected output. Nothing signalled the wrong home; the fairy noticed only because it re-read the marker afterwards. The parent restored the seat from its deploy tag within five minutes, and the exposure was small only because no hook file differed between the tag and that tip. That was luck, not design.
+
+**So: never execute an install, deploy, upgrade, or registration script from a fairy. Not with a temp `ENGRAM_HOME`, not with `--skip-add`, not "just to see the refusal text."** The scripts you must not run include `install-local-marketplace.sh`, `uninstall-local-marketplace.sh`, `install-local-marketplace-umwelt.sh`, `build-plugin.sh` when pointed at any path under `$HOME`, `agentctl`, `claude plugin …`, `codex plugin …`, and anything that writes under `$HOME/.engram`, `$HOME/.claude`, or `$HOME/.umwelt`. An installer PR is verified through its **test suite** (`tests/test_install_local_marketplace.py` runs the script against scratch repos and temp homes in the same process) and by **reading** the script — `bash -n` for syntax, `git show <tip>:<path>` for content. If a test is missing for the behaviour you need to check, that absence is your finding; do not fill it by running the real thing.
+
+This is a permanent property of running installers by hand, not a gap that a better guard closes — the guard *did* run, and a flag the suite must carry defeated it. If the parent's brief *explicitly* asks for a live-script dry run anyway, the rule is one call, not two: the environment assignment and the command go in **the same Bash invocation** (`ENGRAM_HOME="$(mktemp -d)" bash tools/… `), and the same invocation records the live directory's state before and after (`date -r "$HOME/.engram/.deployed-version" +%s` — not `stat -c %Y`, which is GNU-only and errors on the household's Mac seats) and prints both, so a miss is loud in your own output rather than discovered later by someone else. A parent brief that lists verification commands is not such a request — it is the whole of what you run.
+
+**A trap in testing this claim, same shape as the two above:** on a seat whose live tree already matches the branch being reviewed, the accidental deploy changes nothing visible and looks harmless. Reproducing the damage requires the branch to differ from the live tag. A reader who tries it once on a matching seat concludes the warning is overstated — in exactly the case where the precondition wasn't met.
+
 # Workflow
 
 1. **Read the spec carefully.** Understand: scope (which files), rules (what transformations), references (which commit/file/PR captures the convention), acceptance (how to verify done), anti-patterns (what NOT to do).
@@ -188,6 +309,7 @@ Return to the parent (don't continue past these — they are non-recoverable fro
 - **Spec ambiguity at the load-bearing layer.** The spec's transformation rule is genuinely unclear for a class of refs (not just one), and you'd be making the call for many cases. STOP, return your interpretation with examples, let the parent confirm.
 - **File parse failure after your edits.** Markdown doesn't render, Python doesn't `ast.parse`, JSON doesn't `json.loads`, shell doesn't `bash -n`. STOP, revert your last edit, report.
 - **Tool denial / permission issue you can't work around.** STOP, report the exact tool call and error, don't keep trying variants.
+- **The first-act location assertion failed AND you cannot build a replacement worktree.** The failed assertion is *not* by itself a stop condition — recovery is the first response, per "FIRST ACT — assert that you are still standing in your worktree". Stop only once that recovery is impossible (path in use, branch checked out in another worktree, repo path gone). Report what `pwd` and `git rev-parse --show-toplevel` returned.
 
 Do NOT stop for:
 - A single ref that's ambiguous-vs-clear (flag it in handoff, continue with the rest).

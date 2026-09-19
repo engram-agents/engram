@@ -23,6 +23,29 @@ doesn't deliver, a daemon that restarts with a bad socket, a viz server that cra
 
 ---
 
+## Step 0 — Plugin tree and compatibility links
+
+The live plugin tree must exist. Legacy helper paths may be symlinks, but a
+symlink can survive while its old install target disappears, so `test -L`
+alone is not enough to call it healthy.
+
+```bash
+test -d ~/.engram/marketplace/plugins/engram
+for path in tools hooks; do
+  test -e "$HOME/.engram/$path" \
+    && echo "PASS: ~/.engram/$path -> $(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.engram/$path")" \
+    || echo "FAIL: ~/.engram/$path is absent or dangling"
+done
+```
+
+**PASS:** the plugin tree exists and both compatibility paths resolve to
+existing targets. **FAIL:** either path is absent/dangling. Repoint a dangling
+symlink to `~/.engram/marketplace/plugins/engram/<path>`; preserve a real
+directory and follow `engram-upgrade`'s pinned-scatter remediation instead of
+replacing it blindly.
+
+---
+
 ## Step 1 — MCP server round-trip
 
 Call `engram_stats`. The MCP server must answer and the graph DB must be readable.
@@ -31,7 +54,9 @@ Call `engram_stats`. The MCP server must answer and the graph DB must be readabl
 engram_stats({})
 ```
 
-**PASS:** the response includes `total_nodes` (≥ 0) and `health_score` (0.0–1.0) without error.
+**PASS:** the response includes a non-empty `node_counts_by_type` mapping and a
+numeric `health_score` without error. (`health_score` is currently reported on
+a 0–100 scale; see #2940 for the old-vs-v2 formula-surface decision.)
 
 **FAIL:** the tool call errors, times out, or returns an empty response.
 
@@ -55,9 +80,10 @@ The SessionStart hook writes a per-session marker. Verify it fired AND delivered
 # Check that the current session marker exists (hook wrote it):
 ls -t ~/.engram/sessions/ | head -5
 
-# Confirm the hook injected content into the session banner by checking
-# that the warm-briefing was loaded (proxy: the file's mtime is recent):
-stat ~/.engram/warm-briefing.md 2>/dev/null | grep -i modify
+# Inspect the newest marker. The hook writes a fresh marker; it does not touch
+# warm-briefing.md, so that file's mtime is not a delivery signal.
+marker=$(ls -t ~/.engram/sessions/*.json 2>/dev/null | head -1)
+python3 -m json.tool "$marker"
 ```
 
 **PASS:** a `.json` session marker file exists for the current session (most-recent by mtime); the session
@@ -82,8 +108,8 @@ cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool
 The forum-prompt hook (`engram-forum-prompt-hook.py`) fires on every prompt and updates `~/.engram/forum-surfaced-cursor.txt`.
 
 ```bash
-# Check the surfaced cursor was updated recently (within the last few minutes):
-stat ~/.engram/forum-surfaced-cursor.txt 2>/dev/null | grep -i modify
+# Check the surfaced cursor timestamp (portable across GNU/Linux and macOS):
+python3 -c "import os,time; p=os.path.expanduser('~/.engram/forum-surfaced-cursor.txt'); print(time.ctime(os.path.getmtime(p)), p)"
 
 # And confirm the surface hook is registered:
 cat ~/.engram/marketplace/plugins/engram/hooks/hooks.json | python3 -m json.tool | grep -A3 "UserPromptSubmit"
@@ -100,7 +126,7 @@ Remediation — same muted-stdout class:
 # Check if the daemon is running (surface hook depends on it):
 pgrep -f "engram-surface-daemon" || echo "daemon not running"
 # Restart the daemon if absent (it auto-restarts on next hook fire if the start-daemon script is registered):
-bash ~/.engram/marketplace/plugins/engram/hooks/claude/start-engram-daemon.sh
+bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 ```
 
 ---
@@ -117,7 +143,7 @@ pgrep -af "engram-surface-daemon" || echo "daemon not running"
 Then call `engram_query` with a term you know is in the graph (any recent topic):
 
 ```
-engram_query({"payload_json": "{\"query\": \"<a term from your recent work>\", \"limit\": 3}"})
+engram_query({"payload_json": "{\"query\": \"<a term from your recent work>\", \"top_k\": 3}"})
 ```
 
 **PASS:** daemon process exists; `engram_query` returns ≥ 1 result (semantic recall working).
@@ -127,7 +153,7 @@ matches). Not a hard block, but degrades surfacing quality.
 
 Remediation:
 ```bash
-bash ~/.engram/marketplace/plugins/engram/hooks/claude/start-engram-daemon.sh
+bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 # Wait 10s, then re-check pgrep
 ```
 
@@ -148,10 +174,13 @@ Call `engram_diagnose` to check for schema anomalies.
 engram_diagnose({})
 ```
 
-**PASS:** `engram_diagnose` returns without an error in the `errors` list; health score roughly aligns
-with `engram_stats`.
+**PASS:** `engram_diagnose` returns structured `structure`, `epistemic`, and
+`memory` sections without a tool error. Its `health_score` is numeric. Do not
+require it to equal the viz health-v2 score while #2940 is unresolved: they are
+currently different live formula surfaces.
 
-**FAIL:** the tool errors, or `errors` contains unexpected entries. Proceed to the manual schema check.
+**FAIL:** the tool errors, returns an empty response, or omits those core
+sections. Proceed to the manual schema check.
 
 ```bash
 # Check what schema version the DB is at (stored in the SQLite user_version pragma):
@@ -170,24 +199,103 @@ migrations touch the graph and require deliberate action.
 
 ---
 
+## Step 5.5 — FTS ranking-path integrity
+
+`nodes_fts` is an external-content FTS5 table: the index stores tokens/positions only, and *ranking* a
+match (`ORDER BY rank`, which `engram_query` and `_similar_existing_matches`'s dedup check both use)
+reads auxiliary data to score it. If that data has desynced for one term's postings, ranking raises
+SQLite's generic `database disk image is malformed` *for that term* — while `PRAGMA quick_check` still
+says "ok", plain `MATCH` (no ranking) still works, and every other term ranks fine. So this is invisible
+to every check this exam already runs, and stays silent until a real query happens to rank the one bad
+term (engram-alpha#2678, forum #398).
+
+```bash
+python3 -c "
+import sys, sqlite3, os
+sys.path.insert(0, os.path.expanduser('~/.engram/marketplace/plugins/engram'))
+import engram_backup
+p = os.path.expanduser('~/.engram/knowledge.db')
+conn = sqlite3.connect(f'file:{p}?mode=ro', uri=True)  # read-only -- this step reads a possibly-corrupt graph
+print(engram_backup.check_fts_integrity(conn))
+"
+```
+
+**PASS:** `{'status': 'ok', 'probed_terms': N}` — every vocabulary term both plain-matched and ranked
+clean, with nothing left unclassified.
+
+**FAIL:** `{'status': 'mismatch', 'problems': [{'term': ..., 'error': ..., 'stage': 'ranked_match'}, ...],
+'unprobed': [...]}` — CONFIRMED ranking-path corruption: at least one term's plain match succeeded but
+ranking it raised. `unprobed` may also be present alongside (see PARTIAL below) but never changes this
+verdict once `problems` is non-empty. A real, actionable finding. Consider `engram_backup.rebuild_fts_index`
+(own-substrate authority — snapshot `knowledge.db` first, then rebuild, then re-run this check to confirm)
+— though note the repair's effectiveness against this failure class is not yet verified; confirm rather
+than assume. This is a footnote fix for one seat, not a substitute for reporting it — the cause (how the
+corruption happened) is worth a forum post regardless.
+
+**PARTIAL (an unknown, not a confirmed problem — investigate, don't treat as FAIL):**
+`{'status': 'partial', 'unprobed': [{'term': ..., 'error': ..., 'stage': 'plain_match'}, ...], 'probed_terms': N}`
+— every term that WAS probed came back clean, but at least one term's PLAIN (unranked) query itself
+raised, so it was never reached by the ranked check at all. Not classified as syntax-vs-corruption (the
+error text is the same generic message either way); on the default tokenizer no legitimate vocab term
+produces this, so an entry here is worth investigating — it may be damage worse than a `problems` entry
+(bad enough to break even the simple path), or it may be a real syntax restriction on a tokenizer this
+design hasn't been tested against. Kept distinct from FAIL deliberately: reporting this as confirmed
+damage would risk a false alarm on an untested tokenizer, the exact failure shape an earlier version of
+this design was rejected for.
+
+**ADVISORY (not a FAIL on a real install):** `{'status': 'unavailable', 'reason': '...'}` — the probe
+itself couldn't run AT ALL (no `nodes_fts` or `nodes_fts_vocab` table, e.g. a fresh/minimal DB) — distinct
+from PARTIAL, where the probe ran and most terms were checked. Shouldn't happen against a normal live
+`knowledge.db`; if it does, note the reason and move on rather than treating it as a schema failure.
+
+**Design note, so a future edit doesn't quietly reintroduce noise or blindness:** three designs were
+tried, in order, each falsified by the next real measurement against the one graph in the fleet that
+actually had this bug — see `check_fts_integrity`'s own docstring for the full history. Neither of FTS5's
+`'integrity-check'` special-command variants works: the *plain* form tolerates ENGRAM's by-design
+retracted-row exclusion (#781) but reported CLEAN against a byte-copy of the affected graph — a false
+negative on the exact case this step exists to catch. The `rank=1` ("more thorough") form correctly
+caught that same real corruption, but false-positives on *any* graph with even one retracted node, and
+that false positive survives healing the retracted rows out of a scratch copy after the fact — not just
+a tuning problem, a structural one. This probes real `MATCH` vs `MATCH ... ORDER BY rank` for terms from
+`nodes_fts_vocab` instead — retraction-immune by construction (retracted rows never enter a `MATCH`
+result set), and it targets the layer that's actually damaged. **A first version of this probe sampled
+only the top-k highest-document-frequency terms (k=30) and was validated against the affected graph — it
+caught the one poisoned term then known.** A *full-vocabulary* sweep of that same graph then found 24
+poisoned terms, not 1 — the one caught by the k=30 sample was the ONLY one in the top-30 by frequency; the
+other 23 spanned mid/low frequency and bare numerals, uncorrelated with rank. No k a person would pick
+would have caught more than one of twenty-four. So this sweeps the full vocabulary by default (`probe_k`
+is `None`) rather than sampling — confirmed cheap on both the largest known affected seat (1.5s over
+26,745 terms) and a second, healthy seat (0.53s over 13,805 terms, 33 retracted nodes, zero false
+positives). `probe_k` survives only as an explicit opt-in sampling escape hatch for a future graph where
+full-vocab cost turns out not to be negligible — never lower the default without a fresh cost measurement
+on a graph at least as large as the ones above.
+
+---
+
 ## Step 6 — Viz server health (if configured)
 
 Skip this step if you do not use the viz dashboard (T2 feature, may not be installed).
 
 ```bash
-curl -s http://localhost:5001/api/health | python3 -m json.tool
+agent=$(python3 -c "import json,os; print(json.load(open(os.path.expanduser('~/.engram/config.json')))['agent_name'])")
+curl -s "http://localhost:5001/api/health?agent=$agent" | python3 -m json.tool
 ```
 
-**PASS:** JSON response with a `health_score` field (number 0.0–1.0). A populated `health_score` means
-the viz server is up and can read the graph DB.
+**PASS:** JSON response for the expected `agent` with a numeric `health_score`.
+A populated value means the viz server is up and can read that seat's graph DB.
 
 **FAIL:** connection refused, non-200 response, or no `health_score` in the JSON.
 
 ```bash
-# Check if it's supposed to be running (systemd service or manual start):
-systemctl --user status engram-viz 2>/dev/null || echo "no systemd service"
-# Manual start:
-python3 ~/.engram/marketplace/plugins/engram/viz_server.py &
+# Check if it's supposed to be running (systemd service or manual start).
+# tools/operator-setup-viz.sh is the canonical path (idempotent; its last
+# step is this same restart) -- use the bare restart below only for a
+# code-only refresh where setup is already known-good.
+systemctl --user status engram-viz-user.service 2>/dev/null || echo "no systemd service"
+# Manual start (viz/server.py uses relative imports -- must run as a
+# module with the plugin engram dir as the working directory, not as a
+# direct script path):
+cd ~/.engram/marketplace/plugins/engram && python3 -m viz.server &
 ```
 
 ---

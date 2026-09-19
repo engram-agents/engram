@@ -3,7 +3,15 @@ Description=ENGRAM surface daemon (semantic recall)
 
 [Service]
 Type=simple
-ExecStart={{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-daemon.py
+# #2652 phase-0 unit 3: the trailing ENGRAM_HOME argv is unused by the
+# script itself (ENGRAM_HOME is still resolved from the Environment= line
+# below) -- it exists solely so start-engram-daemon.sh's `pgrep -f`-based
+# reap pattern (end-anchored on ENGRAM_HOME) can see and scope on it. Env
+# vars are invisible to `pgrep -f` (it matches argv/cmdline only), so
+# without this trailing argv a daemon launched by this unit was
+# un-reapable by that pattern. Mirrors start-engram-daemon.sh's own launch
+# line's argv shape exactly.
+ExecStart={{PYTHON}} {{ENGRAM_HOOKS_DIR}}/engram-surface-daemon.py {{ENGRAM_HOME}}
 Environment=ENGRAM_HOME={{ENGRAM_HOME}}
 Environment=ENGRAM_DAEMON_IDLE_TIMEOUT=0
 Restart=always

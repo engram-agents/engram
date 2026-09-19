@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """UserPromptSubmit hook: surface baton-in-court projects to the agent.
 
-On every prompt, in multi-agent mode, queries the forum coordination API
-(GET /api/projects) for project records where turn == this agent and status
-is active (not merged or cancelled). Injects a summary into the session
-context reminding the agent of pending batons. Reads are 100% via the LAN
-forum API — no local-filesystem path (UCS pure-API invariant). If the API is
-unreachable, the hook surfaces a loud "⚠️ UCS unreachable" banner rather than
-silently rendering nothing.
+On every prompt, when a forum is configured, queries the forum coordination
+API (GET /api/projects) for project records where turn == this agent and
+status is active (not merged or cancelled). Injects a summary into the
+session context reminding the agent of pending batons. Reads are 100% via
+the LAN forum API — no local-filesystem path (UCS pure-API invariant). If
+the API is unreachable, the hook surfaces a loud "⚠️ UCS unreachable" banner
+rather than silently rendering nothing.
 
 Unlike the inter-agent hook, baton has no cursor — turn state is the
 explicit current-state field in the file, read fresh each prompt. No
 surfaced/read cursor mechanism needed; the baton file IS the state.
 
 Anti-patterns guarded:
-  - Single-agent guard: if config.json mode != 'multi', exits silently.
-    Single-agent users see zero behavior change.
+  - Forum-configured guard (#2857 step 1): if no forum.url/agent_name is set
+    in config.json, exits silently. Installs with no forum configured see
+    zero behavior change. (Previously gated on config.json mode == 'multi' —
+    baton is symmetric for any agent once a forum is configured, regardless
+    of host topology.)
   - No LLM calls, no DB — one forum API call (+ optional gh calls) only.
     Per-gh-call timeout 4s; worst case one gh call per in-court baton on a
     full cache miss (N_batons calls). The 30s-TTL status cache makes the
@@ -446,9 +449,16 @@ def _get_live_status(anchor: str, cache: dict) -> str:
 # Forum API (pure-API coordination reads — UCS invariant)
 # ---------------------------------------------------------------------------
 
-def _is_multi_agent_mode(config: dict) -> bool:
-    """True if config.json mode == 'multi' (mirrors ia.py / baton.py)."""
-    return config.get("mode", "single") == "multi"
+def _is_forum_configured(config: dict) -> bool:
+    """Return True if forum is explicitly configured (url or agent_name set).
+
+    Silent no-op gate: if neither forum.url nor agent_name is in config, skip
+    the hook to avoid noise on non-forum installs.
+    """
+    forum_cfg = config.get("forum", {})
+    has_url = isinstance(forum_cfg, dict) and bool(forum_cfg.get("url", "").strip())
+    has_agent = bool(config.get("agent_name", "").strip())
+    return has_url or has_agent
 
 
 def _fetch_active_projects(config: dict) -> list:
@@ -630,10 +640,11 @@ def main() -> None:
     agent_name = _get_agent_name(config)
     # Even if agent_name is empty, filtering returns nothing (no turn match).
 
-    # ── Multi-agent gate ──────────────────────────────────────────────────────
-    # Pure-API: single-agent installs (mode != 'multi'), or a missing forum_api
-    # import, exit silently — zero behavior change, and no local-FS fallback.
-    if not _FORUM_API_OK or not _is_multi_agent_mode(config):
+    # ── Forum-configured gate ────────────────────────────────────────────────
+    # Pure-API: no forum configured (no forum.url, no agent_name), or a missing
+    # forum_api import, exit silently — zero behavior change, and no local-FS
+    # fallback.
+    if not _FORUM_API_OK or not _is_forum_configured(config):
         sys.exit(0)
 
     # ── Fetch coordination state via the LAN forum API (loud on failure) ──────

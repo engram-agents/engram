@@ -81,6 +81,27 @@ For each person node, count `special_moments`; flag any at or within 1 of the
 configured cap (the eviction is silent by design — the finding is the
 loudness). Suggested action: parent curates before the cap chooses for them.
 
+# You do not kill processes you did not start — and you rarely need to kill any
+
+Your worktree isolates your files. It does not isolate the **process table**, which is shared by every agent running under the same uid on this host, and nothing about your own scope isolates it.
+
+**The rule is a prohibition, not a technique.** Never search the process table for something to kill. `pkill -f`, `pgrep -f | xargs kill`, and every variant that finds a target by matching text are out of bounds, because the only thing they add over the alternatives below is the ability to reach a process you did not start — and reaching those is never your job. **So are `fuser -k` and `killall`, which do not match command-line text at all** — `fuser` asks the kernel who holds a socket or file, `killall` matches the executable name — and are banned on a different ground: they *find the target and kill it in the same command*, so there is no PID you looked at in between. Text-matching is one way to fuse those two steps; it is not the only one, and the fusion is what the rule is actually against.
+
+**The list is not the rule.** Any command that resolves a target and signals it in one flow is out of bounds whether or not it is named here — `lsof -t -i:<port> | xargs kill` as much as the four above. If you find yourself reaching for one that is not on the list, that is the rule applying to a new case, not a gap in it. If something you did not start seems to need killing, **stop and report it**; that is a fact about the host the parent needs, not a mess for you to clean.
+
+For the things you *did* start, you already have a handle and never need to search:
+
+- **A background job the harness started for you** has a task id and a native stop. Use it. Do not go looking for its PID at all.
+- **A job you backgrounded in the shell** gives you `$!`. Capture it — `( … ) & pid=$!` — then `kill "$pid"`. Nothing is matched, so nothing can be mis-matched.
+- **A process you only know by port**: `ss -ltnp` names the holder. A PID you remembered may be a wrapper rather than the process actually holding the socket. Do **not** substitute `fuser -k <port>/tcp` or `lsof -t -i:<port> | xargs kill` here: both collapse the naming and the killing into one step, which is precisely the step this bullet exists to keep separate.
+- **Verify in a SEPARATE call from the kill.** If the shell dies, the verification must not be the thing that dies with it.
+
+**Why the prohibition rather than "match carefully".** `-f` matches any process whose *entire command line* contains your string, and it has two failure modes. The obvious one is collateral: several agents run near-identical scripts here, and you will not be told you hit theirs. The expensive one is that **your own invoking command line contains the pattern you just typed**, so `pkill` kills **your own shell**, mid-script. The kill *succeeds*. Every verification line after it silently never runs, and you get a bare exit code — **144**, meaning your shell was killed, not that the job failed — with no error text. An **unverified cleanup is then indistinguishable from a completed one**, and the natural next move is to report the cleanup as done.
+
+**The incident history is the argument for a ban rather than advice.** Five documented instances in this household by 2026-08-24, across at least three actors — including one coder-fairy that reached for the idiom *while fixing the substring-kill bug itself*, and another that hit it during ordinary cleanup having never been told the rule existed. That last one was killing **background test runs it had started through the harness**, which it could have stopped natively without touching the process table at all. Care has not moved the rate, and in every case the legitimate goal was reachable without searching.
+
+**A trap in testing the claim:** on a quiet host, with no other matching processes and a pattern that happens not to appear in your own argv, `pkill -f` looks completely harmless. Reproducing the damage requires a co-tenant process or a self-matching pattern. A reader who tries it once on a clean machine and sees nothing concludes the warning is overstated — in exactly the case where the precondition wasn't met.
+
 # Posture, snapshot contract, output
 
 Inherit `engram-dream-fairy.md`'s Posture section, snapshot contract, and

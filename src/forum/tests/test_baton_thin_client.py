@@ -7,8 +7,10 @@ All tests mock ForumClient — no live server needed.  The tests verify that:
   4. ForumHttpError 404 → EXIT_VALIDATION (exit code 1) for project-not-found paths.
   5. ForumHttpError 422/400 → EXIT_VALIDATION (exit code 1).
   6. ForumHttpError 5xx → EXIT_IO (exit code 2).
-  7. Config-based multi-agent gate: reads → silent exit 0 in single mode;
-     writes → EXIT_STATE + error message in single mode.
+  7. Config-based forum-configured gate (#2857 step 1): reads → silent exit 0
+     with no forum configured; writes → EXIT_STATE + error message with no
+     forum configured. The gate is `forum.url`/`agent_name` presence, not the
+     separate (topology-only) `mode` field.
 
 Import strategy: baton.py lives in tools/ (symlinked from src/engram/tools/).
 We add the worktree-relative path to sys.path before importing.
@@ -45,9 +47,11 @@ EXIT_VALIDATION = 1
 EXIT_IO = 2
 EXIT_STATE = 3
 
-# Config for multi-agent mode (all write commands need this)
-MULTI_CONFIG = {"mode": "multi"}
-# Config for single-agent mode
+# Config with a forum configured (all write commands need this) — #2857 step 1
+# retired the mode-based gate; `mode` is kept here only for realism, it is not
+# what `_is_forum_configured` reads.
+MULTI_CONFIG = {"mode": "multi", "forum": {"url": "http://test-forum:5002"}}
+# Config with no forum configured
 SINGLE_CONFIG = {"mode": "single"}
 
 
@@ -227,6 +231,80 @@ class TestCmdFlip:
             _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_IO
 
+    # -----------------------------------------------------------------
+    # #2511: unqualified pr/<N> anchor + flip-to-pool-sentinel must REFUSE
+    # (not warn-and-proceed) -- see cmd_flip's gate comment for the design
+    # rationale and cmd_merge's identical-shape gate for the template.
+    # -----------------------------------------------------------------
+
+    def test_refuses_unqualified_anchor_flip_to_pool_sentinel(self, monkeypatch, capsys):
+        """Unqualified anchor + flip-to-sentinel refuses; the flip never happens."""
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(get_return={"raw": raw})
+        args = _ns(project_id="PR-99", to="casey", reason="ready")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        stderr = capsys.readouterr().err
+        assert "baton anchor PR-99 --github pr/<owner>/<repo>/42" in stderr
+
+    def test_refuses_unqualified_anchor_even_with_force(self, monkeypatch, capsys):
+        """--force does NOT override the unqualified-anchor refusal (not a quality gate)."""
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(get_return={"raw": raw})
+        args = _ns(project_id="PR-99", to="casey", reason="ready", force=True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+        stderr = capsys.readouterr().err
+        assert "baton anchor PR-99 --github pr/<owner>/<repo>/42" in stderr
+
+    def test_unqualified_anchor_refuses_for_maintainer_flip_to_non_sentinel_participant(self, monkeypatch):
+        """#2914: the maintainer-role gate fires on ANY flip that isn't a
+        self-flip or a flip to the registered colleague -- not only the
+        literal pool sentinel. Flipping to "ariadne" here is neither
+        (current holder is "borges", no colleague is registered on this
+        baton), so it IS a maintainer-role flip, and the unqualified-anchor
+        refusal must fire on it exactly as it does on flip-to-sentinel.
+
+        Supersedes this method's pre-#2914 premise ("flip to a non-sentinel
+        participant is untouched by the gate") -- that was only ever true of
+        the OLD gate, which fired on the literal pool-sentinel name alone.
+        """
+        raw = _make_raw_baton("PR-99", github="pr/42")
+        client = _make_client(
+            post_return={"seq": 7},
+            get_return={"raw": raw},
+        )
+        args = _ns(project_id="PR-99", to="ariadne", reason="fairy-converged")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_VALIDATION
+        client.post.assert_not_called()
+
+    def test_qualified_anchor_flip_to_pool_sentinel_still_works(self, monkeypatch):
+        """A repo-qualified anchor flip-to-sentinel is unaffected -- proceeds to post."""
+        raw = _make_raw_baton("PR-99", github="pr/engram-agents/engram-paper/42")
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr, repo=None: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr, repo=None: ("unknown", "no gh"))
+
+        client = _make_client(
+            post_return={"seq": 7},
+            get_return={"raw": raw},
+        )
+        args = _ns(project_id="PR-99", to="casey", reason="ready")
+
+        _baton.cmd_flip(args, MULTI_CONFIG, "borges", client)
+
+        client.post.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # cmd_claim
@@ -384,6 +462,7 @@ class TestCmdInit:
             participants="borges,ariadne",
             status="in-progress",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
@@ -413,12 +492,13 @@ class TestCmdInit:
             status="planning",
             turn="borges",
             github="pr/200",
+            repo="engram-agents/engram-paper",
         )
 
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
 
         _, body = client.post.call_args[0]
-        assert body["github"] == "pr/200"
+        assert body["github"] == "pr/engram-agents/engram-paper/200"
 
     def test_409_conflict_maps_to_exit_validation(self, monkeypatch):
         """ForumHttpError 409 (project already exists) → EXIT_VALIDATION."""
@@ -433,6 +513,7 @@ class TestCmdInit:
             participants="borges",
             status="planning",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -452,6 +533,7 @@ class TestCmdInit:
             participants="borges",
             status="planning",
             turn="borges",
+            repo="engram-agents/engram-paper",
         )
 
         with pytest.raises(SystemExit) as exc_info:
@@ -587,8 +669,8 @@ class TestReadCommands:
         assert "PR-42" in out.getvalue()
         client.get.assert_called_once_with("/api/projects/PR-42")
 
-    def test_status_single_agent_silent_exit(self):
-        """cmd_status exits 0 silently in single-agent mode (no API call made)."""
+    def test_status_no_forum_configured_silent_exit(self):
+        """cmd_status exits 0 silently with no forum configured (no API call made)."""
         client = _make_client()
         args = _ns(mine=False)
 
@@ -597,8 +679,8 @@ class TestReadCommands:
         assert exc_info.value.code == EXIT_OK
         client.get.assert_not_called()
 
-    def test_mine_single_agent_silent_exit(self):
-        """cmd_mine exits 0 silently in single-agent mode."""
+    def test_mine_no_forum_configured_silent_exit(self):
+        """cmd_mine exits 0 silently with no forum configured."""
         client = _make_client()
         args = _ns(mine=True)
 
@@ -607,8 +689,8 @@ class TestReadCommands:
         assert exc_info.value.code == EXIT_OK
         client.get.assert_not_called()
 
-    def test_show_single_agent_silent_exit(self):
-        """cmd_show exits 0 silently in single-agent mode."""
+    def test_show_no_forum_configured_silent_exit(self):
+        """cmd_show exits 0 silently with no forum configured."""
         client = _make_client()
         args = _ns(project_id="PR-42")
 
@@ -619,13 +701,13 @@ class TestReadCommands:
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent gate (config-based)
+# Forum-configured gate (config-based) — #2857 step 1
 # ---------------------------------------------------------------------------
 
-class TestMultiAgentGate:
-    """Write commands exit EXIT_STATE in single-agent mode with an error message."""
+class TestForumConfiguredGate:
+    """Write commands exit EXIT_STATE with no forum configured, and an error message."""
 
-    def test_flip_single_agent_exits_state(self, capsys):
+    def test_flip_no_forum_configured_exits_state(self, capsys):
         client = _make_client()
         args = _ns(project_id="PR-99", to="ariadne", reason="done")
 
@@ -633,11 +715,11 @@ class TestMultiAgentGate:
             _baton.cmd_flip(args, SINGLE_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent mode" in captured.err
+        assert "no forum configured" in captured.err
         client.get.assert_not_called()
         client.post.assert_not_called()
 
-    def test_init_single_agent_exits_state(self, capsys, monkeypatch):
+    def test_init_no_forum_configured_exits_state(self, capsys, monkeypatch):
         monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "lei")
         monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda name: name == "lei")
         client = _make_client()
@@ -647,9 +729,9 @@ class TestMultiAgentGate:
             _baton.cmd_init(args, SINGLE_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
-        assert "single-agent mode" in captured.err
+        assert "no forum configured" in captured.err
 
-    def test_claim_single_agent_exits_state(self, capsys):
+    def test_claim_no_forum_configured_exits_state(self, capsys):
         client = _make_client()
         args = _ns(project_id="pool-x")
 
@@ -657,7 +739,7 @@ class TestMultiAgentGate:
             _baton.cmd_claim(args, SINGLE_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_STATE
 
-    def test_close_single_agent_exits_state(self, capsys):
+    def test_close_no_forum_configured_exits_state(self, capsys):
         client = _make_client()
         args = _ns(project_id="PR-50", status="merged")
 
@@ -665,11 +747,27 @@ class TestMultiAgentGate:
             _baton.cmd_close(args, SINGLE_CONFIG, "borges", client)
         assert exc_info.value.code == EXIT_STATE
 
-    def test_is_multi_agent_mode_reads_config(self):
-        """_is_multi_agent_mode reads config.mode, not filesystem presence."""
-        assert _baton._is_multi_agent_mode({"mode": "multi"}) is True
-        assert _baton._is_multi_agent_mode({"mode": "single"}) is False
-        assert _baton._is_multi_agent_mode({}) is False  # default = single
+    def test_flip_mode_single_with_forum_configured_succeeds(self, monkeypatch):
+        """mode='single' alone is irrelevant: a configured forum still succeeds (#2857)."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        monkeypatch.setattr(_baton, "_pr_ci_state", lambda pr: ("unknown", "no gh"))
+        monkeypatch.setattr(_baton, "_pr_approval_state", lambda pr: ("unknown", "no gh"))
+        raw = _make_raw_baton("PR-99")
+        client = _make_client(post_return={"seq": 7}, get_return={"raw": raw})
+        args = _ns(project_id="PR-99", to="ariadne", reason="done")
+        config_single_mode_with_forum = {"mode": "single", "agent_name": "borges"}
+
+        _baton.cmd_flip(args, config_single_mode_with_forum, "borges", client)
+        client.post.assert_called_once()
+
+    def test_is_forum_configured_reads_config(self):
+        """_is_forum_configured reads forum.url/agent_name, not the mode field."""
+        assert _baton._is_forum_configured({"forum": {"url": "http://x:5002"}}) is True
+        assert _baton._is_forum_configured({"agent_name": "borges"}) is True
+        assert _baton._is_forum_configured({"mode": "multi"}) is False  # mode alone is not enough
+        assert _baton._is_forum_configured({"mode": "single"}) is False
+        assert _baton._is_forum_configured({}) is False  # default = not configured
 
 
 # ---------------------------------------------------------------------------

@@ -12,8 +12,9 @@ Wave-3 structural note — diagnostic snapshot and calibration snapshot:
   ``_checkpoint_internal`` previously called ``engram_diagnose()`` (a server.py
   @mcp.tool) to store a diagnostic snapshot inside diagnostic_history.  Because
   family modules may not import server.py, that call has been lifted into the
-  server.py wrappers (``engram_nap`` / ``engram_advance_turn``), which add the
-  ``diagnostic_snapshot`` key to the result after calling the lifecycle impl.
+  server.py wrappers (``engram_checkpoint`` -- formerly ``engram_nap`` --
+  and ``engram_advance_turn``), which add the ``diagnostic_snapshot`` key to
+  the result after calling the lifecycle impl.
   Behaviour is preserved end-to-end; only the call site moves.
 
   Similarly, ``_reflect_impl`` previously called ``engram_stats()`` to append a
@@ -116,9 +117,10 @@ def _append_nap_to_history(message: str) -> dict:
 
     (b) Fail-soft, but NOT silent (Ariadne's colleague-pass suggestion,
     2026-08-15). A history-write failure (missing dir, unwritable disk,
-    lock failure, anything) must never fail the engram_nap call it's
-    attached to — nap's job is the checkpoint (session log, stats, snapshot
-    commit); this is a best-effort side effect layered on top. But
+    lock failure, anything) must never fail the engram_checkpoint (formerly
+    engram_nap) call it's attached to — nap's job is the checkpoint (session
+    log, stats, snapshot commit); this is a best-effort side effect layered
+    on top. But
     "guarantees that something concise lands for every nap" (clause (a))
     is not actually true if a failed attempt is indistinguishable from a
     successful one to the caller — a guaranteed side effect that can
@@ -222,7 +224,8 @@ def _append_nap_to_history(message: str) -> dict:
 
 
 def _checkpoint_internal(message: str, advance_turn: bool) -> str:
-    """Internal checkpoint logic shared by engram_nap and engram_advance_turn.
+    """Internal checkpoint logic shared by engram_checkpoint (formerly
+    engram_nap) and engram_advance_turn.
 
     Computes graph stats, appends to session_log, snapshots + commits.
     If advance_turn is True, increments the global turn counter (subsequent
@@ -230,14 +233,15 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
     importance_score). If False, leaves the turn counter alone (nap mode) and
     arms a nap_checkpoint feeling nudge.
 
-    The two public tools (engram_nap and engram_advance_turn) exist as
-    distinct MCP entry points so a missed kwarg cannot accidentally promote
-    a nap into a turn-advancing checkpoint — the prior single-tool design
-    was bug-prone under context pressure (brief automated sessions especially).
+    The two public tools (engram_checkpoint, formerly engram_nap, and
+    engram_advance_turn) exist as distinct MCP entry points so a missed kwarg
+    cannot accidentally promote a nap into a turn-advancing checkpoint — the
+    prior single-tool design was bug-prone under context pressure (brief
+    automated sessions especially).
 
     Note: the ``diagnostic_snapshot`` key is NOT in this function's return
-    value. The server.py wrappers (engram_nap / engram_advance_turn) append
-    it after calling this impl, using engram_diagnose() which lives in
+    value. The server.py wrappers (engram_checkpoint / engram_advance_turn)
+    append it after calling this impl, using engram_diagnose() which lives in
     server.py. See module docstring for the wave-3 structural note.
     """
     mode = "session" if advance_turn else "nap"
@@ -310,6 +314,173 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
         # succeeds and the version_control field reports why.
         version_control = core._commit_snapshot(conn, message, mode)
 
+        # Health-score engine snapshot (engram-alpha#1991 PR2) — piggybacked
+        # on this exact call site because this is "where the graph is
+        # already checkpointed and committed" (design doc §4.4): the
+        # knowledge.sql dump + git commit just above has already happened,
+        # so `conn` reflects a fresh, already-durable state.
+        #
+        # checkpoint_mode mapping: this function's own two modes are "nap"
+        # (advance_turn=False) and "session" (advance_turn=True). "nap" maps
+        # directly. "session" maps to "post_dream" because engram_advance_turn
+        # is documented [Sleep/first-session only] and the codebase states
+        # outright that "turn advance is reserved for post-dream session
+        # checkpoints" (engram-nap/SKILL.md) — the dream master's own Step 8
+        # calls engram_advance_turn as its LAST action, after all consolidation
+        # writes. The one other legitimate caller (first-session bootstrap) is
+        # a once-ever edge case that would also get labelled "post_dream" here;
+        # flagged in the PR2 report rather than special-cased silently.
+        #
+        # The THIRD checkpoint ("pre_sleep") is deliberately NOT wired — the
+        # PR2 investigation found no concrete hook point for it (see PR2
+        # report); guessing one would risk a wiring point that silently never
+        # fires, which the design doc explicitly calls worse than leaving it
+        # unwired and reporting the gap.
+        #
+        # Best-effort, mirrors core._commit_snapshot's own posture just above:
+        # a health-snapshot failure must never break the underlying nap/
+        # advance_turn checkpoint tool it's piggybacked onto.
+        _health_checkpoint_mode = "nap" if mode == "nap" else "post_dream"
+        try:
+            from health import engine as health_engine
+            _health_snapshot = health_engine.write_snapshot(conn, _health_checkpoint_mode)
+            health_snapshot_summary = {
+                "checkpoint_mode": _health_checkpoint_mode,
+                "composed_score": _health_snapshot["scores"]["composed"],
+                "aspect_scores": _health_snapshot["scores"]["aspects"],
+                "path": _health_snapshot.get("_snapshot_path"),
+            }
+        except Exception as e:
+            health_snapshot_summary = {
+                "checkpoint_mode": _health_checkpoint_mode,
+                "error": str(e),
+            }
+
+        # #2559: seed + PRAGMA optimize, after the health snapshot, on EVERY
+        # checkpoint (both nap and advance_turn -- unlike the post_dream-only
+        # health series store below). No shipped code path ever ran ANALYZE
+        # before this, so sqlite_stat1 never existed and the query planner
+        # ran every multi-index query (not just the dangling-evidence one
+        # this issue was filed about) without cardinality statistics.
+        #
+        # #2685 review finding (Ariadne, SQLite 3.45.1), CORRECTED 2026-09-11
+        # on a ~5,750-node live graph -- the earlier wording of this comment
+        # overstated the measurement it rested on, so read the bound with the
+        # claim: PRAGMA optimize alone seeds nothing ON A CONNECTION THAT HAS
+        # ISSUED NO QUERY (zero rows under every documented mask -- default,
+        # 0x02, 0x10002, 0xfffe). It does NOT follow, and is false, that
+        # optimize can never bootstrap a never-analyzed table: on the same
+        # 3.45.1 process, once a query has touched `nodes`, optimize seeds it
+        # (8 rows). The operative parameter is whether the table was queried
+        # in THIS connection, not whether it has ever been analyzed.
+        #
+        # That correction does not weaken the case for the seed -- it moves
+        # it. What optimize cannot do is COVER THE SCHEMA: it only ever
+        # analyzes the tables the calling process happened to query, so a
+        # checkpoint would seed whatever subset that process touched and
+        # nothing else. Measured on the same graph: the unscoped ANALYZE
+        # below produces 32 rows across 17 tables; optimize alone in the same
+        # process produces 8 rows across 1. The other 16 tables would keep
+        # planning without statistics indefinitely.
+        #
+        # A same-day re-run of Ariadne's exact experiment on this repo's own
+        # vendored SQLite (3.53.4) got the OPPOSITE result: PRAGMA optimize
+        # alone DID seed sqlite_stat1 immediately, under every mask. The
+        # first read of that disagreement (per-seat SQLite version) was
+        # ITSELF corrected within the hour: Ariadne re-ran both binaries on
+        # her OWN single host and found both outcomes live there, minutes
+        # apart -- her machine's standalone `sqlite3` CLI links a newer
+        # SQLite (3.53.0) while the same host's ENGRAM venv Python links an
+        # older one (3.45.1), on identical SQL and schema. Re-measured
+        # 2026-09-11 with the queried-vs-unqueried parameter above held
+        # explicit, which is what makes the two separable: 3.53.0 seeds in
+        # BOTH conditions (28 rows either way), 3.45.1 only when the table
+        # was queried first (0 unqueried, 8 queried). So linked-library
+        # version is a genuine discriminator and does not reduce to the
+        # queried-in-this-connection parameter; it shows up specifically in
+        # the unqueried condition. The boundary is per-PROCESS library
+        # linkage, not per-seat/per-agent version -- a fact no code running
+        # inside one process can observe about another process, which is
+        # exactly why the explicit seed below is not merely convenient but
+        # the ONLY deterministic option: a version-conditioned check cannot
+        # be written correctly (a process cannot know what a different
+        # process would have linked), so there is nothing to gate on except
+        # sqlite_stat1's own presence. With the seed, every checkpoint gets
+        # sqlite_stat1 populated unconditionally on first run, regardless of
+        # which SQLite build the calling process happens to have linked.
+        #
+        # Costs, all re-measured 2026-09-11 on a ~5,750-node graph, n=12 per
+        # variant. ONE-TIME SEED: unscoped ANALYZE (what ships) median 28.6ms
+        # (25.2-36.8); scoped `ANALYZE nodes` median 24.3ms (21.3-32.5). An
+        # earlier version of this comment said ~8.5ms; that does not reproduce
+        # under either variant. STEADY-STATE PRAGMA optimize once stats exist:
+        # median 0.004ms (0.003-0.022) -- which is what makes the unconditional
+        # every-checkpoint call free at nap frequency.
+        #
+        # READ THE ORDER OF MAGNITUDE AS THE CLAIM, not any single figure:
+        # these are wall-clock and load-dependent, and an independent re-run on
+        # the same host produced a 97.3ms outlier on the unscoped seed. What
+        # survives the noise is the shape -- tens of milliseconds once, then
+        # microseconds forever.
+        #
+        # DO NOT read "and PRAGMA optimize maintains it thereafter" into the
+        # above -- an earlier version of this comment said exactly that and it
+        # is NOT true on 3.45.1: after a 16x row growth the seeded stats stayed
+        # frozen under all three variants (table queried first, fresh
+        # connection, explicit 0xfffe mask), while an explicit ANALYZE on the
+        # same data updated them. Tracked as #2732; what bounds the drift today
+        # is nothing in this block, only whatever cadence re-seeds after a
+        # sqlite_stat1-absent state. The seed fixes "no statistics at all";
+        # it does not promise "statistics that stay current".
+        #
+        # The seed is a plain, unscoped ANALYZE (deliberate -- analyzes the
+        # whole schema, not just the nodes table the composite index above
+        # targets) run exactly once, gated on sqlite_stat1 not existing yet;
+        # PRAGMA optimize is SQLite's own documented low-cost maintenance
+        # form and still runs every checkpoint after the gate, unconditionally
+        # (unlike a full ANALYZE on every open, which would be wasteful at
+        # nap frequency). Best-effort as a single unit, mirrors the health
+        # snapshot block just above: a failure in the seed check or the
+        # ANALYZE must not prevent PRAGMA optimize from at least being
+        # attempted, and neither may ever break the underlying nap/
+        # advance_turn checkpoint tool this is piggybacked onto.
+        # Two separate try/except blocks, not one -- #2685 reviewer-fairy
+        # finding: a single shared block let a seed-check/ANALYZE failure
+        # silently skip PRAGMA optimize too, contradicting the comment above.
+        # Splitting them means a failure in the seed step can never prevent
+        # the optimize attempt, and vice versa.
+        try:
+            _stat1_exists = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'"
+            ).fetchone()
+            if not _stat1_exists:
+                conn.execute("ANALYZE")
+        except Exception:
+            pass
+        try:
+            conn.execute("PRAGMA optimize")
+        except Exception:
+            pass
+
+        # Health series store (engram-alpha#2575 PR C, design doc §4 "When it
+        # runs"): ingest -> backfill -> derive, best-effort, POST-DREAM ONLY
+        # (the design's "regular backfill mechanism" -- nightly cost is the
+        # gap only; a nap checkpoint fires far more often and would pay that
+        # cost for no benefit, so it deliberately skips this block). Mirrors
+        # the health_snapshot_summary block just above: a failure here must
+        # never break the underlying nap/advance_turn checkpoint tool.
+        if _health_checkpoint_mode == "post_dream":
+            try:
+                from health import engine as health_engine
+                from health import series as health_series
+                health_series_summary = health_series.checkpoint_hook(
+                    str(health_engine._snapshot_dir()), str(core.DATA_DIR),
+                    str(health_engine._snapshot_dir() / "series.db"), _health_checkpoint_mode)
+            except Exception as e:
+                health_series_summary = {"error": str(e), "checkpoint_mode": _health_checkpoint_mode}
+        else:
+            health_series_summary = {"skipped": "nap checkpoints do not run the series store; post_dream only"}
+
         result = {
             "status": "checkpoint_saved",
             "mode": mode,
@@ -330,6 +501,8 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
                 "tier3_total": current_count,
                 "decay_base": mem.get("decay_base", 1.014),
             },
+            "health_snapshot": health_snapshot_summary,
+            "health_series": health_series_summary,
             "version_control": version_control,
         }
 
@@ -359,7 +532,9 @@ def _checkpoint_internal(message: str, advance_turn: bool) -> str:
 
 
 def _nap_impl(message: str) -> str:
-    """Impl for engram_nap — callable with named kwargs for in-server callers."""
+    """Impl for engram_checkpoint (formerly engram_nap; also used by the
+    engram_nap deprecated alias) — callable with named kwargs for in-server
+    callers."""
     return _checkpoint_internal(message, advance_turn=False)
 
 
@@ -721,10 +896,22 @@ def _reflect_impl(summary_top_k: int = 5) -> str:
         ).fetchall()
         # Filter to thin-support (support_count <= 1), preserving importance order.
         thin_support_candidates = []
+        # #2624: "how many premises does this derivation rest on" is the
+        # SAME one-hop-premise question core._direct_premise_ids answers
+        # (core.CITATION_SUPPORT_RELATIONS -- derives_from, supported_by,
+        # acknowledged_derives_from) -- NOT the confidence-formula's own
+        # narrower core.CASCADE_RELATIONS, which deliberately excludes
+        # supported_by because that relation is a real premise for
+        # cascade/health purposes but not a formula input (see #2618's
+        # comment at engram_core.py's confidence-recompute site). This is
+        # a "how well is this claim grounded" health metric, not a
+        # confidence recompute, so it uses the general premise notion.
+        _rels = sorted(core.CITATION_SUPPORT_RELATIONS)
         for d in derivations:
             support_count = conn.execute(
-                "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation = 'derives_from'",
-                (d["id"],),
+                "SELECT COUNT(*) as c FROM edges WHERE source_id = ? AND relation IN "
+                f"({','.join('?' for _ in _rels)})",
+                (d["id"], *_rels),
             ).fetchone()["c"]
             if support_count <= 1:
                 thin_support_candidates.append((d, support_count))

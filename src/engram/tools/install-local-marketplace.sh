@@ -80,22 +80,28 @@ trap _venv_fail_trap EXIT
 
 usage() {
   cat <<'EOF'
-Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch]
+Usage: bash tools/install-local-marketplace.sh [--help] [--skip-add] [--skip-build] [--target <claude-code|codex>] [--allow-branch] [--allow-untagged]
 
 Assembles a local ENGRAM marketplace at $ENGRAM_HOME/marketplace/ from
 build/plugin/. With --target claude-code it registers via `claude plugin marketplace add`;
 with --target codex it installs via `codex plugin add engram@engram-local`.
 
 Options:
-  --help          Show this help and exit.
-  --skip-add      Assemble but skip the `claude plugin marketplace add` step.
-  --skip-build    Skip the internal build-plugin.sh invocation. Use when the
-                  caller has already built build/plugin/ with the correct flags.
-                  build/plugin/plugin.json must already exist.
-  --target T      Build target to pass through when not using --skip-build:
-                  claude-code (default) or codex.
-  --allow-branch  Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' always allowed).
-                  Use only for deliberate branch builds (e.g. metric-eval checkouts).
+  --help            Show this help and exit.
+  --skip-add        Assemble but skip the `claude plugin marketplace add` step.
+  --skip-build      Skip the internal build-plugin.sh invocation. Use when the
+                    caller has already built build/plugin/ with the correct flags.
+                    build/plugin/plugin.json must already exist.
+  --target T        Build target to pass through when not using --skip-build:
+                    claude-code (default) or codex.
+  --allow-branch    Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' always allowed).
+                    Use only for deliberate branch builds (e.g. metric-eval checkouts).
+  --allow-untagged  Allow building from a commit that carries no deployable tag
+                    (overrides the tag guard, #2586). Deployable tags are v* and
+                    deploy/* at HEAD — the same set the health-snapshot versioning
+                    gate (#2563) treats as the deployable predecessors. Use only for
+                    a deliberate untagged deploy (e.g. certifying an unreleased
+                    merge commit); .deployed-version records alpha_tag=none.
 
 After running:
   $ENGRAM_HOME/marketplace/.claude-plugin/marketplace.json
@@ -125,12 +131,14 @@ SKIP_ADD=0
 SKIP_BUILD=0
 TARGET="claude-code"
 ALLOW_BRANCH=0
+ALLOW_UNTAGGED=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage ;;
     --skip-add) SKIP_ADD=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --allow-branch) ALLOW_BRANCH=1; shift ;;
+    --allow-untagged) ALLOW_UNTAGGED=1; shift ;;
     --target)
       [[ $# -ge 2 ]] || die "--target requires a value: claude-code or codex"
       TARGET="$2"
@@ -152,12 +160,148 @@ if [[ ! -f "$REPO_ROOT/src/engram/server.py" ]]; then
   die "Must be run from the repo root (expected src/engram/server.py at $REPO_ROOT/src/engram/server.py)"
 fi
 
-# #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set.
+# #2586's tag-guard predicate is computed HERE, before the #794 branch-name
+# check below, because #794 now also consults it (#2711): a detached HEAD's
+# "branch name" is the literal string 'HEAD' (or empty, depending on the git
+# command), which always tripped #794 before the #2586 tag exception ever
+# got a chance to fire — e.g. `git checkout deploy/2026-09-06-...` then
+# `install-local-marketplace.sh` with no flags. "Deployable" is defined
+# identically to test_health_version_gate.py's deployable_tags() —
+# refs/tags/v* UNION refs/tags/deploy/* — enumerated here with `git tag
+# --points-at HEAD` filtered to those two patterns rather than `for-each-ref`
+# (deployable_tags() scans every tag in the repo to find the max version;
+# this guard only needs to know what's AT HEAD). An unrelated tag (e.g.
+# foo/bar) does not count and is ignored below.
+DEPLOY_TAGS="$(git -C "$REPO_ROOT" tag --points-at HEAD 2>/dev/null | grep -E '^(v|deploy/)' || true)"
+
+# A same-named LOCAL tag on genuinely unmerged work must NOT be able to
+# bypass #794 just by being named v*/deploy/* — that would defeat #794's
+# whole purpose (block deploying unmerged code). So the exception requires
+# BOTH a deployable tag at HEAD AND that HEAD is actually merged history: an
+# ancestor of origin/dev or origin/main. Uses HEAD itself, never a bare tag
+# name, for the ancestry check — not because a bare tag name is unsafe AT
+# THIS CALL (`git merge-base --is-ancestor` dereferences an annotated tag to
+# its commit automatically, so the `git rev-parse <annotated-tag>` trap —
+# returns the tag object, not the commit, #2711 — was never reachable here
+# either way; confirmed by mutating this line to a bare tag name and
+# re-running the suite, which stayed all-green). HEAD is still the right
+# choice: it's unambiguous when several tags point at the same commit, where
+# a bare tag name would need picking one arbitrarily. The rev-parse trap is
+# real elsewhere (anywhere a tag name is handed straight to `git rev-parse`)
+# — just not at this call.
+#
+# Before trusting origin/dev + origin/main for that ancestry check, refresh
+# them: a local remote-tracking ref that hasn't been re-fetched since a
+# merge can still show a LATER-REVERTED commit as an ancestor (e.g. dev gets
+# force-pushed back past a bad merge; the stale local ref still contains the
+# reverted commit, so this exception would wrongly fire for code that is no
+# longer merged history). FAIL CLOSED if the refresh itself doesn't succeed
+# — offline, no 'origin' remote configured, auth failure, whatever the
+# cause: an unreachable network must make this guard STRICTER, never
+# looser. A failed refresh falls through to the #794 guard below exactly as
+# if HEAD carried no deployable tag at all.
+#
+# BOUND THE FETCH (#2711 round 3): "fail closed" above assumes the fetch
+# call actually RETURNS. A silently-dropped network (packets unrouted
+# rather than refused) can leave `git fetch` hanging indefinitely with no
+# error and no timeout — worse than a refusal, because a refusal tells the
+# operator to pass --allow-branch and move on in seconds, while a hang gives
+# them nothing to act on and looks like the build is simply slow. Cap the
+# fetch at FETCH_TIMEOUT_SECS (default 15s — this fetch pulls two ref
+# updates over SSH, which on a working connection completes in well under a
+# second; 15s absorbs real congestion or slow DNS on a normal connection
+# without leaving a dropped one to hang for minutes) and route a timeout
+# into the SAME fail-closed branch as any other fetch failure, with a
+# message that names it as a timeout specifically so the operator knows to
+# retry rather than assume something is broken. Override via
+# ENGRAM_INSTALL_FETCH_TIMEOUT_SECS — test-only knob, not documented in
+# --help, so a real deploy always uses the 15s default.
+#
+# `timeout` (GNU coreutils) is not guaranteed on every seat this script
+# runs on: Linux seats ship it standard, but at least one macOS seat
+# (Luria's) does not carry it by default (BSD userland, no GNU coreutils).
+# Git's own http.lowSpeedLimit/http.lowSpeedTime knobs were considered
+# instead and rejected: they only bound the HTTP transport, and this
+# repo's origin is reached over SSH (git@github.com:...), so they would
+# never engage here. Prefer `timeout`; else try `gtimeout` — Homebrew's
+# coreutils installs GNU tools under a `g`-prefix on macOS (gtimeout,
+# gsed, gdate, ...), so a macOS seat that has coreutils at all is likely
+# to carry `gtimeout` rather than a bare `timeout` (reasoning about the
+# Homebrew convention, not a measurement — no macOS seat was available to
+# confirm `gtimeout` actually resolves on Luria's machine specifically).
+# Degrade to an UNBOUNDED fetch only if NEITHER resolves, rather than
+# breaking the fetch outright on a seat that lacks both — but that means a
+# seat with none of `timeout`, `gtimeout`, or an equivalent shim is NOT
+# protected by this fix; a dropped network there can still hang exactly as
+# before. That gap is real and left open rather than papered over with a
+# false sense of coverage.
+FETCH_TIMEOUT_SECS="${ENGRAM_INSTALL_FETCH_TIMEOUT_SECS:-15}"
+_TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  _TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  _TIMEOUT_BIN="gtimeout"
+fi
+DEPLOYABLE_ANCESTOR=0
+if [[ -n "$DEPLOY_TAGS" ]]; then
+  _fetch_rc=0
+  if [[ -n "$_TIMEOUT_BIN" ]]; then
+    "$_TIMEOUT_BIN" "$FETCH_TIMEOUT_SECS" git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
+  else
+    log "WARNING: neither 'timeout' nor 'gtimeout' is on PATH, so the pre-build 'git fetch origin dev main' below is running UNBOUNDED on this seat — a silently-dropped connection can hang this install indefinitely instead of failing fast after ${FETCH_TIMEOUT_SECS}s. Run 'brew install coreutils' (macOS) to restore the bound."
+    git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
+  fi
+  if [[ $_fetch_rc -eq 0 ]]; then
+    if git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/dev 2>/dev/null \
+       || git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+      DEPLOYABLE_ANCESTOR=1
+    fi
+  elif [[ $_fetch_rc -eq 124 ]]; then
+    log "WARNING: refreshing origin/dev + origin/main before the merged-history check TIMED OUT after ${FETCH_TIMEOUT_SECS}s (a silently-dropped connection, not an outright refusal — the network may be reachable but not responding). Retry once the connection is healthy, or pass --allow-branch now to proceed without the refresh. Treating HEAD as unconfirmed merged history — the #794 guard below will require --allow-branch unless HEAD is on 'dev' or 'main'."
+  else
+    log "WARNING: could not refresh origin/dev + origin/main before the merged-history check (offline? no 'origin' remote configured? git fetch --tags origin first if you suspect a stale remote). Treating HEAD as unconfirmed merged history — the #794 guard below will require --allow-branch unless HEAD is on 'dev' or 'main'."
+  fi
+fi
+
+# #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set,
+# OR HEAD is at a deployable tag that is merged history (the #2586/#2711 exception above).
 # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
-# Every other branch — PR branches, feature branches, etc. — requires --allow-branch to override.
+# Every other branch — PR branches, feature branches, etc. — requires --allow-branch to override
+# (or a deploy-tag checkout, which needs no flag at all).
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $ALLOW_BRANCH -eq 0 ]]; then
-  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts). Guard per #794."
+if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $DEPLOYABLE_ANCESTOR -eq 0 && $ALLOW_BRANCH -eq 0 ]]; then
+  die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts), or check out a deployable tag (v*/deploy/*) that is merged into origin/dev or origin/main — no flag needed for that. Guard per #794 (tag exception per #2586/#2711)."
+fi
+
+# #2586 tag guard: refuse builds from an untagged commit unless --allow-untagged
+# is set.
+#
+# This sits before the --target dispatch so both Claude and Codex install
+# paths get it — the guard lives in the script, not in the engram-upgrade
+# skill (see #2586's issue body).
+#
+# TODO(#2586 follow-up): a future `--verify` mode (compare the deployed tree
+# to the recorded tag's source) must apply the build's template substitution
+# before diffing, or its first result on every seat is a false positive
+# (start-engram-daemon.sh's {{PYTHON}} token is the concrete example Borges
+# measured) — and it must name its baseline (the seat's own recorded
+# alpha_tag, never the dev tip) in its own output, or a fully-consistent seat
+# reads as drifted against the wrong reference.
+ALPHA_UNTAGGED_OVERRIDE_FIRED=0
+if [[ -z "$DEPLOY_TAGS" ]]; then
+  SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  NEAREST_TAG="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null || echo none)"
+  TAG_GUARD_MSG="HEAD ($SHORT_SHA) is not a tagged commit (deployable tags = v* and deploy/*; nearest by ancestry: $NEAREST_TAG). The health-snapshot versioning gate (engram-alpha#2563) treats tags as the deployable set; snapshots written from untagged code are invisible to it and can orphan your health history. Rebuild from a tag (git fetch --tags origin first if your tags are stale), or pass --allow-untagged to proceed anyway — the deploy log repeats this warning and .deployed-version records alpha_tag=none. Guard per #2586."
+  if [[ $ALLOW_UNTAGGED -eq 0 ]]; then
+    die "$TAG_GUARD_MSG"
+  else
+    log "WARNING: $TAG_GUARD_MSG"
+    ALPHA_UNTAGGED_OVERRIDE_FIRED=1
+  fi
+  ALPHA_TAG="none"
+else
+  ALPHA_TAG="$(printf '%s' "$DEPLOY_TAGS" | paste -sd, -)"
+  log "Deployable tag(s) at HEAD: $ALPHA_TAG"
 fi
 
 ENGRAM_HOME="${ENGRAM_HOME:-$HOME/.engram}"
@@ -182,26 +326,100 @@ else
   build_flags=()
   _cfg="$ENGRAM_HOME/config.json"
   if [[ -f "$_cfg" ]]; then
-    # Hard-require jq when a config exists: without it the build silently
-    # proceeds flagless and drops configured surfaces (multi-agent / dev tier)
-    # — the #704 class. Same contract as migrate-to-plugin.sh's require_jq.
-    if ! command -v jq &>/dev/null; then
-      {
-        printf '[install-local-marketplace] ERROR: jq is required to read %s (multi_agent/install_tier).\n' "$_cfg"
-        printf '[install-local-marketplace]   Install jq:  brew install jq  (macOS)  |  sudo apt-get install jq  (Debian/Ubuntu)\n'
-        printf '[install-local-marketplace]   No-jq path:  bash tools/build-plugin.sh --tier <tier> --multi-agent\n'
-        printf '[install-local-marketplace]                bash tools/install-local-marketplace.sh --skip-build\n'
-        printf '[install-local-marketplace]   Without jq the build silently drops configured surfaces (#704 class).\n'
-      } >&2
+    # Read multi_agent/install_tier via python3, not jq (#2955) — python3 is
+    # already a hard requirement of this script (see the config-persist block
+    # below), so there is nothing left to require a system jq binary for.
+    # One python3 invocation reads both fields from a single parse (cheaper
+    # than two separate calls, and keeps the pair atomically consistent) and
+    # prints them as two stdout lines. This is a DELIBERATE style choice
+    # against the later _eff_tier/_eff_multi_agent block (~line 497 below),
+    # which makes two separate python3 -c calls — that shape predates this
+    # fix and is unrelated pre-existing code (its own silent-exception-swallow
+    # anti-pattern is tracked separately under #2951; not the model to follow
+    # here). On ANY parse error this block prints a clear message to stderr
+    # and exits non-zero — the same fail-loud contract the old jq path got
+    # for free from `set -e`, just with a cleaner message than a raw
+    # traceback.
+    # PORTABILITY LANDMINE (#2979): bash 3.2 (macOS's system bash) requires an
+    # EVEN total count of literal ' characters across this heredoc's body when
+    # the heredoc is nested in a $(...) command substitution like this one --
+    # an odd count (even from an English apostrophe in a comment!) desyncs
+    # bash 3.2's naive quote-balance scan for the substitution's closing paren
+    # and produces a spurious syntax error dozens of lines later. Count single
+    # quotes before adding/editing any comment or string inside this heredoc.
+    if ! _ma_tier_out="$(python3 - "$_cfg" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError(f"expected a JSON object at the top level, got {type(d).__name__}")
+    # #2965: the TOP LEVEL was type-checked above; the VALUES were not, so a
+    # well-formed config with a wrong-typed value (install_tier: 0, an int
+    # whose str() is non-empty) silently passed the `-z` fallback check
+    # further down and dropped dev/forum requirements with no signal --
+    # exactly the outcome issue #2951 says absence should never
+    # produce. Reject a present-but-wrong-typed value the same fail-loud way
+    # a malformed file is already rejected, rather than let it degrade to a
+    # convenience/single-agent default.
+    ma_raw = d.get("multi_agent")
+    if ma_raw is not None and not isinstance(ma_raw, bool):
+        raise ValueError(f"multi_agent must be a boolean (or null/absent), got {type(ma_raw).__name__}: {ma_raw!r}")
+    ma = "true" if (ma_raw is True or d.get("mode") == "multi") else "false"
+    # Match jq install_tier // empty semantics: only null/missing falls back
+    # to empty -- an already-empty-string value passes through as itself.
+    tier = d.get("install_tier")
+    if tier is not None and tier is not False and not isinstance(tier, str):
+        raise ValueError(f"install_tier must be a string (or null/absent/false), got {type(tier).__name__}: {tier!r}")
+    if tier is None or tier is False:
+        tier = ""
+    # Reviewer catch (#2958, Mira): this block hands ma/tier to bash as two
+    # stdout lines, split via `sed -n '1p'`/`sed -n '2p'` (see below) --
+    # unlike the old single-jq-argument path, a value containing an embedded
+    # newline is silently split across MULTIPLE lines and the sed split then
+    # truncates it to just its first line, with everything after the
+    # newline dropped from the pipeline with no error. Reject it here
+    # instead, matching the fail-loud contract already used above. `ma` is always
+    # "true"/"false" (derived above, never copied from user input) so it can
+    # never contain a newline -- only `tier`, a raw string straight out of
+    # config.json, is at risk.
+    if "\n" in tier:
+        raise ValueError(
+            "install_tier must not contain a newline "
+            f"(got {tier!r})"
+        )
+except Exception as e:
+    # Reviewer-fairy round 1 (#2955): the ORIGINAL version of this block only
+    # wrapped the open()+json.load() call, so a syntactically-valid-but-wrong-
+    # shape config (e.g. a bare JSON array or string at the top level) still
+    # aborted the script (d.get() raised AttributeError, uncaught, non-zero
+    # exit -- fail-loud held) but with a raw Python traceback instead of this
+    # clean one-line message. Widened to cover every failure mode with the
+    # SAME message, matching the safety property this whole block exists for.
+    print(f"[install-local-marketplace] ERROR: failed to parse {path}: {e}", file=sys.stderr)
+    sys.exit(1)
+print(ma)
+print(tier)
+PY
+    )"; then
       exit 1
     fi
-    _ma="$(jq -r 'if (.multi_agent == true) or (.mode == "multi") then "true" else "false" end' "$_cfg")"
-    _tier="$(jq -r '.install_tier // empty' "$_cfg")"
+    # Split the two stdout lines without readarray/mapfile -- unavailable
+    # on bash 3.2 (macOS's system /usr/bin/env bash target).
+    _ma="$(printf '%s\n' "$_ma_tier_out" | sed -n '1p')"
+    _tier="$(printf '%s\n' "$_ma_tier_out" | sed -n '2p')"
     [[ "$_ma" == "true" ]] && build_flags+=("--multi-agent")
     [[ -n "$_tier" ]] && build_flags+=("--tier" "$_tier")
   fi
   build_flags+=("--target" "$TARGET")
-  [[ $ALLOW_BRANCH -eq 1 ]] && build_flags+=("--allow-branch")
+  # build-plugin.sh (tools/engine/cli.py) carries its OWN independent #794
+  # branch guard, unrelated to the one above — passing our local tag/ancestor
+  # exception here too (not just $ALLOW_BRANCH) is what actually makes a
+  # deploy-tag checkout build end-to-end without --allow-branch; otherwise
+  # this guard would pass while the engine's own guard still refuses one
+  # call downstream. #2711.
+  [[ $ALLOW_BRANCH -eq 1 || $DEPLOYABLE_ANCESTOR -eq 1 ]] && build_flags+=("--allow-branch")
   log "Building plugin tree (target: $TARGET, flags: ${build_flags[*]:-none})"
   bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 fi
@@ -280,13 +498,17 @@ if [[ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/n
 else
   ALPHA_DIRTY="clean"
 fi
-cat > "$ENGRAM_HOME/.deployed-version" <<MARKER
-alpha_sha=$ALPHA_SHA
-alpha_branch=$ALPHA_BRANCH
-alpha_dirty=$ALPHA_DIRTY
-deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-deployed_from=$REPO_ROOT
-MARKER
+{
+  printf 'alpha_sha=%s\n' "$ALPHA_SHA"
+  printf 'alpha_branch=%s\n' "$ALPHA_BRANCH"
+  printf 'alpha_tag=%s\n' "$ALPHA_TAG"
+  if [[ $ALPHA_UNTAGGED_OVERRIDE_FIRED -eq 1 ]]; then
+    printf 'alpha_untagged_override=1\n'
+  fi
+  printf 'alpha_dirty=%s\n' "$ALPHA_DIRTY"
+  printf 'deployed_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'deployed_from=%s\n' "$REPO_ROOT"
+} > "$ENGRAM_HOME/.deployed-version"
 log "Version marker refreshed: $ENGRAM_HOME/.deployed-version (alpha_sha=$ALPHA_SHA)"
 
 # ── Persist install choices to config.json (bug 4, #1244) ────────────────────
@@ -340,13 +562,69 @@ fi
 # this run rebuilt the plugin tree.
 _ENGRAM_VENV_PY="$ENGRAM_HOME/venv/bin/python"
 if [[ -f "$_ENGRAM_VENV_PY" ]] && command -v python3 &>/dev/null; then
-  _eff_tier="$(python3 -c "import json,sys
+  # #2951: these two reads used to swallow ANY parse failure and silently
+  # resolve to convenience/not-multi-agent, dropping the dev/forum
+  # requirements with no signal. Fail loud instead, matching the
+  # _ma_tier_out block's contract above (#2955/#2958) -- absence of the
+  # value means "something is wrong", never "single-agent convenience".
+  # A well-formed config that simply omits install_tier (or has it as
+  # null) still resolves to empty string here, exactly like the sibling
+  # block, so the existing `[[ -z ... ]] && _eff_tier="convenience"` line
+  # below keeps doing the legitimate-default job -- only a parse/type
+  # failure takes the new sys.exit(1) path. Kept as TWO separate python3
+  # calls (not merged into one heredoc like the _ma_tier_out block) --
+  # deliberate minimal-diff scope: this fix makes the existing two calls
+  # fail loud, it does not restructure them.
+  if ! _eff_tier="$(python3 -c "import json,sys
+path = sys.argv[1]
 try:
-    print(json.load(open(sys.argv[1])).get('install_tier','convenience'))
-except Exception:
-    print('convenience')
-" "$ENGRAM_HOME/config.json" 2>/dev/null)"
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
+    tier = d.get('install_tier')
+    # #2965: reject a present-but-wrong-typed value (e.g. an int/list/dict)
+    # instead of letting it fall through non-empty and silently defeat the
+    # [[ -z ... ]] && _eff_tier=convenience fallback below.
+    if tier is not None and tier is not False and not isinstance(tier, str):
+        raise ValueError('install_tier must be a string (or null/absent/false), got ' + type(tier).__name__ + ': ' + repr(tier))
+    if tier is None or tier is False:
+        tier = ''
+except Exception as e:
+    print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
+    sys.exit(1)
+print(tier)
+" "$ENGRAM_HOME/config.json")"; then
+    exit 1
+  fi
   [[ -z "$_eff_tier" ]] && _eff_tier="convenience"
+  # Independent of tier (#2944): is this seat multi-agent? Same boolean logic
+  # as the earlier jq-based read above (multi_agent==true OR mode=="multi"),
+  # reimplemented via python3 here to match this later block's jq-optional
+  # style (this block already doesn't assume jq is present). Same #2951
+  # fail-loud contract as _eff_tier above -- absence of multi_agent/mode
+  # keys is a legitimate "false", only a parse/type failure errors.
+  if ! _eff_multi_agent="$(python3 -c "import json,sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError('expected a JSON object at the top level, got ' + type(d).__name__)
+    _ma_raw = d.get('multi_agent')
+    # #2965: reject a present-but-wrong-typed value (e.g. the string 'true',
+    # or 1) instead of letting it silently resolve to false and drop the
+    # forum package requirements with no signal.
+    if _ma_raw is not None and not isinstance(_ma_raw, bool):
+        raise ValueError('multi_agent must be a boolean (or null/absent), got ' + type(_ma_raw).__name__ + ': ' + repr(_ma_raw))
+    print('true' if (_ma_raw is True or d.get('mode') == 'multi') else 'false')
+except Exception as e:
+    print('[install-local-marketplace] ERROR: failed to parse ' + path + ': ' + str(e), file=sys.stderr)
+    sys.exit(1)
+" "$ENGRAM_HOME/config.json")"; then
+    exit 1
+  fi
+  [[ -z "$_eff_multi_agent" ]] && _eff_multi_agent="false"
   _runtime_req="$REPO_ROOT/requirements/requirements.txt"
   if [[ -f "$_runtime_req" ]]; then
     log "Provisioning venv at $ENGRAM_HOME/venv (tier: $_eff_tier)"
@@ -369,6 +647,28 @@ except Exception:
       # server update, so this is WARN-and-continue only (NOT flagged).
       "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_dev_req" \
         || log "WARN: venv dev-requirements install failed (continuing; server still runs)"
+    fi
+  fi
+  if [[ "$_eff_multi_agent" == "true" ]]; then
+    _forum_req="$REPO_ROOT/src/forum/requirements.txt"
+    if [[ -f "$_forum_req" ]]; then
+      log "Multi-agent: installing forum package dependencies into $ENGRAM_HOME/venv"
+      # A failed FORUM-requirements install (Flask, bleach, beautifulsoup4,
+      # html5lib, markdown-it-py, sentence-transformers, huggingface_hub,
+      # sqlite-vec) only affects local forum-test collection (src/forum/tests/)
+      # — the server still runs on the runtime reqs above. Failing the whole
+      # install over a missing forum-test dep would block a working server
+      # update, so this is WARN-and-continue only (NOT flagged), matching the
+      # dev-requirements install above.
+      "$_ENGRAM_VENV_PY" -m pip install --quiet -r "$_forum_req" \
+        || log "WARN: venv forum-requirements install failed (continuing; server still runs)"
+    else
+      # #2951 (Kepler, folded into the same rc2 item): a missing forum-
+      # requirements file used to silently no-op with zero log output,
+      # unlike the install-failed case above which does WARN. A
+      # multi-agent seat with no forum requirements file is a real gap
+      # (forum tooling silently unavailable), so surface it the same way.
+      log "WARN: multi-agent seat but $_forum_req not found -- forum/coordination package dependencies were not installed (continuing; server still runs, forum tooling may be unavailable)"
     fi
   fi
 fi
@@ -411,6 +711,10 @@ if [[ "$TARGET" == "codex" ]]; then
   # hook-provided cache root.  The compat cleanup below may remove and replace
   # OLD_CODEX_PLUGIN_CACHE_DIR, so it must only ever receive a direct child of
   # this plugin's versioned cache directory.
+  # PORTABILITY LANDMINE (#2979): this heredoc is $(...)-nested like the one at
+  # line 343 -- keep the total literal ' count across its body EVEN or bash 3.2
+  # breaks with a spurious syntax error dozens of lines later. See line 343's
+  # full comment for why.
   CODEX_CACHE_PARENT="$(python3 - "$CODEX_HOME/plugins/cache/engram-local/engram" <<'PY'
 import os
 import sys
@@ -428,6 +732,8 @@ PY
   # not eligible fallbacks because this cleanup replaces its selected path.
   OLD_CODEX_PLUGIN_CACHE_DIR=""
   if [[ -n "${CLAUDE_PLUGIN_ROOT:-}" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     NORMALIZED_CLAUDE_PLUGIN_ROOT="$(python3 - "$CLAUDE_PLUGIN_ROOT" <<'PY'
 import os
 import sys
@@ -439,6 +745,8 @@ PY
     fi
   fi
   if [[ -z "$OLD_CODEX_PLUGIN_CACHE_DIR" && -d "$CODEX_CACHE_PARENT" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     OLD_CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re
@@ -473,6 +781,8 @@ PY
   # absolute cache path so the next session can spawn ENGRAM reliably.
   CODEX_PLUGIN_CACHE_DIR=""
   if [[ -d "$CODEX_CACHE_PARENT" ]]; then
+    # Same $(...)-nested-heredoc landmine as line 714/343 (#2979) -- keep the
+    # literal ' count in this body EVEN.
     CODEX_PLUGIN_CACHE_DIR="$(python3 - "$CODEX_CACHE_PARENT" <<'PY'
 import os
 import re

@@ -76,9 +76,29 @@ if _lp_plugin_root:
     _lp_candidates.append(Path(_lp_plugin_root) / "tools")
 for _lp_parent in Path(__file__).resolve().parents:
     _lp_candidates.append(_lp_parent / "tools")
-_LP_TOOLS_DIR = next(
-    (c for c in _lp_candidates if (c / "loop_prompt.py").exists()), None
-)
+# (c / "loop_prompt.py").exists() raises OSError -- not False -- on an
+# unreadable candidate directory, and this whole block runs at bare
+# module-import time, so an unguarded raise here must never crash the
+# hook process. PER-CANDIDATE guard, not a single try/except around the
+# whole search: _lp_candidates puts $CLAUDE_PLUGIN_ROOT FIRST and the
+# __file__-relative walk-parents fallbacks after, so if the plugin-root
+# candidate is the unreadable one (exactly this issue's reported case),
+# a whole-search try/except aborts on that first raise and never tries
+# the later, normally-readable fallbacks -- discarding a candidate that
+# would have resolved. Skipping just the failing candidate and
+# continuing the search is what actually degrades gracefully
+# (engram-alpha#2671 review round: reproduced the whole-search variant
+# returning None on an unreadable-then-readable candidate order, where
+# the per-candidate variant correctly finds the readable one).
+_LP_TOOLS_DIR = None
+for _lp_candidate in _lp_candidates:
+    try:
+        _lp_found = (_lp_candidate / "loop_prompt.py").exists()
+    except OSError:
+        continue
+    if _lp_found:
+        _LP_TOOLS_DIR = _lp_candidate
+        break
 if _LP_TOOLS_DIR is not None and str(_LP_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_LP_TOOLS_DIR))
 try:

@@ -319,6 +319,16 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     No prompt.md is written — the dispatcher constructs the short prompt inline
     at dispatch time using paths from the manifest.
     Exit code: 0.
+
+    Optional --expect-total N (mechanical truncation gate): the caller
+    (typically the engram-sleep skill) may pass the exact node count it
+    expects, e.g. from engram_list's total_matched field. Once the id list
+    is resolved (post-dedup), if len(ids) != N, prepare fails loudly instead
+    of silently chunking a truncated cohort — engram_list defaults to
+    limit=100, and a caller that forgets `unlimited: true` gets back exactly
+    100 ids even when more nodes match. Omitting --expect-total leaves
+    behavior byte-identical to before this flag existed. On mismatch,
+    nothing is written (no chunk dirs, no payload files, no manifest.json).
     """
     # Resolve node IDs
     node_ids: list[str]
@@ -349,6 +359,41 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     node_ids = deduped
+
+    # Optional mechanical gate: --expect-total lets the caller
+    # assert the id count it resolved is the count it actually meant to send.
+    # Checked here — post-dedup, the earliest point at which "the final id
+    # list" actually exists — and BEFORE any DB fetch or filesystem write, so
+    # a mismatch leaves nothing behind to clean up.
+    if args.expect_total is not None and len(node_ids) != args.expect_total:
+        received = len(node_ids)
+        expected = args.expect_total
+        message = (
+            f"received {received} id(s) but expected {expected} (--expect-total)"
+        )
+        if received == 100 and expected > received:
+            message += (
+                ". Received count is exactly 100 -- the most likely cause is "
+                "an engram_list call that omitted `unlimited: true` and "
+                "silently truncated at its default limit of 100. Re-run "
+                "engram_list with unlimited: true and pass total_matched as "
+                "--expect-total."
+            )
+        result = {
+            "passed": False,
+            "error_count": 1,
+            "errors": [
+                {
+                    "chunk": "all",
+                    "check": "expect_total",
+                    "error": message,
+                    "received": received,
+                    "expected": expected,
+                }
+            ],
+        }
+        print(json.dumps(result, indent=2))
+        return 1
 
     db_path = Path(args.db)
     nodes = _fetch_nodes(db_path, node_ids)
@@ -1205,6 +1250,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_prepare.add_argument(
         "--db", default=str(DEFAULT_DB), help="Path to ENGRAM SQLite database"
+    )
+    p_prepare.add_argument(
+        "--expect-total",
+        type=int,
+        default=None,
+        help=(
+            "Expected resolved id count (e.g. engram_list's total_matched). "
+            "If the post-dedup id count doesn't match, prepare fails loudly "
+            "instead of chunking a silently truncated cohort. Omit for "
+            "unchanged (pre-existing) behavior."
+        ),
     )
 
     # --- verify-in ---

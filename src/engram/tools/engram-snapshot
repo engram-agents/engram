@@ -15,6 +15,9 @@ Sources (P1):
     jsonl:               Bare — current session transcript (most-recent marker)
 Sources (P1.5):
     file:<path>          Archive an arbitrary local file (absolute, relative, or ~-prefixed)
+Sources (P2):
+    web:<url>            Archive a web page's raw bytes (http:// or https:// only)
+    pdf:<url>            Archive a PDF's raw bytes (http:// or https:// only)
 
 Output (JSON to stdout, designed to feed engram_add_observation):
     {
@@ -25,22 +28,31 @@ Output (JSON to stdout, designed to feed engram_add_observation):
       "archive_status": "archived",         // archived | blocked | unreachable
       "original_url":   "http://localhost:5002/threads/119",
       "source_type":    "forum",
-      "block_reason":   null
+      "block_reason":   null,
+      "evidence_type":  "forum_thread"      // closed vocabulary, derived from source_type (#2606 facet 1)
     }
 
-Design / full spec: engram-alpha issue #1253 (universal archive-at-filing).
+Design / full spec: engram-alpha issue #1253 (universal archive-at-filing);
+web:/pdf: + evidence_type + original_url-retention: issue #2606 facet 1.
 """
 
 import argparse
 import hashlib
+import http.client
 import io
+import ipaddress
 import json
 import os
 import pwd
+import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import redirect_stdout
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -72,6 +84,30 @@ EXIT_OK = 0
 EXIT_VALIDATION = 1
 EXIT_IO = 2
 EXIT_STATE = 3
+
+# evidence_type closed vocabulary (#2606 facet 1 unit 2). One-to-one with the
+# five source kinds below -- derived from source_type, never inferred from
+# content, never caller-overridable at snapshot time. Consumed by
+# engram_add_observation's evidence_type passthrough, which stores it on the
+# evidence node's metadata at capture time (first-capture-wins there).
+EVIDENCE_TYPE_BY_SOURCE = {
+    "forum": "forum_thread",
+    "jsonl": "session_transcript",
+    "file": "local_file",
+    "web": "web_page",
+    "pdf": "pdf",
+}
+
+# Unit 1 (#2606 facet 1) -- bounded network fetch for web:/pdf: source kinds.
+# Chosen conservatively rather than measured: evidence snapshots target
+# citable documents (articles, papers), not bulk media. 30s tolerates a slow
+# but real server without hanging a filing workflow; 25 MiB comfortably
+# covers any realistic HTML page or PDF paper while bounding the in-memory
+# buffer this single-process CLI tool holds during the fetch. Named
+# constants per the spec's own instruction -- state them here, restate the
+# values (and rationale) in the PR body.
+WEB_FETCH_TIMEOUT_SECONDS = 30
+WEB_FETCH_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +230,976 @@ def _now_utc_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Redirect safety (#2639): the http/https invariant, enforced ACROSS redirects
+#
+# The CLI validates a web:/pdf: URL as http:// or https:// at parse time, but
+# that check only ever saw the URL the OPERATOR typed.  urllib's stock
+# HTTPRedirectHandler applies its own, wider allowlist to redirect targets --
+# ('http', 'https', 'ftp', '') -- so a validated https:// input could be
+# steered by a remote 302 to ftp://, fetched through FTPHandler, and archived
+# into the content-addressed evidence store as a citable source.  The tool's
+# stated invariant was true at the input and false end-to-end.
+#
+# Two notes that shape the fix:
+#   * '' is NOT a hole.  An empty scheme is a RELATIVE redirect;
+#     http_error_302 runs urljoin(req.full_url, newurl) after that check, so it
+#     inherits the base scheme.  The scheme gap is 'ftp', alone.
+#   * redirect_request is the correct override point, not http_error_302.  It
+#     is called with the already-resolved ABSOLUTE target, and
+#     max_redirections / loop detection sit upstream of it, so overriding here
+#     re-implements neither the urljoin nor the loop guard.
+#
+# Scope decision, deliberate: the INPUT url stays unrestricted and only
+# REDIRECT TARGETS get the host guard below.  The threat model is a remote
+# server steering us SOMEWHERE WE DID NOT CHOOSE -- an operator typing
+# web:http://127.0.0.1:5001/... is expressing intent, a third-party 302 to the
+# same place is not.  Guarding the input would also break a workflow we
+# actually have (our own LAN services are legitimate snapshot targets) for no
+# security gain, and would not close the interesting case anyway: a legitimate
+# external URL that redirects inward.
+#
+# INTENT INHERITANCE, and it is what keeps that scope decision honest: an
+# internal target is followed IFF its (address, effective_port, host)
+# authority is one the ORIGINAL input host already resolved to AND that
+# original host resolved to no globally reachable address at all.  The HOST
+# leg is not a refinement either -- address-set membership only proves the
+# SAME host resolves internally too; it must never be read as authorising a
+# DIFFERENT hostname that happens to share an address, because HTTP authority
+# is (address, port, Host) and two different names on one address are two
+# different virtual hosts -- compared with NO normalisation, so 'chosen.lan.'
+# and 'chosen.lan' are two of them (see the HOST IDENTITY block comment above
+# InheritedAuthority and _redirect_host_block_reason's docstring for the full
+# argument, and #2691's security re-read for the defect this closes: the
+# code's own reasoning already said "the operator chose the HOST" while the
+# implementation keyed only on the address).  Applying the host guard
+# to every hop unconditionally broke the very workflow the input exemption
+# exists to preserve -- an operator-chosen LAN host that does trailing-slash
+# normalisation, slash merging, an HTTP->HTTPS upgrade or a /login bounce
+# redirects to ITSELF, and a blanket guard refuses it.  A redirect back to the
+# host the operator typed is not steering; a redirect to a DIFFERENT internal
+# host still is, and stays blocked -- and so, since #2691 round N, is a
+# redirect to a DIFFERENT PORT on the same address: sibling ports are
+# different services on the same host, and choosing one is not consent for a
+# compromised service there to steer us at a sibling admin surface.  The one
+# named exception is the ordinary http->https upgrade bounce on the same
+# address (effective port 80 -> 443); nothing else crosses ports.  So this is
+# intent following the chain, not a loosening: the set of internal authorities
+# reachable through a redirect never exceeds the one (address, port) the
+# caller already named, plus that single scheme-upgrade step.
+#
+# The no-global half of that rule is not a refinement of it, it is the half
+# that makes it safe, and inheritance without it is an SSRF: DNS for a name is
+# controlled by whoever owns the name, so an attacker publishes attacker.test
+# as A 93.184.216.34 + A 127.0.0.1 and an unconditional rule follows their 302
+# to loopback -- because loopback IS in their own host's resolved set.  An
+# operator who typed a host reachable from the public internet did not thereby
+# choose whatever internal address it also answers with, so such a host
+# inherits NOTHING; a purely-internal one (a LAN name, a loopback literal, a
+# tailnet peer) inherits its own addresses, which is the whole workflow above.
+#
+# WHEN the original host is resolved matters as much as WHAT it resolves to:
+# the authority is sampled ONCE, at _SafeRedirectHandler construction -- i.e.
+# before urllib ever opens the original connection, not lazily on first
+# access inside redirect_request.  A lazy, post-response sample is
+# attacker-triggerable: the attacker chooses when their own 30x arrives, and
+# so chooses when a lazy lookup would run, and can flip their own DNS between
+# the original connection and that lookup so the lookup sees only an
+# internal-only answer the no-global gate never gets a chance to object to.
+# The gate lives in _SafeRedirectHandler._resolve_inherited, where the
+# original url is resolved.
+# ---------------------------------------------------------------------------
+
+_ALLOWED_URL_SCHEMES = ("http", "https")
+
+
+def _redirect_scheme_ok(url: str) -> bool:
+    """True iff url's scheme is one this tool is allowed to fetch.
+
+    Pure and directly callable so the bulk of the coverage needs no server.
+    """
+    return urllib.parse.urlparse(url).scheme.lower() in _ALLOWED_URL_SCHEMES
+
+
+# RFC 6598 shared address space.  ipaddress deliberately reports is_private
+# False here -- see CPython's ipaddress.py, the "is_private is False for
+# 100.64.0.0/10" comment on IPv4Network.is_private and the _public_network
+# constant -- so any is_private-based classification is blind to it.  This
+# range is NOT theoretical for us: it is Tailscale's, and we are on a tailnet.
+_CGNAT_NETWORKS = (ipaddress.ip_network("100.64.0.0/10"),)
+
+
+def _is_globally_reachable(addr) -> bool:
+    """THE GATE: is addr reachable from the public internet?
+
+    Both of this module's internal-vs-not decisions come here, and neither
+    reads ``is_global`` for itself:
+
+      * _internal_address_label -- may this address be fetched at all.
+      * _SafeRedirectHandler._resolve_inherited -- is the ORIGINAL url's host purely
+        internal, and so may a redirect inherit the operator's intent.
+
+    One name because those two sites sit ~200 lines apart, and a divergence
+    between them is SILENT.  Measured, not feared: changing only the second
+    to `any(not is_private)` -- the classification this module deliberately
+    does NOT use, see _internal_address_label -- left the whole suite green,
+    while silently refusing a purely-CGNAT (tailnet) original's own
+    self-redirect.  test_ROW4_control_purely_CGNAT_original_still_inherits
+    is the test that now catches it.
+
+    Deliberately thin: it is exactly ``addr.is_global`` and nothing else, so
+    the rationale for choosing is_global over the loopback/link-local/
+    unspecified/private quartet -- and the measured CPython version bound on
+    that choice -- lives once, in _internal_address_label's docstring.
+    """
+    return addr.is_global
+
+
+def _internal_address_label(addr) -> Optional[str]:
+    """A short label for why addr is not globally reachable, or None if it is.
+
+    ``_is_globally_reachable`` -- which is exactly ``addr.is_global``, and
+    is the same call _SafeRedirectHandler._resolve_inherited makes -- IS THE GATE,
+    and it is tested FIRST; every branch after it exists only so a blocked
+    fetch can say WHY, to a human.  Read that division of labour literally:
+    the labels cannot change WHICH addresses are blocked, only what a
+    blocked one is called.
+
+    is_global rather than the loopback/link-local/unspecified/private quartet
+    because the quartet has a hole:  100.64.0.0/10 (RFC 6598) is is_private
+    False by CPython's deliberate design, and it is the range a tailnet peer
+    lives in.  Verified exhaustively rather than by sample -- over the whole
+    IPv4 and IPv6 address spaces, by interval arithmetic on CPython 3.12.3's
+    own range constants, ``not is_global`` is a strict superset of the
+    quartet: zero addresses the quartet blocks are is_global, and the only
+    addresses it newly blocks are exactly 100.64.0.0/10.
+
+    That verification is bounded at 3.12.3, and past its bound the two sides
+    stop being equal on the IPv6 half.  On 3.14.4, IPv6Address's is_global
+    (and is_loopback) DELEGATE to the embedded IPv4 address of an IPv4-mapped
+    form; 3.12.3 computes is_global as `not is_private` instead, which
+    delegates only through is_private.  (Read off inspect.getsource on both
+    interpreters.  3.13 is untested here, so all that is established is that
+    the change lands somewhere in 3.12.3 < v <= 3.14.4.)  Measured consequence
+    -- endpoints and midpoints of every ipaddress range constant, NOT the full
+    interval arithmetic above -- is one-directional: the newly-blocked set
+    gains the IPv4-mapped CGNAT forms, ::ffff:100.64.0.0/106, so `not
+    is_global` blocks strictly MORE on 3.14.4, and on neither interpreter does
+    the quartet block an address that is_global.  A bound, not a defect: the
+    gate is is_global on every version, and this function's callers in the
+    module reach it through _normalised_address, which unwraps the mapped form
+    before it ever gets here.  It is worth naming because it is reachable on
+    this host -- the shebang runtime and CI are python3 = 3.12.3, but the
+    ENGRAM plugin venv is 3.14.4, so a reader running the venv interpreter is
+    outside the verified bound.
+
+    Residuals, MEASURED after this change and deliberately not closed here
+    (each is still ALLOWED, and there is a characterization test asserting so,
+    so closing one later fails loudly rather than silently):
+
+      * fec0::/10   deprecated IPv6 site-local -- not is_private, is_global.
+      * ::7f00:1    IPv4-COMPATIBLE (not -mapped) IPv6; ipv4_mapped is None
+                    for it, so the unwrap never reaches it.
+      * 64:ff9b::/96 NAT64 -- 64:ff9b::a00:1 is 10.0.0.1 on the far side of a
+                    NAT64 gateway, but the IPv6 form itself is is_global.
+      * multicast   224.0.0.0/4 and ff00::/8 are is_global.
+
+    None of these is closed by is_global; all are exotic relative to the
+    threat model (a remote 302 steering us at an internal service), and each
+    would need its own membership test.  Named so the gap is on the record
+    rather than implied-complete.
+    """
+    # THE GATE, and deliberately the FIRST thing here so that nothing below
+    # can widen or narrow it.  Everything after this line runs only for an
+    # address already decided to be blocked, and only to give it a name.
+    if _is_globally_reachable(addr):
+        return None
+
+    if addr.is_loopback:
+        return "loopback"
+    if addr.is_link_local:
+        return "link-local"
+    if addr.is_unspecified:
+        return "unspecified"
+    if addr.is_private:
+        return "private"
+    # Reached only for a non-global address that is not is_private -- which
+    # on CPython 3.12.3 means exactly 100.64.0.0/10.  The version check inside
+    # __contains__ makes the IPv6 comparison a safe False.
+    if any(addr in net for net in _CGNAT_NETWORKS):
+        return "shared-address-space (CGNAT)"
+    # A non-global address none of the labels above names.  Unreachable on
+    # CPython 3.12.3 (verified exhaustively: the labels above cover the whole
+    # non-global set), and kept anyway as the forward-compatible default --
+    # if a later CPython marks a new range non-global, it is blocked here
+    # with a generic name rather than silently allowed.  That is precisely
+    # the failure this whole change fixes: 100.64.0.0/10 was allowed because
+    # the classification enumerated attributes instead of asking the gate.
+    return "non-global"
+
+
+def _normalised_address(raw: str):
+    """The ipaddress object for raw, with an IPv4-mapped IPv6 form unwrapped.
+
+    The per-address normalise step shared by _resolve_host_addresses and
+    _redirect_host_block_reason, extracted because both must spell an address
+    the SAME way: ::ffff:127.0.0.1 reports is_loopback False on CPython
+    3.12.3 (3.14.4 delegates to the embedded IPv4 and reports True), so
+    judging the unwrapped form is what makes the label right AND what makes
+    the inherited-set comparison compare like with like.
+
+    Raises ValueError (from ipaddress.ip_address) on an unparseable address,
+    and deliberately decides nothing about it: the two callers fail closed in
+    two DIFFERENT ways -- one skips the address, the other returns a reason
+    string naming it -- so what is shared is the normalise, not the loop.
+    """
+    addr = ipaddress.ip_address(raw)
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped if mapped is not None else addr
+
+
+def _resolve_host_addresses(host: str):
+    """Resolved addresses for host as a frozenset of str, IPv4-mapped unwrapped.
+
+    Returns an EMPTY set on any resolution failure, which is the fail-closed
+    answer for every caller here: an empty set inherits no exemption and
+    certifies no address as external.
+    """
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        # UnicodeError, not just gaierror: getaddrinfo raises it (NOT an
+        # OSError, so no wider `except OSError` would catch it either) for a
+        # malformed hostname -- an over-long or empty DNS label.  See the
+        # matching catch in _redirect_host_block_reason.
+        return frozenset()
+    out = set()
+    for info in infos:
+        try:
+            addr = _normalised_address(info[4][0])
+        except ValueError:
+            continue
+        out.add(str(addr))
+    return frozenset(out)
+
+
+def _effective_port(url: str) -> int:
+    """The port url's authority is reached on: explicit if present, else the
+    scheme default (80 for http, 443 for https; 80 for anything else, which
+    is harmless because a non-http(s) scheme is already refused by
+    _redirect_scheme_ok before this value is ever consulted).
+
+    Used to key redirect intent-inheritance on (address, port) rather than
+    address alone -- see _SafeRedirectHandler._resolve_inherited and
+    InheritedAuthority's ``port`` field.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme.lower() == "https" else 80
+
+
+def _port_inherited(inherited_port: int, target_port: int) -> bool:
+    """True iff target_port is within the authority inherited_port granted.
+
+    Exact match, OR the one named exception: an http->https scheme-upgrade
+    bounce on the same address, i.e. inherited_port 80 -> target_port 443.
+    Nothing else crosses ports -- in particular this is NOT symmetric: a
+    443 -> 80 downgrade is not the upgrade bounce and is refused.
+
+    ``inherited_port`` is a REQUIRED int, and there is deliberately NO
+    "unstated port" branch (#2691's security re-read).  An earlier version
+    accepted ``Optional[int]`` and returned True for ``None``, on the
+    argument that InheritedAuthority's own required ``port`` field kept that
+    branch off the production path.  Both halves of that argument were
+    wrong: the field's annotation was not enforced at runtime, so
+    ``InheritedAuthority(host=..., addrs=..., port=None)`` constructed
+    cleanly and an explicit ``None`` reached here and authorised EVERY port
+    -- exactly the fail-open the port dimension exists to remove.  The
+    constructor now rejects that (see InheritedAuthority.__post_init__), and
+    this branch is gone too rather than merely made unreachable: a fail-open
+    default that can no longer be constructed is dead code that still reads
+    as permission to the next reader.
+
+    With the branch removed, a direct ``_port_inherited(None, 443)`` -- the
+    isolated misuse the old docstring was trying to accommodate -- returns
+    False rather than True.  Fail-closed, and a caller wanting to exercise
+    the port-matching rule in isolation passes two ints, which is what
+    exercising the rule actually means.
+    """
+    if inherited_port == target_port:
+        return True
+    return inherited_port == 80 and target_port == 443
+
+
+# ---------------------------------------------------------------------------
+# HOST IDENTITY IS COMPARED UNNORMALISED, AND THAT IS THE POINT (#2691).
+#
+# There used to be a `_normalised_host` here that casefolded its argument and
+# stripped a single trailing dot before the host-identity comparison, on the
+# argument that 'chosen.lan.' and 'chosen.lan' "name the same DNS zone (RFC
+# 1035)".  That statement is true about NAME RESOLUTION and false about VHOST
+# SELECTION, which is the thing this guard is actually protecting: a server
+# picks its virtual host off the LITERAL Host header, not off a resolved zone.
+#
+# The divergence was measurable, and urllib sends the RAW host:
+#
+#   input host      urlparse(url).hostname      wire "Host:" header
+#   -----------     ----------------------      -------------------
+#   chosen.lan      chosen.lan                  chosen.lan:PORT
+#   chosen.lan.     chosen.lan.                 chosen.lan.:PORT
+#   Chosen.LAN      chosen.lan                  Chosen.LAN:PORT
+#   Chosen.LAN.     chosen.lan.                 Chosen.LAN.:PORT
+#
+# (urllib.request.AbstractHTTPHandler.do_request_ sets Host from
+# Request.host, which is the raw netloc -- it never reaches http.client's
+# idna-lowercasing putheader path.)
+#
+# So a redirect chosen.lan -> chosen.lan. passed authorization as "the same
+# host" and arrived on the wire as a DIFFERENT virtual host.  The rule that
+# closes it: THE STRING USED FOR AUTHORIZATION AND THE STRING THAT GOES ON
+# THE WIRE MUST BE THE SAME ONE.  Both sides of the comparison are therefore
+# now plain `urllib.parse.urlparse(<url>).hostname` -- one producer, applied
+# identically to the original URL and to the redirect target, with nothing
+# folded in between.  'chosen.lan.' and 'chosen.lan' are different hosts,
+# because that is what the wire says they are, and the whole point of the
+# host dimension is that the operator chose a specific name.
+#
+# The casefold went for a second, independent reason: str.casefold() is
+# strictly more aggressive than the lowercasing urlparse already did, so it
+# COLLAPSED pairs the wire keeps distinct -- 'straße.lan'.casefold() ==
+# 'strasse.lan', while urlparse leaves the two hostnames different and
+# urllib sends them differently.  A fold that maps two wire-distinct hosts
+# onto one authorization key is the same defect as the trailing dot, not
+# defense-in-depth against it.
+#
+# ONE RESIDUAL DIVERGENCE, named rather than hidden: `urlparse().hostname`
+# lowercases ASCII on its own (row 3 above), while the wire preserves the
+# operator's case -- so 'Chosen.LAN' still authorizes against 'chosen.lan'.
+# It is left in place deliberately.  RFC 3986 s3.2.2 declares the host
+# component case-insensitive, so a conformant server cannot select a
+# different vhost on case alone (unlike the trailing dot, which no
+# specification folds); and closing it would mean extracting the hostname
+# from the raw netloc by hand -- a SECOND hostname parser, diverging from
+# the one every resolution path in this module already uses, which is a
+# fresh instance of exactly the two-strings-for-one-thing defect above.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InheritedAuthority:
+    """The (host, addrs, port) authority a redirect's ORIGINAL URL granted.
+
+    ONE authority, not three independent parts -- see the block comment
+    above this section.  Every finding in #2691's security re-read was the
+    enforced check being narrower than this triple by exactly one dimension
+    (sampled-after-the-30x; address-only; address+port).  Two hand-written
+    ``ValueError`` guards used to exist to reject a PARTIAL authority at
+    call time, and were removed on the theory that this type replaced them.
+    IT DID NOT, and the correction is the reason this is a frozen dataclass
+    with a ``__post_init__`` rather than the NamedTuple it started as: an
+    annotation is not a runtime guard, so
+    ``InheritedAuthority(host='chosen.lan', addrs=frozenset({'127.0.0.1'}),
+    port=None)`` CONSTRUCTED CLEANLY -- and that explicit ``None`` then
+    authorised every port downstream, because the port predicate read it as
+    "no port was stated" and returned True.  Removing two guards in favour
+    of a type that enforced nothing turned a loud call-time error into a
+    silent fail-open.
+
+    ``__post_init__`` is what makes the "partial authority is
+    unrepresentable" claim true rather than aspirational: every field is
+    checked for presence AND type at construction, so there is no way to
+    build one with some dimensions real and others missing, absent, or of a
+    type the consumers cannot use.  A frozen dataclass specifically because
+    ``typing.NamedTuple`` REFUSES a ``__new__`` validator -- defining one in
+    the class body raises ``AttributeError: Cannot overwrite NamedTuple
+    attribute __new__`` (measured, CPython 3.12) -- so on a NamedTuple there
+    is no construction-time hook to put the check in at all.  ``frozen=True``
+    preserves the immutability the NamedTuple gave (and keeps the object
+    hashable), while ``__post_init__`` runs on every construction, including
+    ``dataclasses.replace``.
+
+    host:  the ORIGINAL URL's host, EXACTLY as ``urlparse(url).hostname``
+           produced it -- not normalised, not casefolded, not
+           trailing-dot-stripped (see the block comment above for the
+           measurement, and why a fold here is a wire divergence rather
+           than a convenience).  HTTP authority is (address, port, Host):
+           two different names answering on the same address and port are
+           still two different virtual hosts, so address-set membership
+           alone must never be read as authorizing a DIFFERENT hostname
+           (#2639's original defect: the code's own reasoning already said
+           "the operator chose the HOST" while the implementation checked
+           only the resolved address).
+    addrs: the ORIGINAL URL's resolved address set (frozenset of str, IPv4-
+           mapped forms unwrapped -- see _normalised_address).  Populated
+           only when the original host resolved to NO globally reachable
+           address at all; see _SafeRedirectHandler._resolve_inherited for
+           why (the set is otherwise attacker-controlled -- DNS for a name
+           is controlled by whoever owns the name).  EMPTY is a legitimate
+           value for this field -- it just means nothing is inherited --
+           unlike a MISSING host or port, which this type does not allow.
+           It must still BE a frozenset (of str): a bare ``None`` is the
+           partial state ``__post_init__`` exists to refuse, and a mutable
+           ``set`` would break the frozen dataclass's hashability.
+    port:  the ORIGINAL URL's effective port (see _effective_port), a real
+           int in 1..65535.  A matching address on a DIFFERENT port is
+           still steering -- sibling ports are different services on the
+           same host -- with exactly one named exception, the http->https
+           upgrade bounce (80 -> 443); see _port_inherited, which no longer
+           has an "unstated port" branch for this field to be absent into.
+
+    "No inheritance granted at all" (the original URL had no host, or
+    _redirect_host_block_reason is exercised directly with the strict
+    default) is expressed by passing ``None`` for the WHOLE authority to
+    _redirect_host_block_reason's ``inherited`` parameter -- never by
+    constructing one of these with a placeholder host/port alongside an
+    empty ``addrs``.  ``None`` is the single legal absent state.
+    """
+
+    host: str
+    addrs: frozenset[str]
+    port: int
+
+    def __post_init__(self) -> None:
+        """Reject a PARTIAL authority at construction -- the enforcement the
+        annotations above only describe.  Raises ValueError.
+
+        Deliberately strict about TYPE, not merely about ``is None``: the
+        claim this class makes is that every dimension is really present,
+        and a host of ``b'chosen.lan'`` or a port of ``'443'`` is a
+        dimension that is present in name only and compares unequal to
+        everything the consumers produce -- fail-closed, but silently, and
+        silence is what #2691 keeps re-finding here.
+        """
+        if not isinstance(self.host, str) or not self.host:
+            raise ValueError(
+                f"InheritedAuthority.host must be a non-empty str "
+                f"(got {self.host!r}); an authority with no host grants "
+                f"nothing and must be expressed as None, not as a partial "
+                f"authority"
+            )
+        if not isinstance(self.addrs, frozenset) or not all(
+            isinstance(a, str) for a in self.addrs
+        ):
+            raise ValueError(
+                f"InheritedAuthority.addrs must be a frozenset of str "
+                f"(got {self.addrs!r}); the EMPTY frozenset is legitimate "
+                f"and means nothing is inherited, but a missing or "
+                f"wrongly-typed set is a partial authority"
+            )
+        # bool is a subclass of int, and True == 1 would read as port 1.
+        if isinstance(self.port, bool) or not isinstance(self.port, int):
+            raise ValueError(
+                f"InheritedAuthority.port must be an int "
+                f"(got {self.port!r}); an unstated port used to authorise "
+                f"EVERY port -- see _port_inherited"
+            )
+        if not 1 <= self.port <= 65535:
+            raise ValueError(
+                f"InheritedAuthority.port must be in 1..65535 "
+                f"(got {self.port!r})"
+            )
+
+
+def _redirect_host_block_reason(
+    url: str,
+    inherited: Optional[InheritedAuthority] = None,
+) -> Optional[str]:
+    """None if url's host may be followed; else a human-readable reason it may not.
+
+    RESOLVES the name first and judges the resulting address(es): a name-based
+    blocklist is trivially bypassed by a hostname that resolves to 127.0.0.1.
+    Blocks if ANY resolved address is internal.
+
+    ``inherited`` carries INTENT INHERITANCE (see the block comment above)
+    as a single InheritedAuthority -- the (host, addrs, port) triple the
+    ORIGINAL input URL's host actually reached, or ``None`` if nothing is
+    inherited (the default, so a direct caller and every unit test gets the
+    strict behaviour unless it opts in).  ``inherited.addrs`` is populated
+    only when the original host resolved to NO globally reachable address at
+    all -- see InheritedAuthority and _SafeRedirectHandler._resolve_inherited.
+    An internal address in that set is then one the caller already chose, so
+    a redirect to it is not a remote server steering us anywhere -- it is
+    the LAN host the operator typed doing trailing-slash normalisation, a
+    scheme upgrade, or a /login bounce.  An internal address NOT in that set
+    is still steering, and is still refused.
+
+    Three checks gate the rescue, in order, all against ``inherited`` (see
+    InheritedAuthority's own field docs for the full argument on each):
+
+      1. HOST IDENTITY (``inherited.host``): the target's host must equal
+         the original's, compared as the two ``urlparse(url).hostname``
+         strings with NO normalisation in between -- because that is the
+         string urllib puts in the Host header, and a server selects its
+         virtual host off the literal header.  In particular
+         ``chosen.lan.`` and ``chosen.lan`` are DIFFERENT hosts here, and a
+         redirect between them is refused; see the block comment above
+         InheritedAuthority for the wire measurement and for the one
+         residual divergence (urlparse's own ASCII lowercasing) that is
+         left in place deliberately.  Checked FIRST, before the port logic,
+         so a hostname mismatch is refused regardless of address membership
+         or port, and is never excused by the http->https upgrade exception
+         below.  A DELIBERATE BEHAVIOUR CHANGE from pre-#2691: a LAN-name ->
+         literal-IP redirect (``http://host.lan/x`` -> ``http://127.0.0.1/x``,
+         where host.lan resolves to 127.0.0.1) used to be ALLOWED, because
+         the address was a member of the inherited set.  It is now REFUSED --
+         'host.lan' and '127.0.0.1' are different host identities even
+         though they name the same address, and such a rescue must be an
+         explicit operator opt-in or a connection-pinned design, never
+         ambient authority inferred from what DNS happens to answer.
+      2. ADDRESS membership (``inherited.addrs``): the target's resolved
+         address must be one the original host already resolved to.
+      3. PORT (``inherited.port``, via _port_inherited): exact match, or the
+         one named exception, the http->https upgrade bounce (80 -> 443).
+         A matching address on any other different port is still steering.
+
+    Why the no-global condition on ``inherited.addrs``: the inherited set is
+    ATTACKER-CONTROLLED for any hostname the attacker owns.  attacker.test
+    published as A 93.184.216.34 + A 127.0.0.1 puts loopback in its OWN
+    resolved set, so an unconditional inheritance rule follows a 302 from it
+    to 127.0.0.1 -- the exact SSRF this guard exists to refuse.  An operator
+    who typed a publicly-reachable host did not thereby choose whatever
+    internal address it also answers with, so the set is trusted only when
+    it is purely internal.  This function still honours whatever authority
+    it is handed: the trust decision belongs to whoever resolves the
+    original url, and lives in _SafeRedirectHandler._resolve_inherited.
+    Passing an InheritedAuthority with an unfiltered ``addrs`` here is
+    therefore still the way to exercise the address-matching rule on its own.
+
+    Fails CLOSED on a resolution failure -- a host we cannot resolve is a host
+    we cannot certify as external.  (The fetch would fail moments later anyway;
+    this only changes which message the operator sees.)
+
+    Deliberately NOT closable at this layer: DNS rebinding, i.e. the TOCTOU
+    window between this check and urllib's own connect().  Closing that needs a
+    connection-level opener, which is out of scope here.
+
+    Module-level by design: directly callable, so the bulk of the coverage
+    needs no server.
+    """
+    host = urllib.parse.urlparse(url).hostname
+    if not host:
+        return f"redirect target '{url}' has no host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError) as exc:
+        # UnicodeError is NOT an OSError, so it escapes both `except
+        # socket.gaierror` and any wider `except OSError`; getaddrinfo raises
+        # it on a malformed hostname (over-long or empty DNS label).  Left
+        # uncaught it surfaces as an unhandled traceback instead of the tool's
+        # clean EXIT_IO path -- fail-closed on safety either way, but the
+        # operator deserves the message rather than the stack.
+        return (
+            f"could not resolve redirect host '{host}' to verify it is not "
+            f"internal ({type(exc).__name__}: {exc})"
+        )
+    target_port = _effective_port(url)
+    for info in infos:
+        raw_addr = info[4][0]
+        # Normalised, i.e. an IPv4-mapped IPv6 address (::ffff:127.0.0.1) is
+        # unwrapped, so the mapped v4 address is judged -- and named -- on its
+        # own terms, and so both sides of the inherited-set comparison below
+        # are spelled the same way.  See _normalised_address.
+        try:
+            addr = _normalised_address(raw_addr)
+        except ValueError:
+            return (
+                f"redirect host '{host}' resolved to an address that could not "
+                f"be parsed ('{raw_addr}')"
+            )
+        label = _internal_address_label(addr)
+        if label is None:
+            continue
+        if inherited is not None and str(addr) in inherited.addrs:
+            # The original input URL's host resolves here too: the operator
+            # already chose this ADDRESS.  That is necessary but not
+            # sufficient -- it must also be the same HOST.  Checked first,
+            # before the port logic, so a hostname mismatch is refused
+            # regardless of port and is never rescued by the http->https
+            # upgrade exception below (see the docstring's host-identity
+            # paragraph).  ``inherited.host`` is a required, non-empty str
+            # enforced at construction, so it is always a concrete string
+            # here -- no "was it even stated?" branch needed.
+            #
+            # Both sides are the UNNORMALISED ``urlparse(url).hostname``:
+            # ``host`` was bound from the target URL at the top of this
+            # function, ``inherited.host`` from the original URL in
+            # _resolve_inherited, by the same call.  Nothing folds them in
+            # between, so the string authorised here is the string urllib
+            # puts on the wire -- see the block comment above
+            # InheritedAuthority for the measurement that made that
+            # equality load-bearing.
+            if host != inherited.host:
+                return (
+                    f"redirect host '{host}' resolves to an address the "
+                    f"original URL already resolved to, but '{host}' is a "
+                    f"DIFFERENT hostname than the original URL's -- refusing "
+                    f"to follow a same-address redirect to a different host "
+                    f"identity (the operator chose the HOST, not merely an "
+                    f"address it happens to share)"
+                )
+            # Not steering -- UNLESS the port is one this authority did not
+            # also choose (see _port_inherited): a sibling port on the same
+            # address is still a different service, not the host the
+            # operator named.
+            if _port_inherited(inherited.port, target_port):
+                continue
+            return (
+                f"redirect host '{host}' resolves to an address the "
+                f"original URL already resolved to, but on port "
+                f"{target_port} rather than the original's "
+                f"{inherited.port} -- refusing to follow a same-address "
+                f"redirect to a different port"
+            )
+        return (
+            f"redirect host '{host}' resolves to {label} address "
+            f"{addr} -- refusing to fetch an internal address the original "
+            f"URL did not resolve to"
+        )
+    return None
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-applies this tool's own URL invariants to every redirect target.
+
+    Carries the original input URL so that (a) errors name what the operator
+    actually asked for, and (b) an internal redirect target can inherit the
+    operator's intent when it is an (address, effective_port, host) authority
+    that input already resolved to -- host-identity continuity, not merely
+    address membership, is what makes the rescue safe (see the HOST IDENTITY
+    block comment above InheritedAuthority and _redirect_host_block_reason's
+    docstring).
+    """
+
+    def __init__(self, original_url: str):
+        super().__init__()
+        self.original_url = original_url
+        self._inherited_authority = self._resolve_inherited(original_url)
+
+    @staticmethod
+    def _resolve_inherited(original_url: str) -> Optional[InheritedAuthority]:
+        """The InheritedAuthority the original input URL's host grants --
+        the (host, addrs, port) authority _redirect_host_block_reason keys
+        inheritance on -- computed ONCE, HERE, at construction time.  See
+        InheritedAuthority for what each field means.
+
+        Returns ``None`` only when the original url has no host at all --
+        the single legal absent state (see InheritedAuthority).  Otherwise
+        ALWAYS returns a fully-populated InheritedAuthority: its ``addrs``
+        field is EMPTY (possibly, and legitimately) unless the original host
+        is PURELY INTERNAL: if ANY address it resolves to is globally
+        reachable, nothing is inherited.  Without that condition the set is
+        attacker-controlled, because DNS for a name is controlled by
+        whoever owns the name -- attacker.test published as A
+        93.184.216.34 + A 127.0.0.1 makes
+        loopback a member of its own resolved set, and a 302 from it to
+        127.0.0.1 would be followed.  An operator who typed a
+        publicly-reachable host did not thereby choose whatever internal
+        address it also answers with; an operator who typed a
+        purely-internal host (a LAN name, a loopback literal, a tailnet
+        peer) did, and every self-redirect shape the exemption exists for
+        still works.
+
+        EAGER -- resolved here at construction, before urllib ever opens the
+        original connection -- rather than lazily on first access inside
+        redirect_request, which is what this used to be and why it used to
+        be a memoised property instead of an __init__ line.  That laziness
+        had a real, honest performance argument: a fresh handler is built for
+        EVERY fetch (see _urlopen) while only a minority of fetches ever
+        redirect, so resolving eagerly puts a DNS lookup on the common
+        no-redirect path.  It lost to a security argument: lazy means this
+        sampling happens AFTER the 30x response has already arrived, and the
+        attacker -- not us -- decides when that response arrives.  A hostname
+        the attacker owns can resolve to a globally reachable address at the
+        moment urllib makes the ORIGINAL connection (so the no-global gate
+        below has nothing to object to), then be repointed to an
+        internal-only answer before a lazy lookup would run -- so a lazy
+        lookup samples the POST-flip, attacker-chosen answer and inherits it.
+        Sampling here, before any of that can happen, means nothing DNS does
+        afterwards can change what was already recorded.  (Skipping the
+        lookup entirely when the original host is already an IP literal --
+        no name to resolve -- keeps most of the performance the lazy version
+        was buying on that common case.)  Resolved exactly once either way:
+        there is no re-entry to memoise against, since this only ever runs
+        once, from __init__.
+
+        ``port`` and ``host`` are still computed even when ``addrs`` is
+        empty, but callers that see an empty ``addrs`` set never reach a
+        point where either matters -- _redirect_host_block_reason's rescue
+        path is only ever entered when an address is present in
+        ``inherited.addrs``.
+
+        ``host`` is stored EXACTLY as ``urlparse(original_url).hostname``
+        produced it, with no casefolding and no trailing-dot stripping: the
+        redirect target's host is produced by that same call, so the two
+        sides of the identity comparison are the same string urllib puts on
+        the wire.  See the HOST IDENTITY block comment above
+        InheritedAuthority for the measurement.
+        """
+        host = urllib.parse.urlparse(original_url).hostname
+        if not host:
+            return None
+        try:
+            literal = _normalised_address(host)
+        except ValueError:
+            literal = None
+        if literal is not None:
+            # No name to resolve -- the host IS the address.
+            resolved = frozenset({str(literal)})
+        else:
+            resolved = _resolve_host_addresses(host)
+        # _resolve_host_addresses (and the literal branch above, via
+        # _normalised_address) already normalised these, so parsing them
+        # back gives the same objects the gate judges elsewhere -- literally
+        # the same gate FUNCTION, not a re-implementation of it.  See
+        # _is_globally_reachable for why it is one name.
+        if any(
+            _is_globally_reachable(_normalised_address(a)) for a in resolved
+        ):
+            resolved = frozenset()
+        # ``host`` is urlparse(original_url).hostname, stored UNNORMALISED --
+        # the same producer _redirect_host_block_reason applies to the
+        # redirect target, so the two sides of the host-identity comparison
+        # are the same string urllib puts in the Host header.  See the HOST
+        # IDENTITY block comment above InheritedAuthority.
+        return InheritedAuthority(
+            host=host,
+            addrs=resolved,
+            port=_effective_port(original_url),
+        )
+
+    def _inherited(self):
+        """The original input host's resolved address set -- see
+        _resolve_inherited, computed once at construction time."""
+        if self._inherited_authority is None:
+            return frozenset()
+        return self._inherited_authority.addrs
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            if not _redirect_scheme_ok(newurl):
+                reason = f"target '{newurl}' is not http:// or https://"
+            else:
+                reason = _redirect_host_block_reason(
+                    newurl, self._inherited_authority
+                )
+        except ValueError as exc:
+            # urlparse(...).port -- reached here through
+            # _redirect_host_block_reason's _effective_port call -- raises
+            # ValueError for an authority whose port is non-numeric or out of
+            # 0..65535 ('http://h:abc/x', 'http://h:99999/x').  The Location
+            # header is ATTACKER-CONTROLLED, so this is remote-triggerable
+            # input, not a programming error; left uncaught it escaped as a
+            # bare traceback AND skipped the fp.close() below, leaking the 30x
+            # response's socket (the ResourceWarning that close exists to
+            # prevent).  Folded into `reason` rather than raised on its own so
+            # an unusable authority is refused by the SAME fail-closed path,
+            # with the same message shape, as every other bad target.
+            reason = f"target '{newurl}' has an unusable authority ({exc})"
+
+        if reason is not None:
+            # http_error_302 calls us BEFORE its own `fp.read(); fp.close()`,
+            # so raising here would otherwise leave the 30x response's socket
+            # unclosed (a ResourceWarning under -W error).  Closing it is safe
+            # precisely because we raise RuntimeError rather than HTTPError:
+            # HTTPError is the one consumer that would still need to read fp.
+            try:
+                fp.close()
+            except Exception:  # pragma: no cover - defensive
+                pass
+            raise RuntimeError(
+                f"blocked redirect while fetching '{self.original_url}': {reason}"
+            )
+
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _urlopen(req: urllib.request.Request, timeout=None):
+    """Open req through an opener carrying _SafeRedirectHandler.
+
+    Deliberately NOT urllib.request.urlopen + install_opener: install_opener
+    mutates process-global state, which would leak across tests and across any
+    future in-process caller.  A fresh opener per call keeps the guard local.
+
+    This is also the single seam the tests patch to inject fake responses --
+    patching urllib.request.urlopen no longer intercepts anything, because we
+    no longer call it.
+    """
+    opener = urllib.request.build_opener(_SafeRedirectHandler(req.full_url))
+    return opener.open(req, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Bounded network fetch (web:/pdf: source kinds, #2606 facet 1 unit 1)
+# ---------------------------------------------------------------------------
+
+def _fetch_url_bytes(url: str, timeout: float, max_bytes: int) -> bytes:
+    """Fetch url's raw bytes over HTTP(S), stdlib-only, time- and size-bounded.
+
+    Must fail LOUDLY and return nothing partial on any failure (non-2xx,
+    timeout, DNS/connection failure, a malformed authority in the URL, or
+    oversize) -- the caller must never reach _archive_write with a truncated
+    read, because the archive's hash would then certify the truncation as if
+    it were the whole document. (A
+    live instance of exactly this shape already exists in our own records: a
+    transcript archived at 26,582,953 bytes against a live 27,282,639, where
+    sha256(archived) == sha256(live[:26582953]) -- content-identity scored a
+    truncated ancestor as a DIFFERENT file rather than as a partial one.)
+    The whole response is buffered in memory before any write is attempted,
+    so a failure at any point during the read leaves nothing on disk.
+
+    Redirects are followed only while the http/https invariant and the
+    internal-host guard hold for every hop (#2639); a violation raises before
+    any body is read, so nothing reaches the archive.  An internal hop is
+    permitted only when its address is one the ORIGINAL url already resolved
+    to -- see the intent-inheritance note in the redirect-safety block comment.
+
+    Raises RuntimeError with a human-readable message describing the failure.
+    Never returns a partial read.
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "engram-snapshot/1.0"})
+        with _urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", None)
+            if status is None:
+                status = resp.getcode()
+            if not (200 <= status < 300):
+                raise RuntimeError(f"non-2xx status {status} fetching '{url}'")
+
+            chunk_size = 65536
+            buf = bytearray()
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise RuntimeError(
+                        f"response exceeded the {max_bytes}-byte size cap "
+                        f"fetching '{url}'"
+                    )
+
+            # "Never returns a partial read" -- the clause http.client
+            # DELIBERATELY does not enforce for us.  On a body shorter than
+            # the declared Content-Length its bounded read(amt) just calls
+            # self._close_conn() and returns what arrived: "Ideally, we would
+            # raise IncompleteRead if the content-length wasn't satisfied,
+            # but it might break compatibility" (CPython 3.12
+            # http/client.py, HTTPResponse.read).  Measured: a response
+            # declaring 1000 bytes that sends 10 and closes returned 10
+            # bytes and no exception -- and the archive would then
+            # content-hash the truncation as if it were the whole document.
+            #
+            # HTTPResponse.length is BYTES STILL OWED, and reading it is not
+            # the same check as comparing the Content-Length header
+            # ourselves: http.client has already decided whether that header
+            # is authoritative, and the two answers differ on real
+            # responses.  It sets length from Content-Length only when the
+            # response is NOT chunked -- chunk framing wins, per the
+            # comment at that very line ("RFC 2616, S4.4, #3 says we ignore
+            # this if tr_enc is chunked"; RFC 9112 S6.3 restates it), and
+            # proxies do emit both -- forces it to 0 for 204/304/1xx and
+            # for HEAD whatever the header says, and leaves it None for a
+            # missing, unparseable or negative one.  read(amt) then
+            # decrements it, so after the loop:
+            #
+            #     None      -- no fixed length declared (chunked, or framed
+            #                  by the close): nothing to hold the body to
+            #     0         -- the declared length was delivered in full
+            #     positive  -- exactly the bytes the server still owed
+            #
+            # so the truthiness test is the whole check, and its two falsy
+            # cases are falsy for DIFFERENT reasons rather than by luck.
+            # (A truncated CHUNKED body has no declared length at all; it is
+            # caught instead by the IncompleteRead the chunk decoder raises,
+            # wrapped in the HTTPException clause below.)
+            #
+            # Read through getattr because _urlopen is a patched test seam:
+            # a stub response object that models no length attribute must
+            # mean "nothing owed", not an AttributeError inside the fetch
+            # path.  Measured on this branch: rewriting it as the bare
+            # `resp.length` form reddens exactly ONE row --
+            # TestStubResponseModelsBytesOwed's
+            # test_CONTROL_a_response_object_with_NO_length_ATTRIBUTE_succeeds,
+            # which feeds in a _LengthlessResponse for precisely this reason
+            # -- and it fails with an AttributeError raised on this very
+            # line.  That row is now the ONLY thing pinning this default: the
+            # happy-path tests the bare form once broke patch the seam with a
+            # stub that models `length` honestly, so they stay green either
+            # way.
+            owed = getattr(resp, "length", None)
+            if owed:
+                raise RuntimeError(
+                    f"short read: {owed} bytes still owed by Content-Length "
+                    f"fetching '{url}'"
+                )
+
+            return bytes(buf)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code} fetching '{url}': {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        # Covers DNS resolution failure, connection refused, and (on most
+        # platforms) a socket timeout raised through urlopen's own retry path.
+        raise RuntimeError(f"failed to fetch '{url}': {exc.reason}") from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise RuntimeError(f"timed out after {timeout}s fetching '{url}'") from exc
+    except http.client.HTTPException as exc:
+        # The protocol-layer failures, which are NEITHER OSError NOR
+        # ValueError and so escaped every clause above -- the same
+        # operator-facing defect as the ValueError case below, arriving by a
+        # different type.  The one that matters for the partial-read contract
+        # is IncompleteRead: a TRUNCATED CHUNKED body raises it out of
+        # http.client's own chunk decoder, and measured against the
+        # pre-#2691 code it reached the operator as a raw
+        # "IncompleteRead(0 bytes read)" traceback out of the one function
+        # whose documented contract is to fail loudly THROUGH this wrapper.
+        # (Chunked framing is why this half exists at all: the
+        # Content-Length check above cannot see a chunked body, because a
+        # chunked response has no authoritative Content-Length to check.)
+        #
+        # Caught BROADLY at HTTPException rather than narrowly at
+        # IncompleteRead, for the same reason `except ValueError` below is
+        # broad: every sibling here (BadStatusLine, RemoteDisconnected,
+        # LineTooLong, UnknownProtocol, ...) is a remote- or
+        # transport-triggered failure of the same fetch, none of them is a
+        # programming error we would want to surface differently, and
+        # urllib's do_open passes them through untouched -- it wraps only
+        # OSError from the request into URLError, and RemoteDisconnected is
+        # the only OSError among them.  So an unexpected sibling is better
+        # relabelled loudly than left to escape as a bare traceback, and
+        # `from exc` keeps the original type, message and frames.
+        #
+        # The type NAME is in the message deliberately, unlike the sibling
+        # clauses: _snapshot_web/_snapshot_pdf catch RuntimeError, print
+        # str(exc) and exit, so the traceback `from exc` preserves never
+        # reaches the operator -- and several siblings' own str is a bare
+        # protocol fragment (BadStatusLine's is just the repr of the offending
+        # line), which names nothing on its own.
+        raise RuntimeError(
+            f"failed to fetch '{url}': {type(exc).__name__}: {exc}"
+        ) from exc
+    except ValueError as exc:
+        # A malformed authority in the URL ITSELF, raised before any
+        # connection is opened: urlparse(...).port raises ValueError on a
+        # non-numeric or out-of-range port ('http://h:abc/x',
+        # 'http://h:99999/x'), and InheritedAuthority.__post_init__ raises it
+        # on port 0 -- both reached through _urlopen ->
+        # _SafeRedirectHandler.__init__ -> _resolve_inherited ->
+        # _effective_port.  ValueError is not an OSError, so it escaped every
+        # clause above and reached the operator as a bare traceback out of the
+        # one function whose documented contract is to fail loudly THROUGH
+        # this wrapper.  (The malformed-authority case on a REDIRECT target is
+        # handled where it arises, in _SafeRedirectHandler.redirect_request,
+        # so the message names the target and the 30x socket still gets
+        # closed; this clause is the ORIGINAL url's half.)
+        #
+        # `from exc` is what keeps this honest for the residual case: a
+        # ValueError raised anywhere else under the `try` still carries its
+        # own message and frames, so it is relabelled loudly rather than
+        # silently swallowed.
+        raise RuntimeError(f"failed to fetch '{url}': {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
 # Source: forum:<id>
 # ---------------------------------------------------------------------------
 
@@ -288,6 +1294,7 @@ def _snapshot_forum(
         "original_url": original_url,
         "source_type": "forum",
         "block_reason": None,
+        "evidence_type": EVIDENCE_TYPE_BY_SOURCE["forum"],
     }
 
 
@@ -430,6 +1437,7 @@ def _snapshot_jsonl(
         "original_url": original_url,
         "source_type": "jsonl",
         "block_reason": None,
+        "evidence_type": EVIDENCE_TYPE_BY_SOURCE["jsonl"],
     }
 
 
@@ -476,6 +1484,80 @@ def _snapshot_file(path_str: str, config: dict) -> dict:
         "original_url": "file://" + str(resolved),
         "source_type": "file",
         "block_reason": None,
+        "evidence_type": EVIDENCE_TYPE_BY_SOURCE["file"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source: web:<url> / pdf:<url>  (#2606 facet 1 unit 1)
+# ---------------------------------------------------------------------------
+
+def _snapshot_web(url: str, config: dict) -> dict:
+    """Fetch and archive a web page's raw bytes (not extracted text) and
+    return the output JSON dict.
+
+    Raw bytes, extension .html -- #1253 open question 1 resolves toward
+    verifiability; text extraction, if ever wanted, is a query-time
+    derivation, not a capture-time one.
+
+    Any fetch failure (non-2xx, timeout, DNS/connection failure, oversize)
+    exits non-zero with the failure in the message and writes NOTHING to the
+    archive -- _fetch_url_bytes only ever returns a complete read or raises;
+    _archive_write is never reached on failure.
+    """
+    try:
+        content_bytes = _fetch_url_bytes(url, WEB_FETCH_TIMEOUT_SECONDS, WEB_FETCH_MAX_BYTES)
+    except RuntimeError as exc:
+        print(f"engram-snapshot: web: fetch failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    try:
+        archive_path, sha = _archive_write(content_bytes, "html")
+    except OSError as exc:
+        print(f"engram-snapshot: archive write failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": url,
+        "source_type": "web",
+        "block_reason": None,
+        "evidence_type": EVIDENCE_TYPE_BY_SOURCE["web"],
+    }
+
+
+def _snapshot_pdf(url: str, config: dict) -> dict:
+    """Fetch and archive a PDF's raw bytes and return the output JSON dict.
+
+    Same fetch/fail/archive discipline as _snapshot_web -- see its docstring.
+    Archived with extension .pdf.
+    """
+    try:
+        content_bytes = _fetch_url_bytes(url, WEB_FETCH_TIMEOUT_SECONDS, WEB_FETCH_MAX_BYTES)
+    except RuntimeError as exc:
+        print(f"engram-snapshot: pdf: fetch failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    try:
+        archive_path, sha = _archive_write(content_bytes, "pdf")
+    except OSError as exc:
+        print(f"engram-snapshot: archive write failed: {exc}", file=sys.stderr)
+        sys.exit(EXIT_IO)
+
+    return {
+        "file_url": _file_url(archive_path),
+        "content_hash": sha,
+        "captured_at": _now_utc_iso(),
+        "git_sha": None,
+        "archive_status": "archived",
+        "original_url": url,
+        "source_type": "pdf",
+        "block_reason": None,
+        "evidence_type": EVIDENCE_TYPE_BY_SOURCE["pdf"],
     }
 
 
@@ -518,9 +1600,9 @@ def _parse_source(source: str) -> tuple:
     """Parse the <source> positional argument.
 
     Returns (source_type, source_id) where:
-      source_type in {'forum', 'jsonl', 'file'}
+      source_type in {'forum', 'jsonl', 'file', 'web', 'pdf'}
       source_id: thread id (int) for forum, session-id string (or '') for jsonl,
-                 path string for file
+                 path string for file, the URL string for web/pdf
 
     Exits EXIT_VALIDATION on unrecognised source format.
     """
@@ -570,12 +1652,28 @@ def _parse_source(source: str) -> tuple:
             raw = rest
         return "file", raw
 
+    if source.startswith("web:") or source.startswith("pdf:"):
+        kind, _, raw_url = source.partition(":")
+        if not raw_url:
+            print(
+                f"engram-snapshot: {kind}: requires a URL (e.g. '{kind}:https://example.com/page')",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        if not (raw_url.startswith("http://") or raw_url.startswith("https://")):
+            print(
+                f"engram-snapshot: {kind}: only supports http:// or https:// URLs, "
+                f"got '{raw_url}'.",
+                file=sys.stderr,
+            )
+            sys.exit(EXIT_VALIDATION)
+        return kind, raw_url
+
     # Bare 'jsonl:' is handled above (empty strip → None)
     print(
         f"engram-snapshot: unrecognised source '{source}'. "
         "Use 'forum:<id>', 'jsonl:<session-id>' (or bare 'jsonl:' for current session), "
-        "or 'file:<path>'. "
-        "P2 (web:, pdf:) not yet implemented.",
+        "'file:<path>', 'web:<url>', or 'pdf:<url>'.",
         file=sys.stderr,
     )
     sys.exit(EXIT_VALIDATION)
@@ -592,7 +1690,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Archive an evidence source into the content-addressed evidence store "
             "and emit a JSON record designed to feed engram_add_observation.\n\n"
             "P1 sources: forum:<id>  jsonl:<session-id>  jsonl: (bare = current session)\n"
-            "P1.5 sources: file:<path>"
+            "P1.5 sources: file:<path>\n"
+            "P2 sources: web:<url>  pdf:<url>  (http:// or https:// only)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -608,7 +1707,10 @@ def build_parser() -> argparse.ArgumentParser:
             "'forum:<id>' (LAN forum thread), "
             "'jsonl:<session-id>' (session transcript span), "
             "'jsonl:' (bare — current session transcript). "
-            "P1.5: 'file:<path>' (arbitrary local file; absolute, relative, or ~-prefixed)."
+            "P1.5: 'file:<path>' (arbitrary local file; absolute, relative, or ~-prefixed). "
+            "P2: 'web:<url>' (archives raw HTML bytes), 'pdf:<url>' (archives raw PDF bytes "
+            "— quotes cannot be verified against a PDF; extract to text first) "
+            "— http:// or https:// only."
         ),
     )
 
@@ -641,7 +1743,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="type_override",
         help=(
             "Override source-type auto-detection. "
-            "'forum', 'jsonl', and 'file' implemented."
+            "'forum', 'jsonl', 'file', 'web', and 'pdf' are all implemented."
         ),
     )
 
@@ -672,13 +1774,13 @@ def main() -> None:
     # Parse source
     source_type, source_id = _parse_source(args.source)
 
-    # Apply --type override if given (validation only for P1 types)
+    # Apply --type override if given
     if args.type_override is not None:
         override = args.type_override
-        if override not in ("auto", "forum", "jsonl", "file"):
+        if override not in ("auto", "forum", "jsonl", "file", "web", "pdf"):
             print(
-                f"engram-snapshot: --type {override!r} is not supported in P1. "
-                "Only 'forum', 'jsonl', and 'file' are implemented.",
+                f"engram-snapshot: --type {override!r} is not supported. "
+                "Only 'forum', 'jsonl', 'file', 'web', and 'pdf' are implemented.",
                 file=sys.stderr,
             )
             sys.exit(EXIT_STATE)
@@ -710,6 +1812,10 @@ def main() -> None:
         result = _snapshot_jsonl(source_id, span_start, span_end, config)
     elif source_type == "file":
         result = _snapshot_file(source_id, config)
+    elif source_type == "web":
+        result = _snapshot_web(source_id, config)
+    elif source_type == "pdf":
+        result = _snapshot_pdf(source_id, config)
     else:
         # Should be unreachable given _parse_source validation
         print(

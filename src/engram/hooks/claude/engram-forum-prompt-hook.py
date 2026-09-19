@@ -150,15 +150,33 @@ PUBLISH_TIMEOUT_SECONDS = 1.0
 # (same directory, same sys.path bootstrap used below). _PROMPTHOOKLIB_OK
 # gates main() -- if the shared module somehow fails to import, the hook
 # degrades to a silent no-op rather than crashing, same discipline as every
-# other best-effort import in this prologue. (emit_context is NOT imported
-# here -- this hook builds its own response dict inline at the end of
-# main(), a differently-shaped call site that had no local _emit_context
-# helper to deduplicate; see _prompthooklib.py's module docstring.)
+# other best-effort import in this prologue.
+#
+# engram-alpha#2863 WS2: this hook's own response-dict construction at the
+# end of main() now routes through _assemble_response() below, which calls
+# `_hooklib.emit_context()` (WS1, #2874) -- the shared bounded-injection
+# renderer, imported unconditionally alongside it just below (same
+# unconditional-import precedent as engram-surface-hook.py's own #2876
+# migration: _hooklib.py / _harness.py are guaranteed sibling files in both
+# build topologies, per the module docstring's #1539/#1558 note above, so
+# this import doesn't need the defensive try/except _PROMPTHOOKLIB_OK gets).
+#
+# NAMING COLLISION worth flagging (mirrors Luria's #2876 note on
+# check_principle_triggers_full): `_prompthooklib.py` already exports its
+# OWN, differently-scoped `emit_context()` -- "print the additionalContext
+# hookSpecificOutput envelope to stdout" for the baton/inter-agent hooks,
+# with no budget/bounding logic at all (see that module's own docstring).
+# This hook does NOT import that name (only the four _prompthooklib names
+# below), so there is no runtime collision -- but two functions named
+# `emit_context()` now exist in this directory with unrelated contracts;
+# don't assume they're the same function when reading either hook.
 # ---------------------------------------------------------------------------
 
 _this_dir = str(Path(__file__).resolve().parent)
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
+from _hooklib import emit_context
+from _harness import detect_harness, get_harness_budgets
 try:
     from _prompthooklib import (
         load_config as _load_config_impl,
@@ -529,6 +547,33 @@ def _fetch_inbox(forum_url: str, agent_name: str) -> Optional[list]:
 # Formatting helpers
 # ---------------------------------------------------------------------------
 
+# engram-alpha#2863 WS2: mention_line becomes `head` -- the "must not miss"
+# content routed through _assemble_response()/emit_context() below -- and
+# thread titles are USER-CONTROLLED, unbounded content: the forum server's
+# create-thread handler only .strip()s and rejects empty (src/forum/server.py,
+# no max-length validation). Unlike engram-surface-hook.py's own head content
+# (#2876), which is naturally short because it's built entirely from fixed
+# system-health strings, this hook's head embeds real user-authored text --
+# so WITHOUT a defensive per-title cap, a single pathologically long title
+# could make `head` (mention_line) itself exceed the harness's head_budget
+# BEFORE it ever reaches emit_context() (which only bounds the render IT
+# produces, not the raw string a caller hands it). This is exactly the
+# "never load content of unpredictable size" case (WS2 spec rule 2).
+_MENTION_TITLE_MAX_CHARS = 150
+
+
+def _truncate_title(title: str) -> str:
+    """Defensively cap a single thread title before it enters mention_line.
+
+    150 chars is a generous display width for a thread title (real titles
+    observed in production top out far shorter -- census: 608-char total
+    mention line, 2026-09-12) while keeping even the worst case (3 shown
+    items, each at the cap) comfortably under head_budget (1,800)."""
+    if len(title) <= _MENTION_TITLE_MAX_CHARS:
+        return title
+    return title[: _MENTION_TITLE_MAX_CHARS - 1] + "…"
+
+
 def _format_mention_line(mentions: list) -> Optional[str]:
     """Format the 🔔 mention summary line for injection into additionalContext.
 
@@ -548,7 +593,7 @@ def _format_mention_line(mentions: list) -> Optional[str]:
     parts = []
     for m in shown:
         tid = m.get("thread_id", "?")
-        title = m.get("thread_title", "?")
+        title = _truncate_title(m.get("thread_title", "?"))
         author = m.get("author", "?")
         kind = m.get("kind", "")
         if kind == "at_mention":
@@ -590,6 +635,93 @@ def _format_umwelt_advisory_line(mentions: list) -> Optional[str]:
         f"the mention bridge is not yet live — `forum read <id>` to collect "
         f"(alpha#2019/umwelt#599 slice 4 will bridge these)."
     )
+
+
+def _assemble_response(head_blocks: list, body_blocks: list) -> dict:
+    """Build the UserPromptSubmit response dict from this prompt's fired
+    head/body blocks, routed through the shared bounded renderer
+    `_hooklib.emit_context()` (engram-alpha#2863 WS2).
+
+    `head_blocks` / `body_blocks` are the already-rendered, non-empty block
+    strings `main()` collected this prompt (see the "Build injection block"
+    section below) -- this function does no filtering of its own beyond the
+    "did anything fire at all" check. Split out from `main()` purely for
+    testability, mirroring engram-surface-hook.py's own `_assemble_response()`
+    (#2876) -- `main()`'s own behavior is otherwise unchanged.
+
+    Census (this hook, unlike surface-hook's ~11 blocks): only 3 possible
+    blocks total, across two branches main()'s own comms_surface gate keeps
+    mutually exclusive within a single invocation:
+      - comms_surface="forum" (default): mention_line (head) + threads_line
+        (body) -- mention_line is the single actionable/addressed-item fact
+        for this prompt (an @mention), threads_line the lower-priority
+        broadcast-only new-threads count.
+      - comms_surface="umwelt": the addressed-item advisory line (head) only
+        -- conceptually the same "actionable fact" role as mention_line
+        above, just this branch's own equivalent wording.
+    So head is always at most one block; body is at most one block, and only
+    ever fires in forum mode.
+
+    Returns `{}` when nothing fired this prompt. In practice this call site
+    never reaches that branch -- main()'s own pre-existing silent-no-op exits
+    (three separate bare `sys.exit(0)` checks: forum-not-configured,
+    advisory_line is None, threads-and-mention_line both absent) all run
+    BEFORE this function is ever called, preserving the exact pre-migration
+    behavior of emitting NO stdout at all (not even `{}`) on those paths --
+    unlike engram-surface-hook.py, which always prints something. The `{}`
+    branch here is defensive belt-and-suspenders only, matching the shared
+    `_assemble_response()` contract established by #2876 for consistency;
+    `emit_context()` is never called with two empty inputs either way.
+    """
+    head = "\n\n".join(head_blocks)
+    body = list(body_blocks)
+    if not head and not body:
+        return {}
+
+    harness = detect_harness()
+    budgets = get_harness_budgets(harness)
+    rendered = emit_context(
+        head,
+        body,
+        budget=budgets["budget"],
+        # DELIBERATE DEVIATION from engram-surface-hook.py's own #2876 choice
+        # (target=budgets["budget"], the hard ceiling): here target is
+        # budgets["head_budget"] instead. Reasoning: this hook's head
+        # (mention_line, or its umwelt-mode equivalent) embeds real
+        # user-authored thread titles -- genuinely unbounded content, unlike
+        # surface-hook's head, which is built entirely from fixed
+        # system-health strings and stays under head_budget only because
+        # those three messages happen to be short today (documented there as
+        # a canary, not a guarantee). Passing target=head_budget makes
+        # emit_context()'s own Stage-1 line-boundary trim (see its docstring)
+        # do the bounding for us, using the SAME tested mechanism the
+        # tripwire hook's own local economy target relies on (_harness.py's
+        # own docstring names this exact precedent: "its own soft target of
+        # 1800 happens to equal claude-code's head_budget here"). This
+        # hook's normal content (max delivered historically: 608 chars, per
+        # the #2863 census) is nowhere near either ceiling, so no real
+        # content is lost by choosing the smaller target -- it only
+        # tightens the worst-case guarantee. (Also see _truncate_title()'s
+        # own defensive cap on individual titles -- belt-and-suspenders
+        # with this target choice, not a substitute for it: together they
+        # make the "head stays under head_budget" property a real
+        # invariant here, not a canary.)
+        target=budgets["head_budget"],
+        # No single block in this hook is known to run large enough to need
+        # the allow_single_overflow exception (unlike surface-hook's
+        # principle_triggers) -- left at the default (False).
+        allow_single_overflow=False,
+        # No shared overflow-persistence helper exists yet in _hooklib.py
+        # (see engram-surface-hook.py's own #2876 note) -- cut content is
+        # dropped with a "M cut" count and no "-- see <path>" pointer.
+        overflow_writer=None,
+    )
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": rendered,
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -738,11 +870,22 @@ def main() -> None:
     # anti-black-hole clause: a world-preferring seat must never silently
     # miss an addressed forum item pre-bridge. Broadcast-only counts (new
     # threads, no mention) are fully suppressed under umwelt.
+    #
+    # engram-alpha#2863 WS2: head_blocks/body_blocks split, routed through
+    # _assemble_response()/emit_context() below -- preserves the exact
+    # existing branching for what fires this prompt (including the three
+    # pre-existing bare `sys.exit(0)` silent-no-op exits below, untouched);
+    # only WHERE the resulting string goes has changed. head_blocks carries
+    # the single actionable/addressed-item fact for this prompt (an
+    # @mention, or its umwelt-mode equivalent); body_blocks carries the
+    # lower-priority broadcast-only new-threads count, forum mode only.
+    head_blocks: list = []
+    body_blocks: list = []
     if comms_surface == "umwelt":
         advisory_line = _format_umwelt_advisory_line(mentions or [])
         if advisory_line is None:
             sys.exit(0)
-        lines = [advisory_line]
+        head_blocks = [advisory_line]
     else:
         # ── Exit silently if nothing to report ──────────────────────────────
         if not threads and not mention_line:
@@ -751,31 +894,29 @@ def main() -> None:
         # ── Count new threads since the surfaced cursor ─────────────────────
         new_count = len(threads) if threads else 0
 
-        lines = []
-
-        # 🔔 mention line first (if any)
+        # 🔔 mention line first (if any) -- head: the actionable fact.
         if mention_line:
-            lines.append(mention_line)
+            head_blocks.append(mention_line)
 
-        # 📢 generic threads line (if any)
+        # 📢 generic threads line (if any) -- body: broadcast-only, lower priority.
         if new_count > 0:
             post_word = "post" if new_count == 1 else "posts"
-            lines.append(
+            body_blocks.append(
                 f"\U0001f4e2 {new_count} new forum {post_word} since last read"
                 f" — run `forum read <id>` or `forum status` to catch up."
             )
 
-        if not lines:
+        if not head_blocks and not body_blocks:
             sys.exit(0)
 
-    context = "\n".join(lines)
+    response = _assemble_response(head_blocks, body_blocks)
+    if not response:
+        # Defensive only -- see _assemble_response()'s own docstring on why
+        # this call site never actually reaches its `{}` branch (the three
+        # sys.exit(0) checks above already cover every "nothing to report"
+        # case with the pre-migration silent-no-op behavior, no print at all).
+        sys.exit(0)
 
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": context,
-        }
-    }
     print(json.dumps(response))
 
 

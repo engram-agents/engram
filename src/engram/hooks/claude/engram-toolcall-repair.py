@@ -51,7 +51,8 @@ from pathlib import Path
 _this_dir = os.path.dirname(os.path.abspath(__file__))
 if _this_dir not in sys.path:
     sys.path.insert(0, _this_dir)
-from _hooklib import atomic_write_json
+from _hooklib import atomic_write_json, emit_context
+from _harness import detect_harness, get_harness_budgets
 
 ENGRAM_HOME = (
     os.environ.get("ENGRAM_HOME")
@@ -95,6 +96,13 @@ PROTECTED_TOOLS = {
     # prevents.
     "mcp__engram__engram_add_observation_batch": {
         "payload_json",
+    },
+    # engram_checkpoint (issue #3015 rename) is the canonical tool name;
+    # engram_nap is its deprecated backward-compat alias (kept for one
+    # release, per Lei's 2026-09-19 ruling) — both entries mirror the same
+    # parameter-name set so the repair hook recognizes either tool-call name.
+    "mcp__engram__engram_checkpoint": {
+        "message",
     },
     "mcp__engram__engram_nap": {
         "message",
@@ -353,24 +361,53 @@ def write_marker(tool_name: str, repairs: list[str]) -> None:
     atomic_write_json(REPAIR_MARKER, marker)
 
 
-def format_additional_context(tool_name: str, repairs: list[str]) -> str:
-    """Build the additionalContext string the model sees this turn."""
+def _build_context_parts(tool_name: str, repairs: list[str]) -> tuple[str, list[str]]:
+    """Split the antml-prefix-repair notice into `head` (the single
+    must-not-miss fact: a repair happened, and how many) and `body` (each
+    repair's own description, most-recent-pass-last as produced by
+    attempt_repair's loop, followed by the generic root-cause explainer as
+    the lowest-priority item) -- engram-alpha#2863 WS2.
+
+    Bounded already by attempt_repair's own MAX_REPAIR_PASSES=5 ceiling and
+    PROTECTED_TOOLS' fixed, short parameter-name vocabulary, so this is not
+    a case of unpredictable size -- routed through emit_context() anyway
+    for the same combined-budget defense-in-depth every other migrated
+    hook gets, and so a future loosening of MAX_REPAIR_PASSES doesn't
+    quietly reopen an unbounded-content hole here.
+    """
     short_name = tool_name.replace("mcp__engram__", "")
-    lines = [
+    head = (
         f"[antml-prefix repair] Your {short_name} call had "
         f"{len(repairs)} swallow-pattern corruption(s). "
         "I repaired the tool_input before invocation; the call will "
         "succeed, but fix the emit next time."
-    ]
-    for r in repairs:
-        lines.append(f"  - {r}")
-    lines.append(
+    )
+    body = [f"  - {r}" for r in repairs]
+    body.append(
         "Root cause: a parameter's closing tag was emitted without the "
         "antml: prefix, so the harness parser swallowed the next "
         "parameter's opening tag and value into the previous parameter. "
         "See ob_NNNN for mechanics."
     )
-    return "\n".join(lines)
+    return head, body
+
+
+def format_additional_context(tool_name: str, repairs: list[str]) -> str:
+    """Build the additionalContext string the model sees this turn, bounded
+    via `_hooklib.emit_context()` (engram-alpha#2863 WS2). No local economy
+    target exists for this hook (content was previously unbounded but is,
+    in practice, always small -- see `_build_context_parts`'s docstring),
+    so `target` uses the same hard `budget` ceiling as `budget` itself,
+    mirroring `engram-surface-hook.py`'s own default choice for a hook with
+    no pre-existing local cap."""
+    head, body = _build_context_parts(tool_name, repairs)
+    budgets = get_harness_budgets(detect_harness())
+    return emit_context(
+        head,
+        body,
+        budget=budgets["budget"],
+        target=budgets["budget"],
+    )
 
 
 def main() -> None:

@@ -6,6 +6,8 @@
 
 **The memory your Claude Code agent is missing — one it *owns*, builds on across sessions, and corrects when it's wrong.**
 
+**[engram-agents.org](https://engram-agents.org)** — overview, user guide, and release notes.
+
 <sub>Authored by **Borges Funes**, an ENGRAM agent · reviewed by **Lei Shi**</sub>
 
 ---
@@ -76,6 +78,7 @@ Install [Claude Code](https://code.claude.com) and **ask your agent to guide you
 | A person deciding whether to try ENGRAM, or living with it day-to-day | **[USER_GUIDE.md](USER_GUIDE.md)** — friendly, no jargon, "what the first week feels like." |
 | An agent helping a human install, orient, or check ENGRAM is safe | **[README-AGENT.md](README-AGENT.md)** — the full install procedure, config, and how the package fits together. |
 | Someone who wants the deep technical + philosophical backbone | **[docs/handbook/](docs/handbook/)** — chapter-by-chapter internals. |
+| Someone who'd rather read all of this on the web, in English or 中文 | **[engram-agents.org](https://engram-agents.org)** — the project site, with the same guides plus per-version release notes. |
 
 ---
 
