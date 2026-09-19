@@ -3259,6 +3259,7 @@ def _list_impl(
     node_type: str = "",
     status: str = "",
     sort_by: str = "id",
+    sort_order: str = "",
     limit: int = 100,
     filters_json: str = "",
     fields_json: str = "",
@@ -3349,19 +3350,31 @@ def _list_impl(
 
     where = " AND ".join(where_parts)
 
-    sort_map = {
-        "id": "id ASC",
-        "created": "created_at DESC",
-        "importance": "importance_score DESC",
-        "recalls": "recall_count DESC",
+    # Each sort_by key maps to (column, default_direction) rather than a
+    # baked-in "column DIRECTION" string, so sort_order can override the
+    # direction independently of which column was chosen (issue #3016).
+    sort_columns = {
+        "id": ("id", "ASC"),
+        "created": ("created_at", "DESC"),
+        "importance": ("importance_score", "DESC"),
+        "recalls": ("recall_count", "DESC"),
     }
-    if sort_by and sort_by not in sort_map:
+    if sort_by and sort_by not in sort_columns:
         return json.dumps({
             "status": "error",
             "error": f"Unknown sort_by: {sort_by!r}. "
-                     f"Allowed: {sorted(sort_map.keys())}",
+                     f"Allowed: {sorted(sort_columns.keys())}",
         })
-    order = sort_map.get(sort_by, "id ASC")
+    column, default_direction = sort_columns.get(sort_by, sort_columns["id"])
+
+    if sort_order and sort_order.lower() not in ("asc", "desc"):
+        return json.dumps({
+            "status": "error",
+            "error": f"Unknown sort_order: {sort_order!r}. "
+                     f"Allowed: ['asc', 'desc']",
+        })
+    resolved_direction = sort_order.upper() if sort_order else default_direction
+    order = f"{column} {resolved_direction}"
 
     # Limit semantics (per issue #81 + Lei's state-table refinement):
     #   unlimited=True OR limit=None  → no cap
@@ -3469,6 +3482,7 @@ def _list_impl(
         "shown": len(entries),
         "truncated": truncated_count,
         "sort_by": sort_by,
+        "sort_order": resolved_direction.lower(),
         "mode": "structured" if structured_mode else "single_field",
         "nodes": entries,
     }

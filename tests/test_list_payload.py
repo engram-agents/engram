@@ -15,6 +15,12 @@ Coverage:
      covers: every valid sort key still orders correctly, a valid node_type
      still filters correctly, and empty/absent sort_by + node_type keep
      meaning "default sort" / "no filter".
+  6. sort_order (engram-alpha#3016) — sort_order="asc" flips the direction for
+     each of the 4 sort_by values; sort_order omitted is byte-identical to
+     pre-change behavior (regression guard); an unrecognized sort_order
+     errors loudly rather than silently falling back; and the literal
+     oldest-first regression this issue exists to fix (sort_by="created",
+     sort_order="asc" surfaces the OLDEST node first).
 
   Note: engram_list has NO required fields (all have defaults), so the
   missing-required-field test (path 5 in the original numbering) is omitted.
@@ -284,4 +290,175 @@ def test_valid_sort_by_recalls_orders_correctly():
     returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
     assert returned == list(reversed(ids)), (
         f"Expected most-recalled-first order (reverse of seed order {ids}), got: {returned}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. sort_order (engram-alpha#3016)
+# ---------------------------------------------------------------------------
+#
+# _seed_three_for_sort seeds ids = [A, B, C] with A oldest/lowest-importance/
+# lowest-recall-count, B mid, C newest/highest-importance/highest-recall-count.
+# So the seed order [A, B, C] IS the ascending order for created/importance/
+# recalls, and sorted(ids) is the ascending order for id.
+
+def test_sort_order_asc_flips_created():
+    """sort_order='asc' reverses 'created' from its default (newest-first)."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "created", "sort_order": "asc",
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == ids, (
+        f"Expected oldest-first order (seed order {ids}) with sort_order=asc, got: {returned}"
+    )
+    assert r["sort_order"] == "asc", f"Expected resolved sort_order 'asc', got: {r['sort_order']}"
+
+
+def test_sort_order_asc_flips_importance():
+    """sort_order='asc' reverses 'importance' from its default (highest-first)."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "importance", "sort_order": "asc",
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == ids, (
+        f"Expected lowest-importance-first order (seed order {ids}) with sort_order=asc, got: {returned}"
+    )
+    assert r["sort_order"] == "asc", f"Expected resolved sort_order 'asc', got: {r['sort_order']}"
+
+
+def test_sort_order_asc_flips_recalls():
+    """sort_order='asc' reverses 'recalls' from its default (most-recalled-first)."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "recalls", "sort_order": "asc",
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == ids, (
+        f"Expected least-recalled-first order (seed order {ids}) with sort_order=asc, got: {returned}"
+    )
+    assert r["sort_order"] == "asc", f"Expected resolved sort_order 'asc', got: {r['sort_order']}"
+
+
+def test_sort_order_desc_flips_id():
+    """sort_order='desc' reverses 'id' from its default (ascending)."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "id", "sort_order": "desc",
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == list(reversed(sorted(ids))), (
+        f"Expected descending id order with sort_order=desc, got: {returned}"
+    )
+    assert r["sort_order"] == "desc", f"Expected resolved sort_order 'desc', got: {r['sort_order']}"
+
+
+def test_sort_order_omitted_matches_pre_change_behavior():
+    """Omitting sort_order (the field absent entirely, not empty string) is a
+    byte-identical regression guard: ordering + resolved sort_order both match
+    what sort_by's own default direction always produced before sort_order
+    existed."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+
+    r_created = json.loads(server.engram_list(payload_json=json.dumps({"sort_by": "created"})))
+    assert r_created["status"] == "ok", f"Expected ok status, got: {r_created}"
+    returned = [n["id"] for n in r_created["nodes"] if n["id"] in ids]
+    assert returned == list(reversed(ids)), (
+        f"Expected unchanged newest-first default order, got: {returned}"
+    )
+    assert r_created["sort_order"] == "desc", (
+        f"Expected resolved sort_order to reflect 'created' default direction 'desc', "
+        f"got: {r_created['sort_order']}"
+    )
+
+    r_id = json.loads(server.engram_list(payload_json=json.dumps({"sort_by": "id"})))
+    assert r_id["status"] == "ok", f"Expected ok status, got: {r_id}"
+    returned_id = [n["id"] for n in r_id["nodes"] if n["id"] in ids]
+    assert returned_id == sorted(ids), f"Expected unchanged ascending id default order, got: {returned_id}"
+    assert r_id["sort_order"] == "asc", (
+        f"Expected resolved sort_order to reflect 'id' default direction 'asc', "
+        f"got: {r_id['sort_order']}"
+    )
+
+
+def test_invalid_sort_order_rejected():
+    """An unrecognized sort_order errors loudly and does not return rows."""
+    server = fresh_server()
+    _add_observation(server, "Node present so a silent-fallback would have rows to return.")
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "created", "sort_order": "sideways",
+    })))
+    assert "nodes" not in r, f"Expected refusal (no 'nodes' key), got: {r}"
+    assert "error" in r, f"Expected error key, got: {r}"
+    for key in ("asc", "desc"):
+        assert key in r["error"], (
+            f"Expected valid sort_order value {key!r} listed in error, got: {r['error']}"
+        )
+
+
+def test_sort_order_case_insensitive():
+    """sort_order accepts mixed-case values ('ASC' as well as 'asc')."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "created", "sort_order": "ASC",
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == ids, f"Expected oldest-first order with sort_order='ASC', got: {returned}"
+    assert r["sort_order"] == "asc", f"Expected resolved sort_order lowercased to 'asc', got: {r['sort_order']}"
+
+
+def test_empty_sort_order_means_default_direction():
+    """Empty-string sort_order (explicit, not omitted) still means 'use
+    sort_by's own default direction', not a refusal."""
+    server = fresh_server()
+    ids = _seed_three_for_sort(server)
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "created", "sort_order": "",
+    })))
+    assert r["status"] == "ok", f"Expected ok status (default direction), got: {r}"
+    returned = [n["id"] for n in r["nodes"] if n["id"] in ids]
+    assert returned == list(reversed(ids)), (
+        f"Expected unchanged newest-first default order with sort_order='', got: {returned}"
+    )
+    assert r["sort_order"] == "desc", f"Expected resolved sort_order 'desc', got: {r['sort_order']}"
+
+
+def test_sort_by_created_asc_surfaces_oldest_node_first():
+    """The literal regression this issue exists to fix (engram-alpha#3016):
+    with sort_by='created', sort_order='asc', a node created BEFORE others
+    actually appears FIRST in the results — the oldest-first case the sleep
+    skill's backfill needs and the tool could not previously express."""
+    server = fresh_server()
+    oldest_id = _add_observation(server, "Oldest node — created first, chronologically earliest.")
+    conn = server.core._get_db()
+    try:
+        conn.execute(
+            "UPDATE nodes SET created_at='2019-01-01T00:00:00Z' WHERE id=?", (oldest_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _add_observation(server, "Middle node — created second.")
+    _add_observation(server, "Newest node — created third, chronologically latest.")
+
+    r = json.loads(server.engram_list(payload_json=json.dumps({
+        "sort_by": "created", "sort_order": "asc", "limit": 1,
+    })))
+    assert r["status"] == "ok", f"Expected ok status, got: {r}"
+    assert len(r["nodes"]) == 1, f"Expected exactly 1 node (limit=1), got: {r['nodes']}"
+    assert r["nodes"][0]["id"] == oldest_id, (
+        f"Expected the oldest node {oldest_id!r} to surface first under "
+        f"sort_by=created, sort_order=asc — got {r['nodes'][0]['id']!r} instead"
     )
