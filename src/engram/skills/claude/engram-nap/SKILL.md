@@ -59,6 +59,12 @@ was renamed so its name would stop colliding with this skill's own name.
 `engram_nap` still works as a deprecated alias for one release, but new calls
 should use `engram_checkpoint`.)
 
+**If `engram_checkpoint` isn't in your tool list:** your MCP server process
+predates the rename (rebuilt-source vs. reconnected-process gap — the skill's
+own hot-reload takes effect immediately, but the running server does not
+until a `/mcp` reconnect). Call `engram_nap` instead until the reconnect
+lands; both names take identical arguments and return identical shapes.
+
 `session_id` is still accepted (kept for backward compatibility with older callers) but no longer does anything for the `warm_briefing` advisory below — as of #3014 that advisory anchors on the **last nap/sleep checkpoint already in `session_log.md`**, not on session identity. `warm_briefing.written_since_last_nap` resolves to `true`/`false` on its own, with no `session_id` needed; it's `null` only when there's no prior checkpoint in the file yet (e.g. this is the very first nap ever) or the warm-briefing file itself is missing.
 
 The `nap` mode:
