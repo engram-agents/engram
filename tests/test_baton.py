@@ -223,6 +223,77 @@ def _make_raw_baton(project_id: str, **frontmatter) -> str:
     return "\n".join(lines)
 
 
+def _raw_from_init_post(post_body: dict, ts: str = "2026-09-20T12:00:00Z") -> str:
+    """Render the baton the forum store WOULD persist for a given
+    ``POST /api/projects`` body — the missing link that lets a test run
+    ``cmd_init`` and then ``cmd_flip`` against what that init actually
+    created, instead of hand-writing the intermediate baton (#3042).
+
+    Unlike ``_make_raw_baton`` (which builds a baton from keyword
+    overrides), the input here is literally ``client.post.call_args``'s
+    body, so every value under test travels the real path: the CLI decides
+    it, this renders it the way the server would, and the next CLI call
+    reads it back.
+
+    Mirrors, deliberately and narrowly, the two server-side rules that
+    decide whether an optional field EXISTS in the frontmatter at all:
+    ``server.py``'s ``author = (data.get("author") or "").strip() or None``
+    and ``coordination/projects.py``'s ``if github: / if colleague: /
+    if author:``. A field posted empty is therefore ABSENT here — which is
+    what makes ``_derive_legacy_author``'s proxy the live path for an
+    unknown invoker, and is asserted directly in
+    ``test_init_with_empty_invoker_leaves_author_empty``.
+
+    The turn-log line is the real one ``init()`` writes
+    (``- {ts} initialized → {turn}: {turn_reason}``) because that line is
+    the sole input to ``_derive_legacy_author``.
+    
+
+    DRIFT NOTE: the two rules mirrored here are pinned against the REAL
+    server in CI by src/forum/tests/test_projects_api.py --
+    `test_init_persists_author_field` (an explicit author is persisted
+    verbatim) and `test_init_without_author_omits_field` (an absent author
+    writes no line at all, not an empty one). If either rule changes, those
+    tests fail first and loudly; this mirror is a convenience, not the
+    authority. Verified present at those names 2026-09-20.
+    """
+    turn = (post_body.get("turn") or "").strip().lower()
+    reason = post_body.get("turn_reason") or ""
+    project_id = post_body["project_id"]
+    title = post_body.get("title") or project_id
+    participants = post_body.get("participants") or []
+    if isinstance(participants, str):
+        participants = [p.strip().lower() for p in participants.split(",") if p.strip()]
+    fm = {
+        "project": project_id,
+        "title": title,
+        "status": post_body.get("status") or "planning",
+        "turn": turn,
+        "turn_since": ts,
+        "turn_reason": f'"{reason}"',
+        "turn_by": '"{}"'.format((post_body.get("agent") or "").strip().lower()),
+        "participants": "[" + ", ".join(participants) + "]",
+    }
+    for key in ("github", "colleague", "author"):
+        val = (post_body.get(key) or "").strip().lower()
+        if val:
+            fm[key] = val
+    lines = ["---"]
+    for k, v in fm.items():
+        lines.append(f"{k}: {v}")
+    lines += [
+        "---",
+        "",
+        f"# {project_id} — {title}",
+        "",
+        "## Turn log",
+        "",
+        f"- {ts} initialized → {turn}: {reason}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def _ts(offset_minutes: int = -5) -> str:
     """Return ISO timestamp offset from now by given minutes."""
     dt = datetime.now(timezone.utc) + timedelta(minutes=offset_minutes)
@@ -3739,6 +3810,239 @@ class TestInitRepoQualification:
         _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
         _, body = client.post.call_args[0]
         assert body.get("github") == "pr/engram-agents/engram-paper/22"
+
+
+class TestInitAuthorIsInvoker:
+    """#3042: `baton init --turn <someone-else>` recorded THAT agent as the
+    baton's `author:`, not the agent who ran the command.
+
+    Live consequence, 2026-09-19: a baton created with `--turn kepler` by a
+    different initor recorded `author: kepler`. Kepler then could not hand
+    it back -- the flip to the initor matched none of `_is_maintainer_flip`'s
+    three exemptions (not a self-flip, not the flip to the registered
+    colleague, and not the flip to the recorded "author", because the author
+    on file WAS kepler himself), so it was classified as presenting-for-merge
+    and demanded a colleague approval that could not exist. `--force` did not
+    help either (the unqualified-anchor refusal is explicitly not
+    force-skippable), and there is no verb that repairs `author:` -- the
+    baton had to be cancelled and re-created.
+
+    The fix passes the INVOKER (`agent_name`), which the same posted dict
+    already carries one line above as `"agent"`. Deliberately NO
+    `or initial_turn` fallback: an unknown invoker must leave the field
+    EMPTY so `_derive_legacy_author`'s documented PROXY fires on read,
+    rather than re-asserting the turn-holder as a confident (and wrong)
+    author. That distinction is pinned by
+    test_init_with_empty_invoker_leaves_author_empty below.
+
+    Sentinel pinned via monkeypatch in every test here, for the reason
+    documented on TestFlipMaintainerRoleGate: `_pool_sentinel()` resolves
+    from the INVOKING SEAT's own config.json, so an unpinned test is
+    seat-dependent.
+    """
+
+    def test_init_with_turn_naming_another_agent_records_invoker_as_author(
+        self, monkeypatch,
+    ):
+        """The field-level claim: init as "borges" with `--turn ariadne`
+        posts `author: borges` (the invoker) and `turn: ariadne` (the turn
+        holder). On the pre-fix code the posted author was `ariadne` --
+        the turn holder -- which is the whole defect."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9400", title="turn names someone else",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("turn") == "ariadne"
+        assert body.get("author") == "borges", (
+            "init must record the INVOKER as author, not the initial turn "
+            f"holder -- got {body.get('author')!r} (#3042)"
+        )
+
+    def test_turn_holder_can_flip_the_baton_back_to_the_initor_ungated(
+        self, monkeypatch, capsys,
+    ):
+        """The trap itself, end to end -- the reason a field-level
+        assertion alone is not enough.
+
+        Chain: `cmd_init` as "borges" with `--turn ariadne` -> the posted
+        body is rendered into the baton the store would persist
+        (`_raw_from_init_post`, which mirrors the server's own
+        optional-field rule) -> "ariadne" flips it BACK to "borges"
+        through `cmd_flip`, reading exactly that baton.
+
+        That flip must NOT be classified as a merge-presentation flip: it
+        is a return to the PR's real author. Both gh-querying helpers are
+        wired to FAIL LOUDLY if called, so the test measures "the gate
+        never ran" rather than merely "the exit code was 0" -- on the
+        pre-fix code, `author:` reads "ariadne", the author exemption
+        cannot fire for a flip TO "borges", and `_pr_ci_state` is reached.
+
+        The registered colleague is "ariadne" (the agent DOING the flip),
+        deliberately: if the colleague were "borges", the flip-to-colleague
+        exemption would fire and this test would pass with or without the
+        fix, measuring nothing.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _no_ci(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_ci_state must not be called -- flipping a baton back to "
+                "the agent who INITIALIZED it is a return-to-author, not a "
+                "presentation for merge (#3042)"
+            )
+
+        def _no_approval(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_approval_state must not be called -- see _no_ci (#3042)"
+            )
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _no_ci)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _no_approval)
+
+        init_client = _make_client({"seq": 1})
+        init_args = argparse.Namespace(
+            project_id="PR-9401", title="borges inits, ariadne holds",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(init_args, MULTI_CONFIG, "borges", init_client)
+        _, init_body = init_client.post.call_args[0]
+        capsys.readouterr()  # discard init's own stdout/stderr
+
+        flip_client = _make_client(
+            post_return={"seq": 2},
+            get_return={"raw": _raw_from_init_post(init_body)},
+        )
+        flip_args = argparse.Namespace(
+            project_id="PR-9401", to="borges",
+            reason="one blocker, back to you", force=False,
+        )
+        _baton.cmd_flip(flip_args, MULTI_CONFIG, "ariadne", flip_client)
+
+        flip_client.post.assert_called_once()
+        assert capsys.readouterr().err.strip() == ""
+
+    def test_turn_holder_flip_back_is_not_blocked_by_the_unforceable_gate(
+        self, monkeypatch, capsys,
+    ):
+        """The same end-to-end chain in the shape that actually stranded
+        the live baton: an UNQUALIFIED `pr/<N>` anchor (auto-derived from
+        the `PR-<N>` project id when no `--repo` is given -- note this init
+        path predates the refusal `TestInitRepoQualification` covers, so
+        the live store holds such batons).
+
+        A misclassified return-to-author hits the unqualified-anchor
+        refusal, which is documented as NOT skippable with `--force` -- so
+        the holder could not hand the baton back at all, by any invocation.
+        With the author recorded correctly the flip is exempt before that
+        branch is ever evaluated, and succeeds.
+
+        `--force` is passed here precisely because it is the escape hatch
+        that did NOT work; the assertion is that no escape hatch is needed.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _no_ci(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called (#3042)")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _no_ci)
+
+        init_client = _make_client({"seq": 1})
+        init_args = argparse.Namespace(
+            project_id="PR-9402", title="bare anchor, stranded",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(init_args, MULTI_CONFIG, "borges", init_client)
+        _, init_body = init_client.post.call_args[0]
+        capsys.readouterr()  # discard init's own stdout/stderr
+
+        # The ANCHOR is downgraded to its bare form after the fact, because
+        # today's cmd_init cannot mint one: it REFUSES a bare pr/<N> anchor,
+        # auto-derived or explicit (#1924). The live store nonetheless holds
+        # batons created before that refusal shipped, and they are exactly
+        # the ones this bug stranded. Only the anchor is overridden --
+        # `author` is still whatever cmd_init actually posted, so this test
+        # measures the fix rather than a value hand-written by the test.
+        raw = _raw_from_init_post(dict(init_body, github="pr/9402"))
+        client = _make_client(post_return={"seq": 2}, get_return={"raw": raw})
+        args = argparse.Namespace(
+            project_id="PR-9402", to="borges",
+            reason="one blocker, back to you", force=True,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "has no repo-qualified github anchor" not in err
+
+    def test_init_without_turn_still_records_invoker_as_author(self, monkeypatch):
+        """Regression control for the normal case, which must be unchanged:
+        with `--turn` omitted the initial turn DEFAULTS to the invoking
+        agent, so author == invoker == turn. This test passes both before
+        and after the fix, by design -- it is what proves the fix did not
+        move the common path."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9403", title="ordinary self-authored baton",
+            participants="borges,ariadne", status="in-progress",
+            turn=None, github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("turn") == "borges"
+        assert body.get("author") == "borges"
+
+    def test_init_with_empty_invoker_leaves_author_empty(self, monkeypatch):
+        """No `or initial_turn` fallback: when the invoker is unknown
+        (`agent_name` empty) the posted `author` must be EMPTY, not the
+        turn holder.
+
+        Empty is the value that makes the server omit the `author:` field
+        entirely (`(data.get("author") or "").strip() or None`, then
+        `if author:` in coordination/projects.py), which is what lets
+        `_derive_legacy_author` supply its documented PROXY from the turn
+        log on read. Substituting the turn holder here would write a
+        confident wrong author in place of a labelled proxy -- so the
+        proxy is asserted too, to show what the empty field buys."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9404", title="unknown invoker",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("author") == "", (
+            "an unknown invoker must leave author EMPTY so the legacy proxy "
+            f"fires -- got {body.get('author')!r} (#3042)"
+        )
+
+        # What the empty field buys: no author: line, and the proxy
+        # recovered from the turn log instead.
+        fields, log_body = _baton._parse_frontmatter(_raw_from_init_post(body))
+        assert "author" not in fields
+        assert _baton._derive_legacy_author(log_body) == "ariadne"
 
 
 class TestGcRepoAware:

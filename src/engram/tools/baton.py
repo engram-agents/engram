@@ -520,13 +520,19 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
-    # #2961: the initial turn holder is the established author-proxy (a PR
-    # baton is normally initialized by its own author with --turn pointing
-    # at themselves, or --turn omitted so it defaults to the invoking agent
-    # -- see the default-turn logic above). Persisted once, here, into a
+    # #3042: the author is the INVOKING agent -- whoever ran `baton init`
+    # created this baton, regardless of whose court --turn puts it in.
+    # #2961 originally persisted `initial_turn` here as a proxy, which is
+    # correct only in the normal case where an author inits with --turn
+    # pointing at themselves; with --turn naming someone else it durably
+    # attributed authorship to a seat that did not create the baton, and
+    # no verb repairs it afterwards. `agent_name` is the real value and is
+    # already in scope (see "agent" above). Persisted once, here, into a
     # dedicated `author:` field that flip/claim/release never touch --
     # unlike `turn_by`, which IS overwritten on every turn-change and so
-    # cannot serve as an author proxy past the very first flip.
+    # cannot serve as an author proxy past the very first flip. An empty
+    # `agent_name` deliberately leaves the field unwritten so the legacy
+    # log-derived proxy fires rather than a confidently wrong author.
     try:
         client.post("/api/projects", {
             "agent": agent_name or "baton",
@@ -538,7 +544,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             "github": github_anchor,
             "participants": participants,
             "colleague": colleague_name,
-            "author": initial_turn,
+            "author": agent_name,
         })
     except ForumNetworkError as e:
         print(f"baton init: {e}", file=sys.stderr)
@@ -562,12 +568,15 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 
     # Colleague-gate enforceability warning for PR-named batons (#1267 Fix B).
     # If this is a PR baton (PR-N id) and no colleague is resolvable from
-    # participants (participants ⊆ {author, sentinel}), warn at creation time
+    # participants (participants ⊆ {initial turn holder, sentinel}), warn at
+    # creation time
     # so the gap surfaces here rather than silently at flip.
     _is_pr_baton = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
     if _is_pr_baton:
         _sentinel = _pool_sentinel()
-        # Determine the author: the initial turn holder (proxy for the PR author)
+        # Colleague candidates: participants other than the initial turn
+        # holder and the pool sentinel. (This is about the COLLEAGUE gate --
+        # it is not where `author` is determined; see the #3042 note above.)
         _colleagues_at_init = [
             p for p in participants
             if p != initial_turn and p != _sentinel
@@ -924,10 +933,12 @@ def _is_maintainer_flip(
     `author` is optional and empty on a baton created before #2961 (no
     `author:` frontmatter field) — an empty/falsy `author` simply means
     this exemption cannot fire, identical to pre-#2961 behavior. It is
-    populated once at `baton init` time from the initial turn holder (the
-    established author-proxy) and never touched again by flip/claim/
-    release, unlike `turn_by`, which IS overwritten on every turn-change
-    and so cannot serve as an author proxy past the first flip.
+    populated once at `baton init` time from the INVOKING agent (#3042 --
+    before that it was taken from the initial turn holder, which mis-attributed
+    authorship whenever --turn named someone other than the initor) and never
+    touched again by flip/claim/release, unlike `turn_by`, which IS overwritten
+    on every turn-change and so cannot serve as an author proxy past the first
+    flip.
 
     Caller guarantees `to_agent` is already either the pool sentinel or a
     genuine registered participant (validated earlier in cmd_flip) — this
