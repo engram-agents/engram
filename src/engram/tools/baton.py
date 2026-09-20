@@ -949,8 +949,10 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
 
     Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
     Project-layer grab/ungrab vocabulary first-class. Only succeeds when
-    turn == pool sentinel (the install's primary_user); refuses to steal from
-    another agent.
+    turn == pool sentinel (the install's primary_user); refuses when the turn
+    is not this seat's recognized pool marker -- which may be a colleague
+    genuinely holding it, or a pool/maintainer marker written by a seat with a
+    different primary_user (engram-alpha#3039).
     """
     _require_forum(config)
 
@@ -974,10 +976,88 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     # Validate: current turn must be the pool sentinel
     current_turn = fields.get("turn", "").strip().lower()
     if not _is_pool_sentinel(current_turn):
+        # WHY THIS REFUSAL REPORTS INDETERMINACY RATHER THAN A VERDICT.
+        # Rounds 2-4 of #3040 ended with "the baton may in fact be free"
+        # whenever the scoped turn-log line was not a `claimed` one. That is
+        # false in the common case, and false in the dangerous direction. Of
+        # the two writers in src/forum/coordination/projects.py that can
+        # produce a non-`claimed` line scoped to the turn value:
+        #   release()  f"- {now} {self_name} → {sentinel}: {reason}"
+        #   flip()     f"- {now} {from_agent} → {to}: {reason}"
+        # the emitted text is IDENTICAL -- `- <ts> <name> → <name>: <text>`
+        # in both, with no marker of which writer produced it. release's RHS
+        # happens to be the RELEASING seat's own primary_user and flip's RHS
+        # is any participant, but primary_user is per-install and this seat
+        # cannot enumerate another install's, so the RHS is not classifiable
+        # from here -- which IS #3039. Measured on batons built through the
+        # real writers: init(turn=borges) + flip(→ariadne) yields
+        # `borges → ariadne: please review` (ariadne HOLDS it) and
+        # init(turn=clio) + release(→"lei shi") yields
+        # `clio → lei shi: released` (FREE); both match "a line handing it
+        # BACK", so round 4 reported the flip-held baton as possibly free --
+        # the round-2 held-baton-reported-free inversion, one layer along.
+        # "Handed BACK" was circular besides: judging it requires already
+        # knowing whether the RHS is a pool marker, the question the reader
+        # came with. turn_reason does not rescue it either -- release's
+        # --reason (see p_release in build_parser) defaults to "released"
+        # but is user-settable, so it hints and never settles, and flip's
+        # reason is free text. The honest output is that this seat cannot
+        # determine it, plus an action that resolves it OFF the log (ask the
+        # named agent; check the anchored PR/project).
+        #
+        # WHY THE TURN-LOG READING RULE IS NOT PRINTED HERE (round 7). The
+        # rule is real and still ships; it lives in the engram-baton skill,
+        # which this message points at. Inlined here it was two bullets, and
+        # those bullets were the site of the held-looks-free inversion in
+        # rounds 2 and 4; repairing them grew the message from 709 chars to
+        # 1049, past the 955 already flagged as too long for an error
+        # stream. A reading rule is prose a reader consults deliberately,
+        # not a wall that arrives mid-refusal. The pinned-message test
+        # carries a hard length ceiling so it cannot grow back unnoticed.
+        #
+        # THE SCOPING AUDIT BEHIND THAT RULE, kept here because it is the
+        # evidence for it and it is easy to get wrong. The rule scopes to
+        # lines shaped `<A> → <B>: <reason>` whose <B> equals `turn`, NOT to
+        # "the last arrow line": three turn-NEUTRAL writers also emit
+        # arrows, so "the last arrow line" can point a reader at a named
+        # agent who does not hold the baton -- #3039's own false-holder
+        # defect one hop downstream. Checked against every arrow-emitting
+        # writer in projects.py:
+        #   flip()    `<from> → <to>: <reason>`         RHS == turn (to)
+        #   claim()   `<sentinel> → <claimer>: claimed` RHS == turn
+        #   release() `<holder> → <sentinel>: <reason>` RHS == turn
+        #   init()    `initialized → <turn>: <reason>`  RHS == turn
+        #   reopen()  `reopened → <invoker>: status was <X> → <Y>`
+        #             -- updates ONLY status, never turn, so RHS != turn
+        #             unless the invoker IS the turn holder, in which case
+        #             the line truthfully names the holder and no false
+        #             diagnosis results. (Its SECOND arrow is why the skill
+        #             says "just after the FIRST arrow".)
+        #   anchor()  `anchor set: github → <anchor>`   no `: <reason>`
+        #             after the arrow, so the shape excludes it
+        #   set_colleague() `<agent> set colleague → <colleague>`
+        #             same -- no `: <reason>` after the arrow
+        # The remaining append_turn_log sites (set_status(), close(),
+        # merge(), rename(), add_participant()) emit no arrow. init() is the
+        # only scoped writer that can emit a line for a baton parked in a
+        # pool and NEVER claimed -- #3039's own motivating case -- so the
+        # skill enumerates it alongside claim, flip and release.
+        #
+        # `baton flip` is deliberately NOT offered here. It is the right
+        # remedy only for the colleague case, and this message no longer
+        # claims to identify that case.
         print(
-            f"baton claim: refusing to steal claim from {current_turn}; "
-            "use 'baton flip <project-id> <self> <reason>' if you have an "
-            "explicit handoff agreement.",
+            f"baton claim: this baton's turn is '{current_turn}', which this "
+            f"seat does not recognize as its pool marker (this seat resolves "
+            f"'{_pool_sentinel()}'). This seat cannot tell from the turn log "
+            f"whether '{current_turn}' is a colleague who holds this baton or "
+            f"a pool marker belonging to an install whose primary_user this "
+            f"seat cannot resolve -- that is engram-alpha#3039. Settle it off "
+            f"the log: ask '{current_turn}', or check the PR or project this "
+            f"baton anchors. To read the log yourself, run\n"
+            f"    baton show {project_id}\n"
+            "and see the engram-baton skill for how to scope a turn-log line "
+            "to the turn value.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -2144,8 +2224,27 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Take a Project-layer baton for yourself. Only succeeds when the "
             "current turn is the pool sentinel (the install's primary_user). "
-            "Refuses to steal from another agent — use 'baton flip' with an "
-            "explicit handoff agreement if needed.\n\n"
+            "Refuses when the turn is not this seat's recognized pool marker "
+            "— which may be a colleague genuinely holding it, or a pool or "
+            "maintainer marker written by a seat with a different "
+            "primary_user (engram-alpha#3039). To see what the turn log "
+            "records, run 'baton show <project-id>' and find the LAST turn "
+            "log line shaped '<A> → <B>: <reason>' whose <B> -- the name "
+            "just after the FIRST arrow -- is the turn value. Only such a "
+            "line records who the turn was handed to: anchor, colleague and "
+            "reopen lines carry arrows of their own and name no holder, and "
+            "turn_reason does not discriminate (every claim writes "
+            "'claimed'). '<pool> → <B>: claimed' means a colleague took it "
+            "-- use 'baton flip' with an explicit handoff agreement. ANY "
+            "OTHER such line leaves this seat unable to tell which case it "
+            "is: release and flip emit the identical text, so the line is "
+            "either a colleague taking it "
+            "on a flip or a return to a pool marker belonging to a seat "
+            "whose primary_user this one cannot resolve -- that is #3039. A "
+            "<reason> of 'released' is release's default but is "
+            "user-settable, so it hints and never settles. Settle it off "
+            "the log: ask <B>, or check the PR or project this baton "
+            "anchors -- do not flip on a guess.\n\n"
             "Vocabulary distinction: claim/release are Project-layer verbs "
             "(single driver, rare passes). flip is the PR-layer verb (frequent "
             "passing through fairy → reviewer → colleague → maintainer)."

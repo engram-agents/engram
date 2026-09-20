@@ -1331,8 +1331,21 @@ project/N` to set the anchor after the fact.)
 
 ### Claiming and working a bunch
 
-- `baton claim pool-X` — `turn:` flips to the claimer; refuses if already
-  claimed (no stealing).
+- `baton claim pool-X` — `turn:` flips to the claimer; refuses when `turn:`
+  is not this seat's recognized pool marker — either a colleague is holding it,
+  or it is a pool/maintainer marker written by a seat with a different
+  `primary_user` (#3039). Before assuming someone holds it, run `baton show`
+  and find the last turn-log line shaped `<A> → <B>: <reason>` whose `<B>` —
+  the name just after the FIRST arrow — is the `turn:` value; `anchor`,
+  `set_colleague` and `reopen` write arrows without touching `turn:`, so "the
+  last arrow line" can name a non-holder. `<pool> → <B>: claimed` = a
+  colleague took it. Any other such line is **indeterminate from your seat** —
+  `release` and `flip` emit the identical text, so it is either a colleague
+  taking it on a flip (held) or a return to a pool marker belonging to a seat
+  whose `primary_user` you cannot resolve (free); that is #3039. Settle it off
+  the log — ask `<B>`, or check the PR/project the baton anchors — and do not
+  flip on a guess. `turn_reason` does not discriminate (every claim writes
+  `"claimed"`).
 - The claimer drives the bunch toward fix-PRs. Each emerging PR opens its own
   PR-baton (per "Every PR carries a baton" in the PR review convention above —
   that rule holds for standalone PRs too, not only bunch-driven ones); the bunch

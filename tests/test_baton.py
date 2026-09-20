@@ -57,10 +57,113 @@ EXIT_STATE = 3
 # Config used for all multi-agent direct-call tests
 MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey"}
 
+# Repo root, for tests that assert on shipped documentation surfaces.
+REPO_ROOT = Path(__file__).parent.parent
+
+# Phrasings that assert, UNCONDITIONALLY, that a person holds the baton --
+# the #3039 defect. Shared by the refusal-message test and the
+# documentation-surface test so a regression on any surface trips the same
+# list (a phrase scrubbed from one surface must stay scrubbed on all of
+# them). "steal" is included because that is the exact word #3039 was filed
+# against. A blacklist can always be dodged by a novel phrasing; it is the
+# backstop, not the guard.
+CLAIM_REFUSAL_BANNED_PHRASES = (
+    "steal",
+    "is currently holding",
+    "cannot take it from",
+    "is holding this baton",
+    "has this baton",
+    "is the current holder",
+    "it is theirs",
+)
+
+# The MIRROR-IMAGE defect, added in round 5. The list above guards one
+# direction only -- asserting a person HOLDS the baton -- and rounds 2-4 all
+# passed it while shipping the opposite error: telling the reader a baton
+# "may in fact be free" whenever the scoped turn-log line was not a
+# `claimed` one. That is wrong in the common case. `release`
+# (projects.py:290, `{holder} → {sentinel}: {reason}`) and `flip` (:161,
+# `{from} → {to}: {reason}`) emit TEXTUALLY IDENTICAL lines, so a baton a
+# colleague genuinely holds via a flip -- the normal PR-layer case --
+# matched the old second branch and was reported as possibly free. A held
+# baton reported free is the same inversion #3039 was filed against, and
+# reporting it as free is the direction that causes a reader to take a
+# baton out from under a colleague.
+#
+# "handing it back" is banned as well, on a second ground: it asks the
+# reader to judge whether the line "handed the baton BACK", which requires
+# already knowing whether <B> is a pool marker -- the very question they
+# consulted this message to answer. A circular instruction is not a weaker
+# instruction, it is a non-instruction.
+#
+# Correct phrasings state the DISJUNCTION and stop ("either a colleague
+# taking it on a flip or a return to a pool marker ... this seat cannot
+# tell"). Naming the free case as one of two possibilities is fine; landing
+# on it as the verdict is not.
+CLAIM_REFUSAL_BANNED_FREE_PHRASES = (
+    "may in fact be free",
+    "is in fact free",
+    "the baton is free",
+    "so the baton may",
+    "handing it back",
+    "handing the baton back",
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _authored_help_strings(parser_obj: argparse.ArgumentParser) -> dict:
+    """Every string THIS REPO AUTHORS that argparse renders into
+    `parser_obj`'s `--help`, collected by INTROSPECTION rather than by a
+    hand-written field list.
+
+    Keyed so that a field nobody has thought of yet -- a `usage=`, a second
+    positional, a new subcommand -- changes the returned dict instead of
+    slipping past a checklist. See the round-11 block in
+    test_claim_disambiguation_surfaces_do_not_regress for why that property
+    is the whole point.
+
+    argparse's own `-h/--help` text is EXCLUDED: its wording belongs to
+    CPython, not to this repo, so pinning it would make the suite fail on an
+    interpreter upgrade. Exactly one such action must exist -- asserted, so
+    the exclusion cannot silently swallow an authored second one.
+    """
+    fields = {
+        "prog": parser_obj.prog,
+        "usage": parser_obj.usage,
+        "description": parser_obj.description,
+        "epilog": parser_obj.epilog,
+    }
+    help_actions = [
+        a for a in parser_obj._actions
+        if isinstance(a, argparse._HelpAction)
+    ]
+    assert len(help_actions) == 1, (
+        f"{parser_obj.prog!r} has {len(help_actions)} argparse-supplied "
+        "help actions, expected exactly 1 -- the exclusion here would be "
+        "dropping authored text from the enumeration"
+    )
+    for a in parser_obj._actions:
+        if isinstance(a, argparse._HelpAction):
+            continue
+        # A sub-parser's `help=` one-liner is stored on the PARENT's
+        # _SubParsersAction, not on the sub-parser, so reading the
+        # sub-parser alone can never see it. That is precisely how round
+        # 10 shipped an inversion through `baton --help`.
+        if isinstance(a, argparse._SubParsersAction):
+            fields["subparsers:metavar"] = a.metavar
+            fields["subparsers:help"] = a.help
+            for ca in a._choices_actions:
+                fields[f"subcommand:{ca.dest}:metavar"] = ca.metavar
+                fields[f"subcommand:{ca.dest}:help"] = ca.help
+            continue
+        key = "|".join(a.option_strings) or a.dest
+        fields[f"arg:{key}:metavar"] = a.metavar
+        fields[f"arg:{key}:help"] = a.help
+    return fields
+
 
 def _run_baton(engram_home: Path, *args: str, env_overrides: dict | None = None) -> tuple:
     """Run the baton CLI as a subprocess; return (exit_code, stdout, stderr)."""
@@ -1049,6 +1152,7 @@ class TestClaim:
 
     def test_claim_refuse_already_claimed_by_other(self, monkeypatch, capsys):
         """Claim when project held by another agent → EXIT_STATE with clear message."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
@@ -1063,6 +1167,909 @@ class TestClaim:
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
         assert "ariadne" in captured.err
+
+    def test_claim_refuse_pool_marker_message_names_seat_mismatch(self, monkeypatch, capsys):
+        """#3039: when turn is a pool/maintainer marker this seat's own
+        config doesn't recognize (e.g. written by a seat with a different
+        primary_user), the refusal must NOT assert a person holds the
+        baton ("steal") -- it must name the turn value, name THIS seat's
+        own resolved sentinel so the mismatch is visible, assert neither
+        "held" nor "free", hand over a remedy that works OFF the turn log,
+        and point at #3039 so a reader lands on the explanation instead of
+        re-deriving it. Round 7 removed the inlined turn-log reading rule
+        (engram-baton/SKILL.md carries it now) and with it the conditional
+        `baton flip` offer, which was the colleague case's remedy and is
+        wrong for a marker this seat cannot classify. Message-text only --
+        behavior (still refuses, still EXIT_STATE) is unchanged and is
+        covered by test_claim_refuse_already_claimed_by_other above."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-1002b", turn="lei shi", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-1002b")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        captured = capsys.readouterr()
+
+        # --- STREAM DISCIPLINE (checked FIRST, because every layer below
+        # --- this one reads only stderr) --------------------------------
+        # Rounds 1-3 asserted exclusively on captured.err and never once on
+        # captured.out, so the entire layered stack below was silent about
+        # stdout. Measured: adding
+        #     print(f"hint: {current_turn} is working this one right now "
+        #           "-- it is theirs until they hand it over.")
+        # before the sys.exit left the pinned stderr byte-identical and the
+        # suite green at 184 passed / 1 skipped -- while shipping exactly
+        # the unconditional-holder claim this test exists to forbid. Note
+        # "it is theirs" was ALREADY on the blacklist: the blind spot was
+        # the STREAM, not the vocabulary. baton.py uses bare print() for
+        # status lines elsewhere, so this is an ordinary edit, not a
+        # contrived one. The refusal writes to stderr and nothing else, so
+        # stdout must be empty; and the blacklist below runs over BOTH
+        # streams, because a guard scoped to one stream is silent on the
+        # other and the message's damage does not care which stream
+        # carried it.
+        assert captured.out == "", (
+            "baton claim wrote to stdout; the refusal belongs on stderr "
+            f"alone, and stdout is unguarded by the pins below: {captured.out!r}"
+        )
+        both_streams = captured.out + captured.err
+
+        # --- POSITION-ANCHORED check (the primary one) ------------------
+        # The defect #3039 fixes always lives in the message's OPENING
+        # clause: that is the sentence a reader acts on, so an
+        # unconditional "<name> is holding this" there does the damage no
+        # matter what the later bullets say. Token-PRESENCE-anywhere
+        # assertions cannot see that -- two rounds of this test were
+        # defeated by mutations that rewrote the opening clause while
+        # retaining every asserted token in the bullets below it. So
+        # assert on the FIRST LINE specifically.
+        first_line = captured.err.split("\n")[0]
+        # It must be the seat-mismatch statement...
+        assert "does not recognize" in first_line
+        assert "lei shi" in first_line
+        assert "casey" in first_line
+        # ...and NOTHING ELSE. Containment alone is not enough: a mutation
+        # that keeps the whole genuine sentence and merely APPENDS "lei shi
+        # has this baton right now, so it is theirs until they hand it
+        # over." to the same line satisfies every containment above and
+        # every token below (measured: it passed 184/1-skipped). Freezing
+        # the opening line is what makes that mutation fail. The
+        # brittleness is deliberate and is the point: the opening clause is
+        # the sentence a reader acts on, so ANY edit to it -- benign or
+        # not -- must come back here and be re-justified against #3039.
+        assert first_line == (
+            "baton claim: this baton's turn is 'lei shi', which this seat "
+            "does not recognize as its pool marker (this seat resolves "
+            "'casey'). This seat cannot tell from the turn log whether "
+            "'lei shi' is a colleague who holds this baton or a pool "
+            "marker belonging to an install whose primary_user this seat "
+            "cannot resolve -- that is engram-alpha#3039. Settle it off "
+            "the log: ask 'lei shi', or check the PR or project this "
+            "baton anchors. To read the log yourself, run"
+        ), f"opening clause changed; re-justify against #3039: {first_line!r}"
+
+        # --- STRUCTURAL: the turn value appears exactly where it should --
+        # #3039's defect IS treating the `turn` value as a human holder, so
+        # an added assertion that "<turn> holds it" has to name the turn
+        # value one more time than the message legitimately does. Round 7's
+        # message names it THREE times, all inside the frozen opening line
+        # above: the turn statement, the held-or-pool disjunction, and the
+        # off-log remedy ("ask '<turn>'"). Rounds 4-6 named it once and
+        # this read `== 1`; the number is RE-DERIVED from the shipped text,
+        # not loosened -- an exact count over BOTH streams still fails on
+        # any extra mention, including one planted on stdout, where the
+        # golden master below cannot see it.
+        assert both_streams.count("lei shi") == 3, (
+            "turn value mentioned an unexpected number of times -- an "
+            "extra mention is likely an assertion that it names a person "
+            "who holds the baton"
+        )
+
+        # --- BLACKLIST (defence in depth, not the primary check) --------
+        # Run over BOTH streams (see the stream-discipline note above), and
+        # over the whole message rather than one line: the conditional
+        # bullets are legitimate, these phrasings are not. The list is
+        # shared with test_claim_disambiguation_surfaces_do_not_regress so a
+        # phrase scrubbed here stays scrubbed in --help and the docs too.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in both_streams.lower(), (
+                f"refusal message asserts a holder unconditionally: {banned!r}"
+            )
+        # ...and the MIRROR-IMAGE blacklist (round 5). Verified to
+        # discriminate: run against round 4's message (commit 1d9da1bc) this
+        # loop fails on "handing it back" and "may in fact be free" -- the
+        # two phrasings that reported a flip-held baton as possibly free.
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in both_streams.lower(), (
+                f"refusal message asserts the baton is free when this seat "
+                f"cannot determine that: {banned!r}"
+            )
+
+        # --- LENGTH CEILING (round 7) -----------------------------------
+        # Checked BEFORE the golden master so that a message which merely
+        # GREW is reported as a length regression rather than as an opaque
+        # multi-hundred-character diff. Trajectory: 955 chars (round 3,
+        # flagged too long) -> 709 (round 4, trimmed) -> 1049 (round 5,
+        # regrown when the second bullet was repaired, and unnoticed for
+        # two rounds). It regrew because "length" was marked resolved and
+        # then nothing watched it: a property fixed once and afterwards
+        # unwatched drifts back past its own threshold. That is why the
+        # ceiling is an assertion and not a review habit.
+        #
+        # HEADROOM IS FIXTURE-RELATIVE, corrected in round 9. Round 7 read
+        # its own 560 chars against the 650 ceiling and called the ~90
+        # chars between them headroom for a rewording. They are not the
+        # same thing: the message interpolates the turn value THREE times
+        # plus the seat's sentinel and the project id, so what this
+        # assertion measures is
+        #     526 (constant) + 3*len(turn) + len(sentinel) + len(project_id)
+        # and this fixture contributes only 34 chars of names
+        # ('lei shi' x3, 'casey', 'PR-1002b') -- among the shortest
+        # combinations that occur. Re-measured through this same code path
+        # with names that actually appear in these docs: turn
+        # 'ariadne-calvino', sentinel 'aleph-menard', project
+        # 'class-env-var-precedence' gives 607, leaving 43; round 8's
+        # pessimistic case measured 628, leaving 22. Every char added to
+        # the turn value costs THREE. So the ceiling is tighter than this
+        # fixture makes it look, and most of the ~90 chars visible here
+        # are not spendable on wording. Raising this number needs the same
+        # re-justification as editing the text below.
+        assert len(captured.err) <= 650, (
+            f"refusal message is {len(captured.err)} chars, over the 650 "
+            "ceiling. It grew 709 -> 1049 once already while nobody was "
+            "watching. Trim it, or re-justify the ceiling against the "
+            "955 -> 709 -> 1049 trajectory -- do not just raise the number."
+        )
+
+        # --- GOLDEN MASTER (the backstop that closes the last hole) -----
+        # Everything above still leaves the message's later text open: two
+        # mutations beat the checks above by planting a nameless,
+        # non-blacklisted assertion away from the first line -- "(A
+        # colleague already took this one. Do not proceed.)" as an extra
+        # line, and a bullet flipped to "This baton is not free: a
+        # colleague already took it" -- both passing 184/1-skipped. No
+        # heuristic closes that: the damaging content is ordinary English
+        # with no fixed vocabulary. Since this whole PR *is* the message
+        # text, the message is pinned verbatim. Any edit to it fails here
+        # BY DESIGN; the fix is never to loosen this assertion but to
+        # update the expected text and re-justify the new wording
+        # against #3039.
+        #
+        # RE-JUSTIFIED for round 7: the message stops teaching grammar.
+        #
+        # WHAT LEFT, AND WHY IT IS NOT COMING BACK. Rounds 3-6 inlined the
+        # turn-log reading rule here as two bullets. Bullet two was the
+        # site of the held-looks-free inversion in rounds 2 and 4 -- "the
+        # baton may in fact be free" for any non-`claimed` scoped line,
+        # which is false in the common case because release and flip emit
+        # TEXTUALLY IDENTICAL log lines. Measured end-to-end through the
+        # real writers: init(turn=borges) + flip(to=ariadne, "please
+        # review") logs "borges → ariadne: please review" with ariadne
+        # genuinely HOLDING it, while init(turn=clio) + release(holder=
+        # clio, sentinel="lei shi") logs "clio → lei shi: released" with it
+        # genuinely free -- same shape, opposite truth. Round 5 repaired
+        # the bullet into an honest disjunction, and that repair is what
+        # grew the message from 709 chars to 1049, past the 955 round 3 had
+        # already flagged as too long. A reading rule is prose a reader
+        # consults deliberately; an error stream arriving mid-refusal is
+        # not the place for it.
+        #
+        # The rule is not lost: engram-baton/SKILL.md carries it, with the
+        # two gaps round 6 found in it closed -- init() is enumerated
+        # alongside claim/flip/release (it is the only scoped writer that
+        # can emit a line for a baton parked in a pool and NEVER claimed,
+        # which is #3039's own motivating case), and branch one now keys on
+        # a `<reason>` of exactly `claimed` instead of asking the reader to
+        # recognize <A> as a pool marker -- which this PR's own thesis says
+        # a reader on another install cannot do. Do NOT restore the bullets
+        # here, and do NOT restore a confident branch anywhere:
+        # under-claiming is the point of #3039.
+        #
+        # `baton flip` is deliberately NOT offered any more. It was bullet
+        # one's remedy -- correct only for the colleague case -- and this
+        # message no longer claims to identify that case, so naming it
+        # would invite exactly the guess #3039 was filed against.
+        #
+        # Still true of the new text, and the things to re-confirm on any
+        # future edit: it refuses without asserting that a person holds the
+        # baton; it asserts neither "held" nor "free"; it names the turn
+        # value AND this seat's own resolved sentinel so the mismatch is
+        # visible; it carries no form of "steal"; it points at 3039 by
+        # number; and the remedy it hands over is OFF the log.
+        assert captured.err == (
+            "baton claim: this baton's turn is 'lei shi', which this seat "
+            "does not recognize as its pool marker (this seat resolves "
+            "'casey'). This seat cannot tell from the turn log whether "
+            "'lei shi' is a colleague who holds this baton or a pool "
+            "marker belonging to an install whose primary_user this seat "
+            "cannot resolve -- that is engram-alpha#3039. Settle it off "
+            "the log: ask 'lei shi', or check the PR or project this "
+            "baton anchors. To read the log yourself, run\n"
+            "    baton show PR-1002b\n"
+            "and see the engram-baton skill for how to scope a turn-log "
+            "line to the turn value.\n"
+        )
+
+        # --- Existing token assertions (kept: not harmful, insufficient) -
+        # Names the turn value, without asserting theft/personhood.
+        assert "lei shi" in captured.err
+        assert "steal" not in captured.err.lower()
+        # Names this seat's OWN resolved sentinel, so the mismatch is visible.
+        assert "casey" in captured.err
+        # States the indeterminacy as a disjunction and lands on NEITHER
+        # arm. Round 4's "means a colleague took it" + "baton flip" pair is
+        # gone with the bullets: the message no longer claims to identify
+        # the colleague case, so shipping that case's remedy would be the
+        # over-claim #3039 was filed against.
+        assert "cannot tell" in captured.err.lower()
+        assert "colleague who holds this baton" in captured.err
+        assert "pool marker belonging to an install" in captured.err
+        # The remedy is OFF the log -- ask the agent the turn value names,
+        # or read the PR/project the baton anchors. The log cannot settle
+        # it from this seat, which is the whole content of #3039.
+        assert "ask 'lei shi'" in captured.err
+        assert "anchors" in captured.err
+        # The reading rule is still reachable, just not reprinted here: the
+        # message points at `baton show` for the log itself and at the
+        # engram-baton skill for how to scope a line to the turn value.
+        assert "baton show" in captured.err
+        assert "turn log" in captured.err.lower()
+        assert "engram-baton skill" in captured.err
+        # Points at the issue by number.
+        assert "3039" in captured.err
+
+    def test_claim_disambiguation_surfaces_do_not_regress(self):
+        """#3039: `baton claim --help`, engram-baton/SKILL.md and CLAUDE.md
+        carry the same corrected disambiguation as the refusal message, and
+        none of them may drift back to asserting that a person holds the
+        baton.
+
+        Added in round 4 because all three surfaces had ZERO coverage: a
+        reviewer gutted the --help description back to "Refuses to steal
+        from another agent who is currently holding it" -- the exact claim
+        this PR exists to remove -- and the suite stayed green at 184
+        passed / 1 skipped. The refusal message was pinned verbatim while
+        the three surfaces a reader is at least as likely to consult were
+        unguarded.
+
+        HARDENED in round 7, because the round-4 guard was still
+        defeatable. The reviewer gutted the claim sub-parser description to
+        "`<B>` owns this baton and you must wait for them to pass it" --
+        every required token retained, the meaning exactly inverted -- and
+        this test passed at 185/1-skipped. Planted-token controls confirm
+        the instrument really does read these files, so the miss was in
+        the ASSERTIONS, not the plumbing: presence-and-count checks cannot
+        see a meaning inversion that preserves the tokens. Two of the
+        three surfaces are now pinned verbatim by the same golden-master
+        instrument that has repeatedly proved discriminating on the
+        refusal message itself.
+
+        EXTENDED in round 11, on two fronts. First, the authored `--help`
+        strings are now pinned as a complete ENUMERATION rather than
+        field by field: rounds 6, 8 and 10 each shipped the same inversion
+        through a different unpinned field at 185/1-green, so the thing
+        that had to be closed was the ability of an unanticipated field to
+        exist unpinned at all. Second, SKILL.md's failure-modes row is now
+        pinned verbatim too. Rounds 7 and 8 deliberately left it on the
+        cheaper count-based checks -- correctly, while the verb-list
+        bullet carried a second copy whose disagreement caught inversion
+        #4. Round 9 cut that copy, leaving the row as the only statement
+        of the rule not already pinned verbatim, and round 10 inverted it
+        with no banned vocabulary while green. Long prose that changes is
+        still the right description of it; requiring deliberate
+        re-justification to change it is now the right price.
+
+        Deliberately cheap and stdlib-only: build the parser in-process
+        (no subprocess) and read the two docs off disk.
+        """
+        parser = _baton.build_parser()
+        # argparse exposes no public accessor for a subparser by name;
+        # _SubParsersAction has been the stable shape across CPython 3.x.
+        # Kept alongside the golden master below: without it, a layout
+        # change would make the pin unreachable rather than red.
+        subparser_actions = [
+            a for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        ]
+        assert len(subparser_actions) == 1, (
+            "baton's subparser layout changed -- this test can no longer "
+            "locate the claim subparser, so it would pass vacuously"
+        )
+        claim_parser = subparser_actions[0].choices["claim"]
+        claim_help = claim_parser.description
+        # The RENDERED surface, whitespace-normalized (round 9). See the
+        # "rendered --help surface" block below for why both exist.
+        claim_help_rendered = " ".join(claim_parser.format_help().split())
+
+        skill_md = (
+            REPO_ROOT / "src" / "engram" / "skills" / "claude"
+            / "engram-baton" / "SKILL.md"
+        ).read_text()
+        claude_md = (REPO_ROOT / "CLAUDE.md").read_text()
+
+        # --- SLICE CLAUDE.md TO THE BATON PASSAGE -----------------------
+        # Everything below runs against the PASSAGE, not the whole file.
+        # Whole-file token checks are near-vacuous here: "identical"
+        # occurs 9 times in CLAUDE.md, 8 of them in passages with nothing
+        # to do with batons, so `assert "identical" in claude_md` could
+        # not fail no matter what happened to the baton bullet. Two
+        # anchors bound the passage; each occurs exactly once in the file.
+        passage_start_anchor = "- `baton claim pool-X`"
+        passage_end_anchor = "\n- The claimer drives the bunch toward fix-PRs"
+        start = claude_md.find(passage_start_anchor)
+        end = claude_md.find(passage_end_anchor)
+        assert start != -1, (
+            "CLAUDE.md no longer contains the baton-claim passage's "
+            f"opening anchor {passage_start_anchor!r} -- the passage moved "
+            "or was reworded. Re-anchor deliberately; do not fall back to "
+            "asserting against the whole file, which is what made these "
+            "checks vacuous in round 6."
+        )
+        assert end != -1 and end > start, (
+            "CLAUDE.md no longer contains the baton-claim passage's "
+            f"closing anchor {passage_end_anchor!r} after the opening one"
+        )
+        assert claude_md.count(passage_start_anchor) == 1, (
+            "the CLAUDE.md opening anchor is no longer unique; the slice "
+            "below could silently bound the wrong passage"
+        )
+        claude_passage = claude_md[start:end]
+        # The passage must stay OUTSIDE the generated team-practice
+        # region: edits inside it are overwritten wholesale the next time
+        # tools/sync_team_practice.py renders TEAM-PRACTICE.md, so a
+        # #3039 fix parked in there would silently revert.
+        generated_end = claude_md.find(
+            "<!-- END team-practice: which-colleague-takes-the-seat -->"
+        )
+        assert generated_end != -1 and start > generated_end, (
+            "the CLAUDE.md baton passage is inside (or ahead of) the "
+            "generated team-practice region -- content there is rendered "
+            "from the team-practice repo and any fix made here is lost on "
+            "the next sync"
+        )
+
+        # --- NEGATIVE CHECKS RUN OVER THE WHOLE FILE (round 9) ----------
+        # The slice above is right for the POSITIVE checks and for the
+        # verbatim pin: those have to name one passage, and a whole-file
+        # token check would be near-vacuous (see the note above). But
+        # scoping the NEGATIVE checks to the slice means every banned
+        # phrase is legal three lines past the end anchor. Measured on
+        # this tip at round 8: a sibling bullet just below the end anchor,
+        # in the same section, carrying "is currently holding" and "it is
+        # theirs" kept the suite green at 185 passed / 1 skipped. A reader
+        # of that section does not stop at the anchor, so neither does
+        # this. Measured free: all 13 phrases occur 0 times in the whole
+        # of CLAUDE.md today.
+        #
+        # If one of these ever fires on a genuinely unrelated passage,
+        # narrow the PHRASE in the shared tuples -- do not re-narrow these
+        # checks back to the slice, which is the hole this closes.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in claude_md.lower(), (
+                f"CLAUDE.md asserts somewhere that a person holds the "
+                f"baton ({banned!r}) -- the #3039 claim this PR removed. "
+                "The baton passage is not the only part of this file a "
+                "reader acts on."
+            )
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in claude_md.lower(), (
+                f"CLAUDE.md tells the reader somewhere that the baton is "
+                f"(or may be) free on evidence that cannot establish it "
+                f"({banned!r}) -- release and flip emit identical turn-log "
+                "lines. State the disjunction and stop."
+            )
+
+        # name -> (text, how many times the scoped-shape token must appear).
+        # The count matters, not just presence: a whole-file `in` check is
+        # satisfied by any single statement of the rule. Measured while
+        # writing this test -- reverting ONLY the verb-list row to round
+        # 3's "last arrow line" left the suite green at 185 passed / 1
+        # skipped, because the failure-modes row still carried the token.
+        # Requiring the count is what makes a one-row regression fail.
+        #
+        # SKILL.md's count was 2 through round 8 and is 1 from round 9. The
+        # second copy was CUT, NOT LOST: the verb-list bullet carried a
+        # CONDENSED restatement of the turn-log reading rule, and round 8
+        # found a FOURTH held-looks-free inversion in it (the `initialized`
+        # case filed under "settled", which is #3039's own motivating case
+        # and is indeterminate). A standing pre-commitment made before
+        # round 6 -- "if that round finds a FOURTH site of the
+        # held-looks-free inversion, CUT the disambiguation guidance rather
+        # than sharpen it again" -- fired, because four attempts at a short
+        # form produced four inversions in four wordings across rounds 2, 4
+        # and 7. The rule survives in exactly ONE place, the line-by-line
+        # audited failure-modes row, and the bullet keeps the pointer to
+        # it. Do NOT read this 1 as drift and restore a second copy: the
+        # lowered count IS the fix. Raising it back to 2 means re-arguing
+        # the pre-commitment, not repairing a regression.
+        SHAPE = "<A> → <B>: <reason>"
+        surfaces = {
+            "baton claim --help": (claim_help, 1),
+            "engram-baton/SKILL.md": (skill_md, 1),
+            "CLAUDE.md baton passage": (claude_passage, 1),
+        }
+
+        for name, (text, shape_count) in surfaces.items():
+            # NEGATIVE first, so that the reviewer's actual regression --
+            # gutting the description to "Refuses to steal from another
+            # agent who is currently holding it" -- is reported as the
+            # refuted claim it is. Were it ordered AFTER the vacuity guard
+            # below, the gutted text (105 chars) would trip that guard
+            # instead and report "unexpectedly short" -- true, but naming
+            # the wrong defect. An EMPTY surface passes this loop vacuously
+            # and is caught by the vacuity guard immediately below, so
+            # nothing escapes either way.
+            for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+                assert banned not in text.lower(), (
+                    f"{name} asserts unconditionally that a person holds "
+                    f"the baton ({banned!r}) -- the #3039 claim this PR "
+                    "removed. If this phrase is legitimate in an unrelated "
+                    "passage, narrow the phrase in "
+                    "CLAIM_REFUSAL_BANNED_PHRASES rather than dropping "
+                    "the guard."
+                )
+            # ...and the mirror-image blacklist (round 5): no surface may
+            # land on "free" for a line this seat cannot classify. Verified
+            # to discriminate on all three surfaces: at round 4 (commit
+            # 1d9da1bc) --help and SKILL.md carried "handing the baton
+            # back" + "may in fact be free", and CLAUDE.md carried "handing
+            # it back", so this loop failed on every one of them.
+            for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+                assert banned not in text.lower(), (
+                    f"{name} tells the reader the baton is (or may be) free "
+                    f"on evidence that cannot establish it ({banned!r}) -- "
+                    "release and flip emit identical turn-log lines, so a "
+                    "colleague's flip-held baton matches too. State the "
+                    "disjunction and stop; narrow the phrase in "
+                    "CLAIM_REFUSAL_BANNED_FREE_PHRASES rather than "
+                    "dropping the guard."
+                )
+            # Guard the instrument: an empty description, or a doc that
+            # moved and now reads as "", would make every substring
+            # assertion here pass vacuously -- which is the exact failure
+            # mode this test was added to close.
+            assert text and len(text) > 200, (
+                f"{name} is empty or unexpectedly short -- the assertions "
+                "here would pass vacuously"
+            )
+            # POSITIVE: a blacklist alone would be satisfied by a surface
+            # that says nothing at all, so require the corrected rule --
+            # the turn-value-scoped log line, not round 3's "last arrow
+            # line", which three turn-neutral writers (reopen, anchor,
+            # set_colleague) can satisfy with a non-holder's name.
+            assert text.count(SHAPE) >= shape_count, (
+                f"{name} names the scoped turn-log line shape "
+                f"{text.count(SHAPE)} time(s), expected at least "
+                f"{shape_count}; an unscoped 'last arrow line' rule "
+                "reintroduces #3039's false-holder diagnosis one hop "
+                "downstream. If a passage was legitimately removed, lower "
+                "the count here deliberately rather than dropping it."
+            )
+            assert "turn_reason" in text, (
+                f"{name} no longer warns off turn_reason, which reads "
+                "'claimed' on every claim"
+            )
+            # POSITIVE for round 5: the blacklist above only forbids landing
+            # on "free"; silently DELETING the second branch would satisfy
+            # it while leaving the reader with no account of the
+            # non-`claimed` case at all. So require each surface to state
+            # WHY it cannot classify that line -- that release and flip emit
+            # the identical text -- and to hand over the off-log remedy that
+            # replaces the verdict. Both tokens are absent from round 4
+            # (1d9da1bc), so this pair fails there.
+            assert "identical" in text.lower(), (
+                f"{name} no longer explains WHY a non-'claimed' scoped line "
+                "is indeterminate (release and flip emit the identical "
+                "text). Without the reason, a later editor reinstates a "
+                "confident branch."
+            )
+            assert "anchors" in text.lower(), (
+                f"{name} no longer gives the off-log remedy (ask <B>, or "
+                "check the PR/project the baton anchors) -- without it the "
+                "message reports indeterminacy and strands the reader."
+            )
+
+        # --- THE RENDERED `--help` SURFACE (round 9) --------------------
+        # Everything above reads `.description`, which is a FIELD of the
+        # help surface, not the surface. argparse also renders `epilog`
+        # (and, on the top-level parser, each subcommand's `help=`), and
+        # nothing in this suite read either. Measured on this tip at
+        # round 8: adding
+        #     epilog="Refuses to steal from another agent who is
+        #             currently holding it"
+        # to p_claim ships that sentence into `baton claim --help` and the
+        # suite stayed green at 185 passed / 1 skipped -- the round-4
+        # regression, re-entering through an unread field. Same dimension
+        # error as the rest of this PR: checking a component of the
+        # surface instead of the surface.
+        #
+        # Whitespace is normalized FIRST because argparse re-wraps prose to
+        # the terminal width: the shipped description already renders with
+        # "'<A> → <B>:\n<reason>'" split across a line break, so a raw
+        # substring blacklist over format_help() would miss any phrase that
+        # happens to straddle a wrap -- and the wrap points move with
+        # $COLUMNS, making the miss environment-dependent. Verified: a
+        # planted "is currently holding" positioned across a wrap is missed
+        # by the raw check and caught by the normalized one.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in claim_help_rendered.lower(), (
+                "the rendered `baton claim --help` asserts unconditionally "
+                f"that a person holds the baton ({banned!r}). It is not in "
+                "the pinned description, so it arrived through `epilog` or "
+                "another field nothing else reads."
+            )
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in claim_help_rendered.lower(), (
+                "the rendered `baton claim --help` tells the reader the "
+                f"baton is (or may be) free on evidence that cannot "
+                f"establish it ({banned!r}) -- see the note on "
+                "CLAIM_REFUSAL_BANNED_FREE_PHRASES."
+            )
+        # Guard the instrument: if format_help() ever returned the
+        # description alone (or less), the two loops above would add
+        # nothing over the ones that already ran on `.description`.
+        assert " ".join(claim_help.split()) in claim_help_rendered, (
+            "the rendered `baton claim --help` no longer contains the "
+            "description -- this block is now checking something else"
+        )
+        assert len(claim_help_rendered) > len(" ".join(claim_help.split())), (
+            "the rendered `baton claim --help` is no larger than its "
+            "description; the blacklists above are then redundant rather "
+            "than a second layer"
+        )
+        # A blacklist cannot see a meaning inversion that uses none of its
+        # vocabulary -- that is exactly what round 6 proved on the
+        # description ("`<B>` owns this baton and you must wait for them to
+        # pass it" retains every token and inverts the meaning), and it is
+        # why the description is ALSO pinned verbatim below. The same hole
+        # is open on `epilog`, which no golden master covers. Measured:
+        # with the two loops above in place, that sentence as an epilog
+        # still passes them. So pin the field EMPTY: nothing reads it, so
+        # nothing may ship through it. If an epilog is ever wanted, add a
+        # verbatim pin for it here in the same breath as adding it.
+        assert claim_parser.epilog is None, (
+            "p_claim grew an `epilog`, which `baton claim --help` renders "
+            "to the user and no test pins verbatim. Round 6's inversion "
+            "used no blacklisted word, so the blacklists above would not "
+            f"catch one here either. Pin it: {claim_parser.epilog!r}"
+        )
+
+        # --- THE COMPLETE ENUMERATION OF AUTHORED `--help` STRINGS ------
+        # (round 11) Rounds 6, 8 and 10 each shipped round 6's exact
+        # inversion through a DIFFERENT unpinned `--help` surface, every
+        # one of them green at 185 passed / 1 skipped. Round 9 is the
+        # instructive one: the block immediately above correctly REFUSES a
+        # blacklist for `epilog` -- "a blacklist cannot see a meaning
+        # inversion that uses none of its vocabulary" -- and then, ten
+        # lines later, guards the subcommand `help=` one-liner with
+        # exactly that blacklist. Round 10 walked round 6's inversion
+        # straight through it. The right reasoning and the wrong
+        # instrument, in one comment block.
+        #
+        # So the fix cannot be another field. Pinning only the two fields
+        # round 10 named would leave round 12 to find the fifth surface.
+        # What is pinned here is the ENUMERATION ITSELF: every authored
+        # string argparse renders into a `--help` surface, gathered by
+        # introspection and compared as a WHOLE dict. An unanticipated
+        # field -- a `usage=`, a second positional, a new subcommand --
+        # changes the dict and fails HERE. That is the property a
+        # per-field checklist structurally cannot have.
+        #
+        # The named per-field guards above are KEPT rather than folded in:
+        # each carries the argument for why that particular field is
+        # dangerous, which a whole-dict comparison cannot express. This
+        # block closes the gap between them; it does not retire them.
+        claim_fields = _authored_help_strings(claim_parser)
+        # `description` is pinned verbatim by the golden master below.
+        # Substitute a sentinel rather than POPPING the key: popping would
+        # let a DELETED description pass this dict comparison, and the
+        # deleted-surface case is exactly what the vacuity guards above
+        # exist for. Replacing keeps the key's presence load-bearing.
+        assert "description" in claim_fields, (
+            "argparse no longer exposes `description` -- the golden master "
+            "below is checking a field this enumeration cannot see"
+        )
+        claim_fields["description"] = (
+            "<pinned verbatim by the golden master below>"
+        )
+        assert claim_fields == {
+            'prog': 'baton claim',
+            'usage': None,
+            'description': '<pinned verbatim by the golden master below>',
+            'epilog': None,
+            'arg:project_id:metavar': 'PROJECT-ID',
+            'arg:project_id:help': 'Project identifier (e.g. pool-cli-gap, DESIGN-trust-tier-v2)',
+        }, (
+            "the authored `--help` strings on the claim sub-parser "
+            "changed. This includes the POSITIONAL's `help=`, which "
+            "renders into `baton claim --help` and which round 10 shipped "
+            "round 6's inversion through while green. If you ADDED a "
+            "field, it is a new user-facing surface: pin its text here in "
+            "the same breath, and re-justify it against #3039. If you "
+            f"edited one, re-justify the new wording: {claim_fields!r}"
+        )
+
+        # The parent parser is a SECOND surface with its own authored
+        # strings -- its description and epilog, plus every subcommand's
+        # `help=` one-liner, all of which render into `baton --help` and
+        # none of which the claim sub-parser can see. Pinning only
+        # `claim`'s one-liner would leave its fourteen siblings guarded by
+        # the blacklist that has now lost three times; the scope of the
+        # guard being replaced was the whole top-level surface, so the
+        # scope of the pin is too.
+        assert _authored_help_strings(parser) == {
+            'prog': 'baton',
+            'usage': None,
+            'description': 'Multi-agent turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
+            'epilog': 'Protocol docs: docs/baton-protocol.md\nProjects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n',
+            'subparsers:metavar': 'subcommand',
+            'subparsers:help': None,
+            'subcommand:init:metavar': 'init',
+            'subcommand:init:help': 'Create a new project baton file',
+            'subcommand:flip:metavar': 'flip',
+            'subcommand:flip:help': 'Pass the baton to another participant',
+            'subcommand:claim:metavar': 'claim',
+            'subcommand:claim:help': 'Claim a Project-layer baton from the pool (pool → self)',
+            'subcommand:release:metavar': 'release',
+            'subcommand:release:help': 'Return a Project-layer baton to the pool (self → pool sentinel)',
+            'subcommand:status:metavar': 'status',
+            'subcommand:status:help': 'List active projects (sorted by turn_since ascending)',
+            'subcommand:mine:metavar': 'mine',
+            'subcommand:mine:help': "Shorthand for 'baton status --mine'",
+            'subcommand:show:metavar': 'show',
+            'subcommand:show:help': 'Display a project file (read-only)',
+            'subcommand:close:metavar': 'close',
+            'subcommand:close:help': 'Mark a project merged or cancelled',
+            'subcommand:reopen:metavar': 'reopen',
+            'subcommand:reopen:help': 'Flip a closed baton back to an active status (inverse of close)',
+            'subcommand:gc:metavar': 'gc',
+            'subcommand:gc:help': 'batch-close PR-batons whose GitHub PR is merged/closed',
+            'subcommand:rename:metavar': 'rename',
+            'subcommand:rename:help': 'Update the human-readable project title',
+            'subcommand:anchor:metavar': 'anchor',
+            'subcommand:anchor:help': 'Set or update the github: anchor on an existing baton',
+            'subcommand:add-participant:metavar': 'add-participant',
+            'subcommand:add-participant:help': "Add an agent to an existing baton's participants list",
+            'subcommand:set-colleague:metavar': 'set-colleague',
+            'subcommand:set-colleague:help': 'Set or change the colleague: field on an existing baton (#2764)',
+            'subcommand:merge:metavar': 'merge',
+            'subcommand:merge:help': 'Gate-checked squash merge for a PR baton',
+        }, (
+            "the authored `--help` strings on the top-level `baton` "
+            "parser changed -- most likely a subcommand's `help=` "
+            "one-liner, which renders in `baton --help` and nowhere else. "
+            "Adding or renaming a subcommand is expected to fail here: "
+            "pin the new one-liner deliberately. For `claim`, re-justify "
+            f"it against #3039: {_authored_help_strings(parser)!r}"
+        )
+        # The subcommand's `help=` one-liner renders on a DIFFERENT
+        # surface -- the top-level `baton --help` listing -- so reading
+        # the claim sub-parser cannot see it. Measured on this tip: all 13
+        # banned phrases occur 0 times in the whole rendered top-level
+        # help, so this costs nothing today. Round 11 pinned those
+        # one-liners verbatim in the enumeration above, which is what
+        # actually guards them; this loop is kept as a cheap second layer
+        # over the RENDERED surface, not as the primary instrument.
+        top_level_rendered = " ".join(parser.format_help().split()).lower()
+        for banned in (
+            CLAIM_REFUSAL_BANNED_PHRASES + CLAIM_REFUSAL_BANNED_FREE_PHRASES
+        ):
+            assert banned not in top_level_rendered, (
+                f"the rendered top-level `baton --help` carries {banned!r} "
+                "-- most likely through a subcommand's `help=` one-liner, "
+                "which is rendered there and nowhere else"
+            )
+
+        # --- GOLDEN MASTERS (round 7) -----------------------------------
+        # The loop above is presence-and-count only, and round 6 proved
+        # that is defeatable by a meaning inversion that keeps every
+        # token: "`<B>` owns this baton and you must wait for them to pass
+        # it" retains the shape token, "turn_reason", "identical" and
+        # "anchors" while asserting exactly the unconditional holder claim
+        # #3039 was filed against. No heuristic closes that -- the
+        # damaging content is ordinary English with no fixed vocabulary --
+        # so the two SHORT surfaces are pinned verbatim, the instrument
+        # that has caught every planted mutation on the refusal message.
+        # Editing either surface fails here BY DESIGN: update the expected
+        # text and re-justify the new wording against #3039, exactly as
+        # for the refusal message. Line-number citations are deliberately
+        # absent from both -- they are prose a reader trusts, they go
+        # stale silently, and a stale one shipped for two rounds of this
+        # PR; engram-alpha#3039 is the durable pointer.
+        assert claim_help == (
+            'Take a Project-layer baton for yourself. Only succeeds '
+            "when the current turn is the pool sentinel (the install's "
+            "primary_user). Refuses when the turn is not this seat's "
+            'recognized pool marker — which may be a colleague '
+            'genuinely holding it, or a pool or maintainer marker '
+            'written by a seat with a different primary_user '
+            '(engram-alpha#3039). To see what the turn log records, '
+            "run 'baton show <project-id>' and find the LAST turn log "
+            "line shaped '<A> → <B>: <reason>' whose <B> -- the name "
+            'just after the FIRST arrow -- is the turn value. Only '
+            'such a line records who the turn was handed to: anchor, '
+            'colleague and reopen lines carry arrows of their own and '
+            'name no holder, and turn_reason does not discriminate '
+            "(every claim writes 'claimed'). '<pool> → <B>: claimed' "
+            "means a colleague took it -- use 'baton flip' with an "
+            'explicit handoff agreement. ANY OTHER such line leaves '
+            'this seat unable to tell which case it is: release and '
+            'flip emit the identical text, so the line is either a '
+            'colleague taking it on a flip or a return to a pool '
+            'marker belonging to a seat whose primary_user this one '
+            "cannot resolve -- that is #3039. A <reason> of 'released' "
+            "is release's default but is user-settable, so it hints "
+            'and never settles. Settle it off the log: ask <B>, or '
+            'check the PR or project this baton anchors -- do not flip '
+            'on a guess.\n'
+            '\n'
+            'Vocabulary distinction: claim/release are Project-layer '
+            'verbs (single driver, rare passes). flip is the PR-layer '
+            'verb (frequent passing through fairy → reviewer → '
+            'colleague → maintainer).'
+        ), (
+            "the claim sub-parser description changed; re-justify the new "
+            f"wording against #3039: {claim_help!r}"
+        )
+
+        assert claude_passage == "\n".join((
+            '- `baton claim pool-X` — `turn:` flips to the claimer; refuses when `turn:`',
+            "  is not this seat's recognized pool marker — either a colleague is holding it,",
+            '  or it is a pool/maintainer marker written by a seat with a different',
+            '  `primary_user` (#3039). Before assuming someone holds it, run `baton show`',
+            '  and find the last turn-log line shaped `<A> → <B>: <reason>` whose `<B>` —',
+            '  the name just after the FIRST arrow — is the `turn:` value; `anchor`,',
+            '  `set_colleague` and `reopen` write arrows without touching `turn:`, so "the',
+            '  last arrow line" can name a non-holder. `<pool> → <B>: claimed` = a',
+            '  colleague took it. Any other such line is **indeterminate from your seat** —',
+            '  `release` and `flip` emit the identical text, so it is either a colleague',
+            '  taking it on a flip (held) or a return to a pool marker belonging to a seat',
+            '  whose `primary_user` you cannot resolve (free); that is #3039. Settle it off',
+            '  the log — ask `<B>`, or check the PR/project the baton anchors — and do not',
+            '  flip on a guess. `turn_reason` does not discriminate (every claim writes',
+            '  `"claimed"`).',
+        )), (
+            "the CLAUDE.md baton passage changed; re-justify the new "
+            f"wording against #3039: {claude_passage!r}"
+        )
+
+        # --- THE SKILL.md FAILURE-MODES ROW, PINNED (round 11) ----------
+        # Rounds 7 and 8 both tiered this row's exposure a Suggestion, on
+        # the ground that SKILL.md is long prose that legitimately changes
+        # and a golden master over it would be noise. That was right while
+        # a SECOND copy existed -- and the two copies disagreeing is
+        # literally how round 8 found inversion #4, in the condensed
+        # restatement carried by the verb-list bullet.
+        #
+        # Round 9 CUT that copy under a standing pre-commitment. The cut
+        # was correct, but it removed the cross-copy detector. Measured on
+        # this tip, the rule is stated user-facing in exactly three places
+        # -- the CLAUDE.md baton passage, the claim sub-parser
+        # description, and this row -- and the first two are pinned
+        # verbatim just above. So this row is the only statement of the
+        # rule a vocabulary-free inversion can still enter through, and
+        # nothing is positioned to contradict it when it does: the pinned
+        # pair cannot silently disagree, but neither is compared against
+        # SKILL.md. Round 10 inverted this row's case (b) using no
+        # blacklisted vocabulary and stayed green at 185 passed / 1
+        # skipped; a count-based check cannot see that.
+        #
+        # So it is pinned, and the cost is the point: this is the single
+        # surviving statement of a rule that has inverted FOUR times, so
+        # changing it SHOULD require deliberate re-justification rather
+        # than passing as ordinary prose drift.
+        skill_claim_rows = [
+            ln for ln in skill_md.splitlines()
+            if ln.startswith("| `baton claim:")
+        ]
+        assert len(skill_claim_rows) == 1, (
+            "engram-baton/SKILL.md no longer has exactly one failure-modes "
+            f"row for `baton claim` ({len(skill_claim_rows)} found), so the "
+            "pin below would compare the wrong line -- or, at zero, pass "
+            "over a surface that had been deleted outright"
+        )
+        assert skill_claim_rows[0] == (
+            '| `baton claim: ... which this seat does not recognize as its '
+            'pool marker` | Either a colleague is genuinely holding it, OR '
+            'the turn is a pool/maintainer marker written by a seat with a '
+            'different `primary_user` (#3039) | Run `baton show <id>` and '
+            'find the **last turn-log line shaped `<A> → <B>: <reason>` '
+            'whose `<B>` — the name just after the FIRST arrow — is the '
+            '`turn:` value**. Only such a line records who the turn was '
+            'handed to: `anchor`, `set_colleague` and `reopen` write '
+            'arrows of their own without touching `turn:`, so "the last '
+            'arrow line" can name an agent who does not hold the baton '
+            '(the same false-holder error as #3039). Four writers can '
+            'produce a scoped line — `init`, `claim`, `flip`, `release` — '
+            'and you classify it by tokens you can actually read, never by '
+            'deciding whether `<A>` is a pool marker: on another install '
+            'you cannot, and that inability IS #3039. **(a) `<reason>` is '
+            'exactly `claimed`** → `claim` wrote it; it is the only one of '
+            'the four that hardcodes that word, so `<B>` took the baton '
+            'from a pool and holds it. Letter them and flip only by '
+            'agreement. The other three take free-text reasons, so a '
+            'hand-typed `claimed` can imitate this — strong evidence, not '
+            'proof. **(b) `<A>` is literally `initialized`** → `init` '
+            'wrote it: the baton has carried this same `turn:` since '
+            'creation and was **never claimed**, so `<B>` is only whatever '
+            "the creator set — very often their own install's pool marker. "
+            "That is #3039's motivating case and it is **indeterminate "
+            'from your seat**. **(c) anything else** → also '
+            '**indeterminate from your seat**: `release` and `flip` emit '
+            'the identical text, so the line is either a colleague taking '
+            'it on a flip (held) or a return to a pool marker belonging to '
+            'a seat whose `primary_user` you cannot resolve (free) — that '
+            "is #3039. A `<reason>` of `released` is `release`'s default "
+            'but is user-settable, so it hints and never settles. In (b) '
+            'and (c), settle it off the log — ask `<B>`, or check the '
+            'PR/project the baton anchors — and do not flip on a guess. Do '
+            '**not** judge by `turn_reason`: every claim writes '
+            '`"claimed"`, so a genuinely-held baton reads there as though '
+            'no handoff happened. |'
+        ), (
+            "the engram-baton/SKILL.md failure-modes row changed. Since "
+            "round 9 cut the condensed copy, this is the only statement "
+            "of the turn-log reading rule that is not already pinned "
+            "verbatim, and the cross-copy disagreement that caught "
+            "inversion #4 no longer exists to catch a fifth. Re-justify "
+            "the new wording against #3039 before updating this pin: "
+            f"{skill_claim_rows[0]!r}"
+        )
+
+        # --- THE SKILL.md VERB-LIST BULLET, PINNED (round 12 fold-in) ---
+        # Round 9 cut the CONDENSED READING RULE out of this bullet, and
+        # the comment above records that correctly. What it left behind is
+        # not nothing: the bullet still states the refusal SEMANTICS -- a
+        # `turn:` this seat does not recognize may be a colleague holding
+        # it, OR a pool/maintainer marker written by a seat with a
+        # different `primary_user`. That disjunction IS #3039, and until
+        # now nothing pinned it. The count-based SKILL.md check above
+        # counts the scoped turn-log SHAPE token, which this bullet no
+        # longer carries after round 9, so it reads the failure-modes row
+        # and not this line; the blacklists cannot see an inversion
+        # written without their vocabulary. Measured in round 12: this
+        # bullet's meaning was rewritten using none of the 13 banned
+        # phrases and the suite stayed green at 185 passed / 1 skipped.
+        #
+        # Same instrument and same price as the failure-modes row above.
+        # This bullet is the statement of the rule a reader meets FIRST,
+        # in the verb list they consult to use the command at all, so
+        # changing it should cost a deliberate re-justification rather
+        # than passing as ordinary prose drift.
+        skill_claim_verb_rows = [
+            ln for ln in skill_md.splitlines()
+            if ln.startswith("- **`baton claim <project-id>`**")
+        ]
+        assert len(skill_claim_verb_rows) == 1, (
+            "engram-baton/SKILL.md no longer has exactly one verb-list "
+            f"bullet for `baton claim` ({len(skill_claim_verb_rows)} "
+            "found), so the pin below would compare the wrong line -- or, "
+            "at zero, pass over a surface that had been deleted outright"
+        )
+        assert skill_claim_verb_rows[0] == (
+            "- **`baton claim <project-id>`** — take ownership from the "
+            "pool sentinel. Refuses when `turn:` is not this seat's "
+            "recognized pool marker — which may be a colleague holding "
+            "it, or a pool/maintainer marker written by a seat with a "
+            "different `primary_user` (#3039). The full reading rule, "
+            "with the evidence for each case, is in **Failure modes + "
+            "recovery** below — the `baton claim` refusal points here "
+            "rather than reprinting it."
+        ), (
+            "the engram-baton/SKILL.md `baton claim` verb-list bullet "
+            "changed. It carries the refusal's DISJUNCTION -- colleague-"
+            "held OR a foreign install's pool marker -- which no other "
+            "check on this file sees, because round 9 cut the turn-log "
+            "shape token out of it. Re-justify the new wording against "
+            f"#3039 before updating this pin: {skill_claim_verb_rows[0]!r}"
+        )
 
     def test_claim_refuse_invoker_not_in_participants(self, monkeypatch, capsys):
         """Claim when invoker not in participants → EXIT_VALIDATION."""
