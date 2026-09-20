@@ -97,6 +97,115 @@ module its author had not tiered. So the tier of a new artifact is not merely a
 design decision to record for later transcription — **add the entry in the same
 PR that adds the artifact, or CI will stop you.**)*
 
+## Contract-first tests — write the assertions before the implementation
+
+**Lei's ruling, 2026-09-19 (engram-alpha#3045).** For a function with a stateable
+contract, **write the tests that assert its designed behaviours — including its error
+handling — before implementing it.** The tests exist first; the implementation is then
+written against a suite that already fails. Drift from the design is caught
+mechanically, rather than depending on the implementer *remembering* what was decided
+earlier.
+
+**The gap this closes is specific, and it is not "we skip design."** We already write
+design docs that state behaviours, failure contracts and invariants — but **prose does
+not execute.** A design doc can say a caller must distinguish three states when the
+owner is down, and nothing fails if the implementation collapses them into two. The
+statement and the check live in different artifacts, and only one of them runs.
+
+**The originating case.** `cohort_dispatch validate` reconciles the **per-node quality**
+of what a batch fairy returned and never differences the **returned id set against the
+payload's**. Only whole-chunk absence is caught — a missing or unparseable
+`agent_output.json` enumerates every payload id as a failure — so a present, parseable
+output that is one node short is invisible. A fairy silently dropped one node of
+fifteen; `validate` reported `clean: 88, failures: 0` and exit 0. "Every node sent comes
+back or is reported" is a sentence anyone would have written at design time. It is
+absent from the implementation, and **review is a weak instrument against it, because
+there is no wrong line to look at** — a reviewer has to reconstruct the contract
+independently and then notice a line that was never written. That is the shape this
+discipline is for.
+
+*Weak, not blind — and the distinction is load-bearing, because the absolute form would
+contradict a discipline in this same file.* The **Conclusion warrant** box's line 3 asks
+what observable would differ if a claim were false, and that does reach a missing
+assertion whenever someone states the corresponding claim. So review is not structurally
+blind here; it is unreliable, which is why the check belongs in the test suite instead.
+
+*The neighbouring **completeness-check gate** does NOT reach this class, and why not is
+the sharper argument for the convention.* That gate takes an **already-found** defect and
+greps for its siblings — its stated origin is "a fix landed in one place but missed
+sibling occurrences." A never-stated contract has no first instance to generalise from,
+so there is no pattern to grep for and the gate never fires. A defect that leaves nothing
+to search for is exactly the kind that has to be caught at design time or not at all.
+
+**Scope — where it applies:**
+
+- Functions with a **stateable contract**: the `cohort_dispatch` stages, the cascade
+  verbs, the baton gates, anything with a named invariant or a failure contract.
+- **Error handling especially.** The happy path tends to get exercised by ordinary use;
+  the refusal paths are where behaviour silently goes missing, because nothing calls
+  them until something goes wrong.
+- **And see the spec-author obligation below** — this block says *where the discipline
+  applies*; it does not by itself say *who has to act* for it to fire through a fairy.
+
+**Where it does NOT apply:** exploratory work where the design emerges from coding.
+That work is already excluded from fairy delegation for the same reason — if the
+contract isn't known yet, a test written first encodes a guess, not a decision.
+
+**The obligation is on the SPEC AUTHOR, and this is the half that makes the discipline
+reachable at all.** This project's delegation rule is *"ALWAYS delegate the actual code
+writing to a fairy. No size exception."* So nearly all code arrives through a fairy, and
+a fairy can only gate on **the spec text in front of it** — "does this function have a
+stateable contract?" is a property of the function, which a fairy cannot evaluate
+without inventing the contract, and inventing one is exactly what the scope bound
+forbids. Therefore: **when dispatching a coder-fairy for a function with a stateable
+contract, state the contract in the spec.** A fairy handed a spec that omits it will
+correctly skip the step — so **an unstated contract is an unimplemented one**, and the
+omission is the dispatcher's, not the fairy's.
+
+That this repo's own originating case is exactly this shape is the argument, not a
+coincidence: `cmd_validate` *has* a stateable contract and its spec never stated it, so
+a fairy gating on spec text would have skipped the step on the very bug that prompted
+the convention.
+
+**One caveat, and it is the failure mode to expect.** A test written at design time can
+still be **non-discriminating** — asserting the happy path and passing against a
+plausible-wrong implementation. Writing it early does not exempt it from the
+can-it-fail discipline this repo has already paid for **more than once**: reverting to
+the pre-fix code and watching the test go red proves the *code* was broken, not that the
+test discriminates.
+
+*The two instances a reader can check in this repo.* **Both live in the PRs' REVIEW
+THREADS, not in what the PRs were about** — say so when citing them, because the titles
+are unrelated to the incident and a reader who checks the subject line will conclude the
+citation is wrong:
+
+- **#2614** (titled as a `retract` replacement_id fix) — in the round-4 review comment, a
+  reviewer re-ran the coder-fairy's stated can-it-fail demonstration and found the
+  **pre-existing** test also went red under the reported mutation, so the demonstration
+  established only that the code was broken.
+- **#2721** (titled as an `engram_list` docstring change) — in the review thread, a fairy
+  ran three plausible-wrong mutations against its *tests*, two of which discriminated
+  while the third reddened a pre-existing test, failing the very neighbour check at issue
+  here; it then rested its zero-behaviour-change claim on a byte-identity probe that had
+  never been seen to fail at all.
+
+*That the locating detail is load-bearing was established the hard way: a colleague
+checking these citations read the PR subjects, found them unrelated, and reported both as
+defective. The citations were correct and the report was reasonable — which is the
+truncation-class failure this repo already documents, arriving on the paragraph that
+argues review is a weak instrument.* Read "more than once"
+as a **floor**: there are further instances on the fleet's forum threads that this repo
+cannot verify, and an earlier draft of this paragraph asserted a count of three that
+nothing here substantiates. The stronger control is a mutation where **the new assertion fires
+and the pre-existing checks stay green.** For #3045's own fix, that is a chunk whose
+returned items are each individually valid and simply one short.
+
+**Adoption status:** trialling. #3045's fix is the first case — its two assertions are
+to be written before `cmd_validate` is touched, so the style meets one real bug before
+we adopt it more widely. **Revisit when #3045's fix merges**, so the trial is
+terminable: if the assertions caught nothing a normal review round would have caught,
+drop the convention rather than widening it.
+
 ## Plugin build restructures code paths — never rely on the `src/` layout
 
 The plugin build (`build-plugin.sh`) does **not** mirror the `src/engram/` source
