@@ -238,11 +238,17 @@ class TestGhReconcile:
         assert pr102["gh_state"] == "merged"
 
     def test_pr103_file_merged_also_done(self, store):
-        """PR-103 file already says merged → effective_status=done regardless of gh."""
+        """PR-103 file already says merged → effective_status=done regardless of gh.
+
+        #2007: PR-103's ref is skipped from the resolve set entirely (file
+        status already file-done), so the {"103": "open"} mock value is never
+        even consulted -- gh_state reports 'skipped', not the mocked 'open'.
+        """
         items = _board_with_gh_mock(store, {"103": "open"})  # gh says open but file says merged
         pr103 = next((i for i in items if i["project"] == "PR-103"), None)
         assert pr103 is not None
         assert pr103["effective_status"] == "done"  # file status is enough
+        assert pr103["gh_state"] == "skipped"
 
     def test_pr100_open_stays_active(self, store):
         """PR-100 open on gh → effective_status=in-review (no reconciliation)."""
@@ -258,6 +264,160 @@ class TestGhReconcile:
         assert pr101 is not None
         assert pr101["effective_status"] == "done"
         assert pr101["gh_state"] == "closed"
+
+
+# ---------------------------------------------------------------------------
+# 3b. #2007: gh reconciliation is skipped for already-file-done records
+# ---------------------------------------------------------------------------
+
+class TestSkipReconcileForFileDone:
+    """#2007: resolving gh for a record whose file status is already in
+    _FILE_DONE_STATUSES can never change its effective_status (see
+    _effective_status's file_done branch) -- so those refs are never added
+    to the resolve set at all. These tests prove that guarantee directly
+    (gh is never actually invoked for such a ref), not just that the
+    resulting effective_status looks right -- a test that only checked the
+    latter would pass even if the skip never happened, since the file
+    status alone already forces 'done'.
+    """
+
+    def test_file_done_record_never_calls_gh(self, store):
+        """PR-103 (file status already 'merged') must never trigger a real gh
+        lookup -- even one that WOULD flip effective_status away from 'done'
+        if it were honored. This is the load-bearing safety guarantee.
+        """
+        from forum import board_projects as bp
+        bp._clear_gh_cache()
+
+        def _fake_gh_pr_state(pr_num, repo):
+            # Deliberately returns a state that would flip PR-103 off 'done'
+            # were it ever consulted for PR-103's ref -- proving the skip
+            # actually happens structurally, not just that the result
+            # happens to look right.
+            return "open"
+
+        try:
+            with patch(
+                "forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state
+            ) as mock_gh:
+                items = read_project_board(store)
+        finally:
+            bp._clear_gh_cache()
+
+        pr103 = next((i for i in items if i["project"] == "PR-103"), None)
+        assert pr103 is not None
+        assert pr103["effective_status"] == "done"
+        assert pr103["gh_state"] == "skipped"
+
+        called_pr_nums = {call.args[0] for call in mock_gh.call_args_list}
+        assert "103" not in called_pr_nums, (
+            "gh must never be queried for an already-file-done record"
+        )
+
+    def test_file_done_reports_skipped_not_unknown(self, store):
+        """A file-done record's gh_state is 'skipped', not 'unknown' -- and
+        gh_unknown stays False (no 'something's wrong' warning for a
+        deliberate, structural skip)."""
+        items = _board_with_gh_mock(store, {"103": "merged"})
+        pr103 = next((i for i in items if i["project"] == "PR-103"), None)
+        assert pr103 is not None
+        assert pr103["gh_state"] == "skipped"
+        assert pr103["gh_unknown"] is False
+
+    def test_shared_ref_active_gets_real_state_done_also_reports_it(self, tmp_path):
+        """Two records share one PR ref: one active ('in-review', drives the
+        resolve), one file-done ('merged', would be skipped alone). The
+        shared ref DOES get resolved (driven by the active record) -- so the
+        file-done record reports the REAL resolved gh_state, never 'skipped'.
+
+        Judgment call (not fully dictated by the spec): when a ref IS
+        resolved this call (because some other record sharing it is active),
+        the file-done record reports that real state rather than always
+        reporting 'skipped' for itself individually. Chosen because it's what
+        the "was this ref present in gh_states this call" discriminator
+        naturally produces without extra per-record bookkeeping, and because
+        it's strictly more informative (ground truth is already in hand) --
+        flagged here for review since a per-record 'skipped' would also have
+        been defensible.
+        """
+        store = FileStore(tmp_path / "coord")
+        alloc = SeqAllocator(recover=store.recover_max_seq)
+        _init(
+            store, alloc, "PR-500", title="Active PR sharing a ref",
+            status="in-review", turn="ariadne", participants=["ariadne"],
+            turn_reason="x", github="pr/999", ts="2026-06-20T10:00:00Z",
+        )
+        _init(
+            store, alloc, "PR-501", title="Done PR, same ref",
+            status="merged", turn="lei", participants=["lei"],
+            turn_reason="merged", github="pr/999", ts="2026-06-10T08:00:00Z",
+        )
+
+        def _fake_batch(pr_refs):
+            return {ref: "closed" for ref in pr_refs}
+
+        with patch(
+            "forum.board_projects._batch_gh_reconcile", side_effect=_fake_batch
+        ) as mock_batch:
+            items = read_project_board(store)
+
+        # The shared ref was passed to _batch_gh_reconcile exactly once
+        # (deduped), driven by PR-500's active status.
+        called_refs = mock_batch.call_args[0][0]
+        assert (DEFAULT_GITHUB_REPO, "999") in called_refs
+        assert len(called_refs) == 1
+
+        pr500 = next(i for i in items if i["project"] == "PR-500")
+        pr501 = next(i for i in items if i["project"] == "PR-501")
+        assert pr500["gh_state"] == "closed"
+        assert pr500["effective_status"] == "done"  # closed -> done
+        assert pr501["gh_state"] == "closed"  # real resolved state, not 'skipped'
+        assert pr501["effective_status"] == "done"  # already file-done anyway
+
+    def test_call_count_excludes_file_done_refs(self, tmp_path):
+        """N records seeded: M file-done with distinct refs, (N-M) active with
+        distinct refs. gh is queried exactly (N-M) times, never N times.
+        Regression guard against silently reverting to resolving everything.
+        """
+        from forum import board_projects as bp
+        bp._clear_gh_cache()
+
+        store = FileStore(tmp_path / "coord")
+        alloc = SeqAllocator(recover=store.recover_max_seq)
+
+        n_done = 5
+        n_active = 3
+        for i in range(n_done):
+            _init(
+                store, alloc, f"PR-DONE-{i}", title=f"done {i}", status="merged",
+                turn="lei", participants=["lei"], turn_reason="merged",
+                github=f"pr/{9000 + i}", ts="2026-06-01T00:00:00Z",
+            )
+        for i in range(n_active):
+            _init(
+                store, alloc, f"PR-ACTIVE-{i}", title=f"active {i}",
+                status="in-review", turn="ariadne", participants=["ariadne"],
+                turn_reason="x", github=f"pr/{8000 + i}", ts="2026-06-01T00:00:00Z",
+            )
+
+        call_log = []
+
+        def _fake_gh_pr_state(pr_num, repo):
+            call_log.append((repo, pr_num))
+            return "open"
+
+        try:
+            with patch(
+                "forum.board_projects._gh_pr_state", side_effect=_fake_gh_pr_state
+            ):
+                items = read_project_board(store)
+        finally:
+            bp._clear_gh_cache()
+
+        assert len(call_log) == n_active
+        assert len(items) == n_done + n_active
+        done_items = [i for i in items if i["project"].startswith("PR-DONE-")]
+        assert all(i["gh_state"] == "skipped" for i in done_items)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +456,14 @@ class TestGhDegrade:
         assert iss["gh_unknown"] is False
 
     def test_batch_exception_degrades(self, store):
-        """If _batch_gh_reconcile raises, board still returns (no 500)."""
+        """If _batch_gh_reconcile raises, board still returns (no 500).
+
+        #2007: _batch_gh_reconcile is only invoked with the non-file-done
+        refs (PR-103's file status is already 'merged', so its ref is never
+        passed to the raising mock at all) — a raised exception there degrades
+        those active refs to 'unknown'; PR-103 independently reports
+        'skipped' since gh reconciliation was never attempted for it.
+        """
         def _raise(*args, **kwargs):
             raise RuntimeError("gh not available")
 
@@ -306,7 +473,7 @@ class TestGhDegrade:
         assert isinstance(items, list)
         for item in items:
             if item["github"]:
-                assert item["gh_state"] == "unknown" or item["gh_state"] == ""
+                assert item["gh_state"] in ("unknown", "skipped", "")
 
 
 # ---------------------------------------------------------------------------

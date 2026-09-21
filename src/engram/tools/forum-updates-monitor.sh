@@ -358,7 +358,7 @@ POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 # absence.
 # ---------------------------------------------------------------------------
 while true; do
-    if RESP="$(curl -s --fail "$URL_BASE&since=0" 2>/dev/null)" \
+    if RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=0" 2>/dev/null)" \
        && _seed="$(printf '%s' "$RESP" | as_of)"; then
         printf '%s\n' "$_seed" > "$CURSOR"
         break
@@ -390,7 +390,14 @@ while true; do
     _cur="$(cat "$CURSOR" 2>/dev/null || echo 0)"
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle and
     # PRESERVE the cursor (never advance past an un-emitted window).
-    RESP="$(curl -s --fail "$URL_BASE&since=$_cur" 2>/dev/null)" || continue
+    # --max-time 60 (#2007): a hung request (e.g. a slow board-adjacent
+    # handler on the same server) must not block this loop indefinitely --
+    # 60s comfortably covers a healthy poll (including a transient slowdown)
+    # while still bounding a truly-hung request. A --fail --max-time timeout
+    # already returns non-zero exactly like any other curl failure, so the
+    # existing `|| continue` here (and the seed retry above) already handles
+    # it correctly -- no other logic change needed.
+    RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=$_cur" 2>/dev/null)" || continue
     printf '%s' "$RESP" | emit
     # Advance the cursor only when this poll actually handed back a watermark.
     # `$( )` swallows the command's status into the assignment, so the status
