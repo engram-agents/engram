@@ -608,10 +608,15 @@ class TestBootChargeAllPgrepInvocationsCarryTheCanonicalPattern:
     # ancestors," not "print argv"); and every span now captures its
     # `pgrep` output into a variable and reports an empty result as a
     # FAILURE rather than silently proceeding.
+    #
+    # #3057 changed the else-branch to capture-and-test per pid
+    # (`_T="$(readlink ...)" || {...}; case "$_T" in socket:*) ...`)
+    # instead of a bare `readlink ...; done` -- the span updated
+    # accordingly.
     _CANONICAL_INVOCATION_SPANS = frozenset(
         {
             '_MATCHED=$(pgrep -u "$USER" -lf \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\'); if [ -z "$_MATCHED" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else echo "$_MATCHED"; fi',
-            '_PIDS="$(pgrep -u "$USER" -f \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\')"; if [ -z "$_PIDS" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else for pid in $_PIDS; do readlink /proc/$pid/fd/1; done; fi',
+            '_PIDS="$(pgrep -u "$USER" -f \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\')"; if [ -z "$_PIDS" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else for pid in $_PIDS; do _T="$(readlink /proc/$pid/fd/1)" || { echo "pid $pid: stdout target UNREADABLE -- FAILURE, not a pass"; continue; }; case "$_T" in socket:*) echo "pid $pid: $_T" ;; *) echo "pid $pid: $_T -- NOT a socket, this monitor is a dead end" ;; esac; done; fi',
             '_PIDS="$(pgrep -u "$USER" -f \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\')"; if [ -z "$_PIDS" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else for pid in $_PIDS; do lsof -a -p "$pid" -d 1; done; fi',
         }
     )
@@ -795,13 +800,22 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             # detached background process looks like (#3007's incident).
             with open(log_path, "w") as f:
                 proc_b = subprocess.Popen(["sleep", "30"], stdout=f)
+            # pid_c: a pid whose /proc/<pid>/fd/1 is genuinely unreadable --
+            # the actual defect #3057 fixes. `true` exits immediately; the
+            # explicit `.wait()` blocks until this test process has reaped
+            # it, so by the time _PIDS is built, /proc/<that pid> no longer
+            # exists at all (not merely a dead symlink target).
+            proc_c = subprocess.Popen(["true"])
+            proc_c.wait()
 
             # Repoint the pid source only: substitute the `_PIDS="$(pgrep
-            # ...)"` assignment with a literal list of the two pids just
-            # spawned. Everything else -- the loud-empty guard's `if [ -z
-            # "$_PIDS" ]` check and the readlink half under test -- runs
-            # verbatim from the charge. Pid discovery for the standalone
-            # `-lf` verify line is covered by the sibling class
+            # ...)"` assignment with a literal list of the three pids just
+            # spawned, in a fixed order (socket, file, dead) -- order
+            # matters for which output line is which. Everything else --
+            # the loud-empty guard's `if [ -z "$_PIDS" ]` check and the
+            # capture-and-test half under test -- runs verbatim from the
+            # charge. Pid discovery for the standalone `-lf` verify line is
+            # covered by the sibling class
             # TestBootChargeMonitorVerifyPatternIsProcessNameAnchored; pid
             # discovery for THIS loop's own embedded `-f` copy (and the
             # Darwin loop's) is covered by
@@ -811,7 +825,7 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             # own live monitors and make the test environment-dependent.
             repointed = re.sub(
                 r'_PIDS="\$\(pgrep.*?\)"',
-                f'_PIDS="{proc_a.pid} {proc_b.pid}"',
+                f'_PIDS="{proc_a.pid} {proc_b.pid} {proc_c.pid}"',
                 cmd,
             )
             assert repointed != cmd, (
@@ -831,23 +845,33 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             sock_b.close()
 
         lines = result.stdout.splitlines()
-        assert len(lines) == 2, (
-            f"expected exactly 2 output lines (one per pid), got stdout={result.stdout!r} "
-            f"stderr={result.stderr!r}"
+        # This is the core property under test: previously a dead pid
+        # silently dropped its own line (2 lines for 3 pids); the fixed
+        # loop is built to print exactly one line per pid in every outcome,
+        # so the line count must match the pid count.
+        assert len(lines) == 3, (
+            f"expected exactly 3 output lines (one per pid, matching pid count), "
+            f"got stdout={result.stdout!r} stderr={result.stderr!r}"
         )
-        socket_line, file_line = lines
+        socket_line, file_line, dead_line = lines
 
         # This IS the discrimination the charge's instruction exists to
         # perform: a monitor whose stdout is a socket (correctly armed) vs
-        # one whose stdout is a file (silently a dead end).
-        assert socket_line.startswith("socket:"), (
-            "the socket-backed pid's stdout-target line must START WITH `socket:` "
-            "(the bracketed inode number varies per run, so this is a prefix check, "
-            f"not an equality check) -- got {socket_line!r}"
+        # one whose stdout is a file (silently a dead end) vs one whose
+        # stdout target is unreadable at all (the pid is dead / the fd
+        # entry vanished).
+        assert socket_line.startswith(f"pid {proc_a.pid}: socket:"), (
+            f"the socket-backed pid's stdout-target line must START WITH `pid {proc_a.pid}: socket:` "
+            "(the bracketed inode number varies per run, so this is a prefix check on the "
+            f"`socket:` segment, not an equality check) -- got {socket_line!r}"
         )
-        assert file_line == str(log_path) and not file_line.startswith("socket:"), (
-            "the file-backed pid's stdout-target line must be the log file's own "
-            f"path and must NOT start with `socket:` -- got {file_line!r}"
+        assert file_line == f"pid {proc_b.pid}: {log_path} -- NOT a socket, this monitor is a dead end", (
+            f"the file-backed pid's stdout-target line must name the log file's own path and "
+            f"the not-a-socket tell -- got {file_line!r}"
+        )
+        assert dead_line == f"pid {proc_c.pid}: stdout target UNREADABLE -- FAILURE, not a pass", (
+            f"the dead pid's stdout-target line must read UNREADABLE -- FAILURE, not silently "
+            f"drop its line -- got {dead_line!r}"
         )
 
     def test_default_charge_carries_the_darwin_branch(self):
