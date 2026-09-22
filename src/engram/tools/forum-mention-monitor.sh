@@ -39,6 +39,18 @@
 #     the engaged window (default 360s = 6 min), skip the emit cycle entirely —
 #     mentions accumulate as unseen and are emitted after the window expires.
 #     The 'engaged' status is published by the forum prompt hook independently.
+#   - unreachable-vs-quiet is EDGE-TRIGGERED, not per-cycle (#3062): a forum
+#     outage and a quiet-but-reachable forum used to be byte-identical at this
+#     script's output (none) — the expiry notice reads "no events delivered"
+#     either way, and there is no way to tell a 7h blackout from a calm night.
+#     Fix mirrors umwelt-bell.py's post-umwelt#637 _ARMED_REACHABLE pattern:
+#     print exactly once on the transition INTO forum-unreachable and once on
+#     the transition back OUT, never once per failed poll. Level-triggered (a
+#     line every cycle) was considered and rejected in that precedent for the
+#     same reason it would be wrong here — at this script's 30s poll interval
+#     an 8h outage is ~960 lines, which destroys the very signal it exists to
+#     give. This does NOT touch $SEEN handling — see the never-clobber
+#     bullet above; the two are orthogonal.
 #   - cross-cycle coalesce window (#1616 / UCS rc2 F10): the first new
 #     mention detected opens a fixed coalesce window (default 120s, override
 #     via $FORUM_MENTION_COALESCE_SECONDS); further new mentions across
@@ -374,6 +386,12 @@ LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
 # If cadence.engaged_window_seconds is customised in config.json, update this too.
 _ENGAGED_WINDOW=360
 
+# Edge-triggered reachability state for the unreachable-vs-quiet announce
+# (#3062 — see the discipline-notes bullet above). Seeded reachable: the seed
+# loop just above only exits once a poll has actually succeeded, so the poll
+# loop below always starts in the reachable state.
+_FORUM_REACHABLE=1
+
 # ---------------------------------------------------------------------------
 # poll loop
 # ---------------------------------------------------------------------------
@@ -393,7 +411,22 @@ while true; do
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle,
     # PRESERVE $SEEN (the fix for the seed-clobber flood, #743) AND the
     # coalesce buffer/window (nothing below this line runs).
-    RESP="$(curl -s --fail "$URL" 2>/dev/null)" || continue
+    #
+    # #3062: the `continue` itself is unchanged ($SEEN and the coalesce
+    # buffer/window still preserved, exactly as before) — only the EDGE is
+    # now announced, once on entry and once on recovery, via
+    # $_FORUM_REACHABLE (declared above the loop).
+    if ! RESP="$(curl -s --fail "$URL" 2>/dev/null)"; then
+        if [ "$_FORUM_REACHABLE" = 1 ]; then
+            echo "⚠️  forum-mention-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
+            _FORUM_REACHABLE=0
+        fi
+        continue
+    fi
+    if [ "$_FORUM_REACHABLE" = 0 ]; then
+        echo "forum-mention-monitor.sh: forum reachable again — receiving resumed"
+        _FORUM_REACHABLE=1
+    fi
     # A 200 whose body does not parse is NOT "zero mentions" (#2225). Left
     # alone it produces an empty $SEEN.now, and the unconditional mv below
     # overwrites $SEEN empty — after which the next GOOD poll marks every
