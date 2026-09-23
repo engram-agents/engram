@@ -3432,43 +3432,68 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
     # can never disagree about what counts as a real gap.
     _needs_async_embedding_regen = False
     try:
-        _null_emb_before = _count_missing_embeddings(conn)
-        if _null_emb_before > 0:
-            emb_config = _get_embedding_config()
-            if not emb_config.get("enabled", True):
-                # Gate the REGENERATION on `enabled` (Borges's ruling, point
-                # 3) -- but the FLAG still fires, naming the cause, matching
-                # the server.py:8017 startup-gate precedent's own wording
-                # for why a deliberate opt-out stays non-fatal.
-                _set_embedding_restore_flag(
-                    conn, null_count=_null_emb_before, cause="disabled-by-config",
-                )
-            elif not _embedder.is_available():
-                # Judgment call (documented in the PR handoff): Borges's
-                # ruling named `enabled` as the synchronous gate explicitly;
-                # extending the same synchronous treatment to a verifiably
-                # UNAVAILABLE embedder (rather than scheduling a thread that
-                # would provably no-op — every node outcome would be
-                # "skipped", per C2's contract) is a superset-safe
-                # extension, not a contradiction: it produces the identical
-                # end state the async path would eventually reach anyway,
-                # without the pointless thread hop.
-                _set_embedding_restore_flag(
-                    conn, null_count=_null_emb_before, cause="embedder-unavailable",
-                )
+        # #3077 round 2 (closing the PR#3078 round-1 reviewer-fairy's
+        # blocker), refined round 4 (closing Borges's colleague-pass
+        # required fix): this whole detection block never itself holds
+        # the regeneration lease. The `_fresh_regeneration_lease_held`
+        # pre-check below is now a CHEAP OPTIMIZATION ONLY — skip the
+        # (real, ~0.07s-at-9399-nodes per Borges's own PR#3076
+        # measurement) _count_missing_embeddings scan when a lease is
+        # already known-fresh — never the correctness mechanism. Round
+        # 2-3 made it the correctness mechanism via a separate
+        # check-then-act (`if not held(conn): <write>`), which is a
+        # genuine TOCTOU: a lease acquired in the window between this
+        # read and a later write would be silently clobbered by that
+        # write. Round 4 fixes this at the SOURCE — every write below
+        # now passes `respect_lease=True`, folding the "don't clobber a
+        # fresh lease" guard into the write's own atomic SQL (the same
+        # WHERE-clause pattern `_try_acquire_regeneration_lease` already
+        # uses) — so correctness no longer depends on this pre-check
+        # being fresh, only on the underlying writes being atomic, which
+        # they now are unconditionally. See _set_embedding_restore_flag's
+        # own `respect_lease` docstring for the full rationale.
+        if not _fresh_regeneration_lease_held(conn):
+            _null_emb_before = _count_missing_embeddings(conn)
+            if _null_emb_before > 0:
+                emb_config = _get_embedding_config()
+                if not emb_config.get("enabled", True):
+                    # Gate the REGENERATION on `enabled` (Borges's ruling,
+                    # point 3) -- but the FLAG still fires, naming the
+                    # cause, matching the server.py:8017 startup-gate
+                    # precedent's own wording for why a deliberate opt-out
+                    # stays non-fatal.
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="disabled-by-config",
+                        respect_lease=True,
+                    )
+                elif not _embedder.is_available():
+                    # Judgment call (documented in the PR handoff): Borges's
+                    # ruling named `enabled` as the synchronous gate explicitly;
+                    # extending the same synchronous treatment to a verifiably
+                    # UNAVAILABLE embedder (rather than scheduling a thread that
+                    # would provably no-op — every node outcome would be
+                    # "skipped", per C2's contract) is a superset-safe
+                    # extension, not a contradiction: it produces the identical
+                    # end state the async path would eventually reach anyway,
+                    # without the pointless thread hop.
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="embedder-unavailable",
+                        respect_lease=True,
+                    )
+                else:
+                    _set_embedding_restore_flag(
+                        conn, null_count=_null_emb_before, cause="regeneration-pending",
+                        respect_lease=True,
+                    )
+                    _needs_async_embedding_regen = True
             else:
-                _set_embedding_restore_flag(
-                    conn, null_count=_null_emb_before, cause="regeneration-pending",
-                )
-                _needs_async_embedding_regen = True
-        else:
-            # No NULL embeddings at all -- clear any stale flag left by an
-            # earlier crashed/failed attempt (documented judgment call, see
-            # _clear_embedding_restore_flag's own docstring: not explicitly
-            # named in Borges's ruling, but required so a resolved problem
-            # doesn't read as permanently broken until the DB happens to
-            # pick up a fresh NULL row).
-            _clear_embedding_restore_flag(conn)
+                # No NULL embeddings at all -- clear any stale flag left by
+                # an earlier crashed/failed attempt (documented judgment
+                # call, see _clear_embedding_restore_flag's own docstring:
+                # not explicitly named in Borges's ruling, but required so
+                # a resolved problem doesn't read as permanently broken
+                # until the DB happens to pick up a fresh NULL row).
+                _clear_embedding_restore_flag(conn, respect_lease=True)
     except Exception as _embed_restore_err:
         print(
             "[_run_db_one_time_setup] embedding restore-completeness check "
@@ -3489,10 +3514,28 @@ def _run_db_one_time_setup(conn: sqlite3.Connection) -> bool:
         # surface "restore state unknown" instead of silence.
         # null_count=-1 is a SENTINEL — the real count is genuinely
         # unknown here, not zero — never read it as an actual count.
+        #
+        # #3077 round 3 (folding the round-2 reviewer-fairy's Suggestion
+        # plus a self-caught completeness gap): this was a FIFTH
+        # unconditional writer round 2 missed. Round 4 (Borges's
+        # colleague-pass required fix on PR#3078) simplifies this: the
+        # write itself is now atomically conditional
+        # (`respect_lease=True`, folded into the UPSERT's own WHERE
+        # clause — see _set_embedding_restore_flag's docstring), so this
+        # site no longer needs its own separate `_fresh_regeneration_
+        # lease_held` pre-check at all — a check-then-act pattern here
+        # would just reintroduce the same TOCTOU window round 4 closes
+        # everywhere else. If a fresh lease genuinely exists, the write
+        # below correctly no-ops (rowcount 0) and leaves it untouched. If
+        # the DB itself is unreachable (the contention scenario this
+        # whole path exists to survive), the outer try/except still
+        # fails safe by skipping the write entirely — same best-effort
+        # posture this function has always had.
         try:
             _set_embedding_restore_flag(
                 conn, null_count=-1,
                 cause=f"detection-failed: {type(_embed_restore_err).__name__}",
+                respect_lease=True,
             )
         except Exception:
             pass  # best-effort -- must not also break setup itself
@@ -5642,7 +5685,10 @@ def _ensure_embedding_restore_state_table(conn: sqlite3.Connection) -> None:
     conn.execute(_EMBEDDING_RESTORE_STATE_SCHEMA)
 
 
-def _set_embedding_restore_flag(conn: sqlite3.Connection, *, null_count: int, cause: str) -> None:
+def _set_embedding_restore_flag(
+    conn: sqlite3.Connection, *, null_count: int, cause: str,
+    respect_lease: bool = False,
+) -> bool:
     """Persist the "DB not fully restored" flag (#3075 C5 round 2).
 
     Durable singleton row (survives process restart — the whole point,
@@ -5652,15 +5698,57 @@ def _set_embedding_restore_flag(conn: sqlite3.Connection, *, null_count: int, ca
     engram_stats/engram_diagnose.
 
     `cause` is one of "disabled-by-config" / "embedder-unavailable" /
-    "per-node-failures" / "regeneration-pending" (the last is the
-    provisional value written before the async regeneration thread has run
-    — see _run_embedding_restore_regeneration below, which overwrites it
-    with the real outcome on completion).
+    "per-node-failures" / "detection-failed: <ExceptionType>" (round 5) /
+    "regeneration-pending" (the provisional value written before the async
+    regeneration thread has run) / "regeneration-running" (#3077 — a
+    SINGLE-FLIGHT LEASE, written via _try_acquire_regeneration_lease, not
+    this function directly, once the thread actually starts working — see
+    that function and _run_embedding_restore_regeneration below, which
+    overwrites this row again with the real outcome on completion).
+
+    #3077 round 4 (Borges's colleague-pass required fix on PR#3078):
+    `respect_lease=True` makes this write ATOMICALLY conditional on no
+    fresh "regeneration-running" lease existing at write time — the same
+    WHERE-clause pattern `_try_acquire_regeneration_lease` already uses,
+    folded into this write's own SQL — rather than a separate
+    caller-side `if not _fresh_regeneration_lease_held(conn): ...`
+    pre-check. Rounds 2-3's pre-check pattern was CHECK-THEN-ACT: a
+    genuine TOCTOU race, since a lease acquired in the window between
+    the read and this write would be silently clobbered by it. Every
+    NON-HOLDER writer (the detection site, its detection-failed handler,
+    the manual regen script) must pass `respect_lease=True`. The
+    legitimate lease holder's own finalize write
+    (`_finalize_embedding_restore_flag`, called only after THIS
+    process's own `_try_acquire_regeneration_lease` already succeeded)
+    must NEVER pass this — it needs to unconditionally overwrite its own
+    lease with the real outcome, and this function has no way to
+    distinguish "my own lease" from "someone else's."
+
+    Returns True if the write actually happened. With
+    `respect_lease=True`, returns False if a fresh lease blocked it (the
+    row was left completely untouched); with the default `False`,
+    always returns True (unconditional, matching pre-round-4 behavior
+    exactly).
 
     Commits immediately — this is a small, standalone bookkeeping write,
     not part of the caller's own larger transaction.
     """
     _ensure_embedding_restore_state_table(conn)
+    if respect_lease:
+        _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+        cur = conn.execute(
+            "INSERT INTO embedding_restore_state "
+            "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+            "VALUES (1, 1, ?, ?, ?) "
+            "ON CONFLICT(singleton_key) DO UPDATE SET "
+            "not_fully_restored=1, null_count=excluded.null_count, "
+            "cause=excluded.cause, updated_at=excluded.updated_at "
+            "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+            "   OR embedding_restore_state.updated_at < ?",
+            (null_count, cause, _now(), _cutoff),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
         "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
@@ -5671,9 +5759,12 @@ def _set_embedding_restore_flag(conn: sqlite3.Connection, *, null_count: int, ca
         (null_count, cause, _now()),
     )
     conn.commit()
+    return True
 
 
-def _clear_embedding_restore_flag(conn: sqlite3.Connection) -> None:
+def _clear_embedding_restore_flag(
+    conn: sqlite3.Connection, *, respect_lease: bool = False,
+) -> bool:
     """Clear the restore-completeness flag (#3075 C5 round 2) — called after
     a fully-successful regeneration (every NULL-embedding node now has an
     embedding), by either the async regeneration thread or a manual
@@ -5683,8 +5774,28 @@ def _clear_embedding_restore_flag(conn: sqlite3.Connection) -> None:
     NULL-embedding nodes at all: a flag left set by an earlier crashed/failed
     attempt must not read as stale-but-permanent once the underlying problem
     is actually gone.
+
+    #3077 round 4: `respect_lease=True` — same atomic-WHERE-clause
+    reasoning, same caller obligation, same return-value contract as
+    `_set_embedding_restore_flag`'s own `respect_lease` parameter; see
+    that function's docstring for the full rationale, not duplicated
+    here.
     """
     _ensure_embedding_restore_state_table(conn)
+    if respect_lease:
+        _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+        cur = conn.execute(
+            "INSERT INTO embedding_restore_state "
+            "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+            "VALUES (1, 0, 0, NULL, ?) "
+            "ON CONFLICT(singleton_key) DO UPDATE SET "
+            "not_fully_restored=0, null_count=0, cause=NULL, updated_at=excluded.updated_at "
+            "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+            "   OR embedding_restore_state.updated_at < ?",
+            (_now(), _cutoff),
+        )
+        conn.commit()
+        return cur.rowcount > 0
     conn.execute(
         "INSERT INTO embedding_restore_state "
         "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
@@ -5694,6 +5805,7 @@ def _clear_embedding_restore_flag(conn: sqlite3.Connection) -> None:
         (_now(),),
     )
     conn.commit()
+    return True
 
 
 def _get_embedding_restore_flag(conn: sqlite3.Connection) -> dict:
@@ -5719,7 +5831,9 @@ def _get_embedding_restore_flag(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _finalize_embedding_restore_flag(conn: sqlite3.Connection, counts: dict) -> None:
+def _finalize_embedding_restore_flag(
+    conn: sqlite3.Connection, counts: dict, *, respect_lease: bool = False,
+) -> None:
     """Clear/set the restore-completeness flag from a FRESH state re-count,
     not from the just-completed pass's own tally (#3075 C5 round 4,
     Borges's design ruling on PR#3076).
@@ -5770,10 +5884,25 @@ def _finalize_embedding_restore_flag(conn: sqlite3.Connection, counts: dict) -> 
     server-side path) and `tools/engram-regenerate-embeddings.py` (the
     manual restore-path script) — same reasoning as round 3: the
     decision lives in ONE place, not duplicated per call site.
+
+    #3077 round 4 (Borges's colleague-pass required fix): `respect_lease`
+    threads straight through to both internal `_clear_embedding_restore_flag`/
+    `_set_embedding_restore_flag` calls below — same atomic-WHERE-clause
+    reasoning as those functions' own `respect_lease` parameter.
+    `_run_embedding_restore_regeneration`'s own call (the legitimate
+    lease holder finishing its own work) must call this with the
+    default `respect_lease=False` — it needs to unconditionally
+    overwrite its own lease with the real outcome. The manual regen
+    script's call, which is NEVER the lease holder, must pass
+    `respect_lease=True` — and, critically, must do so on THIS call
+    directly rather than wrapping the whole call in its own separate
+    `if not _fresh_regeneration_lease_held(conn): ...` pre-check (the
+    exact check-then-act TOCTOU this round closes at every non-holder
+    site).
     """
     _missing = _count_missing_embeddings(conn)
     if _missing == 0:
-        _clear_embedding_restore_flag(conn)
+        _clear_embedding_restore_flag(conn, respect_lease=respect_lease)
         return
     emb_config = _get_embedding_config()
     if not emb_config.get("enabled", True):
@@ -5798,7 +5927,149 @@ def _finalize_embedding_restore_flag(conn: sqlite3.Connection, counts: dict) -> 
             "genuine disagreement.)",
             counts.get("failed", 0), _missing, _cause,
         )
-    _set_embedding_restore_flag(conn, null_count=_missing, cause=_cause)
+    _set_embedding_restore_flag(
+        conn, null_count=_missing, cause=_cause, respect_lease=respect_lease,
+    )
+
+
+# ---------------------------------------------------------------------------
+# #3077 — cross-process single-flight lease for the async regeneration pass.
+#
+# Every process that runs _run_db_one_time_setup with missing embeddings > 0
+# independently spawns its OWN _run_embedding_restore_regeneration thread —
+# safe (NULL-only, idempotent) but wasteful under concurrency: N concurrent
+# MCP sessions / short-lived CLIs each redundantly re-embed the same rows.
+# This section adds a lease so only one pass actually does the work at a
+# time; the rest exit immediately without touching anything.
+# ---------------------------------------------------------------------------
+
+_REGENERATION_LEASE_STALENESS_SECONDS = 600  # 10 minutes, per Borges's ruling
+# DOCUMENTED BOUND (Borges's colleague-pass Suggestion on PR#3078, accepted
+# as a bound rather than a fix): this lease is never RENEWED mid-pass. A
+# genuine regeneration pass that takes longer than this window loses its
+# lease, and a second process can then start a duplicate pass -- wasteful,
+# not unsafe (the underlying regeneration is idempotent/NULL-only either
+# way). Borges measured all-MiniLM-L6-v2 at ~320 short texts/s one-at-a-time
+# on his seat, making a 9,399-node restore roughly a minute -- 600s is ample
+# there. A CPU-only host an order of magnitude slower, with longer real
+# claim text, could approach this bound. If real-world pass durations ever
+# regularly approach it, add a heartbeat (refresh updated_at every N nodes
+# inside _reembed_nodes) rather than just raising the constant.
+
+
+def _try_acquire_regeneration_lease(conn: sqlite3.Connection, *, null_count: int) -> bool:
+    """Atomically acquire the "regeneration-running" lease (#3077).
+
+    Returns True (and durably sets cause="regeneration-running" with a
+    FRESH updated_at) when no fresh lease already exists: no row at all,
+    cause is NULL (the cleared/all-clear state), cause is any OTHER
+    terminal value, or cause IS "regeneration-running" but its updated_at
+    is older than _REGENERATION_LEASE_STALENESS_SECONDS (a crashed or
+    killed lease-holder self-heals — nobody has to detect the crash,
+    the staleness window just expires).
+
+    Returns False, making NO changes to the row whatsoever, when a FRESH
+    "regeneration-running" lease already exists — the caller must not do
+    any work in that case (see _run_embedding_restore_regeneration below).
+
+    The mutual exclusion is SQLite's own transactional serialization on a
+    single conditional UPSERT — verified empirically (not assumed) to
+    behave as a genuine cross-connection compare-and-swap, including
+    under real concurrent threads/connections against the same db file
+    (see this file's own test suite, TestTryAcquireRegenerationLease.
+    test_acquire_is_atomic_under_real_concurrency). No new lock, no new
+    table — this reuses the existing embedding_restore_state singleton
+    row. `_db_setup_lock` (a Python threading.Lock) does NOT help here —
+    it only serializes threads WITHIN one process, never across the
+    separate processes (concurrent MCP sessions, short-lived CLIs) this
+    lease actually needs to coordinate.
+
+    IMPORTANT SQL NOTE, verified empirically during design (a real bug
+    this exact check caught before it shipped): the WHERE clause MUST use
+    `IS NOT 'regeneration-running'`, never `!= 'regeneration-running'`.
+    In SQL, `NULL != 'x'` evaluates to NULL (not TRUE), so a naive `!=`
+    would leave the WHERE clause false whenever cause is NULL (the
+    ordinary cleared/all-clear state) — meaning the lease could NEVER be
+    acquired again once the flag had ever been cleared. `IS NOT` is
+    NULL-safe and was confirmed correct against exactly this case.
+
+    `null_count` is used only on the INSERT branch (no prior row) — on
+    the UPDATE (conflict) branch it is deliberately left untouched
+    (not part of the SET clause), preserving whatever count the last
+    detection pass recorded; it is purely informational either way and
+    never load-bearing to the mutual-exclusion decision itself.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    _now_ts = _now()
+    _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+    cur = conn.execute(
+        "INSERT INTO embedding_restore_state "
+        "(singleton_key, not_fully_restored, null_count, cause, updated_at) "
+        "VALUES (1, 1, ?, 'regeneration-running', ?) "
+        "ON CONFLICT(singleton_key) DO UPDATE SET "
+        "not_fully_restored=1, cause='regeneration-running', "
+        "updated_at=excluded.updated_at "
+        "WHERE embedding_restore_state.cause IS NOT 'regeneration-running' "
+        "   OR embedding_restore_state.updated_at < ?",
+        (null_count, _now_ts, _cutoff),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def _iso_seconds_ago(seconds: int) -> str:
+    """ISO-8601 UTC timestamp `seconds` in the past — same format as _now(),
+    so lexicographic string comparison against a stored updated_at value
+    correctly matches chronological comparison (#3077).
+    """
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+
+
+def _fresh_regeneration_lease_held(conn: sqlite3.Connection) -> bool:
+    """Read-only check: is a FRESH "regeneration-running" lease currently
+    held by some process (#3077 round 2, closing the PR#3078 round-1
+    reviewer-fairy's blocker)?
+
+    The round-1 lease mechanism (_try_acquire_regeneration_lease) was
+    individually correct but NOT actually cross-process exclusive under
+    its own stated primary scenario: `_run_db_one_time_setup`'s
+    detection-site write (`_set_embedding_restore_flag`/
+    `_clear_embedding_restore_flag`, both unconditional) would CLOBBER a
+    fresh lease held by another process the moment a second process's
+    ordinary startup ran detection — letting that second process
+    successfully re-acquire the lease and run a fully redundant
+    concurrent regeneration pass. Reproduced empirically (both by the
+    reviewer-fairy and independently by me, against the real shipped
+    functions) before this fix: no crash, no 10-minute wait required —
+    just ordinary concurrent session startup while a nontrivial backfill
+    is still running on the first session.
+
+    This function is the shared guard used by every writer that
+    STRUCTURALLY NEVER HOLDS THE LEASE ITSELF: the detection site (below)
+    and the manual regen script's own finalize call
+    (tools/engram-regenerate-embeddings.py). Both skip their own write
+    entirely when this returns True — their writes were only ever
+    informational snapshots, never load-bearing, so skipping costs
+    nothing; the in-flight pass's own `_finalize_embedding_restore_flag`
+    call determines the true final state when it completes.
+
+    NEVER call this from `_run_embedding_restore_regeneration`'s own
+    finalize call. That call IS the lease holder finishing its own
+    work — at that point the row legitimately still reads
+    "regeneration-running" (itself) with a fresh `updated_at`, and this
+    function has NO way to distinguish "my own lease" from "someone
+    else's." It is only safe to call from code paths that never hold the
+    lease themselves — using it anywhere else would incorrectly skip a
+    necessary write.
+    """
+    _ensure_embedding_restore_state_table(conn)
+    row = conn.execute(
+        "SELECT cause, updated_at FROM embedding_restore_state WHERE singleton_key = 1"
+    ).fetchone()
+    if not row or row[0] != "regeneration-running":
+        return False
+    _cutoff = _iso_seconds_ago(_REGENERATION_LEASE_STALENESS_SECONDS)
+    return row[1] is not None and row[1] >= _cutoff
 
 
 def _run_embedding_restore_regeneration(db_path: str) -> None:
@@ -5818,6 +6089,15 @@ def _run_embedding_restore_regeneration(db_path: str) -> None:
     which may be closed or reused concurrently on the main thread by the
     time this thread actually runs.
 
+    #3077: FIRST attempts to acquire the single-flight lease
+    (_try_acquire_regeneration_lease) before doing any work at all. If
+    another process's lease is fresh, this returns IMMEDIATELY — no
+    _reembed_null_nodes call, no embed() calls, the existing lease row is
+    left completely untouched. This is what actually eliminates the
+    redundant-compute cost (#3077's whole point) — a thread still gets
+    spawned per process (cheap), but only the lease-holder does the
+    expensive scan-and-embed work.
+
     On completion: delegates to _finalize_embedding_restore_flag, which
     (round 4) decides clear-vs-set from a FRESH, skip-aware state
     re-count of missing embeddings — never from this pass's own returned
@@ -5827,6 +6107,9 @@ def _run_embedding_restore_regeneration(db_path: str) -> None:
     mid-run, "per-node-failures" if it's still available/enabled and
     individual embed() calls simply failed. See that function's own
     docstring for the full round 2/3/4 history this line summarizes.
+    Because this always writes a DIFFERENT cause than
+    "regeneration-running" (or clears the flag outright), the lease is
+    inherently self-releasing on completion — no separate release call.
     """
     import sys
     try:
@@ -5834,6 +6117,8 @@ def _run_embedding_restore_regeneration(db_path: str) -> None:
         try:
             conn.execute("PRAGMA foreign_keys=ON")
             _load_vec_extension(conn)
+            if not _try_acquire_regeneration_lease(conn, null_count=-1):
+                return  # another process's pass is already in flight (#3077)
             _reembed_counts = _reembed_null_nodes(conn)
             _finalize_embedding_restore_flag(conn, _reembed_counts)
         finally:

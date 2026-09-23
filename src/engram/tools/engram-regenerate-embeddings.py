@@ -304,7 +304,18 @@ def backfill_embeddings(engram_home: Path) -> None:
             # NULL embeddings exist, so any restore-completeness flag left
             # set by an earlier crashed/failed attempt is stale — clear it.
             try:
-                server.core._clear_embedding_restore_flag(conn)
+                # #3077 round 4 (Borges's colleague-pass required fix):
+                # this script never acquires the regeneration lease
+                # itself, so a fresh "regeneration-running" lease found
+                # here is definitionally someone else's. round 2's
+                # separate `if not fresh_lease_held(conn): <write>`
+                # pre-check was a check-then-act TOCTOU (a lease acquired
+                # in the window between the read and this write would be
+                # silently clobbered) -- fixed by folding the guard into
+                # the write's own atomic SQL instead
+                # (respect_lease=True, see _clear_embedding_restore_flag's
+                # docstring).
+                server.core._clear_embedding_restore_flag(conn, respect_lease=True)
             except Exception:
                 pass  # best-effort — never fail the script over flag bookkeeping
             return
@@ -356,7 +367,16 @@ def backfill_embeddings(engram_home: Path) -> None:
         # a few lines above already calls "expected") no longer leaves
         # this flag permanently stuck with an unhelpful remedy.
         try:
-            server.core._finalize_embedding_restore_flag(conn, counts)
+            # #3077 round 4 (Borges's colleague-pass required fix): same
+            # reasoning as the processed==0 branch above -- this script
+            # never acquires the lease itself, so the finalize write must
+            # respect a genuinely fresh lease. respect_lease=True on THIS
+            # call folds the guard into _finalize_embedding_restore_flag's
+            # own atomic writes, rather than a separate check-then-act
+            # pre-check around the whole call (round 2's TOCTOU).
+            server.core._finalize_embedding_restore_flag(
+                conn, counts, respect_lease=True,
+            )
         except Exception:
             pass  # best-effort — never fail the script over flag bookkeeping
 
