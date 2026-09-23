@@ -386,6 +386,65 @@ def _check_backup_staleness(engram_home: str) -> tuple[bool, str | None]:
         return True, None  # advisory — never block session start
 
 
+def _check_embedding_restore_flag(engram_home: str) -> tuple[bool, str | None]:
+    """Check the embedding restore-completeness flag (#3075 C5 round 2,
+    Borges's design ruling).
+
+    Reads the embedding_restore_state singleton row directly via a
+    read-only SQLite connection — this hook process never imports
+    engram_core; duplicated by value from engram-surface-hook.py's own
+    identically-named function (same cross-process-boundary precedent this
+    file's sibling hook already follows — see that function's docstring for
+    the full rationale) and from engram_core.py's server-side
+    _get_embedding_restore_flag.
+
+    Returns (True, None) when the flag is unset/clear, the DB is absent,
+    the table doesn't exist yet (a DB that predates this feature), or on
+    any other read failure — fail-open, same posture as
+    _check_backup_staleness above: an advisory probe must never block
+    session start.
+
+    Returns (False, message) when the flag IS SET — message names the
+    count, cause, and remedy.
+    """
+    db_path = os.path.join(engram_home, "knowledge.db")
+    if not os.path.exists(db_path):
+        return True, None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        row = conn.execute(
+            "SELECT not_fully_restored, null_count, cause FROM "
+            "embedding_restore_state WHERE singleton_key = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return True, None
+        null_count, cause = row[1], row[2]
+        if cause and cause.startswith("detection-failed"):
+            # ROUND 4 (Borges's colleague pass, PR#3076 finding A):
+            # null_count=-1 here is a SENTINEL — detection itself raised,
+            # so the real count is unknown, not zero. A distinct message
+            # avoids a nonsensical "-1 node(s) lack embeddings" line.
+            return False, (
+                f"restore-completeness state UNKNOWN ({cause}) — recall "
+                f"may be degraded"
+            )
+        return False, (
+            f"{null_count} node(s) lack embeddings (cause: {cause}) — "
+            f"recall degraded/blocked for these nodes"
+        )
+    except sqlite3.OperationalError:
+        return True, None  # table doesn't exist yet — treat as clear
+    except Exception:
+        return True, None  # fail-open — advisory probe, never block
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 # ── Viz-server health probe (#2783) ─────────────────────────────────────────
 # The MCP probe above is deliberately tri-state (#1754); the viz server needs
 # a REQUIRED fourth state -- see _check_viz_server_health's docstring for why
@@ -3003,6 +3062,7 @@ def main() -> None:
     mcp_status, mcp_reason = _check_mcp_health(ENGRAM_HOME)
     stale_ok, stale_reason = _check_backup_staleness(ENGRAM_HOME)
     viz_status, viz_reason = _check_viz_server_health(ENGRAM_HOME)
+    embed_restore_ok, embed_restore_reason = _check_embedding_restore_flag(ENGRAM_HOME)
 
     # Tri-state (#1754): False = confirmed absent (hard alarm); None =
     # indeterminate probe (soft note, no "tell the user immediately" — a
@@ -3019,7 +3079,10 @@ def main() -> None:
     viz_down = viz_status == "down"
     viz_inconclusive = viz_status == "indeterminate"
 
-    if mcp_offline or mcp_inconclusive or not stale_ok or viz_down or viz_inconclusive:
+    if (
+        mcp_offline or mcp_inconclusive or not stale_ok or viz_down
+        or viz_inconclusive or not embed_restore_ok
+    ):
         lines.append("")
         lines.append("⚠️  ENGRAM substrate health:")
         if mcp_offline:
@@ -3035,6 +3098,18 @@ def main() -> None:
             lines.append("  → Tell the user; the health dashboard is unreachable.")
         elif viz_inconclusive:
             lines.append(f"  Viz liveness: inconclusive ({viz_reason})")
+        if not embed_restore_ok:
+            # #3075 C5 round 2 (Borges's design ruling): same flag the
+            # surface hook re-checks every prompt (engram-surface-hook.py's
+            # own _check_embedding_restore_flag) — surfaced here too so the
+            # very first turn of a session already carries it, not just the
+            # first UserPromptSubmit.
+            lines.append(f"  Embeddings: DB NOT FULLY RESTORED ({embed_restore_reason})")
+            lines.append(
+                "  → Run tools/engram-regenerate-embeddings.py once an "
+                "embedder is available (or wait — a regeneration may "
+                "already be running in the background)."
+            )
 
     if source == "startup":
         # ── Small, single-purpose, cheap, purely-local-or-bounded-subprocess
