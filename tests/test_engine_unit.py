@@ -6,8 +6,6 @@ Tests:
      - Essential tier returns only essential entries
      - Convenience tier is a superset of essential
      - Dev tier is a superset of convenience
-     - MA-gated entries excluded without --multi-agent
-     - MA-gated entries included with --multi-agent
      - excluded[] entries are never in select_shippables (they aren't in mechanisms[])
   2. filter_hooks_json — happy path + edges
      - MA-flagged hook dropped when hook isn't in shipped set
@@ -85,53 +83,6 @@ class TestSelectShippables:
         missing = conv - dev
         assert not missing, (
             f"dev set is not a superset of convenience: {sorted(missing)}"
-        )
-
-    def test_ma_gated_entry_excluded_without_flag(self):
-        """MA-gated entries must not appear when multi_agent=False.
-
-        #2857 step 1 un-gated every genuinely forum-backed hook/skill
-        (baton/inter-agent hooks, engram-letter, etc.) — they ship
-        regardless of --multi-agent now. #2857 step 2 then disposed of five
-        of the six remaining NOT-forum-backed entries: session.py,
-        _session_context.py, and the sibling collab-letter-monitor.sh were
-        deleted outright; _channel.py and agents.json.example were
-        reclassified to excluded[]. tools/collab-baton-monitor.sh is the
-        only entry left with multi_agent: true in mechanisms[], so it is
-        now the sole "known MA-gated" fixture.
-        """
-        result = self.select_shippables(self.manifest, "convenience", multi_agent=False)
-        paths = {e["path"] for e in result}
-        # Known MA-gated entry (still gated post-#2857 step 2)
-        assert "tools/collab-baton-monitor.sh" not in paths, (
-            "tools/collab-baton-monitor.sh must not ship without --multi-agent"
-        )
-        # Forum-backed entries are un-gated now — they DO ship without --multi-agent
-        assert "hooks/claude/engram-baton-prompt-hook.py" in paths, (
-            "engram-baton-prompt-hook.py should ship without --multi-agent "
-            "now that it is forum-backed and un-gated (#2857 step 1)"
-        )
-        assert "hooks/claude/engram-inter-agent-prompt-hook.py" in paths, (
-            "engram-inter-agent-prompt-hook.py should ship without --multi-agent "
-            "now that it is forum-backed and un-gated (#2857 step 1)"
-        )
-        assert "skills/claude/engram-letter" in paths, (
-            "engram-letter skill should ship without --multi-agent "
-            "now that it is forum-backed and un-gated (#2857 step 1)"
-        )
-
-    def test_ma_gated_entry_included_with_flag(self):
-        """MA-gated entries at the right tier must appear when multi_agent=True."""
-        result = self.select_shippables(self.manifest, "convenience", multi_agent=True)
-        paths = {e["path"] for e in result}
-        assert "tools/collab-baton-monitor.sh" in paths
-
-    def test_ma_gated_blocked_by_tier_even_with_flag(self):
-        """An MA-gated convenience entry must not ship at essential tier, even with MA flag."""
-        result = self.select_shippables(self.manifest, "essential", multi_agent=True)
-        paths = {e["path"] for e in result}
-        assert "tools/collab-baton-monitor.sh" not in paths, (
-            "MA-gated convenience tool must not ship at essential tier even with --multi-agent"
         )
 
     def test_dev_tier_ships_dev_entries(self):

@@ -506,11 +506,6 @@
       "tier": "convenience"
     },
     {
-      "path": "tools/collab-baton-monitor.sh",
-      "tier": "convenience",
-      "multi_agent": true
-    },
-    {
       "path": "tools/forum-mention-monitor.sh",
       "tier": "convenience"
     },

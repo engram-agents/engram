@@ -42,19 +42,6 @@ short "could this match the invoker / a co-tenant?" answer):
       at test time below; both files are also asserted to carry the
       identical pattern.
 
-  UNARMED / DEAD CODE (found during #3032's repo sweep, NOT repaired here --
-  routed to #2857 for a deletion decision instead; repairing an unused
-  script's GNU escapes would only produce a more convincing decoy):
-    - collab-baton-monitor.sh — carries the identical `\\S`/`\\s` GNU-escape
-      defect #3032 fixes above, and #1935's anchoring fix (same shape as
-      #2028's) is subject to the identical Darwin inertness. Verified
-      (2026-09-19) to have no arm site anywhere in this repo, the installed
-      plugin tree, hooks config, or settings, and no running process on
-      this host -- every repo hit is a test, a packaging manifest, or the
-      changelog. `TestCollabBatonMonitorReapPattern` below is marked
-      `xfail` for this reason: fixing it here would repair code nothing
-      runs, which is worse than leaving it visibly broken pending #2857.
-
   EXCLUDED (not a pattern-liveness probe): tools/agentctl's account-
   decommission `pkill -KILL -u "$newborn_user"` / `pgrep -u "$newborn_user"`
   (~line 1127-1129) is a uid-scoped kill-everything-for-this-account step,
@@ -1066,110 +1053,6 @@ class TestForumUpdatesMonitorCandidatePattern(_TwoLayerMonitorFixture):
         assert verified == [target_pid, wrapper_pid]
         assert invoker_decoy_pid not in verified
         assert cotenant_pid not in verified
-
-
-# ===========================================================================
-# FINDING (xfail, not fixed here): collab-baton-monitor.sh's #1935 anchoring
-# fix (below) is real, but the pattern it anchored carries the SAME
-# \S/\s GNU-only-escape defect #3032 fixes for the boot charges above --
-# and this script is unarmed dead code (no arm site anywhere in this repo,
-# the installed plugin tree, hooks config, settings, or on this host's
-# process table; verified 2026-09-19), routed to #2857 for a deletion
-# decision rather than repaired here.
-# ===========================================================================
-
-
-class _SingleLayerReapMonitorFixture:
-    SCRIPT: Path
-
-    def _build_table(self, script_basename: str, purpose: str):
-        target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid = 1, 2, 3, 4
-        table = [
-            # target: a genuine second instance -- this IS meant to be
-            # reaped (last-arm-wins by design).
-            {
-                "pid": target_pid,
-                "uid": 1000,
-                "cmdline": ["bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-            # co-tenant equivalent, different uid -- must be excluded by -u.
-            {
-                "pid": cotenant_pid,
-                "uid": 1001,
-                "cmdline": ["bash", f"/home/agentY/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-            # invoking-process self-quote decoy -- the #1933 repro shape,
-            # UNFIXED here: this script has no second layer to filter it.
-            {
-                "pid": invoker_decoy_pid,
-                "uid": 1000,
-                "cmdline": [
-                    "python3", "-c", "import time; time.sleep(9)",
-                    f"Automatic morning boot charge: bash /home/agentX/.engram/tools/{script_basename} "
-                    f"--purpose {purpose} (unrelated instructions) continue with the day's plan",
-                ],
-            },
-            # wrapper: a genuine second instance via login-shell argv0.
-            {
-                "pid": wrapper_pid,
-                "uid": 1000,
-                "cmdline": ["-bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-        ]
-        return table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid)
-
-    def _pattern(self, script_basename: str, purpose: str) -> str:
-        patterns = _extract_pgrep_pattern_branches(self.SCRIPT)
-        return patterns["named"].format(purpose=purpose)
-
-
-class TestCollabBatonMonitorReapPattern(_SingleLayerReapMonitorFixture):
-    """ANCHORING fixed by #1935 (porting #1933/#2028's process-name-anchored
-    candidate pattern -- collab-baton-monitor.sh no longer feeds an
-    unanchored substring match straight into `kill`; the candidate pgrep
-    pattern is anchored on `^(\\S*/)?-?bash\\s+...` so the self-quoting-
-    charge-text decoy is excluded even before any /proc/<pid>/cmdline
-    verification runs, and the script also gained the /proc two-layer
-    verification + warn-not-kill posture (see the script's own inline
-    comments)).
-
-    ESCAPE DIALECT NOT fixed (#3032): that same anchor is written with
-    `\\S`/`\\s`, the identical GNU-only-escape defect #3032 fixes for the
-    boot-charge markdown above -- on real BSD `pgrep`, this pattern matches
-    NOTHING, exactly like the pre-fix boot-charge pattern did (measured on
-    this seat's own Darwin `pgrep`). Not repaired here: #3032's sweep found
-    collab-baton-monitor.sh has no arm site anywhere in this repo, the
-    installed plugin tree, hooks config, settings, or this host's process
-    table -- it is unarmed dead code, routed to #2857 for a deletion
-    decision rather than patched into a more convincing decoy. This test
-    is therefore marked `xfail`: `simulate_pgrep_f`'s #3032 hardening
-    correctly refuses to bless this pattern, and that refusal is expected,
-    not a regression."""
-
-    SCRIPT = _TOOLS / "collab-baton-monitor.sh"
-
-    @pytest.mark.xfail(
-        raises=GnuOnlyBsdEscapeError,
-        reason=(
-            "#3032: collab-baton-monitor.sh's _pgrep_pattern still carries "
-            "\\S/\\s GNU-only escapes real BSD pgrep cannot run. Unarmed "
-            "dead code (no arm site found anywhere) -- routed to #2857 for "
-            "a deletion decision rather than repaired here."
-        ),
-        strict=True,
-    )
-    def test_reap_pattern_matches_exactly_the_target_and_wrapper(self):
-        purpose = "unittestpurpose"
-        pattern = self._pattern("collab-baton-monitor.sh", purpose)
-        table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid) = self._build_table(
-            "collab-baton-monitor.sh", purpose
-        )
-
-        matched = simulate_pgrep_f(pattern, table, uid=1000)
-        # Desired safe behavior (what this asserts, and what currently
-        # fails): only the target + wrapper (genuine instances meant to be
-        # reaped) match -- the self-quote decoy must NOT.
-        assert matched == [target_pid, wrapper_pid]
 
 
 if __name__ == "__main__":

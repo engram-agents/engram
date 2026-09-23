@@ -494,12 +494,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/collab-baton-monitor.sh",
-      "test_globs": [
-        "tests/test_baton_monitor.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
