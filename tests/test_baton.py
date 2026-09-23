@@ -3660,6 +3660,64 @@ class TestParseGithubAnchor:
         assert _baton._parse_github_anchor("not-an-anchor") is None
 
 
+class TestPrBatonNameRe:
+    """#2010 (+followup): _PR_BATON_NAME_RE matches a PR-baton's project_id
+    by PREFIX ONLY -- both bare "PR-<N>" and repo-qualified
+    "<REPO>-PR-<N>" (the documented cross-repo naming convention,
+    umwelt/CLAUDE.md) must match, and so must a live "PR-<N>-<repo-slug>"
+    naming shape (e.g. "PR-37-paper") -- what follows the "PR-" prefix is
+    irrelevant to this gate, which is a pure shape test with no capture
+    group. Matched against project_id.upper(), per the call sites."""
+
+    def test_bare_pr_id_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("PR-42".upper()) is not None
+
+    def test_repo_qualified_umwelt_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("UMWELT-PR-572".upper()) is not None
+
+    def test_repo_qualified_engram_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("ENGRAM-PR-2020".upper()) is not None
+
+    def test_lowercase_repo_qualified_matches_when_uppercased(self):
+        """Call sites match against project_id.upper() -- confirm the
+        pattern (which requires uppercase [A-Z]) is satisfied once the
+        caller does that normalization, not case-insensitive on its own."""
+        assert _baton._PR_BATON_NAME_RE.match("umwelt-pr-572".upper()) is not None
+
+    def test_num_dash_suffix_shape_matches(self):
+        """'PR-37-paper' (a live baton naming shape in the engram-paper
+        repo) matches -- the digits and the trailing "-paper" suffix are
+        both irrelevant to this prefix-only gate. An interim
+        suffix-anchored regex ("...(\\d+)$") regressed this shape; the
+        prefix-only form restores it."""
+        assert _baton._PR_BATON_NAME_RE.match("PR-37-paper".upper()) is not None
+
+    def test_non_pr_pool_coordination_does_not_match(self):
+        assert _baton._PR_BATON_NAME_RE.match("pool-coordination".upper()) is None
+
+    def test_non_pr_issue_id_does_not_match(self):
+        assert _baton._PR_BATON_NAME_RE.match("ISSUE-200".upper()) is None
+
+    def test_malformed_non_numeric_suffix_now_matches_by_design(self):
+        """'PR-abc' still starts with "PR-", so under the prefix-only fix
+        it DOES match this gate (unlike the interim, over-tightened
+        suffix-anchored regex, which required the string to end right
+        after a numeric suffix and so excluded it). This gate's only job
+        is the shape test; a downstream anchor-resolution step is what
+        keeps a malformed id like this from ever being silently closed
+        (see cmd_gc's own coverage of that in TestGcSuffixMatchAndNearMiss)."""
+        assert _baton._PR_BATON_NAME_RE.match("PR-ABC".upper()) is not None
+
+    def test_no_hyphen_before_pr_does_not_match(self):
+        """'XPR-42' looks PR-related (contains "PR-") but has no hyphen
+        separating a repo-qualifier segment from "PR-", so the optional
+        `(?:[A-Z][A-Z0-9]*-)?` group cannot consume the leading "X" alone
+        -- and 'XPR-42' itself doesn't start with "PR-" either. This is
+        exactly the near-miss shape cmd_gc's near_miss_ids counter exists
+        to surface rather than silently drop."""
+        assert _baton._PR_BATON_NAME_RE.match("XPR-42".upper()) is None
+
+
 class TestInitRepoQualification:
     def test_init_refuses_bare_anchor_auto_derived_from_pr_project_id(self, monkeypatch, capsys):
         """A PR-<N> project_id with no --github still auto-derives pr/<N>
@@ -4105,7 +4163,7 @@ class TestGcRepoAware:
 
         assert captured_cmds == []  # no gh call at all -- never guessed
         captured = capsys.readouterr()
-        assert "skipped 1 PR-baton" in captured.err
+        assert "ungauged 1 PR-baton" in captured.err
         assert "unqualified" in captured.err
 
     def test_gc_skips_pr_baton_with_no_github_anchor(self, monkeypatch, capsys):
@@ -4123,7 +4181,7 @@ class TestGcRepoAware:
 
         assert called == []  # no gh call at all for the ungauged baton
         captured = capsys.readouterr()
-        assert "skipped 1 PR-baton" in captured.err
+        assert "ungauged 1 PR-baton" in captured.err
 
     def test_gc_two_different_repos_same_number_both_handled_correctly(self, monkeypatch):
         """The exact #1715 collision shape: two PR-batons for the SAME
@@ -4165,6 +4223,257 @@ class TestGcRepoAware:
         assert "22" in by_repo["example-org/example-repo"]
 
 
+class TestGcSuffixMatchAndNearMiss:
+    """#2010 (+followup): cmd_gc's PR-baton name gate is a PREFIX-only shape
+    test, so a correctly-anchored repo-qualified baton (e.g.
+    "ENGRAM-PR-2020", per umwelt/CLAUDE.md's documented cross-repo naming
+    convention) is reaped exactly like a bare "PR-<N>" baton, and so is a
+    live "PR-<N>-<repo-slug>" naming shape (e.g. "PR-37-paper") -- an
+    interim suffix-anchored regex regressed that second shape, which this
+    class also now covers. A project_id that merely *looks* PR-related
+    without matching the prefix pattern at all is surfaced via an explicit
+    named near-miss counter rather than silently dropped; a project_id
+    that DOES match the (deliberately loose) prefix but has no resolvable
+    anchor is never silently closed either -- it falls to the (unnamed)
+    ungauged count instead."""
+
+    def test_repo_qualified_and_bare_baton_both_reaped(self, monkeypatch, capsys):
+        """Mirrors Borges's live A/B corroboration on the issue: two
+        correctly-anchored, both-MERGED PR-batons, one bare-named and one
+        repo-qualified-named. Before the fix, only the bare one would ever
+        enter pr_batons -- the repo-qualified one was invisible to the name
+        gate entirely, matching neither closed/skipped/failed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-2021", "github": "pr/engram-agents/engram-paper/2021"},
+            {"project_id": "ENGRAM-PR-2020", "github": "pr/engram-agents/engram-paper/2020"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close PR-2021" in captured.out
+        assert "would close ENGRAM-PR-2020" in captured.out
+        assert "would close 2, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_pr_num_dash_suffix_baton_is_reaped(self, monkeypatch, capsys):
+        """#2010-followup: a live 'PR-<N>-<repo-slug>' naming shape (e.g.
+        real batons 'PR-37-paper'/'PR-38-paper'/'PR-39-paper' in the
+        engram-paper repo) is reaped -- the interim suffix-anchored
+        ("...(\\d+)$") regex regressed this shape (it requires the string
+        to END right after the digits), even though the ORIGINAL bare
+        `pid.upper().startswith("PR-")` check handled it correctly. The
+        fix is a genuine PREFIX test: what follows "PR-" (digits, then any
+        suffix) is irrelevant to this gate."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-37-paper", "github": "pr/engram-agents/engram-paper/37"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close PR-37-paper" in captured.out
+        assert "would close 1, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_near_miss_id_reported_not_silently_dropped(self, monkeypatch, capsys):
+        """A project_id that contains 'PR-' but doesn't match the name
+        gate's prefix pattern at all (e.g. 'XPR-42' -- no hyphen precedes
+        "PR", so the optional repo-qualifier group can't consume the "X")
+        is tracked in an explicit near-miss counter with its id named, per
+        the issue's own 'Suggested fix' #2 -- rather than falling through
+        the same bare `continue` as a genuinely unrelated id like
+        'pool-coordination'. (Not 'PR-abc': under the prefix-only fix,
+        'PR-abc' DOES match the name gate -- see
+        test_prefix_only_false_positive_stays_ungauged_not_closed below
+        for that shape's own, now-different, coverage.)"""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "XPR-42"},
+            {"project_id": "pool-coordination"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "1 baton(s) look PR-related but did not match" in captured.err
+        assert "XPR-42" in captured.err
+        assert "pool-coordination" not in captured.err
+        # Neither id enters the gh-query loop -- no attempted PR lookups.
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_prefix_only_false_positive_stays_ungauged_not_closed(self, monkeypatch, capsys):
+        """The prefix-only fix is deliberately looser than the interim
+        suffix-anchored regex: a malformed, non-numeric id like 'PR-abc'
+        now DOES match the name gate (it starts with "PR-"), so it no
+        longer lands in the named near-miss counter -- it falls through to
+        the anchor-resolution path instead. With no `github:` anchor at
+        all, `_parse_github_anchor` returns None, so it is counted as
+        `ungauged` (a generic, un-named count) rather than `near_miss` (a
+        named one) -- end-to-end, the one property that matters still
+        holds: it is NEVER silently closed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-abc"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        # No longer surfaced via the named near-miss line.
+        assert "look PR-related but did not match" not in captured.err
+        # Instead counted (not named) as ungauged -- never closed.
+        assert "ungauged 1 PR-baton" in captured.err
+        assert "would close 0, still-open 0, ungauged 1, failed 0" in captured.out
+
+    def test_summary_line_word_collision_fixed(self, monkeypatch, capsys):
+        """The two early-vs-final counters read 'skipped' for DIFFERENT
+        things pre-fix (ungauged-anchor count vs still-open count) -- a
+        one-line-tail reader undercounted. This test constructs BOTH
+        non-zero and DIFFERENT in the same run and asserts the final
+        summary line distinguishes them by non-colliding words; it fails
+        against the old wording where both were rendered as 'skipped N'."""
+        client = _make_client(get_return={"projects": [
+            # Matches the name gate but has no usable github anchor -> ungauged.
+            {"project_id": "PR-9998", "github": None},
+            # Matches the name gate, has a good anchor, gh reports OPEN -> still-open.
+            {"project_id": "PR-9999", "github": "pr/example-org/example-repo/9999"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=0, stdout="OPEN", stderr=""),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 1, ungauged 1, failed 0" in captured.out
+        # The early ungauged-anchor line carries the SAME word as the final
+        # summary's ungauged count -- both name the same 1, unambiguously.
+        assert "ungauged 1 PR-baton" in captured.err
+
+
+class TestGcAnchorFirst:
+    """#2010 rider 1 (Kepler DM, 2026-09-21): cmd_gc's PR-baton detection is
+    ANCHOR-FIRST, not name-first. A baton whose `github:` field resolves to
+    a repo-qualified PR anchor is a PR-baton unconditionally, whatever its
+    project_id looks like -- the name-regex gate (_PR_BATON_NAME_RE) is now
+    only the FALLBACK, consulted when no qualified anchor is present.
+
+    Contract-first (this repo's CLAUDE.md "Contract-first tests"): written
+    against 705107ff (the pre-anchor-first tip), where this class's
+    discriminating tests go RED -- the old loop checks the name regex
+    FIRST and `continue`s before the anchor is ever inspected, so a
+    correctly-anchored, MERGED, name-mismatched baton is silently invisible
+    to this whole pass. Confirmed RED pre-fix, GREEN post-fix (see PR
+    handoff for the actual pytest runs).
+
+    The discriminating id shape below ("ENGRAM-ALPHA-PR-9601" /
+    "UMWELT-PAPER-PR-31") is a MULTI-segment repo-qualifier --
+    _PR_BATON_NAME_RE's own single-segment tolerance
+    (`^(?:[A-Z][A-Z0-9]*-)?PR-`) does NOT match it (confirmed via
+    `python3 -c "import re; print(bool(re.match(r'^(?:[A-Z][A-Z0-9]*-)?PR-',
+    'ENGRAM-ALPHA-PR-9601'.upper())))"` -> False, before writing this test).
+    This is exactly the class of baton the 2026-09-02 census found silently
+    invisible to the pre-anchor-first gate: a PREFIXED project_id with a
+    qualified anchor to an already-MERGED PR. A fresh 2026-09-23 census of
+    the live active-baton store (across all repos the shared forum tracks,
+    not engram-alpha alone -- see PR handoff) found 0 real batons in this
+    exact discriminating class today, so this fixture is SYNTHETIC, not a
+    reproduction of a real live baton (unlike TestGcSuffixMatchAndNearMiss's
+    'PR-37-paper', which mirrors real batons)."""
+
+    def test_anchor_qualified_name_mismatch_baton_is_reaped(self, monkeypatch, capsys):
+        """The core discriminating case: a project_id that does NOT match
+        _PR_BATON_NAME_RE at all, but whose github: anchor is repo-qualified
+        and points at an already-MERGED PR, must still be picked up and
+        closed by cmd_gc."""
+        pid = "ENGRAM-ALPHA-PR-9601"
+        assert _baton._PR_BATON_NAME_RE.match(pid.upper()) is None, (
+            "fixture id must NOT match the name gate -- this is the "
+            "discriminating property of this test"
+        )
+        client = _make_client(get_return={"projects": [
+            {"project_id": pid, "github": "pr/engram-agents/engram-paper/9601"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert f"would close {pid}" in captured.out
+        assert "would close 1, still-open 0, ungauged 0, failed 0" in captured.out
+        # Never routed through the near-miss (name-mismatch) counter either
+        # -- anchor-first means it's a clean PR-baton, not a near-miss.
+        assert "look PR-related but did not match" not in captured.err
+
+    def test_anchor_qualified_name_mismatch_baton_never_hits_ungauged(self, monkeypatch, capsys):
+        """A second angle on the same discriminating case: confirm the
+        baton is never counted as `ungauged` either (which would mean it
+        WAS reached via the name gate and merely lacked an anchor -- the
+        wrong reason for the right-shaped count). Uses a still-OPEN PR so
+        the summary's `still-open` bucket, not `would close`, is the
+        discriminator that the anchor-first path was even reached."""
+        pid = "UMWELT-PAPER-PR-31"
+        assert _baton._PR_BATON_NAME_RE.match(pid.upper()) is None
+        client = _make_client(get_return={"projects": [
+            {"project_id": pid, "github": "pr/example-org/example-repo/31"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=0, stdout="OPEN", stderr=""),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 1, ungauged 0, failed 0" in captured.out
+        assert "look PR-related but did not match" not in captured.err
+
+    def test_non_pr_pool_baton_still_ignored_after_anchor_first(self, monkeypatch, capsys):
+        """Regression guard (#2010 rider 1, Test E): a genuinely non-PR
+        pool baton (a `project/<N>` anchor, not `pr/...`, and a name that
+        doesn't match the fallback gate either) is unaffected by the
+        anchor-first reorder -- still silently skipped: not near-missed,
+        not ungauged, not closed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "pool-coordination-system", "github": "project/4"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+        assert "look PR-related but did not match" not in captured.err
+
+
 class TestGcFailedVsSkipped:
     """#1918 defect 2: a gh query failure must be counted as `failed`, not
     `skipped` -- the old code bucketed both together, so a run's own
@@ -4187,7 +4496,7 @@ class TestGcFailedVsSkipped:
 
         assert exc_info.value.code == EXIT_IO
         captured = capsys.readouterr()
-        assert "would close 0, skipped 0, failed 1" in captured.out
+        assert "would close 0, still-open 0, ungauged 0, failed 1" in captured.out
 
     def test_pr_still_open_counted_as_skipped_not_failed(self, monkeypatch, capsys):
         """The companion case: a SUCCESSFUL gh query whose PR is simply
@@ -4208,7 +4517,7 @@ class TestGcFailedVsSkipped:
         _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
 
         captured = capsys.readouterr()
-        assert "would close 0, skipped 1, failed 0" in captured.out
+        assert "would close 0, still-open 1, ungauged 0, failed 0" in captured.out
 
     def test_mixed_run_exits_nonzero_and_reports_accurate_counts(self, monkeypatch, capsys):
         client = _make_client(get_return={"projects": [
@@ -4234,7 +4543,7 @@ class TestGcFailedVsSkipped:
 
         assert exc_info.value.code == EXIT_IO
         captured = capsys.readouterr()
-        assert "would close 1, skipped 1, failed 1" in captured.out
+        assert "would close 1, still-open 1, ungauged 0, failed 1" in captured.out
 
 
 class TestFlipRepoQualifiedGuard:

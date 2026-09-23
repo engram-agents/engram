@@ -299,6 +299,20 @@ def _age_str(ts: Optional[datetime]) -> str:
 
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
+# Matches a PR-baton's project_id by PREFIX ONLY: an optional
+# single-segment repo-qualifier (e.g. "UMWELT-") followed by "PR-". This
+# is a pure shape test -- what follows the "PR-" prefix (a bare number, or
+# a number plus a suffix like "-paper", e.g. "PR-37-paper") is irrelevant
+# to this gate; the actual PR number/repo always come from the
+# separately-stored `github:` anchor field, never from this regex. #2010:
+# the original prefix-only check required the id to START with "PR-", so
+# a repo-qualified id like "UMWELT-PR-572" was invisible to this gate; a
+# first fix over-corrected into a full-string ("...(\d+)$") match, which
+# then made a live "PR-<N>-<repo-slug>" naming shape (e.g. "PR-37-paper")
+# invisible too. This prefix-only form fixes both. Kept in sync by hand
+# with the sibling copy in hooks/claude/engram-baton-prompt-hook.py.
+_PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
+
 # _GITHUB_ANCHOR_RE and _parse_github_anchor now live in baton_gate.py
 # (#2884, second half) -- imported above, shared with src/forum/server.py's
 # api_project_flip. See baton_gate.py for the full "#1918: no default repo"
@@ -1425,6 +1439,15 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     Use ``--limit N`` to cap the number of PR-batons processed per run
     (default: 30) and bound wall-clock runtime.
 
+    PR-baton detection is ANCHOR-FIRST (#2010 rider 1, Kepler DM
+    2026-09-21): a project whose ``github:`` field resolves to a
+    repo-qualified PR anchor is a PR-baton unconditionally, whatever its
+    ``project_id`` looks like.  The ``_PR_BATON_NAME_RE`` name-shape gate is
+    consulted only as a FALLBACK, to classify batons with no qualified
+    anchor (near-miss vs. genuinely unrelated).  Do not read the older
+    "match by suffix, not prefix" framing as still-primary; that governs
+    only the fallback path now.
+
     This is the explicit full-sweep complement to the prompt hook's
     cache-only auto-archive pass.  Agents should run ``baton gc`` at
     loop-start to drain the backlog of merged/closed PR-batons that the
@@ -1455,31 +1478,66 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     # DEFAULT_GITHUB_REPO removal note near the top of this file). Ported
     # from umwelt's gh_reconcile.py: "skip and count, never resolve against
     # a default or ambient repo."
+    #
+    # #2010 rider 1 (Kepler DM, 2026-09-21): ANCHOR FIRST, name-regex only
+    # as the no-anchor fallback. A 2026-09-02 census (Kepler) found that
+    # matching the name FIRST (as this loop used to) made a baton with a
+    # perfectly valid, repo-qualified `github:` anchor to an already-MERGED
+    # PR silently invisible to this whole pass whenever its project_id
+    # didn't happen to match the name pattern -- exactly the discriminating
+    # case tests/test_baton.py::TestGcAnchorFirst pins. So: for every
+    # project, try the anchor FIRST. Any project_id whose `github:` field
+    # resolves to a repo-qualified PR anchor (`_parse_github_anchor` returns
+    # `("pr", <owner/repo>, <N>)` with a non-None repo) IS a PR-baton,
+    # whatever its name looks like -- the name gate (_PR_BATON_NAME_RE) is
+    # consulted only as a FALLBACK, for batons with no qualified anchor
+    # (no anchor at all, an unparseable one, a non-PR anchor, or an
+    # UNQUALIFIED bare `pr/<N>` -- #1918 above still applies to that last
+    # case: it is never gc-eligible, whether reached via the anchor path or
+    # the name-fallback path). A project_id that merely *contains* "PR-"
+    # without matching the name pattern at all (e.g. a malformed "PR-abc")
+    # is not silently dropped into the same continue as an unrelated
+    # non-PR id -- it is tracked separately in near_miss_ids below so a
+    # completeness read can see it, per the issue's own "Suggested fix" #2.
     pr_batons = []
     ungauged = 0
+    near_miss_ids = []
     for p in all_projects:
         pid = p.get("project_id", "")
-        if not pid.upper().startswith("PR-"):
-            continue
         parsed = _parse_github_anchor((p.get("github") or "").strip().lower())
-        if parsed is None or parsed[0] != "pr" or parsed[1] is None:
-            ungauged += 1
+        if parsed is not None and parsed[0] == "pr" and parsed[1] is not None:
+            # Qualified PR anchor -- a PR-baton unconditionally, name shape
+            # never consulted.
+            _, repo, pr_num = parsed
+            pr_batons.append((pid, repo, pr_num))
+            if len(pr_batons) >= limit:
+                break
             continue
-        _, repo, pr_num = parsed
-        pr_batons.append((pid, repo, pr_num))
-        if len(pr_batons) >= limit:
-            break
+        # No qualified PR anchor -- fall back to the name-shape gate exactly
+        # as before this anchor-first redesign.
+        if not _PR_BATON_NAME_RE.match(pid.upper()):
+            if "PR-" in pid.upper():
+                near_miss_ids.append(pid)
+            continue
+        ungauged += 1
+
+    if near_miss_ids:
+        print(
+            f"baton gc: {len(near_miss_ids)} baton(s) look PR-related but did "
+            f"not match the name pattern -- ids: {near_miss_ids}",
+            file=sys.stderr,
+        )
 
     if ungauged:
         print(
-            f"baton gc: skipped {ungauged} PR-baton(s) with no/invalid/"
+            f"baton gc: ungauged {ungauged} PR-baton(s) with no/invalid/"
             "unqualified github anchor -- run "
             "'baton anchor <id> --github pr/<owner>/<repo>/<N>' "
             "to make them gc-eligible.",
             file=sys.stderr,
         )
 
-    closed = skipped = failed = 0
+    closed = still_open = failed = 0
 
     for project_id, repo, pr_num in pr_batons:
         try:
@@ -1506,7 +1564,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
         elif state == "CLOSED":
             new_status = "cancelled"
         else:
-            skipped += 1
+            still_open += 1
             continue
 
         if dry_run:
@@ -1531,7 +1589,10 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             failed += 1
 
     action = "would close" if dry_run else "closed"
-    print(f"baton gc: {action} {closed}, skipped {skipped}, failed {failed}")
+    print(
+        f"baton gc: {action} {closed}, still-open {still_open}, "
+        f"ungauged {ungauged}, failed {failed}"
+    )
 
     # #1918: a non-zero exit when any lookup failed -- the prior all-exit-0
     # behavior is what let "failed 0, 33 failure lines printed above it" go

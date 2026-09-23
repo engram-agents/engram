@@ -149,6 +149,27 @@ _FRONTMATTER_FIELD_RE = re.compile(r"^(\w[\w-]*):\s*(.*)$", re.MULTILINE)
 # PR-ID fallback pattern: "PR-NNN"
 _PR_ID_RE = re.compile(r"^PR-(\d+)$")
 
+# Matches a PR-baton's project_id by PREFIX ONLY: an optional
+# single-segment repo-qualifier (e.g. "UMWELT-") followed by "PR-". This
+# is a pure shape test -- what follows the "PR-" prefix (a bare number, or
+# a number plus a suffix like "-paper", e.g. "PR-37-paper") is irrelevant
+# to this gate; the actual PR number/repo always come from the
+# separately-stored `github:` anchor field, never from this regex. #2010:
+# the original prefix-only check required the id to START with "PR-", so
+# a repo-qualified id like "UMWELT-PR-572" was invisible to this gate; a
+# first fix over-corrected into a full-string ("...(\d+)$") match, which
+# then made a live "PR-<N>-<repo-slug>" naming shape (e.g. "PR-37-paper")
+# invisible too. This prefix-only form fixes both. Kept in sync by hand
+# with the sibling copy in tools/baton.py. Deliberately separate from
+# _PR_ID_RE above, which has a
+# narrower, still-correct job (_resolve_anchor's ID-based anchor fallback,
+# used only when no explicit github: field is present) -- widening
+# _PR_ID_RE itself would make _resolve_anchor start guessing an anchor
+# from a repo-prefixed id like "UMWELT-PR-572" as if it meant an
+# unqualified pr/572 in some ambient/default repo, exactly the guessing
+# behavior #1715/#1918 deliberately removed elsewhere in this file.
+_PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
+
 
 # ---------------------------------------------------------------------------
 # Config helpers -- delegate to _prompthooklib (gh#1680 slice 1). Thin
@@ -547,6 +568,30 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
     hook's 5s timeout before completing the scan.  Use ``baton gc`` for an
     explicit full offline sweep that queries live GitHub state for every
     uncached PR-baton.
+
+    Detection order is ANCHOR-FIRST (#2010 rider 1, Kepler DM 2026-09-21),
+    mirroring tools/baton.py's cmd_gc: a project whose ``github:`` field
+    resolves to a repo-qualified PR anchor is a PR-baton unconditionally,
+    whatever its ``project_id`` looks like -- the name shape
+    (_PR_BATON_NAME_RE) is never consulted for such a baton, at any point.
+    The name gate is consulted only as a FALLBACK, for batons with no
+    qualified anchor (an unqualified bare ``pr/<N>``, a non-PR anchor, or
+    no anchor at all).
+
+    Two DISTINCT skip reasons exist past this point, and rider 2 requires
+    they stay distinguishable rather than conflated into one "skipped"
+    bucket:
+      1. NO-QUALIFIED-ANCHOR-AND-NAME-MISMATCH -- the baton has no
+         qualified PR anchor, and its project_id also doesn't match the
+         name-gate fallback (or matched but produced no anchor at all).
+         This is an ID/anchor-shape decision, made before the cache is
+         ever consulted.
+      2. UNCACHED-ANCHOR -- the baton IS an anchored, qualified (or
+         name-fallback-resolved) PR-baton, but its anchor's live status
+         hasn't been fetched into the 30s-TTL cache yet. This is a
+         cache-BUDGET decision, made only after the baton has already
+         cleared reason 1 -- an anchored PR-baton is never skipped on name
+         shape merely because it happens to be uncached.
     """
     # Resolve the baton binary; skip if not in PATH.
     _baton_which = shutil.which("baton")
@@ -564,20 +609,38 @@ def _auto_archive_merged_pr_batons(projects: list, cache: dict) -> None:
         if status in CLOSED_STATUSES:
             continue
 
-        # Only PR-batons (project_id matches ^PR-\d+$)
         project_id = (p.get("project_id") or "").strip()
-        if not _PR_ID_RE.match(project_id):
-            continue
 
-        # Resolve GitHub anchor. The auto-archive pass only runs on PR-N
-        # batons so the id-fallback suffices; the github: field is a bonus.
+        # #2010 rider 1: resolve the GitHub anchor FIRST. For a bare
+        # "PR-<N>" id, _resolve_anchor's own id-fallback suffices with no
+        # explicit github: field. For a repo-qualified id (e.g.
+        # "UMWELT-PR-572") or any id shape at all, an explicit github:
+        # field produces the anchor directly, independent of project_id.
         anchor = _resolve_anchor(project_id, p.get("github", ""))
-        if not anchor:
-            continue
+        _anchor_m = _PR_ANCHOR_RE.match(anchor) if anchor else None
+        qualified = bool(_anchor_m and _anchor_m.group(1) and _anchor_m.group(2))
 
-        # Cache-only: skip uncached anchors to stay within the hook's 5s timeout.
-        # With 430+ baton files, uncached gh calls (~0.4s each) would exceed the
-        # timeout before completing the scan. Use 'baton gc' for full offline sweep.
+        if not qualified:
+            # No qualified PR anchor -- fall back to the name-shape gate
+            # (skip reason 1, above), exactly as this pass behaved before
+            # the anchor-first redesign. #2010: matched by SUFFIX
+            # (_PR_BATON_NAME_RE), not prefix, so both bare "PR-<N>" and
+            # repo-qualified "<REPO>-PR-<N>" batons reach this pass.
+            # (_PR_ID_RE is a narrower, separate pattern used only inside
+            # _resolve_anchor's id-based anchor fallback -- do not conflate
+            # the two.)
+            if not _PR_BATON_NAME_RE.match(project_id.upper()):
+                continue
+            if not anchor:
+                continue
+
+        # Cache-only (skip reason 2, above): skip uncached anchors to stay
+        # within the hook's 5s timeout. With 430+ baton files, uncached gh
+        # calls (~0.4s each) would exceed the timeout before completing the
+        # scan. Use 'baton gc' for full offline sweep. This is a
+        # cache-budget skip, NOT a name-shape rejection -- a
+        # qualified-anchor PR-baton that reaches this line has already
+        # cleared the name gate entirely (it never consulted it).
         cached = _cache_get(cache, anchor)
         if cached is None:
             continue

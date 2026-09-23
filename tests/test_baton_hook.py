@@ -95,11 +95,19 @@ def _make_project_dict(
     turn_reason: str = "colleague-review request",
     participants: "list | None" = None,
     seq: int = 1,
+    github: "str | None" = None,
 ) -> dict:
-    """Build a project dict matching the shape returned by GET /api/projects."""
+    """Build a project dict matching the shape returned by GET /api/projects.
+
+    github: optional explicit github: anchor field (e.g. "pr/owner/repo/N").
+    Omitted by default -- most fixtures rely on _resolve_anchor's bare
+    "PR-<N>" id-fallback and never need it set explicitly. #2010: a
+    repo-qualified project_id (e.g. "UMWELT-PR-572") does NOT match that
+    id-fallback, so a test exercising one must set this explicitly.
+    """
     if turn_since is None:
         turn_since = datetime.now(timezone.utc) - timedelta(minutes=30)
-    return {
+    d = {
         "project_id": project_id,
         "title": title,
         "status": status,
@@ -109,6 +117,9 @@ def _make_project_dict(
         "participants": participants or ["borges", "ariadne"],
         "seq": seq,
     }
+    if github is not None:
+        d["github"] = github
+    return d
 
 
 def _ts(offset_minutes: int) -> datetime:
@@ -747,6 +758,102 @@ class TestAutoArchivePure:
             "non-PR-NNN batons must not be archived"
         )
 
+    # 32b. Non-PR-NNN, second shape (#2010 required coverage)
+    def test_issue_nnn_project_not_archived(self, engram_home):
+        """A second non-PR shape ('ISSUE-200') -- also never archived, and
+        also never near the "contains PR-" boundary this fix introduces
+        (cmd_gc's near-miss counter; this hook has no equivalent, per the
+        issue's own scoping -- see cmd_gc's tests in tests/test_baton.py)."""
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict("ISSUE-200", turn="maintainer",
+                                       status="in-progress")]
+        cache = self._fresh_cache("ISSUE-200", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        assert self._close_calls_from(mock_sub) == [], (
+            "ISSUE-NNN batons must not be archived"
+        )
+
+    # #2010 core fix: repo-qualified PR-baton, correctly anchored, now reached.
+    def test_repo_qualified_pr_baton_with_anchor_is_archived(self, engram_home):
+        """'UMWELT-PR-572' (the documented cross-repo naming convention,
+        umwelt/CLAUDE.md), with an explicit github: anchor and a cached
+        MERGED status, is now archived -- pre-fix, the prefix-only
+        ^PR-(\\d+)$ gate made this project_id invisible to this pass
+        entirely, matching neither closed nor skipped nor failed."""
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict(
+            "UMWELT-PR-572", turn="maintainer", status="in-progress",
+            github="pr/engram-agents/umwelt/572",
+        )]
+        cache = self._fresh_cache("pr/engram-agents/umwelt/572", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        mock_sub.run.assert_called_once_with(
+            ["baton", "close", "UMWELT-PR-572", "--status", "merged"],
+            capture_output=True, text=True, timeout=mod._GH_TIMEOUT,
+        )
+
+    # #2010-followup: a live "PR-<N>-<repo-slug>" naming shape, correctly
+    # anchored, is now archived -- an interim suffix-anchored regex
+    # ("...(\\d+)$") regressed this real, live shape (real batons
+    # "PR-37-paper"/"PR-38-paper"/"PR-39-paper" in the engram-paper repo)
+    # even though the ORIGINAL bare startswith("PR-") check handled it
+    # fine; the prefix-only fix restores that.
+    def test_pr_num_dash_suffix_baton_with_anchor_is_archived(self, engram_home):
+        """'PR-37-paper', with an explicit github: anchor and a cached
+        MERGED status, is archived -- pre-fix (suffix-anchored
+        "...(\\d+)$"), this project_id was invisible to this pass
+        entirely, matching neither closed nor skipped nor failed."""
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict(
+            "PR-37-paper", turn="maintainer", status="in-progress",
+            github="pr/engram-agents/engram-paper/37",
+        )]
+        cache = self._fresh_cache("pr/engram-agents/engram-paper/37", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        mock_sub.run.assert_called_once_with(
+            ["baton", "close", "PR-37-paper", "--status", "merged"],
+            capture_output=True, text=True, timeout=mod._GH_TIMEOUT,
+        )
+
+    # Judgment-call guard: a repo-qualified id WITHOUT an explicit github:
+    # field must NOT resolve an anchor via the id-fallback -- _PR_ID_RE
+    # (deliberately untouched, per the issue's own "do NOT touch" scope)
+    # only matches a bare "PR-<N>" id, so a repo-qualified id with no
+    # explicit anchor stays un-gc-able rather than silently guessing one.
+    def test_repo_qualified_pr_baton_without_anchor_not_archived(self, engram_home):
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict(
+            "UMWELT-PR-573", turn="maintainer", status="in-progress",
+        )]
+        # Even if something were cached under a guessed bare-id anchor, the
+        # id-fallback must never produce one for a repo-qualified id.
+        cache = self._fresh_cache("pr/573", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        assert self._close_calls_from(mock_sub) == [], (
+            "a repo-qualified PR-baton with no explicit github: field must "
+            "not be archived via a guessed anchor"
+        )
+
     # 33. Baton binary missing
     def test_baton_binary_missing_emits_skip_stderr(self, engram_home):
         """baton binary absent -> stderr skip line, no exception raised."""
@@ -785,6 +892,129 @@ class TestAutoArchivePure:
                 mock_sub.run.side_effect = _exploding_run
                 # Must not raise
                 mod._auto_archive_merged_pr_batons(projects, cache)
+
+
+class TestAutoArchiveAnchorFirst:
+    """#2010 rider 1 (Kepler DM, 2026-09-21): mirrors
+    tests/test_baton.py::TestGcAnchorFirst for the hook's own
+    _auto_archive_merged_pr_batons -- same anchor-first contract, same
+    discriminating id shapes. Contract-first (this repo's CLAUDE.md
+    "Contract-first tests"): written against 705107ff (the pre-fix tip),
+    where the discriminating test below goes RED -- the old loop checks
+    _PR_BATON_NAME_RE FIRST and `continue`s before the anchor is ever
+    resolved, so a correctly-anchored, MERGED, name-mismatched baton is
+    silently invisible to this pass. Confirmed RED pre-fix, GREEN post-fix
+    (see PR handoff for the actual pytest runs)."""
+
+    @staticmethod
+    def _which(name: str):
+        if name in ("baton", "gh"):
+            return name
+        return None
+
+    @staticmethod
+    def _fresh_cache(anchor: str, render: str) -> dict:
+        return {anchor: {"fetched_at": time.time(), "render": render}}
+
+    @staticmethod
+    def _close_calls_from(mock_sub) -> list:
+        return [
+            call.args[0] for call in mock_sub.run.call_args_list
+            if call.args and call.args[0][:2] == ["baton", "close"]
+        ]
+
+    def _mod(self, engram_home: Path):
+        _write_config(engram_home)
+        return _load_hook_module(engram_home)
+
+    # Test C: hook mirror of TestGcAnchorFirst's core discriminating case.
+    def test_anchor_qualified_name_mismatch_baton_is_archived(self, engram_home):
+        """A project_id that does NOT match _PR_BATON_NAME_RE at all, with
+        a repo-qualified github: anchor and a cached MERGED status, must
+        still be archived -- anchor-qualification alone makes this a
+        PR-baton, regardless of name shape."""
+        pid = "ENGRAM-ALPHA-PR-9601"
+        mod = self._mod(engram_home)
+        assert mod._PR_BATON_NAME_RE.match(pid.upper()) is None, (
+            "fixture id must NOT match the name gate -- the discriminating "
+            "property of this test"
+        )
+        projects = [_make_project_dict(
+            pid, turn="maintainer", status="in-progress",
+            github="pr/engram-agents/engram-paper/9601",
+        )]
+        cache = self._fresh_cache("pr/engram-agents/engram-paper/9601", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        mock_sub.run.assert_called_once_with(
+            ["baton", "close", pid, "--status", "merged"],
+            capture_output=True, text=True, timeout=mod._GH_TIMEOUT,
+        )
+
+    # Test D: cache-miss is a DISTINCT skip reason from name-mismatch
+    # (rider 2) -- same anchored, qualified, name-mismatched baton, skipped
+    # purely because its anchor isn't cached yet, then archived once cached.
+    def test_anchor_qualified_uncached_is_skipped_by_cache_not_name(self, engram_home):
+        """Isolates that an anchored, QUALIFIED PR-baton whose anchor is
+        not yet in the cache is skipped purely due to the cache-budget
+        guard -- never due to name shape. Same baton (whose id deliberately
+        does NOT match _PR_BATON_NAME_RE): uncached -> skipped; cached ->
+        archived. If a stray name check had crept back in ahead of the
+        cache-only guard, the second half of this test would fail for the
+        WRONG reason -- exactly the conflation rider 2 warns against."""
+        pid = "ENGRAM-ALPHA-PR-9602"
+        mod = self._mod(engram_home)
+        assert mod._PR_BATON_NAME_RE.match(pid.upper()) is None
+        projects = [_make_project_dict(
+            pid, turn="maintainer", status="in-progress",
+            github="pr/engram-agents/engram-paper/9602",
+        )]
+
+        # Uncached -> skipped (cache-budget skip, reason 2).
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache={})
+        assert self._close_calls_from(mock_sub) == [], (
+            "uncached anchor must be skipped even when qualified -- a "
+            "cache-budget skip, not a name-shape skip"
+        )
+
+        # Same baton, now cached -> archived.
+        cache = self._fresh_cache("pr/engram-agents/engram-paper/9602", "MERGED")
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+        mock_sub.run.assert_called_once_with(
+            ["baton", "close", pid, "--status", "merged"],
+            capture_output=True, text=True, timeout=mod._GH_TIMEOUT,
+        )
+
+    # Test E: regression guard, unrelated (non-PR) batons unaffected.
+    def test_non_pr_pool_baton_still_ignored_after_anchor_first(self, engram_home):
+        """A genuinely non-PR pool baton (a project/<N> anchor, not
+        pr/..., and a name that doesn't match the fallback gate either) is
+        unaffected by the anchor-first reorder -- still not archived."""
+        mod = self._mod(engram_home)
+        projects = [_make_project_dict(
+            "pool-coordination-system", turn="maintainer", status="in-progress",
+            github="project/4",
+        )]
+        cache = self._fresh_cache("project/4", "MERGED")
+
+        with patch.object(mod.shutil, "which", side_effect=self._which):
+            with patch.object(mod, "subprocess") as mock_sub:
+                mock_sub.run.return_value = type("CP", (), {"returncode": 0})()
+                mod._auto_archive_merged_pr_batons(projects, cache)
+
+        assert self._close_calls_from(mock_sub) == [], (
+            "a project-anchored (non-PR) pool baton must not be archived"
+        )
 
 
 # ---------------------------------------------------------------------------
