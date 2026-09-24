@@ -865,7 +865,8 @@ class TestC5RestoreRegeneratesEmbeddings:
                 conn2 = core._get_db()
 
                 settled = self._wait_until(
-                    lambda: not core._get_embedding_restore_flag(conn2)["cause"] == "regeneration-pending"
+                    lambda: core._get_embedding_restore_flag(conn2)["cause"]
+                    not in ("regeneration-pending", "regeneration-running")
                 )
             assert settled, "restore-completeness flag never settled within the timeout"
 
@@ -942,7 +943,8 @@ class TestC5RestoreRegeneratesEmbeddings:
                 conn2 = core._get_db()
 
                 settled = self._wait_until(
-                    lambda: core._get_embedding_restore_flag(conn2)["cause"] != "regeneration-pending"
+                    lambda: core._get_embedding_restore_flag(conn2)["cause"]
+                    not in ("regeneration-pending", "regeneration-running")
                 )
             assert settled, "restore-completeness flag never settled within the timeout"
 
@@ -991,7 +993,8 @@ class TestC5RestoreRegeneratesEmbeddings:
                 conn2 = core._get_db()
 
                 settled = self._wait_until(
-                    lambda: core._get_embedding_restore_flag(conn2)["cause"] != "regeneration-pending"
+                    lambda: core._get_embedding_restore_flag(conn2)["cause"]
+                    not in ("regeneration-pending", "regeneration-running")
                 )
             assert settled, "restore-completeness flag never settled within the timeout"
 
