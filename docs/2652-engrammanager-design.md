@@ -945,7 +945,7 @@ reported `created` and was lost, and a two-state contract cannot express it.
 | state | meaning | caller sees |
 |---|---|---|
 | `ok` | the operation completed AND the owner read the committed row back | the result |
-| `unavailable` | the owner could not be reached, or did not answer within the bound | an explicit error naming the socket path and the bound — never a result |
+| `unavailable` | the owner could not be reached, or did not answer within the bound | an explicit error naming the socket path and the bound, plus §5.5's two-kind recovery guidance (agent-actionable / human-only) — never a result |
 | `rejected` | the owner was reached and refused (schema, contract version, validation) | the reason, distinguishable from `unavailable` at the type level |
 
 **`unavailable` and `rejected` must not collapse into one error type.** They have
@@ -971,7 +971,37 @@ Without it, "owner commits → socket drops before ack → client sees `unavaila
 a retry duplicate. The three states describe what the OWNER did; they do not describe
 what the CLIENT may safely do next, and for writes those are different questions.
 
-### 5.5 Degraded mode — the one question this RIDER leaves open
+### 5.5 Degraded mode — SETTLED (Lei, 2026-09-24 13:45Z)
+
+**Ruling, quoted rather than paraphrased:**
+
+> "hard stop for write, and don't serve stale read, just LOUDLY say ENGRAM is not
+> available, and provide the immediate recovery guidance so the agent can
+> self-recover or surface to the user for whatever only human users can do, e.g.
+> restart session or run mcp refresh, etc."
+
+**What the ruling itself requires** — each bullet traces to the quote:
+
+- **No degraded mode of either kind.** A write while the owner is unreachable is
+  refused ("hard stop for write"). A read is refused too; no snapshot is served in
+  its place ("don't serve stale read").
+- **The `unavailable` response says so LOUDLY and carries immediate recovery
+  guidance in two kinds**: steps the calling agent can take itself ("self-recover"),
+  and steps it must surface to its user because only a human can do them ("restart
+  session or run mcp refresh, etc.").
+
+**Design inference — the author's, NOT part of the ruling**, stated separately so
+a reader can disagree with it without disagreeing with Lei:
+
+- The guidance travels **in the response payload, not a log line**, and the two
+  kinds are **distinguishable without parsing prose** (e.g. separate fields). The
+  reason is the same as §5.2's type-level split of `unavailable` from `rejected`: an
+  agent acts on structure it can branch on, and a log line or a paragraph is where
+  guidance is silently lost.
+- **"Loudly"** is read as: the agent cannot mistake the response for an empty or
+  slow answer — §5.1's no-manufactured-null rule, applied to the whole mode.
+
+The analysis below is kept as the reasoning the ruling adopted.
 
 The epic asks: read-only degraded mode from a checkpointed snapshot, or hard
 stop? **Today's answer is neither, which is how "created-but-lost" happens.**
@@ -1186,7 +1216,7 @@ with the file actually opened.
 |---|---|---|---|
 | **the typed write operation set — GENERATE it, and NOT from statement enumeration.** §3.1's counterexample rules that instrument out: `create_node(derivation)` consumes *many* `(verb, table)` pairs across many functions, so anything enumerating **statements** — SET-signatures included — partitions one operation into several and cannot recover the intent. **The generator must walk CALL PATHS** from each caller-facing write entry point through the helpers it reaches, recording the pair-set and the **site**-set each root consumes. **THE CHECK IS SITE-LEVEL, NOT PAIR-LEVEL** — a union over pairs cannot detect a missed path, because `INSERT INTO edit_history` has 9 sites across 5 files and the other 8 keep the union complete. **THE ROOT SET IS §2.0's SURFACE LIST**, and a write site with no function-level entry point is its own root — two hooks are exactly that (`engram-surface-hook.py:955`, `engram-utility-credit-mention-stop.py:145`), both on `UPDATE nodes` (53 sites), so omitting a whole surface also passes a union test. ⚠ **That clause must be qualified or it eats the check: if EVERY site may promote itself to a root, then "a site no root reaches" is definitionally empty and the site-level test proves nothing.** The qualification is that self-promotion is a *declaration made when the root set is built*, not a fallback applied when the walk misses — a site is its own root because a surface owner named it, and an undeclared site the walk fails to reach is still **a finding**. **Any unreached site is a finding; that criterion is what the site-level check delivers, and without it the check has no output.** **THE HOLES BELOW ARE THE ONES KNOWN TODAY — the list is open, not closed,** and it is stated rather than papered over because a check asserted sound is worse than one asserted incomplete: **(a) the check is still ∃-over-roots while the DELIVERABLE is the per-root MAPPING** — if the walk resolves `_stamp_new_node`→`_log_edit` from the observation root but not the derivation root, `:4546` stays claimed and the miss passes unchanged; validating the mapping needs a per-root expectation the walk cannot supply about itself. **(b) the root set is PRESCRIBED, not CHECKED** — nothing detects an omitted surface. **(c) the site universe inherits Kepler's `.py`-only scope, which §4.2 argues against by name** — the two SKILL.md channels are not reachable by any Python-source walk. **(d) the site universe is scoped to Kepler's 27-table set** — a DIFFERENT population from the **19 tables** attributed to him in §3.1, and the document should not use one name for two numbers: §3.1's 19 is his count of tables carrying DML in the write census, this 27 is the table set the site universe is scoped to, and neither figure states that distinction where it appears. Which §3.1 shows is a declared input rather than a given — `sequences` is inside it, `vec_nodes` may not be, and both appear in §3.1's own worked example. *Four attacks were tried and did NOT land, recorded because a check nobody has failed to break is not yet trusted: dynamic SQL, try/except-only helpers, unimported modules, and — refuted only once the self-promotion clause above is qualified — a site promoting itself out of reachability.* *(Naming tables in the instrument does not violate §2.0's backend-neutrality rule — that rule governs MECHANISM SIGNATURES; this is a measurement pointed at the current sqlite impl, and the backend-specific surface is exactly what it is measuring.)* **And one scoping caveat on the output:** a walk yields ENTRY POINTS, which are signatures, and one entry point can carry several intents — `engram_update_task` (`server.py:5721`) rebalances importance across four statuses through a single signature. Splitting an entry point into its invocations is a further step the walk does not perform. | ✓ | ✓ | |
 | writers-vs-readers split of the 56 sites | ✓ | | |
-| degraded mode: hard stop vs read-only snapshot | lean stated | | ✓ substrate |
+| ~~degraded mode: hard stop vs read-only snapshot~~ — **SETTLED 2026-09-24, see §5.5**: hard stop for writes, no stale reads, loud `unavailable` with two-tier recovery guidance | lean stated | | ✓ ruled |
 | supervision per platform (systemd --user / launchd) | | ✓ | |
 
 ---
