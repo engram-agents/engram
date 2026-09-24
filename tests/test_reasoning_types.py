@@ -2,7 +2,7 @@
 Tests for the reasoning types system in ENGRAM v2.
 
 Tests cover:
-1. All 13 reasoning types produce correct confidence values
+1. All 14 reasoning types produce correct confidence values
 2. Legacy derivation_mode fallback still works
 3. Structural validation (premise counts, multi-source)
 4. Abductive confidence caps
@@ -95,7 +95,7 @@ def setup_base_graph(client):
 
 
 # ---------------------------------------------------------------------------
-# Test: All 13 reasoning types accepted
+# Test: All 14 reasoning types accepted
 # ---------------------------------------------------------------------------
 
 def test_all_reasoning_types_accepted():
@@ -106,7 +106,7 @@ def test_all_reasoning_types_accepted():
     all_types = [
         "deductive_modus_ponens", "deductive_modus_tollens",
         "deductive_hypothetical_syllogism", "deductive_disjunctive",
-        "deductive_reductio",
+        "deductive_reductio", "deductive_conjunction",
         "inductive_generalization", "inductive_statistical",
         "inductive_analogy", "inductive_causal",
         "abductive_best_explanation", "abductive_elimination",
@@ -168,6 +168,123 @@ def test_deductive_confidence():
     assert result["confidence"] == expected, f"Expected {expected}, got {result['confidence']}"
     assert result["reasoning_class"] == "deductive"
     print(f"  PASS: Deductive confidence = {expected} (min(0.95,0.70) × 0.98)")
+
+
+# ---------------------------------------------------------------------------
+# Test: deductive_conjunction — weakest-link over N≥2 premises, NOT noisy-OR
+# ---------------------------------------------------------------------------
+
+def test_deductive_conjunction_confidence_weakest_link():
+    """deductive_conjunction uses weakest-link with 0.98 discount (N=2 case)."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    # ob1 is hard_data (0.95), ob2 is attributed_analysis (0.70)
+    result = client.call("engram_derive", {
+        "claim": "Deductive conjunction test: min(0.95, 0.70) × 0.98",
+        "supporting_ids": f"{ids['ob1']},{ids['ob2']}",
+        "logical_chain": "Gold fell AND rates caused the decline; the conjunction holds",
+        "reasoning_type": "deductive_conjunction",
+    })
+    assert result.get("status") == "created"
+    expected = round(0.70 * 0.98, 3)
+    assert result["confidence"] == expected, f"Expected {expected}, got {result['confidence']}"
+    assert result["reasoning_class"] == "deductive"
+    print(f"  PASS: Deductive conjunction confidence = {expected} (min(0.95,0.70) × 0.98)")
+
+
+def _synthesize_conjunction_premises(client, n):
+    """Create n observations for deductive_conjunction premises, cycling
+    quote_type through hard_data (0.95) / official_statement (0.85) /
+    attributed_analysis (0.70) so confidences vary, each on its own fresh
+    evidence root (distinct url per call) so there's no accidental
+    same-root entanglement."""
+    quote_types = ["hard_data", "official_statement", "attributed_analysis"]
+    confidence_by_type = {
+        "hard_data": 0.95,
+        "official_statement": 0.85,
+        "attributed_analysis": 0.70,
+    }
+    ids = []
+    confidences = []
+    for i in range(n):
+        qt = quote_types[i % len(quote_types)]
+        r = client.call("engram_add_observation", {
+            "url": f"https://example.com/conjunction-premise-{i}",
+            "title": f"System {i} lacks feature X",
+            "quoted_text": f"System {i} does not implement feature X.",
+            "interpretation": f"System {i} lacks feature X",
+            "claim": f"System {i} lacks feature X",
+            "quote_type": qt,
+            "source_date": "2026-03-20",
+        })
+        assert r.get("status") == "created", f"Failed to create premise {i}: {r}"
+        ids.append(r["observation_id"])
+        confidences.append(confidence_by_type[qt])
+    return ids, confidences
+
+
+def _noisy_or(confidences, discount):
+    """Reference noisy-OR computation (1 - ∏(1-cᵢ)) × discount — the
+    corroboration formula deductive_conjunction must NOT use."""
+    product = 1.0
+    for c in confidences:
+        product *= (1.0 - c)
+    return round((1.0 - product) * discount, 3)
+
+
+def test_deductive_conjunction_confidence_n11():
+    """N=11 premises: weakest-link, and the result must DIFFER from what
+    the noisy-OR (corroboration) formula would produce — this is the
+    discriminating assertion that would fail if deductive_conjunction were
+    ever accidentally wired to inductive_corroboration's formula."""
+    client = fresh_client()
+    ids, confidences = _synthesize_conjunction_premises(client, 11)
+
+    result = client.call("engram_derive", {
+        "claim": "None of the 11 surveyed systems has feature X",
+        "supporting_ids": ",".join(ids),
+        "logical_chain": "Each of the 11 systems individually lacks feature X; therefore the universal (none has it) holds",
+        "reasoning_type": "deductive_conjunction",
+    })
+    assert result.get("status") == "created"
+    expected_weakest = round(min(confidences) * 0.98, 3)
+    assert result["confidence"] == expected_weakest, (
+        f"Expected weakest-link {expected_weakest}, got {result['confidence']}"
+    )
+    noisy_or = _noisy_or(confidences, 0.98)
+    assert result["confidence"] != noisy_or, (
+        f"deductive_conjunction must NOT use the noisy-OR formula; "
+        f"got {result['confidence']} which coincides with noisy-OR {noisy_or}"
+    )
+    assert result["reasoning_class"] == "deductive"
+    print(f"  PASS: deductive_conjunction N=11 weakest-link = {expected_weakest} (noisy-OR would be {noisy_or})")
+
+
+def test_deductive_conjunction_confidence_n30():
+    """N=30 premises: same discrimination as N=11, at larger N (the gap
+    between weakest-link and noisy-OR only widens as N grows)."""
+    client = fresh_client()
+    ids, confidences = _synthesize_conjunction_premises(client, 30)
+
+    result = client.call("engram_derive", {
+        "claim": "None of the 30 surveyed systems has feature X",
+        "supporting_ids": ",".join(ids),
+        "logical_chain": "Each of the 30 systems individually lacks feature X; therefore the universal (none has it) holds",
+        "reasoning_type": "deductive_conjunction",
+    })
+    assert result.get("status") == "created"
+    expected_weakest = round(min(confidences) * 0.98, 3)
+    assert result["confidence"] == expected_weakest, (
+        f"Expected weakest-link {expected_weakest}, got {result['confidence']}"
+    )
+    noisy_or = _noisy_or(confidences, 0.98)
+    assert result["confidence"] != noisy_or, (
+        f"deductive_conjunction must NOT use the noisy-OR formula; "
+        f"got {result['confidence']} which coincides with noisy-OR {noisy_or}"
+    )
+    assert result["reasoning_class"] == "deductive"
+    print(f"  PASS: deductive_conjunction N=30 weakest-link = {expected_weakest} (noisy-OR would be {noisy_or})")
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +472,24 @@ def test_structural_warning_too_many_premises():
     print(f"  PASS: Warning for too many premises (modus_ponens with 3)")
 
 
+def test_deductive_conjunction_single_premise_warning():
+    """deductive_conjunction with 1 premise should produce a structural
+    warning (min_premises=2), not a hard block."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    result = client.call("engram_derive", {
+        "claim": "Under-premised conjunction",
+        "supporting_ids": ids["ob1"],
+        "logical_chain": "Only one premise",
+        "reasoning_type": "deductive_conjunction",
+    })
+    assert result.get("status") == "created"  # Warnings don't block creation
+    assert "structure_warnings" in result, "Expected structural warning"
+    assert any("at least 2" in w for w in result["structure_warnings"])
+    print(f"  PASS: Warning for too few premises (deductive_conjunction with 1)")
+
+
 # ---------------------------------------------------------------------------
 # Test: Structural validation — multi-source
 # ---------------------------------------------------------------------------
@@ -412,6 +547,38 @@ def test_no_warning_multi_source_generalization():
         f"only advisory/register lines expected, got: {warns}"
     )
     print(f"  PASS: no source-independence warning for multi-source generalization (F-S advisory benign)")
+
+
+def test_deductive_conjunction_no_multi_source_check():
+    """deductive_conjunction's multi_source=False means the shared-evidence-root
+    check does NOT run at all — the opposite fixture pairing from
+    test_no_warning_multi_source_generalization above: deliberately reuse
+    premises that share the SAME evidence root (ob1+ob2 both trace to ev1).
+
+    For inductive_generalization/authority_consensus (multi_source=True),
+    this exact pairing DOES trip the source-independence warning (see
+    test_structural_warning_single_source_generalization). Here it must not —
+    this pins Borges's contract point 4 (the shared-evidence-root check is
+    gated entirely by multi_source) as an actual regression test, not just an
+    assumption. Benign advisory lines (FALSIFICATION/STANDPOINT/CHECKED
+    register-disclosure) may still be present; only the same-source warning
+    text is asserted absent, not the whole list."""
+    client = fresh_client()
+    ids = setup_base_graph(client)
+
+    # ob1 and ob2 both come from ev1 (reuters) — same evidence root
+    result = client.call("engram_derive", {
+        "claim": "Conjunction over same-root premises",
+        "supporting_ids": f"{ids['ob1']},{ids['ob2']}",
+        "logical_chain": "Gold fell AND rates caused the decline; the conjunction holds",
+        "reasoning_type": "deductive_conjunction",
+    })
+    assert result.get("status") == "created"
+    warns = result.get("structure_warnings", [])
+    assert not any(
+        ("independent sources" in w) or ("same evidence node" in w) for w in warns
+    ), f"deductive_conjunction must not run the multi_source same-evidence check: {warns}"
+    print(f"  PASS: no same-evidence warning for deductive_conjunction (multi_source=False)")
 
 
 def test_no_false_same_source_on_deep_premise():
@@ -883,6 +1050,9 @@ if __name__ == "__main__":
         test_all_reasoning_types_accepted,
         test_invalid_reasoning_type_rejected,
         test_deductive_confidence,
+        test_deductive_conjunction_confidence_weakest_link,
+        test_deductive_conjunction_confidence_n11,
+        test_deductive_conjunction_confidence_n30,
         test_inductive_generalization_confidence,
         test_inductive_analogy_confidence,
         test_abductive_cap,
@@ -892,8 +1062,10 @@ if __name__ == "__main__":
         test_legacy_corroboration_fallback,
         test_structural_warning_too_few_premises,
         test_structural_warning_too_many_premises,
+        test_deductive_conjunction_single_premise_warning,
         test_structural_warning_single_source_generalization,
         test_no_warning_multi_source_generalization,
+        test_deductive_conjunction_no_multi_source_check,
         test_resolve_with_reasoning_type,
         test_stats_reasoning_breakdown,
         test_confidence_ordering,

@@ -8601,6 +8601,7 @@ REASONING_STRUCTURE = {
     "deductive_hypothetical_syllogism": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "deductive_disjunctive": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "deductive_reductio": {"min_premises": 1, "max_premises": None, "multi_source": False},
+    "deductive_conjunction": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_generalization": {"min_premises": 2, "max_premises": None, "multi_source": True},
     "inductive_enumeration": {"min_premises": 2, "max_premises": None, "multi_source": False},
     "inductive_statistical": {"min_premises": 1, "max_premises": 2, "multi_source": False},
