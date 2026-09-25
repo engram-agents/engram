@@ -1,6 +1,6 @@
 {
   "name": "engram",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "ENGRAM — Protocol-governed knowledge graph memory for agents. Claim-level memory with provenance, confidence, contradiction detection, and structured epistemics.",
   "author": {
     "name": "engram-agents"

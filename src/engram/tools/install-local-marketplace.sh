@@ -252,8 +252,24 @@ if [[ -n "$DEPLOY_TAGS" ]]; then
     git -C "$REPO_ROOT" fetch --quiet origin dev main 2>/dev/null || _fetch_rc=$?
   fi
   if [[ $_fetch_rc -eq 0 ]]; then
-    if git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/dev 2>/dev/null \
-       || git -C "$REPO_ROOT" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+    # #3092: the tag+ancestor determination now delegates to the shared
+    # Python predicate (src/build/engine/deploy_tag.py deployable_tag_at())
+    # instead of this block's own inline `git merge-base --is-ancestor`
+    # calls, so this script and the engine (tools/engine/flows.py,
+    # tools/engine/cli.py) share ONE source of truth for what counts as a
+    # deployable, merged tag at HEAD — they cannot drift on this again.
+    # PYTHONPATH (not `cd`) so this call works regardless of the caller's
+    # cwd, matching how REPO_ROOT itself is resolved above. Only DEPLOY_TAGS
+    # (line ~175's own raw `git tag --points-at HEAD` computation) stays as
+    # the shell's own inline logic — it drives the #2586 untagged-guard
+    # below independent of ancestry/network state, exactly as before; the
+    # predicate call here replaces ONLY the ancestor determination.
+    if [[ -n "$(PYTHONPATH="$REPO_ROOT" python3 -c "
+from src.build.engine.deploy_tag import deployable_tag_at
+import sys
+r = deployable_tag_at(sys.argv[1])
+print(r or '')
+" "$REPO_ROOT" 2>/dev/null)" ]]; then
       DEPLOYABLE_ANCESTOR=1
     fi
   elif [[ $_fetch_rc -eq 124 ]]; then
@@ -420,6 +436,11 @@ PY
   # this guard would pass while the engine's own guard still refuses one
   # call downstream. #2711.
   [[ $ALLOW_BRANCH -eq 1 || $DEPLOYABLE_ANCESTOR -eq 1 ]] && build_flags+=("--allow-branch")
+  # Mirror: forward --allow-untagged too, for the same #2711-class reason —
+  # cli.py build's own #3092 tag guard is independent of this script's
+  # #2586 guard above, so the override must be forwarded explicitly or an
+  # explicit --allow-untagged deploy fails one call downstream.
+  [[ $ALLOW_UNTAGGED -eq 1 ]] && build_flags+=("--allow-untagged")
   log "Building plugin tree (target: $TARGET, flags: ${build_flags[*]:-none})"
   bash "$REPO_ROOT/tools/build-plugin.sh" ${build_flags[@]+"${build_flags[@]}"}
 fi

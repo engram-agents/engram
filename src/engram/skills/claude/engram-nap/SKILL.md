@@ -121,10 +121,11 @@ way the backup check surfaces a degrading `version_control` backup: nothing
 fails when Step 5b is skipped, so without this print the omission is
 invisible until a later session reads a stale/empty warm briefing. The
 note's own wording distinguishes a CONFIRMED-stale finding ("Step 5b not
-performed this session") from an UNKNOWN one ("could not determine whether
-Step 5b ran (...)") — deliberately a neutral print prefix rather than a
-hardcoded "NOT updated this session" claim, so the printed line never
-asserts more than the note itself actually knows (#2998 round 3).
+performed since the last checkpoint") from an UNKNOWN one ("could not
+determine whether Step 5b ran (...)") — deliberately a neutral print
+prefix rather than a hardcoded "NOT updated this session" claim, so the
+printed line never asserts more than the note itself actually knows
+(#2998 round 3).
 
 ## Step 3.5 — Prune finished fairy worktrees
 

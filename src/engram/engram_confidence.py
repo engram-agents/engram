@@ -55,6 +55,7 @@ REASONING_TYPES = {
     "deductive_hypothetical_syllogism",  # If P→Q and Q→R; therefore P→R
     "deductive_disjunctive",        # P or Q; not P; therefore Q
     "deductive_reductio",           # Assume P; derive contradiction; therefore not P
+    "deductive_conjunction",        # P1 and P2 and ... and Pn; therefore the conjunction. Weakest-link over N≥2 premises (e.g. a universal over an explicitly enumerated complete set).
     # Inductive: more evidence = more likely, but never certain
     "inductive_generalization",     # Observed X in A,B,C → X generally true. REQUIRES 2+ distinct evidence sources.
     "inductive_enumeration",        # Source S enumerates items I1,I2,...,In sharing property P → P has n instances (single authoritative source, structurally-independent items)
@@ -76,6 +77,7 @@ REASONING_CLASS = {
     "deductive_hypothetical_syllogism": "deductive",
     "deductive_disjunctive": "deductive",
     "deductive_reductio": "deductive",
+    "deductive_conjunction": "deductive",
     "inductive_generalization": "inductive_corroboration",
     "inductive_enumeration": "inductive_corroboration",
     "inductive_statistical": "inductive_chain",
@@ -94,6 +96,7 @@ REASONING_DISCOUNT = {
     "deductive_hypothetical_syllogism": 0.98,
     "deductive_disjunctive": 0.98,
     "deductive_reductio": 0.98,
+    "deductive_conjunction": 0.98,
     "inductive_generalization": 0.95,
     "inductive_enumeration": 0.93,
     "inductive_statistical": 0.90,

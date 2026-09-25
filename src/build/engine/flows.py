@@ -42,6 +42,7 @@ Callers must provide a dict (or dict-subclass) with at least:
   target_sha: str           the git commit SHA to upgrade to
   ack_changeset: bool       True once the agent has reviewed the changeset
   allow_branch: bool        True to skip the dev-branch guard (#794)
+  allow_untagged: bool      True to skip the deploy-tag guard (#2586/#3092)
 
 Optional keys (computed by steps, stored back into ctx):
 
@@ -59,6 +60,7 @@ import os
 import subprocess
 from typing import Any
 
+from .deploy_tag import refresh_and_check_deployable_tag_at
 from .steps import Step
 
 # ---------------------------------------------------------------------------
@@ -541,27 +543,65 @@ def _check_marketplace_rebuilt(ctx: dict[str, Any]) -> bool:
         return False
 
 
+def _nearest_tag(source_dir: str) -> str:
+    """Return the nearest tag by ancestry (``git describe --tags --abbrev=0``),
+    or "none" if that also fails — same fallback the shell script uses for
+    its #2586 error message."""
+    result = _git(["describe", "--tags", "--abbrev=0"], source_dir)
+    nearest = result.stdout.strip()
+    return nearest if result.returncode == 0 and nearest else "none"
+
+
 def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
     """Call Phase-1 build_plugin() to rebuild the marketplace.
 
-    PRECONDITION: branch == 'dev' or 'main' unless ctx.allow_branch.
-    This guard implements #794's requirement: the build step refuses to run
-    on a PR/feature branch unless the caller explicitly passes allow_branch=True.
-    Rationale: shipping a PR/feature branch's code as a plugin upgrade is almost
-    always a mistake; the guard makes the unusual case explicit.
-    Valid production branches: 'dev' (private dev source), 'main' (public release).
+    PRECONDITION 1: branch == 'dev' or 'main', UNLESS ctx.allow_branch, OR
+    HEAD is at a deployable tag that is merged history (see PRECONDITION 2
+    below) — the same tag/ancestor exception
+    install-local-marketplace.sh's own #794 guard has carried since
+    #2586/#2711. This guard implements #794's requirement: the build step
+    refuses to run on a PR/feature branch unless the caller explicitly
+    passes allow_branch=True (or checks out a deployable tag). Rationale:
+    shipping a PR/feature branch's code as a plugin upgrade is almost
+    always a mistake; the guard makes the unusual case explicit. Valid
+    production branches: 'dev' (private dev source), 'main' (public
+    release).
+
+    PRECONDITION 2 (#3092): HEAD must be at a deployable tag (v*/deploy/*,
+    merged into origin/dev or origin/main) UNLESS ctx.allow_untagged. This
+    is the engine-side counterpart to install-local-marketplace.sh's own
+    #2586 tag guard — before #3092 the engine enforced no such thing, so an
+    untagged commit could upgrade fine through the engine while the shell
+    script would have refused it. Both guards now share ONE predicate
+    (deploy_tag.deployable_tag_at, via refresh_and_check_deployable_tag_at)
+    so the two paths cannot drift again.
     """
     source_dir = ctx.get("source_dir", "")
     if not source_dir:
         raise RuntimeError("source_dir not set in ctx — cannot rebuild marketplace")
 
-    # #794 branch guard: refuse PR/feature branches unless allow_branch is set.
+    # #3092: one shared, fetch-then-check call serves BOTH the #794 branch
+    # guard's deploy-tag exception below AND the new #2586-equivalent
+    # untagged guard that follows it — a single git round-trip rather than
+    # two independent ones.
+    deployable_tag = refresh_and_check_deployable_tag_at(source_dir)
+
+    # #794 branch guard: refuse PR/feature branches unless allow_branch is
+    # set, OR HEAD is at a deployable tag that is merged history (the
+    # #2586/#2711/#3092 exception — mirrors the shell script's
+    # DEPLOYABLE_ANCESTOR exception, extended to the engine path here for
+    # the first time).
     # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
     current = _current_branch(source_dir)
-    if current not in ("dev", "main") and not ctx.get("allow_branch"):
+    if (
+        current not in ("dev", "main")
+        and not ctx.get("allow_branch")
+        and deployable_tag is None
+    ):
         raise RuntimeError(
             f"marketplace-rebuilt: source tree is on branch {current!r}, not 'dev' (private dev) or 'main' (public release). "
-            "Pass allow_branch=True in ctx to override this guard. "
+            "Pass allow_branch=True in ctx to override this guard, or check out a deployable "
+            "tag (v*/deploy/*) that is merged into origin/dev or origin/main — no flag needed for that. "
             "(Guard per #794: shipping a PR/feature branch is almost always a mistake.)"
         )
 
@@ -574,6 +614,21 @@ def _apply_marketplace_rebuilt(ctx: dict[str, Any]) -> None:
             "before upgrading; see #707"
         )
     multi_agent = bool(config.get("multi_agent")) or config.get("mode") == "multi"
+
+    # #3092 deploy-tag guard: refuse an untagged (or unmerged-tag) commit
+    # unless allow_untagged is set. Mirrors install-local-marketplace.sh's
+    # own #2586 guard — refusing here closes the gap where the engine
+    # upgraded fine from an untagged tip while the shell script would have
+    # refused it.
+    if deployable_tag is None and not ctx.get("allow_untagged"):
+        nearest = _nearest_tag(source_dir)
+        raise RuntimeError(
+            f"marketplace-rebuilt: HEAD is not a tagged commit (deployable tags = v* and deploy/*; "
+            f"nearest by ancestry: {nearest}). The health-snapshot versioning gate (engram-alpha#2563) "
+            "treats tags as the deployable set; snapshots written from untagged code are invisible to it "
+            "and can orphan your health history. Rebuild from a tag (fetch --tags origin first if your "
+            "tags are stale), or pass allow_untagged=True in ctx to override this guard. (Guard per #2586/#3092.)"
+        )
 
     # Determine plugin output path
     plugin_root = os.path.join(source_dir, "build", "plugin")

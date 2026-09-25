@@ -1,12 +1,14 @@
-"""Tests for the duplicate-instance detection in forum-updates-monitor.sh,
-forum-mention-monitor.sh (#1933: warn-not-kill), and — since #1935 ported the
-identical structure — collab-baton-monitor.sh.
+"""Tests for the duplicate-instance detection in forum-updates-monitor.sh and
+forum-mention-monitor.sh (#1933: warn-not-kill).
 
-(This suite originally also covered collab-letter-monitor.sh, ported
-alongside collab-baton-monitor.sh in #1935. That script was deleted as dead
-code in #2857 step 2 — its watched channel was retired by the 2026-06-28
-UCS cutover to forum DMs — and its coverage removed from this file in the
-same PR.)
+(This suite originally also covered the two collab-*-monitor.sh scripts,
+ported alongside these two in #1935. collab-letter-monitor.sh was deleted as
+dead code in #2857 step 2 — its watched channel was retired by the
+2026-06-28 UCS cutover to forum DMs — with its coverage removed from this
+file in the same PR. The collab baton monitor script was itself later
+deleted as unarmed dead code (#2857) — no arm site anywhere in the repo, the
+installed plugin tree, hooks config, settings, or any running process —
+with its coverage removed from this file in the same PR.)
 
 Background: all three monitors used to SIGTERM any pgrep -f match against
 their own script basename on arm ("last-arm-wins" reap). pgrep -f is an
@@ -38,8 +40,8 @@ dir, rather than the real shared production dir
 duplicate-detection code path runs before directory resolution either way,
 so this is belt-and-suspenders isolation, not a correctness requirement.
 
-Verifies (per #1933's fix + the parent spec's required coverage), for all
-three scripts:
+Verifies (per #1933's fix + the parent spec's required coverage), for both
+scripts:
   1. A decoy whose argv merely CONTAINS the script path + purpose text as a
      python3 one-liner's argument (mirrors the real boot-charge repro) is
      left alive and is NOT reported as a suspect.
@@ -48,7 +50,7 @@ three scripts:
   2b. A genuine second instance launched with a login-shell-style argv0
       (`exec -a "-bash" bash <script>`, argv[0] == "-bash") is STILL
       reported — not a false negative from the interpreter-name check.
-  3. $FORUM_UPDATES_NO_REAP / $FORUM_MENTION_NO_REAP / $COLLAB_MONITOR_NO_REAP
+  3. $FORUM_UPDATES_NO_REAP / $FORUM_MENTION_NO_REAP
      suppresses the detection/warning pass entirely.
 
 Mutation-checks (run manually, not as pytest cases — see the handoff):
@@ -87,21 +89,6 @@ _SCRIPTS = {
     "forum-mention-monitor.sh": {
         "path": _TOOLS / "forum-mention-monitor.sh",
         "no_reap_env": "FORUM_MENTION_NO_REAP",
-    },
-    # #1935: collab-baton-monitor.sh gained the identical warn-not-kill +
-    # /proc two-layer verification structure (originally ported alongside
-    # collab-letter-monitor.sh, which was deleted as dead code in #2857
-    # step 2 -- its watched channel was retired by the 2026-06-28 UCS
-    # cutover to forum DMs). It takes a watched-directory env override
-    # (unlike the forum scripts, which poll a URL) -- "dir_env" names it so
-    # each test below can point the watched dir at an empty per-test scratch
-    # directory instead of the real shared production dir
-    # (/home/agents-shared/forum/projects), keeping this suite's live-host
-    # isolation property (see the module docstring) intact for this one too.
-    "collab-baton-monitor.sh": {
-        "path": _TOOLS / "collab-baton-monitor.sh",
-        "no_reap_env": "COLLAB_MONITOR_NO_REAP",
-        "dir_env": "BATON_DIR",
     },
 }
 
@@ -222,20 +209,18 @@ def _start_collab_layer2_decoy(
     the pid as a candidate in the first place).
 
     This decoy is a REAL bash process (satisfies layer 1's interpreter
-    anchor) launching a SIBLING-NAMED throwaway script
-    (`watch-<script>`, e.g. `watch-collab-baton-monitor.sh`) that lives
-    in the per-test scratch dir. `\\S*<script>\\.sh` in the layer-1
-    pattern permits an arbitrary non-space PREFIX before the script
-    name, so `bash /tmp/.../watch-collab-baton-monitor.sh --purpose X`
-    matches layer 1 (confirmed by regex simulation against the real
-    pattern before wiring this fixture). But layer 2's
-    `_check_collab_*_dup` requires an argv token that either EQUALS the
-    real script's exact basename or ENDS WITH `/<real-script-basename>`
-    — `.../watch-collab-baton-monitor.sh` does neither (it ends with
-    `watch-collab-baton-monitor.sh`, not `/collab-baton-monitor.sh`), so
-    a correct layer 2 must reject it. If layer 2 is bypassed (see the
-    handoff's mutation-check), this decoy IS reported — giving the
-    false-positive half of #1935 a test that can actually fail."""
+    anchor) launching a SIBLING-NAMED throwaway script (`watch-<script>`)
+    that lives in the per-test scratch dir. `\\S*<script>\\.sh` in the
+    layer-1 pattern permits an arbitrary non-space PREFIX before the script
+    name, so `bash /tmp/.../watch-<script>.sh --purpose X` matches layer 1
+    (confirmed by regex simulation against the real pattern before wiring
+    this fixture). But layer 2's `_check_collab_*_dup` requires an argv
+    token that either EQUALS the real script's exact basename or ENDS WITH
+    `/<real-script-basename>` — `.../watch-<script>.sh` does neither (it
+    ends with `watch-<script>.sh`, not `/<script>.sh`), so a correct layer
+    2 must reject it. If layer 2 is bypassed (see the handoff's
+    mutation-check), this decoy IS reported — giving the false-positive
+    half of #1935 a test that can actually fail."""
     scratch = tmp_path / "layer2_decoy"
     scratch.mkdir(exist_ok=True)
     decoy_script = scratch / f"watch-{script_basename}"

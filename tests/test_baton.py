@@ -57,10 +57,113 @@ EXIT_STATE = 3
 # Config used for all multi-agent direct-call tests
 MULTI_CONFIG = {"mode": "multi", "agent_name": "borges", "primary_user": "casey"}
 
+# Repo root, for tests that assert on shipped documentation surfaces.
+REPO_ROOT = Path(__file__).parent.parent
+
+# Phrasings that assert, UNCONDITIONALLY, that a person holds the baton --
+# the #3039 defect. Shared by the refusal-message test and the
+# documentation-surface test so a regression on any surface trips the same
+# list (a phrase scrubbed from one surface must stay scrubbed on all of
+# them). "steal" is included because that is the exact word #3039 was filed
+# against. A blacklist can always be dodged by a novel phrasing; it is the
+# backstop, not the guard.
+CLAIM_REFUSAL_BANNED_PHRASES = (
+    "steal",
+    "is currently holding",
+    "cannot take it from",
+    "is holding this baton",
+    "has this baton",
+    "is the current holder",
+    "it is theirs",
+)
+
+# The MIRROR-IMAGE defect, added in round 5. The list above guards one
+# direction only -- asserting a person HOLDS the baton -- and rounds 2-4 all
+# passed it while shipping the opposite error: telling the reader a baton
+# "may in fact be free" whenever the scoped turn-log line was not a
+# `claimed` one. That is wrong in the common case. `release`
+# (projects.py:290, `{holder} → {sentinel}: {reason}`) and `flip` (:161,
+# `{from} → {to}: {reason}`) emit TEXTUALLY IDENTICAL lines, so a baton a
+# colleague genuinely holds via a flip -- the normal PR-layer case --
+# matched the old second branch and was reported as possibly free. A held
+# baton reported free is the same inversion #3039 was filed against, and
+# reporting it as free is the direction that causes a reader to take a
+# baton out from under a colleague.
+#
+# "handing it back" is banned as well, on a second ground: it asks the
+# reader to judge whether the line "handed the baton BACK", which requires
+# already knowing whether <B> is a pool marker -- the very question they
+# consulted this message to answer. A circular instruction is not a weaker
+# instruction, it is a non-instruction.
+#
+# Correct phrasings state the DISJUNCTION and stop ("either a colleague
+# taking it on a flip or a return to a pool marker ... this seat cannot
+# tell"). Naming the free case as one of two possibilities is fine; landing
+# on it as the verdict is not.
+CLAIM_REFUSAL_BANNED_FREE_PHRASES = (
+    "may in fact be free",
+    "is in fact free",
+    "the baton is free",
+    "so the baton may",
+    "handing it back",
+    "handing the baton back",
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _authored_help_strings(parser_obj: argparse.ArgumentParser) -> dict:
+    """Every string THIS REPO AUTHORS that argparse renders into
+    `parser_obj`'s `--help`, collected by INTROSPECTION rather than by a
+    hand-written field list.
+
+    Keyed so that a field nobody has thought of yet -- a `usage=`, a second
+    positional, a new subcommand -- changes the returned dict instead of
+    slipping past a checklist. See the round-11 block in
+    test_claim_disambiguation_surfaces_do_not_regress for why that property
+    is the whole point.
+
+    argparse's own `-h/--help` text is EXCLUDED: its wording belongs to
+    CPython, not to this repo, so pinning it would make the suite fail on an
+    interpreter upgrade. Exactly one such action must exist -- asserted, so
+    the exclusion cannot silently swallow an authored second one.
+    """
+    fields = {
+        "prog": parser_obj.prog,
+        "usage": parser_obj.usage,
+        "description": parser_obj.description,
+        "epilog": parser_obj.epilog,
+    }
+    help_actions = [
+        a for a in parser_obj._actions
+        if isinstance(a, argparse._HelpAction)
+    ]
+    assert len(help_actions) == 1, (
+        f"{parser_obj.prog!r} has {len(help_actions)} argparse-supplied "
+        "help actions, expected exactly 1 -- the exclusion here would be "
+        "dropping authored text from the enumeration"
+    )
+    for a in parser_obj._actions:
+        if isinstance(a, argparse._HelpAction):
+            continue
+        # A sub-parser's `help=` one-liner is stored on the PARENT's
+        # _SubParsersAction, not on the sub-parser, so reading the
+        # sub-parser alone can never see it. That is precisely how round
+        # 10 shipped an inversion through `baton --help`.
+        if isinstance(a, argparse._SubParsersAction):
+            fields["subparsers:metavar"] = a.metavar
+            fields["subparsers:help"] = a.help
+            for ca in a._choices_actions:
+                fields[f"subcommand:{ca.dest}:metavar"] = ca.metavar
+                fields[f"subcommand:{ca.dest}:help"] = ca.help
+            continue
+        key = "|".join(a.option_strings) or a.dest
+        fields[f"arg:{key}:metavar"] = a.metavar
+        fields[f"arg:{key}:help"] = a.help
+    return fields
+
 
 def _run_baton(engram_home: Path, *args: str, env_overrides: dict | None = None) -> tuple:
     """Run the baton CLI as a subprocess; return (exit_code, stdout, stderr)."""
@@ -117,6 +220,77 @@ def _make_raw_baton(project_id: str, **frontmatter) -> str:
     for k, v in fm.items():
         lines.append(f"{k}: {v}")
     lines += ["---", "", "## Turn log", "", "- 2026-06-26T12:00:00Z initialized", ""]
+    return "\n".join(lines)
+
+
+def _raw_from_init_post(post_body: dict, ts: str = "2026-09-20T12:00:00Z") -> str:
+    """Render the baton the forum store WOULD persist for a given
+    ``POST /api/projects`` body — the missing link that lets a test run
+    ``cmd_init`` and then ``cmd_flip`` against what that init actually
+    created, instead of hand-writing the intermediate baton (#3042).
+
+    Unlike ``_make_raw_baton`` (which builds a baton from keyword
+    overrides), the input here is literally ``client.post.call_args``'s
+    body, so every value under test travels the real path: the CLI decides
+    it, this renders it the way the server would, and the next CLI call
+    reads it back.
+
+    Mirrors, deliberately and narrowly, the two server-side rules that
+    decide whether an optional field EXISTS in the frontmatter at all:
+    ``server.py``'s ``author = (data.get("author") or "").strip() or None``
+    and ``coordination/projects.py``'s ``if github: / if colleague: /
+    if author:``. A field posted empty is therefore ABSENT here — which is
+    what makes ``_derive_legacy_author``'s proxy the live path for an
+    unknown invoker, and is asserted directly in
+    ``test_init_with_empty_invoker_leaves_author_empty``.
+
+    The turn-log line is the real one ``init()`` writes
+    (``- {ts} initialized → {turn}: {turn_reason}``) because that line is
+    the sole input to ``_derive_legacy_author``.
+    
+
+    DRIFT NOTE: the two rules mirrored here are pinned against the REAL
+    server in CI by src/forum/tests/test_projects_api.py --
+    `test_init_persists_author_field` (an explicit author is persisted
+    verbatim) and `test_init_without_author_omits_field` (an absent author
+    writes no line at all, not an empty one). If either rule changes, those
+    tests fail first and loudly; this mirror is a convenience, not the
+    authority. Verified present at those names 2026-09-20.
+    """
+    turn = (post_body.get("turn") or "").strip().lower()
+    reason = post_body.get("turn_reason") or ""
+    project_id = post_body["project_id"]
+    title = post_body.get("title") or project_id
+    participants = post_body.get("participants") or []
+    if isinstance(participants, str):
+        participants = [p.strip().lower() for p in participants.split(",") if p.strip()]
+    fm = {
+        "project": project_id,
+        "title": title,
+        "status": post_body.get("status") or "planning",
+        "turn": turn,
+        "turn_since": ts,
+        "turn_reason": f'"{reason}"',
+        "turn_by": '"{}"'.format((post_body.get("agent") or "").strip().lower()),
+        "participants": "[" + ", ".join(participants) + "]",
+    }
+    for key in ("github", "colleague", "author"):
+        val = (post_body.get(key) or "").strip().lower()
+        if val:
+            fm[key] = val
+    lines = ["---"]
+    for k, v in fm.items():
+        lines.append(f"{k}: {v}")
+    lines += [
+        "---",
+        "",
+        f"# {project_id} — {title}",
+        "",
+        "## Turn log",
+        "",
+        f"- {ts} initialized → {turn}: {reason}",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -1049,6 +1223,7 @@ class TestClaim:
 
     def test_claim_refuse_already_claimed_by_other(self, monkeypatch, capsys):
         """Claim when project held by another agent → EXIT_STATE with clear message."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
         monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
 
         client = _make_client(
@@ -1063,6 +1238,909 @@ class TestClaim:
         assert exc_info.value.code == EXIT_STATE
         captured = capsys.readouterr()
         assert "ariadne" in captured.err
+
+    def test_claim_refuse_pool_marker_message_names_seat_mismatch(self, monkeypatch, capsys):
+        """#3039: when turn is a pool/maintainer marker this seat's own
+        config doesn't recognize (e.g. written by a seat with a different
+        primary_user), the refusal must NOT assert a person holds the
+        baton ("steal") -- it must name the turn value, name THIS seat's
+        own resolved sentinel so the mismatch is visible, assert neither
+        "held" nor "free", hand over a remedy that works OFF the turn log,
+        and point at #3039 so a reader lands on the explanation instead of
+        re-deriving it. Round 7 removed the inlined turn-log reading rule
+        (engram-baton/SKILL.md carries it now) and with it the conditional
+        `baton flip` offer, which was the colleague case's remedy and is
+        wrong for a marker this seat cannot classify. Message-text only --
+        behavior (still refuses, still EXIT_STATE) is unchanged and is
+        covered by test_claim_refuse_already_claimed_by_other above."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_is_pool_sentinel", lambda n: n == "casey")
+
+        client = _make_client(
+            get_return={"raw": _make_raw_baton(
+                "PR-1002b", turn="lei shi", participants="[borges, ariadne]",
+            )},
+        )
+        args = argparse.Namespace(project_id="PR-1002b")
+
+        with pytest.raises(SystemExit) as exc_info:
+            _baton.cmd_claim(args, MULTI_CONFIG, "borges", client)
+        assert exc_info.value.code == EXIT_STATE
+        captured = capsys.readouterr()
+
+        # --- STREAM DISCIPLINE (checked FIRST, because every layer below
+        # --- this one reads only stderr) --------------------------------
+        # Rounds 1-3 asserted exclusively on captured.err and never once on
+        # captured.out, so the entire layered stack below was silent about
+        # stdout. Measured: adding
+        #     print(f"hint: {current_turn} is working this one right now "
+        #           "-- it is theirs until they hand it over.")
+        # before the sys.exit left the pinned stderr byte-identical and the
+        # suite green at 184 passed / 1 skipped -- while shipping exactly
+        # the unconditional-holder claim this test exists to forbid. Note
+        # "it is theirs" was ALREADY on the blacklist: the blind spot was
+        # the STREAM, not the vocabulary. baton.py uses bare print() for
+        # status lines elsewhere, so this is an ordinary edit, not a
+        # contrived one. The refusal writes to stderr and nothing else, so
+        # stdout must be empty; and the blacklist below runs over BOTH
+        # streams, because a guard scoped to one stream is silent on the
+        # other and the message's damage does not care which stream
+        # carried it.
+        assert captured.out == "", (
+            "baton claim wrote to stdout; the refusal belongs on stderr "
+            f"alone, and stdout is unguarded by the pins below: {captured.out!r}"
+        )
+        both_streams = captured.out + captured.err
+
+        # --- POSITION-ANCHORED check (the primary one) ------------------
+        # The defect #3039 fixes always lives in the message's OPENING
+        # clause: that is the sentence a reader acts on, so an
+        # unconditional "<name> is holding this" there does the damage no
+        # matter what the later bullets say. Token-PRESENCE-anywhere
+        # assertions cannot see that -- two rounds of this test were
+        # defeated by mutations that rewrote the opening clause while
+        # retaining every asserted token in the bullets below it. So
+        # assert on the FIRST LINE specifically.
+        first_line = captured.err.split("\n")[0]
+        # It must be the seat-mismatch statement...
+        assert "does not recognize" in first_line
+        assert "lei shi" in first_line
+        assert "casey" in first_line
+        # ...and NOTHING ELSE. Containment alone is not enough: a mutation
+        # that keeps the whole genuine sentence and merely APPENDS "lei shi
+        # has this baton right now, so it is theirs until they hand it
+        # over." to the same line satisfies every containment above and
+        # every token below (measured: it passed 184/1-skipped). Freezing
+        # the opening line is what makes that mutation fail. The
+        # brittleness is deliberate and is the point: the opening clause is
+        # the sentence a reader acts on, so ANY edit to it -- benign or
+        # not -- must come back here and be re-justified against #3039.
+        assert first_line == (
+            "baton claim: this baton's turn is 'lei shi', which this seat "
+            "does not recognize as its pool marker (this seat resolves "
+            "'casey'). This seat cannot tell from the turn log whether "
+            "'lei shi' is a colleague who holds this baton or a pool "
+            "marker belonging to an install whose primary_user this seat "
+            "cannot resolve -- that is engram-alpha#3039. Settle it off "
+            "the log: ask 'lei shi', or check the PR or project this "
+            "baton anchors. To read the log yourself, run"
+        ), f"opening clause changed; re-justify against #3039: {first_line!r}"
+
+        # --- STRUCTURAL: the turn value appears exactly where it should --
+        # #3039's defect IS treating the `turn` value as a human holder, so
+        # an added assertion that "<turn> holds it" has to name the turn
+        # value one more time than the message legitimately does. Round 7's
+        # message names it THREE times, all inside the frozen opening line
+        # above: the turn statement, the held-or-pool disjunction, and the
+        # off-log remedy ("ask '<turn>'"). Rounds 4-6 named it once and
+        # this read `== 1`; the number is RE-DERIVED from the shipped text,
+        # not loosened -- an exact count over BOTH streams still fails on
+        # any extra mention, including one planted on stdout, where the
+        # golden master below cannot see it.
+        assert both_streams.count("lei shi") == 3, (
+            "turn value mentioned an unexpected number of times -- an "
+            "extra mention is likely an assertion that it names a person "
+            "who holds the baton"
+        )
+
+        # --- BLACKLIST (defence in depth, not the primary check) --------
+        # Run over BOTH streams (see the stream-discipline note above), and
+        # over the whole message rather than one line: the conditional
+        # bullets are legitimate, these phrasings are not. The list is
+        # shared with test_claim_disambiguation_surfaces_do_not_regress so a
+        # phrase scrubbed here stays scrubbed in --help and the docs too.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in both_streams.lower(), (
+                f"refusal message asserts a holder unconditionally: {banned!r}"
+            )
+        # ...and the MIRROR-IMAGE blacklist (round 5). Verified to
+        # discriminate: run against round 4's message (commit 1d9da1bc) this
+        # loop fails on "handing it back" and "may in fact be free" -- the
+        # two phrasings that reported a flip-held baton as possibly free.
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in both_streams.lower(), (
+                f"refusal message asserts the baton is free when this seat "
+                f"cannot determine that: {banned!r}"
+            )
+
+        # --- LENGTH CEILING (round 7) -----------------------------------
+        # Checked BEFORE the golden master so that a message which merely
+        # GREW is reported as a length regression rather than as an opaque
+        # multi-hundred-character diff. Trajectory: 955 chars (round 3,
+        # flagged too long) -> 709 (round 4, trimmed) -> 1049 (round 5,
+        # regrown when the second bullet was repaired, and unnoticed for
+        # two rounds). It regrew because "length" was marked resolved and
+        # then nothing watched it: a property fixed once and afterwards
+        # unwatched drifts back past its own threshold. That is why the
+        # ceiling is an assertion and not a review habit.
+        #
+        # HEADROOM IS FIXTURE-RELATIVE, corrected in round 9. Round 7 read
+        # its own 560 chars against the 650 ceiling and called the ~90
+        # chars between them headroom for a rewording. They are not the
+        # same thing: the message interpolates the turn value THREE times
+        # plus the seat's sentinel and the project id, so what this
+        # assertion measures is
+        #     526 (constant) + 3*len(turn) + len(sentinel) + len(project_id)
+        # and this fixture contributes only 34 chars of names
+        # ('lei shi' x3, 'casey', 'PR-1002b') -- among the shortest
+        # combinations that occur. Re-measured through this same code path
+        # with names that actually appear in these docs: turn
+        # 'ariadne-calvino', sentinel 'aleph-menard', project
+        # 'class-env-var-precedence' gives 607, leaving 43; round 8's
+        # pessimistic case measured 628, leaving 22. Every char added to
+        # the turn value costs THREE. So the ceiling is tighter than this
+        # fixture makes it look, and most of the ~90 chars visible here
+        # are not spendable on wording. Raising this number needs the same
+        # re-justification as editing the text below.
+        assert len(captured.err) <= 650, (
+            f"refusal message is {len(captured.err)} chars, over the 650 "
+            "ceiling. It grew 709 -> 1049 once already while nobody was "
+            "watching. Trim it, or re-justify the ceiling against the "
+            "955 -> 709 -> 1049 trajectory -- do not just raise the number."
+        )
+
+        # --- GOLDEN MASTER (the backstop that closes the last hole) -----
+        # Everything above still leaves the message's later text open: two
+        # mutations beat the checks above by planting a nameless,
+        # non-blacklisted assertion away from the first line -- "(A
+        # colleague already took this one. Do not proceed.)" as an extra
+        # line, and a bullet flipped to "This baton is not free: a
+        # colleague already took it" -- both passing 184/1-skipped. No
+        # heuristic closes that: the damaging content is ordinary English
+        # with no fixed vocabulary. Since this whole PR *is* the message
+        # text, the message is pinned verbatim. Any edit to it fails here
+        # BY DESIGN; the fix is never to loosen this assertion but to
+        # update the expected text and re-justify the new wording
+        # against #3039.
+        #
+        # RE-JUSTIFIED for round 7: the message stops teaching grammar.
+        #
+        # WHAT LEFT, AND WHY IT IS NOT COMING BACK. Rounds 3-6 inlined the
+        # turn-log reading rule here as two bullets. Bullet two was the
+        # site of the held-looks-free inversion in rounds 2 and 4 -- "the
+        # baton may in fact be free" for any non-`claimed` scoped line,
+        # which is false in the common case because release and flip emit
+        # TEXTUALLY IDENTICAL log lines. Measured end-to-end through the
+        # real writers: init(turn=borges) + flip(to=ariadne, "please
+        # review") logs "borges → ariadne: please review" with ariadne
+        # genuinely HOLDING it, while init(turn=clio) + release(holder=
+        # clio, sentinel="lei shi") logs "clio → lei shi: released" with it
+        # genuinely free -- same shape, opposite truth. Round 5 repaired
+        # the bullet into an honest disjunction, and that repair is what
+        # grew the message from 709 chars to 1049, past the 955 round 3 had
+        # already flagged as too long. A reading rule is prose a reader
+        # consults deliberately; an error stream arriving mid-refusal is
+        # not the place for it.
+        #
+        # The rule is not lost: engram-baton/SKILL.md carries it, with the
+        # two gaps round 6 found in it closed -- init() is enumerated
+        # alongside claim/flip/release (it is the only scoped writer that
+        # can emit a line for a baton parked in a pool and NEVER claimed,
+        # which is #3039's own motivating case), and branch one now keys on
+        # a `<reason>` of exactly `claimed` instead of asking the reader to
+        # recognize <A> as a pool marker -- which this PR's own thesis says
+        # a reader on another install cannot do. Do NOT restore the bullets
+        # here, and do NOT restore a confident branch anywhere:
+        # under-claiming is the point of #3039.
+        #
+        # `baton flip` is deliberately NOT offered any more. It was bullet
+        # one's remedy -- correct only for the colleague case -- and this
+        # message no longer claims to identify that case, so naming it
+        # would invite exactly the guess #3039 was filed against.
+        #
+        # Still true of the new text, and the things to re-confirm on any
+        # future edit: it refuses without asserting that a person holds the
+        # baton; it asserts neither "held" nor "free"; it names the turn
+        # value AND this seat's own resolved sentinel so the mismatch is
+        # visible; it carries no form of "steal"; it points at 3039 by
+        # number; and the remedy it hands over is OFF the log.
+        assert captured.err == (
+            "baton claim: this baton's turn is 'lei shi', which this seat "
+            "does not recognize as its pool marker (this seat resolves "
+            "'casey'). This seat cannot tell from the turn log whether "
+            "'lei shi' is a colleague who holds this baton or a pool "
+            "marker belonging to an install whose primary_user this seat "
+            "cannot resolve -- that is engram-alpha#3039. Settle it off "
+            "the log: ask 'lei shi', or check the PR or project this "
+            "baton anchors. To read the log yourself, run\n"
+            "    baton show PR-1002b\n"
+            "and see the engram-baton skill for how to scope a turn-log "
+            "line to the turn value.\n"
+        )
+
+        # --- Existing token assertions (kept: not harmful, insufficient) -
+        # Names the turn value, without asserting theft/personhood.
+        assert "lei shi" in captured.err
+        assert "steal" not in captured.err.lower()
+        # Names this seat's OWN resolved sentinel, so the mismatch is visible.
+        assert "casey" in captured.err
+        # States the indeterminacy as a disjunction and lands on NEITHER
+        # arm. Round 4's "means a colleague took it" + "baton flip" pair is
+        # gone with the bullets: the message no longer claims to identify
+        # the colleague case, so shipping that case's remedy would be the
+        # over-claim #3039 was filed against.
+        assert "cannot tell" in captured.err.lower()
+        assert "colleague who holds this baton" in captured.err
+        assert "pool marker belonging to an install" in captured.err
+        # The remedy is OFF the log -- ask the agent the turn value names,
+        # or read the PR/project the baton anchors. The log cannot settle
+        # it from this seat, which is the whole content of #3039.
+        assert "ask 'lei shi'" in captured.err
+        assert "anchors" in captured.err
+        # The reading rule is still reachable, just not reprinted here: the
+        # message points at `baton show` for the log itself and at the
+        # engram-baton skill for how to scope a line to the turn value.
+        assert "baton show" in captured.err
+        assert "turn log" in captured.err.lower()
+        assert "engram-baton skill" in captured.err
+        # Points at the issue by number.
+        assert "3039" in captured.err
+
+    def test_claim_disambiguation_surfaces_do_not_regress(self):
+        """#3039: `baton claim --help`, engram-baton/SKILL.md and CLAUDE.md
+        carry the same corrected disambiguation as the refusal message, and
+        none of them may drift back to asserting that a person holds the
+        baton.
+
+        Added in round 4 because all three surfaces had ZERO coverage: a
+        reviewer gutted the --help description back to "Refuses to steal
+        from another agent who is currently holding it" -- the exact claim
+        this PR exists to remove -- and the suite stayed green at 184
+        passed / 1 skipped. The refusal message was pinned verbatim while
+        the three surfaces a reader is at least as likely to consult were
+        unguarded.
+
+        HARDENED in round 7, because the round-4 guard was still
+        defeatable. The reviewer gutted the claim sub-parser description to
+        "`<B>` owns this baton and you must wait for them to pass it" --
+        every required token retained, the meaning exactly inverted -- and
+        this test passed at 185/1-skipped. Planted-token controls confirm
+        the instrument really does read these files, so the miss was in
+        the ASSERTIONS, not the plumbing: presence-and-count checks cannot
+        see a meaning inversion that preserves the tokens. Two of the
+        three surfaces are now pinned verbatim by the same golden-master
+        instrument that has repeatedly proved discriminating on the
+        refusal message itself.
+
+        EXTENDED in round 11, on two fronts. First, the authored `--help`
+        strings are now pinned as a complete ENUMERATION rather than
+        field by field: rounds 6, 8 and 10 each shipped the same inversion
+        through a different unpinned field at 185/1-green, so the thing
+        that had to be closed was the ability of an unanticipated field to
+        exist unpinned at all. Second, SKILL.md's failure-modes row is now
+        pinned verbatim too. Rounds 7 and 8 deliberately left it on the
+        cheaper count-based checks -- correctly, while the verb-list
+        bullet carried a second copy whose disagreement caught inversion
+        #4. Round 9 cut that copy, leaving the row as the only statement
+        of the rule not already pinned verbatim, and round 10 inverted it
+        with no banned vocabulary while green. Long prose that changes is
+        still the right description of it; requiring deliberate
+        re-justification to change it is now the right price.
+
+        Deliberately cheap and stdlib-only: build the parser in-process
+        (no subprocess) and read the two docs off disk.
+        """
+        parser = _baton.build_parser()
+        # argparse exposes no public accessor for a subparser by name;
+        # _SubParsersAction has been the stable shape across CPython 3.x.
+        # Kept alongside the golden master below: without it, a layout
+        # change would make the pin unreachable rather than red.
+        subparser_actions = [
+            a for a in parser._actions
+            if isinstance(a, argparse._SubParsersAction)
+        ]
+        assert len(subparser_actions) == 1, (
+            "baton's subparser layout changed -- this test can no longer "
+            "locate the claim subparser, so it would pass vacuously"
+        )
+        claim_parser = subparser_actions[0].choices["claim"]
+        claim_help = claim_parser.description
+        # The RENDERED surface, whitespace-normalized (round 9). See the
+        # "rendered --help surface" block below for why both exist.
+        claim_help_rendered = " ".join(claim_parser.format_help().split())
+
+        skill_md = (
+            REPO_ROOT / "src" / "engram" / "skills" / "claude"
+            / "engram-baton" / "SKILL.md"
+        ).read_text()
+        claude_md = (REPO_ROOT / "CLAUDE.md").read_text()
+
+        # --- SLICE CLAUDE.md TO THE BATON PASSAGE -----------------------
+        # Everything below runs against the PASSAGE, not the whole file.
+        # Whole-file token checks are near-vacuous here: "identical"
+        # occurs 9 times in CLAUDE.md, 8 of them in passages with nothing
+        # to do with batons, so `assert "identical" in claude_md` could
+        # not fail no matter what happened to the baton bullet. Two
+        # anchors bound the passage; each occurs exactly once in the file.
+        passage_start_anchor = "- `baton claim pool-X`"
+        passage_end_anchor = "\n- The claimer drives the bunch toward fix-PRs"
+        start = claude_md.find(passage_start_anchor)
+        end = claude_md.find(passage_end_anchor)
+        assert start != -1, (
+            "CLAUDE.md no longer contains the baton-claim passage's "
+            f"opening anchor {passage_start_anchor!r} -- the passage moved "
+            "or was reworded. Re-anchor deliberately; do not fall back to "
+            "asserting against the whole file, which is what made these "
+            "checks vacuous in round 6."
+        )
+        assert end != -1 and end > start, (
+            "CLAUDE.md no longer contains the baton-claim passage's "
+            f"closing anchor {passage_end_anchor!r} after the opening one"
+        )
+        assert claude_md.count(passage_start_anchor) == 1, (
+            "the CLAUDE.md opening anchor is no longer unique; the slice "
+            "below could silently bound the wrong passage"
+        )
+        claude_passage = claude_md[start:end]
+        # The passage must stay OUTSIDE the generated team-practice
+        # region: edits inside it are overwritten wholesale the next time
+        # tools/sync_team_practice.py renders TEAM-PRACTICE.md, so a
+        # #3039 fix parked in there would silently revert.
+        generated_end = claude_md.find(
+            "<!-- END team-practice: which-colleague-takes-the-seat -->"
+        )
+        assert generated_end != -1 and start > generated_end, (
+            "the CLAUDE.md baton passage is inside (or ahead of) the "
+            "generated team-practice region -- content there is rendered "
+            "from the team-practice repo and any fix made here is lost on "
+            "the next sync"
+        )
+
+        # --- NEGATIVE CHECKS RUN OVER THE WHOLE FILE (round 9) ----------
+        # The slice above is right for the POSITIVE checks and for the
+        # verbatim pin: those have to name one passage, and a whole-file
+        # token check would be near-vacuous (see the note above). But
+        # scoping the NEGATIVE checks to the slice means every banned
+        # phrase is legal three lines past the end anchor. Measured on
+        # this tip at round 8: a sibling bullet just below the end anchor,
+        # in the same section, carrying "is currently holding" and "it is
+        # theirs" kept the suite green at 185 passed / 1 skipped. A reader
+        # of that section does not stop at the anchor, so neither does
+        # this. Measured free: all 13 phrases occur 0 times in the whole
+        # of CLAUDE.md today.
+        #
+        # If one of these ever fires on a genuinely unrelated passage,
+        # narrow the PHRASE in the shared tuples -- do not re-narrow these
+        # checks back to the slice, which is the hole this closes.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in claude_md.lower(), (
+                f"CLAUDE.md asserts somewhere that a person holds the "
+                f"baton ({banned!r}) -- the #3039 claim this PR removed. "
+                "The baton passage is not the only part of this file a "
+                "reader acts on."
+            )
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in claude_md.lower(), (
+                f"CLAUDE.md tells the reader somewhere that the baton is "
+                f"(or may be) free on evidence that cannot establish it "
+                f"({banned!r}) -- release and flip emit identical turn-log "
+                "lines. State the disjunction and stop."
+            )
+
+        # name -> (text, how many times the scoped-shape token must appear).
+        # The count matters, not just presence: a whole-file `in` check is
+        # satisfied by any single statement of the rule. Measured while
+        # writing this test -- reverting ONLY the verb-list row to round
+        # 3's "last arrow line" left the suite green at 185 passed / 1
+        # skipped, because the failure-modes row still carried the token.
+        # Requiring the count is what makes a one-row regression fail.
+        #
+        # SKILL.md's count was 2 through round 8 and is 1 from round 9. The
+        # second copy was CUT, NOT LOST: the verb-list bullet carried a
+        # CONDENSED restatement of the turn-log reading rule, and round 8
+        # found a FOURTH held-looks-free inversion in it (the `initialized`
+        # case filed under "settled", which is #3039's own motivating case
+        # and is indeterminate). A standing pre-commitment made before
+        # round 6 -- "if that round finds a FOURTH site of the
+        # held-looks-free inversion, CUT the disambiguation guidance rather
+        # than sharpen it again" -- fired, because four attempts at a short
+        # form produced four inversions in four wordings across rounds 2, 4
+        # and 7. The rule survives in exactly ONE place, the line-by-line
+        # audited failure-modes row, and the bullet keeps the pointer to
+        # it. Do NOT read this 1 as drift and restore a second copy: the
+        # lowered count IS the fix. Raising it back to 2 means re-arguing
+        # the pre-commitment, not repairing a regression.
+        SHAPE = "<A> → <B>: <reason>"
+        surfaces = {
+            "baton claim --help": (claim_help, 1),
+            "engram-baton/SKILL.md": (skill_md, 1),
+            "CLAUDE.md baton passage": (claude_passage, 1),
+        }
+
+        for name, (text, shape_count) in surfaces.items():
+            # NEGATIVE first, so that the reviewer's actual regression --
+            # gutting the description to "Refuses to steal from another
+            # agent who is currently holding it" -- is reported as the
+            # refuted claim it is. Were it ordered AFTER the vacuity guard
+            # below, the gutted text (105 chars) would trip that guard
+            # instead and report "unexpectedly short" -- true, but naming
+            # the wrong defect. An EMPTY surface passes this loop vacuously
+            # and is caught by the vacuity guard immediately below, so
+            # nothing escapes either way.
+            for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+                assert banned not in text.lower(), (
+                    f"{name} asserts unconditionally that a person holds "
+                    f"the baton ({banned!r}) -- the #3039 claim this PR "
+                    "removed. If this phrase is legitimate in an unrelated "
+                    "passage, narrow the phrase in "
+                    "CLAIM_REFUSAL_BANNED_PHRASES rather than dropping "
+                    "the guard."
+                )
+            # ...and the mirror-image blacklist (round 5): no surface may
+            # land on "free" for a line this seat cannot classify. Verified
+            # to discriminate on all three surfaces: at round 4 (commit
+            # 1d9da1bc) --help and SKILL.md carried "handing the baton
+            # back" + "may in fact be free", and CLAUDE.md carried "handing
+            # it back", so this loop failed on every one of them.
+            for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+                assert banned not in text.lower(), (
+                    f"{name} tells the reader the baton is (or may be) free "
+                    f"on evidence that cannot establish it ({banned!r}) -- "
+                    "release and flip emit identical turn-log lines, so a "
+                    "colleague's flip-held baton matches too. State the "
+                    "disjunction and stop; narrow the phrase in "
+                    "CLAIM_REFUSAL_BANNED_FREE_PHRASES rather than "
+                    "dropping the guard."
+                )
+            # Guard the instrument: an empty description, or a doc that
+            # moved and now reads as "", would make every substring
+            # assertion here pass vacuously -- which is the exact failure
+            # mode this test was added to close.
+            assert text and len(text) > 200, (
+                f"{name} is empty or unexpectedly short -- the assertions "
+                "here would pass vacuously"
+            )
+            # POSITIVE: a blacklist alone would be satisfied by a surface
+            # that says nothing at all, so require the corrected rule --
+            # the turn-value-scoped log line, not round 3's "last arrow
+            # line", which three turn-neutral writers (reopen, anchor,
+            # set_colleague) can satisfy with a non-holder's name.
+            assert text.count(SHAPE) >= shape_count, (
+                f"{name} names the scoped turn-log line shape "
+                f"{text.count(SHAPE)} time(s), expected at least "
+                f"{shape_count}; an unscoped 'last arrow line' rule "
+                "reintroduces #3039's false-holder diagnosis one hop "
+                "downstream. If a passage was legitimately removed, lower "
+                "the count here deliberately rather than dropping it."
+            )
+            assert "turn_reason" in text, (
+                f"{name} no longer warns off turn_reason, which reads "
+                "'claimed' on every claim"
+            )
+            # POSITIVE for round 5: the blacklist above only forbids landing
+            # on "free"; silently DELETING the second branch would satisfy
+            # it while leaving the reader with no account of the
+            # non-`claimed` case at all. So require each surface to state
+            # WHY it cannot classify that line -- that release and flip emit
+            # the identical text -- and to hand over the off-log remedy that
+            # replaces the verdict. Both tokens are absent from round 4
+            # (1d9da1bc), so this pair fails there.
+            assert "identical" in text.lower(), (
+                f"{name} no longer explains WHY a non-'claimed' scoped line "
+                "is indeterminate (release and flip emit the identical "
+                "text). Without the reason, a later editor reinstates a "
+                "confident branch."
+            )
+            assert "anchors" in text.lower(), (
+                f"{name} no longer gives the off-log remedy (ask <B>, or "
+                "check the PR/project the baton anchors) -- without it the "
+                "message reports indeterminacy and strands the reader."
+            )
+
+        # --- THE RENDERED `--help` SURFACE (round 9) --------------------
+        # Everything above reads `.description`, which is a FIELD of the
+        # help surface, not the surface. argparse also renders `epilog`
+        # (and, on the top-level parser, each subcommand's `help=`), and
+        # nothing in this suite read either. Measured on this tip at
+        # round 8: adding
+        #     epilog="Refuses to steal from another agent who is
+        #             currently holding it"
+        # to p_claim ships that sentence into `baton claim --help` and the
+        # suite stayed green at 185 passed / 1 skipped -- the round-4
+        # regression, re-entering through an unread field. Same dimension
+        # error as the rest of this PR: checking a component of the
+        # surface instead of the surface.
+        #
+        # Whitespace is normalized FIRST because argparse re-wraps prose to
+        # the terminal width: the shipped description already renders with
+        # "'<A> → <B>:\n<reason>'" split across a line break, so a raw
+        # substring blacklist over format_help() would miss any phrase that
+        # happens to straddle a wrap -- and the wrap points move with
+        # $COLUMNS, making the miss environment-dependent. Verified: a
+        # planted "is currently holding" positioned across a wrap is missed
+        # by the raw check and caught by the normalized one.
+        for banned in CLAIM_REFUSAL_BANNED_PHRASES:
+            assert banned not in claim_help_rendered.lower(), (
+                "the rendered `baton claim --help` asserts unconditionally "
+                f"that a person holds the baton ({banned!r}). It is not in "
+                "the pinned description, so it arrived through `epilog` or "
+                "another field nothing else reads."
+            )
+        for banned in CLAIM_REFUSAL_BANNED_FREE_PHRASES:
+            assert banned not in claim_help_rendered.lower(), (
+                "the rendered `baton claim --help` tells the reader the "
+                f"baton is (or may be) free on evidence that cannot "
+                f"establish it ({banned!r}) -- see the note on "
+                "CLAIM_REFUSAL_BANNED_FREE_PHRASES."
+            )
+        # Guard the instrument: if format_help() ever returned the
+        # description alone (or less), the two loops above would add
+        # nothing over the ones that already ran on `.description`.
+        assert " ".join(claim_help.split()) in claim_help_rendered, (
+            "the rendered `baton claim --help` no longer contains the "
+            "description -- this block is now checking something else"
+        )
+        assert len(claim_help_rendered) > len(" ".join(claim_help.split())), (
+            "the rendered `baton claim --help` is no larger than its "
+            "description; the blacklists above are then redundant rather "
+            "than a second layer"
+        )
+        # A blacklist cannot see a meaning inversion that uses none of its
+        # vocabulary -- that is exactly what round 6 proved on the
+        # description ("`<B>` owns this baton and you must wait for them to
+        # pass it" retains every token and inverts the meaning), and it is
+        # why the description is ALSO pinned verbatim below. The same hole
+        # is open on `epilog`, which no golden master covers. Measured:
+        # with the two loops above in place, that sentence as an epilog
+        # still passes them. So pin the field EMPTY: nothing reads it, so
+        # nothing may ship through it. If an epilog is ever wanted, add a
+        # verbatim pin for it here in the same breath as adding it.
+        assert claim_parser.epilog is None, (
+            "p_claim grew an `epilog`, which `baton claim --help` renders "
+            "to the user and no test pins verbatim. Round 6's inversion "
+            "used no blacklisted word, so the blacklists above would not "
+            f"catch one here either. Pin it: {claim_parser.epilog!r}"
+        )
+
+        # --- THE COMPLETE ENUMERATION OF AUTHORED `--help` STRINGS ------
+        # (round 11) Rounds 6, 8 and 10 each shipped round 6's exact
+        # inversion through a DIFFERENT unpinned `--help` surface, every
+        # one of them green at 185 passed / 1 skipped. Round 9 is the
+        # instructive one: the block immediately above correctly REFUSES a
+        # blacklist for `epilog` -- "a blacklist cannot see a meaning
+        # inversion that uses none of its vocabulary" -- and then, ten
+        # lines later, guards the subcommand `help=` one-liner with
+        # exactly that blacklist. Round 10 walked round 6's inversion
+        # straight through it. The right reasoning and the wrong
+        # instrument, in one comment block.
+        #
+        # So the fix cannot be another field. Pinning only the two fields
+        # round 10 named would leave round 12 to find the fifth surface.
+        # What is pinned here is the ENUMERATION ITSELF: every authored
+        # string argparse renders into a `--help` surface, gathered by
+        # introspection and compared as a WHOLE dict. An unanticipated
+        # field -- a `usage=`, a second positional, a new subcommand --
+        # changes the dict and fails HERE. That is the property a
+        # per-field checklist structurally cannot have.
+        #
+        # The named per-field guards above are KEPT rather than folded in:
+        # each carries the argument for why that particular field is
+        # dangerous, which a whole-dict comparison cannot express. This
+        # block closes the gap between them; it does not retire them.
+        claim_fields = _authored_help_strings(claim_parser)
+        # `description` is pinned verbatim by the golden master below.
+        # Substitute a sentinel rather than POPPING the key: popping would
+        # let a DELETED description pass this dict comparison, and the
+        # deleted-surface case is exactly what the vacuity guards above
+        # exist for. Replacing keeps the key's presence load-bearing.
+        assert "description" in claim_fields, (
+            "argparse no longer exposes `description` -- the golden master "
+            "below is checking a field this enumeration cannot see"
+        )
+        claim_fields["description"] = (
+            "<pinned verbatim by the golden master below>"
+        )
+        assert claim_fields == {
+            'prog': 'baton claim',
+            'usage': None,
+            'description': '<pinned verbatim by the golden master below>',
+            'epilog': None,
+            'arg:project_id:metavar': 'PROJECT-ID',
+            'arg:project_id:help': 'Project identifier (e.g. pool-cli-gap, DESIGN-trust-tier-v2)',
+        }, (
+            "the authored `--help` strings on the claim sub-parser "
+            "changed. This includes the POSITIONAL's `help=`, which "
+            "renders into `baton claim --help` and which round 10 shipped "
+            "round 6's inversion through while green. If you ADDED a "
+            "field, it is a new user-facing surface: pin its text here in "
+            "the same breath, and re-justify it against #3039. If you "
+            f"edited one, re-justify the new wording: {claim_fields!r}"
+        )
+
+        # The parent parser is a SECOND surface with its own authored
+        # strings -- its description and epilog, plus every subcommand's
+        # `help=` one-liner, all of which render into `baton --help` and
+        # none of which the claim sub-parser can see. Pinning only
+        # `claim`'s one-liner would leave its fourteen siblings guarded by
+        # the blacklist that has now lost three times; the scope of the
+        # guard being replaced was the whole top-level surface, so the
+        # scope of the pin is too.
+        assert _authored_help_strings(parser) == {
+            'prog': 'baton',
+            'usage': None,
+            'description': 'Multi-agent turn-state CLI — declare whose move it is on a shared project via explicit baton files.',
+            'epilog': 'Protocol docs: docs/baton-protocol.md\nProjects dir:  /home/agents-shared/forum/projects/ (manual deploy)\n',
+            'subparsers:metavar': 'subcommand',
+            'subparsers:help': None,
+            'subcommand:init:metavar': 'init',
+            'subcommand:init:help': 'Create a new project baton file',
+            'subcommand:flip:metavar': 'flip',
+            'subcommand:flip:help': 'Pass the baton to another participant',
+            'subcommand:claim:metavar': 'claim',
+            'subcommand:claim:help': 'Claim a Project-layer baton from the pool (pool → self)',
+            'subcommand:release:metavar': 'release',
+            'subcommand:release:help': 'Return a Project-layer baton to the pool (self → pool sentinel)',
+            'subcommand:status:metavar': 'status',
+            'subcommand:status:help': 'List active projects (sorted by turn_since ascending)',
+            'subcommand:mine:metavar': 'mine',
+            'subcommand:mine:help': "Shorthand for 'baton status --mine'",
+            'subcommand:show:metavar': 'show',
+            'subcommand:show:help': 'Display a project file (read-only)',
+            'subcommand:close:metavar': 'close',
+            'subcommand:close:help': 'Mark a project merged or cancelled',
+            'subcommand:reopen:metavar': 'reopen',
+            'subcommand:reopen:help': 'Flip a closed baton back to an active status (inverse of close)',
+            'subcommand:gc:metavar': 'gc',
+            'subcommand:gc:help': 'batch-close PR-batons whose GitHub PR is merged/closed',
+            'subcommand:rename:metavar': 'rename',
+            'subcommand:rename:help': 'Update the human-readable project title',
+            'subcommand:anchor:metavar': 'anchor',
+            'subcommand:anchor:help': 'Set or update the github: anchor on an existing baton',
+            'subcommand:add-participant:metavar': 'add-participant',
+            'subcommand:add-participant:help': "Add an agent to an existing baton's participants list",
+            'subcommand:set-colleague:metavar': 'set-colleague',
+            'subcommand:set-colleague:help': 'Set or change the colleague: field on an existing baton (#2764)',
+            'subcommand:merge:metavar': 'merge',
+            'subcommand:merge:help': 'Gate-checked squash merge for a PR baton',
+        }, (
+            "the authored `--help` strings on the top-level `baton` "
+            "parser changed -- most likely a subcommand's `help=` "
+            "one-liner, which renders in `baton --help` and nowhere else. "
+            "Adding or renaming a subcommand is expected to fail here: "
+            "pin the new one-liner deliberately. For `claim`, re-justify "
+            f"it against #3039: {_authored_help_strings(parser)!r}"
+        )
+        # The subcommand's `help=` one-liner renders on a DIFFERENT
+        # surface -- the top-level `baton --help` listing -- so reading
+        # the claim sub-parser cannot see it. Measured on this tip: all 13
+        # banned phrases occur 0 times in the whole rendered top-level
+        # help, so this costs nothing today. Round 11 pinned those
+        # one-liners verbatim in the enumeration above, which is what
+        # actually guards them; this loop is kept as a cheap second layer
+        # over the RENDERED surface, not as the primary instrument.
+        top_level_rendered = " ".join(parser.format_help().split()).lower()
+        for banned in (
+            CLAIM_REFUSAL_BANNED_PHRASES + CLAIM_REFUSAL_BANNED_FREE_PHRASES
+        ):
+            assert banned not in top_level_rendered, (
+                f"the rendered top-level `baton --help` carries {banned!r} "
+                "-- most likely through a subcommand's `help=` one-liner, "
+                "which is rendered there and nowhere else"
+            )
+
+        # --- GOLDEN MASTERS (round 7) -----------------------------------
+        # The loop above is presence-and-count only, and round 6 proved
+        # that is defeatable by a meaning inversion that keeps every
+        # token: "`<B>` owns this baton and you must wait for them to pass
+        # it" retains the shape token, "turn_reason", "identical" and
+        # "anchors" while asserting exactly the unconditional holder claim
+        # #3039 was filed against. No heuristic closes that -- the
+        # damaging content is ordinary English with no fixed vocabulary --
+        # so the two SHORT surfaces are pinned verbatim, the instrument
+        # that has caught every planted mutation on the refusal message.
+        # Editing either surface fails here BY DESIGN: update the expected
+        # text and re-justify the new wording against #3039, exactly as
+        # for the refusal message. Line-number citations are deliberately
+        # absent from both -- they are prose a reader trusts, they go
+        # stale silently, and a stale one shipped for two rounds of this
+        # PR; engram-alpha#3039 is the durable pointer.
+        assert claim_help == (
+            'Take a Project-layer baton for yourself. Only succeeds '
+            "when the current turn is the pool sentinel (the install's "
+            "primary_user). Refuses when the turn is not this seat's "
+            'recognized pool marker — which may be a colleague '
+            'genuinely holding it, or a pool or maintainer marker '
+            'written by a seat with a different primary_user '
+            '(engram-alpha#3039). To see what the turn log records, '
+            "run 'baton show <project-id>' and find the LAST turn log "
+            "line shaped '<A> → <B>: <reason>' whose <B> -- the name "
+            'just after the FIRST arrow -- is the turn value. Only '
+            'such a line records who the turn was handed to: anchor, '
+            'colleague and reopen lines carry arrows of their own and '
+            'name no holder, and turn_reason does not discriminate '
+            "(every claim writes 'claimed'). '<pool> → <B>: claimed' "
+            "means a colleague took it -- use 'baton flip' with an "
+            'explicit handoff agreement. ANY OTHER such line leaves '
+            'this seat unable to tell which case it is: release and '
+            'flip emit the identical text, so the line is either a '
+            'colleague taking it on a flip or a return to a pool '
+            'marker belonging to a seat whose primary_user this one '
+            "cannot resolve -- that is #3039. A <reason> of 'released' "
+            "is release's default but is user-settable, so it hints "
+            'and never settles. Settle it off the log: ask <B>, or '
+            'check the PR or project this baton anchors -- do not flip '
+            'on a guess.\n'
+            '\n'
+            'Vocabulary distinction: claim/release are Project-layer '
+            'verbs (single driver, rare passes). flip is the PR-layer '
+            'verb (frequent passing through fairy → reviewer → '
+            'colleague → maintainer).'
+        ), (
+            "the claim sub-parser description changed; re-justify the new "
+            f"wording against #3039: {claim_help!r}"
+        )
+
+        assert claude_passage == "\n".join((
+            '- `baton claim pool-X` — `turn:` flips to the claimer; refuses when `turn:`',
+            "  is not this seat's recognized pool marker — either a colleague is holding it,",
+            '  or it is a pool/maintainer marker written by a seat with a different',
+            '  `primary_user` (#3039). Before assuming someone holds it, run `baton show`',
+            '  and find the last turn-log line shaped `<A> → <B>: <reason>` whose `<B>` —',
+            '  the name just after the FIRST arrow — is the `turn:` value; `anchor`,',
+            '  `set_colleague` and `reopen` write arrows without touching `turn:`, so "the',
+            '  last arrow line" can name a non-holder. `<pool> → <B>: claimed` = a',
+            '  colleague took it. Any other such line is **indeterminate from your seat** —',
+            '  `release` and `flip` emit the identical text, so it is either a colleague',
+            '  taking it on a flip (held) or a return to a pool marker belonging to a seat',
+            '  whose `primary_user` you cannot resolve (free); that is #3039. Settle it off',
+            '  the log — ask `<B>`, or check the PR/project the baton anchors — and do not',
+            '  flip on a guess. `turn_reason` does not discriminate (every claim writes',
+            '  `"claimed"`).',
+        )), (
+            "the CLAUDE.md baton passage changed; re-justify the new "
+            f"wording against #3039: {claude_passage!r}"
+        )
+
+        # --- THE SKILL.md FAILURE-MODES ROW, PINNED (round 11) ----------
+        # Rounds 7 and 8 both tiered this row's exposure a Suggestion, on
+        # the ground that SKILL.md is long prose that legitimately changes
+        # and a golden master over it would be noise. That was right while
+        # a SECOND copy existed -- and the two copies disagreeing is
+        # literally how round 8 found inversion #4, in the condensed
+        # restatement carried by the verb-list bullet.
+        #
+        # Round 9 CUT that copy under a standing pre-commitment. The cut
+        # was correct, but it removed the cross-copy detector. Measured on
+        # this tip, the rule is stated user-facing in exactly three places
+        # -- the CLAUDE.md baton passage, the claim sub-parser
+        # description, and this row -- and the first two are pinned
+        # verbatim just above. So this row is the only statement of the
+        # rule a vocabulary-free inversion can still enter through, and
+        # nothing is positioned to contradict it when it does: the pinned
+        # pair cannot silently disagree, but neither is compared against
+        # SKILL.md. Round 10 inverted this row's case (b) using no
+        # blacklisted vocabulary and stayed green at 185 passed / 1
+        # skipped; a count-based check cannot see that.
+        #
+        # So it is pinned, and the cost is the point: this is the single
+        # surviving statement of a rule that has inverted FOUR times, so
+        # changing it SHOULD require deliberate re-justification rather
+        # than passing as ordinary prose drift.
+        skill_claim_rows = [
+            ln for ln in skill_md.splitlines()
+            if ln.startswith("| `baton claim:")
+        ]
+        assert len(skill_claim_rows) == 1, (
+            "engram-baton/SKILL.md no longer has exactly one failure-modes "
+            f"row for `baton claim` ({len(skill_claim_rows)} found), so the "
+            "pin below would compare the wrong line -- or, at zero, pass "
+            "over a surface that had been deleted outright"
+        )
+        assert skill_claim_rows[0] == (
+            '| `baton claim: ... which this seat does not recognize as its '
+            'pool marker` | Either a colleague is genuinely holding it, OR '
+            'the turn is a pool/maintainer marker written by a seat with a '
+            'different `primary_user` (#3039) | Run `baton show <id>` and '
+            'find the **last turn-log line shaped `<A> → <B>: <reason>` '
+            'whose `<B>` — the name just after the FIRST arrow — is the '
+            '`turn:` value**. Only such a line records who the turn was '
+            'handed to: `anchor`, `set_colleague` and `reopen` write '
+            'arrows of their own without touching `turn:`, so "the last '
+            'arrow line" can name an agent who does not hold the baton '
+            '(the same false-holder error as #3039). Four writers can '
+            'produce a scoped line — `init`, `claim`, `flip`, `release` — '
+            'and you classify it by tokens you can actually read, never by '
+            'deciding whether `<A>` is a pool marker: on another install '
+            'you cannot, and that inability IS #3039. **(a) `<reason>` is '
+            'exactly `claimed`** → `claim` wrote it; it is the only one of '
+            'the four that hardcodes that word, so `<B>` took the baton '
+            'from a pool and holds it. Letter them and flip only by '
+            'agreement. The other three take free-text reasons, so a '
+            'hand-typed `claimed` can imitate this — strong evidence, not '
+            'proof. **(b) `<A>` is literally `initialized`** → `init` '
+            'wrote it: the baton has carried this same `turn:` since '
+            'creation and was **never claimed**, so `<B>` is only whatever '
+            "the creator set — very often their own install's pool marker. "
+            "That is #3039's motivating case and it is **indeterminate "
+            'from your seat**. **(c) anything else** → also '
+            '**indeterminate from your seat**: `release` and `flip` emit '
+            'the identical text, so the line is either a colleague taking '
+            'it on a flip (held) or a return to a pool marker belonging to '
+            'a seat whose `primary_user` you cannot resolve (free) — that '
+            "is #3039. A `<reason>` of `released` is `release`'s default "
+            'but is user-settable, so it hints and never settles. In (b) '
+            'and (c), settle it off the log — ask `<B>`, or check the '
+            'PR/project the baton anchors — and do not flip on a guess. Do '
+            '**not** judge by `turn_reason`: every claim writes '
+            '`"claimed"`, so a genuinely-held baton reads there as though '
+            'no handoff happened. |'
+        ), (
+            "the engram-baton/SKILL.md failure-modes row changed. Since "
+            "round 9 cut the condensed copy, this is the only statement "
+            "of the turn-log reading rule that is not already pinned "
+            "verbatim, and the cross-copy disagreement that caught "
+            "inversion #4 no longer exists to catch a fifth. Re-justify "
+            "the new wording against #3039 before updating this pin: "
+            f"{skill_claim_rows[0]!r}"
+        )
+
+        # --- THE SKILL.md VERB-LIST BULLET, PINNED (round 12 fold-in) ---
+        # Round 9 cut the CONDENSED READING RULE out of this bullet, and
+        # the comment above records that correctly. What it left behind is
+        # not nothing: the bullet still states the refusal SEMANTICS -- a
+        # `turn:` this seat does not recognize may be a colleague holding
+        # it, OR a pool/maintainer marker written by a seat with a
+        # different `primary_user`. That disjunction IS #3039, and until
+        # now nothing pinned it. The count-based SKILL.md check above
+        # counts the scoped turn-log SHAPE token, which this bullet no
+        # longer carries after round 9, so it reads the failure-modes row
+        # and not this line; the blacklists cannot see an inversion
+        # written without their vocabulary. Measured in round 12: this
+        # bullet's meaning was rewritten using none of the 13 banned
+        # phrases and the suite stayed green at 185 passed / 1 skipped.
+        #
+        # Same instrument and same price as the failure-modes row above.
+        # This bullet is the statement of the rule a reader meets FIRST,
+        # in the verb list they consult to use the command at all, so
+        # changing it should cost a deliberate re-justification rather
+        # than passing as ordinary prose drift.
+        skill_claim_verb_rows = [
+            ln for ln in skill_md.splitlines()
+            if ln.startswith("- **`baton claim <project-id>`**")
+        ]
+        assert len(skill_claim_verb_rows) == 1, (
+            "engram-baton/SKILL.md no longer has exactly one verb-list "
+            f"bullet for `baton claim` ({len(skill_claim_verb_rows)} "
+            "found), so the pin below would compare the wrong line -- or, "
+            "at zero, pass over a surface that had been deleted outright"
+        )
+        assert skill_claim_verb_rows[0] == (
+            "- **`baton claim <project-id>`** — take ownership from the "
+            "pool sentinel. Refuses when `turn:` is not this seat's "
+            "recognized pool marker — which may be a colleague holding "
+            "it, or a pool/maintainer marker written by a seat with a "
+            "different `primary_user` (#3039). The full reading rule, "
+            "with the evidence for each case, is in **Failure modes + "
+            "recovery** below — the `baton claim` refusal points here "
+            "rather than reprinting it."
+        ), (
+            "the engram-baton/SKILL.md `baton claim` verb-list bullet "
+            "changed. It carries the refusal's DISJUNCTION -- colleague-"
+            "held OR a foreign install's pool marker -- which no other "
+            "check on this file sees, because round 9 cut the turn-log "
+            "shape token out of it. Re-justify the new wording against "
+            f"#3039 before updating this pin: {skill_claim_verb_rows[0]!r}"
+        )
 
     def test_claim_refuse_invoker_not_in_participants(self, monkeypatch, capsys):
         """Claim when invoker not in participants → EXIT_VALIDATION."""
@@ -2582,6 +3660,64 @@ class TestParseGithubAnchor:
         assert _baton._parse_github_anchor("not-an-anchor") is None
 
 
+class TestPrBatonNameRe:
+    """#2010 (+followup): _PR_BATON_NAME_RE matches a PR-baton's project_id
+    by PREFIX ONLY -- both bare "PR-<N>" and repo-qualified
+    "<REPO>-PR-<N>" (the documented cross-repo naming convention,
+    umwelt/CLAUDE.md) must match, and so must a live "PR-<N>-<repo-slug>"
+    naming shape (e.g. "PR-37-paper") -- what follows the "PR-" prefix is
+    irrelevant to this gate, which is a pure shape test with no capture
+    group. Matched against project_id.upper(), per the call sites."""
+
+    def test_bare_pr_id_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("PR-42".upper()) is not None
+
+    def test_repo_qualified_umwelt_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("UMWELT-PR-572".upper()) is not None
+
+    def test_repo_qualified_engram_matches(self):
+        assert _baton._PR_BATON_NAME_RE.match("ENGRAM-PR-2020".upper()) is not None
+
+    def test_lowercase_repo_qualified_matches_when_uppercased(self):
+        """Call sites match against project_id.upper() -- confirm the
+        pattern (which requires uppercase [A-Z]) is satisfied once the
+        caller does that normalization, not case-insensitive on its own."""
+        assert _baton._PR_BATON_NAME_RE.match("umwelt-pr-572".upper()) is not None
+
+    def test_num_dash_suffix_shape_matches(self):
+        """'PR-37-paper' (a live baton naming shape in the engram-paper
+        repo) matches -- the digits and the trailing "-paper" suffix are
+        both irrelevant to this prefix-only gate. An interim
+        suffix-anchored regex ("...(\\d+)$") regressed this shape; the
+        prefix-only form restores it."""
+        assert _baton._PR_BATON_NAME_RE.match("PR-37-paper".upper()) is not None
+
+    def test_non_pr_pool_coordination_does_not_match(self):
+        assert _baton._PR_BATON_NAME_RE.match("pool-coordination".upper()) is None
+
+    def test_non_pr_issue_id_does_not_match(self):
+        assert _baton._PR_BATON_NAME_RE.match("ISSUE-200".upper()) is None
+
+    def test_malformed_non_numeric_suffix_now_matches_by_design(self):
+        """'PR-abc' still starts with "PR-", so under the prefix-only fix
+        it DOES match this gate (unlike the interim, over-tightened
+        suffix-anchored regex, which required the string to end right
+        after a numeric suffix and so excluded it). This gate's only job
+        is the shape test; a downstream anchor-resolution step is what
+        keeps a malformed id like this from ever being silently closed
+        (see cmd_gc's own coverage of that in TestGcSuffixMatchAndNearMiss)."""
+        assert _baton._PR_BATON_NAME_RE.match("PR-ABC".upper()) is not None
+
+    def test_no_hyphen_before_pr_does_not_match(self):
+        """'XPR-42' looks PR-related (contains "PR-") but has no hyphen
+        separating a repo-qualifier segment from "PR-", so the optional
+        `(?:[A-Z][A-Z0-9]*-)?` group cannot consume the leading "X" alone
+        -- and 'XPR-42' itself doesn't start with "PR-" either. This is
+        exactly the near-miss shape cmd_gc's near_miss_ids counter exists
+        to surface rather than silently drop."""
+        assert _baton._PR_BATON_NAME_RE.match("XPR-42".upper()) is None
+
+
 class TestInitRepoQualification:
     def test_init_refuses_bare_anchor_auto_derived_from_pr_project_id(self, monkeypatch, capsys):
         """A PR-<N> project_id with no --github still auto-derives pr/<N>
@@ -2734,6 +3870,239 @@ class TestInitRepoQualification:
         assert body.get("github") == "pr/engram-agents/engram-paper/22"
 
 
+class TestInitAuthorIsInvoker:
+    """#3042: `baton init --turn <someone-else>` recorded THAT agent as the
+    baton's `author:`, not the agent who ran the command.
+
+    Live consequence, 2026-09-19: a baton created with `--turn kepler` by a
+    different initor recorded `author: kepler`. Kepler then could not hand
+    it back -- the flip to the initor matched none of `_is_maintainer_flip`'s
+    three exemptions (not a self-flip, not the flip to the registered
+    colleague, and not the flip to the recorded "author", because the author
+    on file WAS kepler himself), so it was classified as presenting-for-merge
+    and demanded a colleague approval that could not exist. `--force` did not
+    help either (the unqualified-anchor refusal is explicitly not
+    force-skippable), and there is no verb that repairs `author:` -- the
+    baton had to be cancelled and re-created.
+
+    The fix passes the INVOKER (`agent_name`), which the same posted dict
+    already carries one line above as `"agent"`. Deliberately NO
+    `or initial_turn` fallback: an unknown invoker must leave the field
+    EMPTY so `_derive_legacy_author`'s documented PROXY fires on read,
+    rather than re-asserting the turn-holder as a confident (and wrong)
+    author. That distinction is pinned by
+    test_init_with_empty_invoker_leaves_author_empty below.
+
+    Sentinel pinned via monkeypatch in every test here, for the reason
+    documented on TestFlipMaintainerRoleGate: `_pool_sentinel()` resolves
+    from the INVOKING SEAT's own config.json, so an unpinned test is
+    seat-dependent.
+    """
+
+    def test_init_with_turn_naming_another_agent_records_invoker_as_author(
+        self, monkeypatch,
+    ):
+        """The field-level claim: init as "borges" with `--turn ariadne`
+        posts `author: borges` (the invoker) and `turn: ariadne` (the turn
+        holder). On the pre-fix code the posted author was `ariadne` --
+        the turn holder -- which is the whole defect."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9400", title="turn names someone else",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("turn") == "ariadne"
+        assert body.get("author") == "borges", (
+            "init must record the INVOKER as author, not the initial turn "
+            f"holder -- got {body.get('author')!r} (#3042)"
+        )
+
+    def test_turn_holder_can_flip_the_baton_back_to_the_initor_ungated(
+        self, monkeypatch, capsys,
+    ):
+        """The trap itself, end to end -- the reason a field-level
+        assertion alone is not enough.
+
+        Chain: `cmd_init` as "borges" with `--turn ariadne` -> the posted
+        body is rendered into the baton the store would persist
+        (`_raw_from_init_post`, which mirrors the server's own
+        optional-field rule) -> "ariadne" flips it BACK to "borges"
+        through `cmd_flip`, reading exactly that baton.
+
+        That flip must NOT be classified as a merge-presentation flip: it
+        is a return to the PR's real author. Both gh-querying helpers are
+        wired to FAIL LOUDLY if called, so the test measures "the gate
+        never ran" rather than merely "the exit code was 0" -- on the
+        pre-fix code, `author:` reads "ariadne", the author exemption
+        cannot fire for a flip TO "borges", and `_pr_ci_state` is reached.
+
+        The registered colleague is "ariadne" (the agent DOING the flip),
+        deliberately: if the colleague were "borges", the flip-to-colleague
+        exemption would fire and this test would pass with or without the
+        fix, measuring nothing.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _no_ci(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_ci_state must not be called -- flipping a baton back to "
+                "the agent who INITIALIZED it is a return-to-author, not a "
+                "presentation for merge (#3042)"
+            )
+
+        def _no_approval(pr_num, repo=None):
+            raise AssertionError(
+                "_pr_approval_state must not be called -- see _no_ci (#3042)"
+            )
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _no_ci)
+        monkeypatch.setattr(_baton, "_pr_approval_state", _no_approval)
+
+        init_client = _make_client({"seq": 1})
+        init_args = argparse.Namespace(
+            project_id="PR-9401", title="borges inits, ariadne holds",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(init_args, MULTI_CONFIG, "borges", init_client)
+        _, init_body = init_client.post.call_args[0]
+        capsys.readouterr()  # discard init's own stdout/stderr
+
+        flip_client = _make_client(
+            post_return={"seq": 2},
+            get_return={"raw": _raw_from_init_post(init_body)},
+        )
+        flip_args = argparse.Namespace(
+            project_id="PR-9401", to="borges",
+            reason="one blocker, back to you", force=False,
+        )
+        _baton.cmd_flip(flip_args, MULTI_CONFIG, "ariadne", flip_client)
+
+        flip_client.post.assert_called_once()
+        assert capsys.readouterr().err.strip() == ""
+
+    def test_turn_holder_flip_back_is_not_blocked_by_the_unforceable_gate(
+        self, monkeypatch, capsys,
+    ):
+        """The same end-to-end chain in the shape that actually stranded
+        the live baton: an UNQUALIFIED `pr/<N>` anchor (auto-derived from
+        the `PR-<N>` project id when no `--repo` is given -- note this init
+        path predates the refusal `TestInitRepoQualification` covers, so
+        the live store holds such batons).
+
+        A misclassified return-to-author hits the unqualified-anchor
+        refusal, which is documented as NOT skippable with `--force` -- so
+        the holder could not hand the baton back at all, by any invocation.
+        With the author recorded correctly the flip is exempt before that
+        branch is ever evaluated, and succeeds.
+
+        `--force` is passed here precisely because it is the escape hatch
+        that did NOT work; the assertion is that no escape hatch is needed.
+        """
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+
+        def _no_ci(pr_num, repo=None):
+            raise AssertionError("_pr_ci_state must not be called (#3042)")
+
+        monkeypatch.setattr(_baton, "_pr_ci_state", _no_ci)
+
+        init_client = _make_client({"seq": 1})
+        init_args = argparse.Namespace(
+            project_id="PR-9402", title="bare anchor, stranded",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(init_args, MULTI_CONFIG, "borges", init_client)
+        _, init_body = init_client.post.call_args[0]
+        capsys.readouterr()  # discard init's own stdout/stderr
+
+        # The ANCHOR is downgraded to its bare form after the fact, because
+        # today's cmd_init cannot mint one: it REFUSES a bare pr/<N> anchor,
+        # auto-derived or explicit (#1924). The live store nonetheless holds
+        # batons created before that refusal shipped, and they are exactly
+        # the ones this bug stranded. Only the anchor is overridden --
+        # `author` is still whatever cmd_init actually posted, so this test
+        # measures the fix rather than a value hand-written by the test.
+        raw = _raw_from_init_post(dict(init_body, github="pr/9402"))
+        client = _make_client(post_return={"seq": 2}, get_return={"raw": raw})
+        args = argparse.Namespace(
+            project_id="PR-9402", to="borges",
+            reason="one blocker, back to you", force=True,
+        )
+        _baton.cmd_flip(args, MULTI_CONFIG, "ariadne", client)
+
+        client.post.assert_called_once()
+        err = capsys.readouterr().err
+        assert "has no repo-qualified github anchor" not in err
+
+    def test_init_without_turn_still_records_invoker_as_author(self, monkeypatch):
+        """Regression control for the normal case, which must be unchanged:
+        with `--turn` omitted the initial turn DEFAULTS to the invoking
+        agent, so author == invoker == turn. This test passes both before
+        and after the fix, by design -- it is what proves the fix did not
+        move the common path."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9403", title="ordinary self-authored baton",
+            participants="borges,ariadne", status="in-progress",
+            turn=None, github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "borges", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("turn") == "borges"
+        assert body.get("author") == "borges"
+
+    def test_init_with_empty_invoker_leaves_author_empty(self, monkeypatch):
+        """No `or initial_turn` fallback: when the invoker is unknown
+        (`agent_name` empty) the posted `author` must be EMPTY, not the
+        turn holder.
+
+        Empty is the value that makes the server omit the `author:` field
+        entirely (`(data.get("author") or "").strip() or None`, then
+        `if author:` in coordination/projects.py), which is what lets
+        `_derive_legacy_author` supply its documented PROXY from the turn
+        log on read. Substituting the turn holder here would write a
+        confident wrong author in place of a labelled proxy -- so the
+        proxy is asserted too, to show what the empty field buys."""
+        monkeypatch.setattr(_baton, "_pool_sentinel", lambda: "casey")
+        monkeypatch.setattr(_baton, "_POOL_SENTINEL_CACHE", [])
+        client = _make_client({"seq": 1})
+        args = argparse.Namespace(
+            project_id="PR-9404", title="unknown invoker",
+            participants="borges,ariadne", status="in-progress",
+            turn="ariadne", github=None,
+            repo="engram-agents/engram-paper", colleague="ariadne",
+        )
+        _baton.cmd_init(args, MULTI_CONFIG, "", client)
+
+        _, body = client.post.call_args[0]
+        assert body.get("author") == "", (
+            "an unknown invoker must leave author EMPTY so the legacy proxy "
+            f"fires -- got {body.get('author')!r} (#3042)"
+        )
+
+        # What the empty field buys: no author: line, and the proxy
+        # recovered from the turn log instead.
+        fields, log_body = _baton._parse_frontmatter(_raw_from_init_post(body))
+        assert "author" not in fields
+        assert _baton._derive_legacy_author(log_body) == "ariadne"
+
+
 class TestGcRepoAware:
     """#1715: cmd_gc must never guess a repo -- it reads the stored `github`
     anchor per project (never re-derives the PR number from project_id via
@@ -2794,7 +4163,7 @@ class TestGcRepoAware:
 
         assert captured_cmds == []  # no gh call at all -- never guessed
         captured = capsys.readouterr()
-        assert "skipped 1 PR-baton" in captured.err
+        assert "ungauged 1 PR-baton" in captured.err
         assert "unqualified" in captured.err
 
     def test_gc_skips_pr_baton_with_no_github_anchor(self, monkeypatch, capsys):
@@ -2812,7 +4181,7 @@ class TestGcRepoAware:
 
         assert called == []  # no gh call at all for the ungauged baton
         captured = capsys.readouterr()
-        assert "skipped 1 PR-baton" in captured.err
+        assert "ungauged 1 PR-baton" in captured.err
 
     def test_gc_two_different_repos_same_number_both_handled_correctly(self, monkeypatch):
         """The exact #1715 collision shape: two PR-batons for the SAME
@@ -2854,6 +4223,257 @@ class TestGcRepoAware:
         assert "22" in by_repo["example-org/example-repo"]
 
 
+class TestGcSuffixMatchAndNearMiss:
+    """#2010 (+followup): cmd_gc's PR-baton name gate is a PREFIX-only shape
+    test, so a correctly-anchored repo-qualified baton (e.g.
+    "ENGRAM-PR-2020", per umwelt/CLAUDE.md's documented cross-repo naming
+    convention) is reaped exactly like a bare "PR-<N>" baton, and so is a
+    live "PR-<N>-<repo-slug>" naming shape (e.g. "PR-37-paper") -- an
+    interim suffix-anchored regex regressed that second shape, which this
+    class also now covers. A project_id that merely *looks* PR-related
+    without matching the prefix pattern at all is surfaced via an explicit
+    named near-miss counter rather than silently dropped; a project_id
+    that DOES match the (deliberately loose) prefix but has no resolvable
+    anchor is never silently closed either -- it falls to the (unnamed)
+    ungauged count instead."""
+
+    def test_repo_qualified_and_bare_baton_both_reaped(self, monkeypatch, capsys):
+        """Mirrors Borges's live A/B corroboration on the issue: two
+        correctly-anchored, both-MERGED PR-batons, one bare-named and one
+        repo-qualified-named. Before the fix, only the bare one would ever
+        enter pr_batons -- the repo-qualified one was invisible to the name
+        gate entirely, matching neither closed/skipped/failed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-2021", "github": "pr/engram-agents/engram-paper/2021"},
+            {"project_id": "ENGRAM-PR-2020", "github": "pr/engram-agents/engram-paper/2020"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close PR-2021" in captured.out
+        assert "would close ENGRAM-PR-2020" in captured.out
+        assert "would close 2, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_pr_num_dash_suffix_baton_is_reaped(self, monkeypatch, capsys):
+        """#2010-followup: a live 'PR-<N>-<repo-slug>' naming shape (e.g.
+        real batons 'PR-37-paper'/'PR-38-paper'/'PR-39-paper' in the
+        engram-paper repo) is reaped -- the interim suffix-anchored
+        ("...(\\d+)$") regex regressed this shape (it requires the string
+        to END right after the digits), even though the ORIGINAL bare
+        `pid.upper().startswith("PR-")` check handled it correctly. The
+        fix is a genuine PREFIX test: what follows "PR-" (digits, then any
+        suffix) is irrelevant to this gate."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-37-paper", "github": "pr/engram-agents/engram-paper/37"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close PR-37-paper" in captured.out
+        assert "would close 1, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_near_miss_id_reported_not_silently_dropped(self, monkeypatch, capsys):
+        """A project_id that contains 'PR-' but doesn't match the name
+        gate's prefix pattern at all (e.g. 'XPR-42' -- no hyphen precedes
+        "PR", so the optional repo-qualifier group can't consume the "X")
+        is tracked in an explicit near-miss counter with its id named, per
+        the issue's own 'Suggested fix' #2 -- rather than falling through
+        the same bare `continue` as a genuinely unrelated id like
+        'pool-coordination'. (Not 'PR-abc': under the prefix-only fix,
+        'PR-abc' DOES match the name gate -- see
+        test_prefix_only_false_positive_stays_ungauged_not_closed below
+        for that shape's own, now-different, coverage.)"""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "XPR-42"},
+            {"project_id": "pool-coordination"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "1 baton(s) look PR-related but did not match" in captured.err
+        assert "XPR-42" in captured.err
+        assert "pool-coordination" not in captured.err
+        # Neither id enters the gh-query loop -- no attempted PR lookups.
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+
+    def test_prefix_only_false_positive_stays_ungauged_not_closed(self, monkeypatch, capsys):
+        """The prefix-only fix is deliberately looser than the interim
+        suffix-anchored regex: a malformed, non-numeric id like 'PR-abc'
+        now DOES match the name gate (it starts with "PR-"), so it no
+        longer lands in the named near-miss counter -- it falls through to
+        the anchor-resolution path instead. With no `github:` anchor at
+        all, `_parse_github_anchor` returns None, so it is counted as
+        `ungauged` (a generic, un-named count) rather than `near_miss` (a
+        named one) -- end-to-end, the one property that matters still
+        holds: it is NEVER silently closed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "PR-abc"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        # No longer surfaced via the named near-miss line.
+        assert "look PR-related but did not match" not in captured.err
+        # Instead counted (not named) as ungauged -- never closed.
+        assert "ungauged 1 PR-baton" in captured.err
+        assert "would close 0, still-open 0, ungauged 1, failed 0" in captured.out
+
+    def test_summary_line_word_collision_fixed(self, monkeypatch, capsys):
+        """The two early-vs-final counters read 'skipped' for DIFFERENT
+        things pre-fix (ungauged-anchor count vs still-open count) -- a
+        one-line-tail reader undercounted. This test constructs BOTH
+        non-zero and DIFFERENT in the same run and asserts the final
+        summary line distinguishes them by non-colliding words; it fails
+        against the old wording where both were rendered as 'skipped N'."""
+        client = _make_client(get_return={"projects": [
+            # Matches the name gate but has no usable github anchor -> ungauged.
+            {"project_id": "PR-9998", "github": None},
+            # Matches the name gate, has a good anchor, gh reports OPEN -> still-open.
+            {"project_id": "PR-9999", "github": "pr/example-org/example-repo/9999"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=0, stdout="OPEN", stderr=""),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 1, ungauged 1, failed 0" in captured.out
+        # The early ungauged-anchor line carries the SAME word as the final
+        # summary's ungauged count -- both name the same 1, unambiguously.
+        assert "ungauged 1 PR-baton" in captured.err
+
+
+class TestGcAnchorFirst:
+    """#2010 rider 1 (Kepler DM, 2026-09-21): cmd_gc's PR-baton detection is
+    ANCHOR-FIRST, not name-first. A baton whose `github:` field resolves to
+    a repo-qualified PR anchor is a PR-baton unconditionally, whatever its
+    project_id looks like -- the name-regex gate (_PR_BATON_NAME_RE) is now
+    only the FALLBACK, consulted when no qualified anchor is present.
+
+    Contract-first (this repo's CLAUDE.md "Contract-first tests"): written
+    against 705107ff (the pre-anchor-first tip), where this class's
+    discriminating tests go RED -- the old loop checks the name regex
+    FIRST and `continue`s before the anchor is ever inspected, so a
+    correctly-anchored, MERGED, name-mismatched baton is silently invisible
+    to this whole pass. Confirmed RED pre-fix, GREEN post-fix (see PR
+    handoff for the actual pytest runs).
+
+    The discriminating id shape below ("ENGRAM-ALPHA-PR-9601" /
+    "UMWELT-PAPER-PR-31") is a MULTI-segment repo-qualifier --
+    _PR_BATON_NAME_RE's own single-segment tolerance
+    (`^(?:[A-Z][A-Z0-9]*-)?PR-`) does NOT match it (confirmed via
+    `python3 -c "import re; print(bool(re.match(r'^(?:[A-Z][A-Z0-9]*-)?PR-',
+    'ENGRAM-ALPHA-PR-9601'.upper())))"` -> False, before writing this test).
+    This is exactly the class of baton the 2026-09-02 census found silently
+    invisible to the pre-anchor-first gate: a PREFIXED project_id with a
+    qualified anchor to an already-MERGED PR. A fresh 2026-09-23 census of
+    the live active-baton store (across all repos the shared forum tracks,
+    not engram-alpha alone -- see PR handoff) found 0 real batons in this
+    exact discriminating class today, so this fixture is SYNTHETIC, not a
+    reproduction of a real live baton (unlike TestGcSuffixMatchAndNearMiss's
+    'PR-37-paper', which mirrors real batons)."""
+
+    def test_anchor_qualified_name_mismatch_baton_is_reaped(self, monkeypatch, capsys):
+        """The core discriminating case: a project_id that does NOT match
+        _PR_BATON_NAME_RE at all, but whose github: anchor is repo-qualified
+        and points at an already-MERGED PR, must still be picked up and
+        closed by cmd_gc."""
+        pid = "ENGRAM-ALPHA-PR-9601"
+        assert _baton._PR_BATON_NAME_RE.match(pid.upper()) is None, (
+            "fixture id must NOT match the name gate -- this is the "
+            "discriminating property of this test"
+        )
+        client = _make_client(get_return={"projects": [
+            {"project_id": pid, "github": "pr/engram-agents/engram-paper/9601"},
+        ]})
+
+        def _fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "MERGED"
+            return result
+
+        monkeypatch.setattr(_baton.subprocess, "run", _fake_run)
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert f"would close {pid}" in captured.out
+        assert "would close 1, still-open 0, ungauged 0, failed 0" in captured.out
+        # Never routed through the near-miss (name-mismatch) counter either
+        # -- anchor-first means it's a clean PR-baton, not a near-miss.
+        assert "look PR-related but did not match" not in captured.err
+
+    def test_anchor_qualified_name_mismatch_baton_never_hits_ungauged(self, monkeypatch, capsys):
+        """A second angle on the same discriminating case: confirm the
+        baton is never counted as `ungauged` either (which would mean it
+        WAS reached via the name gate and merely lacked an anchor -- the
+        wrong reason for the right-shaped count). Uses a still-OPEN PR so
+        the summary's `still-open` bucket, not `would close`, is the
+        discriminator that the anchor-first path was even reached."""
+        pid = "UMWELT-PAPER-PR-31"
+        assert _baton._PR_BATON_NAME_RE.match(pid.upper()) is None
+        client = _make_client(get_return={"projects": [
+            {"project_id": pid, "github": "pr/example-org/example-repo/31"},
+        ]})
+        monkeypatch.setattr(
+            _baton.subprocess, "run",
+            lambda *a, **kw: MagicMock(returncode=0, stdout="OPEN", stderr=""),
+        )
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 1, ungauged 0, failed 0" in captured.out
+        assert "look PR-related but did not match" not in captured.err
+
+    def test_non_pr_pool_baton_still_ignored_after_anchor_first(self, monkeypatch, capsys):
+        """Regression guard (#2010 rider 1, Test E): a genuinely non-PR
+        pool baton (a `project/<N>` anchor, not `pr/...`, and a name that
+        doesn't match the fallback gate either) is unaffected by the
+        anchor-first reorder -- still silently skipped: not near-missed,
+        not ungauged, not closed."""
+        client = _make_client(get_return={"projects": [
+            {"project_id": "pool-coordination-system", "github": "project/4"},
+        ]})
+        monkeypatch.setattr(_baton.shutil, "which", lambda _: "/usr/bin/gh")
+        args = argparse.Namespace(dry_run=True, limit=30)
+        _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
+
+        captured = capsys.readouterr()
+        assert "would close 0, still-open 0, ungauged 0, failed 0" in captured.out
+        assert "look PR-related but did not match" not in captured.err
+
+
 class TestGcFailedVsSkipped:
     """#1918 defect 2: a gh query failure must be counted as `failed`, not
     `skipped` -- the old code bucketed both together, so a run's own
@@ -2876,7 +4496,7 @@ class TestGcFailedVsSkipped:
 
         assert exc_info.value.code == EXIT_IO
         captured = capsys.readouterr()
-        assert "would close 0, skipped 0, failed 1" in captured.out
+        assert "would close 0, still-open 0, ungauged 0, failed 1" in captured.out
 
     def test_pr_still_open_counted_as_skipped_not_failed(self, monkeypatch, capsys):
         """The companion case: a SUCCESSFUL gh query whose PR is simply
@@ -2897,7 +4517,7 @@ class TestGcFailedVsSkipped:
         _baton.cmd_gc(args, MULTI_CONFIG, "borges", client)
 
         captured = capsys.readouterr()
-        assert "would close 0, skipped 1, failed 0" in captured.out
+        assert "would close 0, still-open 1, ungauged 0, failed 0" in captured.out
 
     def test_mixed_run_exits_nonzero_and_reports_accurate_counts(self, monkeypatch, capsys):
         client = _make_client(get_return={"projects": [
@@ -2923,7 +4543,7 @@ class TestGcFailedVsSkipped:
 
         assert exc_info.value.code == EXIT_IO
         captured = capsys.readouterr()
-        assert "would close 1, skipped 1, failed 1" in captured.out
+        assert "would close 1, still-open 1, ungauged 0, failed 1" in captured.out
 
 
 class TestFlipRepoQualifiedGuard:

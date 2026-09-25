@@ -408,6 +408,11 @@ def _stats_impl(mode: str = "all", sections=None) -> str:
             result["memory"] = {
                 "current_turn": core._get_current_turn(),
                 "tier2_threshold": core._get_tier_threshold(conn, 2),
+                # #3075 C5 round 2 (Borges's design ruling): the numeric
+                # embedding_coverage percentage alone is NOT a substitute for
+                # this explicit count+cause (Lei's ruling) — read from the
+                # durable flag, cheap (single-row PK lookup).
+                "embedding_restore": core._get_embedding_restore_flag(conn),
             }
 
         # ── confidence ─────────────────────────────────────────────────────
@@ -813,6 +818,11 @@ def _diagnose_impl() -> str:
             "without_embedding": total_current - with_emb,
             "coverage_pct": round(with_emb / total_current * 100, 1) if total_current else 0,
         }
+
+        # #3075 C5 round 2 (Borges's design ruling): the coverage_pct number
+        # above is NOT a substitute for this explicit count+cause (Lei's
+        # ruling, #3075) — read from the durable restore-completeness flag.
+        memory["embedding_restore"] = core._get_embedding_restore_flag(conn)
 
         metrics["memory"] = memory
 

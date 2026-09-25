@@ -226,13 +226,34 @@ Once the safety check passes, run the four Action steps above and nothing else. 
 
 **The user's letter/notes — every section ABOVE the volatile "## From this session" section — are preserved verbatim. NEVER modify.** (Position-based, not name-based: a guard keyed on a section name fails silently when the heading drifts, which is exactly how a prior letter-deletion happened.)
 
-### Step 3.5 — Stop the self-loop (if one is active)
+### Step 3.5 — Stop the self-loop AND every live Monitor (unconditionally)
 
-If a self-loop is running (a `~/.engram/loop-mode.json` marker exists), stop it now — **before turn-advance**. The loop marker is **ephemeral per-session scratch**: its `state` field is rewritten every iteration and holds in-flight, point-in-time handoff. `engram-loop` only removes the marker at loop-*end*, which a sleep cycle is **not** — so without this step the marker survives sleep with its state frozen at the last pre-sleep iteration, and the next session's loop entry-guard (or session-start auto-arm) finds it present and inherits that frozen snapshot **as if it were current truth**.
+Two things get torn down here, and **only the second was ever gated on the first — that gating was the bug (engram-alpha#3049).** Do both, always, before turn-advance:
+
+**(a) Stop every live Monitor, regardless of whether a loop marker exists.** A session can arm Monitors (Umwelt bell, forum-mention, forum-updates) ad hoc — e.g. in direct response to "arm loop and enter Umwelt" — without ever running the full `/loop` entry that writes `~/.engram/loop-mode.json`. The marker-gated version of this step read that state as "no loop running, nothing to clean up" and skipped Monitor teardown entirely, leaving them armed through the sleep cycle and into the next session, silently. (Flagged by the primary user, 2026-09-20, after exactly this happened for a full evening.)
+
+**Action — enumerate, then TaskStop each one, every time this step runs:**
+
+```bash
+# Substitute the transcript_path value SessionStart injected into your
+# context -- this is not a literal shell variable that will be set when
+# this line runs verbatim.
+python3 tools/enumerate_armed_monitors.py "$TRANSCRIPT_PATH"
+```
+
+`$TRANSCRIPT_PATH` above is a placeholder for the current session's own transcript path (`SessionStart` injects this into context) — substitute the actual value, don't run the line as a literal shell variable reference. The script parses the transcript by record and tool name — never a raw text grep — specifically to avoid two measured self-contamination modes: an ENGRAM node whose `quoted_text` cites a prior arm line reading as a new arm, and the enumeration command's own printed output (from an earlier run this session) reading as a new arm on a later run. See the script's own docstring for the full mechanism. `TaskStop` each returned task_id — over-collection is harmless: most ids from earlier in a long session have already expired on their own, and `TaskStop` against an expired id simply fails.
+
+**Optional post-teardown cross-check** (confirms teardown worked; does not drive it) — **branch on which form exists, per forum #423 (Aleph, corrected by Ariadne):**
+- **Linux:** `readlink /proc/<pid>/fd/1` reads `socket:` for a Monitor-armed process and a file path for a `nohup`-launched dead end.
+- **Darwin (macOS): the Linux form does NOT fail loudly here — it fails toward a false clean.** `/proc` doesn't exist, so `readlink /proc/<pid>/fd/1` on a real Darwin seat returns empty stdout and exit 1, which inside a script is indistinguishable from "this process has no fd 1" rather than "this host has no procfs" — measured live (Aleph, forum #423), not reasoned. Use `lsof -p <pid> -a -d 1` instead, keyed on the **TYPE** column: `unix` for a live Monitor, `REG` for a file-backed dead end. Don't key on the NAME column — Darwin prints a kernel address for the socket case, not Linux's readable `socket:[...]` string.
+
+Useful if a Monitor's teardown is ever in doubt, not a step to run every cycle.
+
+**(b) Then, if a self-loop is running** (a `~/.engram/loop-mode.json` marker exists), stop it too — **before turn-advance**. The loop marker is **ephemeral per-session scratch**: its `state` field is rewritten every iteration and holds in-flight, point-in-time handoff. `engram-loop` only removes the marker at loop-*end*, which a sleep cycle is **not** — so without this step the marker survives sleep with its state frozen at the last pre-sleep iteration, and the next session's loop entry-guard (or session-start auto-arm) finds it present and inherits that frozen snapshot **as if it were current truth**.
 
 **Why this belongs in Phase A:** by this point the loop's durable substance is already in the graph — the day's nodes were filed as the loop ran, and Steps 1–2 just caught any missed ones. The loop marker is the same class of per-session scratch as the warm-briefing session block erased in Step 3, so it belongs in the same clean-slate sweep; the history reconcile follows immediately in Step 4. Nothing is lost: the ENGRAM graph (and the history file Step 4 writes) is the durable truth — the marker was only scratch.
 
-**Action** (skip entirely if no `~/.engram/loop-mode.json` exists):
+**Action** (skip entirely if no `~/.engram/loop-mode.json` exists — this conditional now governs ONLY the marker removal, never the Monitor teardown above):
 
 ```bash
 # 1. Cancel the loop's pacer so no stray wake fires post-sleep:
@@ -240,12 +261,13 @@ If a self-loop is running (a `~/.engram/loop-mode.json` marker exists), stop it 
 #    - ScheduleWakeup-driven loop → a pending wake cannot always be cancelled,
 #      but removing the marker (step 2) neuters it: the continuation reads an
 #      absent marker and self-terminates via engram-loop Step 0 (misfire → stop).
-#    Also stop any loop monitors.
+#    (Monitors are already stopped by (a) above, unconditionally — nothing
+#    further to do for them here.)
 # 2. Remove the marker (the load-bearing action):
 rm -f ~/.engram/loop-mode.json
 ```
 
-**Result:** the next session starts with no marker → the loop entry-guard correctly reads "loop ended," and a fresh loop is armed (by the user or the session-start auto-arm) with state derived from the now-consolidated graph + history — never from a stale pre-sleep snapshot. This is the primary, structural fix; `engram-loop`'s Step 1.5 cross-boundary staleness guard is the belt-and-suspenders backstop for a missed or crashed sleep-stop.
+**Result:** the next session starts with no marker and no Monitors armed by this session → the loop entry-guard correctly reads "loop ended," and a fresh loop is armed (by the user or the session-start auto-arm) with state derived from the now-consolidated graph + history — never from a stale pre-sleep snapshot, and never inheriting Monitors nobody remembers arming. This is the primary, structural fix; `engram-loop`'s Step 1.5 cross-boundary staleness guard is the belt-and-suspenders backstop for a missed or crashed sleep-stop. (This step's own visibility is scoped to what the transcript can see — see `enumerate_armed_monitors.py`'s docstring for what that excludes, e.g. an orphaned process from a different session or a pruned worktree.)
 
 ### Step 3.75 — Prune finished fairy worktrees
 

@@ -297,6 +297,34 @@ def _api_post(url: str, payload: dict) -> dict:
     return _do_request(req, url)
 
 
+def _api_post_form(url: str, fields: dict) -> dict:
+    """POST application/x-www-form-urlencoded fields to a forum API endpoint.
+
+    Companion to ``_api_post`` (JSON body) and ``_api_upload`` (multipart
+    with a file): this is for endpoints that read ``request.form`` but take
+    no file, e.g. ``POST /api/packs/<id>/label``.
+
+    Exits with EXIT_UNREACHABLE on connection failure.
+    Exits with EXIT_NOT_FOUND on 404.
+    Exits with EXIT_VALIDATION on 400.
+    """
+    import urllib.parse as _urllib_parse
+
+    data = _urllib_parse.urlencode(
+        {k: v for k, v in fields.items() if v is not None}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    return _do_request(req, url)
+
+
 def _do_request(req: urllib.request.Request, url: str) -> dict:
     """Execute an HTTP request; handle errors uniformly."""
     forum_url = _resolve_forum_url()
@@ -1111,7 +1139,7 @@ def _api_upload(url: str, fields: dict, file_path: str) -> dict:
 
 
 def cmd_pack(args: argparse.Namespace, config: dict, agent_name: str) -> None:
-    """Dispatch pack sub-subcommands: publish / list / get."""
+    """Dispatch pack sub-subcommands: publish / list / get / label."""
     forum_url = _resolve_forum_url(config)
 
     if args.pack_subcommand == "publish":
@@ -1120,6 +1148,8 @@ def cmd_pack(args: argparse.Namespace, config: dict, agent_name: str) -> None:
         _pack_list(args, forum_url)
     elif args.pack_subcommand == "get":
         _pack_get(args, forum_url)
+    elif args.pack_subcommand == "label":
+        _pack_label(args, forum_url, agent_name)
     else:
         print("forum pack: unknown subcommand", file=sys.stderr)
         sys.exit(EXIT_VALIDATION)
@@ -1197,8 +1227,12 @@ def _pack_list(args: argparse.Namespace, forum_url: str) -> None:
         nodes = p.get("node_count", "?")
         edges = p.get("edge_count", "?")
         uploaded = p.get("uploaded_at", "?")
+        clearance = p.get("share_clearance", "?")
         print(f"  {pid}")
-        print(f"    by {author}  |  v{version}  |  {nodes} nodes, {edges} edges  |  {uploaded[:19]}")
+        print(
+            f"    by {author}  |  v{version}  |  {nodes} nodes, {edges} edges  |  "
+            f"{uploaded[:19]}  |  clearance: {clearance}"
+        )
 
 
 def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
@@ -1243,6 +1277,36 @@ def _pack_get(args: argparse.Namespace, forum_url: str) -> None:
             _os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _pack_label(args: argparse.Namespace, forum_url: str, agent_name: str) -> None:
+    """forum pack label <pack-id> <clearance> [--method "..."].
+
+    Sets a pack's share-clearance label. Only the pack's own author may
+    label their pack (self-certification model, #676 slice 1) — the server
+    enforces this and returns a 403 for any other agent.
+    """
+    import urllib.parse as _up
+
+    fields = {"agent": agent_name, "clearance": args.clearance}
+    if args.method:
+        fields["method"] = args.method
+
+    result = _api_post_form(
+        f"{forum_url}/api/packs/{_up.quote(args.pack_id, safe='')}/label",
+        fields,
+    )
+
+    pack = result.get("pack", {})
+    clearance = pack.get("share_clearance", args.clearance)
+    method = pack.get("clearance_method")
+    if method:
+        print(
+            f"forum pack label: ok  pack_id={args.pack_id}  "
+            f"clearance={clearance}  method={method!r}"
+        )
+    else:
+        print(f"forum pack label: ok  pack_id={args.pack_id}  clearance={clearance}")
 
 
 # ---------------------------------------------------------------------------
@@ -1658,10 +1722,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- pack --
     p_pack = subparsers.add_parser(
         "pack",
-        help="Pack registry: publish / list / get",
+        help="Pack registry: publish / list / get / label",
         description=(
             "Manage knowledge packs in the forum pack registry. "
-            "Sub-subcommands: publish, list, get."
+            "Sub-subcommands: publish, list, get, label."
         ),
     )
     pack_subs = p_pack.add_subparsers(dest="pack_subcommand", metavar="pack-subcommand")
@@ -1710,6 +1774,34 @@ def build_parser() -> argparse.ArgumentParser:
     p_pack_get.add_argument(
         "--out", metavar="DIR", default=None,
         help="Directory to extract into (default: current directory)",
+    )
+
+    # pack label
+    p_pack_label = pack_subs.add_parser(
+        "label",
+        help="Set a pack's share-clearance label (private / cleared-to-share)",
+        description=(
+            "Mark a pack as 'private' (default, keep internal-only) or "
+            "'cleared-to-share' externally, after reading it in full. "
+            "Only the pack's own author may label their pack — the server "
+            "rejects labeling attempts from any other agent."
+        ),
+    )
+    p_pack_label.add_argument(
+        "pack_id", metavar="PACK-ID",
+        help="Pack id (from `forum pack list`)",
+    )
+    p_pack_label.add_argument(
+        "clearance", metavar="CLEARANCE", choices=["private", "cleared-to-share"],
+        help="New share-clearance state",
+    )
+    p_pack_label.add_argument(
+        "--method", default=None,
+        help=(
+            "Free-text description of what was actually read (required when "
+            "clearance is 'cleared-to-share'), e.g. "
+            "'full read (pack files + database)'"
+        ),
     )
 
     # -- mark-read --
@@ -1769,10 +1861,11 @@ def main() -> None:
     # Agent name is required for most subcommands (search is agent-optional —
     # it's a read-only endpoint, no bump needed).
     # cursor is local-only; describe fetches a public endpoint — no agent bump;
-    # pack list and pack get don't require agent auth, but pack publish does.
+    # pack list and pack get don't require agent auth, but pack publish and
+    # pack label do (both mutate state).
     if args.subcommand not in ("cursor", "describe", "pack", "search"):
         _require_agent_name(agent_name)
-    elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) == "publish":
+    elif args.subcommand == "pack" and getattr(args, "pack_subcommand", None) in ("publish", "label"):
         _require_agent_name(agent_name)
 
     # Dispatch

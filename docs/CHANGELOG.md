@@ -9,6 +9,177 @@ with an `-alpha` suffix during the alpha phase.
 
 ## [Unreleased]
 
+## [v0.5.2] - 2026-09-25
+
+### Added
+
+- **`deductive_conjunction` reasoning type** (#3082, closes #3080) — a new
+  reasoning type for claims that are the logical conjunction of their
+  premises (e.g. "none of the N surveyed systems has feature X" over an
+  explicitly enumerated, complete set). Confidence is weakest-link
+  (`min(premise confidences) × 0.98`), matching the existing deductive
+  types but without their 2-premise cap.
+- **Per-pack share-clearance label on the forum pack registry** (#3036,
+  part of #676) — four new columns on `packs` distinguishing packs that
+  have been read in full and cleared for eventual external sharing from
+  packs that haven't (default `private` for every existing and new pack).
+  A deliberately narrow slice following a live pack-privacy incident;
+  the full node-level visibility system is tracked separately.
+- **`engram_list` gains a `sort_order` parameter** (#3025, closes #3016) —
+  `sort_by` previously baked column and direction into one fixed string,
+  so callers could never ask for oldest-first ordering. The optional
+  `sort_order` (`"asc"`/`"desc"`) now overrides direction independently of
+  column; omitted, behavior is unchanged. Fixes the engram-sleep Step 5
+  backfill, which needs oldest-first and had no way to request it.
+
+### Changed
+
+- **Board API reconciliation skips already-file-done records** (#3060,
+  closes #2007) — `/api/board/projects` and `/api/board/updates` were
+  taking 300-500s because every request re-resolved GitHub state for up
+  to 1038 PR refs serially, even for records whose file status already
+  reads `merged`/`cancelled` (where that resolution is provably
+  unused). Skipping those cuts the working set to ~30 refs, a ~34x
+  reduction, with no change to any served status.
+
+### Fixed
+
+- **Monitor timeout budgets are now end-to-end, not per-op**
+  (#3110, closes #3106, closes #3107) — `forum-mention-monitor.sh` had no
+  `--max-time` at all, and the forum prompt-hook's worst-case timeout
+  arithmetic assumed a call with `timeout=T` takes at most T, which is
+  false against a server that trickles data (the per-op timeout re-arms
+  on every partial read). Both now enforce a genuine wall-clock deadline.
+- **Health-exam liveness checks could not report failure** (#3070) — the
+  agent-facing health-exam skill's `pgrep`-based checks counted other
+  seats' processes, could never detect a dead daemon on Darwin, silently
+  swallowed an absent-`pgrep` error as a false clean, and a zsh `$PATH`
+  clobber in Step 0 turned that false clean into a false alarm on a
+  healthy system. All three liveness sites fixed, plus a gate across all
+  29 shipped skill docs, with its known limits listed on the PR.
+- **One shared deploy-tag predicate, enforced by the engine too** (#3099,
+  closes #3092) — the install script already refused to build from an
+  untagged commit unless `--allow-untagged` was passed, but the engine's own
+  `upgrade`/`build` entry points never enforced this, so an untagged
+  `dev` tip could upgrade through the engine while the shell script would
+  have refused it. The engine paths now use the shared Python predicate;
+  the shell installer's own untagged check still reads raw tags at HEAD,
+  tracked in #3103.
+- **WS3 hook-injection gate is now live, not `xfail`** (#3098, closes
+  #2863) — the test asserting every hook's `additionalContext` routes
+  through the shared `emit_context()` helper was marked
+  `xfail(strict=True)` pending five known exceptions; four are confirmed
+  deliberate (atomic fixed-format emitters); the fifth, the session-start
+  hook, is excluded with its uncapped total emission disclosed and tracked
+  separately in #127; the gate is now enforced rather than merely tracked.
+- **`engram-sleep` stops live Monitors unconditionally in Step 3.5**
+  (#3050, closes #3049) — Step 3.5 only tore down live Monitors
+  (Umwelt bell, forum-mention, forum-updates) when a loop-mode marker
+  file was present, so a session that armed Monitors ad hoc (without the
+  marker) left them running through the sleep cycle and into the next
+  session.
+- **Racy wait predicate in the embedding-restore C5 tests fixed** (#3088,
+  closes #3087) — a test-only race in the async regeneration-daemon wait
+  helper, not a production defect; fixes the alpha nightly CI failure.
+- **Cross-process single-flight lease for embedding restore regeneration**
+  (#3078, closes #3077) — every process hitting missing embeddings on
+  startup independently spawned its own regeneration daemon thread;
+  harmless but wasteful under concurrency. A lease now coordinates
+  regeneration across concurrent MCP sessions / short-lived CLIs.
+- **Restore-completeness contract for the embedding pipeline, C1-C5**
+  (#3076, closes #3075) — fixes three real problems surfaced when a
+  user's agent restored from a backup snapshot: embedding-text generation
+  depending on caller row-factory state, an implicit regeneration
+  outcome, and other completeness gaps in the restore path, written to a
+  contract-first test suite before the fix.
+- **PR-baton auto-close gate now matches by suffix, not prefix** (#3061,
+  closes #2010) — both baton auto-close gates required a baton's
+  `project_id` to *start with* `PR-`, but the documented cross-repo
+  naming convention names cross-repo batons `<REPO>-PR-<N>`, so every
+  correctly-named cross-repo baton was invisible to both auto-close
+  mechanisms. Measured: 33 of 99 active batons followed the convention
+  and none matched either gate.
+- **Forum monitors announce the edge into and out of an outage** (#3065,
+  closes #3062) — previously an outage and a quiet-but-reachable forum
+  produced identical (silent) output, so a multi-hour blackout was
+  indistinguishable from a calm night. Both forum monitors now announce
+  the transition, once each way, instead of failing in total silence.
+- **Linux boot-charge stdout-target check counts lines, not the loop's
+  exit status** (#3059, closes #3057) — `readlink /proc/$pid/fd/1` on a
+  pid whose target is unreadable produces empty output with no error, so
+  a bare loop over monitor pids silently dropped that pid's line instead
+  of reporting it, and the "every line must start `socket:`" check then
+  passed against zero lines.
+- **`baton init` records the invoker as author, not the initial turn
+  holder** (#3054, closes #3042) — with `--turn` naming someone else,
+  authorship was durably misattributed to the turn holder, and the real
+  creator couldn't have the baton flipped back without `--force`.
+- **`baton claim`'s refusal no longer asserts a person holds a pool
+  baton** (#3040, part of #3039) — the refusal message resolves "is this
+  a pool sentinel" from the invoking seat's own `primary_user`, checked
+  against a `turn` written into a shared store; a pool baton parked by a
+  seat with a different `primary_user` produced a refusal claiming a
+  named colleague was holding it, when no one was.
+- **`pgrep` on BSD/Darwin no longer silently no-ops on GNU regex escapes**
+  (#3035, closes #3032) — BSD `pgrep -f` compiles its pattern as a POSIX
+  ERE, where `\s`/`\S` aren't special, so a Darwin boot-charge
+  monitor-verify check using GNU escapes matched nothing and exited 0 —
+  indistinguishable from "checked, both monitors fine." Fixed in the
+  charge text and the test harness that should have caught it.
+- **Nap advisory note wording now tracks the #3014 checkpoint anchor**
+  (#3031, closes #3030) — the warm-briefing staleness note still read
+  "Step 5b not performed this session" after #3014 moved the advisory's
+  anchor from session-start to last-checkpoint, which was false on
+  exactly the cases #3014 exists to catch.
+
+### Removed
+
+- **Deleted the unarmed `collab-baton-monitor.sh`** (#3072, part of
+  #2857) — no skill, hook, agent spec, or template invoked it; the live
+  baton wake path runs through `forum-updates-monitor.sh --kinds
+  dm,baton` instead. Removed alongside its dedicated test file and its
+  manifest entries.
+
+### Docs
+
+- **EngramManager design doc** (#2828, part of #2652) — design document
+  for the EngramManager substrate, the layer that will own `knowledge.db`
+  behind a socket contract. Design only; no code.
+- **EngramManager design §5.1 — 'bounded' means one end-to-end deadline**
+  (#3108, part of #2652) — states that a "bounded" retry window must mean
+  one deadline per request, end to end, on both sides of the socket, not
+  a timeout re-armed per socket operation.
+- **EngramManager design §5.5 — degraded-mode ruling recorded** (#3089,
+  part of #2652) — records the ruling that there is no degraded mode of
+  either kind: a hard stop for writes, no stale reads served, and a loud
+  unavailability signal with two-tier recovery guidance.
+- **Retraction replacement contract, design draft 4** (#2837, closes
+  #2613) — design contract requiring every author-initiated retraction to
+  record a replacement decision (the node that replaces the claim, or a
+  stated reason nothing does). Design only; implementation tracked
+  separately.
+- **Contract-first tests: write the assertions before the implementation**
+  (#3046, part of #3045) — for a function with a stateable contract,
+  write the tests asserting its designed behaviours (including error
+  handling) before implementing it, so drift from the design is caught
+  mechanically. Documents the discipline motivated by a silent-node-drop
+  bug.
+- **Falsifier-log figure re-measured; detective-channel caveat folded
+  into Confounds** (#3034, closes #3033) — re-measures a stale per-seat
+  cache figure and folds a caveat about detective-channel bias into the
+  log's Confounds section. Docs only.
+- **Boot-charge doc: the Darwin `/proc` form fails silently, not
+  outright** (#3056) — corrects a self-contradicting sentence claiming
+  the Linux `readlink /proc/$pid/fd/1` check "fails outright" on Darwin;
+  it actually fails silently, the same accepted-and-wrong shape the
+  paragraph already described one line later.
+- **`auto-reviewer-fairy-judgement` skill clarified: doesn't waive the
+  mandatory review round** (#3026) — the skill's "do the review
+  directly" branch was being misread as licensing a same-context
+  self-review in place of the mandatory pre-peer reviewer-fairy round;
+  it only ever governed whether spawning a fairy is worth the dispatch
+  overhead.
+
 ## [v0.5.1] - 2026-09-14
 
 ### rc5 fix round — 2026-09-19 (found on the rc4 soak; tracking #2941)
@@ -34,6 +205,14 @@ with an `-alpha` suffix during the alpha phase.
   the advisory now compares against the most recent one instead of the
   per-session marker, re-arming after every nap and naturally covering the
   compaction case (#3017, closes #3014).
+- **Nap advisory's CONFIRMED-stale note text updated to match the #3014
+  anchor.** #3014 moved the anchor from session-start to last-checkpoint
+  and renamed the field (`written_this_session` → `written_since_last_nap`),
+  but left the emitted note string reading "Step 5b not performed this
+  session" — false on exactly the cases #3014 newly catches (written since
+  session start, but before the last checkpoint). Now reads "Step 5b not
+  performed since the last checkpoint," true under both anchors (closes
+  #3030).
 - **Boot charge's monitor-liveness check reads the monitor's stdout target,
   not just process presence.** `pgrep` certifies a monitor process alive
   even when its stdout was armed to a dead end (a detached `nohup … > file`

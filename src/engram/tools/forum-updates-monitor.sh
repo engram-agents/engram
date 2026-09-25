@@ -43,6 +43,18 @@
 #     engaged window (default 360s), skip the emit cycle entirely AND do not
 #     advance the cursor — events accumulate in (cursor, as_of] and emit once the
 #     window expires.
+#   - unreachable-vs-quiet is EDGE-TRIGGERED, not per-cycle (#3062): a forum
+#     outage and a quiet-but-reachable forum used to be byte-identical at this
+#     script's output (none) — the expiry notice reads "no events delivered"
+#     either way, and there is no way to tell a 7h blackout from a calm night.
+#     Fix mirrors umwelt-bell.py's post-umwelt#637 _ARMED_REACHABLE pattern:
+#     print exactly once on the transition INTO forum-unreachable and once on
+#     the transition back OUT, never once per failed poll. Level-triggered (a
+#     line every cycle) was considered and rejected in that precedent for the
+#     same reason it would be wrong here — at this script's 30s poll interval
+#     an 8h outage is ~960 lines, which destroys the very signal it exists to
+#     give. This does NOT touch cursor handling — see the never-advance-cursor
+#     bullet above; the two are orthogonal.
 
 set -u
 # NOT -e: a transient failure must not kill a session-length watch.
@@ -358,7 +370,7 @@ POLL_SECONDS="${FORUM_UPDATES_POLL_SECONDS:-30}"
 # absence.
 # ---------------------------------------------------------------------------
 while true; do
-    if RESP="$(curl -s --fail "$URL_BASE&since=0" 2>/dev/null)" \
+    if RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=0" 2>/dev/null)" \
        && _seed="$(printf '%s' "$RESP" | as_of)"; then
         printf '%s\n' "$_seed" > "$CURSOR"
         break
@@ -371,6 +383,12 @@ done
 # mention-monitor / _status_derive._recently_engaged().
 LAST_USER_ACTIVITY="$HOME/.engram/last-user-activity"
 _ENGAGED_WINDOW=360  # matches _status_derive._DEFAULT_ENGAGED_WINDOW
+
+# Edge-triggered reachability state for the unreachable-vs-quiet announce
+# (#3062 — see the discipline-notes bullet above). Seeded reachable: the seed
+# loop just above only exits once a poll has actually succeeded, so the poll
+# loop below always starts in the reachable state.
+_FORUM_REACHABLE=1
 
 # ---------------------------------------------------------------------------
 # poll loop
@@ -390,7 +408,28 @@ while true; do
     _cur="$(cat "$CURSOR" 2>/dev/null || echo 0)"
     # Forum unreachable -> curl --fail returns non-zero -> skip the cycle and
     # PRESERVE the cursor (never advance past an un-emitted window).
-    RESP="$(curl -s --fail "$URL_BASE&since=$_cur" 2>/dev/null)" || continue
+    # --max-time 60 (#2007): a hung request (e.g. a slow board-adjacent
+    # handler on the same server) must not block this loop indefinitely --
+    # 60s comfortably covers a healthy poll (including a transient slowdown)
+    # while still bounding a truly-hung request. A --fail --max-time timeout
+    # already returns non-zero exactly like any other curl failure, so the
+    # existing `|| continue` here (and the seed retry above) already handles
+    # it correctly -- no other logic change needed.
+    #
+    # #3062: the `continue` itself is unchanged (cursor still preserved,
+    # exactly as before) — only the EDGE is now announced, once on entry and
+    # once on recovery, via $_FORUM_REACHABLE (declared above the loop).
+    if ! RESP="$(curl -s --fail --max-time 60 "$URL_BASE&since=$_cur" 2>/dev/null)"; then
+        if [ "$_FORUM_REACHABLE" = 1 ]; then
+            echo "⚠️  forum-updates-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
+            _FORUM_REACHABLE=0
+        fi
+        continue
+    fi
+    if [ "$_FORUM_REACHABLE" = 0 ]; then
+        echo "forum-updates-monitor.sh: forum reachable again — receiving resumed"
+        _FORUM_REACHABLE=1
+    fi
     printf '%s' "$RESP" | emit
     # Advance the cursor only when this poll actually handed back a watermark.
     # `$( )` swallows the command's status into the assignment, so the status

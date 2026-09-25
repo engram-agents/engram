@@ -299,6 +299,20 @@ def _age_str(ts: Optional[datetime]) -> str:
 
 _PROJECT_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*-[A-Za-z0-9][A-Za-z0-9_-]*$")
 
+# Matches a PR-baton's project_id by PREFIX ONLY: an optional
+# single-segment repo-qualifier (e.g. "UMWELT-") followed by "PR-". This
+# is a pure shape test -- what follows the "PR-" prefix (a bare number, or
+# a number plus a suffix like "-paper", e.g. "PR-37-paper") is irrelevant
+# to this gate; the actual PR number/repo always come from the
+# separately-stored `github:` anchor field, never from this regex. #2010:
+# the original prefix-only check required the id to START with "PR-", so
+# a repo-qualified id like "UMWELT-PR-572" was invisible to this gate; a
+# first fix over-corrected into a full-string ("...(\d+)$") match, which
+# then made a live "PR-<N>-<repo-slug>" naming shape (e.g. "PR-37-paper")
+# invisible too. This prefix-only form fixes both. Kept in sync by hand
+# with the sibling copy in hooks/claude/engram-baton-prompt-hook.py.
+_PR_BATON_NAME_RE = re.compile(r"^(?:[A-Z][A-Z0-9]*-)?PR-")
+
 # _GITHUB_ANCHOR_RE and _parse_github_anchor now live in baton_gate.py
 # (#2884, second half) -- imported above, shared with src/forum/server.py's
 # api_project_flip. See baton_gate.py for the full "#1918: no default repo"
@@ -520,13 +534,19 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
     title = args.title or project_id
     init_reason = f"project initialized by {agent_name or 'unknown'}"
 
-    # #2961: the initial turn holder is the established author-proxy (a PR
-    # baton is normally initialized by its own author with --turn pointing
-    # at themselves, or --turn omitted so it defaults to the invoking agent
-    # -- see the default-turn logic above). Persisted once, here, into a
+    # #3042: the author is the INVOKING agent -- whoever ran `baton init`
+    # created this baton, regardless of whose court --turn puts it in.
+    # #2961 originally persisted `initial_turn` here as a proxy, which is
+    # correct only in the normal case where an author inits with --turn
+    # pointing at themselves; with --turn naming someone else it durably
+    # attributed authorship to a seat that did not create the baton, and
+    # no verb repairs it afterwards. `agent_name` is the real value and is
+    # already in scope (see "agent" above). Persisted once, here, into a
     # dedicated `author:` field that flip/claim/release never touch --
     # unlike `turn_by`, which IS overwritten on every turn-change and so
-    # cannot serve as an author proxy past the very first flip.
+    # cannot serve as an author proxy past the very first flip. An empty
+    # `agent_name` deliberately leaves the field unwritten so the legacy
+    # log-derived proxy fires rather than a confidently wrong author.
     try:
         client.post("/api/projects", {
             "agent": agent_name or "baton",
@@ -538,7 +558,7 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
             "github": github_anchor,
             "participants": participants,
             "colleague": colleague_name,
-            "author": initial_turn,
+            "author": agent_name,
         })
     except ForumNetworkError as e:
         print(f"baton init: {e}", file=sys.stderr)
@@ -562,12 +582,15 @@ def cmd_init(args: argparse.Namespace, config: dict, agent_name: str, client: Fo
 
     # Colleague-gate enforceability warning for PR-named batons (#1267 Fix B).
     # If this is a PR baton (PR-N id) and no colleague is resolvable from
-    # participants (participants ⊆ {author, sentinel}), warn at creation time
+    # participants (participants ⊆ {initial turn holder, sentinel}), warn at
+    # creation time
     # so the gap surfaces here rather than silently at flip.
     _is_pr_baton = re.match(r"^(?:PR-|pr-)(\d+)$", project_id)
     if _is_pr_baton:
         _sentinel = _pool_sentinel()
-        # Determine the author: the initial turn holder (proxy for the PR author)
+        # Colleague candidates: participants other than the initial turn
+        # holder and the pool sentinel. (This is about the COLLEAGUE gate --
+        # it is not where `author` is determined; see the #3042 note above.)
         _colleagues_at_init = [
             p for p in participants
             if p != initial_turn and p != _sentinel
@@ -924,10 +947,12 @@ def _is_maintainer_flip(
     `author` is optional and empty on a baton created before #2961 (no
     `author:` frontmatter field) — an empty/falsy `author` simply means
     this exemption cannot fire, identical to pre-#2961 behavior. It is
-    populated once at `baton init` time from the initial turn holder (the
-    established author-proxy) and never touched again by flip/claim/
-    release, unlike `turn_by`, which IS overwritten on every turn-change
-    and so cannot serve as an author proxy past the first flip.
+    populated once at `baton init` time from the INVOKING agent (#3042 --
+    before that it was taken from the initial turn holder, which mis-attributed
+    authorship whenever --turn named someone other than the initor) and never
+    touched again by flip/claim/release, unlike `turn_by`, which IS overwritten
+    on every turn-change and so cannot serve as an author proxy past the first
+    flip.
 
     Caller guarantees `to_agent` is already either the pool sentinel or a
     genuine registered participant (validated earlier in cmd_flip) — this
@@ -949,8 +974,10 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
 
     Equivalent to 'baton flip <project-id> <self> "claimed"' but makes the
     Project-layer grab/ungrab vocabulary first-class. Only succeeds when
-    turn == pool sentinel (the install's primary_user); refuses to steal from
-    another agent.
+    turn == pool sentinel (the install's primary_user); refuses when the turn
+    is not this seat's recognized pool marker -- which may be a colleague
+    genuinely holding it, or a pool/maintainer marker written by a seat with a
+    different primary_user (engram-alpha#3039).
     """
     _require_forum(config)
 
@@ -974,10 +1001,88 @@ def cmd_claim(args: argparse.Namespace, config: dict, agent_name: str, client: F
     # Validate: current turn must be the pool sentinel
     current_turn = fields.get("turn", "").strip().lower()
     if not _is_pool_sentinel(current_turn):
+        # WHY THIS REFUSAL REPORTS INDETERMINACY RATHER THAN A VERDICT.
+        # Rounds 2-4 of #3040 ended with "the baton may in fact be free"
+        # whenever the scoped turn-log line was not a `claimed` one. That is
+        # false in the common case, and false in the dangerous direction. Of
+        # the two writers in src/forum/coordination/projects.py that can
+        # produce a non-`claimed` line scoped to the turn value:
+        #   release()  f"- {now} {self_name} → {sentinel}: {reason}"
+        #   flip()     f"- {now} {from_agent} → {to}: {reason}"
+        # the emitted text is IDENTICAL -- `- <ts> <name> → <name>: <text>`
+        # in both, with no marker of which writer produced it. release's RHS
+        # happens to be the RELEASING seat's own primary_user and flip's RHS
+        # is any participant, but primary_user is per-install and this seat
+        # cannot enumerate another install's, so the RHS is not classifiable
+        # from here -- which IS #3039. Measured on batons built through the
+        # real writers: init(turn=borges) + flip(→ariadne) yields
+        # `borges → ariadne: please review` (ariadne HOLDS it) and
+        # init(turn=clio) + release(→"lei shi") yields
+        # `clio → lei shi: released` (FREE); both match "a line handing it
+        # BACK", so round 4 reported the flip-held baton as possibly free --
+        # the round-2 held-baton-reported-free inversion, one layer along.
+        # "Handed BACK" was circular besides: judging it requires already
+        # knowing whether the RHS is a pool marker, the question the reader
+        # came with. turn_reason does not rescue it either -- release's
+        # --reason (see p_release in build_parser) defaults to "released"
+        # but is user-settable, so it hints and never settles, and flip's
+        # reason is free text. The honest output is that this seat cannot
+        # determine it, plus an action that resolves it OFF the log (ask the
+        # named agent; check the anchored PR/project).
+        #
+        # WHY THE TURN-LOG READING RULE IS NOT PRINTED HERE (round 7). The
+        # rule is real and still ships; it lives in the engram-baton skill,
+        # which this message points at. Inlined here it was two bullets, and
+        # those bullets were the site of the held-looks-free inversion in
+        # rounds 2 and 4; repairing them grew the message from 709 chars to
+        # 1049, past the 955 already flagged as too long for an error
+        # stream. A reading rule is prose a reader consults deliberately,
+        # not a wall that arrives mid-refusal. The pinned-message test
+        # carries a hard length ceiling so it cannot grow back unnoticed.
+        #
+        # THE SCOPING AUDIT BEHIND THAT RULE, kept here because it is the
+        # evidence for it and it is easy to get wrong. The rule scopes to
+        # lines shaped `<A> → <B>: <reason>` whose <B> equals `turn`, NOT to
+        # "the last arrow line": three turn-NEUTRAL writers also emit
+        # arrows, so "the last arrow line" can point a reader at a named
+        # agent who does not hold the baton -- #3039's own false-holder
+        # defect one hop downstream. Checked against every arrow-emitting
+        # writer in projects.py:
+        #   flip()    `<from> → <to>: <reason>`         RHS == turn (to)
+        #   claim()   `<sentinel> → <claimer>: claimed` RHS == turn
+        #   release() `<holder> → <sentinel>: <reason>` RHS == turn
+        #   init()    `initialized → <turn>: <reason>`  RHS == turn
+        #   reopen()  `reopened → <invoker>: status was <X> → <Y>`
+        #             -- updates ONLY status, never turn, so RHS != turn
+        #             unless the invoker IS the turn holder, in which case
+        #             the line truthfully names the holder and no false
+        #             diagnosis results. (Its SECOND arrow is why the skill
+        #             says "just after the FIRST arrow".)
+        #   anchor()  `anchor set: github → <anchor>`   no `: <reason>`
+        #             after the arrow, so the shape excludes it
+        #   set_colleague() `<agent> set colleague → <colleague>`
+        #             same -- no `: <reason>` after the arrow
+        # The remaining append_turn_log sites (set_status(), close(),
+        # merge(), rename(), add_participant()) emit no arrow. init() is the
+        # only scoped writer that can emit a line for a baton parked in a
+        # pool and NEVER claimed -- #3039's own motivating case -- so the
+        # skill enumerates it alongside claim, flip and release.
+        #
+        # `baton flip` is deliberately NOT offered here. It is the right
+        # remedy only for the colleague case, and this message no longer
+        # claims to identify that case.
         print(
-            f"baton claim: refusing to steal claim from {current_turn}; "
-            "use 'baton flip <project-id> <self> <reason>' if you have an "
-            "explicit handoff agreement.",
+            f"baton claim: this baton's turn is '{current_turn}', which this "
+            f"seat does not recognize as its pool marker (this seat resolves "
+            f"'{_pool_sentinel()}'). This seat cannot tell from the turn log "
+            f"whether '{current_turn}' is a colleague who holds this baton or "
+            f"a pool marker belonging to an install whose primary_user this "
+            f"seat cannot resolve -- that is engram-alpha#3039. Settle it off "
+            f"the log: ask '{current_turn}', or check the PR or project this "
+            f"baton anchors. To read the log yourself, run\n"
+            f"    baton show {project_id}\n"
+            "and see the engram-baton skill for how to scope a turn-log line "
+            "to the turn value.",
             file=sys.stderr,
         )
         sys.exit(EXIT_STATE)
@@ -1334,6 +1439,15 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     Use ``--limit N`` to cap the number of PR-batons processed per run
     (default: 30) and bound wall-clock runtime.
 
+    PR-baton detection is ANCHOR-FIRST (#2010 rider 1, Kepler DM
+    2026-09-21): a project whose ``github:`` field resolves to a
+    repo-qualified PR anchor is a PR-baton unconditionally, whatever its
+    ``project_id`` looks like.  The ``_PR_BATON_NAME_RE`` name-shape gate is
+    consulted only as a FALLBACK, to classify batons with no qualified
+    anchor (near-miss vs. genuinely unrelated).  Do not read the older
+    "match by suffix, not prefix" framing as still-primary; that governs
+    only the fallback path now.
+
     This is the explicit full-sweep complement to the prompt hook's
     cache-only auto-archive pass.  Agents should run ``baton gc`` at
     loop-start to drain the backlog of merged/closed PR-batons that the
@@ -1364,31 +1478,66 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
     # DEFAULT_GITHUB_REPO removal note near the top of this file). Ported
     # from umwelt's gh_reconcile.py: "skip and count, never resolve against
     # a default or ambient repo."
+    #
+    # #2010 rider 1 (Kepler DM, 2026-09-21): ANCHOR FIRST, name-regex only
+    # as the no-anchor fallback. A 2026-09-02 census (Kepler) found that
+    # matching the name FIRST (as this loop used to) made a baton with a
+    # perfectly valid, repo-qualified `github:` anchor to an already-MERGED
+    # PR silently invisible to this whole pass whenever its project_id
+    # didn't happen to match the name pattern -- exactly the discriminating
+    # case tests/test_baton.py::TestGcAnchorFirst pins. So: for every
+    # project, try the anchor FIRST. Any project_id whose `github:` field
+    # resolves to a repo-qualified PR anchor (`_parse_github_anchor` returns
+    # `("pr", <owner/repo>, <N>)` with a non-None repo) IS a PR-baton,
+    # whatever its name looks like -- the name gate (_PR_BATON_NAME_RE) is
+    # consulted only as a FALLBACK, for batons with no qualified anchor
+    # (no anchor at all, an unparseable one, a non-PR anchor, or an
+    # UNQUALIFIED bare `pr/<N>` -- #1918 above still applies to that last
+    # case: it is never gc-eligible, whether reached via the anchor path or
+    # the name-fallback path). A project_id that merely *contains* "PR-"
+    # without matching the name pattern at all (e.g. a malformed "PR-abc")
+    # is not silently dropped into the same continue as an unrelated
+    # non-PR id -- it is tracked separately in near_miss_ids below so a
+    # completeness read can see it, per the issue's own "Suggested fix" #2.
     pr_batons = []
     ungauged = 0
+    near_miss_ids = []
     for p in all_projects:
         pid = p.get("project_id", "")
-        if not pid.upper().startswith("PR-"):
-            continue
         parsed = _parse_github_anchor((p.get("github") or "").strip().lower())
-        if parsed is None or parsed[0] != "pr" or parsed[1] is None:
-            ungauged += 1
+        if parsed is not None and parsed[0] == "pr" and parsed[1] is not None:
+            # Qualified PR anchor -- a PR-baton unconditionally, name shape
+            # never consulted.
+            _, repo, pr_num = parsed
+            pr_batons.append((pid, repo, pr_num))
+            if len(pr_batons) >= limit:
+                break
             continue
-        _, repo, pr_num = parsed
-        pr_batons.append((pid, repo, pr_num))
-        if len(pr_batons) >= limit:
-            break
+        # No qualified PR anchor -- fall back to the name-shape gate exactly
+        # as before this anchor-first redesign.
+        if not _PR_BATON_NAME_RE.match(pid.upper()):
+            if "PR-" in pid.upper():
+                near_miss_ids.append(pid)
+            continue
+        ungauged += 1
+
+    if near_miss_ids:
+        print(
+            f"baton gc: {len(near_miss_ids)} baton(s) look PR-related but did "
+            f"not match the name pattern -- ids: {near_miss_ids}",
+            file=sys.stderr,
+        )
 
     if ungauged:
         print(
-            f"baton gc: skipped {ungauged} PR-baton(s) with no/invalid/"
+            f"baton gc: ungauged {ungauged} PR-baton(s) with no/invalid/"
             "unqualified github anchor -- run "
             "'baton anchor <id> --github pr/<owner>/<repo>/<N>' "
             "to make them gc-eligible.",
             file=sys.stderr,
         )
 
-    closed = skipped = failed = 0
+    closed = still_open = failed = 0
 
     for project_id, repo, pr_num in pr_batons:
         try:
@@ -1415,7 +1564,7 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
         elif state == "CLOSED":
             new_status = "cancelled"
         else:
-            skipped += 1
+            still_open += 1
             continue
 
         if dry_run:
@@ -1440,7 +1589,10 @@ def cmd_gc(args: argparse.Namespace, config: dict, agent_name: str, client: Foru
             failed += 1
 
     action = "would close" if dry_run else "closed"
-    print(f"baton gc: {action} {closed}, skipped {skipped}, failed {failed}")
+    print(
+        f"baton gc: {action} {closed}, still-open {still_open}, "
+        f"ungauged {ungauged}, failed {failed}"
+    )
 
     # #1918: a non-zero exit when any lookup failed -- the prior all-exit-0
     # behavior is what let "failed 0, 33 failure lines printed above it" go
@@ -2144,8 +2296,27 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Take a Project-layer baton for yourself. Only succeeds when the "
             "current turn is the pool sentinel (the install's primary_user). "
-            "Refuses to steal from another agent — use 'baton flip' with an "
-            "explicit handoff agreement if needed.\n\n"
+            "Refuses when the turn is not this seat's recognized pool marker "
+            "— which may be a colleague genuinely holding it, or a pool or "
+            "maintainer marker written by a seat with a different "
+            "primary_user (engram-alpha#3039). To see what the turn log "
+            "records, run 'baton show <project-id>' and find the LAST turn "
+            "log line shaped '<A> → <B>: <reason>' whose <B> -- the name "
+            "just after the FIRST arrow -- is the turn value. Only such a "
+            "line records who the turn was handed to: anchor, colleague and "
+            "reopen lines carry arrows of their own and name no holder, and "
+            "turn_reason does not discriminate (every claim writes "
+            "'claimed'). '<pool> → <B>: claimed' means a colleague took it "
+            "-- use 'baton flip' with an explicit handoff agreement. ANY "
+            "OTHER such line leaves this seat unable to tell which case it "
+            "is: release and flip emit the identical text, so the line is "
+            "either a colleague taking it "
+            "on a flip or a return to a pool marker belonging to a seat "
+            "whose primary_user this one cannot resolve -- that is #3039. A "
+            "<reason> of 'released' is release's default but is "
+            "user-settable, so it hints and never settles. Settle it off "
+            "the log: ask <B>, or check the PR or project this baton "
+            "anchors -- do not flip on a guess.\n\n"
             "Vocabulary distinction: claim/release are Project-layer verbs "
             "(single driver, rare passes). flip is the PR-layer verb (frequent "
             "passing through fairy → reviewer → colleague → maintainer)."

@@ -344,21 +344,22 @@ class TestHookResilience:
         # Stub _read_loop_mode for sleep guard (no loop marker)
         monkeypatch.setattr(hook, "_read_loop_mode", lambda: None)
 
-        # Make urlopen raise for the POST (but not for threads/inbox fetches)
+        # Make _fetch_with_deadline raise for the POST (but not for
+        # threads/inbox fetches -- though with a fresh cache the hook does
+        # not fetch threads at all, so only the POST path is exercised).
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         _write_fresh_cache(tmp_cache, threads=[{"id": "2", "title": "a thread"}])
 
-        original_urlopen = hook.urllib.request.urlopen
-        call_count = [0]
+        calls = []
 
-        def patched_urlopen(req, timeout=None):
-            call_count[0] += 1
-            # Raise on the POST (status endpoint)
-            if hasattr(req, "get_method") and req.get_method() == "POST":
+        def patched_fetch_with_deadline(*args, **kwargs):
+            method = kwargs.get("method", "GET")
+            calls.append((args[0], method, kwargs.get("body")))
+            if method == "POST":
                 raise ConnectionRefusedError("no server")
-            return original_urlopen(req, timeout=timeout)
+            return None
 
-        monkeypatch.setattr(hook.urllib.request, "urlopen", patched_urlopen)
+        monkeypatch.setattr(hook, "_fetch_with_deadline", patched_fetch_with_deadline)
 
         output = _run_main(hook, capture_output=True)
         assert output.strip(), "Expected threads output even when POST raises"
@@ -369,6 +370,9 @@ class TestHookResilience:
         assert not tmp_publish.exists(), (
             "Publish state file must NOT be written when POST fails"
         )
+        post_calls = [c for c in calls if c[1] == "POST"]
+        assert len(post_calls) == 1, f"Expected exactly one POST attempt, got {post_calls}"
+        assert post_calls[0][0].endswith("/api/agents/status")
 
     def test_post_success_writes_publish_state(
         self, tmp_cursor, tmp_cache, tmp_publish, monkeypatch
@@ -387,18 +391,16 @@ class TestHookResilience:
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         _write_fresh_cache(tmp_cache, threads=[{"id": "3", "title": "new thread"}])
 
-        class _FakeResp:
-            def read(self):
+        calls = []
+
+        def patched_fetch_with_deadline(*args, **kwargs):
+            method = kwargs.get("method", "GET")
+            calls.append((args[0], method, kwargs.get("body")))
+            if method == "POST":
                 return b'{"ok": true}'
-            def __enter__(self):
-                return self
-            def __exit__(self, *a):
-                pass
+            return None
 
-        def patched_urlopen(req, timeout=None):
-            return _FakeResp()
-
-        monkeypatch.setattr(hook.urllib.request, "urlopen", patched_urlopen)
+        monkeypatch.setattr(hook, "_fetch_with_deadline", patched_fetch_with_deadline)
 
         _run_main(hook, capture_output=True)
 
@@ -407,6 +409,14 @@ class TestHookResilience:
         assert state_data["state"] == "working"
         assert state_data["cadence"] == 270
         assert "published_at" in state_data
+
+        post_calls = [c for c in calls if c[1] == "POST"]
+        assert len(post_calls) == 1, f"Expected exactly one POST call, got {post_calls}"
+        url, method, body = post_calls[0]
+        assert url.endswith("/api/agents/status")
+        posted = json.loads(body.decode("utf-8"))
+        assert posted["agent"] == "ariadne"
+        assert posted["state"] == "working"
 
     def test_throttle_skips_unchanged_within_window(
         self, tmp_cursor, tmp_cache, tmp_publish, monkeypatch
@@ -433,17 +443,20 @@ class TestHookResilience:
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         _write_fresh_cache(tmp_cache, threads=[])
 
-        post_calls = []
+        calls = []
 
-        def patched_urlopen(req, timeout=None):
-            if hasattr(req, "get_method") and req.get_method() == "POST":
-                post_calls.append(req)
-            raise ConnectionRefusedError("should not be called")
+        def patched_fetch_with_deadline(*args, **kwargs):
+            method = kwargs.get("method", "GET")
+            calls.append((args[0], method, kwargs.get("body")))
+            if method == "POST":
+                raise AssertionError("should not be called")
+            return None
 
-        monkeypatch.setattr(hook.urllib.request, "urlopen", patched_urlopen)
+        monkeypatch.setattr(hook, "_fetch_with_deadline", patched_fetch_with_deadline)
 
         _run_main(hook, capture_output=True)
 
+        post_calls = [c for c in calls if c[1] == "POST"]
         assert post_calls == [], (
             "No POST should be made when status unchanged within throttle window"
         )
@@ -464,15 +477,18 @@ class TestHookResilience:
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         _write_fresh_cache(tmp_cache, threads=[{"id": "10", "title": "thread"}])
 
-        post_calls = []
+        calls = []
 
-        def patched_urlopen(req, timeout=None):
-            if hasattr(req, "get_method") and req.get_method() == "POST":
-                post_calls.append(req)
-            raise ConnectionRefusedError("should not be called for status")
+        def patched_fetch_with_deadline(*args, **kwargs):
+            method = kwargs.get("method", "GET")
+            calls.append((args[0], method, kwargs.get("body")))
+            if method == "POST":
+                raise AssertionError("should not be called for status")
+            return None
 
-        monkeypatch.setattr(hook.urllib.request, "urlopen", patched_urlopen)
+        monkeypatch.setattr(hook, "_fetch_with_deadline", patched_fetch_with_deadline)
 
         _run_main(hook, capture_output=True)
 
+        post_calls = [c for c in calls if c[1] == "POST"]
         assert post_calls == [], "No POST when agent_name is empty"

@@ -3142,8 +3142,9 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
 
     - SILENT (no `note` key at all): written_since_last_nap is True AND
       session_section_empty is False -- both confidently non-stale.
-    - CONFIRMED-stale (`note` = "Step 5b not performed this session", the
-      original text, unchanged): written_since_last_nap is False OR
+    - CONFIRMED-stale (`note` = "Step 5b not performed since the last
+      checkpoint" -- wording tracks the #3014 checkpoint anchor, see below):
+      written_since_last_nap is False OR
       session_section_empty is True -- at least one signal is a definite
       negative/positive-for-staleness. This takes PRECEDENCE over the
       unknown case below when both are simultaneously present (e.g.
@@ -3253,7 +3254,7 @@ def _compute_warm_briefing_advisory(warm_briefing_path: Path, last_checkpoint_at
             # unknown branch below even when the OTHER signal is also
             # None: a confirmed problem is real regardless of what a
             # separate, independent signal couldn't determine.
-            result["note"] = "Step 5b not performed this session"
+            result["note"] = "Step 5b not performed since the last checkpoint"
         else:
             # Neither confidently-clear nor confirmed-stale -- at least one
             # signal is None (undetermined) and neither is a confirmed
@@ -7395,7 +7396,7 @@ def engram_set_recall_summaries(payload_json: str) -> str:
 # Max-depth-8 nesting on filter trees: practical safety, prevents arbitrary-
 # depth queries from bloating the SQL. Top-level bare list = implicit AND.
 _LIST_FIELDS = frozenset({
-    "node_type", "status", "sort_by", "limit", "filters_json",
+    "node_type", "status", "sort_by", "sort_order", "limit", "filters_json",
     "fields_json", "unlimited", "include_superseded",
 })
 
@@ -7486,6 +7487,10 @@ def engram_list(payload_json: str = "{}") -> str:
                 (newest first), 'importance' (highest first), 'recalls'
                 (most recalled first). Unrecognized non-empty value errors
                 loudly rather than silently falling back to 'id' order.
+            sort_order (str, optional): Direction override — 'asc' or 'desc'
+                (case-insensitive). Empty = use sort_by's own default
+                direction (see above). Unrecognized non-empty value errors
+                loudly rather than silently falling back.
             limit (int, optional): Cap on rows returned. Default 100. Set to
                 0 for a metadata-only response (total_matched without rows).
                 Ignored if unlimited=True. Hard ceiling 500 in single-field
@@ -7501,8 +7506,11 @@ def engram_list(payload_json: str = "{}") -> str:
                 (superseded) nodes too. Default False.
 
     Returns JSON:
-        {status, total_matched, shown, truncated, sort_by, nodes,
+        {status, total_matched, shown, truncated, sort_by, sort_order, nodes,
          mode: "single_field" | "structured"}
+        sort_order echoes the RESOLVED direction actually used ('asc' or
+        'desc'), not a raw echo of the input — so a caller who omitted
+        sort_order can still see which direction they got.
         On payload-parsing failure, returns {"error": "..."}.
 
     See _list_impl for full semantics — kept callable with named kwargs for

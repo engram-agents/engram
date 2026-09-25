@@ -1385,6 +1385,79 @@ def create_app(
         return jsonify({"pack": pack})
 
     # ------------------------------------------------------------------
+    # POST /api/packs/<id>/label  — set a pack's share-clearance label
+    #
+    # Self-certification model (privacy-incident follow-up, #676 slice 1):
+    # only the pack's own author may set its clearance, because the author
+    # is the one who read the full closure -- that read is what EARNS the
+    # label, not what PERMITS the publish. Enforced server-side below.
+    # ------------------------------------------------------------------
+    @app.route("/api/packs/<pack_id>/label", methods=["POST"])
+    def api_packs_label(pack_id: str):
+        agent_name = (request.form.get("agent") or "").strip()
+        if not agent_name:
+            return jsonify({"error": "agent is required (form field)"}), 400
+
+        pack = db.get_pack(g.conn, pack_id)
+        if pack is None:
+            return jsonify({"error": f"pack {pack_id!r} not found"}), 404
+
+        agent_slug = packs_mod._slugify(agent_name)
+        if agent_slug != pack["author"]:
+            return jsonify({
+                "error": (
+                    f"agent {agent_slug!r} is not the author of pack "
+                    f"{pack_id!r} (author: {pack['author']!r}); only a "
+                    "pack's own author may set its share clearance"
+                )
+            }), 403
+
+        clearance = (request.form.get("clearance") or "").strip()
+        if clearance not in db.PACK_SHARE_CLEARANCE_STATES:
+            return jsonify({
+                "error": (
+                    f"clearance {clearance!r} is not valid; "
+                    f"allowed: {sorted(db.PACK_SHARE_CLEARANCE_STATES)!r}"
+                )
+            }), 400
+
+        method = (request.form.get("method") or "").strip() or None
+        if clearance == "cleared-to-share" and not method:
+            return jsonify({
+                "error": (
+                    "method is required when clearing a pack to "
+                    "'cleared-to-share' -- describe what was actually read "
+                    "(e.g. 'full read (pack files + database)')"
+                )
+            }), 400
+
+        # Overwrite semantics, stated deliberately: read_by/read_at/method
+        # always reflect the MOST RECENT labeling action, whoever performed
+        # it and whichever direction. A revert to 'private' is itself a real
+        # action by the pack's author and becomes the new current state --
+        # this is not an append-only audit log of every past clearance, just
+        # "who set the CURRENT label, when, how." A durable history of prior
+        # clearances would need a separate log table; out of scope for this
+        # slice (#676 slice 1).
+        updated = db.set_pack_clearance(
+            g.conn,
+            pack_id,
+            clearance=clearance,
+            read_by=agent_slug,
+            read_at=packs_mod._now_iso(),
+            method=method if clearance == "cleared-to-share" else None,
+        )
+        if not updated:
+            # Race: the pack existed above but was removed before the UPDATE.
+            # No delete_pack() exists yet, so this is unreachable today --
+            # forward-defensive for whenever pack deletion ships, so a future
+            # reader isn't left looking for the test that exercises it.
+            return jsonify({"error": f"pack {pack_id!r} not found"}), 404
+
+        pack = db.get_pack(g.conn, pack_id)
+        return jsonify({"pack": pack})
+
+    # ------------------------------------------------------------------
     # GET /api/packs/<id>/download  — serve the tarball
     # ------------------------------------------------------------------
     @app.route("/api/packs/<pack_id>/download")

@@ -26,25 +26,79 @@ short "could this match the invoker / a co-tenant?" answer):
   PLUS anchored the layer-1 candidate pattern itself on
   `^(\\S*/)?-?bash\\s+...` per #2028's boot-charge fix, so the candidate stage
   alone already excludes the self-quoting-charge-text decoy):
-    - collab-baton-monitor.sh
-      (#1935 originally ported the identical fix to collab-letter-monitor.sh
-      too — that script was deleted as dead code in #2857 step 2, its
-      watched channel retired by the 2026-06-28 UCS cutover to forum DMs —
-      and its coverage removed from this file in the same PR.)
+    - deploy/autostart/boot-charge-default-claude.md / boot-charge-quiet-
+      claude.md's monitor-verify step. #2028 anchored the candidate pattern
+      on `^(\\S*/)?bash\\s+...` (self-quote-decoy exclusion, still correct
+      and unchanged); #3032 (this file's own fix, below) is an ORTHOGONAL
+      correction to the SAME step -- the `\\S`/`\\s` GNU escapes #2028 used
+      to write that anchor are not special in the POSIX ERE real BSD
+      `pgrep(1)` compiles, so on Darwin the #2028-anchored pattern matched
+      NOTHING regardless of the anchor being logically correct. #3032
+      replaces `\\s`/`\\S` with `[[:space:]]`/`[^[:space:]]`, replaces the
+      standalone verify's `-af` with `-lf` (on BSD, `-a` means "include
+      process ancestors," NOT "print full argv" -- `man pgrep` on the
+      deploying seat is the authority), and makes an empty pgrep result
+      LOUD in every loop that consumes it. Single-sourced from the markdown
+      at test time below; both files are also asserted to carry the
+      identical pattern.
 
-    - deploy/autostart/boot-charge-default.md / boot-charge-quiet.md's
-      monitor-verify step: `pgrep -u "$USER" -af
-      '^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh'`. Fixed by
-      #2028 (process-name-anchored `^(\\S*/)?bash`, so an unanchored
-      self-quote of the pattern/monitor names in the charge text itself
-      cannot match). Single-sourced from the markdown at test time below;
-      both files are also asserted to carry the identical pattern.
+  FIXED (#2132 / #2133 -- the `pgrep ... || echo ...` liveness idiom in the
+  SHIPPED SKILL DOCS, an artifact type this inventory had never covered):
+    - src/engram/skills/claude/engram-health-exam/SKILL.md -- three sites
+      (one server-liveness, two surface-daemon), each broken three ways at
+      once. No `-u`, so they counted co-tenant agents' processes (measured
+      on a shared macOS host: unscoped 2, scoped 1; a colleague measured the
+      same shipped line on a shared Linux host: unscoped 5, scoped 1) --
+      a healthy-looking count made mostly of other people's processes, and
+      identical with this seat's own daemon dead. `-a` on one of them, which
+      on Darwin re-admits the current process's ANCESTORS to the match set;
+      since an agent runs this doc through a harness whose wrapper-shell
+      argv quotes the search pattern, the `|| echo` branch is unreachable
+      in practice -- though reachable in principle, from a clean script
+      where the pattern appears in no ancestor's argv, where rc=1. And `||`
+      alone, conflating pgrep's exit 1 ("ran, found nothing") with exit >1
+      ("could not run", e.g. 127) -- an absent pgrep printed the same
+      reassuring "not running" as a genuine absence. Each site now branches
+      on the exit status, and the one that wanted full argv takes it from
+      `ps -o args=` on the returned pids rather than from `-a`.
+    - src/engram/skills/claude/engram-collaborating-loop/SKILL.md -- gained
+      a pasteable arm-site + liveness block (uid-scoped, shell-anchored,
+      POSIX bracket classes per #3032's escape fix, no `-a`).
+
+  WHY THIS INVENTORY MISSED THEM, and what changed: this file is scoped by
+  ARTIFACT TYPE -- it covers scripts and modules, and a skill doc is neither
+  -- so those three sites sat in plain sight through #2029, #1933, #1935 and
+  #3032. An inventory scoped by artifact type is blind exactly where a
+  DIFFERENT artifact type carries the same idiom, and is worse than no
+  inventory there, because its existence reads as coverage. So the gate added
+  in tests/test_health_exam_skill.py deliberately does not enumerate the three
+  repaired lines: it walks `src/engram/skills/**/*.md` as a POPULATION
+  (parametrized per doc, plus a non-vacuity guard that fails if the glob stops
+  resolving or the docs stop invoking pgrep), asserting that no shipped skill
+  doc -- present or future -- carries a pgrep invocation that lacks `-u`, uses
+  `-a`/`-af`, or hides its failure in a bare `|| echo`. (That same sweep now
+  also carries an unrelated shell-hygiene assertion for #3068 -- no skill doc
+  may bind a zsh-tied loop variable such as `path` -- for the same reason:
+  the population, not the one line that was found broken.) Measured 2026-09-22
+  over all 29 shipped skill docs: engram-upgrade/SKILL.md's single invocation
+  was already `-u "$USER"`-scoped, and the remaining 26 invoke pgrep nowhere
+  (they pass vacuously today, which is the point of gating the population --
+  the next one to grow a liveness check is covered before it is written).
 
   EXCLUDED (not a pattern-liveness probe): tools/agentctl's account-
   decommission `pkill -KILL -u "$newborn_user"` / `pgrep -u "$newborn_user"`
   (~line 1127-1129) is a uid-scoped kill-everything-for-this-account step,
   not a command-line pattern match -- there is no `-f PATTERN` to false-
   match or drift, so it is out of scope for this inventory.
+
+ROOT CAUSE (#3032): `simulate_pgrep_f` below modeled `pgrep -f` with Python's
+`re` module, which DOES support `\\s`/`\\S`/`\\d`/`\\w`/`\\b` (and their
+negations) -- a dialect no real BSD `pgrep` ever runs. That let every pattern
+above pass this file's own tests while being silently broken on Darwin. The
+fix hardens `simulate_pgrep_f` itself to refuse any pattern carrying those
+GNU-only escapes, so this class of defect can never again be blessed by this
+suite. See `GnuOnlyBsdEscapeError` and `TestSimulatePgrepFRejectsGnuOnlyEscapes`
+below.
 """
 
 from __future__ import annotations
@@ -77,13 +131,82 @@ _AUTOSTART = _REPO_ROOT / "deploy" / "autostart"
 #     another regex term).
 
 
+_GNU_ONLY_ESCAPE_RE = re.compile(r"\\[sSdDwWbB]")
+
+# Python's `re` module does NOT understand POSIX bracket-class syntax
+# (`[[:space:]]`, `[^[:space:]]`, ...) -- confirmed live: `re.compile(r"a[[:
+# space:]]b")` matches NEITHER "a b" nor "axb", with a `FutureWarning:
+# Possible nested set` -- it silently misparses the construct as a literal
+# character set containing '[', ':', 's', ... instead of the POSIX "space"
+# class. Real BSD pgrep's POSIX ERE compiler DOES understand this syntax
+# natively; it is exactly what #3032's fix substitutes for the GNU-only
+# \s/\S this file's own root-cause bug modeled. So simulate_pgrep_f must
+# translate POSIX bracket-class syntax to a Python-re equivalent BEFORE
+# compiling, or it cannot correctly simulate the very patterns #3032 ships
+# -- it would silently mis-simulate the fix the same way it silently
+# mis-simulated the bug. Only classes this repo's patterns actually use are
+# supported; an unrecognized class raises loudly rather than guessing.
+_POSIX_BRACKET_CLASS_RE = re.compile(r"\[(\^)?\[:(\w+):\]\]")
+_POSIX_CLASS_TO_PYTHON_RE = {
+    "space": (r"\s", r"\S"),  # (positive, negated)
+}
+
+
+def _translate_posix_bracket_classes(pattern: str) -> str:
+    def _replace(m: "re.Match[str]") -> str:
+        negated, cls_name = m.group(1), m.group(2)
+        if cls_name not in _POSIX_CLASS_TO_PYTHON_RE:
+            raise NotImplementedError(
+                f"simulate_pgrep_f has no Python-re translation for POSIX "
+                f"bracket class [:{cls_name}:] -- add one to "
+                f"_POSIX_CLASS_TO_PYTHON_RE (verify the translation matches "
+                f"real BSD pgrep semantics) rather than letting this pattern "
+                f"silently mis-simulate"
+            )
+        positive, negative = _POSIX_CLASS_TO_PYTHON_RE[cls_name]
+        return negative if negated else positive
+
+    return _POSIX_BRACKET_CLASS_RE.sub(_replace, pattern)
+
+
+class GnuOnlyBsdEscapeError(AssertionError):
+    """Raised by simulate_pgrep_f when a pattern carries a GNU-only regex
+    escape (\\s \\S \\d \\D \\w \\W \\b \\B) that a real BSD pgrep(1)'s
+    POSIX ERE compiler does NOT treat as special (#3032). Python's `re`
+    module supports all of these -- that dialect mismatch is exactly the
+    root cause #3032 fixes: this simulator must refuse to bless a pattern
+    real BSD pgrep cannot run, rather than silently passing it through a
+    dialect BSD never uses."""
+
+
 def simulate_pgrep_f(pattern: str, table: list[dict], uid: int | None = None) -> list[int]:
     """Return the list of pids that `pgrep [-u uid] -f pattern` would match
     against a synthetic process table.
 
     table: list of {"pid": int, "uid": int, "cmdline": list[str]}
+
+    Raises GnuOnlyBsdEscapeError if `pattern` contains a GNU-only escape
+    (\\s \\S \\d \\D \\w \\W \\b \\B) -- see #3032. This is deliberately a
+    hard refusal, not a warning: the whole point of this simulator is to
+    prove a pattern is safe, and a pattern real BSD pgrep cannot run is not
+    safe regardless of what Python's `re` module does with it. Use POSIX
+    bracket classes instead (e.g. `[[:space:]]` for `\\s`, `[^[:space:]]`
+    for `\\S`); this function translates those to a Python-re equivalent
+    internally (see _translate_posix_bracket_classes) so it can correctly
+    simulate them, without changing what pattern text ships in the
+    real script/markdown.
     """
-    rx = re.compile(pattern)
+    offending = sorted(set(_GNU_ONLY_ESCAPE_RE.findall(pattern)))
+    if offending:
+        raise GnuOnlyBsdEscapeError(
+            f"pattern {pattern!r} contains GNU-only regex escape(s) "
+            f"{offending!r} -- real BSD pgrep(1) compiles a POSIX ERE where "
+            f"\\s \\S \\d \\D \\w \\W \\b \\B are NOT special (#3032). This "
+            f"simulator refuses to bless a pattern BSD pgrep cannot run; "
+            f"substitute POSIX bracket classes (e.g. [[:space:]] for \\s, "
+            f"[^[:space:]] for \\S) in the source script/markdown instead."
+        )
+    rx = re.compile(_translate_posix_bracket_classes(pattern))
     candidates = table if uid is None else [p for p in table if p["uid"] == uid]
     return [p["pid"] for p in candidates if rx.search(" ".join(p["cmdline"]))]
 
@@ -144,17 +267,24 @@ def _extract_reap_pattern(script_path: Path, var_name: str) -> str:
 
 
 def _extract_boot_charge_pgrep_pattern(md_path: Path) -> str:
-    """Extract the monitor-verify `pgrep -u "$USER" -af '<pattern>'` pattern
+    """Extract the monitor-verify `pgrep -u "$USER" -lf '<pattern>'` pattern
     literally from a boot-charge markdown file's prose, single-sourced so
     this test can never silently drift from what the charge text actually
     tells an agent to run. The pattern is single-quoted in the source (bash
     single-quotes suppress all interpolation/escaping), so the extracted
-    text is already the literal ERE the shell would pass to `pgrep -af`,
+    text is already the literal ERE the shell would pass to `pgrep -lf`,
     with no bash-quote-unescaping step required.
+
+    `-lf`, not `-af` (#3032): on BSD, `-a` means "include process ancestors
+    in the match list," NOT "print full argv" -- using it here would be a
+    silent no-op on output shape while quietly re-including the invoking
+    session's own ancestors, reopening the self-match tautology the
+    `^bash` anchor exists to prevent. `-l` combined with `-f` is the actual
+    argv-printing form on this seat's `pgrep(1)` (man page, confirmed live).
     """
     text = md_path.read_text()
-    m = re.search(r"""pgrep -u \\?"\$USER\\?" -af '([^']*)'""", text)
-    assert m, f"{md_path.name}: no monitor-verify pgrep -u \"$USER\" -af '...' pattern found"
+    m = re.search(r"""pgrep -u \\?"\$USER\\?" -lf '([^']*)'""", text)
+    assert m, f"{md_path.name}: no monitor-verify pgrep -u \"$USER\" -lf '...' pattern found"
     return m.group(1)
 
 
@@ -171,6 +301,90 @@ def _load_hooklib():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+# ===========================================================================
+# ROOT CAUSE (#3032): simulate_pgrep_f must not bless a pattern real BSD
+# pgrep cannot run. This is the regression test the root-cause fix needs:
+# feed the simulator the ACTUAL pre-#3032 boot-charge pattern (frozen
+# literal, copied from the charge's own pre-fix text -- not re-derived) and
+# assert it is REJECTED, proving the guard fires on the exact pattern that
+# was silently blessed by every test above before this fix existed.
+# ===========================================================================
+
+
+class TestSimulatePgrepFRejectsGnuOnlyEscapes:
+    # The literal pre-#3032 boot-charge monitor-verify pattern -- what
+    # shipped before this fix, and what every earlier version of the tests
+    # below silently blessed via Python `re` (which DOES support \S/\s).
+    _PRE_FIX_PATTERN = r"^(\S*/)?bash\s+\S*forum-(mention|updates)-monitor\.sh"
+    # The #3032-fixed form of the same pattern -- POSIX bracket classes,
+    # identical matching semantics on both Python `re` and real BSD pgrep.
+    _POSIX_PATTERN = r"^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\.sh"
+
+    def test_pre_fix_pattern_is_rejected(self):
+        """The exact pattern real BSD pgrep silently matched nothing
+        against (measured live on this seat, #3032) must be REJECTED by
+        the simulator, not silently accepted the way Python `re` accepts
+        it. This is the mutation-shape proof: this test, run against an
+        unhardened simulate_pgrep_f, FAILS (see this fix's handoff for the
+        literal pytest output of that run) -- restoring the hardening
+        makes it pass, which is the discriminating behavior the guard
+        exists to provide."""
+        with pytest.raises(GnuOnlyBsdEscapeError) as excinfo:
+            simulate_pgrep_f(self._PRE_FIX_PATTERN, table=[])
+        # The error must name the actual offending escapes, not just fail
+        # generically -- a bare `raise` with no diagnostic would pass this
+        # test just as well as a useful one, so pin the message content.
+        assert "\\S" in str(excinfo.value)
+        assert "\\s" in str(excinfo.value)
+
+    def test_posix_fixed_pattern_is_accepted(self):
+        """The #3032-fixed POSIX-class form must NOT be rejected -- the
+        guard targets GNU-only escapes specifically, not bracket classes,
+        and must not false-positive on the very fix it exists to require."""
+        result = simulate_pgrep_f(self._POSIX_PATTERN, table=[])
+        assert result == []
+
+    def test_posix_fixed_pattern_still_matches_correctly(self):
+        """Sanity: the POSIX rewrite isn't just "doesn't raise" -- it must
+        still match the real target shape Python `re` (and, per this fix's
+        live Darwin control, real BSD pgrep) matches."""
+        table = [
+            {"pid": 1, "uid": 1000, "cmdline": ["bash", "/x/forum-mention-monitor.sh"]},
+            {"pid": 2, "uid": 1000, "cmdline": ["claude", "-p", "not a real monitor"]},
+        ]
+        assert simulate_pgrep_f(self._POSIX_PATTERN, table, uid=1000) == [1]
+
+    @pytest.mark.parametrize(
+        "escape,example",
+        [
+            ("\\s", r"a\sb"),
+            ("\\S", r"a\Sb"),
+            ("\\d", r"a\db"),
+            ("\\D", r"a\Db"),
+            ("\\w", r"a\wb"),
+            ("\\W", r"a\Wb"),
+            ("\\b", r"a\bb"),
+            ("\\B", r"a\Bb"),
+        ],
+    )
+    def test_each_gnu_only_escape_is_individually_rejected(self, escape, example):
+        """Every escape in the class this guard exists to catch, checked
+        individually -- not just the two (\\s \\S) the shipped bug
+        happened to use, so a future pattern using \\d or \\b alone is
+        caught just as reliably."""
+        with pytest.raises(GnuOnlyBsdEscapeError) as excinfo:
+            simulate_pgrep_f(example, table=[])
+        assert escape in str(excinfo.value)
+
+    def test_literal_dot_and_dollar_escapes_are_not_false_flagged(self):
+        """The guard must not over-fire on ordinary regex escapes that ARE
+        POSIX-ERE-safe on real BSD pgrep -- \\. (literal dot) and \\$ (bash
+        double-quote unescaping artifact, see _extract_reap_pattern) are
+        the two other backslash-escapes this file's real patterns use."""
+        result = simulate_pgrep_f(r"engram-surface-daemon\.py.*/home/agentX$", table=[])
+        assert result == []
 
 
 # ===========================================================================
@@ -302,19 +516,21 @@ class TestDaemonReapPatternEngramHomeAnchored:
 
 # ===========================================================================
 # SAFE site 3: harness-specific Claude boot-charge components' monitor-verify
-# pgrep -u "$USER" -af '...' step (#2029, #2028)
+# pgrep -u "$USER" -lf '...' step (#2029, #2028)
 # ===========================================================================
 
 
 class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
     """Both Claude charge components instruct the booting agent to verify the forum
-    monitors are actually running via `pgrep -u "$USER" -af
-    '^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh'`. The charge
+    monitors are actually running via `pgrep -u "$USER" -lf
+    '^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh'`. The charge
     text itself QUOTES both monitor names and this very pgrep pattern as
     prose, so the invoking session's own argv is the self-match decoy this
     site has to survive -- the same trap #1933 fixed for the two monitor
-    scripts, fixed here by #2028 via the leading `^(\\S*/)?bash` process-name
-    anchor instead of an argv-verification second layer."""
+    scripts, fixed here by #2028 via a leading process-name anchor instead of an
+    argv-verification second layer. #2028 wrote that anchor as `^(\\S*/)?bash`;
+    #3032 respelled it `^([^[:space:]]*/)?bash` without changing what it
+    anchors on -- the mechanism is #2028's, the POSIX spelling is #3032's."""
 
     _DEFAULT_MD = _AUTOSTART / "boot-charge-default-claude.md"
     _QUIET_MD = _AUTOSTART / "boot-charge-quiet-claude.md"
@@ -371,7 +587,7 @@ class TestBootChargeMonitorVerifyPatternIsProcessNameAnchored:
                 ],
             },
             # wrapper: a genuine instance launched via an absolute /bin/bash
-            # path -- the leading `(\S*/)?` must still match it.
+            # path -- the leading `([^[:space:]]*/)?` must still match it.
             {
                 "pid": wrapper_pid,
                 "uid": 1000,
@@ -411,15 +627,27 @@ class TestBootChargeAllPgrepInvocationsCarryTheCanonicalPattern:
     # The complete, exact, canonical invocation spans -- the full
     # inline-code span text for each of the three real pgrep
     # invocations, copied verbatim from the charge as it stood at
-    # #3007's own commit (31fd8502). Frozen literals, not re-derived
+    # #3032's own commit (this fix). Frozen literals, not re-derived
     # from the file at test time, so this check can never itself become
     # a parser with its own blind spot. Membership is EXACT STRING
     # EQUALITY -- no substring, no regex, no shell-grammar parse.
+    #
+    # #3032 changed all three spans: `\S`/`\s` (GNU-only, inert in real
+    # BSD pgrep's POSIX ERE) -> `[^[:space:]]`/`[[:space:]]`; the
+    # standalone verify's `-af` -> `-lf` (BSD `-a` means "include
+    # ancestors," not "print argv"); and every span now captures its
+    # `pgrep` output into a variable and reports an empty result as a
+    # FAILURE rather than silently proceeding.
+    #
+    # #3057 changed the else-branch to capture-and-test per pid
+    # (`_T="$(readlink ...)" || {...}; case "$_T" in socket:*) ...`)
+    # instead of a bare `readlink ...; done` -- the span updated
+    # accordingly.
     _CANONICAL_INVOCATION_SPANS = frozenset(
         {
-            'pgrep -u "$USER" -af \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'',
-            'for pid in $(pgrep -u "$USER" -f \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'); do readlink /proc/$pid/fd/1; done',
-            'for pid in $(pgrep -u "$USER" -f \'^(\\S*/)?bash\\s+\\S*forum-(mention|updates)-monitor\\.sh\'); do lsof -a -p "$pid" -d 1; done',
+            '_MATCHED=$(pgrep -u "$USER" -lf \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\'); if [ -z "$_MATCHED" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else echo "$_MATCHED"; fi',
+            '_PIDS="$(pgrep -u "$USER" -f \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\')"; if [ -z "$_PIDS" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else for pid in $_PIDS; do _T="$(readlink /proc/$pid/fd/1)" || { echo "pid $pid: stdout target UNREADABLE -- FAILURE, not a pass"; continue; }; case "$_T" in socket:*) echo "pid $pid: $_T" ;; *) echo "pid $pid: $_T -- NOT a socket, this monitor is a dead end" ;; esac; done; fi',
+            '_PIDS="$(pgrep -u "$USER" -f \'^([^[:space:]]*/)?bash[[:space:]]+[^[:space:]]*forum-(mention|updates)-monitor\\.sh\')"; if [ -z "$_PIDS" ]; then echo "NO monitor processes matched -- this is a FAILURE, not a pass"; else for pid in $_PIDS; do lsof -a -p "$pid" -d 1; done; fi',
         }
     )
 
@@ -460,7 +688,7 @@ class TestBootChargeAllPgrepInvocationsCarryTheCanonicalPattern:
         assert len(selected) >= self._EXPECTED_MIN_COUNT, (
             f"{md_path.name}: expected at least {self._EXPECTED_MIN_COUNT} "
             f"pgrep invocations naming the forum monitors (the standalone "
-            f"`-af` verify line plus the Linux and Darwin loop-embedded "
+            f"`-lf` verify line plus the Linux and Darwin loop-embedded "
             f"copies), found {len(selected)}: {selected!r} -- a lower count "
             f"means a copy was silently dropped or no longer reads as a "
             f"real invocation, not that fewer copies legitimately exist. "
@@ -553,14 +781,18 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
         surrounding keyword prose intact), this extraction fails and the
         test fails with it -- this is the assertion a gutted paragraph
         trips."""
-        # The `for pid in` anchor is load-bearing, not cosmetic: without it,
-        # `[^`]*` happily spans the prose BETWEEN two unrelated inline-code
-        # spans, so a mutation that deletes the runnable command (leaving
-        # `readlink` and `fd/1` sitting in plain prose elsewhere in the
-        # paragraph) still "matches" -- and the test then fails at the wrong
-        # assertion downstream, reporting a reshaped loop instead of a
-        # deleted command. Measured 2026-09-18.
-        m = re.search(r"`(for pid in [^`]*readlink[^`]*fd/1[^`]*)`", span)
+        # The `_PIDS="$(pgrep` anchor is load-bearing, not cosmetic: without
+        # it, `[^`]*` happily spans the prose BETWEEN two unrelated
+        # inline-code spans, so a mutation that deletes the runnable command
+        # (leaving `readlink` and `fd/1` sitting in plain prose elsewhere in
+        # the paragraph) still "matches" -- and the test then fails at the
+        # wrong assertion downstream, reporting a reshaped loop instead of a
+        # deleted command. Measured 2026-09-18 (pre-#3032, when the command
+        # started with `for pid in`); #3032 changed the command's own shape
+        # to `_PIDS="$(pgrep ...)"; if [ -z "$_PIDS" ]; ... else for pid in
+        # $_PIDS; do readlink ...; done; fi` (the loud-empty guard), so the
+        # anchor moved with it -- same load-bearing role, new literal text.
+        m = re.search(r'`(_PIDS="\$\(pgrep[^`]*readlink[^`]*fd/1[^`]*)`', span)
         assert m, (
             "no backticked command containing both `readlink` and `fd/1` found in "
             "the stdout-target-check paragraph -- the charge no longer carries a "
@@ -598,12 +830,22 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             # detached background process looks like (#3007's incident).
             with open(log_path, "w") as f:
                 proc_b = subprocess.Popen(["sleep", "30"], stdout=f)
+            # pid_c: a pid whose /proc/<pid>/fd/1 is genuinely unreadable --
+            # the actual defect #3057 fixes. `true` exits immediately; the
+            # explicit `.wait()` blocks until this test process has reaped
+            # it, so by the time _PIDS is built, /proc/<that pid> no longer
+            # exists at all (not merely a dead symlink target).
+            proc_c = subprocess.Popen(["true"])
+            proc_c.wait()
 
-            # Repoint the pid source only: substitute the $(pgrep ...)
-            # command-substitution with a literal list of the two pids just
-            # spawned. Everything else -- the readlink half under test --
-            # runs verbatim from the charge. Pid discovery for the
-            # standalone `-af` verify line is covered by the sibling class
+            # Repoint the pid source only: substitute the `_PIDS="$(pgrep
+            # ...)"` assignment with a literal list of the three pids just
+            # spawned, in a fixed order (socket, file, dead) -- order
+            # matters for which output line is which. Everything else --
+            # the loud-empty guard's `if [ -z "$_PIDS" ]` check and the
+            # capture-and-test half under test -- runs verbatim from the
+            # charge. Pid discovery for the standalone `-lf` verify line is
+            # covered by the sibling class
             # TestBootChargeMonitorVerifyPatternIsProcessNameAnchored; pid
             # discovery for THIS loop's own embedded `-f` copy (and the
             # Darwin loop's) is covered by
@@ -612,13 +854,13 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             # here -- running the real pgrep here would pick up this seat's
             # own live monitors and make the test environment-dependent.
             repointed = re.sub(
-                r"for pid in \$\(.*?\); do",
-                f"for pid in {proc_a.pid} {proc_b.pid}; do",
+                r'_PIDS="\$\(pgrep.*?\)"',
+                f'_PIDS="{proc_a.pid} {proc_b.pid} {proc_c.pid}"',
                 cmd,
             )
             assert repointed != cmd, (
                 "the pid-source substitution did not change the command -- the "
-                "charge's `for pid in $(...); do` loop is no longer the expected shape"
+                'charge\'s `_PIDS="$(pgrep ...)"` assignment is no longer the expected shape'
             )
 
             result = subprocess.run(
@@ -633,23 +875,33 @@ class TestBootChargeMonitorStdoutTargetCheckDiscriminates:
             sock_b.close()
 
         lines = result.stdout.splitlines()
-        assert len(lines) == 2, (
-            f"expected exactly 2 output lines (one per pid), got stdout={result.stdout!r} "
-            f"stderr={result.stderr!r}"
+        # This is the core property under test: previously a dead pid
+        # silently dropped its own line (2 lines for 3 pids); the fixed
+        # loop is built to print exactly one line per pid in every outcome,
+        # so the line count must match the pid count.
+        assert len(lines) == 3, (
+            f"expected exactly 3 output lines (one per pid, matching pid count), "
+            f"got stdout={result.stdout!r} stderr={result.stderr!r}"
         )
-        socket_line, file_line = lines
+        socket_line, file_line, dead_line = lines
 
         # This IS the discrimination the charge's instruction exists to
         # perform: a monitor whose stdout is a socket (correctly armed) vs
-        # one whose stdout is a file (silently a dead end).
-        assert socket_line.startswith("socket:"), (
-            "the socket-backed pid's stdout-target line must START WITH `socket:` "
-            "(the bracketed inode number varies per run, so this is a prefix check, "
-            f"not an equality check) -- got {socket_line!r}"
+        # one whose stdout is a file (silently a dead end) vs one whose
+        # stdout target is unreadable at all (the pid is dead / the fd
+        # entry vanished).
+        assert socket_line.startswith(f"pid {proc_a.pid}: socket:"), (
+            f"the socket-backed pid's stdout-target line must START WITH `pid {proc_a.pid}: socket:` "
+            "(the bracketed inode number varies per run, so this is a prefix check on the "
+            f"`socket:` segment, not an equality check) -- got {socket_line!r}"
         )
-        assert file_line == str(log_path) and not file_line.startswith("socket:"), (
-            "the file-backed pid's stdout-target line must be the log file's own "
-            f"path and must NOT start with `socket:` -- got {file_line!r}"
+        assert file_line == f"pid {proc_b.pid}: {log_path} -- NOT a socket, this monitor is a dead end", (
+            f"the file-backed pid's stdout-target line must name the log file's own path and "
+            f"the not-a-socket tell -- got {file_line!r}"
+        )
+        assert dead_line == f"pid {proc_c.pid}: stdout target UNREADABLE -- FAILURE, not a pass", (
+            f"the dead pid's stdout-target line must read UNREADABLE -- FAILURE, not silently "
+            f"drop its line -- got {dead_line!r}"
         )
 
     def test_default_charge_carries_the_darwin_branch(self):
@@ -844,82 +1096,6 @@ class TestForumUpdatesMonitorCandidatePattern(_TwoLayerMonitorFixture):
         assert verified == [target_pid, wrapper_pid]
         assert invoker_decoy_pid not in verified
         assert cotenant_pid not in verified
-
-
-# ===========================================================================
-# FINDING (xfail, not fixed here): collab-baton-monitor.sh --
-# single-layer unanchored pgrep -f feeding
-# directly into `kill`, no argv verification, no warn-not-kill guard.
-# ===========================================================================
-
-
-class _SingleLayerReapMonitorFixture:
-    SCRIPT: Path
-
-    def _build_table(self, script_basename: str, purpose: str):
-        target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid = 1, 2, 3, 4
-        table = [
-            # target: a genuine second instance -- this IS meant to be
-            # reaped (last-arm-wins by design).
-            {
-                "pid": target_pid,
-                "uid": 1000,
-                "cmdline": ["bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-            # co-tenant equivalent, different uid -- must be excluded by -u.
-            {
-                "pid": cotenant_pid,
-                "uid": 1001,
-                "cmdline": ["bash", f"/home/agentY/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-            # invoking-process self-quote decoy -- the #1933 repro shape,
-            # UNFIXED here: this script has no second layer to filter it.
-            {
-                "pid": invoker_decoy_pid,
-                "uid": 1000,
-                "cmdline": [
-                    "python3", "-c", "import time; time.sleep(9)",
-                    f"Automatic morning boot charge: bash /home/agentX/.engram/tools/{script_basename} "
-                    f"--purpose {purpose} (unrelated instructions) continue with the day's plan",
-                ],
-            },
-            # wrapper: a genuine second instance via login-shell argv0.
-            {
-                "pid": wrapper_pid,
-                "uid": 1000,
-                "cmdline": ["-bash", f"/home/agentX/.engram/tools/{script_basename}", "--purpose", purpose],
-            },
-        ]
-        return table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid)
-
-    def _pattern(self, script_basename: str, purpose: str) -> str:
-        patterns = _extract_pgrep_pattern_branches(self.SCRIPT)
-        return patterns["named"].format(purpose=purpose)
-
-
-class TestCollabBatonMonitorReapPattern(_SingleLayerReapMonitorFixture):
-    """FIXED by #1935 (porting #1933/#2028's process-name-anchored candidate
-    pattern -- collab-baton-monitor.sh no longer feeds an unanchored
-    substring match straight into `kill`; the candidate pgrep pattern is now
-    itself anchored on `^(\\S*/)?-?bash\\s+...` so the self-quoting-charge-text
-    decoy is excluded even before any /proc/<pid>/cmdline verification runs,
-    and the script also gained the /proc two-layer verification + warn-not-kill
-    posture (see the script's own inline comments)."""
-
-    SCRIPT = _TOOLS / "collab-baton-monitor.sh"
-
-    def test_reap_pattern_matches_exactly_the_target_and_wrapper(self):
-        purpose = "unittestpurpose"
-        pattern = self._pattern("collab-baton-monitor.sh", purpose)
-        table, (target_pid, cotenant_pid, invoker_decoy_pid, wrapper_pid) = self._build_table(
-            "collab-baton-monitor.sh", purpose
-        )
-
-        matched = simulate_pgrep_f(pattern, table, uid=1000)
-        # Desired safe behavior (what this asserts, and what currently
-        # fails): only the target + wrapper (genuine instances meant to be
-        # reaped) match -- the self-quote decoy must NOT.
-        assert matched == [target_pid, wrapper_pid]
 
 
 if __name__ == "__main__":

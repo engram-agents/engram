@@ -859,9 +859,12 @@ def init(
             misclassified as presenting-for-merge and demanded an approval
             that cannot exist (the colleague is the one objecting). The
             caller (``cmd_init``) is responsible for supplying the right
-            value — the established convention is the initial ``turn``
-            holder, since a PR baton is normally initialized by its own
-            author with ``turn`` pointing at themselves. Omitted (``None`` /
+            value — as of #3042 that is the INVOKING agent, the seat that ran
+            ``baton init``, regardless of whose court ``turn`` puts it in.
+            (Before #3042 ``cmd_init`` supplied the initial ``turn`` holder as
+            a proxy, which is correct only when a baton is initialized by its
+            own author with ``turn`` pointing at themselves, and mis-attributed
+            authorship whenever it was not.) Omitted (``None`` /
             falsy) on an existing baton created before this field existed —
             ``_is_maintainer_flip`` treats a missing author as "no exemption
             available," identical to pre-#2961 behavior, not as an error.

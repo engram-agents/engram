@@ -281,7 +281,7 @@ Each entry: **contract** (payload_json fields), **guards** (named blocking check
 - **tests**: *(unverified)*
 
 **29. engram_list** — Enumerate by single-field or structured filter.
-- **contract**: `{[node_type, status, sort_by, limit, filters_json, fields_json, unlimited, include_superseded]}`
+- **contract**: `{[node_type, status, sort_by, sort_order, limit, filters_json, fields_json, unlimited, include_superseded]}`
 - **guards**: dual-mode (legacy shorthand OR recursive condition tree); filters_json supports AND/OR/NOT + 15 atomic operators; virtual fields cites/cited_by; limit default 100, ceiling 500 (legacy); unlimited=True in structured mode; include_superseded=False default
 - **readOnlyHint**: True
 - **status-candidate**: PROD-VERIFIED (structured-filter mode per issue #81)

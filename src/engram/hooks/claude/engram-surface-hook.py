@@ -208,6 +208,72 @@ def _check_mcp_write_tool_marker(engram_home: str) -> tuple[bool, str | None]:
             return False, f"mcp-tools-ready.json stale (server PID {pid} no longer running)"
     except Exception:
         return True, None  # advisory — never block
+
+
+def _check_embedding_restore_flag(db_path: str) -> tuple[bool, str | None]:
+    """Check the embedding restore-completeness flag (#3075 C5 round 2,
+    Borges's design ruling).
+
+    Reads the embedding_restore_state singleton row directly via a
+    read-only SQLite connection — this hook process never imports
+    engram_core (see _cosine_similarity's docstring above for this file's
+    established "duplicate small primitives by value across the
+    hook/server process boundary" precedent; engram_core.py's own
+    _get_embedding_restore_flag is the server-side twin of this read).
+
+    Returns (True, None) when the flag is unset/clear, the DB is absent, the
+    table doesn't exist yet (a DB that predates this feature), or on any
+    other read failure — fail-open, same posture as _check_db_liveness
+    above: an advisory probe must never block the hook.
+
+    Returns (False, message) when the flag IS SET — message names the
+    count, cause, and remedy, ready for direct injection into
+    additionalContext (per Borges's ruling: "the hooks are the load-bearing
+    channel, because they reach the agent without it calling anything").
+    """
+    if not os.path.exists(db_path):
+        return True, None
+    conn = None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
+        row = conn.execute(
+            "SELECT not_fully_restored, null_count, cause FROM "
+            "embedding_restore_state WHERE singleton_key = 1"
+        ).fetchone()
+        if not row or not row[0]:
+            return True, None
+        null_count, cause = row[1], row[2]
+        if cause and cause.startswith("detection-failed"):
+            # ROUND 4 (Borges's colleague pass, PR#3076 finding A):
+            # null_count=-1 here is a SENTINEL — detection itself raised,
+            # so the real count is unknown, not zero. A distinct message
+            # avoids a nonsensical "-1 node(s) lack embeddings" line.
+            return False, (
+                f"ENGRAM DB restore-completeness state UNKNOWN ({cause}) "
+                f"— recall may be degraded; remedy: run "
+                f"tools/engram-regenerate-embeddings.py to check/repair."
+            )
+        return False, (
+            f"ENGRAM DB NOT FULLY RESTORED: {null_count} node(s) lack "
+            f"embeddings, recall degraded/blocked; cause: {cause}; "
+            f"remedy: run tools/engram-regenerate-embeddings.py once an "
+            f"embedder is available (or wait — a regeneration may already "
+            f"be running in the background)."
+        )
+    except sqlite3.OperationalError:
+        # embedding_restore_state doesn't exist yet (DB predates this
+        # feature) — treat as clear, same as "no flag ever set."
+        return True, None
+    except Exception:
+        return True, None  # fail-open — advisory probe, never block
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 SOCKET_PATH = os.path.join(ENGRAM_HOME, "recall-daemon.sock")
 COUNTER_PATH = os.path.join(ENGRAM_HOME, "prompt-counter.json")
 WRITE_REMINDER_PATH = os.path.join(ENGRAM_HOME, "write-reminder.json")
@@ -3502,6 +3568,14 @@ def main():
             f"  → MCP tool calls will fail. Surface nodes above may be stale pre-failure cache.\n"
             f"  Recovery: check disk health / WAL integrity, then restart the MCP server."
         )
+
+    # Embedding restore-completeness flag (#3075 C5 round 2, Borges's design
+    # ruling) — surfaced every prompt until cleared. This is the load-bearing
+    # channel for "fail loud": a stderr print nobody reads (round 1) is
+    # replaced by a durable flag the hooks re-check on every prompt.
+    embed_restore_ok, embed_restore_msg = _check_embedding_restore_flag(KNOWLEDGE_DB_PATH)
+    if not embed_restore_ok:
+        head_blocks.append(f"⚠️  {embed_restore_msg}")
 
     # Attached-pack surfacing — queried AFTER own-graph result, guarded
     # fail-open so any pack error never breaks the hook.

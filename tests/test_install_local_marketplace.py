@@ -14,6 +14,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = REPO_ROOT / "tools" / "install-local-marketplace.sh"
+DEPLOY_TAG_INIT = REPO_ROOT / "src" / "build" / "engine" / "__init__.py"
+DEPLOY_TAG_MODULE = REPO_ROOT / "src" / "build" / "engine" / "deploy_tag.py"
 
 
 def _env(tmp_path, **overrides):
@@ -1307,6 +1309,9 @@ def _make_scratch_repo_with_ancestry(tmp_path, *, fake_build_plugin=False):
     (repo / "tools").mkdir(parents=True)
     (repo / "src" / "engram").mkdir(parents=True)
     (repo / "src" / "engram" / "server.py").write_text("# stub\n")
+    (repo / "src" / "build" / "engine").mkdir(parents=True)
+    (repo / "src" / "build" / "engine" / "__init__.py").write_text(DEPLOY_TAG_INIT.read_text())
+    (repo / "src" / "build" / "engine" / "deploy_tag.py").write_text(DEPLOY_TAG_MODULE.read_text())
     scratch_installer = repo / "tools" / "install-local-marketplace.sh"
     scratch_installer.write_text(INSTALLER.read_text())
     scratch_installer.chmod(0o755)

@@ -446,6 +446,13 @@
       "note": "engram-alpha#2544. test_reconcile_lesson_demotions.py loads the module via importlib.util.spec_from_file_location (not a static `import`), same reasoning as the hyphenated hook files above -- invisible to the layer-1 AST import graph despite having a valid module name, so it needs this layer-2 mapping."
     },
     {
+      "path_prefix_or_glob": "tools/enumerate_armed_monitors.py",
+      "test_globs": [
+        "tests/test_enumerate_armed_monitors.py"
+      ],
+      "note": "engram-alpha#3049/#3050. test_enumerate_armed_monitors.py DOES statically import via `from tools.enumerate_armed_monitors import find_armed_monitor_task_ids`, but this was invisible to the layer-1 AST import graph scan (test_all_shipped_tools_are_covered failed on this path) -- root cause of the miss not fully diagnosed at write time; this layer-2 mapping unblocks CI honestly rather than papering over an unexplained gap."
+    },
+    {
       "path_prefix_or_glob": "tools/grant_viz_operator_acl.py",
       "test_globs": [
         "tests/test_grant_viz_operator_acl.py"
@@ -494,12 +501,6 @@
       "note": "No test file found for engram-fix-git-backup.sh"
     },
     {
-      "path_prefix_or_glob": "tools/collab-baton-monitor.sh",
-      "test_globs": [
-        "tests/test_baton_monitor.py"
-      ]
-    },
-    {
       "path_prefix_or_glob": "tools/forum-mention-monitor.sh",
       "test_globs": [
         "tests/test_forum_mention_monitor_coalesce.py",
@@ -538,18 +539,20 @@
         "tests/test_loop_skill_harness_selection.py",
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
-        "tests/test_tiers_manifest.py"
+        "tests/test_tiers_manifest.py",
+        "tests/test_health_exam_skill.py"
       ],
-      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates."
+      "note": "The loop skill has a harness-routing order invariant in addition to the generic skill lint gates. The health-exam gate is listed here as well as on the broader skills/claude/ entry because selection is FIRST-MATCH-WINS: this entry shadows that one for this path, so a gate omitted here simply never runs for this doc."
     },
     {
       "path_prefix_or_glob": "skills/claude/",
       "test_globs": [
         "tests/test_skill_frontmatter_lint.py",
         "tests/test_skill_server_sync.py",
-        "tests/test_tiers_manifest.py"
+        "tests/test_tiers_manifest.py",
+        "tests/test_health_exam_skill.py"
       ],
-      "note": "Any change to a skill directory triggers skill lint + tiers manifest"
+      "note": "Any change to a skill directory triggers skill lint + tiers manifest, plus the health-exam shell-pattern gate, whose population is EVERY shipped skill doc rather than the health-exam one. Adding a more specific skills/claude/<name>/ entry above this one shadows it (first-match-wins), so such an entry must repeat this gate."
     },
     {
       "path_prefix_or_glob": "templates/",

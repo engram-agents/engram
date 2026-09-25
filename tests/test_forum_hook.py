@@ -35,6 +35,8 @@ are inspected.
 
 import importlib.util
 import json
+import socket
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -236,7 +238,7 @@ def test_live_fetch_success_cursor_advanced(tmp_cursor, tmp_cache, monkeypatch):
     assert not tmp_cache.exists()
 
     # Stub _fetch_threads to return a non-None empty list (success, no threads)
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
 
     before_call = datetime.now(timezone.utc)
 
@@ -289,7 +291,7 @@ def test_unreachable_no_cache_cursor_unchanged(tmp_cursor, tmp_cache, monkeypatc
 
     # No cache file, and _fetch_threads returns None (server unreachable)
     assert not tmp_cache.exists()
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: None)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: None)
 
     # main() exits silently (threads=None -> no-op)
     try:
@@ -325,9 +327,9 @@ def test_mention_line_present_when_mentions_returned(
 
     mention = _make_inbox_item(tid="99", title="Review my PR", author="luria")
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
     monkeypatch.setattr(hook, "_fetch_inbox",
-                        lambda url, name: [mention])
+                        lambda url, name, deadline: [mention])
 
     output = _run_main(hook, capture_output=True)
 
@@ -356,8 +358,8 @@ def test_mention_line_absent_on_none_generic_unaffected(
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent: [{"id": "1", "title": "hello"}])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: None)
+                        lambda url, since, agent, deadline: [{"id": "1", "title": "hello"}])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: None)
 
     output = _run_main(hook, capture_output=True)
 
@@ -400,10 +402,10 @@ def test_907_banner_clears_when_inbox_no_longer_returns_mention(
     mention = _make_inbox_item(tid="55", title="Please review", author="ariadne")
     inbox_items = [mention]
 
-    def fetch_inbox_dynamic(url, name):
+    def fetch_inbox_dynamic(url, name, deadline):
         return list(inbox_items)
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
     monkeypatch.setattr(hook, "_fetch_inbox", fetch_inbox_dynamic)
 
     # Prompt 1: mention present in inbox → banner appears
@@ -426,7 +428,7 @@ def test_907_banner_clears_when_inbox_no_longer_returns_mention(
     hook2 = _load_hook()
     _patch_hook_paths(hook2, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
     _stub_config(hook2, monkeypatch)
-    monkeypatch.setattr(hook2, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook2, "_fetch_threads", lambda url, since, agent, deadline: [])
     monkeypatch.setattr(hook2, "_fetch_inbox", fetch_inbox_dynamic)
 
     # Prompt 2: inbox is empty → banner must clear (exit 0, no output)
@@ -462,9 +464,9 @@ def test_mentions_persist_when_inbox_still_returns_item(
 
     mention = _make_inbox_item(tid="7", title="A colleague needs you", author="colleague-a")
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
 
-    def fetch_inbox(url, name):
+    def fetch_inbox(url, name, deadline):
         # Returns the same mention regardless — simulates a server where the
         # thread has not been marked read yet.
         return [mention]
@@ -515,11 +517,11 @@ def test_cache_stores_and_reads_both_threads_and_mentions(
 
     fetch_inbox_calls = []
 
-    def stub_fetch_inbox(url, name):
+    def stub_fetch_inbox(url, name, deadline):
         fetch_inbox_calls.append((url, name))
         return []
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
     monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
@@ -604,7 +606,7 @@ def test_stale_cache_fallback_renders_mentions(
     tmp_cache.write_text(json.dumps(stale_payload))
 
     # Server unreachable: _fetch_threads returns None
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: None)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: None)
 
     output = _run_main(hook, capture_output=True)
 
@@ -636,9 +638,9 @@ def test_both_lines_ordering_mention_above_generic(
     mention = _make_inbox_item(tid="10", title="Needs review", author="luria")
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent: [{"id": "2", "title": "new thread"}])
+                        lambda url, since, agent, deadline: [{"id": "2", "title": "new thread"}])
     monkeypatch.setattr(hook, "_fetch_inbox",
-                        lambda url, name: [mention])
+                        lambda url, name, deadline: [mention])
 
     output = _run_main(hook, capture_output=True)
     assert output.strip(), "Expected non-empty output"
@@ -680,12 +682,12 @@ def test_empty_agent_name_no_mentions_fetch_generic_works(
 
     fetch_inbox_calls = []
 
-    def stub_fetch_inbox(url, name):
+    def stub_fetch_inbox(url, name, deadline):
         fetch_inbox_calls.append(name)
         return [_make_inbox_item()]
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent: [{"id": "3", "title": "thread"}])
+                        lambda url, since, agent, deadline: [{"id": "3", "title": "thread"}])
     monkeypatch.setattr(hook, "_fetch_inbox", stub_fetch_inbox)
 
     output = _run_main(hook, capture_output=True)
@@ -717,20 +719,39 @@ def test_fetch_inbox_swallows_404(monkeypatch):
     This is the low-level contract: any HTTP error including 404 is swallowed
     so that a missing /api/agent/<name>/inbox endpoint on an old server is
     indistinguishable from "no mentions" from the caller's perspective.
+
+    gh#3107: _fetch_inbox now drives http.client.HTTPConnection (via
+    _fetch_with_deadline), not urlopen -- mocked at the new layer. A non-2xx
+    status is read off resp.status directly (http.client does not raise on
+    it the way urlopen raises HTTPError), so this fake's status=404 exercises
+    the same swallow path via a different mechanism.
     """
     hook = _load_hook()
 
-    # Patch urlopen to raise HTTPError 404
-    def fake_urlopen(req, timeout=None):
-        raise urllib.error.HTTPError(
-            req.full_url, 404, "Not Found", {}, None
-        )
+    class FakeResponse:
+        status = 404
+        def read(self, n=-1):
+            return b""
 
-    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
+    class FakeConn:
+        def __init__(self, host, port, timeout=None):
+            pass
+        def connect(self):
+            pass
+        def request(self, method, path, body=None, headers=None):
+            pass
+        def getresponse(self):
+            return FakeResponse()
+        def close(self):
+            pass
 
-    result = hook._fetch_inbox("http://localhost:5002", "testbot")
+    monkeypatch.setattr(hook.http.client, "HTTPConnection", FakeConn)
+
+    result = hook._fetch_inbox(
+        "http://localhost:5002", "testbot", hook.time.monotonic() + 5.0
+    )
     assert result is None, (
-        "_fetch_inbox must return None on HTTPError 404 (old server)"
+        "_fetch_inbox must return None on a 404 status (old server)"
     )
 
 
@@ -751,9 +772,9 @@ def test_old_server_404_inbox_silent_skip_in_main(
     _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
 
     monkeypatch.setattr(hook, "_fetch_threads",
-                        lambda url, since, agent: [{"id": "5", "title": "new thread"}])
+                        lambda url, since, agent, deadline: [{"id": "5", "title": "new thread"}])
     # Simulate what _fetch_inbox returns after swallowing a 404
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: None)
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: None)
 
     output = _run_main(hook, capture_output=True)
 
@@ -779,6 +800,9 @@ def test_fetch_inbox_filters_reply_on_my_thread(monkeypatch):
 
     This tests the filtering layer inside _fetch_inbox: when the server inbox
     response contains both kinds, only at_mention items reach the caller.
+
+    gh#3107: mocked at the http.client.HTTPConnection layer _fetch_inbox now
+    drives (via _fetch_with_deadline), not urlopen.
     """
     hook = _load_hook()
 
@@ -792,21 +816,38 @@ def test_fetch_inbox_filters_reply_on_my_thread(monkeypatch):
         ],
         "unread_all": 2,
     }
+    body = json.dumps(inbox_response).encode("utf-8")
 
     class FakeResponse:
-        def read(self):
-            return json.dumps(inbox_response).encode("utf-8")
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
+        status = 200
+        def __init__(self, body):
+            self._chunks = [body, b""]
+        def read1(self, n=-1):
+            return self._chunks.pop(0)
+
+    class FakeConn:
+        def __init__(self, host, port, timeout=None):
             pass
+        def connect(self):
+            pass
+        def request(self, method, path, body=None, headers=None):
+            pass
+        def getresponse(self):
+            return FakeResponse(body)
+        def close(self):
+            pass
+        @property
+        def sock(self):
+            class _FakeSock:
+                def settimeout(self, t):
+                    pass
+            return _FakeSock()
 
-    def fake_urlopen(req, timeout=None):
-        return FakeResponse()
+    monkeypatch.setattr(hook.http.client, "HTTPConnection", FakeConn)
 
-    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
-
-    result = hook._fetch_inbox("http://localhost:5002", "testbot")
+    result = hook._fetch_inbox(
+        "http://localhost:5002", "testbot", hook.time.monotonic() + 5.0
+    )
     assert result is not None, "_fetch_inbox must succeed"
     assert len(result) == 1, (
         f"_fetch_inbox must return only at_mention items; got {result!r}"
@@ -833,8 +874,8 @@ def test_reply_on_my_thread_only_inbox_no_banner(
 
     # _fetch_inbox returns [] because all inbox items are reply_on_my_thread
     # (the real _fetch_inbox filters; this simulates that filtered result)
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
 
     output = _run_main(hook, capture_output=True)
 
@@ -866,6 +907,14 @@ def test_worst_case_three_call_budget_under_hook_timeout():
     derive_own_status, on its own independent _FORUM_REQUEST_TIMEOUT_SECONDS
     in _status_derive.py) is a separate, still-open gap — not asserted here.
     See the KNOWN GAP comment above FETCH_TIMEOUT_SECONDS in the hook module.
+
+    gh#3107: this arithmetic is a CONSTANT-BUMP GUARD, kept as exactly that —
+    it catches someone raising FETCH/PUBLISH_TIMEOUT_SECONDS without checking
+    the sum. It does NOT itself prove the hook is bounded in wall-clock time,
+    because it never opens a socket: "a call made with timeout=T takes at
+    most T" is FALSE for a server that trickles data (see
+    test_shared_deadline_bounds_a_trickling_fetch below for the real,
+    socket-based contract this constant-sum guard cannot provide).
     """
     hook = _load_hook()
     worst_case = 2 * hook.FETCH_TIMEOUT_SECONDS + hook.PUBLISH_TIMEOUT_SECONDS
@@ -879,6 +928,212 @@ def test_worst_case_three_call_budget_under_hook_timeout():
         f"Worst case ({worst_case}s) should leave at least ~0.8s margin under "
         f"the 5s budget for interpreter startup + JSON parsing, matching the "
         f"margin the original (two-call) design already relied on"
+    )
+
+
+# ---------------------------------------------------------------------------
+# B11: gh#3107 — the shared deadline must actually bound a TRICKLING server,
+# not just a silent (non-responding) one. Methodology validated by Aleph
+# (forum #430, 2026-09-25): a trickle SLOWER than the per-op cap only proves
+# the cap fires, not the deadline (every read individually times out first);
+# the trickle here is deliberately FASTER than FETCH_TIMEOUT_SECONDS so every
+# individual read succeeds and only ACCUMULATED elapsed time can trip
+# anything -- isolating the deadline-derivation logic from the per-op cap.
+# ---------------------------------------------------------------------------
+
+class _TricklingServer:
+    """Raw-socket server: sends a valid 200 + Content-Length header, then
+    sends ONE BYTE at a time at `gap` seconds apart, for `nbytes_before_stall`
+    bytes, then STOPS SENDING ENTIRELY (holds the connection open, no more
+    data, no close) -- so whichever read is in flight when the shared
+    deadline is reached genuinely BLOCKS rather than succeeding quickly.
+    `content_length` (>= nbytes_before_stall) is what the header advertises,
+    so the client never sees EOF from the stall alone.
+
+    This genuine-stall tail is the part that actually discriminates
+    "cap every read at the REMAINING budget" from "re-check between reads
+    with a FIXED cap" (Aleph's own measured distinction, forum #430): a
+    steady trickle that never stalls lets the between-op check alone catch
+    things quickly regardless of which cap is used (measured: ~0.05s
+    overshoot either way, not discriminating) -- the fixed-cap weakness only
+    shows up when a read is truly blocked and the cap's SIZE (not just its
+    presence) determines how long that block lasts.
+
+    Raw socket, not http.server.BaseHTTPRequestHandler, because a buffered
+    handler's .wfile.write() sends its whole payload in one call -- there is
+    no way to make it stall mid-body. Same wall this file's own #3106
+    sibling test (test_forum_monitor_unreachable_edge.py's
+    _MockStallingServer) hit and solved the same way -- independent
+    convergence on raw sockets is itself mild evidence it's the only way.
+    """
+
+    def __init__(self, nbytes_before_stall: int, gap: float, content_length: int = 10000):
+        self._nbytes_before_stall = nbytes_before_stall
+        self._gap = gap
+        self._content_length = content_length
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self._sock.settimeout(10)
+        self.port = self._sock.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2)
+
+    def _serve(self):
+        try:
+            conn, _ = self._sock.accept()
+        except OSError:
+            return
+        try:
+            conn.recv(4096)
+            conn.sendall(
+                f"HTTP/1.1 200 OK\r\nContent-Length: {self._content_length}\r\n\r\n".encode()
+            )
+            for _ in range(self._nbytes_before_stall):
+                if self._stop.is_set():
+                    return
+                conn.sendall(b"x")
+                time.sleep(self._gap)
+            # Genuine stall: send nothing further, hold the connection open.
+            while not self._stop.is_set():
+                time.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def test_shared_deadline_bounds_a_trickling_fetch():
+    """gh#3107's real contract: _fetch_threads, driven through the shared
+    deadline, must abort near HOOK_TOTAL_BUDGET_SECONDS -- even when a read
+    is genuinely BLOCKED (no data arriving) right as the deadline passes.
+
+    Server: a brief fast trickle (2 bytes at 0.02s each -- faster than
+    per_op_cap, so those early reads succeed quickly and prove the deadline
+    isn't merely the per-op cap firing on a slow trickle, Aleph's own first
+    probe's mistake per forum #430), THEN A GENUINE STALL (no more data,
+    ever). Whichever read is in flight when the deadline is reached is
+    therefore truly blocked, which is the part that actually discriminates
+    "cap every read at the REMAINING budget" from "re-check between reads
+    with a FIXED cap": measured directly (see the mutation-control
+    verification in the PR body) -- a steady trickle that never stalls lets
+    a fixed-cap implementation look correct (its overshoot bounded by the
+    trickle's own fast gap, not by the cap), because no read ever actually
+    blocks for close to the cap's full duration. Only a genuine stall forces
+    a read to block long enough for the cap's SIZE (shrunk vs. fixed) to
+    matter.
+
+    Written before the deadline mechanism existed in this file, this test
+    must fail against flat-per-call-timeout code (elapsed runs until the
+    test's own patience/thread teardown, unbounded by the budget) and pass
+    once every read is capped at min(per_op_cap, remaining-budget).
+    """
+    hook = _load_hook()
+    per_op_cap = 0.5
+    budget = 0.25  # SMALLER than per_op_cap once the brief trickle elapses,
+                   # so the stalled read's timeout MUST shrink below
+                   # per_op_cap to land near budget -- the exact regime
+                   # where "cap at remaining" and "fixed cap" diverge (see
+                   # this test's own docstring and the PR body's mutation
+                   # measurement for the numbers that justify this choice).
+    server = _TricklingServer(nbytes_before_stall=2, gap=0.02)
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/threads"
+        deadline = time.monotonic() + budget
+        t0 = time.monotonic()
+        result = hook._fetch_with_deadline(url, deadline, per_op_cap)
+        elapsed = time.monotonic() - t0
+    finally:
+        server.stop()
+
+    assert result is None, (
+        f"a permanently-stalled body must never complete -- got {result!r}"
+    )
+    assert elapsed < budget + 0.15, (
+        f"elapsed {elapsed:.2f}s overshot the {budget}s shared deadline by "
+        f"more than a small jitter margin -- a per-op cap that is NOT "
+        f"shrunk toward the remaining budget would instead wait its full "
+        f"{per_op_cap}s cap on the read blocked at the deadline (measured: "
+        f"~{budget + per_op_cap - 0.04:.2f}s for that mutation, well past "
+        f"this bound), which is the exact distinction Aleph's measurement "
+        f"drew between 'cap at remaining' and 're-check between ops' alone"
+    )
+    assert elapsed > budget - 0.1, (
+        f"elapsed {elapsed:.2f}s returned suspiciously early relative to "
+        f"the {budget}s budget"
+    )
+
+
+def test_shared_deadline_checked_between_reads_not_just_between_calls():
+    """A SEPARATE property from the stall test above: with a CONTINUOUS fast
+    trickle (never stalling, faster than per_op_cap) spanning far longer than
+    the budget, the deadline must still be re-checked frequently enough to
+    catch it -- not just once per logical fetch call.
+
+    This is what actually discriminates HTTPResponse.read(n) (loops
+    internally, making as many underlying raw reads as needed to fill n
+    bytes before EVER returning to the caller -- so a deadline recheck
+    between separate .read() calls never gets a chance to run while one call
+    is trapped looping) from .read1(n) (at most one raw read per call,
+    letting the deadline recheck fire after every individual socket op).
+    Measured self-caught bug (see PR body / ob_1064): with plain .read(4096)
+    against a 600-byte/0.05s-per-byte trickle and a 2.0s budget, elapsed was
+    34.49s -- one .read(4096) call ran to completion (~30s) because 4096 far
+    exceeds what trickles in per recv(), so the between-CALLS deadline check
+    never ran until the whole body had arrived.
+
+    The genuine-stall test above cannot catch this: with only ~2 trickled
+    bytes before a permanent stall, there is only ever ONE logical read
+    operation regardless of read() vs read1(), so both forms compute the
+    same single settimeout() value up front. Only a long CONTINUOUS trickle
+    -- many small chunks, each its own opportunity for the deadline check to
+    fire between them -- exercises the difference.
+    """
+    hook = _load_hook()
+    per_op_cap = 0.5  # trickle gap (0.05s) is FASTER than this cap, so every
+                       # individual chunk arrives well within its own
+                       # settimeout() -- isolating the between-reads-check
+                       # property from the cap-shrinking property the other
+                       # test covers.
+    budget = 2.0
+    server = _TricklingServer(nbytes_before_stall=600, gap=0.05, content_length=600)
+    server.start()
+    try:
+        url = f"http://127.0.0.1:{server.port}/api/threads"
+        deadline = time.monotonic() + budget
+        t0 = time.monotonic()
+        result = hook._fetch_with_deadline(url, deadline, per_op_cap)
+        elapsed = time.monotonic() - t0
+    finally:
+        server.stop()
+
+    assert result is None, (
+        f"a trickling body 30s long against a {budget}s budget must never "
+        f"complete -- got {result!r}"
+    )
+    assert elapsed < budget + 0.6, (
+        f"elapsed {elapsed:.2f}s should stay close to the {budget}s shared "
+        f"deadline -- .read(n) (which loops internally accumulating up "
+        f"to n bytes before returning) would instead run close to the "
+        f"trickle's own 30s length (measured: 34.49s for that mutation), "
+        f"because the between-CALLS deadline check never gets a chance to "
+        f"fire while one .read(4096) call is trapped looping internally"
     )
 
 
@@ -912,13 +1167,13 @@ def test_same_second_post_not_excluded_by_cursor(
     # Capture the `since` value that the hook passes to _fetch_threads
     captured_since = []
 
-    def stub_fetch_threads(url, since, agent):
+    def stub_fetch_threads(url, since, agent, deadline):
         captured_since.append(since)
         # Simulate a post that arrived at T:00.000500Z (same second, after cursor)
         return [{"id": "99", "title": "Same-second post"}]
 
     monkeypatch.setattr(hook, "_fetch_threads", stub_fetch_threads)
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
 
     output = _run_main(hook, capture_output=True)
 
@@ -983,9 +1238,9 @@ def test_forum_mode_explicit_matches_absent_key_default(
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(
             hook, "_fetch_threads",
-            lambda url, since, agent: [{"id": "2", "title": "new thread"}],
+            lambda url, since, agent, deadline: [{"id": "2", "title": "new thread"}],
         )
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [mention])
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [mention])
         return _run_main(hook, capture_output=True)
 
     output_absent = _run(None)
@@ -1012,8 +1267,8 @@ def test_forum_mode_parity_holds_in_silent_state(
         _patch_hook_paths(hook, monkeypatch, tmp_cursor, tmp_cache, tmp_read_cursor)
         _stub_config_with_comms_surface(hook, monkeypatch, comms_surface)
         _write_cursor_file(tmp_cursor, datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc))
-        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+        monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+        monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
         return _run_main(hook, capture_output=True)
 
     output_absent = _run(None)
@@ -1038,9 +1293,9 @@ def test_umwelt_mode_mention_pending_emits_advisory(
 
     monkeypatch.setattr(
         hook, "_fetch_threads",
-        lambda url, since, agent: [{"id": "9", "title": "some new thread"}],
+        lambda url, since, agent, deadline: [{"id": "9", "title": "some new thread"}],
     )
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [mention])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [mention])
 
     output = _run_main(hook, capture_output=True)
 
@@ -1073,9 +1328,9 @@ def test_umwelt_mode_broadcast_only_no_emission(
 
     monkeypatch.setattr(
         hook, "_fetch_threads",
-        lambda url, since, agent: [{"id": "9", "title": "broadcast-only thread"}],
+        lambda url, since, agent, deadline: [{"id": "9", "title": "broadcast-only thread"}],
     )
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: [])
 
     output = _run_main(hook, capture_output=True)
 
@@ -1099,8 +1354,8 @@ def test_umwelt_mode_advisory_pluralizes_count(
         _make_inbox_item(tid="2", title="Second", author="b"),
     ]
 
-    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent: [])
-    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name: mentions)
+    monkeypatch.setattr(hook, "_fetch_threads", lambda url, since, agent, deadline: [])
+    monkeypatch.setattr(hook, "_fetch_inbox", lambda url, name, deadline: mentions)
 
     output = _run_main(hook, capture_output=True)
 

@@ -104,6 +104,12 @@ def build_command(args: list[str]) -> int:
         action="store_true",
         help="Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' are always allowed)",
     )
+    parser.add_argument(
+        "--allow-untagged",
+        dest="allow_untagged",
+        action="store_true",
+        help="Allow building from an untagged commit (overrides #2586/#3092's deploy-tag guard)",
+    )
     parser.add_argument("--help", "-h", action="store_true")
 
     parsed, unknown = parser.parse_known_args(args)
@@ -138,6 +144,7 @@ def build_command(args: list[str]) -> int:
             "                      leak-scan over the emitted bundle.\n"
             "  --engram-home PATH  ENGRAM_HOME path to embed in hook commands and MCP config.\n"
             "  --allow-branch      Allow building from a PR/feature branch (overrides #794's guard; 'dev'/'main' always allowed).\n"
+            "  --allow-untagged    Allow building from an untagged commit (overrides #2586/#3092's deploy-tag guard).\n"
             "  --help              Show this help message and exit.\n"
             "\n"
             "Tier filtering uses src/build/packaging/tiers.json as the single source of truth.\n"
@@ -181,11 +188,23 @@ def build_command(args: list[str]) -> int:
         )
         return 1
 
-    # #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set.
+    # #3092: one shared, fetch-then-check call serves BOTH the #794 branch
+    # guard's deploy-tag exception below AND the new #2586-equivalent
+    # untagged guard that follows it — a single git round-trip rather than
+    # two independent ones. Imported here (not at module top) to avoid
+    # import-time failures when --help is used (matching this file's own
+    # existing deferred-import convention for engine modules).
+    from .deploy_tag import refresh_and_check_deployable_tag_at
+
+    import subprocess as _sp
+    deployable_tag = refresh_and_check_deployable_tag_at(repo_root)
+
+    # #794 branch guard: refuse builds from PR/feature branches unless --allow-branch is set,
+    # OR HEAD is at a deployable tag that is merged history (the #2586/#2711/#3092 exception —
+    # mirrors install-local-marketplace.sh's own DEPLOYABLE_ANCESTOR exception).
     # Valid production branches: 'dev' (private dev source) and 'main' (public release branch).
     # git branch --show-current returns "" in detached HEAD — treat as a block (fail safe).
-    if not parsed.allow_branch:
-        import subprocess as _sp
+    if not parsed.allow_branch and deployable_tag is None:
         _br = _sp.run(
             ["git", "branch", "--show-current"],
             cwd=repo_root, capture_output=True, text=True,
@@ -195,11 +214,32 @@ def build_command(args: list[str]) -> int:
             print(
                 f"[build-plugin] ERROR: Source repo is at {_br_desc}, not 'dev' (private dev) or 'main' (public release). "
                 "Building from a PR/feature branch can deploy unmerged code. "
-                "Pass --allow-branch to override (e.g. for metric-eval checkouts). "
+                "Pass --allow-branch to override (e.g. for metric-eval checkouts), or check out a "
+                "deployable tag (v*/deploy/*) that is merged into origin/dev or origin/main — no flag "
+                "needed for that. "
                 "Guard per #794.",
                 file=sys.stderr,
             )
             return 1
+
+    # #3092 deploy-tag guard: refuse an untagged (or unmerged-tag) commit
+    # unless --allow-untagged is set. Engine-side counterpart to
+    # install-local-marketplace.sh's own #2586 guard — before #3092 the
+    # engine enforced no such thing.
+    if deployable_tag is None and not parsed.allow_untagged:
+        _nearest = _sp.run(
+            ["git", "describe", "--tags", "--abbrev=0"],
+            cwd=repo_root, capture_output=True, text=True,
+        ).stdout.strip() or "none"
+        print(
+            f"[build-plugin] ERROR: HEAD is not a tagged commit (deployable tags = v* and deploy/*; "
+            f"nearest by ancestry: {_nearest}). The health-snapshot versioning gate (engram-alpha#2563) "
+            "treats tags as the deployable set; snapshots written from untagged code are invisible to it "
+            "and can orphan your health history. Rebuild from a tag (fetch --tags origin first if your "
+            "tags are stale), or pass --allow-untagged to proceed anyway. Guard per #2586/#3092.",
+            file=sys.stderr,
+        )
+        return 1
 
     manifest_path = os.path.join(repo_root, "src", "build", "packaging", "tiers.json")
     if not os.path.isfile(manifest_path):
@@ -374,13 +414,19 @@ def run_command(args: list[str]) -> int:
         action="store_true",
         help="Allow building from a PR/feature branch (overrides #794's guard; 'dev' and 'main' are always allowed)",
     )
+    parser.add_argument(
+        "--allow-untagged",
+        dest="allow_untagged",
+        action="store_true",
+        help="Allow building from an untagged commit (overrides #2586/#3092's deploy-tag guard)",
+    )
     parser.add_argument("--help", "-h", action="store_true")
 
     parsed, unknown = parser.parse_known_args(args)
 
     if parsed.help or parsed.flow is None:
         print(
-            "Usage: python3 -m tools.engine.cli run <flow> [--ack-changeset] [--allow-branch]\n"
+            "Usage: python3 -m tools.engine.cli run <flow> [--ack-changeset] [--allow-branch] [--allow-untagged]\n"
             "\n"
             "Execute a flow until DONE, PAUSED, or FAILED.\n"
             "\n"
@@ -389,6 +435,7 @@ def run_command(args: list[str]) -> int:
             "Options:\n"
             "  --ack-changeset   Acknowledge the changeset review step.\n"
             "  --allow-branch    Allow building from a PR/feature branch ('dev'/'main' always allowed).\n"
+            "  --allow-untagged  Allow building from an untagged commit (overrides #2586/#3092's deploy-tag guard).\n"
             "\n"
             "Exit codes: 0=DONE  3=PAUSED  1=FAILED\n"
         )
@@ -405,6 +452,7 @@ def run_command(args: list[str]) -> int:
     ctx = _build_ctx_from_env()
     ctx["ack_changeset"] = bool(parsed.ack_changeset)
     ctx["allow_branch"] = bool(parsed.allow_branch)
+    ctx["allow_untagged"] = bool(parsed.allow_untagged)
 
     from .steps import run_flow, Done, Paused, Failed
 
