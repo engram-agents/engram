@@ -31,15 +31,28 @@ alone is not enough to call it healthy.
 
 ```bash
 test -d ~/.engram/marketplace/plugins/engram
-for path in tools hooks; do
-  test -e "$HOME/.engram/$path" \
-    && echo "PASS: ~/.engram/$path -> $(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.engram/$path")" \
-    || echo "FAIL: ~/.engram/$path is absent or dangling"
+# Loop variable is `p`, never `path`: in zsh `path` is a tied array bound to
+# $PATH, so `for path in ...` wipes PATH for the rest of the shell (#3068).
+for p in tools hooks; do
+  target=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/.engram/$p" 2>/dev/null) || target=""
+  if [ -e "$HOME/.engram/$p" ] && [ -n "$target" ] && [ -e "$target" ]; then
+      echo "PASS: ~/.engram/$p -> $target"
+  else
+      echo "FAIL: ~/.engram/$p is absent, dangling, or unresolvable"
+  fi
+  # `test -e` and `test -L` are builtins, so this still answers even if the resolver above died.
+  # Gated on -e as well as -L: an ABSENT path is not "a real directory", and the
+  # pinned-scatter remediation is the wrong fix for a path that simply is not there.
+  if [ -e "$HOME/.engram/$p" ] && [ ! -L "$HOME/.engram/$p" ]; then
+      echo "NOTE: ~/.engram/$p is a real directory, not a symlink — see engram-upgrade's pinned-scatter remediation"
+  fi
 done
 ```
 
 **PASS:** the plugin tree exists and both compatibility paths resolve to
-existing targets. **FAIL:** either path is absent/dangling. Repoint a dangling
+existing targets. **FAIL:** either path is absent, dangling, or unresolvable
+(a `NOTE:` line means the path is a real directory rather than a symlink — it
+resolves, but it is pinned to whatever it last held). Repoint a dangling
 symlink to `~/.engram/marketplace/plugins/engram/<path>`; preserve a real
 directory and follow `engram-upgrade`'s pinned-scatter remediation instead of
 replacing it blindly.
@@ -63,7 +76,13 @@ a 0–100 scale; see #2940 for the old-vs-v2 formula-surface decision.)
 Remediation:
 ```bash
 # Check if the server process is running
-pgrep -f "launch-engram-server.sh|engram/server.py" || echo "server process not found"
+# -u: own seat only; never -a — on Darwin -a re-admits ancestors, so the else branch never fires (#2132/#2133).
+if pids=$(pgrep -u "$(id -u)" -f "launch-engram-server.sh|engram/server.py"); then
+    echo "$pids"
+else
+    rc=$?
+    [ "$rc" -eq 1 ] && echo "server process not found" || echo "could not check: pgrep exited $rc"
+fi
 
 # Attempt manual restart (plugin install):
 ~/.engram/marketplace/plugins/engram/launch-engram-server.sh &
@@ -124,7 +143,13 @@ not delivering.
 Remediation — same muted-stdout class:
 ```bash
 # Check if the daemon is running (surface hook depends on it):
-pgrep -f "engram-surface-daemon" || echo "daemon not running"
+# -u: own seat only; never -a — on Darwin -a re-admits ancestors, so the else branch never fires (#2132/#2133).
+if pids=$(pgrep -u "$(id -u)" -f "engram-surface-daemon"); then
+    echo "$pids"
+else
+    rc=$?
+    [ "$rc" -eq 1 ] && echo "daemon not running" || echo "could not check: pgrep exited $rc"
+fi
 # Restart the daemon if absent (it auto-restarts on next hook fire if the start-daemon script is registered):
 bash ~/.engram/marketplace/plugins/engram/hooks/start-engram-daemon.sh
 ```
@@ -137,7 +162,13 @@ The surface daemon powers semantic recall. Test it directly.
 
 ```bash
 # Check the daemon process:
-pgrep -af "engram-surface-daemon" || echo "daemon not running"
+# -u: own seat only; never -a — on Darwin -a re-admits ancestors (else branch never fires), so take argv from ps (#2132/#2133).
+if pids=$(pgrep -u "$(id -u)" -f "engram-surface-daemon"); then
+    ps -o pid=,args= -p "$(echo "$pids" | tr '\n' ',' | sed 's/,$//')"
+else
+    rc=$?
+    [ "$rc" -eq 1 ] && echo "daemon not running" || echo "could not check: pgrep exited $rc"
+fi
 ```
 
 Then call `engram_query` with a term you know is in the graph (any recent topic):

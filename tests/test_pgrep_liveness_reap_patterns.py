@@ -42,6 +42,49 @@ short "could this match the invoker / a co-tenant?" answer):
       at test time below; both files are also asserted to carry the
       identical pattern.
 
+  FIXED (#2132 / #2133 -- the `pgrep ... || echo ...` liveness idiom in the
+  SHIPPED SKILL DOCS, an artifact type this inventory had never covered):
+    - src/engram/skills/claude/engram-health-exam/SKILL.md -- three sites
+      (one server-liveness, two surface-daemon), each broken three ways at
+      once. No `-u`, so they counted co-tenant agents' processes (measured
+      on a shared macOS host: unscoped 2, scoped 1; a colleague measured the
+      same shipped line on a shared Linux host: unscoped 5, scoped 1) --
+      a healthy-looking count made mostly of other people's processes, and
+      identical with this seat's own daemon dead. `-a` on one of them, which
+      on Darwin re-admits the current process's ANCESTORS to the match set;
+      since an agent runs this doc through a harness whose wrapper-shell
+      argv quotes the search pattern, the `|| echo` branch is unreachable
+      in practice -- though reachable in principle, from a clean script
+      where the pattern appears in no ancestor's argv, where rc=1. And `||`
+      alone, conflating pgrep's exit 1 ("ran, found nothing") with exit >1
+      ("could not run", e.g. 127) -- an absent pgrep printed the same
+      reassuring "not running" as a genuine absence. Each site now branches
+      on the exit status, and the one that wanted full argv takes it from
+      `ps -o args=` on the returned pids rather than from `-a`.
+    - src/engram/skills/claude/engram-collaborating-loop/SKILL.md -- gained
+      a pasteable arm-site + liveness block (uid-scoped, shell-anchored,
+      POSIX bracket classes per #3032's escape fix, no `-a`).
+
+  WHY THIS INVENTORY MISSED THEM, and what changed: this file is scoped by
+  ARTIFACT TYPE -- it covers scripts and modules, and a skill doc is neither
+  -- so those three sites sat in plain sight through #2029, #1933, #1935 and
+  #3032. An inventory scoped by artifact type is blind exactly where a
+  DIFFERENT artifact type carries the same idiom, and is worse than no
+  inventory there, because its existence reads as coverage. So the gate added
+  in tests/test_health_exam_skill.py deliberately does not enumerate the three
+  repaired lines: it walks `src/engram/skills/**/*.md` as a POPULATION
+  (parametrized per doc, plus a non-vacuity guard that fails if the glob stops
+  resolving or the docs stop invoking pgrep), asserting that no shipped skill
+  doc -- present or future -- carries a pgrep invocation that lacks `-u`, uses
+  `-a`/`-af`, or hides its failure in a bare `|| echo`. (That same sweep now
+  also carries an unrelated shell-hygiene assertion for #3068 -- no skill doc
+  may bind a zsh-tied loop variable such as `path` -- for the same reason:
+  the population, not the one line that was found broken.) Measured 2026-09-22
+  over all 29 shipped skill docs: engram-upgrade/SKILL.md's single invocation
+  was already `-u "$USER"`-scoped, and the remaining 26 invoke pgrep nowhere
+  (they pass vacuously today, which is the point of gating the population --
+  the next one to grow a liveness check is covered before it is written).
+
   EXCLUDED (not a pattern-liveness probe): tools/agentctl's account-
   decommission `pkill -KILL -u "$newborn_user"` / `pgrep -u "$newborn_user"`
   (~line 1127-1129) is a uid-scoped kill-everything-for-this-account step,
