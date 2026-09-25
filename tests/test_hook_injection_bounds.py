@@ -10,8 +10,8 @@ Borges S4 + Kepler's amendments):
   1. Bound            -- TestBound
   2. Head survives     -- TestHeadSurvives
   3. No writer outside the helper (structural) -- TestNoBareJoinOutsideHelper
-     (currently xfail-tracked pending #2859's session-start migration -- see
-     that class's own docstring for why)
+     (live, enforced gate -- see that class's own docstring for the named,
+     rationale-carrying exclusion set)
   4. Trailing-summary decoy MUST FAIL -- TestTrailingSummaryDecoy
   5. Straddling-line decoy MUST FAIL  -- TestStraddlingLineDecoy
   6. Unknown-harness fixture -- TestUnknownHarnessFloor
@@ -197,18 +197,21 @@ class TestHeadSurvives:
 # ---------------------------------------------------------------------------
 # Item 3 -- No writer outside the helper (structural).
 # ---------------------------------------------------------------------------
-# NOT enforced today (xfail-tracked): 5 hook emitters still don't route
-# their additionalContext content through emit_context() -- WS2 (the bulk
-# migration, engram-alpha#2863) has landed; what remains is
-# engram-session-start-hook.py (pending its own restructure, #2859, owned
-# by Clio) plus 4 files deliberately escape-valved as atomic fixed-format
-# emitters that were never meant to migrate onto emit_context() by design.
-# Hard-failing this check today would make merges red on #2859's still-open
-# work, which is clearly wrong -- so the check exists (real, working
-# structural logic below) but is skipped until #2859 lands and this xfail
-# is removed. This is a deliberate choice named in the WS1 spec itself
-# ("Choose (b)"), not an oversight. See the xfail's own reason= just below
-# the class for the exact per-file breakdown.
+# ENFORCED (live gate, no xfail): WS2 (the bulk migration, engram-alpha#2863)
+# has landed, and #2859 (SessionStart restructure) closed on 2026-09-24 via
+# PR#2925. All 5 previously-tracked hook emitters that don't route their
+# additionalContext content through emit_context() are now named,
+# rationale-carrying entries in `_EXCLUDED` below -- 4 are deliberate
+# atomic fixed-format emitters never meant to migrate onto emit_context()
+# by design; the 5th, engram-session-start-hook.py, is excluded for a
+# different, explicitly-disclosed reason (its own inline comment in
+# `_EXCLUDED` below) -- it is NOT a claim that hook is within budget; that
+# gap is separately tracked at engram-alpha#127. With all 5 named and
+# excluded, `_find_violators()` returns `[]` and
+# `test_every_additionalContext_emitter_routes_through_emit_context` below
+# is a normal, enforced, passing assertion -- a NEW hook that builds
+# `additionalContext` without calling `emit_context()` fails this test on
+# sight, with no exemption to reach for.
 class TestNoBareJoinOutsideHelper:
     """Any hook file that assembles a string destined for
     hookSpecificOutput.additionalContext must route that content through
@@ -251,6 +254,36 @@ class TestNoBareJoinOutsideHelper:
     _EXCLUDED = {
         "_hooklib.py",  # emit_context()'s own implementation lives here
         "_harness.py",  # no additionalContext content of its own
+        # The 4 below: deliberately escape-valved as atomic fixed-format
+        # emitters (no head/body split, per the epic's own reasoning) and
+        # were never meant to migrate onto emit_context() by design.
+        "engram-bash-pipe-exit-warn.py",
+        "engram-end-of-day-hook.py",
+        "engram-stale-tree-warn-hook.py",
+        "engram-time-bar-hook.py",
+        # engram-session-start-hook.py: different rationale from the 4
+        # above -- NOT a claim of byte-budget compliance. #2859 (its
+        # SessionStart restructure) closed 2026-09-24 via PR#2925, but that
+        # PR's own body explicitly says "this hook doesn't use
+        # emit_context()" and explicitly deferred the question of whether
+        # this hook should ever migrate onto the shared helper. The hook's
+        # own main() comment block (the "ORDERING INVARIANT #1819, extended
+        # #2150" section) self-documents that its TOTAL additionalContext
+        # emission has NO cap at all -- only per-block caps exist (e.g.
+        # HISTORY_ARC_CHAR_CAP=32000, which alone exceeds #2863's 9,500-char
+        # total budget) -- with a real measured case hitting 62,859 bytes
+        # (#2150). This total-emission-cap problem is separately tracked at
+        # engram-alpha#127, explicitly out of scope for #2863. Excluded here
+        # because: (a) it predates the #2863 mandate and its 20+ separate
+        # block-function architecture makes a full emit_context() migration
+        # a large, separate restructuring effort, not safely doable as a
+        # drop-in; (b) its actual byte-budget compliance is a known,
+        # disclosed, SEPARATELY TRACKED gap at #127, not silently accepted
+        # or hidden here; (c) the #1819/#2150 ordering invariant (already
+        # shipped) is a partial mitigation -- it protects must-survive
+        # content from being truncated by a downstream reader, but does not
+        # cap total size.
+        "engram-session-start-hook.py",
     }
 
     # A quoted `additionalContext` immediately followed by a colon -- the
@@ -283,42 +316,11 @@ class TestNoBareJoinOutsideHelper:
             violators.append(path.name)
         return violators
 
-    @pytest.mark.xfail(
-        reason=(
-            "engram-alpha#2863 WS3: 5 hook emitters still don't route their "
-            "additionalContext content through emit_context() -- this is "
-            "EXPECTED to report violators today. engram-session-start-hook.py "
-            "is pending its own restructure, #2859 (owned by Clio, not a "
-            "drop-in migration -- explicitly out of scope here). The other 4 "
-            "-- engram-bash-pipe-exit-warn.py, engram-end-of-day-hook.py, "
-            "engram-stale-tree-warn-hook.py, engram-time-bar-hook.py -- are "
-            "deliberately escape-valved as atomic fixed-format emitters (no "
-            "head/body split, per the epic's own reasoning) and were never "
-            "meant to migrate onto emit_context() by design. Remove this "
-            "xfail once #2859 lands and re-run to confirm the violator list "
-            "is empty."
-        ),
-        strict=True,
-    )
     def test_every_additionalContext_emitter_routes_through_emit_context(self):
         violators = self._find_violators()
         assert not violators, (
             "hooks building additionalContext content without calling "
             f"emit_context(): {violators}"
-        )
-
-    def test_the_check_itself_currently_finds_real_violators(self):
-        """Not a gate assertion -- a sanity check on the checking LOGIC
-        above, so the xfail above is known to be genuinely xfailing (a
-        violator list of zero would make the xfail vacuous, not a passing
-        gate)."""
-        violators = self._find_violators()
-        assert violators, (
-            "expected at least one un-migrated hook emitter today "
-            "(engram-session-start-hook.py, pending #2859) -- if this is "
-            "empty, either #2859 landed or one of the 4 deliberately "
-            "escape-valved emitters was migrated, and the xfail above "
-            "should be removed/activated instead."
         )
 
 
