@@ -436,9 +436,26 @@ def test_no_reap_env_suppresses_the_warning(tmp_path, script_name):
         try:
             time.sleep(_DETECT_WINDOW)
             assert dup_proc.poll() is None
-            assert reader.lines == [], (
-                f"{meta['no_reap_env']}=1 should suppress ALL detection "
-                f"output, got: {reader.lines!r}"
+            # Narrowed from `reader.lines == []` (#3067). This test points the
+            # monitor at a dead port ON PURPOSE (see _free_port) so it parks in
+            # its seed-retry loop — and the seed now announces that it cannot
+            # seed, which is CORRECT there and has nothing to do with
+            # duplicate detection. The property under test is unchanged: no
+            # duplicate-detection output at all. Both halves of the predicate
+            # matter and neither is a blanket filter: every line the detection
+            # pass can print contains "duplicate" (including the
+            # could-not-verify line, which says "NOT auto-flagged as a
+            # duplicate"), and the pid check is the same handle the positive
+            # tests above assert ON — so if $NO_REAP stops suppressing the
+            # pass, this still fails.
+            detection = [
+                l for l in reader.lines
+                if "duplicate" in l.lower() or str(dup_proc.pid) in l
+            ]
+            assert detection == [], (
+                f"{meta['no_reap_env']}=1 should suppress ALL duplicate-"
+                f"detection output, got: {detection!r} "
+                f"(full stdout: {reader.lines!r})"
             )
         finally:
             _terminate(primary)

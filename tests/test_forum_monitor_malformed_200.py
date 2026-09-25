@@ -493,6 +493,45 @@ def test_updates_seed_refuses_to_baseline_without_a_watermark(
     )
 
 
+# --- narrowing "did arming replay the backlog?" (#3067) ---------------------
+# The two end-to-end seed tests below used to assert `proc.lines == []`, using
+# "no output at all" as a proxy for "no replay". That stopped being equivalent
+# when the seed gained an arm-time announce (#3067): these tests deliberately
+# serve bodies the seed MUST refuse, so the seed reports that it cannot seed
+# yet — correct behaviour on this path, and not a replay.
+#
+# The replacement is a POSITIVE predicate rather than a filter that subtracts
+# the announce: it looks for the backlogged updates themselves. Every entry
+# these tests serve is kind "dm" with a distinct sender, and emit() prints the
+# sender on each DM line ("new DM from agentN: msg N"), so a seed that
+# baselined at 0 and replayed the (0, 7095] window shows up here as one
+# matching line per backlogged update — five, not zero. The regression these
+# tests exist to catch therefore still reddens them.
+#
+# Derived from ONE source rather than kept in sync by hand with the backlog
+# built inline in the tests below. #3111's review measured that a desync does
+# not merely weaken this filter, it VACATES it: with the senders left at
+# agent1..agent5 while a test's backlog moved to a disjoint range, the #743
+# clobber-replay regression came back GREEN (`1 passed`) — a vacuous filter
+# matches nothing, and "nothing matched" is exactly what the assertion wants
+# to see. The near-miss is the part worth recording: a `range(10, 15)` desync
+# still reddened, but only because "agent1" is a SUBSTRING of "agent10", so
+# the test was protected by an accident of substring matching rather than by
+# construction. Both payloads below are now built from _BACKLOG_UPDATES, so
+# the range cannot drift away from the senders the filter looks for.
+_BACKLOG_SEQS = tuple(range(1, 6))
+_BACKLOG_UPDATES = [
+    {"seq": i, "kind": "dm", "sender": f"agent{i}", "body": f"msg {i}"}
+    for i in _BACKLOG_SEQS
+]
+_BACKLOG_SENDERS = tuple(u["sender"] for u in _BACKLOG_UPDATES)
+
+
+def _replay_lines(lines: list[str]) -> list[str]:
+    """Lines reporting one of the backlogged updates as newly delivered."""
+    return [l for l in lines if any(s in l for s in _BACKLOG_SENDERS)]
+
+
 def test_updates_seed_retries_past_a_watermarkless_body_and_does_not_replay(
     serve, run_updates
 ):
@@ -500,15 +539,7 @@ def test_updates_seed_retries_past_a_watermarkless_body_and_does_not_replay(
     #1-2 parse but carry no watermark; from #3 the feed answers honestly and a
     since=0 request gets the full backlog exactly as the real feed would.
     Arming must replay none of it."""
-    backlog = json.dumps(
-        {
-            "as_of": 7095,
-            "updates": [
-                {"seq": i, "kind": "dm", "sender": f"agent{i}", "body": f"msg {i}"}
-                for i in range(1, 6)
-            ],
-        }
-    )
+    backlog = json.dumps({"as_of": 7095, "updates": _BACKLOG_UPDATES})
     quiet = '{"updates":[],"as_of":7095}'
 
     def payload_fn(n: int, path: str):
@@ -525,7 +556,8 @@ def test_updates_seed_retries_past_a_watermarkless_body_and_does_not_replay(
     _wait_for_requests(server, 6)
     time.sleep(0.4)
 
-    assert proc.lines == [], (
+    # Narrowed from `proc.lines == []` — see _replay_lines above.
+    assert _replay_lines(proc.lines) == [], (
         "arming replayed the backlog — the seed baselined at 0 from a body "
         f"that never served a watermark: {proc.lines!r}"
     )
@@ -563,15 +595,7 @@ def test_updates_seed_retries_past_malformed_200_and_does_not_replay_backlog(
     Pre-fix the seed took the malformed #1, wrote 0, and the next poll's
     since=0 dumped all five updates. Post-fix the seed retries, baselines at
     the live watermark, and nothing is replayed."""
-    backlog = json.dumps(
-        {
-            "as_of": 7095,
-            "updates": [
-                {"seq": i, "kind": "dm", "sender": f"agent{i}", "body": f"msg {i}"}
-                for i in range(1, 6)
-            ],
-        }
-    )
+    backlog = json.dumps({"as_of": 7095, "updates": _BACKLOG_UPDATES})
     quiet = '{"updates":[],"as_of":7095}'
 
     def payload_fn(n: int, path: str):
@@ -590,7 +614,8 @@ def test_updates_seed_retries_past_malformed_200_and_does_not_replay_backlog(
     time.sleep(0.4)
 
     assert cursor.read_text().strip() == "7095"
-    assert proc.lines == [], (
+    # Narrowed from `proc.lines == []` — see _replay_lines above.
+    assert _replay_lines(proc.lines) == [], (
         "arming replayed the backlog — the seed baselined at 0 from a "
         f"malformed 200: {proc.lines!r}"
     )
