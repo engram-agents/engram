@@ -937,6 +937,26 @@ distinct `unavailable` status and does nothing else.** Specifically it must neve
 - retry silently past a bounded window (a hang is indistinguishable from a slow
   graph, and the caller cannot tell which it is waiting on).
 
+**"Bounded" means one deadline per request, end to end, on both sides of the
+socket, not a timeout per socket operation.** A per-operation timeout restarts
+on every byte, so a peer that trickles data never trips it. Measured on U1
+(#3102): with `read(timeout=2.0)`, a silent peer gave `unavailable` at 2.0s, but
+a peer sending one byte per second held the call for 30s. It stopped only
+because the test peer closed the connection. Aleph reproduced the same shape on
+Darwin and in stdlib `urlopen`. So the client computes its deadline once,
+checks it again before every connect, send and receive, gives each of them only
+the time that remains, and stops with `unavailable` once no time is left. One
+tempting shortcut does not meet this: passing the remaining budget once, as a
+single library call's `timeout=`. The library still applies that value to each
+socket operation inside the call. Aleph measured that form against a
+trickling server: it respected a 3s budget against a silent server, but against
+the trickle it ran until the server chose to finish. Its bound is the server's
+patience, which is to say it has none of its own. A test that uses only a silent peer passes
+both forms, so the contract test needs a trickling peer and must assert on
+elapsed time. The exception type does not tell the two forms apart. The owner
+applies the same rule to each client it serves, timed from accept, so that one
+stalled caller cannot hold the others (#3096 contract items 8–10).
+
 ### 5.2 The three states a caller must be able to distinguish
 
 The reason this needs three and not two: today's #2635 shape is a write that
