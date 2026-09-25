@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -368,6 +369,168 @@ def test_mention_ordinary_quiet_reachable_cycle_announces_nothing(serve, run_men
     assert _recovered_lines(proc.lines) == [], (
         f"a reachable poll cycle (no prior outage) announced 'recovered': "
         f"{proc.lines!r}"
+    )
+
+
+# ===========================================================================
+# #3106 — a STALLED response (headers sent, body withheld, connection never
+# closed) must reach the SAME unreachable announce a curl --fail failure
+# does. curl --fail only fires on a non-2xx status or a connection failure;
+# a connection that is accepted and sends a valid 200 header but then never
+# finishes the body passes --fail and never returns AT ALL without
+# --max-time, so pre-#3106 code hangs the curl call indefinitely instead of
+# skipping the cycle. This is deliberately a RAW socket server, not
+# _MockScriptedServer (BaseHTTPRequestHandler's .wfile.write() sends the
+# whole body in one buffered call — there is no way to make it stop midway).
+# ===========================================================================
+
+class _MockStallingServer:
+    """Raw-socket server: each connection gets one scripted outcome —
+    ("respond", status, body) behaves like _MockScriptedServer, or "stall"
+    to send a valid 200 + Content-Length header and then withhold the body
+    forever (never closes). Repeats the LAST script entry once exhausted,
+    matching _MockScriptedServer's convention.
+    """
+
+    def __init__(self, script: list):
+        self._script = script
+        self._count = 0
+        self._lock = threading.Lock()
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.5)  # so the accept loop can notice _stop
+        self.port = self._sock.getsockname()[1]
+        self._stop = False
+        self._conns: list = []
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+
+    @property
+    def request_count(self) -> int:
+        with self._lock:
+            return self._count
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        for c in self._conns:
+            try:
+                c.close()
+            except OSError:
+                pass
+        self._thread.join(timeout=2)
+
+    def _accept_loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            self._conns.append(conn)
+            threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+
+    def _handle(self, conn: socket.socket):
+        try:
+            conn.settimeout(5)
+            conn.recv(65536)  # drain the request line/headers; body unused
+            with self._lock:
+                self._count += 1
+                idx = min(self._count - 1, len(self._script) - 1)
+            entry = self._script[idx]
+            if entry == "stall":
+                body_len = 100
+                header = (
+                    f"HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n"
+                ).encode()
+                conn.sendall(header)
+                # Send nothing further; hold the connection open until the
+                # test tears the server down (stop() closes every tracked
+                # conn) or the client's own --max-time gives up first.
+                while not self._stop:
+                    time.sleep(0.05)
+            else:
+                status, body = entry
+                payload = body.encode()
+                resp = (
+                    f"HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n"
+                    f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n"
+                ).encode() + payload
+                conn.sendall(resp)
+        except OSError:
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+@pytest.fixture
+def serve_stalling():
+    servers = []
+
+    def _start(script: list):
+        s = _MockStallingServer(script)
+        s.start()
+        servers.append(s)
+        return s
+
+    yield _start
+    for s in servers:
+        s.stop()
+
+
+def test_mention_seed_does_not_hang_forever_on_a_stalled_response(
+    serve_stalling, run_mention, monkeypatch
+):
+    """#3106: the seed loop must not hang indefinitely on a connection that
+    sends valid headers and then withholds the body. Script: stall twice,
+    then answer normally — pre-fix, the very FIRST stalled connection never
+    returns (no --max-time), so the seed can never reach attempt 3 within any
+    bounded test window. Post-fix, each stalled attempt is bounded by
+    --max-time and the seed succeeds once the server starts answering.
+    """
+    server = serve_stalling(["stall", "stall", (200, _MENTIONS_QUIET)])
+    # Bound the client's per-request patience well under the test's own
+    # wait budget so a hang is distinguishable from "just needs more time".
+    monkeypatch.setenv("FORUM_MENTION_MAX_TIME_SECONDS", "1")
+    proc, seen = run_mention(server.port, poll_seconds="0.3")
+
+    assert _wait_until(lambda: seen.is_file(), timeout=8.0), (
+        f"seed never baselined $SEEN after two stalled connections — a "
+        f"stalled response is hanging the seed loop instead of being "
+        f"bounded by --max-time (full output: {proc.lines!r})"
+    )
+
+
+def test_mention_poll_announces_unreachable_on_a_stalled_response(
+    serve_stalling, run_mention, monkeypatch
+):
+    """#3106's core claim: a stalled response must reach the SAME
+    'unreachable' announce (#3065) a curl --fail failure already produces.
+    Script: seed + one healthy poll, then stall — pre-fix, the stalled
+    connection hangs the curl call forever and the announce is never
+    reached; post-fix, --max-time bounds it, curl returns non-zero, and the
+    existing announce path fires exactly as it does for a 500 response.
+    """
+    server = serve_stalling([(200, _MENTIONS_QUIET), (200, _MENTIONS_QUIET), "stall"])
+    monkeypatch.setenv("FORUM_MENTION_MAX_TIME_SECONDS", "1")
+    proc, seen = run_mention(server.port, poll_seconds="0.3")
+
+    assert _wait_until(lambda: seen.is_file()), "seed never baselined $SEEN"
+    assert _wait_until(lambda: len(_unreachable_lines(proc.lines)) >= 1, timeout=8.0), (
+        f"a stalled response never produced the 'unreachable' announce — "
+        f"curl is hanging past the poll cycle instead of being bounded by "
+        f"--max-time (full output so far: {proc.lines!r})"
     )
 
 

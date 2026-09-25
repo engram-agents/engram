@@ -306,6 +306,26 @@ except Exception: pass'
 # uses it too.
 POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 
+# --max-time (#3106): neither curl call below bounded a STALLED response —
+# one that is accepted and sends valid headers but then withholds the body
+# forever without closing. `--fail` only rejects a non-2xx status or a
+# connection failure; a stall is neither, so pre-#3106 curl never returns and
+# the monitor hangs silently, reaching neither #3065's nor #3067's
+# unreachable announce (measured: Darwin, a 200+Content-Length response that
+# never sends its body did not self-bound within 8s of `curl -s --fail`
+# alone). Chosen at 10s, deliberately NOT copying the sibling
+# forum-updates-monitor.sh's `--max-time 60` (#2007): that script's poll
+# cadence is also 30s, but this monitor additionally runs a coalesce-window
+# check every cycle (COALESCE_SECONDS below) — a stall that ate 60s of a 30s
+# cycle would double the effective cycle length and skew how many real polls
+# land inside a coalesce window, whereas 10s (comfortably above LAN tail
+# latency, comfortably below one poll interval) keeps a stall's cost to at
+# most one extended cycle, never approaching two. A stalled call still
+# returns non-zero exactly like any other curl failure once --max-time
+# elapses, so the existing `|| continue` / `if ! RESP=...` handling below
+# needs no other change — the fix is the flag, on both call sites.
+CURL_MAX_TIME="${FORUM_MENTION_MAX_TIME_SECONDS:-10}"
+
 # ---------------------------------------------------------------------------
 # seed — retry until the first poll that both SUCCEEDS and PARSES
 # Handles: arm-while-forum-down (waits), arm-while-up (seeds now), and
@@ -321,7 +341,7 @@ POLL_SECONDS="${FORUM_MENTION_POLL_SECONDS:-30}"
 while true; do
     # Stage through $SEEN.now and mv, exactly as the poll loop does, so a
     # retrying seed never truncates a prior run's baseline on its way past.
-    if RESP="$(curl -s --fail "$URL" 2>/dev/null)" \
+    if RESP="$(curl -s --fail --max-time "$CURL_MAX_TIME" "$URL" 2>/dev/null)" \
        && ( set -o pipefail; printf '%s' "$RESP" | ids | sort > "$SEEN.now" ); then
         mv "$SEEN.now" "$SEEN"
         break
@@ -416,7 +436,7 @@ while true; do
     # buffer/window still preserved, exactly as before) — only the EDGE is
     # now announced, once on entry and once on recovery, via
     # $_FORUM_REACHABLE (declared above the loop).
-    if ! RESP="$(curl -s --fail "$URL" 2>/dev/null)"; then
+    if ! RESP="$(curl -s --fail --max-time "$CURL_MAX_TIME" "$URL" 2>/dev/null)"; then
         if [ "$_FORUM_REACHABLE" = 1 ]; then
             echo "⚠️  forum-mention-monitor.sh: forum unreachable — still armed, not receiving; will report when it returns"
             _FORUM_REACHABLE=0
