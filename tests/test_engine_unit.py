@@ -529,7 +529,7 @@ class TestBuildCommandBranchGuard:
             return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(_sp, "run", _fake_run)
-        self._run_build_command(monkeypatch, tmp_path)
+        self._run_build_command(monkeypatch, tmp_path, extra_args=["--allow-untagged"])
         captured = capsys.readouterr()
         # The branch guard must NOT have fired — any failure is from later steps
         assert "794" not in captured.err
@@ -560,7 +560,7 @@ class TestBuildCommandBranchGuard:
             return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(_sp, "run", _fake_run)
-        rc = self._run_build_command(monkeypatch, tmp_path, extra_args=["--allow-branch"])
+        rc = self._run_build_command(monkeypatch, tmp_path, extra_args=["--allow-branch", "--allow-untagged"])
         # Guard skipped; 794 error must NOT appear
         captured = capsys.readouterr()
         assert "794" not in captured.err

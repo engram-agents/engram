@@ -55,7 +55,7 @@ def _load_manifest() -> dict:
 def _run_build(args: list[str], output_dir: str | None = None) -> "subprocess.CompletedProcess":
     import subprocess
     # --allow-branch: tests may run on feature branches, not just dev (#794 guard override)
-    cmd = [sys.executable, "-m", "tools.engine.cli", "build", "--allow-branch"] + args
+    cmd = [sys.executable, "-m", "tools.engine.cli", "build", "--allow-branch", "--allow-untagged"] + args
     if output_dir:
         cmd += ["--output", output_dir]
     return subprocess.run(

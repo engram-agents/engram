@@ -113,7 +113,7 @@ def _hooks_referenced_in_built_json(plugin_root: str) -> set[str]:
 def _run_build(extra_args: list[str]) -> subprocess.CompletedProcess:
     """Run build-plugin.sh from repo root with given extra args."""
     # --allow-branch: tests may run on feature branches, not just dev (#794 guard override)
-    cmd = ["bash", BUILD_PLUGIN_SH, "--allow-branch"] + extra_args
+    cmd = ["bash", BUILD_PLUGIN_SH, "--allow-branch", "--allow-untagged"] + extra_args
     return subprocess.run(
         cmd,
         cwd=REPO_ROOT,
