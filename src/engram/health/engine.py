@@ -2511,4 +2511,4 @@ def _count_null_embeddings(conn: sqlite3.Connection, population: str) -> int:
         f"SELECT COUNT(*) as c FROM nodes WHERE is_current = 1 AND type IN "
         f"({placeholders}) AND embedding IS NULL",
         claim_bearing_types,
-    ).fetchone()["c"]
+    ).fetchone()[0]
