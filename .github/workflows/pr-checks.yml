@@ -723,12 +723,14 @@ jobs:
       - name: test-id-set-check — fail on a shrinking test-id set without a Removed-test marker
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           printf '%s' "$PR_BODY" > /tmp/pr_body.txt
           python3 tools/test_id_set_check.py \
             --base "$BASE_SHA" --head HEAD \
-            --pr-body-file /tmp/pr_body.txt
+            --pr-body-file /tmp/pr_body.txt \
+            --gh-repo ${{ github.repository }}
 
       # ── 8b. test-id-set-check-unit-tests ────────────────────────────────
       # #2950/#2959 — reviewer-fairy round 2: step 8 above runs the TOOL
