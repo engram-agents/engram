@@ -289,8 +289,27 @@ if [[ "$CURRENT_BRANCH" != "dev" && "$CURRENT_BRANCH" != "main" && $DEPLOYABLE_A
   die "Source repo is on branch '$CURRENT_BRANCH', not 'dev' (private dev) or 'main' (public release). Building from a PR/feature branch can deploy unmerged code. Pass --allow-branch to override (e.g. for metric-eval checkouts), or check out a deployable tag (v*/deploy/*) that is merged into origin/dev or origin/main — no flag needed for that. Guard per #794 (tag exception per #2586/#2711)."
 fi
 
-# #2586 tag guard: refuse builds from an untagged commit unless --allow-untagged
-# is set.
+# #2586/#3103 tag guard: refuse builds unless HEAD carries a deployable tag
+# AND that tag is CONFIRMED merged history (DEPLOYABLE_ANCESTOR -eq 1, the
+# same predicate the #794 guard above already consults) — not merely "does
+# a deployable-pattern tag point at HEAD" (DEPLOY_TAGS non-empty). Before
+# #3103 this guard decided on DEPLOY_TAGS alone, independent of ancestry —
+# so a same-named LOCAL tag on an unmerged/unpushed commit (e.g. a local
+# 'dev' checkout with an unpushed child commit tagged v9.9.9) passed this
+# guard even though the #794 guard's own DEPLOYABLE_ANCESTOR computation,
+# a few lines above, had already determined HEAD is NOT confirmed-merged —
+# the shell and the engine's `cli run upgrade` path (which routes entirely
+# through refresh_and_check_deployable_tag_at()) disagreed on exactly this
+# case. Three distinct cases now, not two:
+#   1. No tag at all (DEPLOY_TAGS empty) — refuse; "not a tagged commit".
+#   2. Tag present AND confirmed ancestor (DEPLOYABLE_ANCESTOR -eq 1) — proceed.
+#   3. Tag present but NOT confirmed ancestor (genuinely unmerged/unpushed,
+#      OR the ancestry check's own fetch failed/timed out and fell through
+#      fail-closed, per the WARNING branches above) — refuse, but say so
+#      accurately: the tag exists, it just isn't confirmed merged into
+#      origin/dev/origin/main. Wording echoes the "unconfirmed merged
+#      history" framing the fetch-failure WARNINGs above already use, so
+#      the guard doesn't claim "not a tagged commit" when it plainly is.
 #
 # This sits before the --target dispatch so both Claude and Codex install
 # paths get it — the guard lives in the script, not in the engram-upgrade
@@ -304,10 +323,14 @@ fi
 # alpha_tag, never the dev tip) in its own output, or a fully-consistent seat
 # reads as drifted against the wrong reference.
 ALPHA_UNTAGGED_OVERRIDE_FIRED=0
-if [[ -z "$DEPLOY_TAGS" ]]; then
+if [[ $DEPLOYABLE_ANCESTOR -ne 1 ]]; then
   SHORT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   NEAREST_TAG="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null || echo none)"
-  TAG_GUARD_MSG="HEAD ($SHORT_SHA) is not a tagged commit (deployable tags = v* and deploy/*; nearest by ancestry: $NEAREST_TAG). The health-snapshot versioning gate (engram-alpha#2563) treats tags as the deployable set; snapshots written from untagged code are invisible to it and can orphan your health history. Rebuild from a tag (git fetch --tags origin first if your tags are stale), or pass --allow-untagged to proceed anyway — the deploy log repeats this warning and .deployed-version records alpha_tag=none. Guard per #2586."
+  if [[ -z "$DEPLOY_TAGS" ]]; then
+    TAG_GUARD_MSG="HEAD ($SHORT_SHA) is not a tagged commit (deployable tags = v* and deploy/*; nearest by ancestry: $NEAREST_TAG). The health-snapshot versioning gate (engram-alpha#2563) treats tags as the deployable set; snapshots written from untagged code are invisible to it and can orphan your health history. Rebuild from a tag (git fetch --tags origin first if your tags are stale), or pass --allow-untagged to proceed anyway — the deploy log repeats this warning and .deployed-version records alpha_tag=none. Guard per #2586."
+  else
+    TAG_GUARD_MSG="HEAD ($SHORT_SHA) carries a deployable-looking tag ($DEPLOY_TAGS) but that tag is NOT confirmed to be merged into origin/dev or origin/main (nearest by ancestry: $NEAREST_TAG) — treating HEAD as unconfirmed merged history, same as the #794 guard above. This can mean the tag is on genuinely unmerged/unpushed work, or that the ancestry check's own origin refresh failed or timed out. The health-snapshot versioning gate (engram-alpha#2563) treats CONFIRMED-merged tags as the deployable set; snapshots written from unconfirmed code are invisible to it and can orphan your health history. Push/merge this commit into origin/dev or origin/main and re-fetch, or pass --allow-untagged to proceed anyway — the deploy log repeats this warning and .deployed-version records alpha_tag=none. Guard per #2586/#3103."
+  fi
   if [[ $ALLOW_UNTAGGED -eq 0 ]]; then
     die "$TAG_GUARD_MSG"
   else

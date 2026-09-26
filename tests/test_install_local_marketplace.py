@@ -1059,10 +1059,25 @@ def test_install_local_marketplace_skip_build_omitted_keys_default_cleanly(tmp_p
 # tag in the real engram-alpha checkout (hard scope bound, #2586).
 
 
-def _make_scratch_repo(tmp_path, *, tags=()):
+def _make_scratch_repo(tmp_path, *, tags=(), configure_origin=False):
     """A minimal standalone git repo carrying its own copy of the installer.
 
     tags: tag names to apply to the single commit at HEAD.
+
+    configure_origin (#3103): when True, wires up a real bare 'origin'
+    remote (dev + main both pushed to HEAD) plus a copy of
+    src/build/engine/deploy_tag.py, so a deployable-pattern tag at HEAD can
+    pass the confirmed-ancestor guard (HEAD is trivially its own ancestor of
+    origin/dev once pushed). Needed by the "accepts a deployable tag" tests
+    below now that the untagged/#2586 guard decides on CONFIRMED ancestry,
+    not on raw tag presence alone (#3103) — without a real origin, the
+    installer's own fetch fails outright (no 'origin' remote configured at
+    all) and the guard fails closed exactly as it should. Tests that stay on
+    the untagged path (no deployable-pattern tag at HEAD) don't need this —
+    the ancestor-check block never even attempts a fetch when DEPLOY_TAGS is
+    empty, so their behavior is unchanged either way. Mirrors
+    test_deploy_tag_guard.py's own `_make_simple_repo(..., configure_origin=...)`
+    convention.
     """
     repo = tmp_path / "scratch-repo"
     (repo / "tools").mkdir(parents=True)
@@ -1071,6 +1086,15 @@ def _make_scratch_repo(tmp_path, *, tags=()):
     scratch_installer = repo / "tools" / "install-local-marketplace.sh"
     scratch_installer.write_text(INSTALLER.read_text())
     scratch_installer.chmod(0o755)
+
+    if configure_origin:
+        (repo / "src" / "build" / "engine").mkdir(parents=True)
+        (repo / "src" / "build" / "engine" / "__init__.py").write_text(
+            DEPLOY_TAG_INIT.read_text()
+        )
+        (repo / "src" / "build" / "engine" / "deploy_tag.py").write_text(
+            DEPLOY_TAG_MODULE.read_text()
+        )
 
     def _git(*args):
         subprocess.run(
@@ -1084,6 +1108,15 @@ def _make_scratch_repo(tmp_path, *, tags=()):
     _git("commit", "-q", "-m", "init")
     for tag in tags:
         _git("tag", tag)
+
+    if configure_origin:
+        origin_bare = tmp_path / "origin-bare.git"
+        _git("init", "-q", "-b", "dev", "--bare", str(origin_bare))
+        _git("remote", "add", "origin", str(origin_bare))
+        _git("push", "-q", "origin", "dev")
+        _git("push", "-q", "origin", "dev:refs/heads/main")
+        _git("fetch", "-q", "origin")
+
     return repo
 
 
@@ -1177,7 +1210,7 @@ def test_tag_guard_refuses_untagged_head(tmp_path):
 
 
 def test_tag_guard_accepts_v_tag(tmp_path):
-    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-test"])
+    repo = _make_scratch_repo(tmp_path, tags=["v9.9.9-test"], configure_origin=True)
     engram_home = tmp_path / "engram-home"
     build_root = tmp_path / "build" / "plugin"
     _write_fake_plugin(build_root, platform="claude-code")
@@ -1191,7 +1224,7 @@ def test_tag_guard_accepts_v_tag(tmp_path):
 
 
 def test_tag_guard_accepts_deploy_tag(tmp_path):
-    repo = _make_scratch_repo(tmp_path, tags=["deploy/2026-09-05-test"])
+    repo = _make_scratch_repo(tmp_path, tags=["deploy/2026-09-05-test"], configure_origin=True)
     engram_home = tmp_path / "engram-home"
     build_root = tmp_path / "build" / "plugin"
     _write_fake_plugin(build_root, platform="claude-code")
@@ -1235,7 +1268,9 @@ def test_tag_guard_override_records_none_and_warns(tmp_path):
 
 
 def test_tag_guard_multiple_tags_joined(tmp_path):
-    repo = _make_scratch_repo(tmp_path, tags=["v1.0.0-a", "deploy/2026-09-05-b"])
+    repo = _make_scratch_repo(
+        tmp_path, tags=["v1.0.0-a", "deploy/2026-09-05-b"], configure_origin=True
+    )
     engram_home = tmp_path / "engram-home"
     build_root = tmp_path / "build" / "plugin"
     _write_fake_plugin(build_root, platform="claude-code")
@@ -1260,6 +1295,154 @@ def test_tag_guard_runs_before_target_dispatch(tmp_path):
     assert "not a tagged commit" in result.stderr
     assert "#2586" in result.stderr
     assert not (engram_home / ".deployed-version").exists()
+
+
+# ── #3103 — untagged guard must decide on CONFIRMED ancestry, not raw tag
+# presence (the shell/engine disagreement borges-funes found in #3103) ───────
+#
+# #3092/#3099 unified the engine's own `cli run upgrade` path onto the shared
+# deployable_tag_at()/refresh_and_check_deployable_tag_at() predicate, which
+# requires BOTH a deployable-pattern tag AND confirmed ancestry (HEAD is an
+# ancestor of origin/dev or origin/main). The shell's #794 branch guard
+# (DEPLOYABLE_ANCESTOR, above) already consulted that same predicate — but
+# the SEPARATE #2586 untagged guard a few lines below it still decided on
+# raw `DEPLOY_TAGS` presence alone, independent of ancestry. The gap: on
+# branch 'dev' itself, #794 passes trivially (branch name IS 'dev'), so the
+# untagged guard was the ONLY thing standing between an unmerged/unpushed
+# locally-tagged commit and a real deploy — and it was silently deciding on
+# the wrong signal. Every existing unmerged-tag test (the #2711 section
+# below) exercises this via a DETACHED HEAD or a non-dev 'stray' branch,
+# where #794 already refuses regardless — none of them reaches the cell
+# this section covers: HEAD literally ON branch 'dev', with a local,
+# unpushed, tagged child commit.
+
+
+def _make_scratch_repo_with_unpushed_tagged_dev_commit(tmp_path):
+    """A scratch repo shaped for #3103's contract test.
+
+    Commit graph:
+        A (== refs/remotes/origin/{dev,main} — genuinely pushed)
+        |
+        B (local 'dev' tip, a child of A; tag v9.9.9 on B; NEVER pushed)
+
+    Ends on branch 'dev' (not detached — this is the load-bearing
+    difference from the #2711 fixtures below: HEAD's branch name really is
+    'dev', so #794 passes trivially and only the #2586/#3103 untagged guard
+    is in play). Mirrors _make_scratch_repo_with_ancestry's real-git-plumbing
+    approach (a real bare 'origin', not a faked ref) one section below,
+    reused here rather than inventing a new fixture shape.
+    """
+    repo = tmp_path / "scratch-repo-unpushed-tag"
+    (repo / "tools").mkdir(parents=True)
+    (repo / "src" / "engram").mkdir(parents=True)
+    (repo / "src" / "engram" / "server.py").write_text("# stub\n")
+    (repo / "src" / "build" / "engine").mkdir(parents=True)
+    (repo / "src" / "build" / "engine" / "__init__.py").write_text(DEPLOY_TAG_INIT.read_text())
+    (repo / "src" / "build" / "engine" / "deploy_tag.py").write_text(DEPLOY_TAG_MODULE.read_text())
+    scratch_installer = repo / "tools" / "install-local-marketplace.sh"
+    scratch_installer.write_text(INSTALLER.read_text())
+    scratch_installer.chmod(0o755)
+
+    def _git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        )
+
+    _git("init", "-q", "-b", "dev")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "init")
+    sha_a = _git("rev-parse", "HEAD").stdout.strip()
+
+    origin_bare = tmp_path / "origin-bare-unpushed-tag.git"
+    _git("init", "-q", "-b", "dev", "--bare", str(origin_bare))
+    _git("remote", "add", "origin", str(origin_bare))
+    _git("push", "-q", "origin", "dev")
+    _git("push", "-q", "origin", "dev:refs/heads/main")
+    _git("fetch", "-q", "origin")
+
+    # A child commit on 'dev' itself, never pushed — HEAD stays on branch
+    # 'dev' (so #794 passes trivially) but the tip is NOT merged history.
+    (repo / "unpushed.txt").write_text("unpushed local work\n")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "unpushed local commit")
+    sha_b = _git("rev-parse", "HEAD").stdout.strip()
+    _git("tag", "v9.9.9")
+
+    return repo, {"a": sha_a, "b": sha_b}
+
+
+def test_shell_refuses_local_tag_on_unpushed_dev_commit(tmp_path):
+    """#3103 contract test, shell half: a repo on branch 'dev' with a local,
+    unpushed child commit carrying a deployable-pattern tag must REFUSE —
+    not the old "proceeds because DEPLOY_TAGS is non-empty" behavior. The
+    message must not claim "not a tagged commit" (false — it IS tagged);
+    it must say the tag isn't confirmed merged, echoing the same
+    "unconfirmed merged history" framing the fetch-failure WARNINGs use."""
+    repo, commits = _make_scratch_repo_with_unpushed_tagged_dev_commit(tmp_path)
+    engram_home = tmp_path / "engram-home"
+
+    result = _run_scratch_installer(repo, engram_home)
+
+    assert result.returncode != 0
+    assert "not a tagged commit" not in result.stderr
+    assert "v9.9.9" in result.stderr
+    assert "not confirmed" in result.stderr or "NOT confirmed" in result.stderr
+    assert "unconfirmed merged history" in result.stderr
+    assert "#2586" in result.stderr
+    assert "#3103" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_shell_allow_untagged_proceeds_for_unpushed_tagged_dev_commit(tmp_path):
+    """Same fixture, with --allow-untagged: proceeds (same override as the
+    plain-untagged case) and records alpha_tag=none — the override still
+    means "don't trust the tag", regardless of which of the three cases
+    triggered the guard."""
+    repo, commits = _make_scratch_repo_with_unpushed_tagged_dev_commit(tmp_path)
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo, engram_home, extra_args=["--allow-untagged"], build_dir=build_root
+    )
+
+    assert result.returncode == 0, result.stderr
+    combined = result.stdout + result.stderr
+    assert "WARNING" in combined
+    assert "v9.9.9" in combined
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=none" in marker
+    assert "alpha_untagged_override=1" in marker
+
+
+def test_engine_predicate_also_refuses_unpushed_tagged_dev_commit(tmp_path):
+    """#3103 contract test, engine half: `cli run upgrade` (already correct
+    per #3092/#3099 — not something this fix touches) routes entirely
+    through refresh_and_check_deployable_tag_at(), which falls through to
+    this same predicate regardless of fetch outcome (both refs are already
+    genuinely up to date here, so no fetch is even required to see this).
+    Asserting the shared predicate returns None (refused) against this SAME
+    fixture is the faithful cross-check that the engine path independently
+    refuses this exact scenario too — the two paths must agree, which is
+    the whole point of #3103. `deployable_tag_at()` is a pure function of
+    its `repo_path` argument (runs `git -C repo_path ...` internally), so
+    it's imported from THIS repo's own tools/engine compat symlink (same
+    import test_deploy_tag_guard.py uses) and simply pointed at the scratch
+    repo — no need to duplicate deploy_tag.py inside the scratch repo for
+    this half of the check (that copy exists solely for the shell script's
+    own `python3 -c` invocation, tested separately above). (Exercising the
+    full `cli run upgrade` flow end-to-end would additionally require
+    config.json/.deployed-version/changeset-ack scaffolding unrelated to
+    the deploy-tag guard itself — see this PR's handoff for why the
+    predicate-level check was chosen instead.)"""
+    from tools.engine.deploy_tag import deployable_tag_at
+
+    repo, commits = _make_scratch_repo_with_unpushed_tagged_dev_commit(tmp_path)
+
+    assert deployable_tag_at(str(repo)) is None
 
 
 # ── #2711 — #794/#2586 guard ordering (detached HEAD at a deploy tag) ────────
@@ -1417,9 +1600,23 @@ def test_detached_head_at_non_ancestor_commit_still_refuses(tmp_path):
     assert not (engram_home / ".deployed-version").exists()
 
 
-def test_detached_head_at_non_ancestor_commit_builds_with_allow_branch(tmp_path):
-    """The --allow-branch override still works for the non-ancestor case —
-    the fix narrows the #794 exception, it doesn't remove the override."""
+def test_detached_head_at_non_ancestor_commit_with_allow_branch_alone_still_refuses_on_untagged_guard(
+    tmp_path,
+):
+    """Post-#3103: --allow-branch alone no longer suffices for this case.
+
+    Before #3103, the #2586 untagged guard decided on raw DEPLOY_TAGS
+    presence alone — so once --allow-branch cleared the #794 branch guard,
+    a stray-but-tagged commit passed the untagged guard for free (DEPLOY_TAGS
+    was non-empty). #3103 makes the untagged guard ALSO require confirmed
+    ancestry, so this exact scenario now falls into case 3 (tagged, but NOT
+    a confirmed ancestor) and needs --allow-untagged too — --allow-branch
+    and --allow-untagged guard two independent risks (#794: unmerged branch;
+    #2586/#3103: unconfirmed-merged health-snapshot provenance), and clearing
+    one says nothing about the other. See
+    test_detached_head_at_non_ancestor_commit_builds_with_both_overrides
+    immediately below for the "override still works" coverage this test
+    used to carry alone."""
     repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
     _checkout(repo, "deploy/2026-09-07-stray")
     engram_home = tmp_path / "engram-home"
@@ -1430,7 +1627,42 @@ def test_detached_head_at_non_ancestor_commit_builds_with_allow_branch(tmp_path)
         repo, engram_home, extra_args=["--allow-branch"], build_dir=build_root
     )
 
+    assert result.returncode != 0
+    # Case-3 message (tagged but NOT confirmed ancestor), not case-1 (no tag
+    # at all) — the guard must not claim "not a tagged commit" when HEAD
+    # plainly carries one.
+    assert "not a tagged commit" not in result.stderr
+    assert "deploy/2026-09-07-stray" in result.stderr
+    assert "NOT confirmed to be merged" in result.stderr
+    assert "#3103" in result.stderr
+    assert not (engram_home / ".deployed-version").exists()
+
+
+def test_detached_head_at_non_ancestor_commit_builds_with_both_overrides(tmp_path):
+    """The override still works for the non-ancestor case — the fix narrows
+    the #794 exception and tightens the #2586 untagged guard's ancestry
+    check, but the escape hatch remains: pass BOTH --allow-branch (for #794)
+    AND --allow-untagged (for #2586/#3103), and the build proceeds. This is
+    the "override still works" coverage the pre-#3103 single-flag test used
+    to carry — split here because two independent guards now require two
+    independent overrides for this scenario."""
+    repo, commits = _make_scratch_repo_with_ancestry(tmp_path)
+    _checkout(repo, "deploy/2026-09-07-stray")
+    engram_home = tmp_path / "engram-home"
+    build_root = tmp_path / "build" / "plugin"
+    _write_fake_plugin(build_root, platform="claude-code")
+
+    result = _run_scratch_installer(
+        repo,
+        engram_home,
+        extra_args=["--allow-branch", "--allow-untagged"],
+        build_dir=build_root,
+    )
+
     assert result.returncode == 0, result.stderr
+    marker = (engram_home / ".deployed-version").read_text()
+    assert "alpha_tag=none" in marker
+    assert "alpha_untagged_override=1" in marker
 
 
 def test_dev_checkout_still_builds_without_allow_branch(tmp_path):
