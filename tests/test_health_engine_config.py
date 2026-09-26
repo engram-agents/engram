@@ -31,6 +31,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from health import config as hec  # noqa: E402 — must follow sys.path setup
+from health import engine as health_engine  # noqa: E402
 from health.config import (  # noqa: E402
     UNAVAILABLE,
     AspectDef,
@@ -514,3 +515,76 @@ class TestLoadConfig:
         with pytest.raises(EngineConfigError):
             fake_module.CONFIG = _config(aspects=())
         assert not hasattr(fake_module, "CONFIG")
+
+
+# ---------------------------------------------------------------------------
+# C1 (engram-alpha#3122): _dotted_name layout independence
+# ---------------------------------------------------------------------------
+#
+# health/engine.py's _metric_def_to_dict / _aspect_def_to_dict serialize a
+# metric/aspect's function identity as f"{fn.__module__}.{fn.__qualname__}".
+# fn.__module__ depends on how the `health` package was imported:
+# `engram.health.metrics` when imported from the `src/` tree (top-level
+# package `engram` on sys.path), `health.metrics` in the deployed plugin
+# (the build flattens `src/engram/` away -- see this repo's CLAUDE.md
+# "Plugin build restructures code paths"). _dotted_name canonicalizes by
+# stripping a leading `engram.` from an `engram.health.` prefix, so both
+# layouts collapse to the SAME `health.metrics.x` string.
+#
+# NOTE on this checkout's own ambient state: this test file's conftest.py
+# puts `src/engram/` (not `src/`) on sys.path, so a REAL production
+# signal_fn/scoring_fn's __module__ here is ALREADY the deployed-layout
+# form (`health.metrics`-shaped) -- verified directly against
+# health_engine.CONFIG before writing this test. So "as-is vs
+# monkeypatched to health.metrics" would just compare `health.metrics`
+# against itself twice and prove nothing. Instead, both layout strings are
+# forced directly via monkeypatch (which restores `__module__` at test
+# teardown) on the SAME real production function object, which is the
+# more direct test of the actual contract -- layout independence, not
+# "whatever this checkout's sys.path happens to produce today." A
+# subprocess re-import under a different sys.path was considered and
+# rejected as unnecessarily heavy for what is a pure string
+# transformation over `fn.__module__` + `fn.__qualname__`.
+
+
+class TestDottedNameLayoutIndependence:
+    def test_metric_signal_fn_collapses_both_layouts(self, monkeypatch):
+        metric = health_engine.CONFIG.aspects[0].metrics[0]
+        qualname = metric.signal_fn.__qualname__
+
+        monkeypatch.setattr(metric.signal_fn, "__module__", "engram.health.metrics")
+        src_tree_name = health_engine._metric_def_to_dict(metric)["signal_fn"]
+
+        monkeypatch.setattr(metric.signal_fn, "__module__", "health.metrics")
+        deployed_name = health_engine._metric_def_to_dict(metric)["signal_fn"]
+
+        assert src_tree_name == deployed_name == f"health.metrics.{qualname}"
+
+    def test_aspect_scoring_fn_collapses_both_layouts(self, monkeypatch):
+        aspect = health_engine.CONFIG.aspects[0]
+        qualname = aspect.scoring_fn.__qualname__
+
+        monkeypatch.setattr(aspect.scoring_fn, "__module__", "engram.health.metrics")
+        src_tree_name = health_engine._aspect_def_to_dict(aspect)["scoring_fn"]
+
+        monkeypatch.setattr(aspect.scoring_fn, "__module__", "health.metrics")
+        deployed_name = health_engine._aspect_def_to_dict(aspect)["scoring_fn"]
+
+        assert src_tree_name == deployed_name == f"health.metrics.{qualname}"
+
+    def test_config_to_dict_end_to_end_collapses_both_layouts(self, monkeypatch):
+        """Same contract, exercised through the full _config_to_dict(CONFIG)
+        call the real ingest()/derive() paths use (design doc §4.1) -- not
+        just the per-def helpers in isolation."""
+        metric = health_engine.CONFIG.aspects[0].metrics[0]
+        aspect = health_engine.CONFIG.aspects[0]
+
+        monkeypatch.setattr(metric.signal_fn, "__module__", "engram.health.metrics")
+        monkeypatch.setattr(aspect.scoring_fn, "__module__", "engram.health.metrics")
+        src_tree_config = health_engine._config_to_dict(health_engine.CONFIG)
+
+        monkeypatch.setattr(metric.signal_fn, "__module__", "health.metrics")
+        monkeypatch.setattr(aspect.scoring_fn, "__module__", "health.metrics")
+        deployed_config = health_engine._config_to_dict(health_engine.CONFIG)
+
+        assert src_tree_config == deployed_config
