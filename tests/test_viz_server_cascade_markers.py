@@ -118,7 +118,7 @@ def test_get_graph_attaches_tainted_by_and_stale_by():
         node_id=ob_root_retract,
         error_type="fabricated_quote",
         reason="Test retract for viz coverage.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", ret
 
     ob_new = _seed_ob(obs, "Replacement for the superseded node.")
@@ -198,7 +198,7 @@ def test_get_health_data_tainted_stale_counts_match_pending_markers():
         tainted_ids.append(dv["derivation_id"])
         ret = json.loads(rev._retract_impl(
             node_id=ob, error_type="fabricated_quote", reason="Test.",
-        ))
+         replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
         assert ret.get("status") == "retracted", ret
 
     db_path = str(core.DB_PATH)

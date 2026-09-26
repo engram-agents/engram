@@ -616,6 +616,7 @@ def test_retract_last_resolver_clears_resolved_by():
         "node_id": dv_id,
         "error_type": "other",
         "reason": "Retracting for test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert ret.get("status") in ("retracted", "retraction_recorded"), ret
 
@@ -702,6 +703,7 @@ def test_retract_one_of_two_resolvers_updates_resolved_by():
         "node_id": dv_strong_id,
         "error_type": "other",
         "reason": "Retracting strong resolver for test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert ret.get("status") in ("retracted", "retraction_recorded"), ret
 
@@ -772,6 +774,7 @@ def test_resolve_retracted_target_rejected_no_successor():
         "node_id": q2_id,
         "error_type": "other",
         "reason": "Retracting target for #919 guard test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert ret.get("status") in ("retracted", "retraction_recorded"), ret
 

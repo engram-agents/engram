@@ -359,7 +359,7 @@ def test_query_pattern_contradiction_obsolescence_tiered_shape():
     rev._retract_impl(
         node_id=obs_a, error_type="other",
         reason="test fixture: simulating retraction for view modes"
-    )
+    , replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test")
 
     r = json.loads(qry._query_pattern_impl(
         pattern_name="contradiction_obsolescence_ready", preset="balanced",

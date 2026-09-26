@@ -114,7 +114,13 @@ marker on that node at once, since the frontier packet already showed you all
 of them):
 
 - **`retracted`** — the argument is broken. Delegates to the retract core
-  (`error_type` optional, defaults `other`).
+  (`error_type` optional, defaults `other`). #2613: a replacement decision is
+  required-always here too, same as the organic path — pass EITHER
+  `replacement_id` (a successor demonstrably exists — the normal case in a
+  sweep, since you write the corrected node first and resolve second) OR
+  `replacement_absent_because` (one of NONE_BECAUSE_NO_SUCCESSOR,
+  NONE_BECAUSE_DUPLICATE, NONE_BECAUSE_SUPERSEDED_ELSEWHERE,
+  NONE_BECAUSE_UNKNOWN — the last requires `replacement_absent_note`).
 - **`superseded`** — the claim survives on the remaining premises, and you
   have **already created the replacement node** via its own canonical tool
   (`engram_derive`, `engram_add_observation`, ...). Pass `replacement_id`.
@@ -128,10 +134,20 @@ of them):
   forbids acknowledging.
 
 ```
+# superseded / acknowledged
 engram_cascade_resolve(payload_json=json.dumps({
     "node_id": "<frontier node>",
     "resolution_kind": "retracted" | "superseded" | "acknowledged",
-    "replacement_id": "<only for superseded>",
+    "replacement_id": "<required for superseded>",
+    "note": "<your reasoning>",
+}))
+
+# retracted — a replacement decision is required; supply exactly one of:
+engram_cascade_resolve(payload_json=json.dumps({
+    "node_id": "<frontier node>",
+    "resolution_kind": "retracted",
+    "replacement_id": "<a demonstrably-existing successor>",
+    # OR: "replacement_absent_because": "NONE_BECAUSE_NO_SUCCESSOR",
     "note": "<your reasoning>",
 }))
 ```

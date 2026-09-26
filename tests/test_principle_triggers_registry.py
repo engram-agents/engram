@@ -291,6 +291,7 @@ def test_legacy_caches_still_written():
 def _retract(server, node_id, reason="test retraction"):
     r = json.loads(server.engram_retract(payload_json=json.dumps({
         "node_id": node_id, "error_type": "other", "reason": reason,
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in r, r
     return r

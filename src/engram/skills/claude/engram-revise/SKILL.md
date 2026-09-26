@@ -55,11 +55,32 @@ instead of attempting Step 2.
 - `duplicate` — same claim already existed
 - `other` — anything else
 
+A replacement DECISION is required-always (#2613) — every retraction must
+name either the node that replaces the claim, or a stated reason nothing
+does. Pick one:
+
 ```
+# The claim is still valid, just miscited — file the corrected node FIRST
+# (its own canonical creation tool), then name it here:
 engram_retract(payload_json=json.dumps({
     "node_id": "<node_id>",
     "error_type": "<from above>",
     "reason": "<honest description of the error>",
+    "replacement_id": "<the corrected node's id>",
+}))
+
+# Nothing replaces this claim — say why, one of:
+#   NONE_BECAUSE_NO_SUCCESSOR         — the claim was simply wrong
+#   NONE_BECAUSE_DUPLICATE            — the surviving node already existed
+#   NONE_BECAUSE_SUPERSEDED_ELSEWHERE — a successor exists but isn't this
+#                                        retraction's to name
+#   NONE_BECAUSE_UNKNOWN              — no successor could be determined
+#                                        (requires replacement_absent_note)
+engram_retract(payload_json=json.dumps({
+    "node_id": "<node_id>",
+    "error_type": "<from above>",
+    "reason": "<honest description of the error>",
+    "replacement_absent_because": "NONE_BECAUSE_NO_SUCCESSOR",
 }))
 ```
 
@@ -68,7 +89,7 @@ evidence/citation, not about the fact), file the corrected replacement node
 and cite it when re-establishing any tainted downstream node — the same
 derive-new-then-link pattern as the `superseded` shape in
 `engram-resolve-cascade`'s worked examples (example A is the retracted-premise
-case).
+case). That corrected node is also what `replacement_id` above names.
 
 ## Step 2′ — For genuine evolution: create the replacement, then supersede
 

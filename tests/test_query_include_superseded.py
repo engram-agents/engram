@@ -227,7 +227,7 @@ def test_query_retracted_behavior_with_include_superseded_flag():
         node_id=x_id,
         error_type="other",
         reason="test retraction for issue #191 regression suite",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
     query = "retract191regression uniquemarkerX"

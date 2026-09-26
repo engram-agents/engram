@@ -117,7 +117,7 @@ def test_direct_target_frontier_transitive_dependent_blocked():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob_id, error_type="hallucinated_claim", reason="wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     resp = json.loads(rev._cascade_frontier_impl())
@@ -136,7 +136,7 @@ def test_direct_target_frontier_transitive_dependent_blocked():
     ret2 = json.loads(rev._retract_impl(
         node_id=dv1_id, error_type="hallucinated_claim", reason="also wrong",
         cascade_triggering=False,
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret2, ret2
 
     resp2 = json.loads(rev._cascade_frontier_impl())
@@ -159,8 +159,8 @@ def test_determinism_across_two_calls():
     dv1 = _seed_dv(derive, "Dependent on A.", [ob1])
     dv2 = _seed_dv(derive, "Dependent on B.", [ob2])
 
-    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="x"))
-    json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="y"))
+    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="x", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+    json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="y", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     resp_a = rev._cascade_frontier_impl()
     resp_b = rev._cascade_frontier_impl()
@@ -198,9 +198,9 @@ def test_multi_event_node_once_and_blocked_until_all_ancestors_resolved():
     # Two independent retracts -> two independent cascade_events, both
     # reaching `joint` (via mid1 and mid2 respectively) as well as marking
     # mid1/mid2 themselves.
-    r1 = json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a"))
+    r1 = json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r1, r1
-    r2 = json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="b"))
+    r2 = json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="b", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r2, r2
 
     conn = core._get_db()
@@ -229,7 +229,7 @@ def test_multi_event_node_once_and_blocked_until_all_ancestors_resolved():
     # internal resolution route (cascade_triggering=False), which resolves the
     # node's own marker and fires no new event (invariant 7).
     json.loads(rev._retract_impl(node_id=mid1, error_type="hallucinated_claim", reason="c",
-                                 cascade_triggering=False))
+                                 cascade_triggering=False, replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     resp2 = json.loads(rev._cascade_frontier_impl())
     ids2 = _frontier_ids(resp2)
     assert joint not in ids2, (
@@ -245,7 +245,7 @@ def test_multi_event_node_once_and_blocked_until_all_ancestors_resolved():
     # verb refuses a marked node, and the resolution route fires no new
     # event — invariant 7 — so joint keeps exactly its two original markers.)
     json.loads(rev._retract_impl(node_id=mid2, error_type="hallucinated_claim", reason="d",
-                                 cascade_triggering=False))
+                                 cascade_triggering=False, replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     resp3 = json.loads(rev._cascade_frontier_impl())
     joint_entries = [s for s in resp3["frontier"] if s["id"] == joint]
     assert len(joint_entries) == 1, (
@@ -281,9 +281,9 @@ def test_mode_c_is_subset_of_mode_b():
     unrelated_ob = _seed_ob(obs, "Unrelated premise.")
     unrelated_dv = _seed_dv(derive, "Unrelated dependent.", [unrelated_ob])
 
-    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a"))
-    json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="b"))
-    json.loads(rev._retract_impl(node_id=unrelated_ob, error_type="hallucinated_claim", reason="c"))
+    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+    json.loads(rev._retract_impl(node_id=ob2, error_type="hallucinated_claim", reason="b", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
+    json.loads(rev._retract_impl(node_id=unrelated_ob, error_type="hallucinated_claim", reason="c", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     mode_b = json.loads(rev._cascade_frontier_impl())
     mode_c = json.loads(rev._cascade_frontier_impl(node_id=joint))
@@ -331,7 +331,7 @@ def test_transitive_catches_out_of_order_resolution_direct_premises_would_miss()
 
     ret = json.loads(rev._retract_impl(
         node_id=r1, error_type="hallucinated_claim", reason="root wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # Sanity: retracting R1 marks G, P1, N (all pending) via the derivation
@@ -415,7 +415,7 @@ def test_mode_c_blast_radius_fields():
     mid1 = _seed_dv(derive, "Intermediate 1.", [ob1])
     target = _seed_dv(derive, "Target.", [mid1])
 
-    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a"))
+    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     mode_c = json.loads(rev._cascade_frontier_impl(node_id=target))
     assert mode_c["mode"] == "C"
@@ -452,7 +452,7 @@ def test_frontier_call_is_read_only():
 
     ob1 = _seed_ob(obs, "Premise 1.")
     dv1 = _seed_dv(derive, "Dependent.", [ob1])
-    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a"))
+    json.loads(rev._retract_impl(node_id=ob1, error_type="hallucinated_claim", reason="a", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     before = _pending_marker_count(core)
     json.loads(rev._cascade_frontier_impl())
@@ -507,7 +507,7 @@ def test_limit_caps_packets_not_summaries():
     dv2 = _seed_dv(derive, "D2.", [ob2])
     dv3 = _seed_dv(derive, "D3.", [ob3])
     for ob in (ob1, ob2, ob3):
-        json.loads(rev._retract_impl(node_id=ob, error_type="hallucinated_claim", reason="x"))
+        json.loads(rev._retract_impl(node_id=ob, error_type="hallucinated_claim", reason="x", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     resp = json.loads(rev._cascade_frontier_impl(limit=1))
     assert resp["frontier_count"] == 3
@@ -559,7 +559,7 @@ def test_invariant_1_anomaly_on_cascade_cycle():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob0, error_type="hallucinated_claim", reason="wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # Sanity: before the cycle is introduced, both dv1 and dv2 are pending
@@ -625,7 +625,7 @@ def test_invariant_1_anomaly_absent_on_healthy_graph():
 
     ret = json.loads(rev._retract_impl(
         node_id=ob0, error_type="hallucinated_claim", reason="wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     resp = json.loads(rev._cascade_frontier_impl())
@@ -668,7 +668,7 @@ def test_dead_premise_detail_is_populated_and_root_case_covered():
 
     ret = json.loads(rev._retract_impl(
         node_id=r1, error_type="hallucinated_claim", reason="root wrong",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     new_g = _seed_dv(derive, "Replacement for G, does not cite r1.", [o1])

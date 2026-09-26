@@ -584,6 +584,7 @@ def test_engram_retract_does_not_bump():
         "node_id": ax_id,
         "error_type": "other",
         "reason": "test: retract no-bump check",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in result, f"engram_retract failed: {result}"
 

@@ -269,8 +269,14 @@ So: `engram_reflect` → `bucket_findings()` → **this sweep** → the bucket w
    pass, and read a packet before you adjudicate from it.
 
 3. For each frontier entry, call
-   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, note)`:
-   - **`retracted`** — a leg of the argument is gone.
+   `engram_cascade_resolve(node_id, resolution_kind, replacement_id?, replacement_absent_because?, note)`:
+   - **`retracted`** — a leg of the argument is gone. #2613: a replacement
+     decision is required-always — pass EITHER `replacement_id` (a
+     demonstrably-existing successor; the normal case in a sweep, since the
+     corrected node is usually written first) OR `replacement_absent_because`
+     (one of NONE_BECAUSE_NO_SUCCESSOR, NONE_BECAUSE_DUPLICATE,
+     NONE_BECAUSE_SUPERSEDED_ELSEWHERE, NONE_BECAUSE_UNKNOWN — the last
+     requires `replacement_absent_note`). Never neither, never both.
    - **`superseded`** — the claim survives on its remaining premises. The
      replacement must **already exist**; compose it with `engram_derive`
      first. This verb never creates it.

@@ -183,7 +183,7 @@ def test_retract_removes_from_fts():
         node_id=ob_id,
         error_type="other",
         reason="FTS trigger regression test #274 — test 1",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
     # After retraction: token must not match in FTS index.
@@ -251,7 +251,7 @@ def test_retract_does_not_remove_non_retracted_supersession():
         node_id=b_id,
         error_type="other",
         reason="FTS trigger regression test #274 — test 2",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
     # A (superseded) must be ABSENT from nodes_fts — removed by supersede trigger.
@@ -393,7 +393,7 @@ def test_query_post_retract_does_not_return_retracted():
         node_id=ob_id,
         error_type="other",
         reason="FTS end-to-end retract test #274",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert ret.get("status") == "retracted", f"retract failed: {ret}"
 
     # After retraction: must not surface with flag=False.
@@ -487,7 +487,7 @@ def test_supersede_then_plain_retract_is_refused_and_fts_is_untouched():
         node_id=a_id,
         error_type="other",
         reason="FTS trigger regression test #280 — test 5 step 2 (#2396 refusal)",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" in ret, (
         f"a plain retract of an already-superseded node must be refused (#2396): {ret}"
     )

@@ -474,6 +474,8 @@ def test_retract_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded(monkeypatc
     dv_id = _seed_dv(derive, "Retract-path derivation.", ob_id)
     ret = json.loads(rev._retract_impl(
         node_id=ob_id, error_type="hallucinated_claim", reason="wrong",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret, ret
     assert _is_tainted(core, dv_id, ob_id), (
@@ -491,6 +493,8 @@ def test_retract_cascade_derives_from_CASCADE_RELATIONS_not_hardcoded(monkeypatc
     dv_id2 = _seed_dv(derive, "Retract-path derivation, patched.", ob_id2)
     ret2 = json.loads(rev._retract_impl(
         node_id=ob_id2, error_type="hallucinated_claim", reason="wrong",
+        replacement_absent_because="NONE_BECAUSE_UNKNOWN",
+        replacement_absent_note="test fixture -- replacement decision not under test",
     ))
     assert "error" not in ret2, ret2
     assert not _is_tainted(core, dv_id2, ob_id2), (

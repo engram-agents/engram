@@ -163,7 +163,7 @@ def test_outgrow_skips_retracted_about_person_node():
         node_id=pn_id,
         error_type="other",
         reason="test: verify non-current about-edge guard",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in rr, rr
 
     # Outgrow the cornerstone — should succeed; non-current person skipped
@@ -236,7 +236,7 @@ def test_outgrow_missing_and_noncurrent_about_nodes_reported_separately():
     pr1 = json.loads(server._add_person_impl(name="Retracted Person", role="test"))
     pn_retracted = pr1["person_id"]
     json.loads(server._link_about_impl(node_id=cs_id, person_id=pn_retracted))
-    json.loads(server._retract_impl(node_id=pn_retracted, error_type="other", reason="test"))
+    json.loads(server._retract_impl(node_id=pn_retracted, error_type="other", reason="test", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     # Person node 2: link then hard-delete (absent)
     pr2 = json.loads(server._add_person_impl(name="Deleted Person", role="test"))
@@ -283,6 +283,7 @@ def _retract_node(server, node_id):
         "node_id": node_id,
         "error_type": "hallucinated_claim",
         "reason": "Test retraction — is_current guard test.",
+        "replacement_absent_because": "NONE_BECAUSE_UNKNOWN", "replacement_absent_note": "test fixture -- replacement decision not under test",
     })))
     assert "error" not in r, f"retract failed: {r}"
 

@@ -183,7 +183,7 @@ def test_contradiction_one_side_obsolete_scores_high():
     # Retract side A — now side B survives
     rev._retract_impl(
         node_id=a_id, error_type="other", reason="test fixture: simulating retraction"
-    )
+    , replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test")
 
     # Test internal pattern function directly to verify score + side metadata
     conn = core._get_db()
@@ -214,8 +214,8 @@ def test_contradiction_both_sides_obsolete_scores_medium():
     core = _fresh_mods()
     qry, obs, rev, drv, epi, tsk, cst, core = _mods()
     ct_id, a_id, b_id = _add_active_contradiction(drv, obs, "Y holds at noon", "Y does not hold at noon")
-    rev._retract_impl(node_id=a_id, error_type="other", reason="fixture")
-    rev._retract_impl(node_id=b_id, error_type="other", reason="fixture")
+    rev._retract_impl(node_id=a_id, error_type="other", reason="fixture", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test")
+    rev._retract_impl(node_id=b_id, error_type="other", reason="fixture", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test")
 
     # Score is 0.5 — below balanced threshold (0.55), at-or-above high_recall (0.45).
     conn = core._get_db()
@@ -365,7 +365,7 @@ def test_tainted_still_valid_surfaces_tainted_nodes():
     rev._retract_impl(
         node_id=obs_a, error_type="hallucinated_claim",
         reason="test fixture: simulating premise retraction"
-    )
+    , replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test")
 
     conn = core._get_db()
     try:

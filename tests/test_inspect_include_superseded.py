@@ -90,7 +90,7 @@ def _retract(server, node_id: str) -> None:
         node_id=node_id,
         error_type="other",
         reason="test retraction",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert r.get("status") == "retracted", f"retract failed: {r}"
 
 

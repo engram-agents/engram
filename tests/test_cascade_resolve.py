@@ -242,7 +242,7 @@ def test_acknowledge_refused_when_the_root_premise_was_retracted():
     dv1 = _seed_dv(derive, "Depends on the wrong premise.", [ob])
 
     ret = json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="never held"))
+        node_id=ob, error_type="hallucinated_claim", reason="never held", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in ret, ret
 
     resp = json.loads(rev._cascade_resolve_impl(
@@ -703,7 +703,7 @@ def test_acknowledgement_rollback_undoes_a_genuinely_written_prior_edge():
         "the fixture itself must start acyclic, or this test proves nothing")
 
     ret = json.loads(rev._retract_impl(
-        node_id=r_ob, error_type="hallucinated_claim", reason="w"))
+        node_id=r_ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in ret, ret
 
     clean_ob = _seed_ob(obs, "Clean basis for P2's replacement.",
@@ -794,10 +794,10 @@ def test_resolving_a_blocked_node_is_refused_and_names_the_blockers():
     dv2 = _seed_dv(derive, "Transitive dependent.", [dv1])
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="wrong"))
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     resp = json.loads(rev._cascade_resolve_impl(
-        node_id=dv2, resolution_kind="retracted"))
+        node_id=dv2, resolution_kind="retracted", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" in resp, resp
     assert resp["blocking_ancestors"] == [dv1], resp
     assert "engram_cascade_frontier" in resp["next_call"], resp
@@ -825,14 +825,14 @@ def test_retract_resolution_opens_no_new_DERIVATION_cascade_event():
     dv2 = _seed_dv(derive, "Transitive dependent.", [dv1])
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="wrong"))
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     events_before = _events(core)
     assert len(events_before) == 1, events_before
     assert len(_markers(core, dv2)) == 1
 
     resp = json.loads(rev._cascade_resolve_impl(
         node_id=dv1, resolution_kind="retracted",
-        note="argument is broken", error_type="wrong_citation"))
+        note="argument is broken", error_type="wrong_citation", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in resp, resp
     assert "SUPPRESSED" in resp["re_cascade"], resp["re_cascade"]
 
@@ -885,7 +885,7 @@ def test_supersede_resolution_opens_no_new_DERIVATION_cascade_event():
     dv1b = _seed_dv(derive, "Direct dependent, restated.", [ob])
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="wrong"))
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     events_before = _events(core)
 
     resp = json.loads(rev._cascade_resolve_impl(
@@ -909,7 +909,7 @@ def test_ordinary_retract_and_supersede_still_cascade():
     ob = _seed_ob(obs, "Premise A.")
     dv = _seed_dv(derive, "Dependent of A.", [ob])
     r = json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="wrong"))
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r, r
     assert len(_markers(core, dv, "pending")) == 1, "normal retract must cascade"
 
@@ -988,9 +988,9 @@ def test_trivial_does_not_fire_when_a_premise_actually_died():
     dv2 = _seed_dv(derive, "Transitive dependent.", [dv1])
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="wrong"))
+        node_id=ob, error_type="hallucinated_claim", reason="wrong", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     resp = json.loads(rev._cascade_resolve_impl(
-        node_id=dv1, resolution_kind="retracted", error_type="wrong_citation"))
+        node_id=dv1, resolution_kind="retracted", error_type="wrong_citation", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in resp, resp
 
     assert resp["auto_resolved_trivial"] == [], resp
@@ -1403,9 +1403,9 @@ def test_no_convergence_warning_on_the_ordinary_paths():
     ob = _seed_ob(obs, "Premise A.")
     dv_leaf = _seed_dv(derive, "Leaf.", [ob])
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="w"))
+        node_id=ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     r = json.loads(rev._cascade_resolve_impl(
-        node_id=dv_leaf, resolution_kind="retracted", error_type="other"))
+        node_id=dv_leaf, resolution_kind="retracted", error_type="other", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r, r
     cr = r["confidence_recompute"]
     assert cr["nodes_considered"] == 0, cr
@@ -1465,7 +1465,7 @@ def test_resolution_marks_contradictions_on_a_dedicated_event():
     ct = c.get("contradiction_id") or c.get("node_id")
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="w"))
+        node_id=ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert _markers(core, ct) == [], (
         "the root's cascade cannot reach a mid-chain node's contradiction — "
         "this is the structural fact the whole fix rests on, so pin it")
@@ -1478,7 +1478,7 @@ def test_resolution_marks_contradictions_on_a_dedicated_event():
     assert r1["marked_contradictions"] == [ct], r1
 
     r2 = json.loads(rev._cascade_resolve_impl(
-        node_id=d2, resolution_kind="retracted", error_type="other"))
+        node_id=d2, resolution_kind="retracted", error_type="other", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r2, r2
 
     # THE COLLISION ASSERTION: d2's resolution must be RECORDED, not merely
@@ -1633,7 +1633,7 @@ def test_acknowledgement_edge_via_marker_branch_is_exercised():
     n = _seed_dv(derive, "Depends on the premise node.", [p])
 
     json.loads(rev._retract_impl(
-        node_id=r_ob, error_type="hallucinated_claim", reason="w"))
+        node_id=r_ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     clean = _seed_ob(obs, "Clean basis.", quote_type="official_statement")
     p2 = _seed_dv(derive, "Premise node, restated.", [clean])
@@ -1692,7 +1692,7 @@ def test_contradiction_marking_writes_the_same_audit_trail_as_the_ordinary_path(
     ct = c.get("contradiction_id") or c.get("node_id")
 
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="w"))
+        node_id=ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     clean = _seed_ob(obs, "Clean basis.")
     d1b = _seed_dv(derive, "First dependent, restated.", [clean])
@@ -1702,7 +1702,7 @@ def test_contradiction_marking_writes_the_same_audit_trail_as_the_ordinary_path(
         f"a supersede resolution must record stale_flagged: {_edit_actions(ct)}")
 
     json.loads(rev._cascade_resolve_impl(
-        node_id=d2, resolution_kind="retracted", error_type="other"))
+        node_id=d2, resolution_kind="retracted", error_type="other", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     acts = _edit_actions(ct)
     assert "tainted" in acts, (
         f"a retract resolution must record tainted, not stale_flagged: {acts}")
@@ -1722,11 +1722,11 @@ def test_no_phantom_contradiction_event_when_the_node_has_none():
     ob = _seed_ob(obs, "Premise.")
     dv1 = _seed_dv(derive, "Dependent, no contradictions.", [ob])
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="w"))
+        node_id=ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     events_before = _events(core)
 
     r = json.loads(rev._cascade_resolve_impl(
-        node_id=dv1, resolution_kind="retracted", error_type="other"))
+        node_id=dv1, resolution_kind="retracted", error_type="other", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     assert "error" not in r, r
     assert r["marked_contradictions"] == [], r
     assert r["contradiction_cascade_event"] is None, (
@@ -1753,9 +1753,9 @@ def test_a_non_current_contradiction_is_not_marked():
     ct = c.get("contradiction_id") or c.get("node_id")
 
     json.loads(rev._retract_impl(
-        node_id=ct, error_type="other", reason="the contradiction was mis-filed"))
+        node_id=ct, error_type="other", reason="the contradiction was mis-filed", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
     json.loads(rev._retract_impl(
-        node_id=ob, error_type="hallucinated_claim", reason="w"))
+        node_id=ob, error_type="hallucinated_claim", reason="w", replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test"))
 
     clean = _seed_ob(obs, "Clean basis.")
     d1b = _seed_dv(derive, "Dependent, restated.", [clean])

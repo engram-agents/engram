@@ -161,7 +161,7 @@ def test_retract_target_does_NOT_taint_cornerstone_source():
         node_id=obs_id,
         error_type="hallucinated_claim",
         reason="The premise observation was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # The cornerstone (source) must NOT be tainted — cascade skip rule applies.
@@ -212,7 +212,7 @@ def test_retract_source_does_not_taint_target():
         node_id=cs_id,
         error_type="other",
         reason="Retracting the cornerstone itself to test inverse cascade.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     # The observation (target / premise) must NOT be tainted
@@ -319,7 +319,7 @@ def test_retract_predictive_observation_retracts_prediction_not_taints():
         node_id=obs_id,
         error_type="fabricated_quote",
         reason="Quote was not in the source document.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
     assert ret.get("retracted_predictions_count") == 1, ret
     assert ret["retracted_predictions"][0]["id"] == pred_id, ret
@@ -393,7 +393,7 @@ def test_retract_predictive_observation_does_not_retract_prediction_with_other_b
         node_id=obs_a_id,
         error_type="fabricated_quote",
         reason="Signal A's quote was not in the source document.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
     # The implementation only ever adds the key when the list is non-empty
     # (engram_revision.py's retracted_predictions block), so its absence
@@ -471,7 +471,7 @@ def test_retract_predictive_observation_preserves_resolved_status_before_overwri
         node_id=obs_id,
         error_type="fabricated_quote",
         reason="Signal E's quote was not in the source document.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
     assert ret.get("retracted_predictions_count") == 1, ret
 
@@ -519,7 +519,7 @@ def test_retract_predictive_observation_with_no_paired_prediction_noops():
         node_id=obs_id,
         error_type="fabricated_quote",
         reason="No paired prediction exists to react to.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
     assert "retracted_predictions" not in ret, ret
 
@@ -572,7 +572,7 @@ def test_retract_predictive_observation_retracts_prediction_only_after_last_basi
         node_id=obs_c_id,
         error_type="fabricated_quote",
         reason="Signal C's quote was not in the source document.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret1, ret1
     assert "retracted_predictions" not in ret1, ret1
 
@@ -594,7 +594,7 @@ def test_retract_predictive_observation_retracts_prediction_only_after_last_basi
         node_id=obs_d_id,
         error_type="fabricated_quote",
         reason="Signal D's quote was not in the source document either.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret2, ret2
     assert ret2.get("retracted_predictions_count") == 1, ret2
     assert ret2["retracted_predictions"][0]["id"] == pred_id, ret2
@@ -685,7 +685,7 @@ def test_derives_from_chain_between_cb_nodes_still_cascades():
         node_id=obs_id,
         error_type="fabricated_quote",
         reason="Root was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert _is_tainted(core, d1_id, obs_id), (
@@ -734,7 +734,7 @@ def test_retract_taints_trust_signal_dependent_via_derives_from():
         node_id=obs_id,
         error_type="fabricated_quote",
         reason="Source was fabricated.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, ts_id, obs_id), (
@@ -813,7 +813,7 @@ def test_retract_taints_prediction_dependent_via_derives_from_reaches_ncb_member
         node_id=root_id,
         error_type="fabricated_quote",
         reason="Root premise fabricated — derives_from-only cascade probe.",
-    ))
+     replacement_absent_because="NONE_BECAUSE_UNKNOWN", replacement_absent_note="test fixture -- replacement decision not under test",))
     assert "error" not in ret, ret
 
     assert not _is_tainted(core, pred_id, root_id), (
